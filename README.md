@@ -1,3 +1,289 @@
+# reims-vgpu: Windows edition
+
+[![Host: Windows 11](https://img.shields.io/badge/host-Windows%2011-0078D4)](#build-and-run-on-windows)
+[![Hypervisor: QEMU + WHPX](https://img.shields.io/badge/hypervisor-QEMU%20%2B%20WHPX-E65100)](https://github.com/MAXZVER/qemu-reims-vgpu)
+[![Guest: macOS 13 Ventura](https://img.shields.io/badge/guest-macOS%2013%20Ventura-555555)](#results)
+[![GPU: Metal to Vulkan](https://img.shields.io/badge/GPU-Metal%20%E2%86%92%20Vulkan-AC162C)](#what-this-is)
+[![Status: experimental](https://img.shields.io/badge/status-experimental-yellow)](#status-and-known-limitations)
+[![License: unchanged from upstream](https://img.shields.io/badge/license-unchanged%20from%20upstream-blue)](#license)
+
+**A macOS guest with a paravirtual GPU on a Windows 11 PC.** This fork of
+[steelbrain/reims-vgpu](https://github.com/steelbrain/reims-vgpu) collects the work that makes
+the Windows 11 + QEMU + WHPX host pathway fast. On one lab PC, a fullscreen Safari CSS animation
+in a macOS 13 guest at 1920x1080 went from **5–7 fps to a median of ~93 fps**.
+
+Everything here is also offered upstream as pull requests. This fork is not a replacement for
+upstream: it is a place to try all of the pending Windows-host work in one build while those PRs
+are reviewed. The original upstream README follows unchanged under
+[Upstream README](#upstream-readme).
+
+## What this is
+
+[reims-vgpu](https://github.com/steelbrain/reims-vgpu) implements the QEMU device that macOS's
+built-in `AppleParavirtGPU.kext` attaches to. It decodes the guest's Metal command stream on the
+host and runs it through Vulkan via [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan).
+There is no custom kext and no guest driver to install. Upstream targets Linux/KVM and Apple
+Silicon hosts. [@Hi-Jiajun](https://github.com/Hi-Jiajun) added a Windows host port upstream
+([reims-vgpu#57](https://github.com/steelbrain/reims-vgpu/pull/57)).
+
+This fork builds on that port and focuses on performance and correctness on Windows 11 with QEMU's
+WHPX accelerator (Windows Hypervisor Platform) and a native Vulkan driver.
+
+## Results
+
+The number is the present rate: frames per second the guest actually presents, from reims-vgpu's
+own census log (`present_hz`, one-second windows).
+
+| Scenario | Before this work (same PC) | `windows` branch changes ¹ | + direct IRQ (experimental) ² |
+|---|---|---|---|
+| CSS keyframe animation, fullscreen Safari | 5–7 | median ~93 (max ~114) | median ~107 (max ~119) |
+| Safari scroll | 5–7 | median ~78–96, mean 66–76 | re-measuring |
+| Window drag | 5–7 | median ~40 | ~35–49 |
+
+**Test conditions**
+
+- Host: Intel Core i7-14700K, 96 GB RAM, NVIDIA GeForce RTX 4060 8 GB, Windows 11 Pro. The host
+  display is 5120x2160 at 120 Hz.
+- Guest: x86_64 macOS 13 Ventura (OSX-KVM OpenCore) at 1920x1080. 8 vCPUs, 12 GB RAM,
+  QEMU + WHPX, `reims-vgpu-pci` with the host window, `REIMS_VGPU_GUEST_IMPORT=off`.
+- Scripted workloads driven over QMP and SSH, 15–35 s per scenario, several boots per
+  configuration. Ranges span boots.
+- ¹ Measured on the development tree this branch was cut from. That tree also carried upstream
+  PR [#78](https://github.com/steelbrain/reims-vgpu/pull/78) (dependency-graph compaction, by
+  [@redvulps](https://github.com/redvulps)), which is *not* merged here, plus the QEMU-side changes
+  listed [below](#qemu-side). The `windows` branch itself has been compile-checked and unit-tested.
+  It has not yet been re-benchmarked on its own.
+- ² Not in this branch yet.
+
+These are single-machine lab numbers at 1080p, not 5K. A steady 120 fps is the goal and has not
+been reached yet. Window drag is the weak spot.
+
+## What changed
+
+### reims-vgpu (merged into `windows`)
+
+All six are open pull requests against upstream.
+
+| PR | Change | Effect |
+|---|---|---|
+| [#110](https://github.com/steelbrain/reims-vgpu/pull/110) | Hold doorbell work until the QEMU shim's dirty-log harvests settle (ABI v21) | Lets QEMU harvest the dirty log off the vCPU (qemu #7) without the drain serving work before its harvest. Merge first. |
+| [#105](https://github.com/steelbrain/reims-vgpu/pull/105) | Retire finished window presents on the maintenance tick | Fixes a VRAM leak: the image slab grew until Vulkan allocations failed. |
+| [#106](https://github.com/steelbrain/reims-vgpu/pull/106) | Narrow GPU writes through the guest-RAM import | Two off-switches that split the import's reads from its writes. They name the write class behind the `AppleParavirtPageTable` panics ([#70](https://github.com/steelbrain/reims-vgpu/issues/70), [#71](https://github.com/steelbrain/reims-vgpu/issues/71), [#100](https://github.com/steelbrain/reims-vgpu/issues/100)). |
+| [#107](https://github.com/steelbrain/reims-vgpu/pull/107) | Consume the resident merge's readback in place | Drops a whole-frame buffer fill per merge. |
+| [#108](https://github.com/steelbrain/reims-vgpu/pull/108) | GPU resident overlay | Copies only the pages the guest CPU wrote onto the live GPU resident, instead of a whole-frame readback-and-merge. The biggest single win. |
+| [#109](https://github.com/steelbrain/reims-vgpu/pull/109) | Write presented framebuffers back at DisplaySwap | Fixes the persistent 1-px horizontal stale-line artifacts. |
+
+### QEMU side
+
+These live in the QEMU fork, not in this repository:
+
+- [qemu-reims-vgpu#6](https://github.com/steelbrain/qemu-reims-vgpu/pull/6): keeps the timer
+  resolution while QEMU's windows are occluded. Without it, Windows 11 rounds waits up to 15.6 ms,
+  and the device's VBL heartbeat drops to 64 Hz.
+- [qemu-reims-vgpu#7](https://github.com/steelbrain/qemu-reims-vgpu/pull/7): harvests the dirty
+  log off the vCPU. Each harvest used to hold the vCPU and the BQL for ~10 ms on WHPX. It needs
+  ABI v21 from #110.
+- The lab QEMU also carries [@Hi-Jiajun](https://github.com/Hi-Jiajun)'s WHPX fixes
+  ([qemu-reims-vgpu#4](https://github.com/steelbrain/qemu-reims-vgpu/pull/4)) and WHPX dirty-page
+  tracking, which has not been sent upstream yet.
+
+## Status and known limitations
+
+- **Experimental.** Upstream calls itself alpha, and this fork is no further along than that.
+  Expect glitches, and don't use it for anything you can't lose.
+- **120 fps is not stable yet.** The CSS animation peaks at ~114–119 fps, but its median is
+  ~93 fps (~107 with the experimental direct IRQ).
+- **Window drag is the weak spot** at a median of ~40 fps.
+- **One machine.** Only an Intel CPU with an NVIDIA RTX 4060 has been measured. Other GPUs are
+  untested on this branch. Hi-Jiajun validated his WHPX fixes on an AMD Ryzen host.
+- **Guest-RAM import.** On this host the import panics the guest (#70/#71/#100), so every
+  number above uses `REIMS_VGPU_GUEST_IMPORT=off`. With the import on,
+  `REIMS_VGPU_GUEST_IMPORT_SURFACE_WRITES=off` (#106) keeps its read side and avoids the class that
+  crashed here. Whether that is faster on this host is not settled.
+- **`vendor/qemu` still points at upstream's shim branch.** See
+  [Build and run](#build-and-run-on-windows).
+- **Only tested at 1080p on macOS 13.** No 5K guest and no macOS 26 Tahoe guest yet.
+
+### Roadmap
+
+1. A steady 120 fps at 1920x1080, including window drag.
+2. A 5120x2160 guest.
+3. A macOS 26 Tahoe guest.
+
+Each step goes upstream as PRs, as before.
+
+## Build and run on Windows
+
+> **Verification status.** The build command and QEMU command line below are the ones our lab
+> runs. The lab drives them through private scripts with machine-specific paths, so steps 1–5 as
+> written here have **not** been re-run end-to-end from a fresh clone. Open an issue if a step
+> fails for you.
+
+### Prerequisites
+
+- Windows 11 with the **Windows Hypervisor Platform** optional feature enabled. QEMU's
+  `-accel whpx` needs it.
+- A Vulkan driver for your GPU. The lab uses the NVIDIA driver on an RTX 4060.
+- [MSYS2](https://www.msys2.org/), **UCRT64** environment. Upstream's Windows port used MINGW64,
+  which is untested here. This is the package set on the lab machine; it has not been trimmed to a
+  minimal set:
+
+  ```sh
+  pacman -S --needed git make bison flex diffutils \
+    mingw-w64-ucrt-x86_64-{gcc,binutils,pkgconf,ninja,meson,python,glib2,pixman,zstd} \
+    mingw-w64-ucrt-x86_64-{libslirp,SDL2,curl,rust,vulkan-headers,vulkan-loader} \
+    mingw-w64-ucrt-x86_64-{llvm-tools,spirv-tools,qemu-image-util}
+  ```
+
+  The Metal→Vulkan translator runs `llvm-dis` (from `llvm-tools`) and `spirv-val` (from
+  `spirv-tools`) at runtime. Start QEMU with the UCRT64 `bin` directory on `PATH`, which also
+  supplies QEMU's DLLs.
+- Docker Desktop, only for building the option ROM the way we did (step 3).
+
+### 1. Get the sources
+
+```sh
+git clone --recurse-submodules https://github.com/MAXZVER/reims-vgpu.git
+cd reims-vgpu            # the default branch is `windows`
+```
+
+`vendor/qemu` still points at upstream's
+[`host-reims-vgpu-vmapple`](https://github.com/steelbrain/qemu-reims-vgpu/tree/host-reims-vgpu-vmapple)
+branch. At that commit, `hw/display/reims-vgpu-pci.c` does not compile on Windows (an unguarded
+`munmap`), and it lacks the WHPX fixes above. Check out the companion QEMU fork in the submodule
+instead:
+
+```sh
+cd vendor/qemu
+git remote add maxzver https://github.com/MAXZVER/qemu-reims-vgpu.git
+git fetch maxzver
+git checkout <windows-integration-branch>   # named in that repository's README
+cd ../..
+```
+
+### 2. Build QEMU with the reims-vgpu device
+
+In an MSYS2 UCRT64 shell at the repository root:
+
+```sh
+REIMS_VGPU_BACKEND=vulkan scripts/qemu-build/qemu-build.sh --target x86_64 --backend vulkan
+```
+
+This builds the Rust staticlib and links it into `vendor/qemu/build/qemu-system-x86_64.exe`.
+Upstream's Windows port notes that non-ASCII Windows locales need `PYTHONUTF8=1` for this step.
+
+### 3. Build the UEFI GOP option ROM
+
+`crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh` produces
+`crates/reims-vgpu-efi/out/reims-vgpu-gop.rom`. It needs `rustup` with the `x86_64-unknown-uefi`
+target, and `python3`. We ran it in the official Rust container, from PowerShell at the repository
+root:
+
+```powershell
+docker run --rm -v "${PWD}:/src" -w /src rust:1-slim bash -c "apt-get update -qq && apt-get install -y -qq python3 && bash crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh"
+```
+
+A native Windows build of the ROM was not tried.
+
+### 4. Prepare a macOS 13 Ventura guest
+
+This repository ships no disk images, firmware variables or OpenCore blobs. Upstream's
+[x86_64 guest steps](#x86_64-guest-on-linux-kvm) use [OSX-KVM](https://github.com/kholia/OSX-KVM)
+for OpenCore, OVMF and the install. On our Windows host we installed the guest with
+[dockur/macos](https://github.com/dockur/macos) under Docker Desktop (WSL2). We then booted the
+disk natively under QEMU + WHPX with OSX-KVM's OpenCore image and OVMF. You end up with:
+
+| File | Role |
+|---|---|
+| `OVMF_CODE_4M.fd` | UEFI firmware, read-only |
+| `OVMF_VARS.fd` | UEFI variables (a copy of OSX-KVM's `OVMF_VARS-1920x1080.fd`) |
+| `OpenCore.qcow2` | OpenCore boot disk |
+| `macos.img` | the installed guest disk (qcow2) |
+| `reims-vgpu-gop.rom` | the option ROM from step 3 |
+
+Tips from our setup:
+
+- We converted dockur's raw disk with `qemu-img convert -O qcow2 data.img macos.img`.
+- To keep the installed disk pristine, boot a throwaway overlay made with
+  `qemu-img create -f qcow2 -b macos.img -F qcow2 macos-run.qcow2`, and point the script's
+  `MacHDD` drive at it.
+- If OpenCore lists the installer's EFI partition first, pick the second entry, the system volume.
+- Enable Remote Login in the guest if you want SSH.
+
+### 5. Boot
+
+`vm/boot-windows.sh`, from upstream's Windows port, boots this configuration from an MSYS2 shell.
+It expects the files above in `C:/hackintosh/vm`; edit `VM_DIR` at the top of the script to use
+another folder.
+
+```sh
+export REIMS_VGPU_GUEST_IMPORT=off   # what every number above was measured with
+vm/boot-windows.sh
+```
+
+- The script sets `REIMS_VGPU_WINDOW=on`, so the guest appears in a host window that reims-vgpu
+  owns.
+- The script defaults to 16 vCPUs and 16 GB. Our lab runs the same devices with `-smp 8` and
+  `-m 12G`.
+- QMP listens on `127.0.0.1:4444`. The script's SSH forward (`hostfwd=tcp::2222-:22`) binds every
+  host interface, so bind it to `127.0.0.1` if that matters on your network.
+- reims-vgpu writes its always-on log to `/tmp/reims-vgpu-fail.log`. On Windows that means
+  `\tmp\reims-vgpu-fail.log` on the drive of QEMU's working directory. Create that `\tmp` folder
+  first, because the device does not create it.
+
+## Companion QEMU fork
+
+The QEMU side lives in **[MAXZVER/qemu-reims-vgpu](https://github.com/MAXZVER/qemu-reims-vgpu)**,
+a fork of [steelbrain/qemu-reims-vgpu](https://github.com/steelbrain/qemu-reims-vgpu). That is
+where the Windows QEMU work is collected: WHPX fixes, #6 and #7. Its Windows integration branch was
+still being assembled when this was written, so check that repository for the current branch.
+
+## Credits
+
+- **[steelbrain](https://github.com/steelbrain)** wrote reims-vgpu, `metal2vulkan` and the QEMU
+  shims. All of the real work is upstream; this fork only adds to it.
+- **[@Hi-Jiajun](https://github.com/Hi-Jiajun)** did the Windows host port
+  ([reims-vgpu#57](https://github.com/steelbrain/reims-vgpu/pull/57),
+  [qemu-reims-vgpu#2](https://github.com/steelbrain/qemu-reims-vgpu/pull/2)) and the WHPX fixes
+  ([qemu-reims-vgpu#3](https://github.com/steelbrain/qemu-reims-vgpu/pull/3),
+  [#4](https://github.com/steelbrain/qemu-reims-vgpu/pull/4)) that got macOS guests booting under
+  WHPX.
+- **[@redvulps](https://github.com/redvulps)** wrote the dependency-graph compaction
+  ([#78](https://github.com/steelbrain/reims-vgpu/pull/78)) that our lab tree carried.
+- **The [QEMU](https://www.qemu.org/) project**, including its WHPX accelerator.
+- **[OSX-KVM](https://github.com/kholia/OSX-KVM)** and **[dockur/macos](https://github.com/dockur/macos)**
+  provided the guest bring-up.
+
+## License
+
+The license is unchanged from upstream. The repository's [LICENSE](LICENSE) file is the GNU LGPL
+v3, and the upstream README below states `LGPL-3.0-or-later`. The crates' `Cargo.toml` files
+declare `GPL-2.0-or-later`. The vendored QEMU carries its own licenses, mainly GPL-2.0. This fork
+keeps every license file and notice as it is. Its changes are contributed under the same terms as
+the files they touch.
+
+## Legal note
+
+Apple's macOS license permits running macOS in a virtual machine only on Apple-branded hardware.
+Running a macOS guest on a Windows PC falls outside those terms. This is a research and
+interoperability project about GPU virtualization. It ships no Apple software, and you are
+responsible for complying with the licenses of whatever you run. It is not affiliated with,
+sponsored by, or endorsed by Apple Inc. Metal and macOS are trademarks of Apple Inc.
+
+## AI-assisted development
+
+Development of this fork was AI-assisted. The investigation, code and PR write-ups were done with
+Claude (Anthropic) under the maintainer's direction and review. Commits carry a
+`Co-Authored-By: Claude` trailer. Every number on this page comes from real runs on the machine
+described above.
+
+---
+
+# Upstream README
+
+> Everything below is the README of
+> [steelbrain/reims-vgpu](https://github.com/steelbrain/reims-vgpu), unchanged.
+
 # reims-vgpu
 
 [![License: LGPL-3.0-or-later](https://img.shields.io/badge/License-LGPL%203.0%20or%20later-blue.svg)](LICENSE) [![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/D2AM9mrDgs)
