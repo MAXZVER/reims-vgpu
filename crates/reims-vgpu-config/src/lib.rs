@@ -1321,6 +1321,18 @@ pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
 
 choices! {
 
+/// **A choice, not a switch.** `WxH` makes that the display's native mode: the first timing element, which
+/// the guest reports as the panel's native pixels and picks by default on a
+/// display it has not seen before. The announced panel takes that aspect in
+/// whole centimetres, about 64 cm wide, so a 5120x2160 native mode reads as a
+/// ~200 DPI panel and the guest defaults to its 2x scaled resolution; the serial
+/// number moves with it, so the guest does not reuse the display arrangement it
+/// saved for the 1920x1080 panel. The built-in modes follow it in the list.
+///
+/// Unset keeps the 1920x1080 panel. A value that does not parse as two sizes
+/// in 1..=8192 is refused on the failure channel and ignored.
+pub const DISPLAY_NATIVE: &str = "REIMS_VGPU_DISPLAY_NATIVE";
+
 /// **A choice, not a switch.** Which execution rail this process runs guest work
 /// on, when the binary carries more than one.
 ///

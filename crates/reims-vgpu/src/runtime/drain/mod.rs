@@ -4269,7 +4269,8 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     };
     let psz = page_size as usize;
 
-    shared_w32(host, gpa, DISPLAY_DESC_SERIAL, DISPLAY_SERIAL_NUMBER, psz);
+    let panel = display_panel();
+    shared_w32(host, gpa, DISPLAY_DESC_SERIAL, panel.serial, psz);
     let _ = gpa_map::write_bytes(
         host,
         gpa + DISPLAY_DESC_PRODUCT_NAME,
@@ -4284,8 +4285,8 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     // float pair is what `displayDimensionFloats` licenses at rung 0x2a and
     // above, and leaving it unwritten is a 0 x 0 mm panel to any guest that gets
     // there.
-    let (width_f32, width_mm) = display_dimension_mm(DISPLAY_WIDTH_MM);
-    let (height_f32, height_mm) = display_dimension_mm(DISPLAY_HEIGHT_MM);
+    let (width_f32, width_mm) = display_dimension_mm(panel.width_mm);
+    let (height_f32, height_mm) = display_dimension_mm(panel.height_mm);
     shared_w16(host, gpa, DISPLAY_DESC_WIDTH_MM, width_mm, psz);
     shared_w16(host, gpa, DISPLAY_DESC_HEIGHT_MM, height_mm, psz);
     shared_w32(
@@ -4315,22 +4316,25 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
         psz,
     );
 
-    const MODES: &[(u16, u16)] = &[
+    const BUILT_IN: &[(u16, u16)] = &[
         (DISPLAY_MODE_EFI_W, DISPLAY_MODE_EFI_H),
         (DISPLAY_MODE1_W, DISPLAY_MODE1_H),
         (DISPLAY_MODE2_W, DISPLAY_MODE2_H),
         (DISPLAY_MODE3_W, DISPLAY_MODE3_H),
     ];
+    let mut modes = vec![panel.native];
+    modes.extend(BUILT_IN.iter().copied().filter(|&m| m != panel.native));
+    let modes: &[(u16, u16)] = &modes;
     shared_w16(
         host,
         gpa,
         DISPLAY_DESC_TIMING_COUNT,
-        MODES.len() as u16,
+        modes.len() as u16,
         psz,
     );
 
     let mut encoded = [0u8; DISPLAY_DESC_TIMING_STRIDE as usize];
-    for (i, &(width, height)) in MODES.iter().enumerate() {
+    for (i, &(width, height)) in modes.iter().enumerate() {
         let Some(off) = display_timing_entry_offset(i as u32, page_size) else {
             return;
         };
@@ -4347,6 +4351,66 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
         }
         let _ = gpa_map::write_bytes(host, gpa + off, &encoded, psz);
     }
+}
+
+/// The panel this device announces: its native mode, physical size and serial.
+struct DisplayPanel {
+    native: (u16, u16),
+    width_mm: u16,
+    height_mm: u16,
+    serial: u32,
+}
+
+/// [`crate::config::DISPLAY_NATIVE`], resolved once.
+///
+/// The built-in panel is the 1920x1080, 48 x 27 cm one `model::regs` derives.
+/// A configured native mode gets the same treatment `DISPLAY_WIDTH_MM`'s doc
+/// gives the built-in one: the aspect reduced to lowest terms and scaled by a
+/// whole number of centimetres, picked so the panel is about 64 cm wide — for
+/// 5120x2160 that is 64 x 27 cm, ~203 DPI, where the guest offers HiDPI.
+fn display_panel() -> &'static DisplayPanel {
+    static PANEL: std::sync::OnceLock<DisplayPanel> = std::sync::OnceLock::new();
+    PANEL.get_or_init(|| {
+        let built_in = DisplayPanel {
+            native: (DISPLAY_MODE_EFI_W, DISPLAY_MODE_EFI_H),
+            width_mm: DISPLAY_WIDTH_MM,
+            height_mm: DISPLAY_HEIGHT_MM,
+            serial: DISPLAY_SERIAL_NUMBER,
+        };
+        let (_, value) = crate::config::read(crate::config::DISPLAY_NATIVE);
+        let Some(value) = value else {
+            return built_in;
+        };
+        let parsed = value
+            .trim()
+            .to_ascii_lowercase()
+            .split_once('x')
+            .and_then(|(w, h)| Some((w.trim().parse::<u16>().ok()?, h.trim().parse::<u16>().ok()?)))
+            .filter(|&(w, h)| (1..=8192).contains(&w) && (1..=8192).contains(&h));
+        let Some((w, h)) = parsed else {
+            crate::observe::fail(format!(
+                "display_native_refused value={value:?} (want WxH, each 1..=8192)"
+            ));
+            return built_in;
+        };
+        let (mut a, mut b) = (u32::from(w), u32::from(h));
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        let (rw, rh) = (u32::from(w) / a, u32::from(h) / a);
+        let k = (64 / rw.max(1)).max(1);
+        let panel = DisplayPanel {
+            native: (w, h),
+            width_mm: (rw * k * 10).min(u32::from(u16::MAX)) as u16,
+            height_mm: (rh * k * 10).min(u32::from(u16::MAX)) as u16,
+            serial: DISPLAY_SERIAL_NUMBER.wrapping_add((u32::from(w) << 16) | u32::from(h)),
+        };
+        crate::observe::off(format!(
+            "display_native {w}x{h} panel={}x{}mm serial={:#x}",
+            panel.width_mm, panel.height_mm, panel.serial
+        ));
+        panel
+    })
 }
 
 /// Sample cursor x/y/show from the display shared-state page (GPA +0xe00).
