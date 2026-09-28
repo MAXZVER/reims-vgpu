@@ -2613,7 +2613,12 @@ const RECLAIM_HISTORY: usize = 256;
 /// [`EngineCounters::sampled_gather_unvouched`] for the reading and its
 /// qualifiers, and prefer removing the write to enlarging the cache.
 const SAMPLED_REACH_BAND: usize = 64;
-const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
+/// 512 MiB, not 128: the cap was sized on 1920x1080 guests, where it holds ~16
+/// full-screen surfaces. A 5120x2160 surface is 44 MB, so 128 MiB held ~3 and a
+/// 5K desktop evicted and re-uploaded its working set every frame
+/// (`sampled_evict_byte_cap` ~54/s in the lab). 512 MiB keeps ~11 at 5K and is
+/// a small share of a discrete GPU's memory.
+const SAMPLED_CACHE_BYTE_CAP: usize = 512 * 1024 * 1024;
 /// How far back the victim ledger remembers what the caps threw away.
 ///
 /// Derived from the count cap rather than written down, so the bands in
