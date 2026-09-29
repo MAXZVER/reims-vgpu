@@ -1468,6 +1468,21 @@ pub fn ensure_image_capabilities(
 /// oracle for proving that reflected variant transforms match executable words.
 #[cfg(test)]
 pub fn sampler_bindings(words: &[u32]) -> Vec<u32> {
+    sampler_descriptor_bindings(words, true)
+}
+
+/// The set-0 bindings whose descriptor is a **separate** `OpTypeSampler`.
+///
+/// [`sampler_bindings`] without the combined `OpTypeSampledImage` half: a
+/// combined image-sampler is a different descriptor type, so a caller that
+/// provisions a sampler object for a binding must not be handed one. Product
+/// code, unlike its sibling — `compute_exec` backstops a sampler the module
+/// uses and reflection does not name with it.
+pub fn separate_sampler_bindings(words: &[u32]) -> Vec<u32> {
+    sampler_descriptor_bindings(words, false)
+}
+
+fn sampler_descriptor_bindings(words: &[u32], include_combined: bool) -> Vec<u32> {
     use std::collections::HashSet;
 
     let mut sampler_types = HashSet::new();
@@ -1483,7 +1498,10 @@ pub fn sampler_bindings(words: &[u32]) -> Vec<u32> {
             break;
         }
         match opcode {
-            OP_TYPE_SAMPLER | OP_TYPE_SAMPLED_IMAGE if word_count >= 2 => {
+            OP_TYPE_SAMPLER if word_count >= 2 => {
+                sampler_types.insert(words[i + 1]);
+            }
+            OP_TYPE_SAMPLED_IMAGE if include_combined && word_count >= 2 => {
                 sampler_types.insert(words[i + 1]);
             }
             OP_TYPE_POINTER if word_count >= 4 => {
@@ -1639,6 +1657,101 @@ pub(crate) fn test_module_with_samplers(bindings: &[u32]) -> Vec<u32> {
             STORAGE_CLASS_UNIFORM_CONSTANT,
         ]);
     }
+    w
+}
+
+#[cfg(test)]
+/// A compute module that loads two separate samplers (bindings 160 and 161)
+/// and one combined image-sampler (162), the shape a macOS 26 kernel binds.
+pub(crate) fn test_module_with_separate_and_combined_samplers() -> Vec<u32> {
+    const MAIN: u32 = 1;
+    const VOID: u32 = 2;
+    const FN: u32 = 3;
+    const FLOAT: u32 = 4;
+    const SAMPLER: u32 = 5;
+    const PTR_SAMPLER: u32 = 6;
+    const IMAGE: u32 = 7;
+    const SAMPLED_IMAGE: u32 = 8;
+    const PTR_SAMPLED_IMAGE: u32 = 9;
+    const VARS: [u32; 3] = [20, 21, 22];
+    let mut w = vec![
+        0x0723_0203,
+        0x0001_0000,
+        0,
+        64,
+        0, //
+        (2 << 16) | 17,
+        1, // OpCapability Shader
+        (3 << 16) | 14,
+        0,
+        1, // OpMemoryModel Logical GLSL450
+        (5 << 16) | OP_ENTRY_POINT as u32,
+        5,
+        MAIN,
+        0x6e69_616d,
+        0,
+    ];
+    for (var, binding) in VARS.iter().zip([160u32, 161, 162]) {
+        w.extend_from_slice(&[
+            (4 << 16) | OP_DECORATE as u32,
+            *var,
+            DECORATION_BINDING,
+            binding,
+        ]);
+    }
+    w.extend_from_slice(&[(2 << 16) | 19, VOID]); // OpTypeVoid
+    w.extend_from_slice(&[(3 << 16) | 33, FN, VOID]); // OpTypeFunction
+    w.extend_from_slice(&[(3 << 16) | 22, FLOAT, 32]); // OpTypeFloat 32
+    w.extend_from_slice(&[(2 << 16) | OP_TYPE_SAMPLER as u32, SAMPLER]);
+    w.extend_from_slice(&[
+        (4 << 16) | OP_TYPE_POINTER as u32,
+        PTR_SAMPLER,
+        STORAGE_CLASS_UNIFORM_CONSTANT,
+        SAMPLER,
+    ]);
+    w.extend_from_slice(&[
+        (9 << 16) | OP_TYPE_IMAGE as u32,
+        IMAGE,
+        FLOAT,
+        1,
+        0,
+        0,
+        0,
+        1,
+        0,
+    ]);
+    w.extend_from_slice(&[
+        (3 << 16) | OP_TYPE_SAMPLED_IMAGE as u32,
+        SAMPLED_IMAGE,
+        IMAGE,
+    ]);
+    w.extend_from_slice(&[
+        (4 << 16) | OP_TYPE_POINTER as u32,
+        PTR_SAMPLED_IMAGE,
+        STORAGE_CLASS_UNIFORM_CONSTANT,
+        SAMPLED_IMAGE,
+    ]);
+    for (var, ptr) in VARS
+        .iter()
+        .zip([PTR_SAMPLER, PTR_SAMPLER, PTR_SAMPLED_IMAGE])
+    {
+        w.extend_from_slice(&[
+            (4 << 16) | OP_VARIABLE as u32,
+            ptr,
+            *var,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ]);
+    }
+    w.extend_from_slice(&[(5 << 16) | OP_FUNCTION as u32, VOID, MAIN, 0, FN]);
+    w.extend_from_slice(&[(2 << 16) | 248, 30]); // OpLabel
+    for (i, (var, ty)) in VARS
+        .iter()
+        .zip([SAMPLER, SAMPLER, SAMPLED_IMAGE])
+        .enumerate()
+    {
+        w.extend_from_slice(&[(4 << 16) | OP_LOAD as u32, ty, 31 + i as u32, *var]);
+    }
+    w.extend_from_slice(&[(1 << 16) | 253, (1 << 16) | 56]); // OpReturn, OpFunctionEnd
     w
 }
 
@@ -3416,6 +3529,22 @@ pub fn log_folded_function_constants(reflection: &ShaderReflection) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The product walk names only separate samplers; the test oracle names both
+    /// kinds. A combined image-sampler handed a sampler object would be a
+    /// descriptor of the wrong type in the layout.
+    #[test]
+    fn separate_sampler_bindings_leaves_combined_image_samplers_out() {
+        let words = test_module_with_separate_and_combined_samplers();
+        assert_eq!(separate_sampler_bindings(&words), vec![160, 161]);
+        assert_eq!(sampler_bindings(&words), vec![160, 161, 162]);
+        for binding in [160, 161, 162] {
+            assert!(
+                descriptor_static_use(&words, binding).is_violation(),
+                "binding {binding} is loaded, so it is statically used"
+            );
+        }
+    }
 
     #[test]
     fn injects_storage_write_without_format_capability_once() {

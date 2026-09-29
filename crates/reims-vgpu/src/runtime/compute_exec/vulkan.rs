@@ -41,6 +41,20 @@ pub(super) fn neutral_sampled_image_bindings(spirv: &[u32], bound: &[u32]) -> Ve
         .collect()
 }
 
+/// Separate samplers the kernel statically uses that nothing in `supplied`
+/// covers — the bindings [`NeutralSamplerUnreflected`] backstops with the
+/// default sampler. Only a separate `OpTypeSampler` qualifies: a combined
+/// image-sampler is a different descriptor type.
+pub(super) fn unreflected_sampler_bindings(spirv: &[u32], supplied: &[u32]) -> Vec<u32> {
+    crate::runtime::spirv_bind::separate_sampler_bindings(spirv)
+        .into_iter()
+        .filter(|binding| {
+            !supplied.contains(binding)
+                && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding).is_violation()
+        })
+        .collect()
+}
+
 /// Side length of the texture substituted for a sampled image the kernel
 /// samples and the guest never bound.
 ///
@@ -79,6 +93,30 @@ impl crate::observe::Decline for NeutralSampledImage {
             ("width", self.width.to_string()),
             ("height", self.height.to_string()),
         ]
+    }
+}
+
+/// A sampler the kernel statically uses that neither the guest nor the
+/// translator's reflection supplied, given the normalized default sampler so
+/// the pipeline layout can describe it.
+///
+/// The same repair [`NeutralSampledImage`] is for a texture, and on the fail
+/// channel for the same reason: the sample runs with a filter and address mode
+/// this device chose. macOS 26 reaches it from kernels that bind a guest
+/// sampler at index 0 and read a second one at binding 161 that reflection
+/// never names (48 dispatches a login, every one refused as
+/// `used_binding_absent_from_layout` before this).
+pub(super) struct NeutralSamplerUnreflected {
+    binding: u32,
+}
+
+impl crate::observe::Decline for NeutralSamplerUnreflected {
+    fn slug(&self) -> &'static str {
+        "compute_neutral_sampler_unreflected"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("binding", self.binding.to_string())]
     }
 }
 
@@ -1277,6 +1315,19 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 );
             }
         }
+    }
+
+    // Backstop for a sampler the module uses and reflection does not name: the
+    // two loops above only reach bindings reflection lists.
+    let supplied: Vec<u32> = samplers.iter().map(|sampler| sampler.binding).collect();
+    for binding in unreflected_sampler_bindings(&spirv, &supplied) {
+        crate::observe::Emit::decline(
+            "compute_linux_sampler",
+            &NeutralSamplerUnreflected { binding },
+        )
+        .field("pipe", acc.pipeline_ref)
+        .fail_once((u64::from(acc.pipeline_ref) << 32) | u64::from(binding));
+        samplers.push(crate::backend::vulkan::engine::SamplerResource::normalized_default(binding));
     }
 
     let req = ComputeRequest {

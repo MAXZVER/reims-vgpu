@@ -2894,6 +2894,32 @@ fn a_sampled_image_the_kernel_uses_and_the_guest_left_empty_gets_a_neutral_textu
     assert_eq!(neutral_sampled_image_bindings(&spirv, &[99]), vec![33]);
 }
 
+/// A separate sampler the kernel loads and nothing supplied gets the default
+/// sampler; a combined image-sampler never does.
+///
+/// macOS 26 kernels bind a guest sampler at index 0 (binding 160) and read a
+/// second one at 161 that the translator's reflection does not name. Both
+/// provisioning loops before this backstop only reach reflected bindings, so
+/// the dispatch reached the engine with 161 missing from its layout and was
+/// refused as `used_binding_absent_from_layout` — 48 dispatches a login.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_used_sampler_neither_the_guest_nor_reflection_supplied_is_backstopped() {
+    let spirv = crate::runtime::spirv_bind::test_module_with_separate_and_combined_samplers();
+
+    // The guest's sampler 0 (and reflection) supplied 160: only 161 is owed.
+    assert_eq!(unreflected_sampler_bindings(&spirv, &[160]), vec![161]);
+    // Everything supplied: nothing to invent.
+    assert_eq!(
+        unreflected_sampler_bindings(&spirv, &[160, 161]),
+        Vec::<u32>::new()
+    );
+    // 162 is a combined image-sampler, a different descriptor type: never a
+    // sampler object, even when nothing covers it.
+    assert!(!unreflected_sampler_bindings(&spirv, &[]).contains(&162));
+    assert_eq!(unreflected_sampler_bindings(&spirv, &[]), vec![160, 161]);
+}
+
 /// A buffer-backed texture (opcode 9) bound to a compute *read* is staged from
 /// the buffer's own bytes, de-pitched to tight rows in its native
 /// format.
