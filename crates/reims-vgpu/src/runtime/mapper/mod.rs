@@ -2599,7 +2599,7 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
         ));
         return false;
     }
-    copy_mapping_runs(
+    let ok = copy_mapping_runs(
         state,
         host,
         mapping_id,
@@ -2607,7 +2607,11 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
         RunCopy::Write(buf),
         only,
         "mapping_write",
-    )
+    );
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.guest_bytes_seq = m.guest_bytes_seq.wrapping_add(1);
+    }
+    ok
 }
 
 /// Read mapping linear `[off, off+buf.len())` via packed map_pages runs.

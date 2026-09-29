@@ -313,6 +313,11 @@ pub const GUEST_IMPORT_SURFACE_WRITES: &str = "REIMS_VGPU_GUEST_IMPORT_SURFACE_W
 /// claim about the other pathways.
 pub const RESIDENT_OVERLAY: &str = "REIMS_VGPU_RESIDENT_OVERLAY";
 
+/// `on` writes a presented framebuffer back into guest RAM page by page: the GPU
+/// compares the frame against the copy its pages were last written from and only
+/// the changed 4 KiB pages cross PCIe and are landed. Opt-in while measured.
+pub const PAY_DIFF: &str = "REIMS_VGPU_PAY_DIFF";
+
 /// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when
 /// the device advertises `VK_KHR_push_descriptor` and the layout fits its
 /// reported limit.

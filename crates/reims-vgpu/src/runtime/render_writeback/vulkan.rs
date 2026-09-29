@@ -35,6 +35,18 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
 ) -> bool {
     let started = std::time::Instant::now();
     crate::runtime::drain::note_store_route("surface_flush");
+    if crate::runtime::writeback_debt::pay_diff_enabled()
+        && state
+            .mappings
+            .get(&mapping_id)
+            .is_some_and(|m| m.scanout_presented)
+    {
+        if let Some(done) =
+            store_changed_pages(state, host, mapping_id, identity, width, height, started)
+        {
+            return done;
+        }
+    }
     // The GPU writes the guest's pages directly. Tried first because when it
     // works there is nothing left to do: no staging buffer is mapped and no
     // host pass over the frame happens at all.
@@ -215,6 +227,96 @@ pub fn store_guest_backed_frame(
     crate::runtime::drain::note_store_route("render_flush_gpu_direct");
     finish(state, mapping_id, identity, bytes as usize, started, true);
     Ok(())
+}
+
+/// [`store_render_frame`] for a presented framebuffer, moving only the pages the
+/// GPU found changed (`engine::read_target_changed_pages`). `None` hands the
+/// frame back to the whole-frame arms.
+fn store_changed_pages<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+    started: std::time::Instant,
+) -> Option<bool> {
+    let m = state.mappings.get(&mapping_id)?;
+    let (base_off, bpr, format) =
+        crate::runtime::mapping_write::resident_gpu_plane(m, width, height)?;
+    if u64::from(bpr) != u64::from(width) * 4
+        || (format != crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
+            && format != crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB)
+    {
+        crate::runtime::drain::note_store_route("pay_diff_plane_not_packed_bgra");
+        return None;
+    }
+    let key = (m.map_generation, width, height, m.guest_bytes_seq);
+    let (_, vouched) = crate::runtime::mapper::vouch_mapping_pages_verdict(state, host, mapping_id);
+    let vouched = vouched?;
+    let changed = match crate::backend::vulkan::engine::read_target_changed_pages(
+        identity, mapping_id, key,
+    ) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            crate::runtime::drain::note_store_route("pay_diff_declined");
+            return None;
+        }
+        Err(e) => {
+            crate::observe::Emit::decline("pay_diff_failed", &e)
+                .field("mapping", mapping_id)
+                .fail_once(u64::from(mapping_id));
+            return None;
+        }
+    };
+    let page = 4096u64;
+    let frame_len = changed.frame_bytes as usize;
+    // SAFETY: `frame_ptr` is the engine's mapped page-diff host buffer, at least
+    // `frame_bytes` long, written by the call above and not touched again until
+    // the next payment — which runs on this same drain thread after this one.
+    let frame = unsafe { std::slice::from_raw_parts(changed.frame_ptr, frame_len) };
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &p in &changed.pages {
+        let lo = u64::from(p) * page;
+        let hi = (lo + page).min(changed.frame_bytes);
+        match runs.last_mut() {
+            Some(last) if last.1 == base_off + lo => last.1 = base_off + hi,
+            _ => runs.push((base_off + lo, base_off + hi)),
+        }
+    }
+    crate::runtime::drain::note_store_route(if changed.full {
+        "pay_diff_full"
+    } else {
+        "pay_diff_pages"
+    });
+    crate::runtime::drain::note_store_route_n("pay_diff_pages_landed", changed.pages.len() as u64);
+    if !runs.is_empty()
+        && !crate::runtime::mapper::write_mapping_bytes_only(
+            state,
+            host,
+            mapping_id,
+            base_off,
+            frame,
+            Some(&runs),
+            &vouched,
+        )
+    {
+        crate::backend::vulkan::engine::page_diff_forget(mapping_id);
+        crate::observe::fail(format!(
+            "render_store_lost mapping={mapping_id} {width}x{height} reason=pay_diff_write_refused"
+        ));
+        return Some(false);
+    }
+    state.invalidate_storage_residency_window(mapping_id, base_off, base_off + changed.frame_bytes);
+    let _ = state.mark_mapping_written(mapping_id);
+    if let Some(m) = state.mappings.get(&mapping_id) {
+        crate::backend::vulkan::engine::page_diff_set_key(
+            mapping_id,
+            (m.map_generation, width, height, m.guest_bytes_seq),
+        );
+    }
+    finish(state, mapping_id, identity, frame_len, started, false);
+    Some(true)
 }
 
 fn finish_needs_registry_handoff(guest_backed: bool) -> bool {

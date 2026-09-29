@@ -28,6 +28,7 @@ mod guest_scatter;
 mod host_ram;
 pub mod init_decline;
 mod linear_target_import;
+mod page_diff;
 mod pools;
 mod queue_owner;
 /// This rail's half of a serialized resource's rail state: the resident-target
@@ -3518,6 +3519,324 @@ impl Drop for LeasedFrame {
     fn drop(&mut self) {
         pools::return_readback_lease(self.token);
     }
+}
+
+/// The pages of a resident's frame that differ from what its guest pages were
+/// last written from, and their bytes. See [`page_diff`].
+pub struct ChangedPages {
+    /// Indices of changed 4 KiB pages of the packed frame, ascending.
+    pub pages: Vec<u32>,
+    /// The frame-shaped host buffer the pages were copied into, each at its own
+    /// offset (the whole frame when `full`). Valid until the next call: the
+    /// caller lands from it before returning to the drain.
+    pub frame_ptr: *const u8,
+    /// Every page was taken: the shadow was new or out of date.
+    pub full: bool,
+    /// Packed frame size in bytes (`width * height * 4`).
+    pub frame_bytes: u64,
+}
+
+/// After the caller landed a [`read_target_changed_pages`] answer: the key the
+/// shadow now stands for (the mapping's `guest_bytes_seq` moved with the landing).
+pub fn page_diff_set_key(mapping_id: u32, key: (u32, u32, u32, u64)) {
+    let mut st = page_diff::STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = st.as_mut().and_then(|s| s.shadows.get_mut(&mapping_id)) {
+        s.key = key;
+    }
+}
+
+/// Forget a mapping's shadow (its landing failed; the pages hold neither frame).
+pub fn page_diff_forget(mapping_id: u32) {
+    let mut st = page_diff::STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = st.as_mut().and_then(|s| s.shadows.get_mut(&mapping_id)) {
+        s.key = (u32::MAX, 0, 0, u64::MAX);
+    }
+}
+
+/// Record one command buffer on the engine's own entry machinery, submit it and
+/// wait for it, exactly as the host-delivered readback does.
+unsafe fn page_diff_submit(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &EngineCounters,
+    record: impl FnOnce(ash::vk::CommandBuffer),
+) -> Result<(), DrawError> {
+    let ops = target_readback_ops();
+    let appended = pools.batch_open_recording();
+    let (cb, fence) = match appended {
+        Some(pair) => pair,
+        None => pools.begin_entry(ctx, counters)?,
+    };
+    if appended.is_none() {
+        unsafe {
+            pools.begin_slot_recording(
+                ctx,
+                cb,
+                gpu_span::Kind::Readback,
+                ops.reset_cb,
+                ops.begin_cb,
+            )?
+        };
+    }
+    unsafe { pools.close_open_pass(&ctx.device, cb) };
+    record(cb);
+    if appended.is_some() {
+        pools.batch_flush(ctx, counters)?;
+    } else {
+        unsafe { pools.gpu_span_seal_current(ctx, cb) };
+        ctx.device
+            .end_command_buffer(cb)
+            .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
+        let cbs = [cb];
+        ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
+            .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
+        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        pools.finish_entry_async(&ctx.device, sealed);
+    }
+    pools.wait_entry_fence(ctx, counters, fence)?;
+    Ok(())
+}
+
+/// Read back only the pages of `identity`'s frame that changed since the frame
+/// last written for `mapping_id` under `key`, updating the shadow to this frame.
+///
+/// `key` is `(map_generation, width, height, guest_bytes_seq)` as the caller
+/// will leave it after landing the answer; a shadow under a different key is
+/// replaced and the whole frame is returned. `Ok(None)` is a routing answer:
+/// the resident is not four-byte scanout colour, or the kernel is unavailable,
+/// and the caller takes the whole-frame readback.
+pub fn read_target_changed_pages(
+    identity: &TargetIdentity,
+    mapping_id: u32,
+    key: (u32, u32, u32, u64),
+) -> Result<Option<ChangedPages>, DrawError> {
+    use ash::vk;
+    use reims_vgpu_vulkan::memory::MemoryClass;
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let (snap, layout) = readback_snapshot(pools, identity)?;
+    if !layout.is_four_byte_color() || !snap.bgra() || snap.guest_backing.is_some() {
+        return Ok(None);
+    }
+    let (w, h) = (snap.width, snap.height);
+    let frame_bytes = u64::from(w) * u64::from(h) * 4;
+    let pages = frame_bytes.div_ceil(page_diff::PAGE_BYTES);
+    let padded = pages * page_diff::PAGE_BYTES;
+
+    let mut st_guard = page_diff::STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let device_handle = ash::vk::Handle::as_raw(ctx.device.handle());
+    if st_guard.as_ref().is_none_or(|s| s.device != device_handle) {
+        // A new device: the old handles are dead. Leak them rather than destroy
+        // objects of a device that no longer exists.
+        if let Some(old) = st_guard.take() {
+            std::mem::forget(old);
+        }
+        *st_guard = Some(page_diff::PageDiffState {
+            device: device_handle,
+            ..Default::default()
+        });
+    }
+    let st = st_guard.as_mut().expect("just set");
+    if !unsafe { st.ensure_pipeline(ctx) } {
+        return Ok(None);
+    }
+    unsafe {
+        page_diff::PageDiffState::ensure(
+            ctx,
+            &mut st.cur,
+            padded,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryClass::DeviceLocal,
+        )?;
+        page_diff::PageDiffState::ensure(
+            ctx,
+            &mut st.flags,
+            pages * 4,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryClass::Readback,
+        )?;
+        page_diff::PageDiffState::ensure(
+            ctx,
+            &mut st.out,
+            padded,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryClass::Readback,
+        )?;
+    }
+    let fresh = unsafe { st.ensure_shadow(ctx, mapping_id, key, padded)? };
+    let read_access = pools::ResidentAccess::transfer_read(false);
+    let (cur, flags, out) = (
+        st.cur.as_ref().expect("ensured"),
+        st.flags.as_ref().expect("ensured"),
+        st.out.as_ref().expect("ensured"),
+    );
+    let prev = &st.shadows.get(&mapping_id).expect("ensured").prev;
+    let pipe = st.pipeline.as_ref().expect("ensured");
+    if !fresh {
+        unsafe { pipe.write_set(&ctx.device, cur, prev, flags, padded, pages) };
+    }
+    let (cur_b, prev_b, flags_b, out_b) = (cur.buffer, prev.buffer, flags.buffer, out.buffer);
+    let (pl_layout, pl, set) = (pipe.layout, pipe.pipeline, pipe.set);
+    unsafe {
+        page_diff_submit(ctx, pools, counters, |cb| {
+            let d = &ctx.device;
+            let to_src = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(RESIDENT_READ_SRC_ACCESS)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(snap.layout)
+                .new_layout(read_access.layout())
+                .image(snap.image)
+                .subresource_range(color_subresource_range())];
+            d.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                feedback_transition_dependency(snap.layout),
+                &[],
+                &[],
+                &to_src,
+            );
+            let region = [vk::BufferImageCopy::default()
+                .image_subresource(color_subresource_layers())
+                .image_extent(vk::Extent3D {
+                    width: w,
+                    height: h,
+                    depth: 1,
+                })];
+            d.cmd_copy_image_to_buffer(cb, snap.image, read_access.layout(), cur_b, &region);
+            let after_copy = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::TRANSFER_READ
+                        | vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::SHADER_WRITE,
+                )];
+            if fresh {
+                // The whole frame goes to the guest, and the shadow becomes it.
+                d.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &after_copy,
+                    &[],
+                    &[],
+                );
+                let whole = [vk::BufferCopy::default().size(frame_bytes)];
+                d.cmd_copy_buffer(cb, cur_b, prev_b, &whole);
+                d.cmd_copy_buffer(cb, cur_b, out_b, &whole);
+            } else {
+                d.cmd_fill_buffer(cb, flags_b, 0, pages * 4, 0);
+                d.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &after_copy,
+                    &[],
+                    &[],
+                );
+                d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pl);
+                d.cmd_bind_descriptor_sets(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pl_layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                let push = [pages as u32, page_diff::WORDS_PER_PAGE];
+                let bytes: &[u8] = std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 8);
+                d.cmd_push_constants(cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+                d.cmd_dispatch(cb, pages as u32, 1, 1);
+            }
+            let to_host = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::TRANSFER_READ)];
+            d.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &to_host,
+                &[],
+                &[],
+            );
+        })?;
+    }
+    pools.registry_note_access(identity, read_access);
+
+    let changed: Vec<u32> = if fresh {
+        (0..pages as u32).collect()
+    } else {
+        unsafe { flags.invalidate(&ctx.device)? };
+        let f = unsafe { std::slice::from_raw_parts(flags.mapped.cast::<u32>(), pages as usize) };
+        (0..pages as u32).filter(|&p| f[p as usize] != 0).collect()
+    };
+    if !fresh && !changed.is_empty() {
+        // Second trip: only the changed pages cross to host memory, packed.
+        let mut regions: Vec<vk::BufferCopy> = Vec::new();
+        let mut i = 0usize;
+        while i < changed.len() {
+            let start = changed[i];
+            let mut end = start + 1;
+            while i + 1 < changed.len() && changed[i + 1] == end {
+                end += 1;
+                i += 1;
+            }
+            let len = u64::from(end - start) * page_diff::PAGE_BYTES;
+            let at = u64::from(start) * page_diff::PAGE_BYTES;
+            // Same offset on both sides: `out` is frame-shaped, so the caller
+            // lands straight out of it with a run list and no repacking.
+            regions.push(
+                vk::BufferCopy::default()
+                    .src_offset(at)
+                    .dst_offset(at)
+                    .size(len),
+            );
+            i += 1;
+        }
+        unsafe {
+            page_diff_submit(ctx, pools, counters, |cb| {
+                let d = &ctx.device;
+                d.cmd_copy_buffer(cb, cur_b, out_b, &regions);
+                let to_host = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                d.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &to_host,
+                    &[],
+                    &[],
+                );
+            })?;
+        }
+    }
+    unsafe { out.invalidate(&ctx.device)? };
+    let n = if fresh {
+        frame_bytes
+    } else {
+        changed.len() as u64 * page_diff::PAGE_BYTES
+    };
+    counters.note_target_read(n, TargetReadDelivery::Host);
+    Ok(Some(ChangedPages {
+        pages: changed,
+        frame_ptr: out.mapped,
+        full: fresh,
+        frame_bytes,
+    }))
 }
 
 /// Read a resident target back and keep the bytes in the staging buffer.

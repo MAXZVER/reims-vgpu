@@ -2093,6 +2093,10 @@ pub struct MappingEntry {
     /// presented, and writing every CPU-written surface back eagerly was
     /// measured to cost what turning the lazy writeback off everywhere does.
     pub scanout_presented: bool,
+    /// Bumped by every landing of device bytes into this mapping's guest pages
+    /// (`mapper::write_mapping_bytes_only`). The page-diff writeback keeps a copy
+    /// of what it last landed and trusts it only while this has not moved since.
+    pub guest_bytes_seq: u64,
     /// Task id that last owned this surface as a backing `OBJECT_TYPE_BACKING`
     /// object (0 = no non-trivial hint; task 0 is always probed first anyway).
     /// `resolve_backing_ex` probes this task right after task 0 so a
