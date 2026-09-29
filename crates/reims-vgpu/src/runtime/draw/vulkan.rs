@@ -4840,6 +4840,17 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // because a linear texture's bytes may alias a surface this device owes a
     // frame and only `pay_for_texture` resolves one id namespace to the other.
     crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+    // And whatever this task owes over the same allocation under another
+    // reference (a view of it was the render target): the name misses those.
+    if let Some(allocation_gva) = tex.allocation_base_gva(state.page_shift) {
+        crate::runtime::writeback_debt::pay_gva_overlapping(
+            state,
+            host,
+            task_id,
+            allocation_gva,
+            tex.allocation_size,
+        );
+    }
     // Retain the texture's complete allocation once. A sampled image needs the
     // allocation base, level offset and row pitch together; reducing it to the
     // level's page runs would throw away the resource shape and force a copy.

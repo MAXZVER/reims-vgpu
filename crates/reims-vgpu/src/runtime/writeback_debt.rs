@@ -627,6 +627,38 @@ impl PendingWritebacks {
             .collect()
     }
 
+    /// Every plane debt of `task_id` whose frame window overlaps the guest span
+    /// `[gva, gva + span)`, taken out of the ledger, whatever reference armed it.
+    ///
+    /// A GVA debt is keyed by the reference its Store named, but a later read may
+    /// name the same pages through another reference of the same task: a texture
+    /// view of the target, or a second texture placed over the same allocation.
+    /// The name misses those; the address does not. GVAs are per task, so the
+    /// task bounds the search and no other address space is reached.
+    pub fn take_gva_overlapping(
+        &mut self,
+        task_id: u32,
+        gva: u64,
+        span: u64,
+    ) -> Vec<(GvaPlaneKey, GvaWritebackDebt)> {
+        let end = gva.saturating_add(span);
+        let planes: Vec<GvaPlaneKey> = self
+            .gva_debts
+            .iter()
+            .filter(|(plane, debt)| {
+                let debt_end = debt.gva.saturating_add(
+                    u64::from(debt.row_stride).saturating_mul(u64::from(debt.height)),
+                );
+                plane.resource.task_id == task_id && debt.gva < end && gva < debt_end
+            })
+            .map(|(plane, _)| *plane)
+            .collect();
+        planes
+            .into_iter()
+            .filter_map(|plane| self.gva_debts.remove(&plane).map(|debt| (plane, debt)))
+            .collect()
+    }
+
     fn take_gva_plane(&mut self, plane: GvaPlaneKey) -> Option<GvaWritebackDebt> {
         self.gva_debts.remove(&plane)
     }
@@ -1667,6 +1699,7 @@ pub fn settle_for_texture<M: HostMemory + HostOps>(
         });
     }
     pay_for_texture(state, host, task_id, texture_ref);
+    pay_gva_overlapping(state, host, task_id, gva, span);
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
         let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
@@ -1675,6 +1708,39 @@ pub fn settle_for_texture<M: HostMemory + HostOps>(
         );
         (gpas.len() as u64 == want).then_some(gpas)
     });
+}
+
+/// Pay every GVA frame this task owes over the pages `[gva, gva + span)`,
+/// whatever reference armed it — the half of a read's obligation the name
+/// cannot reach.
+///
+/// macOS 26 renders its icon layers into linear targets and samples them back
+/// through a different reference (a texture view of the target): the debt is
+/// keyed by the Store's reference, `pay_for_texture` under the sampled one
+/// finds nothing (`wbdebt_texture_owes_nothing`), and the sample reads guest
+/// pages that never received the frame — every such icon came out transparent.
+/// Free when nothing is owed.
+pub fn pay_gva_overlapping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    span: u64,
+) {
+    if state.pending_writebacks.is_empty() || span == 0 {
+        return;
+    }
+    let owed = state
+        .pending_writebacks
+        .take_gva_overlapping(task_id, gva, span);
+    if owed.is_empty() {
+        return;
+    }
+    let rail = crate::backend::selected();
+    for (plane, debt) in owed {
+        crate::runtime::drain::note_store_route("gvadebt_paid_overlap");
+        let _ = pay_gva(rail, state, host, plane, debt, GvaPaySite::Named);
+    }
 }
 
 /// [`settle_for_mapping`] for a caller that is **about to land the owed frame
@@ -2186,6 +2252,47 @@ mod tests {
         assert_eq!(previous.map(|debt| debt.generation), Some(7));
         assert_eq!(pending.len(), 1);
         assert_eq!(pending.get_gva(key).map(|debt| debt.generation), Some(8));
+    }
+
+    /// A read that names a GVA plane's pages through another reference of the
+    /// same task — a view of the target — takes the plane's debt out of the
+    /// ledger by address, which the name cannot reach. Pages of another task's
+    /// address space, and windows that only touch the plane's edges, take
+    /// nothing.
+    #[test]
+    fn an_overlapping_read_takes_the_gva_debt_whatever_reference_armed_it() {
+        let mut pending = PendingWritebacks::default();
+        let key = GvaResourceKey {
+            task_id: 3,
+            texture_ref: 19,
+        };
+        // 64 rows of 256 bytes from 0x4000: the plane is [0x4000, 0x8000).
+        assert_eq!(pending.arm_gva(key, gva_debt(7)), None);
+
+        assert!(
+            pending.take_gva_overlapping(4, 0x4000, 0x4000).is_empty(),
+            "the same addresses in another task are another address space"
+        );
+        assert!(
+            pending.take_gva_overlapping(3, 0x3000, 0x1000).is_empty(),
+            "a window that ends where the plane starts"
+        );
+        assert!(
+            pending.take_gva_overlapping(3, 0x8000, 0x1000).is_empty(),
+            "a window that starts where the plane ends"
+        );
+        assert!(pending.get_gva(key).is_some());
+
+        let taken = pending.take_gva_overlapping(3, 0x7ff0, 0x100);
+        assert_eq!(
+            taken
+                .iter()
+                .map(|(_, debt)| debt.generation)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
+        assert!(pending.get_gva(key).is_none(), "taken, not copied");
+        assert!(pending.is_empty());
     }
 
     /// The pages an owed GVA plane covers are what the reach alarm compares a
