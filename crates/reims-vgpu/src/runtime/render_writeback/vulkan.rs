@@ -777,6 +777,22 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         }
     };
     crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+    // Arm the write witness exactly as the direct arm does: the pages now hold
+    // this resident's frame, texel for texel on the native arm and byte for byte
+    // on the eight-bit one. Without it a later LOAD or sample never reads quiet
+    // and re-reads the pages through the eight-bit seed rail — which for a float
+    // target is not "a re-read" but a clamped, quantised copy of it. Only for a
+    // whole-frame landing: a store that skipped ranges left guest bytes in the
+    // plane that the resident does not hold.
+    if skip.is_empty() {
+        if let (Some(key), Some(gpas)) = (
+            crate::backend::vulkan::gva_witness_key(identity),
+            pages.ordered_complete(c0.target_gva, state.page_size()),
+        ) {
+            let gpas = gpas.to_vec();
+            crate::runtime::gva_store_witness::note_store(state, host, key, &gpas);
+        }
+    }
     crate::runtime::drain::note_store_route("gva_flush_copied");
     Ok(extent)
 }
@@ -1130,14 +1146,12 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
     // witness records is compared against that same ring — capturing it first
     // would have every target permanently invalidated by its own Store.
     //
-    // Only this rail stamps. Both copying arms — the eager `gva_store_sync` and
-    // [`land_gva_frame_bytes`] behind this call — leave no witness, so their
-    // targets never read quiet and never take the shortcut this arms. That is
-    // safe and deliberate rather than an oversight: it is the arm a host without
-    // the guest-RAM import takes, and it already pays a blocking readback per
-    // Store, so the shortcut is worth less there and the rails stay easier to
-    // tell apart. The frame is in the guest's pages either way; what a missing
-    // stamp costs is a re-read, never a wrong image.
+    // The copying arm of [`store_gva_frame`] stamps too, for a whole-frame
+    // landing. It used not to, on the argument that a missing stamp costs a
+    // re-read and never a wrong image; that holds for eight-bit colour only. The
+    // re-read is the eight-bit seed rail, so for a float target it *is* a wrong
+    // image — the clamped one. The eager eight-bit `gva_store_sync` still leaves
+    // none, which is safe for the formats it now carries.
     if let Some(key) = crate::backend::vulkan::gva_witness_key(identity) {
         crate::runtime::gva_store_witness::note_store(state, host, key, gpas);
     }
