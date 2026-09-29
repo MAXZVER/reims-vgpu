@@ -46,6 +46,11 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
         {
             return done;
         }
+        // The whole-frame arms below land without moving `guest_bytes_seq` (the
+        // GPU-direct one writes the guest's pages itself), so the page-diff copy
+        // would outlive the bytes it stands for: forget it, and the next
+        // payment lands the whole frame and takes the copy again.
+        crate::backend::vulkan::engine::page_diff_forget(mapping_id);
     }
     // The GPU writes the guest's pages directly. Tried first because when it
     // works there is nothing left to do: no staging buffer is mapped and no
@@ -252,10 +257,51 @@ fn store_changed_pages<M: HostMemory + HostOps>(
         return None;
     }
     let key = (m.map_generation, width, height, m.guest_bytes_seq);
+    // The guest-write witness. A token built for an older page list watches
+    // pages this surface may no longer own, so it is no witness at all.
+    let token = if m.guest_write_token_gen == m.map_generation {
+        m.guest_write_token
+    } else {
+        0
+    };
+    let (baseline, baseline_token) = (m.pay_diff_gen, m.pay_diff_token);
+    let frame_bytes = u64::from(width) * u64::from(height) * 4;
+    // The generation this landing will stand for, read before it: a guest store
+    // racing the landing then counts as written since, and is landed next time.
+    let gen_now = if token != 0 {
+        host.guest_write_gen(token)
+    } else {
+        None
+    };
+    let force = match gen_now {
+        Some(g) if baseline != 0 && baseline_token == token => {
+            if g == baseline {
+                Some(Vec::new())
+            } else {
+                host.guest_written_pages(token, baseline).map(|pages| {
+                    let ranges =
+                        crate::runtime::mapper::mapping_offsets_of_pages(state, mapping_id, &pages);
+                    forced_frame_pages(&ranges, base_off, frame_bytes)
+                })
+            }
+        }
+        _ => None,
+    };
+    let force = match force {
+        Some(f) => f,
+        None => {
+            // No witness to say which guest pages moved since the copy was
+            // taken: land the whole frame and take the copy again.
+            crate::runtime::drain::note_store_route("pay_diff_unwitnessed_full");
+            crate::backend::vulkan::engine::page_diff_forget(mapping_id);
+            Vec::new()
+        }
+    };
+    crate::runtime::drain::note_store_route_n("pay_diff_pages_forced", force.len() as u64);
     let (_, vouched) = crate::runtime::mapper::vouch_mapping_pages_verdict(state, host, mapping_id);
     let vouched = vouched?;
     let changed = match crate::backend::vulkan::engine::read_target_changed_pages(
-        identity, mapping_id, key,
+        identity, mapping_id, key, &force,
     ) {
         Ok(Some(c)) => c,
         Ok(None) => {
@@ -302,10 +348,18 @@ fn store_changed_pages<M: HostMemory + HostOps>(
         )
     {
         crate::backend::vulkan::engine::page_diff_forget(mapping_id);
+        if let Some(m) = state.mappings.get_mut(&mapping_id) {
+            m.pay_diff_gen = 0;
+            m.pay_diff_token = 0;
+        }
         crate::observe::fail(format!(
             "render_store_lost mapping={mapping_id} {width}x{height} reason=pay_diff_write_refused"
         ));
         return Some(false);
+    }
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.pay_diff_gen = gen_now.unwrap_or(0);
+        m.pay_diff_token = if gen_now.is_some() { token } else { 0 };
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, base_off + changed.frame_bytes);
     let _ = state.mark_mapping_written(mapping_id);
@@ -317,6 +371,31 @@ fn store_changed_pages<M: HostMemory + HostOps>(
     }
     finish(state, mapping_id, identity, frame_len, started, false);
     Some(true)
+}
+
+/// The 4 KiB frame pages (the diff's unit, counted from `base_off`) that a set
+/// of guest-written mapping-offset ranges touches, ascending and deduplicated.
+/// A guest page that straddles two frame pages forces both; bytes outside
+/// `[base_off, base_off + frame_bytes)` force nothing.
+fn forced_frame_pages(ranges: &[(u64, u64)], base_off: u64, frame_bytes: u64) -> Vec<u32> {
+    const PAGE: u64 = 4096;
+    let end = base_off + frame_bytes;
+    let mut out: Vec<u32> = Vec::new();
+    for &(s, e) in ranges {
+        if e <= base_off || s >= end {
+            continue;
+        }
+        let lo = (s.max(base_off) - base_off) / PAGE;
+        let hi = (e.min(end) - base_off).div_ceil(PAGE);
+        for p in lo..hi {
+            if out.last() != Some(&(p as u32)) {
+                out.push(p as u32);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 fn finish_needs_registry_handoff(guest_backed: bool) -> bool {
@@ -366,6 +445,45 @@ fn finish(
         "render_store mapping={mapping_id} bytes={frame_len} us={}",
         started.elapsed().as_micros()
     ));
+}
+
+#[cfg(test)]
+mod forced_frame_pages_tests {
+    use super::forced_frame_pages;
+
+    /// A frame that starts half-way into the mapping's first guest page, so
+    /// frame page `k` covers mapping bytes `[2048 + 4096k, 6144 + 4096k)`.
+    const BASE: u64 = 2048;
+    const FRAME: u64 = 4 * 4096;
+
+    #[test]
+    fn a_guest_page_straddling_two_frame_pages_forces_both() {
+        assert_eq!(forced_frame_pages(&[(4096, 8192)], BASE, FRAME), vec![0, 1]);
+    }
+
+    #[test]
+    fn a_larger_guest_page_forces_every_frame_page_under_it() {
+        assert_eq!(
+            forced_frame_pages(&[(0, 16384)], 0, FRAME),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn bytes_outside_the_frame_force_nothing() {
+        let end = BASE + FRAME;
+        assert!(forced_frame_pages(&[(0, BASE)], BASE, FRAME).is_empty());
+        assert!(forced_frame_pages(&[(end, end + 4096)], BASE, FRAME).is_empty());
+        // Clipped to the frame at either edge.
+        assert_eq!(forced_frame_pages(&[(0, 4096)], BASE, FRAME), vec![0]);
+        assert_eq!(forced_frame_pages(&[(16384, 20480)], BASE, FRAME), vec![3]);
+    }
+
+    #[test]
+    fn the_answer_is_sorted_and_deduplicated() {
+        let ranges = [(16384, 20480), (4096, 8192), (8192, 12288), (4096, 8192)];
+        assert_eq!(forced_frame_pages(&ranges, BASE, FRAME), vec![0, 1, 2, 3]);
+    }
 }
 
 #[cfg(test)]

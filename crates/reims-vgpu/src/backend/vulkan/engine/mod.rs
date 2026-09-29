@@ -3602,13 +3602,16 @@ unsafe fn page_diff_submit(
 ///
 /// `key` is `(map_generation, width, height, guest_bytes_seq)` as the caller
 /// will leave it after landing the answer; a shadow under a different key is
-/// replaced and the whole frame is returned. `Ok(None)` is a routing answer:
+/// replaced and the whole frame is returned. `force` (ascending) names pages
+/// returned whether or not they changed: pages the guest CPU wrote since the
+/// shadow was taken, which the shadow cannot see. `Ok(None)` is a routing answer:
 /// the resident is not four-byte scanout colour, or the kernel is unavailable,
 /// and the caller takes the whole-frame readback.
 pub fn read_target_changed_pages(
     identity: &TargetIdentity,
     mapping_id: u32,
     key: (u32, u32, u32, u64),
+    force: &[u32],
 ) -> Result<Option<ChangedPages>, DrawError> {
     use ash::vk;
     use reims_vgpu_vulkan::memory::MemoryClass;
@@ -3780,7 +3783,11 @@ pub fn read_target_changed_pages(
     } else {
         unsafe { flags.invalidate(&ctx.device)? };
         let f = unsafe { std::slice::from_raw_parts(flags.mapped.cast::<u32>(), pages as usize) };
-        (0..pages as u32).filter(|&p| f[p as usize] != 0).collect()
+        // Unflagged, a forced page's shadow already equals the frame, so landing
+        // it from `cur` keeps the shadow true of the guest's pages.
+        (0..pages as u32)
+            .filter(|&p| f[p as usize] != 0 || force.binary_search(&p).is_ok())
+            .collect()
     };
     if !fresh && !changed.is_empty() {
         // Second trip: only the changed pages cross to host memory, packed.

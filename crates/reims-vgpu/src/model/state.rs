@@ -2097,6 +2097,17 @@ pub struct MappingEntry {
     /// (`mapper::write_mapping_bytes_only`). The page-diff writeback keeps a copy
     /// of what it last landed and trusts it only while this has not moved since.
     pub guest_bytes_seq: u64,
+    /// This mapping's guest-write generation when the page-diff writeback last
+    /// made its guest pages equal to the copy it diffs against (0 = never).
+    /// Pages the guest CPU wrote since are landed whatever the diff says: the
+    /// copy cannot see those stores, so a frame page equal to the copy can still
+    /// differ from the guest's bytes (WindowServer copies an older frame's
+    /// region in with the CPU, then redraws it on the GPU to what it was).
+    pub pay_diff_gen: u64,
+    /// The guest-write token [`Self::pay_diff_gen`] was read from. A generation
+    /// is a statement about one token's pages only, so a different token (the
+    /// page list was retracked) makes the next payment land the whole frame.
+    pub pay_diff_token: u64,
     /// Task id that last owned this surface as a backing `OBJECT_TYPE_BACKING`
     /// object (0 = no non-trivial hint; task 0 is always probed first anyway).
     /// `resolve_backing_ex` probes this task right after task 0 so a
