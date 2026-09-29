@@ -35,3 +35,10 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 incremental = true
+
+# Windows/Tahoe edition: the translator with the macOS 26 fixes, taken from the
+# MAXZVER/metal2vulkan fork (branch windows-tahoe) until they land upstream. A
+# patch rather than an edit of the dependency line, so the crate still names
+# upstream's source and dropping this block is the whole of going back.
+[patch."https://github.com/steelbrain/metal2vulkan.git"]
+metal2vulkan = { git = "https://github.com/MAXZVER/metal2vulkan.git", rev = "c1fc19d539dbb299573192afb2a13a342b36f9ca" }
