@@ -1505,7 +1505,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 } {
                     crate::runtime::drain::note_store_route(route);
                 }
-                let guest_owned = currency.guest_owned_ranges();
+                let guest_owned = currency.guest_owned();
                 // Every rung under this one reads the guest's own pages, so a
                 // serve this rung refuses is corrected below it rather than
                 // held: the ladder takes the permissive standard.
@@ -1563,7 +1563,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // remaps channels cannot bind the resident at all, so it
                     // keeps the merge and the byte rungs below.
                     if may_bind_resident {
-                        if let Some(ranges) = guest_owned {
+                        if let Some(owned) = guest_owned {
                             if overlay_guest_writes_onto_resident(
                                 state,
                                 host,
@@ -1571,7 +1571,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                                 w,
                                 h,
                                 &resident_id,
-                                ranges,
+                                owned,
                             ) {
                                 let format = resident_id.resident_format();
                                 return Some((
@@ -1584,7 +1584,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         }
                     }
                     match guest_owned {
-                        Some(ranges) => {
+                        Some(owned) => {
                             // Named pages inside the window are the evidence the
                             // latch asks for; it decides whether this surface is
                             // a presented framebuffer.
@@ -1616,7 +1616,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                                 w,
                                 h,
                                 &resident_id,
-                                ranges,
+                                &owned.ranges,
                             ) {
                                 crate::runtime::drain::note_store_route(
                                     "t11sample_resident_merge_unlanded",
@@ -8690,6 +8690,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // elision, so revalidating by re-reading would move ~237 GB of guest
         // memory a session. The bitmap answers the same question in a word.
         if !chain_load_from_target {
+            // Before anything below reads the guest's pages or a verdict about
+            // them: the Store that publishes this pass stamps this, not a
+            // generation read after the draws (see `GuestWriteObservation`).
+            if let Some(mid) = req.colors.first().map(|c| c.mapping_id).filter(|m| *m != 0) {
+                crate::runtime::mapper::note_pass_guest_observation(state, host, mid);
+            }
             if let Some((identity, mapping_epoch)) =
                 mapper_ref_texture_load_currency_query(state, req)
             {
@@ -10688,9 +10694,9 @@ fn reconcile_guest_writes_for_load<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route("load_seed_guest_wrote_elsewhere");
             true
         }
-        SurfaceCurrency::WrotePixels(ranges) => {
+        SurfaceCurrency::WrotePixels(owned) => {
             let landed = overlay_guest_writes_onto_resident(
-                state, host, mapping_id, width, height, identity, &ranges,
+                state, host, mapping_id, width, height, identity, &owned,
             );
             if landed {
                 crate::runtime::drain::note_store_route("load_seed_overlaid");
@@ -10737,7 +10743,9 @@ fn resident_overlay_allowed() -> bool {
 ///
 /// - The resident holds both halves, so the guest-write stamp is re-taken: the
 ///   device has adopted the guest's stores, exactly as the merge's skipping
-///   write does.
+///   write does. It stamps the generation the guest's ranges were listed
+///   against ([`crate::runtime::surface_currency::GuestOwned::seen`]), never one
+///   read afterwards.
 /// - The host byte cache does not hold them, so it is dropped — the stamp would
 ///   otherwise vouch for it.
 /// - The mapping's content epoch does not move and no writeback debt is paid or
@@ -10757,7 +10765,7 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
     identity: &crate::backend::vulkan::engine::TargetIdentity,
-    guest_owned: &[(u64, u64)],
+    guest_owned: &crate::runtime::surface_currency::GuestOwned,
 ) -> bool {
     use crate::backend::vulkan::engine::{ResidentOverlay, ResidentOverlaySpan};
     if !resident_overlay_allowed() {
@@ -10781,7 +10789,8 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
     }
     let pitch = u64::from(bpr);
     let extent_end = u64::from(height - 1) * pitch + u64::from(width) * u64::from(RGBA8_BPP);
-    let (spans, staged) = ResidentOverlaySpan::from_guest_owned(guest_owned, base_off, extent_end);
+    let (spans, staged) =
+        ResidentOverlaySpan::from_guest_owned(&guest_owned.ranges, base_off, extent_end);
     // A GPU copy into guest pages still in flight would tear the read below.
     crate::backend::vulkan::engine::quiesce_guest_writes();
     let mut bytes = vec![0u8; staged as usize];
@@ -10822,10 +10831,13 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
         }
     }
     crate::runtime::surface_cache::forget(state, mapping_id);
-    for &(start, end) in guest_owned {
+    for &(start, end) in &guest_owned.ranges {
         state.invalidate_storage_residency_window(mapping_id, start, end);
     }
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    // The generation the ranges were listed against, not a fresh one: a page
+    // the host folded after the list was taken was not read above, and a fresh
+    // stamp would vouch for the resident's old bytes there for good.
+    crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, guest_owned.seen);
     crate::runtime::drain::note_store_route("t11sample_resident_overlaid");
     true
 }
@@ -11019,7 +11031,7 @@ fn stamp_mapper_ref_texture_resident<M: HostMemory + HostOps>(
         crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
     }
     if let Some(mapping_id) = req.colors.first().map(|c| c.mapping_id).filter(|m| *m != 0) {
-        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        crate::runtime::mapper::commit_pass_guest_stamp(state, host, mapping_id);
     }
 }
 
@@ -11350,7 +11362,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     if plan == SurfaceStorePlan::DeferCopy
         && arm_surface_writeback_debt(state, host, mapping_id, identity, width, height)
     {
-        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        crate::runtime::mapper::commit_pass_guest_stamp(state, host, mapping_id);
         return true;
     }
     if plan == SurfaceStorePlan::SynchronizeGuestBacking {
@@ -11384,7 +11396,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     // The guest half of the write witness, recorded here rather than by the caller because this
     // rail returns straight out of `encode_draw` — it never reaches
     // `stamp_mapper_ref_texture_resident`, and it is where nearly all mapper-ref-texture Stores go.
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    crate::runtime::mapper::commit_pass_guest_stamp(state, host, mapping_id);
     true
 }
 
@@ -12905,10 +12917,10 @@ mod vulkan_split_tests {
         // content epoch does not move and this is the only witness that sees it.
         host.guest_wrote_page(gpa);
         assert_eq!(
-            surface_currency(&state, &host, mid, w, h),
+            surface_currency(&state, &host, mid, w, h).guest_owned_ranges(),
             // Whole-page, because the hypervisor's witness has page granularity
             // and the surface's one page is the whole of its mapping offsets.
-            SurfaceCurrency::WrotePixels(vec![(0, 1u64 << PAGE_SHIFT_X86)]),
+            Some(&[(0, 1u64 << PAGE_SHIFT_X86)][..]),
             "the write has to land inside the sampled window, or the rung under \
              test is being asked the wrong question"
         );

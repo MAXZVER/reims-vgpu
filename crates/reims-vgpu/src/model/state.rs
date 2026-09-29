@@ -1955,6 +1955,32 @@ pub struct RenderFlushWitness {
     pub landed_us: u64,
 }
 
+/// A guest-write generation read for one mapping's page list, taken before the
+/// bytes it will vouch for were read from the guest or landed by this device.
+///
+/// A stamp (`MappingEntry::guest_write_gen_at_store`) says "this device's copy
+/// holds every guest write up to here". A generation read *after* the copy was
+/// made can fold in a write the copy never saw: the host's prefetch moves
+/// generations at any moment, mid-pass, and a page it folds between the copy and
+/// the read is then vouched for and never read again (whole stale 4 KiB pages of
+/// CPU-painted tiles, held until the guest happens to write them again). So a
+/// rail observes first and commits after — `runtime::mapper::observe_guest_write_gen`
+/// and `commit_guest_write_stamp`. Committing an older observation is always
+/// safe: a later currency check only re-reads pages the copy already has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GuestWriteObservation {
+    pub(crate) token: u64,
+    pub(crate) map_generation: u32,
+    pub(crate) gen_: u64,
+}
+
+impl GuestWriteObservation {
+    /// The generation a commit of this observation stamps. 0 is never live.
+    pub fn generation(&self) -> u64 {
+        self.gen_
+    }
+}
+
 /// IOSurface mapper registry entry keyed by mapping_id.
 #[derive(Clone, Debug, Default)]
 pub struct MappingEntry {
@@ -2084,6 +2110,11 @@ pub struct MappingEntry {
     /// never compares equal to a live generation (the host's first readable
     /// generation is 1).
     pub guest_write_gen_at_store: u64,
+    /// The guest-write generation observed when this surface's pass last took
+    /// its content from the guest's side — a seed from its pages, or a verdict
+    /// that the resident still is them — held for the Store that publishes the
+    /// pass, which stamps this instead of a generation read after the draws.
+    pub pending_guest_write_obs: Option<GuestWriteObservation>,
     /// A DisplaySwap has presented this surface since it was last unmapped.
     ///
     /// Presentation is what makes a surface one of WindowServer's framebuffers,

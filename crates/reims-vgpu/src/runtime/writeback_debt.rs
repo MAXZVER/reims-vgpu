@@ -1863,6 +1863,8 @@ fn pay<M: HostMemory + HostOps>(
         return;
     }
     crate::runtime::drain::note_store_route(route);
+    // Before the landing (see `GuestWriteObservation`).
+    let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);
     if !rail.pay_surface_writeback(
         state,
         host,
@@ -1879,7 +1881,7 @@ fn pay<M: HostMemory + HostOps>(
             debt.width, debt.height
         ));
     }
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

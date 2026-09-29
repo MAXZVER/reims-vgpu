@@ -777,6 +777,10 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             SurfaceWriteRefusal::SourceStride { src_stride, width },
         );
     }
+    // Before the landing: the stamps below vouch for pages this write puts in
+    // place, and a generation read after it could fold in a guest write that
+    // landed meanwhile (see `GuestWriteObservation`).
+    let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);
     let Some(m) = state.mappings.get(&mapping_id) else {
         return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
@@ -1134,7 +1138,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         // It is honest as well as necessary: the stamp says "no host-side copy
         // is known stale relative to these pages", and after the two retirements
         // above there is no host-side copy at all.
-        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
         return true;
     }
     let cache_started = std::time::Instant::now();
@@ -1170,8 +1174,8 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // `gw_clean` 0 because only the Vulkan Store rails ever stamped, and the
     // copy that rung serves is written here. Unstamped, the reader cannot tell a
     // surface the guest has rewritten from one it has not, and must assume the
-    // worst on every bind.
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    // worst on every bind. Stamped with what was observed before the landing.
+    crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
     true
 }
 
@@ -1244,6 +1248,8 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     if !scanout_extent_ok(width, height) {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }
+    // Before the landing, as in `write_bgra8_inner`.
+    let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);
     let rgba_stride = width.saturating_mul(RGBA8_BPP);
     let need = (height as usize).saturating_mul(rgba_stride as usize);
     if rgba.len() < need {
@@ -1643,8 +1649,8 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // `gw_clean` 0 because only the Vulkan Store rails ever stamped, and the
     // copy that rung serves is written here. Unstamped, the reader cannot tell a
     // surface the guest has rewritten from one it has not, and must assume the
-    // worst on every bind.
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    // worst on every bind. Stamped with what was observed before the landing.
+    crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
     true
 }
 

@@ -8476,3 +8476,72 @@ fn both_spellings_of_the_channel_exchange_agree_and_are_their_own_inverse() {
         );
     }
 }
+
+/// A stamp vouches only for what the copy saw.
+///
+/// The host's prefetch moves generations at any moment, so a generation read
+/// *after* the copy was made can fold in a guest write the copy never saw. The
+/// resident is then vouched for with the old bytes in that page, and nothing
+/// re-reads it until the guest happens to write it again (whole black 4 KiB rows
+/// in a new CPU-painted tile, held for seconds on the Dell). The rails observe
+/// before the copy and commit after.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_guest_write_between_observation_and_copy_is_not_vouched_for() {
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::runtime::host::FakeHost;
+    use crate::runtime::mapper::{
+        commit_guest_write_stamp, commit_pass_guest_stamp, note_pass_guest_observation,
+        observe_guest_write_gen, stamp_guest_write_gen,
+    };
+
+    let entry_for =
+        |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page = state.page_size();
+    assert!(state.map_surface(7));
+    let gpas = [0x40 * page, 0x91 * page];
+    state
+        .mappings
+        .get_mut(&7)
+        .expect("mapped above")
+        .page_entries = gpas.iter().map(|g| entry_for(*g)).collect();
+
+    // Observed before the copy; the guest paints a page before the copy lands.
+    let seen = observe_guest_write_gen(&mut state, &mut host, 7);
+    assert_ne!(seen.generation(), 0, "FakeHost arms on the first read");
+    host.guest_wrote_page(gpas[1]);
+    commit_guest_write_stamp(&mut state, 7, seen);
+    assert!(
+        mapper_ref_texture_guest_wrote_since_store(&state, &host, 7),
+        "the write landed after the observation, so the copy may not hold it"
+    );
+
+    // The order this replaces: a generation read after the copy folds it in.
+    stamp_guest_write_gen(&mut state, &mut host, 7);
+    assert!(
+        !mapper_ref_texture_guest_wrote_since_store(&state, &host, 7),
+        "a fresh stamp vouches for the write — the defect"
+    );
+
+    // The pass form: observed at the LOAD, committed by the Store.
+    note_pass_guest_observation(&mut state, &mut host, 7);
+    host.guest_wrote_page(gpas[0]);
+    commit_pass_guest_stamp(&mut state, &mut host, 7);
+    assert!(mapper_ref_texture_guest_wrote_since_store(&state, &host, 7));
+    assert_eq!(
+        state.mappings[&7].pending_guest_write_obs, None,
+        "a Store consumes the observation it stamped"
+    );
+
+    // An observation for a page list the mapping no longer has stamps nothing.
+    let stale = observe_guest_write_gen(&mut state, &mut host, 7);
+    state
+        .mappings
+        .get_mut(&7)
+        .expect("mapped above")
+        .map_generation += 1;
+    commit_guest_write_stamp(&mut state, 7, stale);
+    assert_eq!(state.mappings[&7].guest_write_gen_at_store, 0);
+}

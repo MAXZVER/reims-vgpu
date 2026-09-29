@@ -1630,7 +1630,21 @@ pub fn stamp_guest_write_gen<M: HostMemory + HostOps>(
     host: &mut M,
     mapping_id: u32,
 ) {
-    let gen_ = match crate::runtime::mapper::ensure_guest_write_token(state, host, mapping_id) {
+    let seen = observe_guest_write_gen(state, host, mapping_id);
+    commit_guest_write_stamp(state, mapping_id, seen);
+}
+
+pub use crate::model::GuestWriteObservation;
+
+/// Observe a mapping's guest-write generation, registering its pages for
+/// tracking the first time. See [`GuestWriteObservation`].
+pub fn observe_guest_write_gen<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) -> GuestWriteObservation {
+    let token = crate::runtime::mapper::ensure_guest_write_token(state, host, mapping_id);
+    let gen_ = match token {
         None => {
             // The host cannot watch these pages: no dirty bitmap, or the mapping
             // has no page list to name. Counted, because a rail whose
@@ -1653,8 +1667,91 @@ pub fn stamp_guest_write_gen<M: HostMemory + HostOps>(
             }
         },
     };
+    GuestWriteObservation {
+        token: token.unwrap_or(0),
+        map_generation: state
+            .mappings
+            .get(&mapping_id)
+            .map_or(0, |m| m.map_generation),
+        gen_,
+    }
+}
+
+/// Observe the generation of a mapping whose token already watches its current
+/// page list, without registering anything: the read-only half for a currency
+/// check. A mapping without such a token observes 0, which commits as "no stamp".
+pub(crate) fn observe_current_guest_write_gen<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+) -> GuestWriteObservation {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return GuestWriteObservation::default();
+    };
+    if m.guest_write_token == 0 || m.guest_write_token_gen != m.map_generation {
+        return GuestWriteObservation::default();
+    }
+    GuestWriteObservation {
+        token: m.guest_write_token,
+        map_generation: m.map_generation,
+        gen_: host.guest_write_gen(m.guest_write_token).unwrap_or(0),
+    }
+}
+
+/// Observe the generation a pass's content is about to be taken against — before
+/// its LOAD reads the guest's pages or trusts a verdict about them — and hold it
+/// on the mapping for the Store that publishes the pass. A later LOAD of a new
+/// pass replaces it: the content the next Store publishes is taken there.
+pub fn note_pass_guest_observation<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    let seen = observe_guest_write_gen(state, host, mapping_id);
     if let Some(m) = state.mappings.get_mut(&mapping_id) {
-        m.guest_write_gen_at_store = gen_;
+        m.pending_guest_write_obs = Some(seen);
+    }
+}
+
+/// The Store half of [`note_pass_guest_observation`]: stamp what the pass's
+/// LOAD observed. A pass that never took content from the guest's side (a
+/// clear, a chain with no LOAD decision) has nothing pending and is stamped as
+/// before, with a generation read now.
+pub fn commit_pass_guest_stamp<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    match state
+        .mappings
+        .get_mut(&mapping_id)
+        .and_then(|m| m.pending_guest_write_obs.take())
+    {
+        Some(seen) => {
+            crate::runtime::drain::note_store_route("t11_gw_stamp_observed");
+            commit_guest_write_stamp(state, mapping_id, seen);
+        }
+        None => {
+            crate::runtime::drain::note_store_route("t11_gw_stamp_fresh");
+            stamp_guest_write_gen(state, host, mapping_id);
+        }
+    }
+}
+
+/// Stamp a mapping with an earlier observation, once the copy it vouches for
+/// has been made. Stamps 0 — fail the currency test — when the observation was
+/// for a token or page list the mapping no longer has.
+pub fn commit_guest_write_stamp(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    seen: GuestWriteObservation,
+) {
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        let current = seen.token != 0
+            && m.guest_write_token == seen.token
+            && m.map_generation == seen.map_generation
+            && m.guest_write_token_gen == m.map_generation;
+        m.guest_write_gen_at_store = if current { seen.gen_ } else { 0 };
     }
 }
 
