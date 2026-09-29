@@ -2509,6 +2509,75 @@ fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
     })
 }
 
+/// The GVA twin of [`try_mapper_ref_texture_target_guest_seed`]: a colour LOAD
+/// seed that carries the attachment's own texels out of its guest pages, for a
+/// destination whose eight-bit seed would lose them.
+///
+/// The only other seed a GVA target has is `seed_color_load`, which answers in
+/// RGBA8 — exact for eight-bit colour and a clamped, quantised copy for a half
+/// float. A pass that LOADs a signed shape map (macOS 26's glass) through it
+/// composites onto a map whose negative half is gone, and each such pass writes
+/// the damage back. `None` hands the caller back to that seed, unchanged.
+///
+/// Debts owed to this texture are paid first, as the mapping twin pays its
+/// mapping's, so the pages hold this device's latest Store and not the frame
+/// before it.
+pub(super) fn try_gva_target_guest_seed<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c0: &ColorRtRequest,
+    target_format: ash::vk::Format,
+) -> Option<crate::backend::vulkan::engine::GuestTargetSeed> {
+    use crate::backend::vulkan::engine::{GuestRunSource, GuestTargetSeed};
+
+    if c0.target_gva == 0 || c0.width == 0 || c0.height == 0 || c0.mapping_id != 0 {
+        return None;
+    }
+    if !guest_run_alias_available(host) {
+        return None;
+    }
+    let layout = pixel_format::store_texel_order(c0.format)?;
+    let source_format = translate::pixel::vk_texel_layout(layout);
+    if source_format != target_format {
+        return None;
+    }
+    let (span, row_length_texels) = strided_window_extent(
+        c0.width,
+        c0.height,
+        u64::from(layout.bytes_per_texel()),
+        u64::from(c0.row_stride),
+    )?;
+    if c0.texture_ref != 0 {
+        crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, c0.texture_ref);
+    }
+    let page = state.page_size();
+    let head_off = c0.target_gva % page;
+    let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        c0.target_gva,
+        span,
+        state.page_shift,
+    );
+    if gpas.len() as u64 != (head_off + span).div_ceil(page) {
+        return None;
+    }
+    let runs = coalesce_pages_to_runs(host, &gpas, page, head_off, span)?;
+    Some(GuestTargetSeed {
+        source: GuestRunSource {
+            runs: std::sync::Arc::new(runs),
+            source_offset: 0,
+            total_len: span,
+            row_length_texels,
+            pages: guest_page_window(host, gpas, page, head_off, span),
+            direct_image: None,
+        },
+        format: source_format,
+    })
+}
+
 fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -8751,7 +8820,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // that layer being dropped, and everything outside the
                     // geometry this pass draws goes blank.
                     let mut seed_door = "none";
-                    if let Some(seed) = c0.target_seed_rgba.as_ref() {
+                    // A GVA target wider than eight-bit colour takes its prior
+                    // content out of its own pages at its own width before the
+                    // eight-bit colour seed is considered; see
+                    // `try_gva_target_guest_seed`.
+                    let native_seed = (c0.mapping_id == 0
+                        && gva_store_needs_native_texels(c0.format))
+                    .then(|| {
+                        try_gva_target_guest_seed(
+                            state,
+                            host,
+                            req.task_id,
+                            c0,
+                            gva_resident_format(c0.format),
+                        )
+                    })
+                    .flatten();
+                    if let Some(seed) = native_seed {
+                        seed_door = "gva_guest_seed";
+                        crate::runtime::drain::note_store_route("gva_guest_seed_native");
+                        target_guest_seed = Some(seed);
+                    } else if let Some(seed) = c0.target_seed_rgba.as_ref() {
                         seed_door = "color_seed";
                         if seed.len() == (w as usize) * (h as usize) * 4 {
                             // seed_color_load selected this by RT provenance.

@@ -1837,6 +1837,61 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
     );
 }
 
+/// A half-float GVA attachment's LOAD seed comes out of its own pages at its own
+/// width, so a signed shape map is loaded as it was stored rather than through
+/// the eight-bit colour seed that clamps it.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_half_float_gva_load_seed_carries_its_own_texels() {
+    crate::runtime::guest_ram_map::reset();
+    use crate::model::PAGE_SHIFT_ARM64E;
+    use crate::protocol::pixel_format as pf;
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    crate::runtime::gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 4);
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+    let mut c0 = ColorRtRequest {
+        slot: 0,
+        texture_ref: 0,
+        mapping_id: 0,
+        target_gva: page, // GVA page 1
+        width: 4,
+        height: 2,
+        row_stride: 64,
+        format: pf::MTL_FORMAT_RGBA16_FLOAT,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        ..Default::default()
+    };
+    let want = ash::vk::Format::R16G16B16A16_SFLOAT;
+    let seed = try_gva_target_guest_seed(&mut state, &mut host, 1, &c0, want)
+        .expect("a half-float plane over walkable pages seeds natively");
+    assert_eq!(seed.format, want);
+    assert_eq!(
+        seed.source.total_len,
+        64 + 4 * 8,
+        "one full row plus the tight last row"
+    );
+    assert_eq!(
+        seed.source.row_length_texels, 8,
+        "a 64-byte row is 8 half4 texels"
+    );
+    // An attachment built in another format cannot take these bytes.
+    assert!(try_gva_target_guest_seed(
+        &mut state,
+        &mut host,
+        1,
+        &c0,
+        ash::vk::Format::R8G8B8A8_UNORM
+    )
+    .is_none());
+    // Nor may a mapping-backed target take the GVA door.
+    c0.mapping_id = 3;
+    assert!(try_gva_target_guest_seed(&mut state, &mut host, 1, &c0, want).is_none());
+    crate::runtime::guest_ram_map::reset();
+}
+
 /// The eager GVA Store lands an eight-bit readback, which is exact only for the
 /// two eight-bit colour orders. Every wider layout must take the native rail, or
 /// a signed half-float glass map is written back clamped to [0,1].
