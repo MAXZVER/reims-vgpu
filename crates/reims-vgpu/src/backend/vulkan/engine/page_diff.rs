@@ -20,7 +20,7 @@
 //! mapping's `guest_bytes_seq` moved), copies and lands the whole frame and
 //! seeds `prev` from it.
 //!
-//! Lab A/B: `REIMS_VGPU_PAY_DIFF` (opt-in while measured).
+//! Default on; `REIMS_VGPU_PAY_DIFF=off` pays whole frames instead.
 
 use ash::vk;
 use std::collections::HashMap;

@@ -313,9 +313,11 @@ pub const GUEST_IMPORT_SURFACE_WRITES: &str = "REIMS_VGPU_GUEST_IMPORT_SURFACE_W
 /// claim about the other pathways.
 pub const RESIDENT_OVERLAY: &str = "REIMS_VGPU_RESIDENT_OVERLAY";
 
-/// `on` writes a presented framebuffer back into guest RAM page by page: the GPU
-/// compares the frame against the copy its pages were last written from and only
-/// the changed 4 KiB pages cross PCIe and are landed. Opt-in while measured.
+/// `off` writes a presented framebuffer back into guest RAM whole at each swap
+/// payment instead of page by page. Unset, the GPU compares the frame against
+/// the copy its pages were last written from and only the changed 4 KiB pages
+/// cross PCIe and are landed (lab, 5120x2160 guest on an RTX 4060: CSS
+/// animation ~93 -> ~100-106 fps, wheel scroll ~64 -> ~71, drag ~23 -> ~28-30).
 pub const PAY_DIFF: &str = "REIMS_VGPU_PAY_DIFF";
 
 /// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when

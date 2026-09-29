@@ -835,9 +835,9 @@ pub fn pay_diff_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = matches!(
+        let on = !matches!(
             crate::config::read(crate::config::PAY_DIFF).0,
-            crate::config::Switch::On
+            crate::config::Switch::Off
         );
         crate::observe::off(format!("pay_diff on={on}"));
         on
