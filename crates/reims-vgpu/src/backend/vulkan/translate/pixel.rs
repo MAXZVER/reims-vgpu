@@ -682,7 +682,9 @@ mod tests {
                 // The packed 32-bit colour family, whose channel boundaries are
                 // not byte boundaries — so the CPU rung could not have served
                 // them at all and the refusal was the whole loss. `BGR10A2Unorm`
-                // is the member a guest was measured binding.
+                // is the member a guest was measured binding; `RGB10A2Unorm` is
+                // the one macOS 26 renders into, so it is sampled on this rail
+                // as well as rendered on the colour one below.
                 p::MTL_FORMAT_RGB10A2_UNORM,
                 p::MTL_FORMAT_RG11B10_FLOAT,
                 p::MTL_FORMAT_BGR10A2_UNORM,
@@ -767,6 +769,13 @@ mod tests {
                 // decline it and this rail is where that decline appears. The
                 // NVIDIA host it was measured on advertises it.
                 p::MTL_FORMAT_BGR10A2_UNORM,
+                // Its red-low twin, which macOS 26 renders into as a linear
+                // target. Every pass naming one was refused as `rt_resolve
+                // reason=rt_linear_format fmt=0x5a` and dropped whole. The same
+                // word with red and blue exchanged, so it takes the same arms;
+                // unlike its twin, Vulkan mandates `A2B10G10R10_UNORM_PACK32` as
+                // a colour attachment, so no host can decline it here.
+                p::MTL_FORMAT_RGB10A2_UNORM,
                 // The first **integer** colour attachment, and the one that
                 // could not be admitted by adding a table entry. A macos-15
                 // guest renders into linear `RG16Uint` targets, and every pass

@@ -2165,6 +2165,42 @@ mod tests {
         assert!(p::store_texel_order(p::MTL_FORMAT_RGBA32_FLOAT).is_none());
     }
 
+    /// Each packed ten-bit colour word renders, byte-copies and samples at the
+    /// one Vulkan format whose bits are its own — red-low `RGB10A2Unorm` at
+    /// `A2B10G10R10`, blue-low `BGR10A2Unorm` at `A2R10G10B10` — on every rail.
+    ///
+    /// The two differ only by where red and blue sit in the word, so a rail that
+    /// crossed them would not fail: it would render and hand back a frame with
+    /// red and blue exchanged. That is why each rail's answer is pinned to a
+    /// literal here rather than compared with another rail's.
+    #[test]
+    fn each_packed_ten_bit_word_is_its_own_vulkan_word_on_every_rail() {
+        for (mtl, word) in [
+            (
+                p::MTL_FORMAT_RGB10A2_UNORM,
+                vk::Format::A2B10G10R10_UNORM_PACK32,
+            ),
+            (
+                p::MTL_FORMAT_BGR10A2_UNORM,
+                vk::Format::A2R10G10B10_UNORM_PACK32,
+            ),
+        ] {
+            assert_eq!(
+                color_attachment(mtl),
+                Ok((word, ColorNumericType::Float)),
+                "{mtl:#x} colour attachment"
+            );
+            assert_eq!(verbatim_texel(mtl), Some((word, 4)), "{mtl:#x} byte copy");
+            let sampled = sampled_pixels(mtl).expect("a packed colour word is sampled natively");
+            assert_eq!(vk_texel_layout(sampled.layout), word, "{mtl:#x} sampled");
+            assert_eq!(
+                vk_storage_image(sampled_image(mtl).expect("sampled-image rail")),
+                word,
+                "{mtl:#x} compute sampled image"
+            );
+        }
+    }
+
     /// The storage rail *declines* sRGB rather than downgrading it, which is
     /// why it keeps a layout enum where the colour and sampled rails now
     /// resolve to a `VkFormat`.
