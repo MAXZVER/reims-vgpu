@@ -2101,10 +2101,13 @@ pub fn render_target_numeric_type(format: u16) -> Option<ColorNumericType> {
 /// The byte-copy rail declines by name and the caller falls to the CPU
 /// converter, which is [`convert_rgba8_to_row`] — so the obligation a missing
 /// arm creates lands there instead, and that one *is* a loss if unmet.
-/// `RG16_FLOAT` is renderable and absent from here for that reason and no
+/// `R16_FLOAT` is renderable and absent from here for that reason and no
 /// other: `a_byte_copy_destination_is_the_texel_every_other_table_agrees_it_is`
 /// requires an admitted format to have a [`sampled_class`] naming the same
-/// texel, and `RG16_FLOAT` has none.
+/// texel, and `R16_FLOAT` has none. `RG16_FLOAT` used to be the example; it
+/// has a sampled class naming its texel, and it is admitted because the CPU
+/// converter narrows through eight bits — macOS 26 renders signed coverage and
+/// shape maps into it, and their negative half does not survive that.
 ///
 /// sRGB folds onto its linear sibling for the same reason [`sampled_class`]
 /// folds it: the qualifier describes how a sampler interprets the bytes, not
@@ -2114,6 +2117,9 @@ pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => TexelLayout::Rgba8,
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => TexelLayout::Bgra8,
         MTL_FORMAT_RGBA16_FLOAT => TexelLayout::Rgba16Float,
+        // Two-channel half float: macOS 26 renders coverage and shape maps into
+        // it, signed, and the eight-bit round trip clamps them to [0,1].
+        MTL_FORMAT_RG16_FLOAT => TexelLayout::Rg16Float,
         // The two packed ten-bit colour words. Admitted because the byte copy is
         // the only rail that can land them without loss: the CPU converter
         // reaches [`rgba8_to_texel`], whose arms for these formats requantize
@@ -4912,6 +4918,7 @@ mod tests {
                     TexelLayout::Rgba8 => SampledClass::Rgba8Unorm,
                     TexelLayout::Bgra8 => SampledClass::Bgra8Unorm,
                     TexelLayout::Rgba16Float => SampledClass::Rgba16Float,
+                    TexelLayout::Rg16Float => SampledClass::Rg16Float,
                     TexelLayout::Rgb10a2Unorm => SampledClass::Rgb10a2Unorm,
                     TexelLayout::Bgr10a2Unorm => SampledClass::Bgr10a2Unorm,
                     TexelLayout::Rg16Uint => SampledClass::Rg16Uint,
@@ -4933,10 +4940,15 @@ mod tests {
         }
         // A renderable format that is still not a byte-copy destination, so a
         // further widening of the set above has to change this line to pass.
-        assert!(render_target_bpp(MTL_FORMAT_RG16_FLOAT).is_some());
+        assert!(render_target_bpp(MTL_FORMAT_R16_FLOAT).is_some());
         assert!(
-            store_texel_order(MTL_FORMAT_RG16_FLOAT).is_none(),
-            "RG16_FLOAT renders but is not admitted to a copy"
+            store_texel_order(MTL_FORMAT_R16_FLOAT).is_none(),
+            "R16_FLOAT renders but is not admitted to a copy"
+        );
+        assert_eq!(
+            store_texel_order(MTL_FORMAT_RG16_FLOAT),
+            Some(TexelLayout::Rg16Float),
+            "a two-channel half-float target carries signed shape and coverage maps              on macOS 26; through eight bits their negative half is lost"
         );
         // The widened one, named so that removing it from the rule is a test
         // failure rather than a silent narrowing back to eight bits.
