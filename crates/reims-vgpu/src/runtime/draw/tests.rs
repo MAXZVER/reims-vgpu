@@ -3614,6 +3614,198 @@ fn mrt_draw_request_texture_view_mip_level_view_of_linear_as_color_rt() {
     assert_eq!(c0.row_stride, 128, "level-1 row stride");
 }
 
+/// A two-level linear texture (object type 3) and a ranged texture view
+/// (object type 8) over its level 1, both in task 1's object list, with each
+/// level's texels in guest memory. Returns the view's ref and level 1's bytes
+/// as stored.
+///
+/// Level 0 is 64x32 and filled with `0xee`; level 1 is 32x16 at allocation
+/// offset `0x2000`, tight, filled with a counting pattern — so a sample that
+/// read the wrong level differs in its bytes as well as its extent.
+#[cfg(feature = "backend-vulkan")]
+fn level_one_view_of_a_linear_texture(
+    state: &mut DeviceState,
+    host: &mut FakeHost,
+    base_format: u16,
+    view_format: u16,
+) -> (u32, Vec<u8>) {
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE,
+        OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_LEVEL_RECORDS,
+        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_MIP_LEVEL_RECORD_LEN,
+        TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE,
+        TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE,
+        TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH, TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN,
+        TEXTURE_VIEW_DESC_LEVEL_BASE, TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_OPCODE,
+        TEXTURE_VIEW_DESC_PIXEL_FORMAT, TEXTURE_VIEW_DESC_SLICE_BASE,
+        TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_DESC_TEXTURE_REF,
+        TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_OPCODE_RANGED,
+    };
+
+    let bpp = crate::protocol::pixel_format::bytes_per_pixel(base_format)
+        .expect("fixture base format has a texel size");
+    let (w0, h0, w1, h1) = (64u32, 32u32, 32u32, 16u32);
+    // The allocation is GVA page 2 of the eight the task maps; the object list
+    // and both descriptors sit in page 0.
+    let (handle, level1_offset) = (2u32, 0x2000u64);
+    let alloc_gva = u64::from(handle) << PAGE_SHIFT_ARM64E;
+
+    gva_mem::define_task_pages_arm64e(host, state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    let base_ref = 5u32;
+    let body = TEXTURE_DESC_BASE_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    let mut b = vec![0u8; body];
+    st64(&mut b[0..], 0x4000); // allocation_size
+    st32(&mut b[8..], handle);
+    st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 2);
+    st32(&mut b[TEXTURE_DESC_USED_SIZE..], w0 * h0 * bpp);
+    st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], w0 * bpp);
+    st32(&mut b[TEXTURE_DESC_WIDTH..], w0);
+    st32(&mut b[TEXTURE_DESC_WIDTH + 4..], h0);
+    let rec = TEXTURE_DESC_LEVEL_RECORDS;
+    st64(&mut b[rec + TEXTURE_LEVEL_OFFSET..], level1_offset);
+    st64(&mut b[rec + TEXTURE_LEVEL_SIZE..], u64::from(w1 * h1 * bpp));
+    st64(
+        &mut b[rec + TEXTURE_LEVEL_ROW_STRIDE..],
+        u64::from(w1 * bpp),
+    );
+    st32(&mut b[rec + TEXTURE_LEVEL_WIDTH..], w1);
+    st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT..], h1);
+    st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT + 4..], 1); // depth
+    st16(
+        &mut b[TEXTURE_DESC_PIXEL_FORMAT + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN..],
+        base_format,
+    );
+    let base_desc_gva = 0x200u64;
+    write_task_gva_arm64e(host, &state.tasks[1], base_desc_gva, &b);
+    let off = list_object_entry_offset(base_ref, 32).unwrap();
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut le[0..],
+        (OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8),
+    );
+    le[4..12].copy_from_slice(&base_desc_gva.to_le_bytes());
+    write_task_gva_arm64e(host, &state.tasks[1], off, &le);
+
+    let view_ref = 8u32;
+    let len = TEXTURE_VIEW_MIN_RANGED;
+    let mut desc = vec![0u8; len];
+    st32(
+        &mut desc[TEXTURE_VIEW_DESC_OPCODE..],
+        TEXTURE_VIEW_OPCODE_RANGED,
+    );
+    st32(&mut desc[TEXTURE_VIEW_DESC_LEN..], len as u32);
+    st32(&mut desc[TEXTURE_VIEW_DESC_TEXTURE_REF..], view_ref);
+    st32(&mut desc[TEXTURE_VIEW_DESC_BASE_REF..], base_ref);
+    st16(&mut desc[TEXTURE_VIEW_DESC_PIXEL_FORMAT..], view_format);
+    st16(
+        &mut desc[TEXTURE_VIEW_DESC_TEXTURE_TYPE..],
+        TEXTURE_VIEW_MTL_TYPE_2D,
+    );
+    st64(&mut desc[TEXTURE_VIEW_DESC_LEVEL_BASE..], 1);
+    st64(&mut desc[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 1);
+    st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
+    st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
+    let desc_gva = 0x400u64;
+    write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
+    let off = list_object_entry_offset(view_ref, 32).unwrap();
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut le[0..],
+        (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8),
+    );
+    le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(host, &state.tasks[1], off, &le);
+
+    let level0 = vec![0xeeu8; (w0 * h0 * bpp) as usize];
+    write_task_gva_arm64e(host, &state.tasks[1], alloc_gva, &level0);
+    let level1: Vec<u8> = (0..w1 * h1 * bpp).map(|i| (i * 7 + 3) as u8).collect();
+    write_task_gva_arm64e(host, &state.tasks[1], alloc_gva + level1_offset, &level1);
+    (view_ref, level1)
+}
+
+/// A texture view has no texture descriptor of its own, so the last-resort
+/// sampled rung takes its geometry from the base texture's descriptor at the
+/// view's level — the level whose bytes it has just loaded through the view.
+///
+/// It used to decode the view's own 52-byte record as a texture descriptor,
+/// which cannot fit one: every viewed sample of a linear texture was refused as
+/// a missing texture after its bytes had loaded. The extent asserted is level
+/// 1's, not the base's, and the payload is exactly that level's worth of texels
+/// in the layout the loader reports.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_view_of_a_linear_texture_samples_at_its_level_from_the_base_descriptor() {
+    use crate::protocol::pixel_format::TexelLayout;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let (view_ref, level1) = level_one_view_of_a_linear_texture(
+        &mut state,
+        &mut host,
+        MTL_FORMAT_BGRA8_UNORM,
+        MTL_FORMAT_BGRA8_UNORM,
+    );
+
+    let (w, h, mid, src) = resolve_sampled_source(&mut state, &mut host, 1, view_ref, None, false)
+        .expect("a view of a linear texture must sample");
+    assert_eq!((w, h), (32, 16), "the view's level, not the base's 64x32");
+    assert_eq!(mid, 0, "a linear texture is no mapping");
+    let SampledSourceRequest::Bytes(bytes, _, format, _) = src else {
+        panic!("the last-resort rung serves bytes");
+    };
+    assert_eq!(
+        bytes.len(),
+        (w * h * format.layout().bytes_per_texel()) as usize,
+        "exactly one level-1 image, in the layout the loader reports"
+    );
+    assert_eq!(format.layout(), TexelLayout::Bgra8);
+    assert_eq!(
+        bytes.as_slice(),
+        level1.as_slice(),
+        "level 1's texels as stored"
+    );
+}
+
+/// The same rung with the view reinterpreting its base: macOS 26 samples its
+/// icon masks through `A8Unorm` views of `R8Unorm` textures. The one stored
+/// byte is alpha under the view's format — red under the base's — and the
+/// extent is still the view level's.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn an_a8_view_of_an_r8_texture_samples_the_byte_as_alpha_at_the_view_level() {
+    use crate::protocol::pixel_format::{MTL_FORMAT_A8_UNORM, MTL_FORMAT_R8_UNORM};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let (view_ref, level1) = level_one_view_of_a_linear_texture(
+        &mut state,
+        &mut host,
+        MTL_FORMAT_R8_UNORM,
+        MTL_FORMAT_A8_UNORM,
+    );
+
+    let (w, h, _, src) = resolve_sampled_source(&mut state, &mut host, 1, view_ref, None, false)
+        .expect("an A8 view of an R8 texture must sample");
+    assert_eq!((w, h), (32, 16), "the view's level, not the base's 64x32");
+    let SampledSourceRequest::Bytes(bytes, _, format, _) = src else {
+        panic!("the last-resort rung serves bytes");
+    };
+    let bpt = format.layout().bytes_per_texel() as usize;
+    assert_eq!(bytes.len(), w as usize * h as usize * bpt);
+    assert_eq!(bpt, 4, "the A8 row rail widens each texel to RGBA8");
+    for (texel, stored) in bytes.chunks_exact(bpt).zip(&level1) {
+        assert_eq!(
+            texel,
+            &[0, 0, 0, *stored],
+            "the view's format, not the base's, decides the channel"
+        );
+    }
+}
+
 #[test]
 fn view_swizzle_remaps_rgba8_pixels() {
     // Every CPU remap must report itself: this is the path the Vulkan

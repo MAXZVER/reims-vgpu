@@ -1855,10 +1855,24 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         native_uploads_asking_host(),
         crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
     )?;
-    let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
+    // A texture view has no texture descriptor of its own: its record names a
+    // base texture, a level and a format override, and `load_sampled_rgba_static`
+    // has just read that level of that base. The geometry therefore comes from
+    // the base's descriptor at the view's level. Reading the view's own record
+    // here instead (52 bytes, which no texture descriptor fits in) refused every
+    // viewed sample after its bytes had already been loaded — macOS 26 samples
+    // its icon masks through `A8Unorm` views and lost ~100 draws a login to it.
+    let view = super::resolve_texture_view(state, host, task_id, texture_ref);
+    let descriptor_ref = view.as_ref().map_or(texture_ref, |v| v.base_texture_ref);
+    let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, descriptor_ref)?;
     let tex = decode_texture_descriptor(&desc).ok()?;
-    let (w, h) = tex.extent()?;
-    let planes = tex.levels.first()?.planes();
+    let level = tex.level(view.as_ref().map_or(0, |v| v.level))?;
+    let (w, h) = if view.is_some() {
+        (level.width, level.height)
+    } else {
+        tex.extent()?
+    };
+    let planes = level.planes();
     let need = (w as usize)
         .saturating_mul(h as usize)
         .saturating_mul(planes as usize)
