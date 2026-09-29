@@ -1004,7 +1004,7 @@ fn execute_submission<M: HostMemory + HostOps>(
     // pixels the guest has since overwritten has to go now — landing it later
     // would replace the guest's own bytes with a frame the guest has declared
     // stale.
-    consume_resource_table(state, task_id, resource_descs);
+    consume_resource_table(state, host, task_id, resource_descs);
 
     // One cursor for the whole packet, not one per buffer: a packet's
     // command-buffer table is one submission and the model resolved all of it
@@ -1188,7 +1188,12 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 ///
 /// The census that measured it is gone; a correlation with no counter-examples
 /// over 19 135 trials is a finding, not a thing to keep re-deriving per frame.
-fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
+fn consume_resource_table<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    descs: &[ExecResourceDesc],
+) {
     use crate::runtime::resource_validity::{apply, ValiditySite};
     let mut no_surface = 0u32;
     let mut unknown = 0u32;
@@ -1201,6 +1206,7 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
                 .fail_once(0);
         }
         let outcome = apply(state, task_id, d.object_id, d.ops, ValiditySite::ExecTable);
+        pay_owed_before_guest_read(state, host, task_id, d.object_id, d.ops);
         if !outcome.missed {
             continue;
         }
@@ -1214,6 +1220,30 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
     // opcode in the device and a per-record line would bury the fail view.
     crate::runtime::drain::note_store_route_n("validity_no_surface", no_surface as u64);
     crate::runtime::drain::note_store_route_n("validity_unknown_object", unknown as u64);
+}
+
+/// Land a frame this device still owes a resource the guest is about to read.
+///
+/// Byte +6 of a validity record (`clear_guest_valid`) is, on either reading of
+/// it, the guest about to look at the resource's pages — see
+/// `resource_validity::apply`, which raises `validity_guest_read_frame_owed`
+/// when a frame is still owed there and used to stop at the alarm. macOS 26
+/// raises it dozens of times a login, and a guest that reads a surface this
+/// device has rendered but not yet written back composites the previous frame:
+/// windows that update only when something else forces a writeback. So the
+/// debt is paid here, before the guest can look. Free when nothing is owed.
+pub(crate) fn pay_owed_before_guest_read<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    object_id: u32,
+    ops: crate::protocol::fifo::InvalidateValidityOps,
+) {
+    if ops.clear_guest_valid == 0 || object_id == 0 || state.pending_writebacks.is_empty() {
+        return;
+    }
+    crate::runtime::drain::note_store_route("validity_guest_read_paid");
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, object_id);
 }
 
 /// The one part of an `EXEC_INDIRECT2` resource-table record this device cannot

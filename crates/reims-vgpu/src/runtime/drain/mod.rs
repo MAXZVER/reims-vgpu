@@ -5631,6 +5631,13 @@ fn apply_map_family<H: HostMemory + HostOps>(
                         rec.ops,
                         ValiditySite::InvalidateResources,
                     );
+                    crate::runtime::exec::pay_owed_before_guest_read(
+                        state,
+                        host,
+                        cmd.task_id,
+                        rec.object_id,
+                        rec.ops,
+                    );
                     bumped = bumped.saturating_add(outcome.bumped);
                     if outcome.missed {
                         miss = miss.saturating_add(1);

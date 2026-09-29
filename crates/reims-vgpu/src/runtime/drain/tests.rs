@@ -4329,6 +4329,66 @@ fn invalidate_resources_bumps_mapping_content_generation() {
     assert_eq!(state.mappings[&0x2a].content_generation, 8);
 }
 
+/// `pageBacking` Invalidate is the other producer of the validity quad, and a
+/// record clearing guest-valid (byte +6) is the guest about to read the
+/// resource's pages: a frame this device still owes it is paid first. Pageon's
+/// own quad does not clear guest-valid and leaves its resource's debt alone.
+///
+/// The observable is the ledger — the debt is taken. Whether the payment lands
+/// is `writeback_debt::pay`'s business and needs an engine.
+#[test]
+fn an_invalidate_record_clearing_guest_valid_pays_the_owed_frame() {
+    use crate::model::CHILD_OP_INVALIDATE_RESOURCES;
+    use crate::protocol::endian::st32;
+    use crate::protocol::fifo::{InvalidateValidityOps, CHILD_INVALIDATE_PAGEON_FLAGS};
+    use crate::runtime::writeback_debt::test_resident_identity;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let (read, pageon) = (0x2au32, 0x2bu32);
+    for mid in [read, pageon] {
+        assert!(state.map_surface(mid));
+        assert_eq!(
+            state
+                .pending_writebacks
+                .arm(mid, test_resident_identity(mid, 64, 64, 1), 64, 64, 1),
+            None,
+        );
+    }
+    let clear_guest = InvalidateValidityOps {
+        clear_guest_valid: 1,
+        ..InvalidateValidityOps::default()
+    };
+    let mut pl = vec![0u8; 24];
+    st32(&mut pl[0..], 0);
+    st32(&mut pl[4..], 2);
+    st32(&mut pl[8..], read);
+    pl[12..16].copy_from_slice(&clear_guest.to_le_dword().to_le_bytes());
+    st32(&mut pl[16..], pageon);
+    st32(&mut pl[20..], CHILD_INVALIDATE_PAGEON_FLAGS);
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &Packet {
+            opcode: CHILD_OP_INVALIDATE_RESOURCES,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 24,
+            completion_stamp: 0,
+            payload: pl,
+            next_head: 0,
+        },
+    );
+    assert!(
+        state.pending_writebacks.get(read).is_none(),
+        "the guest was told to read pages this device still owed a frame"
+    );
+    assert!(
+        state.pending_writebacks.get(pageon).is_some(),
+        "pageon's quad does not clear guest-valid, so its frame stays owed"
+    );
+}
+
 /// MapMemory2 product path must **not** write guest GVA (flush disabled after
 /// freelist PTE panic correlation). Helper still unit-tested in surface_cache.
 #[test]

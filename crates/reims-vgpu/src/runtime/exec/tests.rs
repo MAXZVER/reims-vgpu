@@ -8160,3 +8160,147 @@ fn a_submission_frames_each_stream_once_and_preflight_frames_none() {
         Some(3)
     );
 }
+
+/// The validity quad as the guest's four bytes: clear host, set host, clear
+/// guest, set guest.
+fn validity_ops(
+    clear_host: u8,
+    set_host: u8,
+    clear_guest: u8,
+    set_guest: u8,
+) -> crate::protocol::fifo::InvalidateValidityOps {
+    crate::protocol::fifo::InvalidateValidityOps {
+        clear_host_valid: clear_host,
+        set_host_valid: set_host,
+        clear_guest_valid: clear_guest,
+        set_guest_valid: set_guest,
+    }
+}
+
+/// Arm a frame owed by the surface `object_id` names — the reference is itself
+/// the mapping id, the spelling `mappings_named_by` resolves without a per-task
+/// registration.
+fn owe_a_frame(state: &mut DeviceState, object_id: u32) {
+    use crate::runtime::writeback_debt::test_resident_identity;
+    assert_eq!(
+        state.pending_writebacks.arm(
+            object_id,
+            test_resident_identity(object_id, 64, 64, 1),
+            64,
+            64,
+            1,
+        ),
+        None,
+    );
+}
+
+/// Byte +6 of a validity record is the guest about to read the resource's
+/// pages, so a frame this device still owes that resource is paid before the
+/// guest can look — and only then: without the byte, for another object, or
+/// with nothing owed anywhere, the ledger is left exactly as it was.
+///
+/// The observable is that the ledger was asked: the debt is taken. Whether the
+/// payment lands is `pay`'s business and needs an engine; what regressed was
+/// the alarm (`validity_guest_read_frame_owed`) firing while nothing paid, and
+/// the guest compositing the frame before the one this device rendered.
+#[test]
+fn a_guest_read_pays_the_frame_its_object_owes_and_nothing_else_does() {
+    use crate::runtime::drain::store_route_count;
+    let paid = || store_route_count("validity_guest_read_paid");
+    let (task_id, object_id, bystander) = (4u32, 21u32, 22u32);
+    let mut host = FakeHost::new();
+
+    // Nothing owed anywhere: byte +6 is ordinary traffic and costs nothing.
+    let mut quiet = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let before = paid();
+    pay_owed_before_guest_read(
+        &mut quiet,
+        &mut host,
+        task_id,
+        object_id,
+        validity_ops(0, 0, 1, 0),
+    );
+    assert_eq!(paid(), before, "nothing is owed, so nothing is paid");
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    owe_a_frame(&mut state, object_id);
+    owe_a_frame(&mut state, bystander);
+
+    // Every quad that does not carry byte +6 — pageon's own among them — says
+    // nothing about the guest reading, so it pays nothing.
+    for ops in [
+        crate::protocol::fifo::InvalidateValidityOps::PAGEON,
+        validity_ops(1, 0, 0, 0),
+        validity_ops(0, 1, 0, 0),
+        validity_ops(0, 0, 0, 1),
+    ] {
+        let before = paid();
+        pay_owed_before_guest_read(&mut state, &mut host, task_id, object_id, ops);
+        assert!(
+            state.pending_writebacks.get(object_id).is_some(),
+            "{ops:?} does not clear guest-valid, so the frame stays owed"
+        );
+        assert_eq!(paid(), before, "{ops:?} paid nothing");
+    }
+    // Id 0 names nothing, even with the byte set.
+    pay_owed_before_guest_read(&mut state, &mut host, task_id, 0, validity_ops(0, 0, 1, 0));
+    assert!(state.pending_writebacks.get(object_id).is_some());
+    assert!(state.pending_writebacks.get(bystander).is_some());
+
+    let before = paid();
+    pay_owed_before_guest_read(
+        &mut state,
+        &mut host,
+        task_id,
+        object_id,
+        validity_ops(0, 0, 1, 0),
+    );
+    assert!(
+        state.pending_writebacks.get(object_id).is_none(),
+        "the guest was about to read pages this device still owes a frame"
+    );
+    assert!(
+        state.pending_writebacks.get(bystander).is_some(),
+        "a guest read of one resource pays that resource's frame and no other"
+    );
+    assert_eq!(paid(), before + 1, "the payment is counted");
+}
+
+/// The `EXEC_INDIRECT2` resource table is one of the two producers of the quad,
+/// and it reaches the payment through its one consumer: a record clearing
+/// guest-valid pays the frame its object owes before the submission runs.
+#[test]
+fn an_exec_resource_record_clearing_guest_valid_pays_the_owed_frame() {
+    let (task_id, read, untouched) = (4u32, 21u32, 22u32);
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    owe_a_frame(&mut state, read);
+    owe_a_frame(&mut state, untouched);
+
+    let record = |object_id, ops| ExecResourceDesc {
+        object_id,
+        ops,
+        tail: [0; crate::protocol::fifo::CHILD_EXEC_RESOURCE_TAIL_LEN as usize],
+    };
+    consume_resource_table(
+        &mut state,
+        &mut host,
+        task_id,
+        &[
+            record(read, validity_ops(0, 0, 1, 0)),
+            record(
+                untouched,
+                crate::protocol::fifo::InvalidateValidityOps::PAGEON,
+            ),
+        ],
+    );
+
+    assert!(
+        state.pending_writebacks.get(read).is_none(),
+        "the table cleared guest-valid on a resource whose frame was still owed"
+    );
+    assert!(
+        state.pending_writebacks.get(untouched).is_some(),
+        "a record that does not clear guest-valid pays nothing"
+    );
+}
