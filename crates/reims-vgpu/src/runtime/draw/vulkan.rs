@@ -249,6 +249,45 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 if landed {
                     note_mapper_ref_texture_store_route("gva_resident_authoritative");
                     gva_store_armed = true;
+                } else if let Some(c0) = req
+                    .colors
+                    .first()
+                    .filter(|c0| gva_store_needs_native_texels(c0.format))
+                    .cloned()
+                {
+                    // The synchronous block below lands `draw_rgba`, an eight-bit
+                    // readback, and a destination wider than that — RGBA16Float,
+                    // RG16Float — would be written back clamped to [0,1] and
+                    // quantised. macOS 26's glass shape maps are signed half
+                    // floats; landed that way, every later LOAD or sample of the
+                    // page read a map whose negative half was gone and the Dock's
+                    // glass composited solid red. `store_gva_frame` lands the
+                    // resident's own texels when the layouts agree.
+                    match crate::runtime::render_writeback::vulkan::store_gva_frame(
+                        state,
+                        host,
+                        req.task_id,
+                        &identity,
+                        &c0,
+                        c0.texture_ref,
+                        sync_store_pages.as_ref(),
+                        &[],
+                    ) {
+                        Ok(_) => {
+                            note_mapper_ref_texture_store_route("gva_store_sync_native");
+                            gva_store_armed = true;
+                        }
+                        Err(decline) => {
+                            crate::observe::Emit::decline(
+                                "gva_store_sync_native_declined",
+                                &decline,
+                            )
+                            .field("fmt", format!("{:#x}", c0.format))
+                            .field("geom", format!("{}x{}", c0.width, c0.height))
+                            .fail_once(u64::from(c0.format));
+                            draw_rgba = read_resident_chain(req, &identity);
+                        }
+                    }
                 } else {
                     // The copying rail: read the resident the draw just
                     // rendered into and let the synchronous Store block below
@@ -907,6 +946,18 @@ type LoadedLinearSample = (
     Option<LinearSampleIdentity>,
     SampledByteFormat,
 );
+
+/// Whether a GVA Store into `format` must land the resident's own texels rather
+/// than an eight-bit readback: every declared layout that is not one of the two
+/// eight-bit colour orders, which is exactly where the RGBA8 round trip loses
+/// range or precision.
+pub(super) fn gva_store_needs_native_texels(format: u16) -> bool {
+    use crate::protocol::pixel_format::TexelLayout;
+    !matches!(
+        pixel_format::store_texel_order(format),
+        Some(TexelLayout::Rgba8 | TexelLayout::Bgra8) | None
+    )
+}
 
 /// Authoritative contents when a fragment texture aliases a GVA color target.
 ///

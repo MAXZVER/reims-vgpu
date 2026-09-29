@@ -1837,6 +1837,29 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
     );
 }
 
+/// The eager GVA Store lands an eight-bit readback, which is exact only for the
+/// two eight-bit colour orders. Every wider layout must take the native rail, or
+/// a signed half-float glass map is written back clamped to [0,1].
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn only_eight_bit_colour_gva_stores_may_land_an_eight_bit_readback() {
+    use crate::protocol::pixel_format as pf;
+    for eight_bit in [
+        pf::MTL_FORMAT_BGRA8_UNORM,
+        pf::MTL_FORMAT_BGRA8_UNORM_SRGB,
+        pf::MTL_FORMAT_RGBA8_UNORM,
+        pf::MTL_FORMAT_RGBA8_UNORM_SRGB,
+    ] {
+        assert!(!gva_store_needs_native_texels(eight_bit), "{eight_bit:#x}");
+    }
+    for wide in [pf::MTL_FORMAT_RGBA16_FLOAT, pf::MTL_FORMAT_RG16_FLOAT] {
+        assert!(gva_store_needs_native_texels(wide), "{wide:#x}");
+    }
+    // A format with no declared store layout keeps the old rail, which reports
+    // its own conversion refusal.
+    assert!(!gva_store_needs_native_texels(0xffff));
+}
+
 /// A pass may sample any of its own attachments at any texture index. macOS 26's
 /// icon renderer binds its `RG16Float` colour 1 at fragment texture 5 and
 /// composites colour 0 from it inside the same pass; resolving that bind from the
