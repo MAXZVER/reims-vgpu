@@ -496,6 +496,64 @@ fn make_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
     pdesc
 }
 
+/// A render pipeline with no fragment function loads, and writes no colour.
+///
+/// Metal allows `fragmentFunction == nil` for a depth/stencil-only pipeline and
+/// macOS 26 builds them for its stencil masks. This loader used to refuse every
+/// one as `fragment_func_zero` (~1200 a login), which dropped the masks and
+/// left the stencil-tested draws after them covering nothing. The colour half
+/// of Metal's contract — such a pipeline writes no colour — is carried in the
+/// descriptor as cleared write masks, so a rail that gives it an empty
+/// fragment stage cannot write undefined values into the attachments.
+#[test]
+fn a_render_pipeline_without_a_fragment_function_loads_and_writes_no_colour() {
+    use crate::runtime::decode::resource::ColorWriteMask;
+    let _guard = icb_test_guard();
+    let (mut host, state) = icb_device();
+
+    let cap = crate::observe::FailCapture::start();
+    let stencil_only = make_stagein_render_pipeline_desc(2, 0);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &stencil_only,
+    );
+    let p = crate::runtime::draw::load_render_pipeline(&state, &host, 1, 6)
+        .expect("a pipeline without a fragment function is a pipeline");
+    assert_eq!(p.vertex_func_ref, 2);
+    assert_eq!(p.fragment_func_ref, 0);
+    assert_eq!(p.color0.write_mask, ColorWriteMask::NONE);
+    assert!(p
+        .color_attachments
+        .iter()
+        .all(|a| a.write_mask == ColorWriteMask::NONE));
+    assert!(
+        cap.lines()
+            .iter()
+            .all(|l| !l.contains("fragment_func_zero")),
+        "no refusal line: {:?}",
+        cap.lines()
+    );
+    drop(cap);
+
+    // With a fragment function the guest's masks stand.
+    let colour = make_stagein_render_pipeline_desc(2, 3);
+    put_object(
+        &mut host,
+        &state,
+        7,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x400,
+        &colour,
+    );
+    let p = crate::runtime::draw::load_render_pipeline(&state, &host, 1, 7).expect("loads");
+    assert_eq!(p.fragment_func_ref, 3);
+    assert_eq!(p.color0.write_mask, ColorWriteMask::ALL);
+}
+
 /// Serializer-object render pipeline with vertex-input block: Float4 attr0 @ buffer0 stride 16.
 ///
 /// Layout matches `parse_vertex_block` / color-attachment section (offset from

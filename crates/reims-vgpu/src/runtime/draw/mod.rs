@@ -877,7 +877,7 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
             return None;
         }
     };
-    let p = match decode_render_pipeline_descriptor(&desc) {
+    let mut p = match decode_render_pipeline_descriptor(&desc) {
         Ok(p) => p,
         Err(status) => {
             // The decoder's own name for what it refused, carried through rather
@@ -897,25 +897,35 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
             return None;
         }
     };
-    // Both stages are required to build a pipeline, and the two are reported
-    // apart because they are different guest mistakes — the compute sibling
+    // A vertex stage is required to build a pipeline — the compute sibling
     // names its one stage the same way, as `kernel_func_zero`.
     if p.vertex_func_ref == 0 {
         report.reason(task_id, pipeline_ref, "vertex_func_zero", "");
         return None;
     }
+    // A fragment stage is not. Metal allows a render pipeline whose
+    // `fragmentFunction` is nil: it rasterizes for depth and stencil only and
+    // writes no colour. macOS 26 builds these for its stencil masks (~1200 per
+    // login, every one refused here as `fragment_func_zero` until now, and the
+    // stencil-tested draws after them then covered nothing). The rail builds
+    // them with an empty fragment stage (`pipeline_resolve::no_fragment_stage`),
+    // so the "writes no colour" half is carried here, where the descriptor is
+    // decoded: every colour attachment's write mask is cleared.
     if p.fragment_func_ref == 0 {
-        report.reason(task_id, pipeline_ref, "fragment_func_zero", "");
-        return None;
+        crate::runtime::drain::note_store_route("pipeline_no_fragment_stage");
+        p.color0.write_mask = reims_vgpu_protocol::blend::ColorWriteMask::NONE;
+        for attachment in &mut p.color_attachments {
+            attachment.write_mask = reims_vgpu_protocol::blend::ColorWriteMask::NONE;
+        }
     }
     // The guest has created this pipeline object, which is the semantic model's
     // `Declared` and nothing more — no host work has started here, and both
     // rails reach this same door before any of theirs does.
     //
-    // After the two zero-stage checks rather than before them: a descriptor
-    // naming no vertex or fragment function is not a pipeline the guest can
-    // ever bind, and declaring one would put a name in the table that nothing
-    // will ever advance or retire.
+    // After the vertex-stage check rather than before it: a descriptor naming
+    // no vertex function is not a pipeline the guest can ever bind, and
+    // declaring one would put a name in the table that nothing will ever
+    // advance or retire.
     if let Some(name) = objects::name_resource(state, host, task_id, pipeline_ref) {
         crate::runtime::drain::note_store_route(if state.declare_pipeline(name) {
             "pipeline_declared"
