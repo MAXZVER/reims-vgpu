@@ -2309,6 +2309,97 @@ impl RectStride {
     }
 }
 
+/// Copy `n` bytes into guest RAM with streaming stores where the CPU has them.
+///
+/// Landing a frame in guest pages ran at 2-3 GB/s against ~9 GB/s for the
+/// readback's own memcpy of the same bytes: the destination is cold, so every
+/// line an ordinary store touches is first read for ownership and later written
+/// back. A non-temporal store writes the line without reading it, and a frame
+/// landed in guest RAM is not read again by this process, so there is nothing
+/// for the cache to keep.
+///
+/// # Safety
+/// `src` and `dst` must be valid for `n` bytes and not overlap.
+unsafe fn write_guest_bytes(src: *const u8, dst: *mut u8, n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if n >= 4096 && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the feature was detected just above; the ranges are the
+            // caller's.
+            unsafe { stream_copy_avx2(src, dst, n) };
+            return;
+        }
+    }
+    // SAFETY: the ranges are the caller's.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, n) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn stream_copy_avx2(src: *const u8, dst: *mut u8, n: usize) {
+    use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_stream_si256, _mm_sfence};
+    // Ordinary stores up to the first 32-byte boundary of the destination, which
+    // is what a streaming store requires.
+    let head = (dst as usize).wrapping_neg() & 31;
+    let head = head.min(n);
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, head) };
+    let mut off = head;
+    while off + 128 <= n {
+        unsafe {
+            let a = _mm256_loadu_si256(src.add(off) as *const __m256i);
+            let b = _mm256_loadu_si256(src.add(off + 32) as *const __m256i);
+            let c = _mm256_loadu_si256(src.add(off + 64) as *const __m256i);
+            let d = _mm256_loadu_si256(src.add(off + 96) as *const __m256i);
+            _mm256_stream_si256(dst.add(off) as *mut __m256i, a);
+            _mm256_stream_si256(dst.add(off + 32) as *mut __m256i, b);
+            _mm256_stream_si256(dst.add(off + 64) as *mut __m256i, c);
+            _mm256_stream_si256(dst.add(off + 96) as *mut __m256i, d);
+        }
+        off += 128;
+    }
+    while off + 32 <= n {
+        unsafe {
+            let a = _mm256_loadu_si256(src.add(off) as *const __m256i);
+            _mm256_stream_si256(dst.add(off) as *mut __m256i, a);
+        }
+        off += 32;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(src.add(off), dst.add(off), n - off) };
+    // Streaming stores are weakly ordered: fence them before anything that
+    // publishes these bytes (a completion stamp, an interrupt) can be issued.
+    _mm_sfence();
+}
+
+#[cfg(test)]
+mod write_guest_bytes_tests {
+    /// Every destination alignment, and lengths that leave an unaligned head,
+    /// whole 128-byte blocks, single 32-byte blocks and a tail, land the source
+    /// unchanged, and nothing outside the destination range is written. Lengths
+    /// under a page take the plain copy; the rest take the streaming one on a
+    /// host that has AVX2.
+    #[test]
+    fn a_landing_copies_exactly_its_range_at_every_alignment() {
+        let src: Vec<u8> = (0..9000u32).map(|i| (i * 31 + 7) as u8).collect();
+        for n in [0usize, 1, 31, 4096, 4097, 4096 + 128 + 32 + 5, 8999] {
+            for misalign in 0..32 {
+                let mut dst = vec![0xa5u8; n + 64];
+                // SAFETY: `dst` holds `misalign + n` bytes and more, and does not
+                // overlap `src`, which holds at least `n`.
+                unsafe {
+                    super::write_guest_bytes(src.as_ptr(), dst.as_mut_ptr().add(misalign), n)
+                };
+                assert_eq!(
+                    &dst[misalign..misalign + n],
+                    &src[..n],
+                    "n={n} misalign={misalign}"
+                );
+                assert!(dst[..misalign].iter().all(|&b| b == 0xa5), "n={n} head");
+                assert!(dst[misalign + n..].iter().all(|&b| b == 0xa5), "n={n} tail");
+            }
+        }
+    }
+}
+
 pub(crate) enum RunCopy<'a> {
     Write(&'a [u8]),
     Read(&'a mut [u8]),
@@ -2371,7 +2462,7 @@ impl RunCopy<'_> {
     ) {
         match self {
             Self::Write(buf) => unsafe {
-                std::ptr::copy_nonoverlapping(
+                write_guest_bytes(
                     buf.as_ptr().add(buf_off),
                     (host_ptr as *mut u8).add(host_off),
                     n,
