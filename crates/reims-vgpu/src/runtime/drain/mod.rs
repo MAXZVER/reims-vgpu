@@ -2596,6 +2596,32 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
         note_store_route("parked_translations_finished");
         for lease in leases {
             ready_lease(state, lease, "pipeline_lease_ready_pump");
+            // A lease the table would not ready names a pipeline that ended —
+            // the guest deleted it (or this device retired its name) while the
+            // packet was parked. Nothing will ever ready it, so without this
+            // the position stays parked, this pass re-plans it on every tranche
+            // (33 000 times a second on a driven macos-26 boot, drain duty
+            // 0.9), and its channel's publication head holds every packet
+            // behind it: WindowServer stopped presenting and the display froze
+            // on the boot logo. The packet runs instead; a draw whose pipeline
+            // is really gone refuses on its own, and the packet completes.
+            if !state.pipeline_is_ready(lease) && state.release_past_ended_pipeline(ingress, lease)
+            {
+                note_store_route("parked_released_past_ended_pipeline");
+                if crate::observe::first_sight(
+                    "parked_released_past_ended_pipeline",
+                    u64::from(lease.slot.0),
+                ) {
+                    crate::observe::fail(format!(
+                        "parked_released_past_ended_pipeline slot={} gen={} state={} (a parked \
+                         packet leased a pipeline that ended before it could be readied; run \
+                         rather than park forever)",
+                        lease.slot.0,
+                        lease.generation.0,
+                        state.pipeline_state(lease).unwrap_or("absent")
+                    ));
+                }
+            }
         }
     }
 }

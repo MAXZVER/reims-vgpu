@@ -328,6 +328,43 @@ impl Scheduler {
             .collect()
     }
 
+    /// Stop holding one transaction on a pipeline that has ended, and ready it
+    /// if that was all it waited for. Returns whether the wait was there.
+    ///
+    /// The other answer to [`Self::pipeline_refused`]'s list, for a caller that
+    /// executes stranded work rather than withdrawing it. Withdrawal publishes
+    /// nothing, so the guest waits on that completion word forever; an executor
+    /// that resolves pipelines by reference at encode time can instead run the
+    /// work, refuse only the draws whose pipeline is really gone, and complete.
+    /// Keyed by the transaction, because the refused list already took the
+    /// pipeline's waiter entry and a transaction can outlive that call still
+    /// holding the wait.
+    pub fn release_ended_pipeline_wait(
+        &mut self,
+        ingress: IngressOrdinal,
+        pipeline: ResourceId,
+    ) -> bool {
+        let Some(p) = self.pending.get_mut(&ingress) else {
+            return false;
+        };
+        let before = p.pipeline_waits.len();
+        p.pipeline_waits.retain(|id| *id != pipeline);
+        if p.pipeline_waits.len() == before {
+            return false;
+        }
+        let ready = p.is_ready();
+        if let Some(waiters) = self.waiters_by_pipeline.get_mut(&pipeline) {
+            waiters.remove(&ingress);
+            if waiters.is_empty() {
+                self.waiters_by_pipeline.remove(&pipeline);
+            }
+        }
+        if ready {
+            self.ready.insert(ingress);
+        }
+        true
+    }
+
     /// Transactions waiting on a pipeline that is still being built.
     #[must_use]
     pub fn waiting_on_pipelines(&self) -> usize {
@@ -453,6 +490,33 @@ mod tests {
         assert_eq!(s.complete(ord(1)), None);
         assert!(s.waiters_by_slot.is_empty(), "slots");
         assert!(s.waiters_by_pipeline.is_empty(), "pipelines");
+    }
+
+    /// A transaction stranded on a pipeline that ended can be released to run:
+    /// the wait goes, the index forgets it, and it is ready once nothing else
+    /// holds it. Asking twice, or for a pipeline it never waited on, is a no.
+    #[test]
+    fn a_wait_on_an_ended_pipeline_can_be_released() {
+        let mut s = Scheduler::new();
+        assert!(!s.admit(ord(1), &[], &[], &[pipe(3), pipe(4)], None));
+        assert_eq!(s.pipeline_refused(pipe(3)), vec![ord(1)]);
+        assert!(s.release_ended_pipeline_wait(ord(1), pipe(3)));
+        assert!(
+            !s.release_ended_pipeline_wait(ord(1), pipe(3)),
+            "already gone"
+        );
+        assert!(s.take_ready().is_empty(), "still waiting on pipe 4");
+        assert!(s.release_ended_pipeline_wait(ord(1), pipe(4)));
+        assert_eq!(s.take_ready(), vec![ord(1)]);
+        assert!(
+            s.waiters_by_pipeline.is_empty(),
+            "{:?}",
+            s.waiters_by_pipeline
+        );
+        assert!(
+            !s.release_ended_pipeline_wait(ord(2), pipe(4)),
+            "not admitted"
+        );
     }
 
     #[test]

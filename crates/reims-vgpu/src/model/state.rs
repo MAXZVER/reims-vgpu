@@ -4515,6 +4515,21 @@ impl DeviceState {
             .map(|entry| entry.state.name())
     }
 
+    /// Release a parked transaction past a pipeline that ended (retired or
+    /// refused, or absent from the table), so it runs instead of holding its
+    /// channel's publication head forever. See
+    /// [`reims_vgpu_core::session::SessionModel::release_past_ended_pipeline`].
+    pub fn release_past_ended_pipeline(
+        &self,
+        ingress: reims_vgpu_core::identity::IngressOrdinal,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .release_past_ended_pipeline(ingress, pipeline)
+    }
+
     #[must_use]
     pub fn pipeline_is_ready(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
         self.session
