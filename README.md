@@ -12,10 +12,52 @@
 the Windows 11 + QEMU + WHPX host pathway fast. On one lab PC, a fullscreen Safari CSS animation
 in a macOS 13 guest at 1920x1080 went from **5–7 fps to a median of ~93 fps**.
 
-Everything here is also offered upstream as pull requests. This fork is not a replacement for
-upstream: it is a place to try all of the pending Windows-host work in one build while those PRs
-are reviewed. The original upstream README follows unchanged under
-[Upstream README](#upstream-readme).
+Nearly everything here is also offered upstream as pull requests; the fork-only commits are
+listed under [What changed](#what-changed). This fork is not a replacement for upstream: it is a
+place to try all of the pending Windows-host work in one build while those PRs are reviewed. The
+original upstream README follows unchanged under [Upstream README](#upstream-readme).
+
+## Latest results (2026-09-29)
+
+These come from the same lab PC (RTX 4060, Windows 11 + WHPX), with a macOS Ventura 13.7.8
+guest. The figures are median present rates in Hz. Boot-to-boot variance in the lab is large, so
+read them as ranges. They were measured on the lab's development trees, which carry the changes
+below (in both this repository and the QEMU fork) plus temporary diagnostics; the published
+branches have been compile-checked and unit-tested, not re-benchmarked on their own.
+
+| Guest | CSS animation | Full-screen CSS scroll | Wheel scroll |
+|---|---|---|---|
+| 1920x1080 | ~92–97 | ~116–118 | ~88–96 |
+| 5120x2160 | ~98–106 | ~47–51 | ~63–71 |
+
+What is new:
+
+- **Page-diff writeback is the default.** A presented framebuffer is written back into guest RAM
+  page by page. The GPU compares the frame with a copy of what was last written back, and only
+  the 4 KiB pages that changed cross PCIe, together with the pages the guest CPU wrote since the
+  last write-back. That second part addresses a 4 KiB page seen stuck stale for about 20 s
+  during a 5K full-screen scroll. At 5K, page-diff raised CSS animation from ~93 to ~100–106,
+  wheel scroll from ~64 to ~71 and window drag from ~23 to ~28–30. At 1080p nothing changed
+  (82 / 117 / 92 with it against 81 / 117 / 92 without). `REIMS_VGPU_PAY_DIFF=off` writes whole
+  frames back instead.
+- **5K guests.** `REIMS_VGPU_DISPLAY_NATIVE=WxH` sets the panel's native mode, and the sampled
+  cache holds 512 MiB instead of 128 MiB so that a 5K desktop's working set fits.
+- **QEMU side: the LLP64 dirty-bitmap fix.** On Windows `long` is 32 bits, and QEMU's bitmap
+  import used the pointer width for its words, so the WHPX dirty syncs dropped or misplaced bits
+  in every unaligned range. The dropped bits were the stale tile pages; on full-screen scroll the
+  streak detector now reads 0 stale-page streaks. The misplaced bits had been marking random
+  surfaces as written, which cost a lot at 5K; fixing them was a large part of the 5K speedup.
+- **QEMU side: on-demand dirty sync is the default.** The drain no longer waits for a dirty-log
+  harvest per doorbell. `REIMS_VGPU_DIRTY_ONDEMAND=off` restores the per-doorbell harvest.
+
+Known limits:
+
+- 5K does not reach 120 Hz yet. Full-screen scrolling is the slowest case at ~47–51.
+- At 5K the remaining cost is the per-doorbell hypervisor dirty-log queries, at about 300
+  doorbells a second. Work on running the prefetch in parallel is in progress.
+- A macOS 26 Tahoe guest has not been tested in the lab yet.
+
+The older tables below are kept for comparison.
 
 ## What this is
 
@@ -73,6 +115,18 @@ All six are open pull requests against upstream.
 | [#108](https://github.com/steelbrain/reims-vgpu/pull/108) | GPU resident overlay | Copies only the pages the guest CPU wrote onto the live GPU resident, instead of a whole-frame readback-and-merge. The biggest single win. |
 | [#109](https://github.com/steelbrain/reims-vgpu/pull/109) | Write presented framebuffers back at DisplaySwap | Fixes the persistent 1-px horizontal stale-line artifacts. |
 
+### reims-vgpu, fork only
+
+These are in `windows` (from the `windows-5k` branch) and are not upstream pull requests yet:
+
+- `REIMS_VGPU_DISPLAY_NATIVE=WxH` sets the panel's native mode, for 5K guests.
+- The sampled cache's byte cap is 512 MiB instead of 128 MiB, which keeps ~11 full 5K surfaces
+  instead of ~3.
+- Page-diff writeback of presented framebuffers, on by default (`REIMS_VGPU_PAY_DIFF=off` turns
+  it off), including the pages the guest CPU wrote since the last write-back.
+- An indexed draw bounds its vertex binds by its largest index, instead of staging every
+  vertex-indexed buffer whole.
+
 ### QEMU side
 
 These live in the QEMU fork, not in this repository:
@@ -85,7 +139,10 @@ These live in the QEMU fork, not in this repository:
   ABI v21 from #110.
 - The lab QEMU also carries [@Hi-Jiajun](https://github.com/Hi-Jiajun)'s WHPX fixes
   ([qemu-reims-vgpu#4](https://github.com/steelbrain/qemu-reims-vgpu/pull/4)) and WHPX dirty-page
-  tracking, which has not been sent upstream yet.
+  tracking with the LLP64 bitmap fix
+  ([qemu-reims-vgpu#10](https://github.com/steelbrain/qemu-reims-vgpu/pull/10)).
+- On-demand dirty sync, the default in the QEMU fork's `windows` branch, has not been proposed
+  upstream yet.
 
 ## Status and known limitations
 
@@ -102,12 +159,13 @@ These live in the QEMU fork, not in this repository:
   crashed here. Whether that is faster on this host is not settled.
 - **`vendor/qemu` still points at upstream's shim branch.** See
   [Build and run](#build-and-run-on-windows).
-- **Only tested at 1080p on macOS 13.** No 5K guest and no macOS 26 Tahoe guest yet.
+- **Only tested on macOS 13**, at 1920x1080 and, since 2026-09-29, 5120x2160. 5K does not reach
+  120 Hz yet, and no macOS 26 Tahoe guest has been tried.
 
 ### Roadmap
 
 1. A steady 120 fps at 1920x1080, including window drag.
-2. A 5120x2160 guest.
+2. A 5120x2160 guest at 120 fps. It runs now; see [Latest results](#latest-results-2026-09-29).
 3. A macOS 26 Tahoe guest.
 
 Each step goes upstream as PRs, as before.
