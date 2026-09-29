@@ -2601,6 +2601,18 @@ impl RenderBufferIndexBounds {
         }
     }
 
+    /// [`Self::new`] for an indexed draw whose index buffer has been read: the
+    /// largest `vertex_id` the vertex shader can observe is the largest index
+    /// plus `baseVertex`, which the caller computed from the indices themselves
+    /// (see `runtime::draw::vulkan::indexed_vertex_max`). `None` keeps the
+    /// indexed draw unbounded, exactly as [`Self::new`] does.
+    pub fn with_indexed_vertex_max(mut self, vertex_max: Option<u64>) -> Self {
+        if self.vertex_index.is_none() {
+            self.vertex_index = vertex_max;
+        }
+        self
+    }
+
     fn maximum(self, source: metal2vulkan::reflect::BufferIndexSource) -> Option<u64> {
         use metal2vulkan::reflect::BufferIndexSource;
         match source {

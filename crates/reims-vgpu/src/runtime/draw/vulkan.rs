@@ -3998,6 +3998,45 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     )
 }
 
+/// The largest `vertex_id` an indexed draw's vertex shader can observe: the
+/// largest of its `index_count` indices plus `baseVertex`.
+///
+/// `None` — keep the draw unbounded — when the bytes do not cover the count, the
+/// ordinal is not an index type, `baseVertex` is negative, or an index is the
+/// type's all-ones value: that is Metal's primitive-restart index, and whether
+/// the pipeline treats it as a restart or as a vertex is not this function's to
+/// decide, so a draw carrying one is not narrowed at all.
+fn indexed_vertex_max(info: &IndexedDrawInfo, bytes: &[u8]) -> Option<u64> {
+    use crate::protocol::render::IndexType as Contract;
+    let count = info.index_count as usize;
+    let max = match Contract::parse(u16::try_from(info.index_type).ok()?)? {
+        Contract::Uint16 => {
+            let raw = bytes.get(..count.checked_mul(2)?)?;
+            let m = raw
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .max()?;
+            if m == u16::MAX {
+                return None;
+            }
+            u64::from(m)
+        }
+        Contract::Uint32 => {
+            let raw = bytes.get(..count.checked_mul(4)?)?;
+            let m = raw
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .max()?;
+            if m == u32::MAX {
+                return None;
+            }
+            u64::from(m)
+        }
+    };
+    let base = u64::try_from(info.base_vertex).ok()?;
+    max.checked_add(base)
+}
+
 /// Retain an indexed draw's exact guest-buffer window for the Vulkan vertex
 /// input stage. Unlike the Metal fallback, this does not materialize the index
 /// array on the CPU: Vulkan consumes the bounded resource directly when the
@@ -7138,6 +7177,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Binds);
     crate::runtime::bind_phase::note_bind();
 
+    let mut early_index = req
+        .indexed
+        .as_ref()
+        .map(|idx| load_index_content_reason(state, host, req.task_id, idx));
+
     // The two modules in the numbering this draw will use, from the translation
     // cache. Each carries the walks of its own numbering beside it — see
     // `m2v_cache::ShaderVariant` — so nothing here re-walks a module per draw.
@@ -7168,13 +7212,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the attribute walk, holds only the indices that actually carried
         // bytes, and decides storage binding.
         let bind_plan = &resolved.bind_plan;
+        // An indexed draw's indices bound the vertex_id its vertex shader can
+        // see, so they are read before the vertex binds they narrow and the same
+        // content is handed to the index bind below. Without this every indexed
+        // draw staged each vertex-indexed `device T*` buffer whole — ~2 GB/s on
+        // a driven CSS animation, ~200 KB a draw for a handful of quads.
+        let indexed_vertex_max = match (req.indexed.as_ref(), early_index.as_ref()) {
+            (Some(idx), Some(Ok(crate::backend::vulkan::engine::BufferContent::Bytes(bytes)))) => {
+                indexed_vertex_max(idx, bytes)
+            }
+            _ => None,
+        };
         let render_buffer_bounds = crate::runtime::spirv_bind::RenderBufferIndexBounds::new(
             req.first_vertex,
             req.vertex_count,
             req.base_instance,
             req.instance_count,
             req.indexed.is_some(),
-        );
+        )
+        .with_indexed_vertex_max(indexed_vertex_max);
         let mut vtx_storage: Vec<(u32, crate::backend::vulkan::engine::BufferContent)> = Vec::new();
         // The three `bind_phase` spans below divide `chain_phase`'s `binds_us`,
         // which is this draw path's largest column and covered three costs with
@@ -8834,8 +8890,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     reason: IndexLoadReason::TypeUnsupported,
                 })
             })?;
-            let content =
-                load_index_content_reason(state, host, req.task_id, idx).map_err(|reason| {
+            let content = early_index
+                .take()
+                .unwrap_or_else(|| load_index_content_reason(state, host, req.task_id, idx))
+                .map_err(|reason| {
                     DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad { reason })
                 })?;
             resources.indexed = Some(crate::backend::vulkan::engine::IndexedDrawResource {
