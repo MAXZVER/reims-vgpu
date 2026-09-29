@@ -1377,6 +1377,14 @@ pub(crate) fn arm_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
     if c0.texture_ref == 0 || window.generation == 0 {
         return false;
     }
+    // The switch that narrows the surface rail to the eager Store narrows this
+    // one too: a GVA debt is the same deferral into a different ledger, and a
+    // guest CPU reader that never synchronizes sees the same stale pages
+    // through either.
+    if !lazy_writeback_enabled() {
+        crate::runtime::drain::note_store_route("gvadebt_arm_lazy_off");
+        return false;
+    }
     // The resident the payment will name is derived from `c0` and this
     // generation; the caller's own resident was derived the same way. See
     // [`GvaWindow`] — the derivation is only sound while the two agree, so a

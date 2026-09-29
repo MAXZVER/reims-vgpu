@@ -638,6 +638,11 @@ pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
 /// `render_writeback::store_render_frame`, and switching this off cannot reach a
 /// copy the lazy rail would not eventually have made.
 ///
+/// A GVA target's Store is narrowed the same way: with the switch off,
+/// `writeback_debt::arm_gva` arms no debt and the Store lands its frame at once.
+/// A GVA debt is the same deferral in a different ledger, and a guest CPU reader
+/// that never synchronizes would see the same stale pages through either.
+///
 /// Default on, because it is the measured winner and by a margin no other rail
 /// here has produced. Twelve interleaved driven macos-13 boots: 90 % of mapper-ref-texture
 /// Stores superseded before anything read their pages, `draw_us` 14.62 against
