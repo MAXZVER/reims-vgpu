@@ -84,6 +84,7 @@ pub mod host_writes;
 /// Serializer-object ICB (0x36) materialization, host command fills, execute writeback.
 pub mod icb;
 pub mod lab_repeat;
+pub mod lab_runs;
 
 /// Metal draw encode + writeback when MTLBs resolve.
 // See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload

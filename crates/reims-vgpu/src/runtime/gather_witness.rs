@@ -1484,8 +1484,49 @@ pub struct GatheredIdentity {
 /// stand in for this epoch's hypervisor sync (see `observe` and
 /// `mapper::mapping_guest_write_verdict`).
 pub(crate) fn lab_stated_vouch() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_STATED_VOUCH").is_ok_and(|v| v == "on"))
+    matches!(lab_stated_mode(), 1 | 3)
+}
+
+/// TEMP (lab): the verdict half of the stated channel - `mapping_guest_write_verdict`
+/// answering from the lagged generation. `on` is both halves; `witness` (the
+/// sampled-window witness only) and `verdict` (the surface-currency verdict only)
+/// split them for attribution.
+pub(crate) fn lab_stated_verdict() -> bool {
+    matches!(lab_stated_mode(), 1 | 4)
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_STATED_VOUCH=verify` behaves exactly like the
+/// switch being off (every verdict follows the synced generation) but, wherever
+/// `on` would have answered from the lagged generation, reads both and counts
+/// the binds on which the lagged answer would have been wrong (`lab_v_*`). The
+/// soundness reading for the stated channel over the whole population, with no
+/// risk to the frame.
+pub(crate) fn lab_stated_verify() -> bool {
+    lab_stated_mode() == 2
+}
+
+fn lab_stated_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("REIMS_VGPU_LAB_STATED_VOUCH").as_deref() {
+            Ok("on") => 1,
+            Ok("verify") => 2,
+            Ok("witness") => 3,
+            Ok("verdict") => 4,
+            _ => 0,
+        },
+    )
+}
+
+/// TEMP (lab): at most this many `lab_v_*` detail lines per boot.
+pub(crate) fn lab_v_detail_budget() -> bool {
+    static LEFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(400);
+    LEFT.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |n| n.checked_sub(1),
+    )
+    .is_ok()
 }
 
 /// The witness itself: ask both halves about the last bind of the same window,
@@ -1662,10 +1703,12 @@ fn decide_warm<M: crate::runtime::host::HostOps>(
     // write the guest did not state is then refused one bind late. A stated
     // write refuses whatever the hypervisor says.
     let lab_stated = lab_stated_vouch();
-    let lagged = lab_stated
+    let lab_verify = lab_stated_verify();
+    let lab_candidate = (lab_stated || lab_verify)
         && matches!(key, GatherKey::Mapping { .. })
         && matches!(stated, StatedGuestWrite::Quiet)
         && host_quiet;
+    let lagged = lab_stated && lab_candidate;
     let stated_wrote = lab_stated && matches!(stated, StatedGuestWrite::Wrote);
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_ng_gen_us"); // TEMP (lab)
     let gen = if entry.token == 0 {
@@ -1673,6 +1716,46 @@ fn decide_warm<M: crate::runtime::host::HostOps>(
     } else if lagged {
         routes.push("lab_gw_lagged");
         host.guest_write_gen_lagged(entry.token).unwrap_or(0)
+    } else if lab_verify && lab_candidate {
+        // TEMP (lab, verify): the verdict follows the synced generation, as with
+        // the switch off; the lagged one is read first (it is never newer) and
+        // compared. A miss is a bind `on` would have vouched although a guest
+        // write the channel did not state was already visible to the synced read.
+        let lag = host.guest_write_gen_lagged(entry.token).unwrap_or(0);
+        let synced = host.guest_write_gen(entry.token).unwrap_or(0);
+        crate::runtime::drain::note_store_route("lab_v_gw_cand");
+        if lag != 0 && synced != 0 && entry.gen != 0 {
+            if lag != entry.gen {
+                crate::runtime::drain::note_store_route("lab_v_gw_seen");
+                if lab_v_detail_budget() {
+                    crate::observe::fail(format!(
+                        "lab_v_gw_seen window={} span={} pages={} lag={lag} synced={synced} entry_gen={}",
+                        key.log_token(),
+                        span,
+                        entry.gpas.len(),
+                        entry.gen
+                    ));
+                }
+            } else if synced != entry.gen {
+                crate::runtime::drain::note_store_route("lab_v_gw_miss");
+                crate::runtime::drain::note_store_route_n("lab_v_gw_miss_kb", span / 1024);
+                if lab_v_detail_budget() {
+                    let written = host
+                        .guest_written_pages(entry.token, entry.gen)
+                        .map_or(-1i64, |p| p.len() as i64);
+                    crate::observe::fail(format!(
+                        "lab_v_gw_miss window={} span={} pages={} written={written} lag={lag} synced={synced} entry_gen={}",
+                        key.log_token(),
+                        span,
+                        entry.gpas.len(),
+                        entry.gen
+                    ));
+                }
+            } else {
+                crate::runtime::drain::note_store_route("lab_v_gw_agree");
+            }
+        }
+        synced
     } else {
         host.guest_write_gen(entry.token).unwrap_or(0)
     };
@@ -1690,6 +1773,18 @@ fn decide_warm<M: crate::runtime::host::HostOps>(
     if lagged && gen != 0 && gen != entry.gen {
         // The lagged read itself caught a write the guest did not state.
         routes.push("lab_gw_lagged_caught");
+        if lab_v_detail_budget() {
+            let written = host
+                .guest_written_pages(entry.token, entry.gen)
+                .map_or(-1i64, |p| p.len() as i64);
+            crate::observe::fail(format!(
+                "lab_gw_lagged_caught window={} span={} pages={} written={written} gen={gen} entry_gen={}",
+                key.log_token(),
+                span,
+                entry.gpas.len(),
+                entry.gen
+            ));
+        }
     }
     let vouched = matches!(verdict, GatherVerdict::Vouched);
 

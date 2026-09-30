@@ -1398,6 +1398,7 @@ fn lab_repeat_draw(
     }
     let mut partial = false;
     let mut bytes = std::collections::hash_map::DefaultHasher::new();
+    let mut pre: [std::collections::hash_map::DefaultHasher; 3] = Default::default();
     for (i, c) in vtx.iter().chain(frag.iter()) {
         i.hash(&mut bytes);
         let len = c.len();
@@ -1407,15 +1408,23 @@ fn lab_repeat_draw(
         }
         // The bound window starts at the draw's own offset, so its prefix is the
         // draw's data; what lies past 4 KiB may be other draws' and is not keyed.
+        let mut feed = |b: &[u8]| {
+            b[..b.len().min(4096)].hash(&mut bytes);
+            for (k, n) in [64usize, 256, 1024].into_iter().enumerate() {
+                i.hash(&mut pre[k]);
+                b[..b.len().min(n)].hash(&mut pre[k]);
+            }
+        };
         match c {
-            BufferContent::Bytes(b) => b[..len.min(4096)].hash(&mut bytes),
+            BufferContent::Bytes(b) => feed(&b[..len.min(4096)]),
             other if len <= 65536 => {
                 let b = other.cpu_bytes();
-                b[..b.len().min(4096)].hash(&mut bytes);
+                feed(&b);
             }
             _ => {}
         }
     }
+    let prefix = [pre[0].finish(), pre[1].finish(), pre[2].finish()];
     // B: everything but the render-target identity. A adds it back; C also drops the
     // bound-texture identity. V0..V5 are B with one field group removed, to find which
     // field keeps a draw from repeating: first_vertex, index buffer ref, viewport and
@@ -1495,7 +1504,7 @@ fn lab_repeat_draw(
     for c in &req.colors {
         (c.texture_ref, c.mapping_id, c.target_gva).hash(&mut a_h);
     }
-    crate::runtime::lab_repeat::draw(a_h.finish(), b_key, c_key, bytes.finish(), partial, !req.continues_render_pass, variants);
+    crate::runtime::lab_repeat::draw(a_h.finish(), b_key, c_key, bytes.finish(), partial, !req.continues_render_pass, variants, prefix);
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_UBO=pipe[,pipe]` logs the fragment buffers
@@ -3824,11 +3833,11 @@ fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
     let page = state.page_size();
     Some(GuestTargetSeed {
         source: GuestRunSource {
-            runs: std::sync::Arc::new(runs),
+            runs,
             source_offset: 0,
             total_len: span,
             row_length_texels,
-            pages: guest_page_window(host, gpas, page, base_off % page, span),
+            pages: guest_page_window(host, &gpas, page, base_off % page, span),
             direct_image: None,
         },
         format: source_format,
@@ -3897,7 +3906,7 @@ pub(super) fn try_gva_target_guest_seed<M: HostMemory + HostOps>(
             source_offset: 0,
             total_len: span,
             row_length_texels,
-            pages: guest_page_window(host, gpas, page, head_off, span),
+            pages: guest_page_window(host, &gpas, page, head_off, span),
             direct_image: None,
         },
         format: source_format,
@@ -4517,13 +4526,13 @@ pub(super) enum WindowRefusal {
 /// gathers on the CPU, which its own volume does not justify changing.
 fn guest_page_window<M: HostOps>(
     host: &mut M,
-    gpas: Vec<u64>,
+    gpas: &[u64],
     page: u64,
     head_offset: u64,
     span: u64,
 ) -> Option<std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>> {
     use crate::runtime::guest_ram_map::MapRefusal;
-    match crate::runtime::guest_ram_map::references_for_runs(host, &gpas, page, head_offset, span) {
+    match crate::runtime::guest_ram_map::references_for_runs(host, gpas, page, head_offset, span) {
         Ok(runs) => {
             // Banded on the way through as well as on the refusals below,
             // because the count is what decides whether a window binds straight
@@ -5189,15 +5198,121 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     mid: u32,
     base_off: u64,
     span: u64,
-) -> Option<(Vec<u64>, Vec<crate::backend::vulkan::engine::GuestRun>)> {
+) -> Option<(
+    std::sync::Arc<Vec<u64>>,
+    std::sync::Arc<Vec<crate::backend::vulkan::engine::GuestRun>>,
+)> {
+    mapping_window_guest_runs_in(
+        crate::runtime::lab_runs::mode(),
+        state,
+        host,
+        mid,
+        base_off,
+        span,
+    )
+}
+
+/// [`mapping_window_guest_runs`] with the arm chosen by the caller, so a test can
+/// state the arm it is testing.
+fn mapping_window_guest_runs_in<M: HostMemory + HostOps>(
+    fix: crate::runtime::lab_runs::Mode,
+    state: &mut DeviceState,
+    host: &mut M,
+    mid: u32,
+    base_off: u64,
+    span: u64,
+) -> Option<(
+    std::sync::Arc<Vec<u64>>,
+    std::sync::Arc<Vec<crate::backend::vulkan::engine::GuestRun>>,
+)> {
+    use crate::runtime::lab_runs::{Mode, WindowKey};
     if !guest_run_alias_available(host) {
         return None;
     }
     // TEMP (lab): per-step cost of the big guest-run bind.
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_mwgr_gpas_us");
-    let gpas = mapper::mapping_page_gpas(state, host, mid)?;
+    if fix == Mode::Off {
+        let gpas = mapper::mapping_page_gpas(state, host, mid)?;
+        drop(lab_span);
+        let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_mwgr_runs_us");
+        let (window, runs) = window_runs_of_gpas(state, host, &gpas, base_off, span)?;
+        return Some((std::sync::Arc::new(window), std::sync::Arc::new(runs)));
+    }
+    // The exact cache (`REIMS_VGPU_LAB_RUNS_FIX`): the same revalidation and
+    // liveness checks, then a hit on the mapping's own key skips the whole-mapping
+    // page list, the run memo and both clones.
+    let (map_generation, control_key, mapping_pages) =
+        mapper::lab_mapping_window_key(state, host, mid)?;
+    let key = WindowKey {
+        map_generation,
+        control_key,
+        mapping_pages,
+        base_off,
+        span,
+        page: state.page_size(),
+    };
+    let hit = mapper::lab_window_cache_lookup(state, mid, &key);
     drop(lab_span);
     let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_mwgr_runs_us");
+    if let Some(hit) = hit {
+        crate::runtime::drain::note_store_route("lab_rf_wc_hit");
+        if fix == Mode::On {
+            return Some(hit);
+        }
+        // Verify: the original computation beside the cached answer; the original's
+        // stands, and a cache that ever disagrees is replaced and reported.
+        let fresh = mapper::mapping_page_gpas_revalidated(state, mid)
+            .and_then(|gpas| window_runs_of_gpas(state, host, &gpas, base_off, span));
+        return match fresh {
+            Some((window, runs)) if *hit.0 == window && *hit.1 == runs => {
+                crate::runtime::drain::note_store_route("lab_rf_verify_ok");
+                Some(hit)
+            }
+            fresh => {
+                crate::runtime::drain::note_store_route("lab_rf_verify_bad");
+                crate::observe::fail(format!(
+                    "lab_rf_verify_bad mid={mid} base_off={base_off} span={span} generation={map_generation}                      cached_pages={} cached_runs={} fresh={}",
+                    hit.0.len(),
+                    hit.1.len(),
+                    fresh.is_some()
+                ));
+                let (window, runs) = fresh?;
+                let (window, runs) = (std::sync::Arc::new(window), std::sync::Arc::new(runs));
+                mapper::lab_window_cache_insert(
+                    state,
+                    mid,
+                    key,
+                    std::sync::Arc::clone(&window),
+                    std::sync::Arc::clone(&runs),
+                );
+                Some((window, runs))
+            }
+        };
+    }
+    crate::runtime::drain::note_store_route("lab_rf_wc_miss");
+    let gpas = mapper::mapping_page_gpas_revalidated(state, mid)?;
+    let (window, runs) = window_runs_of_gpas(state, host, &gpas, base_off, span)?;
+    let (window, runs) = (std::sync::Arc::new(window), std::sync::Arc::new(runs));
+    mapper::lab_window_cache_insert(
+        state,
+        mid,
+        key,
+        std::sync::Arc::clone(&window),
+        std::sync::Arc::clone(&runs),
+    );
+    Some((window, runs))
+}
+
+/// The window `[base_off, base_off + span)` of a mapping's page list, and its runs:
+/// the half of [`mapping_window_guest_runs`] that does not depend on how the page
+/// list was obtained.
+fn window_runs_of_gpas<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &mut M,
+    gpas: &[u64],
+    base_off: u64,
+    span: u64,
+) -> Option<(Vec<u64>, Vec<crate::backend::vulkan::engine::GuestRun>)> {
     let page = state.page_size();
     if (gpas.len() as u64).saturating_mul(page) < base_off.checked_add(span)? {
         return None;
@@ -5361,7 +5476,7 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         }
     };
     let page = state.page_size();
-    let pages = guest_page_window(host, gpas, page, (gva + offset) % page, span);
+    let pages = guest_page_window(host, &gpas, page, (gva + offset) % page, span);
     // Here, and only here, is it known whether this bind would record a gather,
     // which is the one thing the floor governs. See [`window_binds_zero_copy`].
     //
@@ -5421,7 +5536,7 @@ fn ensure_whole_runs<M: HostMemory + HostOps>(
         return false;
     };
     let page = state.page_size();
-    if guest_page_window(host, gpas, page, gva % page, size).is_some() {
+    if guest_page_window(host, &gpas, page, gva % page, size).is_some() {
         crate::runtime::drain::note_store_route("zc_buffer_whole_importable");
         return false;
     }
@@ -6550,7 +6665,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 source_offset: 0,
                 total_len: span,
                 row_length_texels,
-                pages: guest_page_window(host, gpas, page as u64, gva % page as u64, span),
+                pages: guest_page_window(host, &gpas, page as u64, gva % page as u64, span),
                 direct_image: None,
             },
             native,
@@ -6681,11 +6796,11 @@ pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
     );
     drop(lab_span);
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_mwgr_pages_us");
-    let lab_pages = guest_page_window(host, gpas, page as u64, base_off % page as u64, span);
+    let lab_pages = guest_page_window(host, &gpas, page as u64, base_off % page as u64, span);
     drop(lab_span);
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
-            runs: std::sync::Arc::new(runs),
+            runs,
             source_offset: 0,
             total_len: span,
             row_length_texels,
@@ -6813,11 +6928,11 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
     );
     drop(lab_span);
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_mwgr_pages_us");
-    let lab_pages = guest_page_window(host, gpas, page as u64, base_off % page as u64, span);
+    let lab_pages = guest_page_window(host, &gpas, page as u64, base_off % page as u64, span);
     drop(lab_span);
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
-            runs: std::sync::Arc::new(runs),
+            runs,
             source_offset: 0,
             total_len: span,
             row_length_texels,
@@ -14900,6 +15015,158 @@ mod vulkan_split_tests {
         assert!(
             state.pending_writebacks.get(mid).is_none(),
             "the gather bound pages still owed a frame this device never wrote down"
+        );
+    }
+
+    /// The window cache (`REIMS_VGPU_LAB_RUNS_FIX`) serves exactly what the walk
+    /// resolves, shares its `Arc`s on a hit, and retires with the page list: a
+    /// `map_generation` bump (every writer that changes the list makes one), a
+    /// moved control layout, and a different window of the same mapping each miss.
+    #[test]
+    fn the_window_cache_serves_what_the_walk_resolves_and_retires_with_the_page_list() {
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::runtime::lab_runs::Mode;
+        use std::sync::Arc;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.stable_map_pages = true;
+        let page = state.page_size();
+        let pages = 48u32;
+        let (pfn_a, pfn_b) = (0x5a40u32, 0x5c00u32);
+        for pfn in [pfn_a, pfn_b] {
+            host.map_range(
+                (pfn as u64) << PAGE_SHIFT_X86,
+                (pages as usize) << PAGE_SHIFT_X86,
+                0,
+            );
+        }
+        let mid = 917u32;
+        assert!(state.map_surface(mid));
+        let entries = |first: u32, n: u32| -> Vec<u32> {
+            (0..n)
+                .map(|i| ((first + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                .collect()
+        };
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.page_entries = entries(pfn_a, pages);
+        }
+        let span = 32 * page;
+        let mut resolve = |fix, state: &mut DeviceState, base_off, span| {
+            mapping_window_guest_runs_in(fix, state, &mut host, mid, base_off, span)
+        };
+
+        let walk = resolve(Mode::Off, &mut state, 0, span).expect("the walk resolves");
+        assert_eq!(walk.0.len(), 32);
+        assert!(
+            state.mappings.get(&mid).unwrap().window_cache.is_empty(),
+            "the off arm remembers nothing"
+        );
+
+        let first = resolve(Mode::On, &mut state, 0, span).expect("a miss resolves");
+        assert_eq!((*first.0).clone(), (*walk.0).clone());
+        assert_eq!((*first.1).clone(), (*walk.1).clone());
+        let hit = resolve(Mode::On, &mut state, 0, span).expect("a hit resolves");
+        assert!(
+            Arc::ptr_eq(&hit.0, &first.0) && Arc::ptr_eq(&hit.1, &first.1),
+            "a hit hands back the stored window, not a rebuilt one"
+        );
+        let verified = resolve(Mode::Verify, &mut state, 0, span).expect("verify resolves");
+        assert_eq!((*verified.0).clone(), (*walk.0).clone());
+        assert_eq!((*verified.1).clone(), (*walk.1).clone());
+        assert!(
+            Arc::ptr_eq(&verified.0, &first.0),
+            "a verified hit keeps the cached window when it agrees"
+        );
+
+        // A different window of the same mapping is its own entry and leaves the
+        // first one served.
+        let other = resolve(Mode::On, &mut state, 8 * page, 16 * page).expect("second window");
+        assert_eq!(other.0.len(), 16);
+        assert_eq!(other.0[0], ((pfn_a as u64) + 8) << PAGE_SHIFT_X86);
+        assert!(!Arc::ptr_eq(&other.0, &first.0));
+        assert!(Arc::ptr_eq(
+            &resolve(Mode::On, &mut state, 0, span).unwrap().0,
+            &first.0
+        ));
+        assert_eq!(state.mappings.get(&mid).unwrap().window_cache.len(), 2);
+
+        // The control layout moves (a task directory appears elsewhere): every
+        // window of the mapping is asked again, and the answer is the walk's.
+        state.gfx.root_page = 0x7777;
+        let control_moved =
+            resolve(Mode::On, &mut state, 0, span).expect("still clear of the root page");
+        assert!(
+            !Arc::ptr_eq(&control_moved.0, &first.0),
+            "a moved control layout is a miss"
+        );
+        assert_eq!((*control_moved.0).clone(), (*walk.0).clone());
+        assert_eq!(
+            state.mappings.get(&mid).unwrap().window_cache.len(),
+            1,
+            "the stale windows were dropped"
+        );
+        // ...and when the moved layout now collides with the surface, the walk's
+        // refusal is what the cache reports, not the window it remembered.
+        state.gfx.root_page = pfn_a + 3;
+        assert!(
+            resolve(Mode::On, &mut state, 0, span).is_none(),
+            "a cache must not serve a window the collision check now refuses"
+        );
+        assert!(
+            resolve(Mode::Off, &mut state, 0, span).is_none(),
+            "and that is what the walk says"
+        );
+        state.gfx.root_page = 0x7777;
+
+        // The guest re-points the surface: the list changes and the generation
+        // bumps, as at every writer of `page_entries`.
+        let before = resolve(Mode::On, &mut state, 0, span).unwrap();
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.page_entries = entries(pfn_b, pages);
+            DeviceState::bump_map_generation(m);
+        }
+        let after = resolve(Mode::On, &mut state, 0, span).expect("the new list resolves");
+        assert!(
+            !Arc::ptr_eq(&after.0, &before.0),
+            "a new map_generation is a miss"
+        );
+        assert_eq!(
+            after.0[0],
+            (pfn_b as u64) << PAGE_SHIFT_X86,
+            "the window names the new pages"
+        );
+        let walk_after = resolve(Mode::Off, &mut state, 0, span).unwrap();
+        assert_eq!((*after.0).clone(), (*walk_after.0).clone());
+        assert_eq!((*after.1).clone(), (*walk_after.1).clone());
+        assert_eq!(
+            state.mappings.get(&mid).unwrap().window_cache.len(),
+            1,
+            "the old generation's windows are gone"
+        );
+
+        // A list of a different length misses even where a writer forgot the bump.
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.page_entries = entries(pfn_b, pages - 8);
+        }
+        let shorter = resolve(Mode::On, &mut state, 0, span).expect("40 pages still cover 32");
+        assert!(
+            !Arc::ptr_eq(&shorter.0, &after.0),
+            "the page count is part of the key"
+        );
+
+        // A window the list cannot cover is refused, cached or not.
+        assert!(resolve(Mode::On, &mut state, 0, 64 * page).is_none());
+
+        // Unmapping retires the mapping's windows with its list.
+        assert!(state.unmap_surface(mid));
+        assert!(
+            resolve(Mode::On, &mut state, 0, span).is_none(),
+            "an unmapped surface serves nothing"
         );
     }
 

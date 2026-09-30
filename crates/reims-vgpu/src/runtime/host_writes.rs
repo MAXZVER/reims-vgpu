@@ -572,7 +572,49 @@ impl HostWrites {
     /// `&DeviceState` to resolve a mapping-named write at read time; the pages
     /// are captured when the write happens now, so no state is needed and a
     /// mapping re-pointed afterwards cannot make the answer wrong.
+    ///
+    /// TEMP (lab, `REIMS_VGPU_LAB_RUNS_FIX`): a reader whose mark is the current
+    /// epoch is told `Quiet` without a walk - see [`Self::wrote_any_since_with`].
     pub fn wrote_any_since(&self, since: u64, pages: &[u64]) -> HostWriteVerdict {
+        use crate::runtime::lab_runs::{mode, Mode};
+        let fix = mode();
+        if fix == Mode::Off || since != self.epoch {
+            return self.wrote_any_since_with(since, pages, false);
+        }
+        crate::runtime::drain::note_store_route("lab_rf_hw_shortcut");
+        if fix == Mode::Verify {
+            // The walk beside the shortcut; the walk's answer stands.
+            let full = self.wrote_any_since_with(since, pages, false);
+            if full != HostWriteVerdict::Quiet {
+                crate::runtime::drain::note_store_route("lab_rf_verify_bad");
+                crate::observe::fail(format!(
+                    "lab_rf_verify_bad hw_shortcut since={since} epoch={} pages={} full={full:?}",
+                    self.epoch,
+                    pages.len()
+                ));
+            } else {
+                crate::runtime::drain::note_store_route("lab_rf_verify_ok");
+            }
+            return full;
+        }
+        self.wrote_any_since_with(since, pages, true)
+    }
+
+    /// [`Self::wrote_any_since`] with the epoch shortcut chosen by the caller.
+    ///
+    /// The shortcut is exact, not approximate. `since == epoch` means this device
+    /// has recorded no write after the reader's mark, and the walk can only say
+    /// otherwise by finding a stored cell (or `unnamed_at`) newer than `since`:
+    /// every write increments the epoch first and stores the new value, so no
+    /// stored value exceeds it. The epoch is a `u64` incremented once per write;
+    /// it cannot wrap in the life of a process, and a wrap would break the whole
+    /// record (older cells would read as newer than every reader) rather than
+    /// this shortcut in particular.
+    fn wrote_any_since_with(&self, since: u64, pages: &[u64], shortcut: bool) -> HostWriteVerdict {
+        if shortcut && since == self.epoch {
+            return HostWriteVerdict::Quiet;
+        }
+        crate::runtime::drain::note_store_route("lab_rf_hw_full");
         self.pages.verdict(since, pages, self.page_shift)
     }
 
@@ -651,6 +693,71 @@ mod tests {
             w.wrote_any_since(after, &[4 * P]),
             HostWriteVerdict::Overlap
         );
+    }
+
+    /// The epoch shortcut is the full verdict, for every mark and every window, over
+    /// arbitrary write sequences: at `since == epoch` the walk can only reach
+    /// `Quiet`, so skipping it changes nothing; below the epoch both take the walk.
+    #[test]
+    fn wrote_any_since_at_the_current_epoch_is_the_full_verdict() {
+        // A small deterministic generator: the sequences are arbitrary, the test is
+        // reproducible.
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..200 {
+            let mut w = HostWrites::default();
+            let mut marks = vec![w.epoch()];
+            for _ in 0..(next() % 40) {
+                match next() % 5 {
+                    0 => w.note_pages((0..(1 + next() % 6)).map(|_| (next() % 4096) * P).collect()),
+                    1 => w.note_unknown(),
+                    2 => w.note_mapping(Some(&[(next() % 4096) * P, (next() % 4096) * P])),
+                    3 => w.note_mapping(None),
+                    _ => w.note_page_iter(
+                        (0..(next() % 1200)).map(|i| ((next() % 64) * 1024 + i) * P),
+                    ),
+                }
+                marks.push(w.epoch());
+            }
+            let windows: Vec<Vec<u64>> = (0..8)
+                .map(|_| {
+                    let start = next() % 4096;
+                    (0..(1 + next() % 300)).map(|i| (start + i) * P).collect()
+                })
+                .collect();
+            for window in &windows {
+                for &mark in &marks {
+                    let walk = w.pages.verdict(mark, window, w.page_shift);
+                    assert_eq!(
+                        w.wrote_any_since_with(mark, window, true),
+                        walk,
+                        "shortcut on, mark {mark}"
+                    );
+                    assert_eq!(
+                        w.wrote_any_since_with(mark, window, false),
+                        walk,
+                        "shortcut off, mark {mark}"
+                    );
+                    if mark == w.epoch() {
+                        assert_eq!(
+                            walk,
+                            HostWriteVerdict::Quiet,
+                            "the walk at the current epoch is Quiet"
+                        );
+                    }
+                }
+                assert_eq!(
+                    w.pages.verdict(w.epoch(), window, w.page_shift),
+                    HostWriteVerdict::Quiet,
+                    "a reader that has just looked has nothing to be told"
+                );
+            }
+        }
     }
 
     /// A writer that could not name its pages must invalidate everything older.
