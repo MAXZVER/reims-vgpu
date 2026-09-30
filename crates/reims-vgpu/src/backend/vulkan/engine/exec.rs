@@ -1244,44 +1244,6 @@ fn preserve_from_ready_resident(
         && declared.is_some_and(|declared| declared.preserves_prior_contents())
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_FIX_SEED_OVER_RESIDENT=1` — the R2 fix under
-/// A/B: an explicit seed outranks a ready resident on a preserving pass.
-fn lab_fix_seed_over_resident() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("REIMS_VGPU_LAB_FIX_SEED_OVER_RESIDENT").is_ok_and(|v| v == "1")
-    })
-}
-
-/// TEMP (lab): `REIMS_VGPU_LAB_SEEDWIN_LOG=1` logs every draw where a ready
-/// resident and an explicit seed compete (at most 6000 lines).
-fn lab_seedwin_log(req: &DrawRequest, applied: bool) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    static N: AtomicU32 = AtomicU32::new(0);
-    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SEEDWIN_LOG").is_ok_and(|v| v == "1")) {
-        return;
-    }
-    if N.fetch_add(1, Ordering::Relaxed) >= 6000 {
-        return;
-    }
-    let seed = if req.target_rgba8.is_some() {
-        "rgba8"
-    } else if req.target_guest_seed.is_some() {
-        "guest"
-    } else {
-        "gpu"
-    };
-    crate::observe::fail(format!(
-        "lab_seedwin dims={}x{} seed={seed} applied={applied} cont={} identity={:?} t={}",
-        req.width,
-        req.height,
-        req.continues_render_pass,
-        req.target_identity,
-        crate::observe::elapsed_us() / 1000
-    ));
-}
-
 /// `vkCmdCopyBufferToImage` requires `bufferOffset` to be a multiple of 4 and of
 /// the format's texel block size. 16 is the largest uncompressed block in core
 /// Vulkan and the larger of the two BC block sizes, so one check covers every
@@ -3116,28 +3078,21 @@ pub(crate) unsafe fn execute_draw_inner(
     let explicit_seed = req.target_rgba8.is_some()
         || req.target_guest_seed.is_some()
         || req.seed_from_target.is_some();
-    // TEMP (lab): the seed outranks the resident only under
-    // `REIMS_VGPU_LAB_FIX_SEED_OVER_RESIDENT=1` until the A/B is in; the main
-    // session flips the default when publishing.
-    let seed_outranks = lab_fix_seed_over_resident();
-    let preserving_existing_target = preserve_from_ready_resident(
-        req.color0_declared,
-        resident_ready,
-        explicit_seed && seed_outranks,
-    );
-    // Where the two rules disagree: a ready resident that would have replaced
-    // the seed. `preserve_resident_over_seed` is the old rule firing,
-    // `preserve_resident_seed_won` the new one declining to.
+    let preserving_existing_target =
+        preserve_from_ready_resident(req.color0_declared, resident_ready, explicit_seed);
+    // The census of that rule. `preserve_resident_seed_won` counts the draws
+    // where a ready resident competed with the request's own seed and the seed
+    // was kept — each one a frame the old order reloaded stale (113-177 a boot
+    // on a driven Tahoe 5K tour). `preserve_resident_over_seed` is the alarm for
+    // the opposite outcome and must read zero.
     if !req.load_from_target
         && explicit_seed
         && preserve_from_ready_resident(req.color0_declared, resident_ready, false)
     {
-        crate::runtime::drain::note_store_route(if seed_outranks {
-            "preserve_resident_seed_won"
-        } else {
-            "preserve_resident_over_seed"
-        });
-        lab_seedwin_log(req, seed_outranks);
+        crate::runtime::drain::note_store_route("preserve_resident_seed_won");
+    }
+    if preserving_existing_target && explicit_seed {
+        crate::runtime::drain::note_store_route("preserve_resident_over_seed");
     }
     let mut load_uses_gpu_content = req.load_from_target || preserving_existing_target;
     // output_bgra (computed with the batch decision above): BGRA output only
@@ -7581,20 +7536,36 @@ mod tests {
     #[test]
     fn a_supplied_seed_outranks_a_ready_resident_on_a_preserving_pass() {
         use reims_vgpu_protocol::pass_action::LoadAction;
-        assert!(preserve_from_ready_resident(Some(LoadAction::Load), true, false));
+        assert!(preserve_from_ready_resident(
+            Some(LoadAction::Load),
+            true,
+            false
+        ));
         assert!(preserve_from_ready_resident(
             Some(LoadAction::DontCare),
             true,
             false
         ));
-        assert!(!preserve_from_ready_resident(Some(LoadAction::Load), true, true));
+        assert!(!preserve_from_ready_resident(
+            Some(LoadAction::Load),
+            true,
+            true
+        ));
         assert!(!preserve_from_ready_resident(
             Some(LoadAction::DontCare),
             true,
             true
         ));
-        assert!(!preserve_from_ready_resident(Some(LoadAction::Load), false, false));
-        assert!(!preserve_from_ready_resident(Some(LoadAction::Clear), true, false));
+        assert!(!preserve_from_ready_resident(
+            Some(LoadAction::Load),
+            false,
+            false
+        ));
+        assert!(!preserve_from_ready_resident(
+            Some(LoadAction::Clear),
+            true,
+            false
+        ));
         assert!(!preserve_from_ready_resident(None, true, false));
     }
 
