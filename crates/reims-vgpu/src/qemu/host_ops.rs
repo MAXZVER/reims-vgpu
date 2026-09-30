@@ -150,6 +150,14 @@ pub struct ReimsVgpuHostOps {
     pub irq_pulse: Option<unsafe extern "C" fn(ctx: *mut c_void, kind: u32) -> c_int>,
     /// Which doorbells bind the generation reads that follow; see the ABI header.
     pub note_work_scope: Option<unsafe extern "C" fn(ctx: *mut c_void, scope: u32)>,
+    /// Register the *calling* thread with the shim's RCU domain. A thread this
+    /// crate spawns must do so before it reads guest memory through `read_gpa`
+    /// or asks the dirty tracker anything. Reached only through
+    /// [`ReimsVgpuHostOps::thread_registrar`], which refuses a table that
+    /// offers one half of the pair.
+    pub thread_attach: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
+    /// The other half: unregister the calling thread, as its last act.
+    pub thread_detach: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -157,6 +165,79 @@ pub struct ReimsVgpuHostOps {
 // pointers and never move the C context.
 unsafe impl Send for ReimsVgpuHostOps {}
 unsafe impl Sync for ReimsVgpuHostOps {}
+
+impl ReimsVgpuHostOps {
+    /// The means to put a worker thread this crate spawns under the shim's RCU,
+    /// or `None` when the shim offers no such thread.
+    ///
+    /// Both callbacks or neither: attaching without a way to detach would leave
+    /// a registered reader behind a thread that has exited, and `synchronize_rcu`
+    /// would then wait for it forever. A half-offered pair is a refusal, not a
+    /// best effort, and the caller reads `None` as "start no worker thread" —
+    /// the structural gate that keeps the parallel pool off on a shim whose
+    /// guest-memory reads were never made safe for it.
+    pub fn thread_registrar(&self) -> Option<ThreadRegistrar> {
+        Some(ThreadRegistrar {
+            ctx: self.ctx,
+            attach: self.thread_attach?,
+            detach: self.thread_detach?,
+        })
+    }
+}
+
+/// How a worker thread joins and leaves the shim's RCU domain.
+///
+/// `Copy` and shareable so one registrar can be handed to every worker of a
+/// pool; what is not shareable is the [`ThreadAttachment`] it makes, which is
+/// the calling thread's own.
+#[derive(Clone, Copy)]
+pub struct ThreadRegistrar {
+    ctx: *mut c_void,
+    attach: unsafe extern "C" fn(ctx: *mut c_void),
+    detach: unsafe extern "C" fn(ctx: *mut c_void),
+}
+
+// SAFETY: the table the registrar was cut from is `Send + Sync` for the same
+// reason — QEMU keeps `ctx` valid for the device lifetime, and both callbacks
+// are documented as safe from any thread that attaches and detaches for itself.
+unsafe impl Send for ThreadRegistrar {}
+unsafe impl Sync for ThreadRegistrar {}
+
+impl ThreadRegistrar {
+    /// Register the calling thread, for as long as the returned guard lives.
+    ///
+    /// Call it as the thread's first act and drop the guard as its last, on the
+    /// same thread: the registration is thread-local, and QEMU asserts on a
+    /// second one.
+    pub fn attach(&self) -> ThreadAttachment {
+        // SAFETY: QEMU owns `ctx` and keeps it valid for the device lifetime;
+        // the shim's attach touches only the calling thread's RCU record.
+        unsafe { (self.attach)(self.ctx) };
+        ThreadAttachment {
+            ctx: self.ctx,
+            detach: self.detach,
+        }
+    }
+}
+
+/// A live RCU registration of the thread that made it. Dropping it unregisters.
+///
+/// Not `Send`: it names the thread that attached, and unregistering from any
+/// other is the asserting case the ABI header rules out. The raw `ctx` pointer
+/// is what makes the type `!Send`; nothing here adds an impl.
+#[must_use = "dropping the guard unregisters the thread at once"]
+pub struct ThreadAttachment {
+    ctx: *mut c_void,
+    detach: unsafe extern "C" fn(ctx: *mut c_void),
+}
+
+impl Drop for ThreadAttachment {
+    fn drop(&mut self) {
+        // SAFETY: paired with the attach that made this guard, on the same
+        // thread, and run before the thread exits.
+        unsafe { (self.detach)(self.ctx) };
+    }
+}
 
 #[cfg(test)]
 impl ReimsVgpuHostOps {
@@ -192,6 +273,8 @@ impl ReimsVgpuHostOps {
             harvests_settled: None,
             irq_pulse: None,
             note_work_scope: None,
+            thread_attach: None,
+            thread_detach: None,
         }
     }
 }
@@ -1232,5 +1315,69 @@ mod tests {
         let prompt = parking_lot::Mutex::new(VecDeque::new());
         let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0xc000], 0x4000), None);
+    }
+
+    // Attach and detach calls recorded per thread: `(attaches, detaches)`. A
+    // `thread_local` because the contract is per calling thread, and a
+    // process-global counter could not tell "the worker attached" from "some
+    // other test's thread did".
+    thread_local! {
+        static REGISTRATIONS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    unsafe extern "C" fn count_attach(_ctx: *mut c_void) {
+        REGISTRATIONS.with(|r| r.set((r.get().0 + 1, r.get().1)));
+    }
+
+    unsafe extern "C" fn count_detach(_ctx: *mut c_void) {
+        REGISTRATIONS.with(|r| r.set((r.get().0, r.get().1 + 1)));
+    }
+
+    /// The pool's structural gate: a table offers worker threads only when it
+    /// offers the whole pair. One half would leave a registered RCU reader
+    /// behind an exited thread, which `synchronize_rcu` then waits on forever.
+    #[test]
+    fn a_thread_registrar_needs_both_halves_of_the_pair() {
+        let mut ops = ReimsVgpuHostOps::null();
+        assert!(
+            ops.thread_registrar().is_none(),
+            "no callbacks, no registrar"
+        );
+
+        ops.thread_attach = Some(count_attach);
+        assert!(ops.thread_registrar().is_none(), "attach alone is refused");
+
+        ops.thread_attach = None;
+        ops.thread_detach = Some(count_detach);
+        assert!(ops.thread_registrar().is_none(), "detach alone is refused");
+
+        ops.thread_attach = Some(count_attach);
+        assert!(ops.thread_registrar().is_some(), "the pair is accepted");
+    }
+
+    /// Attach happens when the guard is made and detach exactly when it is
+    /// dropped, on the thread that made it — the pairing the header promises the
+    /// shim.
+    #[test]
+    fn a_thread_attachment_detaches_on_drop_on_its_own_thread() {
+        let mut ops = ReimsVgpuHostOps::null();
+        ops.thread_attach = Some(count_attach);
+        ops.thread_detach = Some(count_detach);
+        let registrar = ops.thread_registrar().expect("the pair is offered");
+
+        // Another thread's registrations are invisible here: the counters are
+        // per thread, so this is also the proof that the guard calls through on
+        // the thread that holds it and nowhere else.
+        let seen = std::thread::spawn(move || {
+            assert_eq!(REGISTRATIONS.with(std::cell::Cell::get), (0, 0));
+            let guard = registrar.attach();
+            assert_eq!(REGISTRATIONS.with(std::cell::Cell::get), (1, 0));
+            drop(guard);
+            REGISTRATIONS.with(std::cell::Cell::get)
+        })
+        .join()
+        .expect("the worker does not panic");
+        assert_eq!(seen, (1, 1), "attach, then detach, once each");
+        assert_eq!(REGISTRATIONS.with(std::cell::Cell::get), (0, 0));
     }
 }

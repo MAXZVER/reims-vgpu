@@ -60,6 +60,11 @@ use std::slice;
 
 /// Bump when breaking the C shim contract.
 ///
+/// v24 adds `thread_attach` / `thread_detach` on [`ReimsVgpuHostOps`]: the door
+/// through which a thread this crate spawns joins QEMU's RCU, which it must
+/// before it reads the FlatView (`read_gpa`, the dirty-tracker queries). A shim
+/// that leaves either NULL gets no worker thread from this device.
+///
 /// v15 adds `reims_vgpu_qemu_scanout_may_paint`, the console-ownership verdict
 /// for one presented mapping. v14 moved the three-way *kind* into Rust but went
 /// on exporting it as an input, and the shims did with it what shims do: the x86
@@ -94,7 +99,7 @@ use std::slice;
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
 /// v20 gives `map_pages` a structured per-call failure output.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 23;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 24;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -968,6 +973,68 @@ mod tests {
             header_define("REIMS_VGPU_QEMU_ABI_VERSION"),
             REIMS_VGPU_QEMU_ABI_VERSION,
             "the shim header and the staticlib disagree on the ABI version"
+        );
+    }
+
+    /// `ReimsVgpuHostOps` is one struct written twice, and a field added to only
+    /// one of them shifts every later offset the shim's compiler lays out. The
+    /// pair v24 appended is the tail of both: same names, same order, last.
+    ///
+    /// Offsets as well as names, because the table is passed by pointer and the
+    /// header is the only other copy: `thread_attach` has to sit immediately
+    /// after `note_work_scope` and `thread_detach` immediately after that, with
+    /// nothing after it.
+    #[test]
+    fn the_abi_header_ends_the_host_ops_table_with_the_thread_registration_pair() {
+        use crate::qemu::host_ops::ReimsVgpuHostOps;
+
+        const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
+        let body = HEADER
+            .split_once("typedef struct ReimsVgpuHostOps {")
+            .expect("the header must declare ReimsVgpuHostOps")
+            .1
+            .split_once("} ReimsVgpuHostOps;")
+            .expect("the declaration must be closed")
+            .0;
+        // Strip block comments so the field list is only declarations.
+        let mut code = String::new();
+        let mut rest = body;
+        while let Some((before, after)) = rest.split_once("/*") {
+            code.push_str(before);
+            rest = after
+                .split_once("*/")
+                .expect("every block comment must be closed")
+                .1;
+        }
+        code.push_str(rest);
+        let fields: Vec<&str> = code
+            .split(';')
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .collect();
+        assert_eq!(
+            &fields[fields.len() - 3..],
+            [
+                "void (*note_work_scope)(void *ctx, uint32_t scope)",
+                "void (*thread_attach)(void *ctx)",
+                "void (*thread_detach)(void *ctx)",
+            ],
+            "the header's HostOps tail must match the Rust struct's"
+        );
+
+        let word = std::mem::size_of::<usize>();
+        assert_eq!(
+            std::mem::offset_of!(ReimsVgpuHostOps, thread_attach),
+            std::mem::offset_of!(ReimsVgpuHostOps, note_work_scope) + word
+        );
+        assert_eq!(
+            std::mem::offset_of!(ReimsVgpuHostOps, thread_detach),
+            std::mem::offset_of!(ReimsVgpuHostOps, thread_attach) + word
+        );
+        assert_eq!(
+            std::mem::size_of::<ReimsVgpuHostOps>(),
+            std::mem::offset_of!(ReimsVgpuHostOps, thread_detach) + word,
+            "nothing may follow the pair on either side"
         );
     }
 

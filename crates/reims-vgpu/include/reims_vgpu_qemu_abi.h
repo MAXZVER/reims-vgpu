@@ -21,7 +21,17 @@
 extern "C" {
 #endif
 
-/* v23: ReimsVgpuHostOps.note_work_scope — which doorbells bind the generation
+/* v24: ReimsVgpuHostOps.thread_attach / thread_detach — let the device's own
+ *      worker threads read guest memory. A thread that reads the FlatView
+ *      (read_gpa, guest_write_gen, guest_written_pages) must be registered with
+ *      QEMU's RCU, or synchronize_rcu() does not wait for it and it can see a
+ *      freed view. The drain and harvest threads are C threads and register
+ *      themselves; a thread Rust spawns cannot, because
+ *      rcu_register_thread() is a QEMU symbol. The pair is the door: the worker
+ *      calls attach as its first act and detach as its last, on its own thread.
+ *      NULL (either of the two) is a shim that offers no such thread, and the
+ *      device then spawns none.
+ * v23: ReimsVgpuHostOps.note_work_scope — which doorbells bind the generation
  *      reads that follow (every channel's, or one channel's for a packet with
  *      no stamp waits).
  * v22: ReimsVgpuHostOps.irq_pulse — raise a device interrupt now, from any
@@ -105,7 +115,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 23u
+#define REIMS_VGPU_QEMU_ABI_VERSION 24u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -417,6 +427,23 @@ typedef struct ReimsVgpuHostOps {
      * read answers for the latest doorbell, which is always correct.
      */
     void (*note_work_scope)(void *ctx, uint32_t scope);
+    /*
+     * Register / unregister the *calling* thread with the shim's RCU domain, so
+     * a thread the staticlib spawned may use read_gpa, guest_write_gen and
+     * guest_written_pages. attach runs first on the new thread and detach last
+     * on the same one, before it exits; the pair is never called from a thread
+     * that did not make the matching attach, and never twice in a row on one
+     * thread. Neither takes the BQL nor blocks on anything but RCU's own
+     * registry lock.
+     *
+     * Both NULL, or only one of them set, is a shim that cannot vouch for a
+     * Rust-spawned reader: the staticlib starts no worker thread, and every read
+     * stays on the drain thread as before. The arm64 sysbus shim leaves both
+     * NULL — its drain runs on the vCPU and only the x86 pathway exercises a
+     * second guest-memory reader.
+     */
+    void (*thread_attach)(void *ctx);
+    void (*thread_detach)(void *ctx);
 } ReimsVgpuHostOps;
 
 /*
