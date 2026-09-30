@@ -412,6 +412,19 @@ impl Pool {
         note_store_route_us("par_fork_us", fork_us);
         note_store_route_us("par_wait_us", wait_us);
         note_store_route_us("par_worker_busy_us", helper_busy_us);
+        // The mean hides the case that matters: the coordinator waiting on an
+        // item a *descheduled* helper has claimed, which costs a scheduler
+        // quantum rather than the item. Counting the scopes past two thresholds
+        // says how often that happens without a histogram.
+        if wait_us >= 200 {
+            note_store_route("par_wait_ge_200us");
+        }
+        if wait_us >= 1000 {
+            note_store_route("par_wait_ge_1ms");
+        }
+        if fork_us >= 50 {
+            note_store_route("par_fork_ge_50us");
+        }
 
         Scoped {
             results,
