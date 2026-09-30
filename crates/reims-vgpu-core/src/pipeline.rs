@@ -599,6 +599,23 @@ impl PipelineTable {
         self.usage.contains_key(&id)
     }
 
+    /// Whether publishing this pipeline's usage now would land: the table
+    /// holds it, it has not ended, and nothing is published for it.
+    ///
+    /// The question a rail asks before paying for a publication it would
+    /// otherwise skip. [`Self::usage_published`] answers "is it covered" and is
+    /// `false` for a pipeline the table does not hold or has retired as well —
+    /// both of which [`Self::publish_usage`] would refuse, so a rail that
+    /// retried on that answer alone would pay for the build of a table on every
+    /// packet that names a retired pipeline and land nothing.
+    #[must_use]
+    pub fn usage_wanted(&self, id: ResourceId) -> bool {
+        self.pipelines
+            .get(&id)
+            .is_some_and(|p| !p.state.is_terminal())
+            && !self.usage.contains_key(&id)
+    }
+
     /// Advance a pipeline. Returns whether the step was legal and taken.
     ///
     /// An illegal step is refused rather than applied, and a caller that has to
@@ -1171,6 +1188,36 @@ mod tests {
         assert!(
             !t.usage_published(id(1)),
             "a retired pipeline holds no answer, and a rail that thought it did              would never publish for the name that replaces it"
+        );
+    }
+
+    /// A pipeline is wanted exactly while the table holds it, it has not ended,
+    /// and nothing is published for it.
+    #[test]
+    fn a_pipeline_is_wanted_only_while_a_publication_would_land() {
+        let mut t = PipelineTable::new();
+        let usage = || PublishedUsage::compute(BindingUsage::new(vec![], vec![]));
+        assert!(!t.usage_wanted(id(1)), "a pipeline the table does not hold");
+        t.declare(id(1), GEN);
+        assert!(t.usage_wanted(id(1)), "declared, nothing published");
+        assert!(t.publish_usage(id(1), usage()));
+        assert!(!t.usage_wanted(id(1)), "published");
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            assert!(t.advance(id(1), step));
+        }
+        assert!(t.withdraw(id(1)));
+        assert!(
+            t.usage_wanted(id(1)),
+            "the withdrawal dropped what was published"
+        );
+        assert!(t.retire(id(1)));
+        assert!(
+            !t.usage_wanted(id(1)),
+            "a retired pipeline refuses the publication, so it is not wanted"
         );
     }
 

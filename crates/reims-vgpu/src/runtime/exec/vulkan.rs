@@ -48,7 +48,32 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             if crate::runtime::drain::lab_dag_window() {
                 crate::runtime::drain::lab_note_memo_skip(state, task_id, pipeline_ref);
             }
-            continue;
+            // **A memoized translation is not a published usage.** The memo
+            // answers "will executing this wait for a translation", and skipping
+            // here was right for that question; but the model learns what a
+            // pipeline's shaders do with each slot only when somebody publishes
+            // it, and this pass is where a packet's pipelines are published
+            // before admission readies them. A pipeline that was memoized by a
+            // path that did not publish — or whose publication the model
+            // declined before it held the pipeline — stays `Unknown` for every
+            // packet that binds it, for as long as this `continue` stands.
+            //
+            // So when the model *wants* the usage (holds the pipeline, it has
+            // not ended, nothing is published) the pass goes on to publish it.
+            // The translation is cached, so the cost is the AIR extraction,
+            // paid once per pipeline and not per packet.
+            //
+            // Behind [`crate::runtime::objects::access_exact`]: publishing
+            // earlier narrows the accesses of every later packet, which changes
+            // which of them the model may release ahead of which.
+            let wanted = crate::runtime::objects::access_exact()
+                && state
+                    .object_name(task_id, pipeline_ref)
+                    .is_some_and(|name| state.pipeline_usage_wanted(name));
+            if !wanted {
+                continue;
+            }
+            crate::runtime::drain::note_store_route("access_memo_hit_publishes_usage");
         }
         let air_started = std::time::Instant::now();
         // The MTLB containers, not owned copies of the AIR inside them: the two

@@ -2210,25 +2210,8 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // a wait nothing can satisfy loses the guest. So the wait is dropped and
     // named, here rather than in the bridge — which slot numbers exist is a
     // property of this device's page and not of the packet.
-    let page_size = state.page_size();
-    built.stamp_waits.retain(|wait| {
-        if stamp_slot_offset(wait.slot.0, page_size).is_some() {
-            return true;
-        }
-        note_store_route("packet_stamp_wait_unresolvable");
-        if crate::observe::first_sight("packet_stamp_wait_unresolvable", u64::from(wait.slot.0)) {
-            crate::observe::fail(format!(
-                "packet_stamp_wait_unresolvable reason=stamp_slot_out_of_range opcode={:#x} \
-                 index={} slots={} (no drain writes a slot outside the stamp page, so the \
-                 packet is admitted unordered against this wait rather than parking forever)",
-                packet.opcode,
-                wait.slot.0,
-                stamp_slot_count(page_size)
-            ));
-        }
-        false
-    });
-    note_access_modes(state, &built);
+    drop_unresolvable_stamp_waits(state, &packet, &mut built);
+    lab_capture_walk_state(state, &built);
     // The pipelines the records bind, told to the model before it is asked
     // whether the packet may run: `PipelineTable::waits_for` refuses a lease it
     // has no entry for, and the entry is this device's to make. The list is the
@@ -2283,6 +2266,49 @@ fn admit_and_park<H: HostMemory + HostOps>(
         }
     }
 
+    // **The walk asked a question the pre-scan has since answered.** It reads
+    // a pipeline's published usage once, before anything for this packet has
+    // been published, so the first packet to bind a pipeline — or the first
+    // after the model dropped what it knew — is walked with every slot it binds
+    // `Unknown`, and is admitted that way for the rest of its life: the
+    // dependency graph keeps the accesses it was admitted with. When the
+    // pre-scan above has published what the walk was missing, walking again is
+    // the only way the admission can be the exact one. The records and the
+    // packet are the same, so the second walk differs from the first in nothing
+    // but what the model now knows.
+    //
+    // Behind [`crate::runtime::objects::access_exact`], because it narrows
+    // accesses the model would otherwise have kept conservative.
+    if crate::runtime::objects::access_exact() {
+        let unanswered = built
+            .payload
+            .exec()
+            .and_then(|work| work.usage_census.first_unanswered_pipeline);
+        if unanswered.is_some_and(|id| state.pipeline_usage_published(id)) {
+            match crate::runtime::ingress::device_packet(
+                state,
+                host,
+                fifo,
+                session,
+                StampSlot(stamp_slot_index(completion_slot)),
+                &packet,
+                crate::runtime::ingress::PacketReads {
+                    submission: arrived.submission.as_ref(),
+                    repointed: arrived.repointed,
+                },
+            ) {
+                Ok(mut again) => {
+                    drop_unresolvable_stamp_waits(state, &packet, &mut again);
+                    note_store_route("access_rewalked");
+                    built = again;
+                }
+                // The first walk is still a valid admission: conservative, and
+                // the one this packet would have had without the switch.
+                Err(_) => note_store_route("access_rewalk_refused"),
+            }
+        }
+    }
+    note_access_modes(state, &built);
     let admission = match state.admit_packet(&built) {
         Ok(admission) => admission,
         Err(refusal) => {
@@ -2335,6 +2361,51 @@ fn admit_and_park<H: HostMemory + HostOps>(
     state.parked.park(ingress, work);
 }
 
+/// Drop the stamp waits a packet names that no drain could ever satisfy.
+///
+/// Factored out of [`admit_and_park`] because a packet may be walked twice and
+/// the rule is about the walk's result, not about which walk it was.
+fn drop_unresolvable_stamp_waits(
+    state: &DeviceState,
+    packet: &Packet,
+    built: &mut reims_vgpu_core::session::Packet,
+) {
+    let page_size = state.page_size();
+    built.stamp_waits.retain(|wait| {
+        if stamp_slot_offset(wait.slot.0, page_size).is_some() {
+            return true;
+        }
+        note_store_route("packet_stamp_wait_unresolvable");
+        if crate::observe::first_sight("packet_stamp_wait_unresolvable", u64::from(wait.slot.0)) {
+            crate::observe::fail(format!(
+                "packet_stamp_wait_unresolvable reason=stamp_slot_out_of_range opcode={:#x} \
+                 index={} slots={} (no drain writes a slot outside the stamp page, so the \
+                 packet is admitted unordered against this wait rather than parking forever)",
+                packet.opcode,
+                wait.slot.0,
+                stamp_slot_count(page_size)
+            ));
+        }
+        false
+    });
+}
+
+/// TEMP (lab, access precision): remember the model's state for the first
+/// pipeline the walk found unanswered, as it was when the walk finished.
+fn lab_capture_walk_state(state: &DeviceState, built: &reims_vgpu_core::session::Packet) {
+    if !lab_dag_on() {
+        return;
+    }
+    if let Some(id) = built
+        .payload
+        .exec()
+        .and_then(|work| work.usage_census.first_unanswered_pipeline)
+    {
+        let st = state.pipeline_state(id).unwrap_or("unleased");
+        LAB_NP.with(|n| *n.borrow_mut() = Some(st));
+    }
+}
+
 /// How much of this packet's ordering is bought by knowing, and how much by not
 /// knowing.
 ///
@@ -2374,12 +2445,6 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
         return;
     };
     let census = &work.usage_census;
-    if lab_dag_on() {
-        if let Some(id) = census.first_unanswered_pipeline {
-            let st = state.pipeline_state(id).unwrap_or("unleased");
-            LAB_NP.with(|n| *n.borrow_mut() = Some(st));
-        }
-    }
     for (route, n) in [
         ("draw_usage_no_pipeline", census.draws_without_a_pipeline),
         ("draw_usage_no_stage", census.draws_with_no_stage_published),

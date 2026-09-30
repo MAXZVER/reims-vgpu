@@ -4552,6 +4552,16 @@ impl DeviceState {
             .usage_published(pipeline)
     }
 
+    /// Whether publishing this pipeline's usage now would land. See
+    /// [`reims_vgpu_core::pipeline::PipelineTable::usage_wanted`].
+    pub fn pipeline_usage_wanted(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .usage_wanted(pipeline)
+    }
+
     /// The published reflections, for the length of one packet's walk.
     ///
     /// A guard rather than a per-lookup call, because the walk asks once per
