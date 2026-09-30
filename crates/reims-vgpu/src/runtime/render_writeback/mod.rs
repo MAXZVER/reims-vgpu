@@ -691,6 +691,10 @@ settle_sites! {
     /// console's rate its meaning. The split is what says which of the two the
     /// wait belongs to before anything is aimed at it.
     SampledMappingRead => "settle_sampled_mapping_read",
+    /// `exec::apply_clear` — a clear-only pass landing its clear colour in a
+    /// GVA target's guest pages. Writes this device already submitted into
+    /// those pages must land first, or they would overwrite the clear.
+    ClearOnlyGva => "settle_clear_only_gva",
     /// `drain::write_stamp` — the completion stamp's blocking fallback, taken
     /// when the GPU-ordered stamp path declined.
     CompletionStamp => "settle_completion_stamp",

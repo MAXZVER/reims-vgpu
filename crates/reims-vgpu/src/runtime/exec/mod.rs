@@ -6155,6 +6155,16 @@ fn apply_clear<M: HostMemory + HostOps>(
             ClearImageEncoding::Rgba8 => draw::FrameRows::Rgba8(clear.pixels()),
             ClearImageEncoding::Native => draw::FrameRows::Native(clear.pixels()),
         };
+        // The clear replaces whatever a lazy Store still owes these pages; left
+        // standing, that debt keeps its resident authoritative and the next
+        // LOAD reloads the cleared-away frame. See
+        // `writeback_debt::supersede_gva_overlapping`.
+        crate::runtime::writeback_debt::supersede_gva_overlapping(
+            state,
+            task_id,
+            c0.target_gva,
+            u64::from(c0.row_stride).saturating_mul(u64::from(c0.height)),
+        );
         let ok = draw::write_gva_frame_within(
             state,
             host,

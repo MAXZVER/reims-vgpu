@@ -1785,6 +1785,45 @@ pub fn supersede_for_mapping(
     crate::runtime::render_writeback::settle_guest_writes(site);
 }
 
+/// Drop every GVA debt of `task_id` over `[gva, gva + span)` because the caller
+/// is about to write newer content over the whole window: a clear-only pass
+/// landing its clear colour in the guest pages.
+///
+/// A debt says the resident its Store produced is the authoritative copy of
+/// these pages, and [`gva_resident_authoritative`] lets the next colour LOAD
+/// take that resident without reading the pages. A clear-only pass writes only
+/// the pages, so with the debt left standing the LOAD that follows it reloads
+/// the frame the clear replaced — and paying the debt later would write that
+/// frame over the clear as well. macOS 26's compositor reuses one pooled
+/// texture for a glass mask (a red gradient drawn and Stored), then clears it
+/// with a pass that has no draws and loads it for the next layer: the reloaded
+/// mask is the red band over the Dock and under Control Center.
+///
+/// So the debt is dropped, not paid, and its resident released: the clear is
+/// the same resource's newer content over its whole window. Writes already
+/// submitted into these pages are settled first, as [`supersede_for_mapping`]
+/// does, so none of them lands after the clear.
+pub fn supersede_gva_overlapping(state: &mut DeviceState, task_id: u32, gva: u64, span: u64) {
+    if !state.pending_writebacks.is_empty() && span != 0 {
+        let owed = state
+            .pending_writebacks
+            .take_gva_overlapping(task_id, gva, span);
+        if !owed.is_empty() {
+            let rail = crate::backend::selected();
+            crate::runtime::drain::note_store_route_n(
+                "gvadebt_superseded_by_clear",
+                owed.len() as u64,
+            );
+            for (_, debt) in owed {
+                release_gva(rail, debt);
+            }
+        }
+    }
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::ClearOnlyGva,
+    );
+}
+
 /// [`settle_for_mapping`] for a caller that cannot name the mapping it is about
 /// to touch, so it owes every debt.
 pub fn settle_unnamed<M: HostMemory + HostOps>(
@@ -2714,6 +2753,51 @@ mod tests {
             .note_write(key.task_id, key.texture_ref);
         assert!(!gva_resident_authoritative(&state, debt.window()));
         assert!(state.pending_writebacks.get_gva(key).is_some());
+    }
+
+    /// A clear-only pass over a GVA plane drops the plane's debt rather than
+    /// leaving it standing, so the resident the Store left behind stops being
+    /// authoritative and the next colour LOAD reads the cleared pages. The same
+    /// addresses in another task are another address space and stay owed.
+    #[test]
+    fn a_clear_only_pass_supersedes_the_gva_debt_over_its_pages() {
+        use crate::runtime::drain::store_route_count;
+
+        // A baseline rather than a clear: the counter is process-global.
+        let superseded0 = store_route_count("gvadebt_superseded_by_clear");
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let cleared = GvaResourceKey {
+            task_id: 3,
+            texture_ref: 19,
+        };
+        let elsewhere = GvaResourceKey {
+            task_id: 4,
+            texture_ref: 19,
+        };
+        let debt = gva_debt(7);
+        let _ = state.pending_writebacks.arm_gva(cleared, debt);
+        let _ = state.pending_writebacks.arm_gva(elsewhere, gva_debt(8));
+        assert!(gva_resident_authoritative(&state, debt.window()));
+
+        // The clear's whole window: 64 rows of 256 bytes from 0x4000.
+        supersede_gva_overlapping(&mut state, 3, 0x4000, 64 * 256);
+
+        assert!(
+            state.pending_writebacks.get_gva(cleared).is_none(),
+            "the cleared plane owes nothing"
+        );
+        assert!(
+            !gva_resident_authoritative(&state, debt.window()),
+            "the next LOAD must read the cleared pages, not the resident"
+        );
+        assert!(
+            state.pending_writebacks.get_gva(elsewhere).is_some(),
+            "another task's pages are not the clear's"
+        );
+        assert_eq!(
+            store_route_count("gvadebt_superseded_by_clear") - superseded0,
+            1
+        );
     }
 
     /// "This texture owes nothing" splits into a surface with no debt and a
