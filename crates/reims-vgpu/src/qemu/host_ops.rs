@@ -438,21 +438,36 @@ impl<'a> QemuHost<'a> {
     }
 
     fn callback_decline(error: MemError, address: u64, len: usize, discriminant: u64) -> MemError {
-        crate::observe::Emit::decline("qemu_host_callback", &error)
-            .field("address", format!("{address:#x}"))
-            .field("len", len)
-            .fail_once(discriminant);
-        error
+        callback_decline(error, address, len, discriminant)
     }
 }
 
-impl HostMemory for QemuHost<'_> {
-    fn read_gpa(&self, gpa: u64, buf: &mut [u8]) -> Result<(), MemError> {
+/// Record that a HostOps callback refused or was missing, and pass the error on.
+///
+/// Free rather than a method of [`QemuHost`] because [`WorkerHost`] reads
+/// through the same table and must decline in the same words.
+fn callback_decline(error: MemError, address: u64, len: usize, discriminant: u64) -> MemError {
+    crate::observe::Emit::decline("qemu_host_callback", &error)
+        .field("address", format!("{address:#x}"))
+        .field("len", len)
+        .fail_once(discriminant);
+    error
+}
+
+/// The read side of the table, callable from any thread the shim knows about.
+///
+/// One body for [`QemuHost`] (the drain thread) and [`WorkerHost`] (a pool
+/// worker): what a read or a dirty-tracker query means, and how it declines,
+/// must not depend on which thread asked. Every one takes `&self` and touches
+/// nothing but the table and the caller's buffer.
+impl ReimsVgpuHostOps {
+    /// [`HostMemory::read_gpa`] through the shim's `read_gpa`.
+    pub(crate) fn read_guest(&self, gpa: u64, buf: &mut [u8]) -> Result<(), MemError> {
         if buf.is_empty() {
             return Ok(());
         }
-        let Some(f) = self.ops.read_gpa else {
-            return Err(Self::callback_decline(
+        let Some(f) = self.read_gpa else {
+            return Err(callback_decline(
                 MemError::QemuReadGpaCallbackMissing,
                 gpa,
                 buf.len(),
@@ -460,17 +475,88 @@ impl HostMemory for QemuHost<'_> {
             ));
         };
         // SAFETY: QEMU owns ctx; buf is valid for len.
-        let rc = unsafe { f(self.ops.ctx, gpa, buf.as_mut_ptr(), buf.len()) };
+        let rc = unsafe { f(self.ctx, gpa, buf.as_mut_ptr(), buf.len()) };
         match rc {
             0 => Ok(()),
             -2 => Err(MemError::NoCpu),
-            _ => Err(Self::callback_decline(
+            _ => Err(callback_decline(
                 MemError::QemuReadGpaCallbackFailed(rc),
                 gpa,
                 buf.len(),
                 gpa,
             )),
         }
+    }
+
+    /// [`HostOps::is_ram_gpa`]: an absent callback answers "yes".
+    pub(crate) fn is_ram(&self, gpa: u64) -> bool {
+        match self.is_ram_gpa {
+            // SAFETY: QEMU owns ctx; pure address-space query.
+            Some(f) => unsafe { f(self.ctx, gpa) != 0 },
+            // Older/missing table: do not invent a reject (map_pages still RAM-checks).
+            None => true,
+        }
+    }
+
+    /// [`HostOps::guest_write_gen`].
+    pub(crate) fn write_gen(&self, token: u64) -> Option<u64> {
+        if token == 0 {
+            return None;
+        }
+        let f = self.guest_write_gen?;
+        // SAFETY: QEMU owns ctx; the shim answers from its own lock.
+        let gen_ = unsafe { f(self.ctx, token) };
+        // 0 is the shim's "unknown token, or not yet armed" answer. Reading it
+        // as a generation would let two pre-arm checks agree and vouch for a
+        // resident nothing has ever validated.
+        (gen_ != 0).then_some(gen_)
+    }
+
+    /// [`HostOps::guest_write_gen_lagged`].
+    pub(crate) fn write_gen_lagged(&self, token: u64) -> Option<u64> {
+        // TEMP (lab): the shim reads bit 63 of the token as "answer from the
+        // last sync, do not sync now" (REIMS_VGPU_DIRTY_TOKEN_LAGGED). Tokens
+        // are a sequential counter and never reach it.
+        if token == 0 || token >> 63 != 0 {
+            return None;
+        }
+        let f = self.guest_write_gen?;
+        // SAFETY: QEMU owns ctx; the shim answers from its own lock.
+        let gen_ = unsafe { f(self.ctx, token | (1 << 63)) };
+        (gen_ != 0).then_some(gen_)
+    }
+
+    /// [`HostOps::guest_written_pages`].
+    pub(crate) fn written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
+        if token == 0 || since_gen == 0 {
+            return None;
+        }
+        let f = self.guest_written_pages?;
+        // The shim refuses rather than truncating, so the buffer has to be able
+        // to hold a whole surface's page list. A display-sized BGRA8 surface is
+        // ~2 000 x86 pages; the cap is a few times that so a larger one still
+        // gets an exact answer, and a set beyond it declines into "assume the
+        // whole surface was written" rather than into a short list.
+        const MAX_PAGES: usize = 16 * 1024;
+        let mut out = vec![0u64; MAX_PAGES];
+        // SAFETY: QEMU owns ctx; `out` is writable for MAX_PAGES u64s for the
+        // duration of the call, and the shim writes at most `max` of them.
+        let n = unsafe { f(self.ctx, token, since_gen, out.as_mut_ptr(), MAX_PAGES) };
+        if n < 0 {
+            return None;
+        }
+        let n = usize::try_from(n).ok()?;
+        if n > MAX_PAGES {
+            return None;
+        }
+        out.truncate(n);
+        Some(out)
+    }
+}
+
+impl HostMemory for QemuHost<'_> {
+    fn read_gpa(&self, gpa: u64, buf: &mut [u8]) -> Result<(), MemError> {
+        self.ops.read_guest(gpa, buf)
     }
 
     fn write_gpa(&mut self, gpa: u64, buf: &[u8]) -> Result<(), MemError> {
@@ -827,12 +913,7 @@ impl HostOps for QemuHost<'_> {
     }
 
     fn is_ram_gpa(&self, gpa: u64) -> bool {
-        match self.ops.is_ram_gpa {
-            // SAFETY: QEMU owns ctx; pure address-space query.
-            Some(f) => unsafe { f(self.ops.ctx, gpa) != 0 },
-            // Older/missing table: do not invent a reject (map_pages still RAM-checks).
-            None => true,
-        }
+        self.ops.is_ram(gpa)
     }
 
     fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {
@@ -860,55 +941,15 @@ impl HostOps for QemuHost<'_> {
     }
 
     fn guest_write_gen(&self, token: u64) -> Option<u64> {
-        if token == 0 {
-            return None;
-        }
-        let f = self.ops.guest_write_gen?;
-        // SAFETY: QEMU owns ctx; the shim answers from its own lock.
-        let gen_ = unsafe { f(self.ops.ctx, token) };
-        // 0 is the shim's "unknown token, or not yet armed" answer. Reading it
-        // as a generation would let two pre-arm checks agree and vouch for a
-        // resident nothing has ever validated.
-        (gen_ != 0).then_some(gen_)
+        self.ops.write_gen(token)
     }
 
     fn guest_write_gen_lagged(&self, token: u64) -> Option<u64> {
-        // TEMP (lab): the shim reads bit 63 of the token as "answer from the
-        // last sync, do not sync now" (REIMS_VGPU_DIRTY_TOKEN_LAGGED). Tokens
-        // are a sequential counter and never reach it.
-        if token == 0 || token >> 63 != 0 {
-            return None;
-        }
-        let f = self.ops.guest_write_gen?;
-        // SAFETY: QEMU owns ctx; the shim answers from its own lock.
-        let gen_ = unsafe { f(self.ops.ctx, token | (1 << 63)) };
-        (gen_ != 0).then_some(gen_)
+        self.ops.write_gen_lagged(token)
     }
 
     fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
-        if token == 0 || since_gen == 0 {
-            return None;
-        }
-        let f = self.ops.guest_written_pages?;
-        // The shim refuses rather than truncating, so the buffer has to be able
-        // to hold a whole surface's page list. A display-sized BGRA8 surface is
-        // ~2 000 x86 pages; the cap is a few times that so a larger one still
-        // gets an exact answer, and a set beyond it declines into "assume the
-        // whole surface was written" rather than into a short list.
-        const MAX_PAGES: usize = 16 * 1024;
-        let mut out = vec![0u64; MAX_PAGES];
-        // SAFETY: QEMU owns ctx; `out` is writable for MAX_PAGES u64s for the
-        // duration of the call, and the shim writes at most `max` of them.
-        let n = unsafe { f(self.ops.ctx, token, since_gen, out.as_mut_ptr(), MAX_PAGES) };
-        if n < 0 {
-            return None;
-        }
-        let n = usize::try_from(n).ok()?;
-        if n > MAX_PAGES {
-            return None;
-        }
-        out.truncate(n);
-        Some(out)
+        self.ops.written_pages(token, since_gen)
     }
 }
 
@@ -930,6 +971,93 @@ impl HostOps for NullHost {
     }
     fn enqueue(&mut self, _action: HostAction) {}
     fn schedule_bh(&mut self) {}
+}
+
+/// What a parallel-pool worker may ask the shim: the read side of the table,
+/// and nothing else.
+///
+/// The worker threads of [`crate::runtime::par`] run on behalf of a transaction
+/// they do not own. Everything a transaction does that the guest can observe —
+/// a write into guest pages, an interrupt, a scanout, the order stamps appear
+/// in — is the commit's, on the drain thread, in the order the ordering core
+/// chose. So a worker's view of the host is the subset that cannot be seen:
+///
+/// | Call | Worker | Why |
+/// |---|---|---|
+/// | `read_gpa` | yes | `address_space_read`; the thread is RCU-registered |
+/// | `is_ram_gpa`, `guest_write_gen`, `guest_written_pages` | yes | pure queries, safe from any thread |
+/// | `write_gpa` | **refused** ([`MemError::ReadOnlyHost`]) | ordering, `host_writes`, stamps |
+/// | `enqueue`, `schedule_bh` | **dropped and counted** | `&mut actions` belong to the drain |
+/// | `read_kva`, `read_xreg`, `map_pages` | default (refuse / absent) | `current_cpu`, registry mutation |
+/// | `note_work_scope` | default (nothing) | the drain set the scope for this tranche and it binds the worker's reads too |
+///
+/// It is a *view*: `Copy`-sized, built per worker from the table the device was
+/// created with, and holds no state of its own.
+pub struct WorkerHost<'a> {
+    ops: &'a ReimsVgpuHostOps,
+}
+
+impl<'a> WorkerHost<'a> {
+    pub fn new(ops: &'a ReimsVgpuHostOps) -> Self {
+        Self { ops }
+    }
+
+    fn misuse(what: &'static str) {
+        crate::runtime::drain::note_store_route("par_worker_host_misuse");
+        crate::observe::fail(format!(
+            "par_worker_host_misuse call={what} (a pool worker reached a HostOps call that \
+             belongs to the drain thread; dropped)"
+        ));
+    }
+}
+
+impl HostMemory for WorkerHost<'_> {
+    fn read_gpa(&self, gpa: u64, buf: &mut [u8]) -> Result<(), MemError> {
+        self.ops.read_guest(gpa, buf)
+    }
+
+    fn write_gpa(&mut self, gpa: u64, buf: &[u8]) -> Result<(), MemError> {
+        Err(callback_decline(
+            MemError::ReadOnlyHost,
+            gpa,
+            buf.len(),
+            gpa,
+        ))
+    }
+}
+
+impl HostOps for WorkerHost<'_> {
+    fn mono_ns(&self) -> u64 {
+        match self.ops.mono_ns {
+            // SAFETY: QEMU owns ctx; a pure clock read.
+            Some(f) => unsafe { f(self.ops.ctx) },
+            None => 0,
+        }
+    }
+
+    fn enqueue(&mut self, _action: HostAction) {
+        Self::misuse("enqueue");
+    }
+
+    fn schedule_bh(&mut self) {
+        Self::misuse("schedule_bh");
+    }
+
+    fn is_ram_gpa(&self, gpa: u64) -> bool {
+        self.ops.is_ram(gpa)
+    }
+
+    fn guest_write_gen(&self, token: u64) -> Option<u64> {
+        self.ops.write_gen(token)
+    }
+
+    fn guest_write_gen_lagged(&self, token: u64) -> Option<u64> {
+        self.ops.write_gen_lagged(token)
+    }
+
+    fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
+        self.ops.written_pages(token, since_gen)
+    }
 }
 
 #[cfg(test)]
@@ -1379,5 +1507,76 @@ mod tests {
         .expect("the worker does not panic");
         assert_eq!(seen, (1, 1), "attach, then detach, once each");
         assert_eq!(REGISTRATIONS.with(std::cell::Cell::get), (0, 0));
+    }
+
+    /// Fake shim callbacks for the worker-host test: a read that fills the
+    /// buffer with the low byte of the address, a RAM predicate that says yes
+    /// below 1 MiB, and a generation that is the token plus one.
+    unsafe extern "C" fn pattern_read_gpa(
+        _ctx: *mut c_void,
+        gpa: u64,
+        buf: *mut u8,
+        len: usize,
+    ) -> i32 {
+        for i in 0..len {
+            // SAFETY: the caller's contract is `buf` writable for `len`.
+            unsafe { *buf.add(i) = (gpa as u8).wrapping_add(i as u8) };
+        }
+        0
+    }
+
+    unsafe extern "C" fn low_ram_only(_ctx: *mut c_void, gpa: u64) -> i32 {
+        i32::from(gpa < 0x10_0000)
+    }
+
+    unsafe extern "C" fn token_plus_one(_ctx: *mut c_void, token: u64) -> u64 {
+        // The lagged form arrives with bit 63 set; the answer is the same.
+        (token & !(1 << 63)) + 1
+    }
+
+    /// A pool worker's host reads through the shim's table exactly as the drain's
+    /// does — same callbacks, same declines — and cannot write, raise an
+    /// interrupt or wake the drain.
+    #[test]
+    fn a_worker_host_reads_through_the_table_and_does_not_write() {
+        use crate::runtime::host::HostMemory as _;
+        let mut table = ReimsVgpuHostOps::null();
+        table.read_gpa = Some(pattern_read_gpa);
+        table.is_ram_gpa = Some(low_ram_only);
+        table.guest_write_gen = Some(token_plus_one);
+
+        let mut worker = WorkerHost::new(&table);
+        let mut buf = [0u8; 4];
+        worker.read_gpa(0x1000, &mut buf).expect("the table reads");
+        assert_eq!(buf, [0x00, 0x01, 0x02, 0x03]);
+        assert!(worker.is_ram_gpa(0x8000));
+        assert!(!worker.is_ram_gpa(0x20_0000));
+        assert_eq!(worker.guest_write_gen(41), Some(42));
+        assert_eq!(worker.guest_write_gen(0), None, "0 is no token");
+        assert_eq!(worker.guest_write_gen_lagged(41), Some(42));
+
+        // The same answers as the drain's host, from the same table.
+        let mut actions = VecDeque::new();
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let drain = QemuHost::new(&table, &mut actions, &prompt);
+        let mut again = [0u8; 4];
+        drain.read_gpa(0x1000, &mut again).expect("the table reads");
+        assert_eq!(again, buf);
+        assert_eq!(drain.guest_write_gen(41), worker.guest_write_gen(41));
+
+        // Everything the drain alone may do is refused or dropped, and said so.
+        assert_eq!(worker.write_gpa(0x1000, &[1]), Err(MemError::ReadOnlyHost));
+        let before = crate::runtime::drain::census::store_route_count("par_worker_host_misuse");
+        worker.enqueue(HA::irq_gfx());
+        worker.schedule_bh();
+        assert_eq!(
+            crate::runtime::drain::census::store_route_count("par_worker_host_misuse") - before,
+            2,
+            "both calls were counted and dropped"
+        );
+        assert!(
+            prompt.lock().is_empty() && actions.is_empty(),
+            "the worker queued nothing for the guest"
+        );
     }
 }

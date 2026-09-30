@@ -89,6 +89,14 @@ pub enum MemError {
     /// is the window, and the guest has already given that memory to somebody
     /// else.
     WriteOutsideWindow,
+    /// A write reached a host that only reads.
+    ///
+    /// The parallel pool's workers get a read-only view of guest memory
+    /// ([`crate::qemu::host_ops::WorkerHost`]); every guest write is the
+    /// commit's, in order, on the drain thread. A job that tried one is a
+    /// defect in the job, and the refusal names it instead of performing a
+    /// store no ordering rule covers.
+    ReadOnlyHost,
 }
 
 impl MemError {
@@ -147,6 +155,7 @@ impl crate::observe::Decline for MemError {
             Self::MapPagesRefused => "mem_map_pages_refused",
             Self::RunOutOfRange => "mem_run_out_of_range",
             Self::WriteOutsideWindow => "mem_write_outside_window",
+            Self::ReadOnlyHost => "mem_read_only_host",
         }
     }
 
