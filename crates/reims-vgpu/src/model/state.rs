@@ -597,9 +597,23 @@ pub struct TaskResource {
     /// The model owns the slot and the drop; it does not own — and cannot name
     /// — the contents.
     rail: Mutex<Option<Box<dyn Any + Send + Sync>>>,
+    /// `observe::elapsed_us` when this resolution was last compared against the
+    /// guest's own object list, or 0 before the first comparison. See
+    /// [`Self::reexamination_due`].
+    reexamined_us: std::sync::atomic::AtomicU64,
 }
 
 impl TaskResource {
+    /// Shortest interval between two comparisons of one cached resolution
+    /// against the guest's object list.
+    ///
+    /// The comparison decides nothing, and making it on *every* memo hit made
+    /// it one of the drain's larger costs: ~10 000 page-table walks a second on
+    /// a 5K Tahoe desktop, against a disagreement count that has stayed at zero
+    /// on every rail. Once per resolution per interval still names a recycled
+    /// slot within the interval.
+    pub const REEXAMINE_INTERVAL_US: u64 = 100_000;
+
     pub fn new(entry: ListObjectEntry, descriptor: Arc<[u8]>) -> Self {
         Self {
             entry,
@@ -608,7 +622,27 @@ impl TaskResource {
             mapper_ref_texture_mapping: OnceLock::new(),
             lifetime: Arc::new(TaskResourceLifetime::new()),
             rail: Mutex::new(None),
+            reexamined_us: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Whether this resolution is due a comparison at `now_us`, taking the slot
+    /// when it is. The first hit always is.
+    pub fn reexamination_due(&self, now_us: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        let last = self.reexamined_us.load(Ordering::Relaxed);
+        if last != 0 && now_us.saturating_sub(last) < Self::REEXAMINE_INTERVAL_US {
+            return false;
+        }
+        self.reexamined_us.store(now_us.max(1), Ordering::Relaxed);
+        true
+    }
+
+    /// Make the next hit due, as if the interval had elapsed.
+    #[cfg(test)]
+    pub fn age_reexamination(&self) {
+        self.reexamined_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Resolve this resource's immutable construction descriptor once.

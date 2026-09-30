@@ -3662,8 +3662,12 @@ fn the_stale_resolution_witness_counts_what_it_compared() {
     );
 
     // The serializer rewrites the descriptor in place: same entry, same
-    // address, different object.
+    // address, different object. The resolution is aged past the comparison
+    // interval, as a later frame's hit would be.
     write_desc(&mut host, 0x100, 0x9000);
+    resolve_resource(&state, &host, task, buffer)
+        .expect("retrieves")
+        .age_reexamination();
     resolve_resource(&state, &host, task, buffer).expect("retrieves");
     assert_eq!(
         store_route_count("task_resource_descriptor_rewritten"),
@@ -3680,6 +3684,9 @@ fn the_stale_resolution_witness_counts_what_it_compared() {
     // The guest points the slot at a different descriptor.
     write_desc(&mut host, 0x180, 0x9000);
     write_entry(&mut host, 0x180);
+    resolve_resource(&state, &host, task, buffer)
+        .expect("retrieves")
+        .age_reexamination();
     resolve_resource(&state, &host, task, buffer).expect("retrieves");
     assert_eq!(
         store_route_count("task_resource_slot_repointed"),
@@ -4656,4 +4663,18 @@ fn the_lifetime_ref_census_counts_what_it_asked_and_prices_the_packet() {
         Some(name),
         "the second occupant of the slot is a different name"
     );
+}
+
+/// A cached resolution is compared against the guest's list on its first hit
+/// and then at most once per interval, not on every hit.
+#[test]
+fn a_cached_resolution_is_reexamined_at_most_once_per_interval() {
+    let r = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
+    let iv = crate::model::TaskResource::REEXAMINE_INTERVAL_US;
+    assert!(r.reexamination_due(1_000));
+    assert!(!r.reexamination_due(1_000 + iv - 1));
+    assert!(r.reexamination_due(1_000 + iv));
+    assert!(!r.reexamination_due(1_000 + iv + 1));
+    r.age_reexamination();
+    assert!(r.reexamination_due(1_000 + iv + 2));
 }
