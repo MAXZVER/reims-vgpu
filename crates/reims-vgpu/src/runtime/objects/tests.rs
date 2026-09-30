@@ -4932,3 +4932,80 @@ fn a_name_is_declared_a_window_only_when_the_switch_is_on() {
         "switch on: the first naming declares what the descriptor says"
     );
 }
+
+/// A name the model holds with no bytes is given the bytes its object turns out
+/// to own when construction finds them — with the switch on, and only then.
+///
+/// The name is issued when something first asks what the slot holds, which is
+/// often before the descriptor behind it is written or over a slot the guest
+/// reuses for another kind of object without a delete. Construction takes the
+/// existing name, so without this the model orders every access by it
+/// `DomainOnly` for as long as the name lives.
+#[test]
+fn a_name_held_with_no_bytes_takes_the_storage_construction_finds_only_with_the_switch_on() {
+    use reims_vgpu_core::access::{
+        AccessKey, AccessMode, AccessSource as _, Participation, ParticipationExtent,
+    };
+    use reims_vgpu_core::identity::{ChannelId, TaskId};
+    use reims_vgpu_core::lifecycle::Storage;
+
+    let build = || {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        setup_task_with_list(&mut host, &mut state);
+        let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+        let mut desc = [0u8; 16];
+        desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+        desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + 0x100, &desc);
+        let mut entry = [0u8; 12];
+        st32(
+            &mut entry[0..],
+            u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+        );
+        entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + 2 * 12, &entry);
+        // Named with no bytes before anything could say otherwise.
+        let name = state
+            .declare_object(1, 2, Storage::NoBytes)
+            .expect("the task is defined")
+            .id;
+        (host, state, name)
+    };
+    let access = |state: &DeviceState, name| {
+        state
+            .task_access(TaskId(1), ChannelId(1))
+            .access(&Participation {
+                resource: name,
+                extent: ParticipationExtent::Whole,
+                mode: AccessMode::Write,
+                api_stages: 0,
+            })
+            .expect("a live name")
+    };
+
+    let (host, state, name) = build();
+    assert!(!state.name_owns_bytes(1, name));
+    with_access_exact(false, || resolve_resource(&state, &host, 1, 2)).expect("constructs");
+    assert!(
+        !state.name_owns_bytes(1, name),
+        "switch off: nothing is told"
+    );
+    assert_eq!(access(&state, name).key, AccessKey::DomainOnly);
+
+    let (host, state, name) = build();
+    with_access_exact(true, || resolve_resource(&state, &host, 1, 2)).expect("constructs");
+    assert!(
+        state.name_owns_bytes(1, name),
+        "switch on: the model is told"
+    );
+    assert!(
+        matches!(access(&state, name).key, AccessKey::Whole(_)),
+        "and the name is ordered by the memory it owns"
+    );
+    assert_eq!(
+        state.object_name(1, 2),
+        Some(name),
+        "under the name it already had: nothing was redeclared"
+    );
+}
