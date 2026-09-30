@@ -745,6 +745,38 @@ pub const GATHER_AUDIT_ALL: &str = "REIMS_VGPU_GATHER_AUDIT_ALL";
 /// binary that can be run both ways against that guest.
 pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 
+/// **Default off.** `on` makes the ordering model state its accesses exactly
+/// where the guest has told it enough to: a texture view, a buffer texture and a
+/// surface-backed texture stop being [`AccessKey::DomainOnly`] and are ordered
+/// against the memory they are a window onto.
+///
+/// # What it changes, and why that is not the default
+///
+/// It changes what the model *knows*, and only that. No packet's records, no
+/// host command and no byte the guest can read is computed differently. But the
+/// model's knowledge is also what releases work: a transaction is ready when the
+/// hazard edges it was admitted with are discharged, and exact accesses draw
+/// fewer edges. So with this on, a packet can be ready while an earlier packet
+/// of its own channel is still parked — on a translation, on a stamp, on host
+/// paint — and then it runs first. That is precisely what the model's schedule
+/// equivalence permits and what exact accesses are *for*; it is also a change
+/// to the order this device executes in, made on the strength of a claim about
+/// a guest (that the accesses are exact) rather than of a measurement of the
+/// frames it produces. A claim of that shape gets a binary that runs both ways
+/// until the measurement exists, and the default stays on the side that changes
+/// nothing.
+///
+/// # Why it is not the widening this module forbids
+///
+/// It turns on no rail and imports nothing. The accesses it states are a
+/// superset of what a record touches by construction — a view is its base's
+/// whole window, a surface is the whole surface — and a name it cannot resolve
+/// stays `DomainOnly`, so the most it can do is order a packet against exactly
+/// what the packet touches instead of against everything.
+///
+/// [`AccessKey::DomainOnly`]: https://docs.rs/reims-vgpu-core
+pub const ACCESS_EXACT: &str = "REIMS_VGPU_ACCESS_EXACT";
+
 /// `on` issues the draw-time guest buffer gather as one compute dispatch per
 /// gathered window instead of one transfer region per guest run.
 ///

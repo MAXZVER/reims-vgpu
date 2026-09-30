@@ -589,6 +589,20 @@ impl Namespace {
         self.named_by_a_live_slot(backing) || self.retiring.contains_key(&backing)
     }
 
+    /// Whether `name` is the current, undeleted occupant of its slot.
+    ///
+    /// The question [`Self::resolve`] answers, without being a resolution: it
+    /// counts nothing and leases nothing, so an owner that has to *look* at a
+    /// second name while it is resolving a first — an alias asking whether the
+    /// thing it is a window onto is still there — does not inflate the census
+    /// of names the guest asked for.
+    #[must_use]
+    pub fn is_live(&self, name: ResourceId) -> bool {
+        self.slots
+            .get(&name.slot)
+            .is_some_and(|s| s.generation == name.generation && !s.deleted)
+    }
+
     /// Accepted uses of a name's current backing that have not retired.
     #[must_use]
     pub fn outstanding(&self, name: ResourceId) -> usize {

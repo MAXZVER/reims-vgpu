@@ -4998,6 +4998,29 @@ impl DeviceState {
         })
     }
 
+    /// Tell the ordering model what a byte-less name is a window onto.
+    ///
+    /// The runtime half of [`reims_vgpu_core::lifecycle::Aliasing`]: only this
+    /// layer reads the descriptor that says what a view or a surface texture is
+    /// over, and only the owner may record it. Returns whether it was recorded;
+    /// `false` is a name that owns bytes, which an alias must not shadow.
+    ///
+    /// # Errors
+    ///
+    /// The owner's refusal: a task it does not hold, or a name that is not its
+    /// slot's live occupant.
+    pub fn declare_alias(
+        &self,
+        task_id: u32,
+        name: reims_vgpu_core::identity::ResourceId,
+        alias: reims_vgpu_core::lifecycle::Aliasing,
+    ) -> Result<bool, reims_vgpu_core::lifecycle::Refusal> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .declare_alias(reims_vgpu_core::identity::TaskId(task_id), name, alias)
+    }
+
     /// Retire a name: stop it resolving, and leave accepted work alone.
     ///
     /// `None` when the slot held nothing this device had named — the guest
@@ -6083,7 +6106,10 @@ impl reims_vgpu_core::access::AccessSource for DeviceAccess<'_> {
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .access(self.task, self.domain, participation)
+                // The device is the mapper, so a name declared as a window onto
+                // a surface resolves to the surface's backing *as of this
+                // access*. With no alias declared this is `access` exactly.
+                .access_through(self.task, self.domain, participation, self.state)
         };
         match answer {
             Ok(intent) => {

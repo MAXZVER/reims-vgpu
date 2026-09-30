@@ -3057,7 +3057,11 @@ pub fn resolve_resource<M: HostMemory>(
             crate::runtime::drain::note_store_route("object_named_before_constructed");
             existing
         }
-        None => declare_object_name(state, task_id, obj_ref, storage)?,
+        None => {
+            let name = declare_object_name(state, task_id, obj_ref, storage)?;
+            declare_alias_for(state, host, task_id, name, &entry, &descriptor);
+            name
+        }
     };
     let resource = Arc::new(TaskResource::new(entry, descriptor));
     Ok(state.task_resources.register(task_id, name, resource))
@@ -3291,7 +3295,192 @@ pub fn name_resource<M: HostMemory>(
     let entry = lookup_list_entry(state, host, task_id, obj_ref)?;
     let descriptor: Arc<[u8]> = Arc::from(read_descriptor(state, host, task_id, &entry)?);
     let storage = declared_storage(state, task_id, obj_ref, &entry, &descriptor).ok();
-    declare_object_name(state, task_id, obj_ref, storage).ok()
+    let name = declare_object_name(state, task_id, obj_ref, storage).ok()?;
+    declare_alias_for(state, host, task_id, name, &entry, &descriptor);
+    Some(name)
+}
+
+/// Whether the ordering model is to state byte-less names exactly. See
+/// [`crate::config::ACCESS_EXACT`]; read once.
+pub(crate) fn access_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::ACCESS_EXACT).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
+/// How deep a declaration may nest: naming a view names its base, which may be
+/// a view, which names its base. The guest writes the list, so the chain is
+/// the guest's length and this is the stack's.
+const ALIAS_DECLARE_DEPTH: u8 = 4;
+
+thread_local! {
+    static ALIAS_DECLARING: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Say what a name that owns no bytes is a window onto, to the model that
+/// orders work.
+///
+/// # What is declared, and from what
+///
+/// Two kinds of object are byte-less and still touch memory, and the model
+/// was answering both `DomainOnly`:
+///
+/// - **A ref texture (type 5)**: the descriptor's header names the surface the
+///   texture is over, and on this interface a surface id *is* its mapping id —
+///   `AppleParavirtResource::allocateBackingHandle` adds the backing object at
+///   the object-list index `IOSurface::getSurfaceID()`. So the alias is the
+///   mapping, and the model asks the mapper for the backing each time it is
+///   used. A present of that surface reads `Whole` of the same backing, so the
+///   two meet.
+/// - **A texture view (type 8)**: a view over another texture, with the level
+///   and slice range its record carries, or a texture laid over a buffer's
+///   bytes (the opcode-9 form). The base is named — a slot the guest has not
+///   been asked about yet is named by reading its list entry, exactly as any
+///   other first mention would — and the alias holds the base's *name*, which
+///   carries a generation, so a base the guest deletes or replaces stops
+///   resolving and the view falls back to `DomainOnly`.
+///
+/// Anything it cannot establish is left undeclared and counted under its own
+/// route; an undeclared name is the `DomainOnly` it always was. Nothing is
+/// refused: this states what a name is over and is never a reason to lose a
+/// packet.
+///
+/// Gated by [`access_exact`], because it changes which packets the model
+/// releases ahead of which.
+fn declare_alias_for<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    name: reims_vgpu_core::identity::ResourceId,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) {
+    use crate::runtime::drain::note_store_route as note;
+
+    if !access_exact()
+        || !matches!(
+            entry.object_type,
+            OBJECT_TYPE_REF_TEXTURE | OBJECT_TYPE_TEXTURE_VIEW
+        )
+    {
+        return;
+    }
+    let depth = ALIAS_DECLARING.with(|d| d.get());
+    if depth >= ALIAS_DECLARE_DEPTH {
+        note("alias_declare_too_deep");
+        return;
+    }
+    ALIAS_DECLARING.with(|d| d.set(depth + 1));
+    let alias = alias_of_descriptor(state, host, task_id, entry, descriptor);
+    ALIAS_DECLARING.with(|d| d.set(depth));
+    let Some((alias, route)) = alias else {
+        return;
+    };
+    note(match state.declare_alias(task_id, name, alias) {
+        Ok(true) => route,
+        Ok(false) => "alias_refused_name_owns_bytes",
+        Err(_) => "alias_refused_name_not_live",
+    });
+}
+
+/// The alias a byte-less object's descriptor states, and the route that counts
+/// it, or `None` (counted) when the descriptor does not say enough.
+fn alias_of_descriptor<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) -> Option<(reims_vgpu_core::lifecycle::Aliasing, &'static str)> {
+    use crate::runtime::decode::resource::{
+        decode_buffer_texture_descriptor, decode_texture_view_descriptor, texture_view_opcode,
+        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
+    };
+    use crate::runtime::drain::note_store_route as note;
+    use reims_vgpu_core::access::SubresourceRange;
+    use reims_vgpu_core::identity::MappingId;
+    use reims_vgpu_core::lifecycle::Aliasing;
+
+    if entry.object_type == OBJECT_TYPE_REF_TEXTURE {
+        let Ok(header) = reims_vgpu_wire::device_desc::ref_texture_header(descriptor) else {
+            note("alias_ref_texture_short");
+            return None;
+        };
+        let surface = header.surface_id.get();
+        if !crate::model::is_mapping_id(surface) {
+            note("alias_ref_texture_no_surface");
+            return None;
+        }
+        return Some((
+            Aliasing::Surface(MappingId(surface)),
+            "alias_declared_surface",
+        ));
+    }
+    if matches!(
+        texture_view_opcode(descriptor),
+        Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE | TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE)
+    ) {
+        let Ok(laid) = decode_buffer_texture_descriptor(descriptor) else {
+            note("alias_buffer_texture_undecodable");
+            return None;
+        };
+        if laid.buffer_ref == 0 {
+            note("alias_buffer_texture_no_buffer");
+            return None;
+        }
+        let Some(buffer) = name_resource(state, host, task_id, laid.buffer_ref) else {
+            note("alias_buffer_texture_buffer_unnamed");
+            return None;
+        };
+        return Some((
+            Aliasing::BufferBytes { buffer },
+            "alias_declared_buffer_bytes",
+        ));
+    }
+    let Ok(view) = decode_texture_view_descriptor(descriptor) else {
+        note("alias_view_undecodable");
+        return None;
+    };
+    if view.base_texture_ref == 0 {
+        note("alias_view_no_base");
+        return None;
+    }
+    let Some(base) = name_resource(state, host, task_id, view.base_texture_ref) else {
+        note("alias_view_base_unnamed");
+        return None;
+    };
+    // The simple form carries no range, and a range that does not fit the
+    // words the model keys on is left as the whole base rather than truncated:
+    // a truncated window would name fewer levels than the view covers.
+    let window = if view.carries_range() {
+        match (
+            u32::try_from(view.level_base),
+            u32::try_from(view.level_count),
+            u32::try_from(view.slice_base),
+            u32::try_from(view.slice_count),
+        ) {
+            (Ok(base_level), Ok(level_count), Ok(base_slice), Ok(slice_count)) => {
+                Some(SubresourceRange {
+                    base_level,
+                    level_count,
+                    base_slice,
+                    slice_count,
+                    plane: 0,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    Some((
+        Aliasing::TextureView { base, window },
+        "alias_declared_view",
+    ))
 }
 
 /// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,
