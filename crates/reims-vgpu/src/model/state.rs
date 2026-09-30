@@ -2118,6 +2118,10 @@ pub struct MappingEntry {
     /// [`Self::contig_refused_gen`]. Re-deriving it sorted every page of the
     /// surface once per draw bind: a 5K surface is ~10 800 pages.
     pub control_clear: Option<(u32, u64)>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_RUNS_FIX`): windows of this page list a sampled
+    /// bind resolved, with their runs, keyed on `map_generation` and the control
+    /// layout key. See [`crate::runtime::lab_runs`].
+    pub window_cache: Vec<crate::runtime::lab_runs::WindowCacheEntry>,
     /// Live [`crate::runtime::host::HostOps::track_guest_writes`] token for the
     /// page list in [`Self::page_entries`], or 0 when the host cannot observe
     /// guest writes (or none has been asked for yet).

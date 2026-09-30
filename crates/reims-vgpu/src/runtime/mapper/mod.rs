@@ -1965,6 +1965,61 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     if !{ revalidate_mapping_pages(state, host, mapping_id) } {
         return None;
     }
+    mapping_page_gpas_revalidated(state, mapping_id)
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_RUNS_FIX`): what a cached window needs to know
+/// about its mapping before it may be served: the same revalidation and
+/// liveness checks as [`mapping_page_gpas`], and the key its answer is valid
+/// under - the list's `map_generation`, the control layout the collision check
+/// compares against, and the list's length. Does not build the page list.
+pub(crate) fn lab_mapping_window_key<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<(u32, u64, usize)> {
+    if !{ revalidate_mapping_pages(state, host, mapping_id) } {
+        return None;
+    }
+    let m = state.mappings.get(&mapping_id)?;
+    if !m.mapped || m.page_entries.is_empty() {
+        return None;
+    }
+    let pages = m.page_entries.len();
+    Some((m.map_generation, control_layout_key(state, pages), pages))
+}
+
+/// TEMP (lab): the cache half of a window resolve.
+pub(crate) fn lab_window_cache_lookup(
+    state: &DeviceState,
+    mapping_id: u32,
+    key: &crate::runtime::lab_runs::WindowKey,
+) -> Option<(
+    std::sync::Arc<Vec<u64>>,
+    std::sync::Arc<Vec<crate::runtime::guest_ram::GuestRun>>,
+)> {
+    crate::runtime::lab_runs::lookup(&state.mappings.get(&mapping_id)?.window_cache, key)
+}
+
+/// TEMP (lab): remember a window resolved under `key`.
+pub(crate) fn lab_window_cache_insert(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    key: crate::runtime::lab_runs::WindowKey,
+    gpas: std::sync::Arc<Vec<u64>>,
+    runs: std::sync::Arc<Vec<crate::runtime::guest_ram::GuestRun>>,
+) {
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        crate::runtime::lab_runs::insert(&mut m.window_cache, key, gpas, runs);
+    }
+}
+
+/// [`mapping_page_gpas`] after the revalidation: the page list of a mapping
+/// whose liveness the caller has just established.
+pub(crate) fn mapping_page_gpas_revalidated(
+    state: &mut DeviceState,
+    mapping_id: u32,
+) -> Option<Vec<u64>> {
     let m = state.mappings.get(&mapping_id)?;
     if !m.mapped || m.page_entries.is_empty() {
         return None;
