@@ -2035,6 +2035,66 @@ pub(crate) fn lab_mapping_window_key<H: HostMemory + HostOps>(
     Some((m.map_generation, control_layout_key(state, pages), pages))
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_RUNS_FIX`): the read-only twin of
+/// [`lab_mapping_window_key`], for a mapping whose revalidation cannot mutate
+/// anything: one with no `mapping_internal`.
+///
+/// [`revalidate_mapping_reason`] re-resolves only `if m.mapping_internal != 0`
+/// and otherwise reaches its final `match`, which for a mapped mapping with a
+/// page list answers `None` ("resolvable") and touches nothing. So for such a
+/// mapping the whole of [`lab_mapping_window_key`] is a function of `&DeviceState`,
+/// and this is that function. It answers `None` for a mapping it cannot vouch for
+/// without mutating - one with a `mapping_internal` (the re-resolve may rewrite
+/// the page list, geometry and descriptor), unmapped, or with no pages - and the
+/// caller then takes the mutating path, which decides those cases as it always did.
+/// On the x86 PCI pathway no mapping ever has a `mapping_internal`: the mapper
+/// capture needs `HostOps::read_xreg`, which the PCI shim answers -1.
+pub(crate) fn mapping_window_key_readonly(
+    state: &DeviceState,
+    mapping_id: u32,
+) -> Option<(u32, u64, usize)> {
+    let m = state.mappings.get(&mapping_id)?;
+    if !m.mapped || m.mapping_internal != 0 || m.page_entries.is_empty() {
+        return None;
+    }
+    let pages = m.page_entries.len();
+    Some((m.map_generation, control_layout_key(state, pages), pages))
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_RUNS_FIX`): the resolved window `[base_off,
+/// base_off + span)` of `mapping_id`, without mutating anything, when the mapping's
+/// window cache holds it under the mapping's current key - `None` for every case
+/// that needs the mutating resolve (see [`mapping_window_key_readonly`]) or has no
+/// cached window.
+///
+/// The page list and runs come back as the `Arc`s the cache holds, so a worker
+/// holding only `&DeviceState` can take them and the drain keeps the mutating
+/// path for misses.
+pub(crate) fn mapping_window_cached(
+    state: &DeviceState,
+    mapping_id: u32,
+    base_off: u64,
+    span: u64,
+) -> Option<(
+    std::sync::Arc<Vec<u64>>,
+    std::sync::Arc<Vec<crate::runtime::guest_ram::GuestRun>>,
+)> {
+    let (map_generation, control_key, mapping_pages) =
+        mapping_window_key_readonly(state, mapping_id)?;
+    lab_window_cache_lookup(
+        state,
+        mapping_id,
+        &crate::runtime::lab_runs::WindowKey {
+            map_generation,
+            control_key,
+            mapping_pages,
+            base_off,
+            span,
+            page: state.page_size(),
+        },
+    )
+}
+
 /// TEMP (lab): the cache half of a window resolve.
 pub(crate) fn lab_window_cache_lookup(
     state: &DeviceState,
