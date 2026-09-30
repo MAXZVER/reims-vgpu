@@ -1874,6 +1874,67 @@ impl Lifecycle {
         Ok(true)
     }
 
+    /// Give a live name that was declared with no bytes the bytes its object
+    /// turns out to own.
+    ///
+    /// # When a name is declared before its object can say what it is
+    ///
+    /// A name is issued the first time anything asks what a slot holds, and the
+    /// question is often a lifetime packet or a pipeline lookup that reads the
+    /// slot's list entry before the guest has finished writing the descriptor
+    /// behind it — or reads a slot the guest has since reused for a different
+    /// kind of object without sending a delete. The name is then declared
+    /// [`Storage::NoBytes`], and it stays so: construction takes the existing
+    /// name rather than issue a second one, because a second one would retire an
+    /// object the guest never deleted. Every access by that name is then
+    /// [`crate::access::AccessKey::DomainOnly`] for as long as the name lives,
+    /// whatever the object in the slot is.
+    ///
+    /// This is the half that was missing: the same declaration
+    /// [`LifecycleOp::CreateResource`] makes — residency, namespace backing,
+    /// content authority over the guest's own pages — applied to a name that
+    /// already exists, without the generation advance and the displacement
+    /// that a redeclaration is. Only a [`Storage::Dedicated`] arrives here:
+    /// nothing in the model stopped a placed resource being described the same
+    /// way, and nothing produces one.
+    ///
+    /// Returns whether the storage was attached. `false` for a name that is not
+    /// live, that already owns bytes, or that is a declared window onto another
+    /// name's memory ([`Aliasing`]) — an alias is itself the statement that the
+    /// name has none — and for any storage other than `Dedicated`.
+    ///
+    /// # Errors
+    ///
+    /// If the task does not exist.
+    pub fn attach_storage(
+        &mut self,
+        task: TaskId,
+        name: ResourceId,
+        storage: Storage,
+    ) -> Result<bool, Refusal> {
+        let Storage::Dedicated { backing, extent } = storage else {
+            return Ok(false);
+        };
+        let t = self
+            .tasks
+            .get_mut(&task)
+            .ok_or(Refusal::NoSuchTask { task })?;
+        if t.resident.contains_key(&name) || t.aliases.contains_key(&name) {
+            return Ok(false);
+        }
+        if !t.namespace.attach_backing(name, backing) {
+            return Ok(false);
+        }
+        // Its own pages: the guest supplied them and holds all of the content,
+        // so this is a declaration and not a write, exactly as in
+        // `create_resource`.
+        self.content.declare(backing, extent, Replica::GuestPages);
+        let t = self.tasks.get_mut(&task).expect("checked above");
+        t.resident
+            .insert(name, Resident::Dedicated { backing, extent });
+        Ok(true)
+    }
+
     /// The alias a name was declared with, for a test or a census.
     #[must_use]
     pub fn alias_of(&self, task: TaskId, resource: ResourceId) -> Option<Aliasing> {
@@ -6704,6 +6765,99 @@ mod alias_tests {
             .expect("neighbour");
         let neighbour = touch(&mut l, name(7), AccessMode::Write);
         assert!(!requires_edge(&neighbour, &view));
+    }
+
+    /// A name declared with no bytes that turns out to own some is ordered
+    /// against those bytes from then on, under the name it already had.
+    ///
+    /// Not a redeclaration: the name, its generation and every id handed out for
+    /// it are the same before and after, and accepted work keeps the name it was
+    /// admitted under.
+    #[test]
+    fn a_name_that_turns_out_to_own_bytes_keeps_its_name_and_takes_them() {
+        let mut l = world();
+        let before = touch(&mut l, name(5), AccessMode::Write);
+        assert_eq!(before.key, AccessKey::DomainOnly);
+
+        let storage = Storage::Dedicated {
+            backing: BackingId(77),
+            extent: range(0, 0x2000),
+        };
+        assert_eq!(l.attach_storage(TASK, name(5), storage), Ok(true));
+
+        let after = touch(&mut l, name(5), AccessMode::Write);
+        assert_eq!(
+            after.key,
+            AccessKey::Whole(ResourceKey {
+                backing: BackingId(77),
+                heap: None
+            })
+        );
+        assert!(
+            after.output_content_version.is_some(),
+            "it owns bytes now, so a write is authority over them like any other"
+        );
+        // The same name still resolves, and another resource over other
+        // storage is still independent of it.
+        let other = touch(&mut l, name(1), AccessMode::Write);
+        assert!(!requires_edge(&other, &after));
+        assert!(l.content().knows(BackingId(77)));
+        // And the name's departure owes what a name over bytes owes.
+        let effects = l
+            .apply(&LifecycleOp::DeleteResource {
+                task: TASK,
+                object_ref: 5,
+                resource: Some(name(5)),
+            })
+            .expect("delete");
+        assert!(
+            matches!(effects.teardowns.as_slice(), [namespace::Teardown::Now { backing }] if *backing == BackingId(77)),
+            "{effects:?}"
+        );
+    }
+
+    /// Storage is settled once, and only for a name that is live and has none.
+    #[test]
+    fn attaching_storage_is_refused_for_everything_but_a_live_name_with_none() {
+        let mut l = world();
+        let dedicated = |b| Storage::Dedicated {
+            backing: BackingId(b),
+            extent: range(0, 0x1000),
+        };
+        // Already owns bytes.
+        assert_eq!(l.attach_storage(TASK, name(0), dedicated(88)), Ok(false));
+        assert_eq!(
+            touch(&mut l, name(0), AccessMode::Read).key,
+            AccessKey::Whole(ResourceKey {
+                backing: BackingId(10),
+                heap: None
+            }),
+            "and keeps the storage it had"
+        );
+        // A declared window onto another name's memory.
+        l.declare_alias(TASK, name(2), Aliasing::Surface(MappingId(7)))
+            .expect("surface");
+        assert_eq!(l.attach_storage(TASK, name(2), dedicated(88)), Ok(false));
+        // Not a live name.
+        assert_eq!(l.attach_storage(TASK, name(99), dedicated(88)), Ok(false));
+        let _ = l
+            .apply(&LifecycleOp::DeleteResource {
+                task: TASK,
+                object_ref: 4,
+                resource: Some(name(4)),
+            })
+            .expect("delete");
+        assert_eq!(l.attach_storage(TASK, name(4), dedicated(88)), Ok(false));
+        // A storage that is not dedicated.
+        assert_eq!(l.attach_storage(TASK, name(3), Storage::NoBytes), Ok(false));
+        // No such task.
+        assert_eq!(
+            l.attach_storage(TaskId(9), name(3), dedicated(88)),
+            Err(Refusal::NoSuchTask { task: TaskId(9) })
+        );
+        // The one that qualifies, once.
+        assert_eq!(l.attach_storage(TASK, name(3), dedicated(88)), Ok(true));
+        assert_eq!(l.attach_storage(TASK, name(3), dedicated(89)), Ok(false));
     }
 
     /// The default of the whole owner is unchanged for a name nobody declared an

@@ -5115,6 +5115,27 @@ impl DeviceState {
             .declare_alias(reims_vgpu_core::identity::TaskId(task_id), name, alias)
     }
 
+    /// Tell the ordering model that a name it holds with no bytes owns some.
+    ///
+    /// The runtime half of [`reims_vgpu_core::lifecycle::Lifecycle::attach_storage`]:
+    /// only this layer reads the descriptor that says what a slot holds *now*.
+    /// Returns whether the model took it.
+    ///
+    /// # Errors
+    ///
+    /// The owner's refusal: a task it does not hold.
+    pub fn attach_storage(
+        &self,
+        task_id: u32,
+        name: reims_vgpu_core::identity::ResourceId,
+        storage: reims_vgpu_core::lifecycle::Storage,
+    ) -> Result<bool, reims_vgpu_core::lifecycle::Refusal> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attach_storage(reims_vgpu_core::identity::TaskId(task_id), name, storage)
+    }
+
     /// TEMP (lab, access precision): whether the model holds this name over
     /// bytes of its own.
     pub fn name_owns_bytes(&self, task_id: u32, name: reims_vgpu_core::identity::ResourceId) -> bool {

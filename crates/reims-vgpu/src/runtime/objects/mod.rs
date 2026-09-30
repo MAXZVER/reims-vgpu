@@ -3065,6 +3065,20 @@ pub fn resolve_resource<M: HostMemory>(
                 Some(reims_vgpu_core::lifecycle::Storage::Dedicated { .. })
             ) && !state.name_owns_bytes(task_id, existing)
             {
+                // Told to the model, which otherwise orders every access by this
+                // name `DomainOnly` for as long as the name lives. Behind the
+                // switch: it changes what the model releases ahead of what.
+                if access_exact() {
+                    if let Some(storage) = storage {
+                        crate::runtime::drain::note_store_route(
+                            match state.attach_storage(task_id, existing, storage) {
+                                Ok(true) => "access_name_storage_attached",
+                                Ok(false) => "access_name_storage_not_attached",
+                                Err(_) => "access_name_storage_no_task",
+                            },
+                        );
+                    }
+                }
                 crate::runtime::drain::note_store_route("lab_named_nobytes_constructed_dedicated");
                 if crate::observe::first_sight(
                     "lab_named_nobytes_constructed_dedicated",

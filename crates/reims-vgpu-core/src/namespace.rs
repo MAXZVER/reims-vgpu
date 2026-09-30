@@ -589,6 +589,29 @@ impl Namespace {
         self.named_by_a_live_slot(backing) || self.retiring.contains_key(&backing)
     }
 
+    /// Give a live name that owns no storage the storage it turns out to own.
+    ///
+    /// **Not a redeclaration, and the difference is the point.** [`Self::declare`]
+    /// advances the slot's generation and displaces the occupant, which is the
+    /// right event for a slot the guest has overwritten and the wrong one for a
+    /// name that was issued before its object's descriptor said what it was:
+    /// every [`ResourceId`] already handed out for it would go stale, and work
+    /// accepted under it would be told its name had been deleted.
+    ///
+    /// `false` — and nothing changes — for a name that is not the slot's live
+    /// occupant, or that already names storage. A name's storage is settled once.
+    pub fn attach_backing(&mut self, name: ResourceId, backing: BackingId) -> bool {
+        let Some(slot) = self.slots.get_mut(&name.slot) else {
+            return false;
+        };
+        if slot.generation != name.generation || slot.deleted || slot.backing.is_some() {
+            return false;
+        }
+        slot.backing = Some(backing);
+        self.enter(Some(backing));
+        true
+    }
+
     /// Whether `name` is the current, undeleted occupant of its slot.
     ///
     /// The question [`Self::resolve`] answers, without being a resolution: it
