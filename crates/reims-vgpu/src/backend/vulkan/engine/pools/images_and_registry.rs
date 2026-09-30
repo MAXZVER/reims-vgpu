@@ -931,7 +931,12 @@ impl ResourcePools {
     ) -> Option<ResidentTargetSlot> {
         let old = self.registry.remove(identity);
         self.registry_order.retain(|k| k != identity);
-        let old = old?;
+        let mut old = old?;
+        // Off the lock-free table in the same critical section as the removal,
+        // not whenever the caller gets round to dropping the slot. Dropping it
+        // would do the same; doing it here is what lets this function's doc say
+        // the registry and the table lose a resident together.
+        old.readiness.retire();
         if old.pin_count == 0 {
             self.registry_non_pinned_adjust(Self::slot_attachment_bytes(&old), false);
         }
@@ -1042,6 +1047,15 @@ impl ResourcePools {
                 generation: new.generation,
                 content_ready: guest_backed,
                 content_epoch: None,
+                // Born on the lock-free table in the state the two fields above
+                // say, so a reader never finds a resident the registry holds and
+                // the table does not. A guest import is ready from birth: its
+                // pixels are the guest's pages.
+                readiness: super::readiness::ReadinessHandle::register(
+                    identity,
+                    guest_backed,
+                    guest_backed,
+                ),
                 access: if guest_backed {
                     ResidentAccess::GuestBacking
                 } else {
@@ -2041,8 +2055,7 @@ impl ResourcePools {
             .get(identity)
             .is_some_and(|slot| slot.memory.is_guest_imported());
         if let Some(slot) = self.registry.get_mut(identity) {
-            slot.content_ready = true;
-            slot.content_epoch = None;
+            slot.set_content(true, None);
         }
         self.set_registry_access(identity, access);
         self.set_sole_copy(identity, !guest_backed);
@@ -2070,7 +2083,7 @@ impl ResourcePools {
     /// deciding depth needs its own age.
     pub(crate) fn registry_mark_depth_ready(&mut self, identity: &TargetIdentity) {
         if let Some(slot) = self.registry.get_mut(identity) {
-            slot.content_ready = true;
+            slot.set_content(true, slot.content_epoch);
         }
         // The depth pass declares `final_layout` DEPTH_STENCIL_ATTACHMENT_
         // OPTIMAL unconditionally, so this is where the image is left and it
@@ -2317,7 +2330,7 @@ impl ResourcePools {
     ) -> bool {
         match self.registry.get_mut(identity) {
             Some(slot) if slot.content_ready => {
-                slot.content_epoch = Some(epoch);
+                slot.set_content(true, Some(epoch));
                 true
             }
             _ => false,
@@ -2992,6 +3005,7 @@ pub(super) mod pin_count_tests {
             generation: 1,
             content_ready,
             content_epoch: None,
+            readiness: super::readiness::ReadinessHandle::detached(),
             // What `registry_mark_ready` actually records, read from the same
             // constant it reads, so this fixture cannot drift into describing a
             // resident no pass produces.
@@ -3363,6 +3377,227 @@ pub(super) mod pin_count_tests {
              the *compute-storage* registry — a different registry the host \
              window is never published against"
         );
+    }
+
+    /// The registry is the only writer of a resident's content state, and it
+    /// writes it in exactly one place: [`ResidentTargetSlot::set_content`], which
+    /// publishes to the lock-free readiness table in the same breath.
+    ///
+    /// The table is what readers consult *instead of* the engine lock, so a
+    /// second writer of `content_ready` or `content_epoch` is a resident the
+    /// table and the registry disagree about, silently, for as long as it lives.
+    /// Nothing in the build relates a new assignment to that rule, so this counts
+    /// them, as the test above does for `access`.
+    ///
+    /// The four other hits are test fixtures that build a slot *before* it is
+    /// registered: their handle is detached, so no reader can see the write.
+    #[test]
+    fn the_registry_writes_a_residents_content_state_in_exactly_one_place() {
+        const SOURCES: [&str; 7] = [
+            include_str!("images_and_registry.rs"),
+            include_str!("teardown.rs"),
+            include_str!("mod.rs"),
+            include_str!("submission_and_buffers.rs"),
+            include_str!("buffer_gather_working_set.rs"),
+            include_str!("sampled_working_set.rs"),
+            include_str!("readiness.rs"),
+        ];
+        let ready = concat!(".", "content_ready", " = ");
+        let ready_hits: usize = SOURCES.iter().map(|src| src.matches(ready).count()).sum();
+        assert_eq!(
+            ready_hits, 5,
+            "one writer of `content_ready` in `pools/` (`set_content`, which publishes) \
+             and four test fixtures assigning it on a slot no registry holds yet"
+        );
+        let epoch = concat!(".", "content_epoch", " = ");
+        let epoch_hits: usize = SOURCES.iter().map(|src| src.matches(epoch).count()).sum();
+        assert_eq!(
+            epoch_hits, 1,
+            "exactly one writer of `content_epoch` in `pools/`: `set_content`"
+        );
+    }
+
+    /// A slot that is a guest import, for the tests that need one registered.
+    fn guest_memory() -> ResidentMemory {
+        ResidentMemory::GuestImported {
+            guest: crate::backend::vulkan::engine::GuestTargetMemory {
+                backing: crate::backend::vulkan::engine::GuestTargetBacking {
+                    allocation_host_ptr: 0x1000,
+                    allocation_len: 0x4000,
+                    plane_offset: 0,
+                    row_pitch: 64,
+                },
+                import: std::sync::Arc::new(
+                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                        0x1000, 0x4000, 0x1000,
+                    )
+                    .unwrap(),
+                ),
+                footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
+                    std::sync::Arc::from([0x1000_u64]),
+                    0x1000,
+                )
+                .expect("page footprint"),
+            },
+        }
+    }
+
+    fn published(id: &TargetIdentity) -> Option<crate::backend::vulkan::engine::ResidentReadiness> {
+        crate::backend::vulkan::engine::resident_readiness(id)
+    }
+
+    /// What the table says and what the registry says, for one identity, and
+    /// whether they are the same thing. The invariant every other readiness test
+    /// is an instance of.
+    fn table_agrees_with_registry(pools: &ResourcePools, id: &TargetIdentity) -> bool {
+        match (published(id), pools.registry_get(id)) {
+            (None, None) => true,
+            (Some(table), Some(slot)) => {
+                table.ready == slot.content_ready
+                    && table.guest_imported == slot.memory.is_guest_imported()
+                    && table.content_epoch == slot.content_epoch
+            }
+            _ => false,
+        }
+    }
+
+    /// The table follows a resident through every change the registry makes to
+    /// what it says about its content, and `resident_content_backing` — which
+    /// now reads the table and takes no engine lock — answers as the registry
+    /// would.
+    #[test]
+    fn the_lock_free_table_follows_a_resident_from_birth_to_removal() {
+        use crate::backend::vulkan::engine::{resident_content_backing, ResidentContentBacking};
+        let mut pools = ResourcePools::new();
+        let id = surf(0x5eed_0001);
+        assert_eq!(published(&id), None);
+        assert_eq!(
+            resident_content_backing(&id),
+            ResidentContentBacking::NotReady,
+            "absent is not ready"
+        );
+
+        pools.register_resident(
+            &id,
+            new_resident(some_framebuffer(), vk::RenderPass::null()),
+        );
+        let born = published(&id).expect("born on the table with the registry");
+        assert!(!born.ready && !born.guest_imported && born.content_epoch.is_none());
+        assert_eq!(
+            resident_content_backing(&id),
+            ResidentContentBacking::NotReady
+        );
+        assert!(table_agrees_with_registry(&pools, &id));
+
+        pools.registry_mark_ready(&id);
+        let drawn = published(&id).unwrap();
+        assert!(drawn.ready && !drawn.guest_imported);
+        assert!(drawn.version > born.version, "a store moves the version");
+        assert_eq!(
+            resident_content_backing(&id),
+            ResidentContentBacking::DeviceAllocation
+        );
+        assert!(table_agrees_with_registry(&pools, &id));
+
+        assert!(pools.registry_stamp_content_epoch(&id, 9));
+        let stamped = published(&id).unwrap();
+        assert_eq!(stamped.content_epoch, Some(9));
+        assert!(stamped.version > drawn.version);
+        assert!(table_agrees_with_registry(&pools, &id));
+
+        // A depth store keeps the stamp — it does not touch the mapping — but it
+        // is still new pixels, so the version moves.
+        pools.registry_mark_depth_ready(&id);
+        let depth = published(&id).unwrap();
+        assert_eq!(depth.content_epoch, Some(9));
+        assert!(depth.version > stamped.version);
+        assert!(table_agrees_with_registry(&pools, &id));
+
+        // A colour store clears it: the image no longer holds the mapping's bytes.
+        pools.registry_mark_ready(&id);
+        let redrawn = published(&id).unwrap();
+        assert_eq!(redrawn.content_epoch, None);
+        assert!(redrawn.version > depth.version);
+        assert!(table_agrees_with_registry(&pools, &id));
+
+        // A refused stamp (absent resident) publishes nothing.
+        assert!(!pools.registry_stamp_content_epoch(&surf(0x5eed_00ff), 1));
+        assert_eq!(published(&surf(0x5eed_00ff)), None);
+
+        // Gone with the removal — before the caller has dropped the slot.
+        let removed = pools.unregister_resident(&id, ResidentReclaim::Recreated);
+        assert!(removed.is_some());
+        assert_eq!(published(&id), None);
+        assert_eq!(
+            resident_content_backing(&id),
+            ResidentContentBacking::NotReady
+        );
+        assert!(table_agrees_with_registry(&pools, &id));
+        drop(removed);
+    }
+
+    /// A guest import is ready from birth and says it is the guest's allocation.
+    #[test]
+    fn a_guest_imported_resident_is_published_ready_and_guest_backed() {
+        use crate::backend::vulkan::engine::{resident_content_backing, ResidentContentBacking};
+        let mut pools = ResourcePools::new();
+        let id = surf(0x5eed_0002);
+        let mut resident = new_resident(some_framebuffer(), vk::RenderPass::null());
+        resident.memory = guest_memory();
+        pools.register_resident(&id, resident);
+        let r = published(&id).expect("registered");
+        assert!(r.ready && r.guest_imported);
+        assert_eq!(
+            resident_content_backing(&id),
+            ResidentContentBacking::GuestAllocation
+        );
+        assert!(table_agrees_with_registry(&pools, &id));
+    }
+
+    /// Registering an identity that already has a resident replaces it, and the
+    /// replaced slot dropping afterwards must not take the new one's entry.
+    #[test]
+    fn replacing_a_resident_keeps_the_replacements_entry() {
+        let mut pools = ResourcePools::new();
+        let id = surf(0x5eed_0003);
+        pools.register_resident(
+            &id,
+            new_resident(some_framebuffer(), vk::RenderPass::null()),
+        );
+        let first = published(&id).unwrap();
+        let mut resident = new_resident(some_framebuffer(), vk::RenderPass::null());
+        resident.memory = guest_memory();
+        pools.register_resident(&id, resident);
+        let second = published(&id).expect("the replacement is on the table");
+        assert!(
+            second.guest_imported,
+            "it is the replacement that is served"
+        );
+        assert!(second.version > first.version);
+        assert!(table_agrees_with_registry(&pools, &id));
+    }
+
+    /// A pools that goes away — replaced by `*pools = ResourcePools::new()` on
+    /// a device recreate, with no `destroy_all` — takes its residents off the
+    /// table as its slots drop, so a successor never inherits a resident it does
+    /// not hold.
+    #[test]
+    fn dropping_a_pools_takes_its_residents_off_the_table() {
+        let ids = [surf(0x5eed_0004), surf(0x5eed_0005)];
+        {
+            let mut pools = ResourcePools::new();
+            for id in &ids {
+                pools.register_resident(
+                    id,
+                    new_resident(some_framebuffer(), vk::RenderPass::null()),
+                );
+                pools.registry_mark_ready(id);
+                assert!(published(id).is_some_and(|r| r.ready));
+            }
+        }
+        for id in &ids {
+            assert_eq!(published(id), None);
+        }
     }
 
     /// A pools that goes away takes its registry with it, and the stamps
@@ -4159,7 +4394,7 @@ pub(super) mod pin_count_tests {
             new_resident(some_framebuffer(), vk::RenderPass::null()),
         );
         let slot = pools.registry.get_mut(&id).expect("just registered");
-        slot.content_ready = true;
+        slot.set_content(true, None);
         slot.last_touch_ms = last_touch_ms;
         // Through the product path, not `slot.pin_count = pin`: pinning is what
         // takes a resident out of the maintained non-pinned totals, and a helper
@@ -4187,7 +4422,7 @@ pub(super) mod pin_count_tests {
         resident.height = height;
         pools.register_resident(&id, resident);
         let slot = pools.registry.get_mut(&id).expect("just registered");
-        slot.content_ready = true;
+        slot.set_content(true, None);
         slot.last_touch_ms = last_touch_ms;
         for _ in 0..pin {
             assert!(pools.pin_resident_target(&id, true), "content is ready");
