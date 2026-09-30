@@ -1,31 +1,42 @@
 //! TEMP (lab, S0): how much of the work WindowServer sends repeats from one
 //! frame to the next. `REIMS_VGPU_LAB_REPEAT=1`; measurement only.
 //!
-//! A frame is what ends at a present. Each draw is keyed twice: a *struct* key
-//! (pipeline, targets, bound resources, samplers, viewport/scissor, counts) and a
-//! *bytes* key (the vertex and fragment buffer bytes the draw carries), and is
-//! counted against the previous frame and the last four:
+//! A frame is what ends at a present. Each draw carries three *struct* keys and a
+//! *bytes* key (the first 4 KiB of every vertex and fragment buffer it binds):
 //!
-//! * `rep_full` - struct and bytes both seen in the previous frame;
-//! * `rep_struct_only` - struct seen, bytes differ (a drag: same draw, new positions);
-//! * `rep_new` - neither; `rep_full_w4` - full key seen in any of the last four
-//!   frames; `rep_partial` - draws that carried a buffer too large to hash whole.
+//! * A - everything: pipeline, targets (ref, mapping, gva), bound texture refs and
+//!   resource identity, samplers, viewport/scissor, counts;
+//! * B - A without the render-target identity (the framebuffers rotate, so A can
+//!   only repeat every third frame);
+//! * C - B without the bound-texture identity (pure shape).
 //!
-//! A stream is a run of draws continuing one render pass. `rep_streams` counts
-//! them and `rep_streams_repeat` those whose ordered list of draw keys appeared in
-//! the previous frame. The counts land in the store-route second windows.
+//! Counters (store-route windows): `rep_a_full`, `rep_b_full`, `rep_c_full` -
+//! key and bytes seen in the previous frame; `rep_a_full_w4`, `rep_b_full_w4` - in any
+//! of the last four; `rep_b_struct` - B seen in the previous frame but the bytes
+//! differ (a drag: same draw, new positions); `rep_new` - B not seen; `rep_partial` -
+//! draws with a buffer over 4 KiB (only its prefix is keyed).
+//!
+//! A stream is a run of draws continuing one render pass; `rep_streams`,
+//! `rep_streams_repeat_b` (ordered B+bytes list seen in the previous frame),
+//! `rep_streams_repeat_b_w4`.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
 
+type Key = (u64, u64);
+
 #[derive(Default)]
 struct Frames {
-    prev: [HashSet<(u64, u64)>; 4],
-    prev_struct: HashSet<u64>,
-    cur: HashSet<(u64, u64)>,
-    cur_struct: HashSet<u64>,
-    prev_streams: HashSet<u64>,
-    cur_streams: HashSet<u64>,
+    a: [HashSet<Key>; 4],
+    b: [HashSet<Key>; 4],
+    c_prev: HashSet<Key>,
+    b_struct_prev: HashSet<u64>,
+    a_cur: HashSet<Key>,
+    b_cur: HashSet<Key>,
+    c_cur: HashSet<Key>,
+    b_struct_cur: HashSet<u64>,
+    streams: [HashSet<u64>; 4],
+    streams_cur: HashSet<u64>,
     stream_hash: u64,
     stream_draws: u32,
 }
@@ -40,10 +51,13 @@ pub fn on() -> bool {
 fn close_stream(f: &mut Frames) {
     if f.stream_draws > 0 {
         crate::runtime::drain::note_store_route("rep_streams");
-        if f.prev_streams.contains(&f.stream_hash) {
-            crate::runtime::drain::note_store_route("rep_streams_repeat");
+        if f.streams[0].contains(&f.stream_hash) {
+            crate::runtime::drain::note_store_route("rep_streams_repeat_b");
         }
-        f.cur_streams.insert(f.stream_hash);
+        if f.streams.iter().any(|s| s.contains(&f.stream_hash)) {
+            crate::runtime::drain::note_store_route("rep_streams_repeat_b_w4");
+        }
+        f.streams_cur.insert(f.stream_hash);
     }
     f.stream_hash = 0;
     f.stream_draws = 0;
@@ -59,37 +73,53 @@ pub fn frame() {
     close_stream(f);
     crate::runtime::drain::note_store_route("rep_frames");
     for i in (1..4).rev() {
-        f.prev[i] = std::mem::take(&mut f.prev[i - 1]);
+        f.a[i] = std::mem::take(&mut f.a[i - 1]);
+        f.b[i] = std::mem::take(&mut f.b[i - 1]);
+        f.streams[i] = std::mem::take(&mut f.streams[i - 1]);
     }
-    f.prev[0] = std::mem::take(&mut f.cur);
-    f.prev_struct = std::mem::take(&mut f.cur_struct);
-    f.prev_streams = std::mem::take(&mut f.cur_streams);
+    f.a[0] = std::mem::take(&mut f.a_cur);
+    f.b[0] = std::mem::take(&mut f.b_cur);
+    f.streams[0] = std::mem::take(&mut f.streams_cur);
+    f.c_prev = std::mem::take(&mut f.c_cur);
+    f.b_struct_prev = std::mem::take(&mut f.b_struct_cur);
 }
 
 /// One draw: `new_stream` when it does not continue the previous draw's pass.
-pub fn draw(struct_key: u64, bytes_key: u64, partial: bool, new_stream: bool) {
+pub fn draw(a: u64, b: u64, c: u64, bytes: u64, partial: bool, new_stream: bool) {
     let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let f = guard.get_or_insert_with(Frames::default);
     if new_stream {
         close_stream(f);
     }
-    let full = (struct_key, bytes_key);
-    crate::runtime::drain::note_store_route("rep_draws");
+    let (ka, kb, kc) = ((a, bytes), (b, bytes), (c, bytes));
+    let note = crate::runtime::drain::note_store_route;
+    note("rep_draws");
     if partial {
-        crate::runtime::drain::note_store_route("rep_partial");
+        note("rep_partial");
     }
-    if f.prev[0].contains(&full) {
-        crate::runtime::drain::note_store_route("rep_full");
-    } else if f.prev_struct.contains(&struct_key) {
-        crate::runtime::drain::note_store_route("rep_struct_only");
+    if f.a[0].contains(&ka) {
+        note("rep_a_full");
+    }
+    if f.b[0].contains(&kb) {
+        note("rep_b_full");
+    } else if f.b_struct_prev.contains(&b) {
+        note("rep_b_struct");
     } else {
-        crate::runtime::drain::note_store_route("rep_new");
+        note("rep_new");
     }
-    if f.prev.iter().any(|s| s.contains(&full)) {
-        crate::runtime::drain::note_store_route("rep_full_w4");
+    if f.c_prev.contains(&kc) {
+        note("rep_c_full");
     }
-    f.cur.insert(full);
-    f.cur_struct.insert(struct_key);
-    f.stream_hash = f.stream_hash.rotate_left(5) ^ struct_key ^ bytes_key.rotate_left(17);
+    if f.a.iter().any(|s| s.contains(&ka)) {
+        note("rep_a_full_w4");
+    }
+    if f.b.iter().any(|s| s.contains(&kb)) {
+        note("rep_b_full_w4");
+    }
+    f.a_cur.insert(ka);
+    f.b_cur.insert(kb);
+    f.c_cur.insert(kc);
+    f.b_struct_cur.insert(b);
+    f.stream_hash = f.stream_hash.rotate_left(5) ^ b ^ bytes.rotate_left(17);
     f.stream_draws += 1;
 }

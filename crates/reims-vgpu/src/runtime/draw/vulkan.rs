@@ -1394,60 +1394,58 @@ fn lab_repeat_draw(
     let mut bytes = std::collections::hash_map::DefaultHasher::new();
     for (i, c) in vtx.iter().chain(frag.iter()) {
         i.hash(&mut bytes);
+        let len = c.len();
+        len.min(4096).hash(&mut bytes);
+        if len > 4096 {
+            partial = true;
+        }
+        // The bound window starts at the draw's own offset, so its prefix is the
+        // draw's data; what lies past 4 KiB may be other draws' and is not keyed.
         match c {
-            BufferContent::Bytes(_) => {
-                let b = c.cpu_bytes();
-                b.len().hash(&mut bytes);
-                if b.len() <= 4096 {
-                    b.hash(&mut bytes);
-                } else {
-                    partial = true;
-                    b[..2048].hash(&mut bytes);
-                    b[b.len() - 2048..].hash(&mut bytes);
-                }
+            BufferContent::Bytes(b) => b[..len.min(4096)].hash(&mut bytes),
+            other if len <= 65536 => {
+                let b = other.cpu_bytes();
+                b[..b.len().min(4096)].hash(&mut bytes);
             }
-            other => {
-                let len = other.len();
-                len.hash(&mut bytes);
-                if len <= 4096 {
-                    other.cpu_bytes().hash(&mut bytes);
-                } else {
-                    partial = true;
-                    if len <= 65536 {
-                        let b = other.cpu_bytes();
-                        b[..2048].hash(&mut bytes);
-                        b[b.len() - 2048..].hash(&mut bytes);
-                    }
-                }
-            }
+            _ => {}
         }
     }
-    let mut st = std::collections::hash_map::DefaultHasher::new();
-    req.task_id.hash(&mut st);
-    req.pipeline_ref.hash(&mut st);
-    vertex_entry.hash(&mut st);
-    fragment_entry.hash(&mut st);
-    (req.vertex_count, req.instance_count, req.primitive_type, req.first_vertex).hash(&mut st);
+    // B: everything but the render-target identity. A adds it back; C also drops the
+    // bound-texture identity.
+    let mut shape = std::collections::hash_map::DefaultHasher::new();
+    req.task_id.hash(&mut shape);
+    req.pipeline_ref.hash(&mut shape);
+    vertex_entry.hash(&mut shape);
+    fragment_entry.hash(&mut shape);
+    (req.vertex_count, req.instance_count, req.primitive_type, req.first_vertex).hash(&mut shape);
     for c in &req.colors {
-        (c.slot, c.texture_ref, c.mapping_id, c.target_gva, c.width, c.height, c.format, c.load_action, c.store_action).hash(&mut st);
-    }
-    for t in req.vertex_textures.iter().chain(req.fragment_textures.iter()) {
-        (t.index, t.texture_ref).hash(&mut st);
-        t.resource.as_ref().map(|r| std::sync::Arc::as_ptr(r) as usize).hash(&mut st);
+        (c.slot, c.width, c.height, c.format, c.load_action, c.store_action).hash(&mut shape);
     }
     for s in req.vertex_samplers.iter().chain(req.fragment_samplers.iter()) {
-        (s.index, s.sampler_ref).hash(&mut st);
+        (s.index, s.sampler_ref).hash(&mut shape);
     }
     for v in &req.viewports {
         for x in v {
-            x.to_bits().hash(&mut st);
+            x.to_bits().hash(&mut shape);
         }
     }
     for s in &req.scissors {
-        (s.x, s.y, s.width, s.height).hash(&mut st);
+        (s.x, s.y, s.width, s.height).hash(&mut shape);
     }
-    req.indexed.as_ref().map(|i| (i.index_type, i.index_count, i.index_buffer_ref, i.base_vertex)).hash(&mut st);
-    crate::runtime::lab_repeat::draw(st.finish(), bytes.finish(), partial, !req.continues_render_pass);
+    req.indexed.as_ref().map(|i| (i.index_type, i.index_count, i.index_buffer_ref, i.base_vertex)).hash(&mut shape);
+    let c_key = shape.finish();
+    let mut b_h = shape;
+    for t in req.vertex_textures.iter().chain(req.fragment_textures.iter()) {
+        (t.index, t.texture_ref).hash(&mut b_h);
+        t.resource.as_ref().map(|r| std::sync::Arc::as_ptr(r) as usize).hash(&mut b_h);
+    }
+    let b_key = b_h.finish();
+    let mut a_h = std::collections::hash_map::DefaultHasher::new();
+    b_key.hash(&mut a_h);
+    for c in &req.colors {
+        (c.texture_ref, c.mapping_id, c.target_gva).hash(&mut a_h);
+    }
+    crate::runtime::lab_repeat::draw(a_h.finish(), b_key, c_key, bytes.finish(), partial, !req.continues_render_pass);
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_UBO=pipe[,pipe]` logs the fragment buffers
