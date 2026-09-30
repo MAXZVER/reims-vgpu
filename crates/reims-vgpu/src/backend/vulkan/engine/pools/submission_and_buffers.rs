@@ -4223,6 +4223,7 @@ impl ResourcePools {
             kind,
             format,
             swizzle,
+            levels,
         } = sk;
         // A hit reuses a recycled slot — no vkAllocateMemory this acquire. A miss
         // is counted here, at the empty free list, rather than after the create
@@ -4272,7 +4273,7 @@ impl ResourcePools {
                         height,
                         depth: extent_depth,
                     })
-                    .mip_levels(1)
+                    .mip_levels(levels.max(1))
                     .array_layers(array_layers)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
@@ -4306,7 +4307,7 @@ impl ResourcePools {
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
-                    level_count: 1,
+                    level_count: levels.max(1),
                     base_array_layer: 0,
                     layer_count: array_layers,
                 }),
@@ -4333,6 +4334,7 @@ impl ResourcePools {
             kind,
             format,
             swizzle,
+            levels,
         };
         let handles = slot.handles();
         match use_ {
@@ -5107,6 +5109,7 @@ mod recycle_tests {
                 crate::protocol::pixel_format::TexelLayout::Bgra8,
             ),
             swizzle: Default::default(),
+            levels: 1,
         }
     }
 

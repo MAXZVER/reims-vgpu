@@ -1122,6 +1122,104 @@ fn lab_pick_draw(
 /// PROBE_WH) additionally requires PATH to exist, checked at most every 250 ms,
 /// so a probe can be switched on and off around a guest action within one boot.
 /// Unset: always open (the probes' own env vars still gate them).
+/// The GVA of level 0 of a sampled plain texture, which is where a bind of it
+/// starts reading. `None` for a view or a descriptor that does not decode: the
+/// caller then keeps the object-only alias rule.
+fn sampled_base_level_gva(
+    resource: Option<&crate::model::TaskResource>,
+    page_shift: u32,
+) -> Option<u64> {
+    if lab_no_m1fix("alias") {
+        return None;
+    }
+    let Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) = resource?.decoded() else {
+        return None;
+    };
+    tex.level_gva(0, page_shift).map(|(gva, _)| gva)
+}
+
+/// The level residents of a mipmapped GVA texture bound through its level-0
+/// resident, when this device rendered every level.
+///
+/// A resident is one image at one level, so a sampled `Target` bind names level
+/// 0 alone and every explicit-LOD sample clamps to it. macOS 26's Liquid Glass
+/// renders its blur pyramid level by level — each level a GVA render target of
+/// its own — and samples it at an explicit LOD; bound as level 0 the blur never
+/// reached the glass, and menus and sidebars showed a sharp, low-resolution
+/// backdrop with a bright rim at the glass edge.
+///
+/// A level is named only when its plane is declared at its own extent
+/// (`writeback_debt::gva_plane_generation`): that is the proof this device
+/// rendered it. The engine refuses the chain again at bind time if any level is
+/// not a ready resident of its mip extent, and then binds level 0 as before.
+fn sampled_mip_chain(
+    state: &DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    resource: Option<&crate::model::TaskResource>,
+    img: &crate::backend::vulkan::engine::SampledImageResource,
+) -> Option<Vec<crate::backend::vulkan::engine::TargetIdentity>> {
+    use crate::backend::vulkan::engine::{SampledSource, TargetIdentity};
+    if lab_no_m1fix("pyramid") {
+        return None;
+    }
+    let SampledSource::Target(base @ TargetIdentity::Gva { format, .. }) = &img.source else {
+        return None;
+    };
+    let Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) = resource?.decoded() else {
+        return None;
+    };
+    if tex.mipmap_level_count < 2 {
+        return None;
+    }
+    let key = crate::runtime::writeback_debt::GvaResourceKey { task_id, texture_ref };
+    let mut levels = Vec::with_capacity(tex.mipmap_level_count as usize);
+    for level in 0..tex.mipmap_level_count {
+        let (gva, layout) = tex.level_gva(level, state.page_shift)?;
+        let span = layout.row_stride.saturating_mul(u64::from(layout.height));
+        let generation = crate::runtime::writeback_debt::gva_plane_generation(state, key, gva, span)?;
+        let identity = TargetIdentity::Gva {
+            gva,
+            width: layout.width,
+            height: layout.height,
+            generation,
+            format: *format,
+        };
+        if level == 0 && &identity != base {
+            crate::runtime::drain::note_store_route("sampled_mip_chain_base_mismatch");
+            return None;
+        }
+        levels.push(identity);
+    }
+    crate::runtime::drain::note_store_route("sampled_mip_chain_named");
+    Some(levels)
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_NO_M1FIX=1` narrows all three M1 fixes away
+/// (constexpr-sampler precedence, level-aware alias, sampled mip chain) for a
+/// same-conditions performance A/B; a comma list of `sampler`, `alias`,
+/// `pyramid` narrows only those.
+fn lab_no_m1fix(part: &str) -> bool {
+    static PARTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let parts = PARTS.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_NO_M1FIX")
+            .map(|v| v.split(',').map(|p| p.trim().to_string()).collect())
+            .unwrap_or_default()
+    });
+    parts.iter().any(|p| p == "1" || p == part)
+}
+
+/// TEMP (lab): whether `REIMS_VGPU_LAB_SMP_LINEAR` names this fragment entry.
+fn lab_smp_linear(entry: Option<&str>) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_SMP_LINEAR")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default()
+    });
+    !names.is_empty() && entry.is_some_and(|e| names.iter().any(|n| e.contains(n.as_str())))
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_DUMP_WINDOW=from-to` (ms since start) bounds
 /// `REIMS_VGPU_LAB_DUMP` and `REIMS_VGPU_LAB_PROBE_WH` in time; unset = always.
 fn lab_dump_window_open() -> bool {
@@ -2120,13 +2218,30 @@ pub(super) enum AttachmentAliasSample<'a> {
 /// GPU without programmable blending). With the index rule the bind fell through
 /// to the attachment's guest pages — never written, its store action is
 /// DontCare — and every app icon composited transparent.
+///
+/// # The object is not the whole answer either
+///
+/// A pass may render one mip level of a texture while sampling another — the
+/// hazard-free way to build a pyramid, and exactly how macOS 26's Liquid Glass
+/// blur renders level N from level N-1 of one texture. The attachment is then
+/// the same object at a different level, and treating the bind as a read of
+/// the attachment substituted that level's Clear: every level above the base
+/// came out transparent black. `sampled_base_gva` is the GVA of the first level
+/// the bind reads (the texture's level 0); when the attachment starts anywhere
+/// else, the bind reads other texels and resolves as an ordinary sample. `None`
+/// (a view, or an undecodable descriptor) keeps the object rule.
 pub(super) fn fragment_attachment_alias_sample<'a>(
     req: &'a DrawEncodeRequest,
     texture_ref: u32,
+    sampled_base_gva: Option<u64>,
 ) -> Option<(u32, u32, AttachmentAliasSample<'a>)> {
     let color = req.colors.iter().find(|color| {
         color.texture_ref == texture_ref && color.mapping_id == 0 && color.target_gva != 0
     })?;
+    if sampled_base_gva.is_some_and(|base| base != color.target_gva) {
+        crate::runtime::drain::note_store_route("attachment_alias_other_level");
+        return None;
+    }
     let need = (color.width as usize)
         .checked_mul(color.height as usize)?
         .checked_mul(RGBA8_BPP as usize)?;
@@ -9221,6 +9336,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Fragment sampled resources use +FRAG_SAMPLED when either both stages
         // sample or fragment buffers moved into the sampled/static-sampler band.
         let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> = Vec::new();
+        // Guest mip chains the sampled binds read whole; see `sampled_mip_chain`.
+        let mut mip_chains: Vec<crate::backend::vulkan::engine::types::SampledPyramid> = Vec::new();
         let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
         // Where each provisioned sampler's state came from, keyed by binding, for
@@ -9319,7 +9436,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         crate::runtime::sampled_phase::Part::ResolveAlias,
                     );
                     let attachment_alias = frag_stage
-                        .then(|| fragment_attachment_alias_sample(req, texture_ref))
+                        .then(|| {
+                            fragment_attachment_alias_sample(
+                                req,
+                                texture_ref,
+                                sampled_base_level_gva(texture_resource.as_deref(), state.page_shift),
+                            )
+                        })
                         .flatten();
                     if let Some((aw, ah, alias)) = attachment_alias {
                         match alias {
@@ -9769,6 +9892,21 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // need it, and there is no case left to forget.
                     swizzle: view_swizzle.unwrap_or_default().after(&sampled_components),
                 });
+                if let Some(levels) = images.last().and_then(|img| {
+                    sampled_mip_chain(
+                        state,
+                        req.task_id,
+                        texture_ref,
+                        texture_resource.as_deref(),
+                        img,
+                    )
+                }) {
+                    mip_chains.push(crate::backend::vulkan::engine::types::SampledPyramid {
+                        binding: img_bind,
+                        array_element,
+                        levels,
+                    });
+                }
                 lab_sampled_bind(req, frag_stage, index, texture_ref, tw, th, images.last(), view_swizzle);
                 lab_sampled_strip_probe(req, texture_ref, images.last());
                 lab_sampled_grid_probe(req, index, texture_ref, images.last());
@@ -9902,6 +10040,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             });
         }
         {
+            // A constexpr sampler owns the binding metal2vulkan gave it; a guest
+            // sampler bound at the same index is one this shader never reads.
+            // See `spirv_bind::constexpr_sampler_bindings`.
+            let static_sampler_binds = if lab_no_m1fix("sampler") {
+                Default::default()
+            } else {
+                let mut binds =
+                    crate::runtime::spirv_bind::constexpr_sampler_bindings(&v_variant.samplers);
+                binds.extend(crate::runtime::spirv_bind::constexpr_sampler_bindings(
+                    &f_variant.samplers,
+                ));
+                binds
+            };
             let mut push_smp = |index: u32,
                                 sampler_ref: u32,
                                 lod_clamp: Option<(u32, u32)>,
@@ -9913,6 +10064,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     0
                 };
                 let smp_bind = SAMPLER_BINDING_BASE + index + base_off;
+                if static_sampler_binds.contains(&smp_bind) {
+                    // Counted: the draws whose shader samples through its own
+                    // constexpr state while the encoder still holds a sampler
+                    // at that index.
+                    crate::runtime::drain::note_store_route("sampler_guest_yields_to_constexpr");
+                    return Ok(());
+                }
                 if sampler_binds.insert(smp_bind) {
                     let mut sampler = if sampler_ref != 0 {
                         sampler_origin.insert(smp_bind, b'g');
@@ -9933,6 +10091,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     if let Some((min_bits, max_bits)) = lod_clamp {
                         sampler.lod_min = min_bits;
                         sampler.lod_max = max_bits;
+                    }
+                    // TEMP (lab): `REIMS_VGPU_LAB_SMP_LINEAR=name[,name]` makes the
+                    // guest samplers of fragment entries containing a name linear
+                    // with linear mips and no LOD cap (M1: menu glass blur).
+                    if frag_stage && lab_smp_linear(f_shader.reflection.entry_point.as_deref()) {
+                        sampler.min_filter = 1;
+                        sampler.mag_filter = 1;
+                        sampler.mip_filter = 2;
+                        sampler.lod_max = f32::MAX.to_bits();
+                        crate::runtime::drain::note_store_route("lab_smp_linear_forced");
                     }
                     samplers.push(sampler);
                 } else {
@@ -10007,6 +10175,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 ),
                             );
                         }
+                    } else if reflected.static_state.is_some() {
+                        // A constexpr sampler whose binding something else
+                        // already provisioned. Guest samplers yield to it above,
+                        // so this is a healthy zero; a firing means two
+                        // reflected samplers named one binding.
+                        crate::runtime::drain::note_store_route("sampler_constexpr_binding_taken");
                     }
                 }
             }
@@ -10661,6 +10835,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.continues_render_pass = req.continues_render_pass;
         resources.render_pass_continues = req.render_pass_continues;
         resources.samplers = samplers;
+        resources.sampled_pyramids = std::mem::take(&mut mip_chains);
         // Load seed always goes to the GPU (workstream D3). Premult One/OMSA is
         // hardware blend over the Load-seeded target — identical math to the
         // retired software `src + seed*(1-src.a)` path. Sampled alpha is
@@ -11184,14 +11359,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .samplers
             .iter()
             .map(|s| {
+                // TEMP (lab): mip filter, LOD clamps and where the state came from.
                 format!(
-                    "b{}:un={}:min={:?}:mag={:?}:u={:?}:v={:?}",
+                    "b{}:un={}:min={:?}:mag={:?}:mip={:?}:lod={}..{}:u={:?}:v={:?}:o={}",
                     s.binding,
                     s.unnormalized_coordinates as u8,
                     s.min_filter,
                     s.mag_filter,
+                    s.mip_filter,
+                    f32::from_bits(s.lod_min),
+                    f32::from_bits(s.lod_max),
                     s.address_mode_u,
-                    s.address_mode_v
+                    s.address_mode_v,
+                    sampler_origin.get(&s.binding).map(|b| *b as char).unwrap_or('?')
                 )
             })
             .collect::<Vec<_>>()

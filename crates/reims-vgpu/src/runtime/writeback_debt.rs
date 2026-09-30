@@ -537,6 +537,13 @@ impl PendingWritebacks {
         ))
     }
 
+    /// A declared plane's generation at exactly `span`, read-only; see the free
+    /// [`gva_plane_generation`].
+    pub fn gva_plane_generation(&self, plane: GvaPlaneKey, span: u64) -> Option<u64> {
+        let (generation, declared_span, has_pages) = self.gva_resource_status(plane)?;
+        (declared_span == span && has_pages).then_some(generation)
+    }
+
     fn gva_resource_status(&self, plane: GvaPlaneKey) -> Option<(u64, u64, bool)> {
         self.gva_resources
             .get(&plane)
@@ -1212,6 +1219,21 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
 /// ways, in which case each draw would mint a generation and no resident could
 /// ever be reused. The line names both declarations so that reading can be made
 /// from a log rather than from a rebuild.
+/// The generation [`gva_resource_generation`] would answer for one plane of a
+/// resource, without declaring anything. `None` when this device never declared
+/// that plane at `span` — nothing rendered it — which is what a sampled mip
+/// chain must know before it names a level's resident.
+pub fn gva_plane_generation(
+    state: &DeviceState,
+    key: GvaResourceKey,
+    gva: u64,
+    span: u64,
+) -> Option<u64> {
+    state
+        .pending_writebacks
+        .gva_plane_generation(key.plane(gva), span)
+}
+
 pub fn gva_resource_generation<M: HostMemory>(
     state: &mut DeviceState,
     host: &M,
@@ -2435,6 +2457,41 @@ mod tests {
             pending.ensure_gva_resource(key, 0x4000, 8192, None),
             second,
             "the new declaration is the live one, so it is stable"
+        );
+    }
+
+    /// A sampled mip chain names a level only when the device rendered it: a
+    /// read-only lookup that answers the declared plane's generation at its own
+    /// length, and nothing for a plane never declared or declared at another
+    /// length — without declaring one, which would mint a generation for a
+    /// level no draw produced.
+    #[test]
+    fn a_plane_generation_is_read_without_declaring_the_plane() {
+        let mut pending = PendingWritebacks::default();
+        let key = GvaResourceKey {
+            task_id: 1,
+            texture_ref: 278,
+        };
+        assert_eq!(
+            pending.gva_plane_generation(key.plane(0x1fca000), 102_400),
+            None
+        );
+        assert!(
+            pending.gva_resources.is_empty(),
+            "the lookup declares nothing"
+        );
+        let level1 = pending.ensure_gva_resource(key, 0x1fca000, 102_400, Some(vec![0x9000]));
+        assert_eq!(
+            pending.gva_plane_generation(key.plane(0x1fca000), 102_400),
+            Some(level1)
+        );
+        assert_eq!(
+            pending.gva_plane_generation(key.plane(0x1fca000), 25_600),
+            None
+        );
+        assert_eq!(
+            pending.gva_plane_generation(key.plane(0x1fe3000), 25_600),
+            None
         );
     }
 

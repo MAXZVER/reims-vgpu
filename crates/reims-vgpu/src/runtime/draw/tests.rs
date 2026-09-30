@@ -1771,13 +1771,13 @@ fn attachment_alias_resident_chain_selection() {
         ..Default::default()
     });
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 42),
+        fragment_attachment_alias_sample(&req, 42, None),
         None,
         "unarmed LOAD without seed must not alias"
     );
     req.chain_from_resident = true;
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 42),
+        fragment_attachment_alias_sample(&req, 42, None),
         Some((8, 8, AttachmentAliasSample::ResidentChain { slot: 0 })),
         "armed chain aliases from the resident target"
     );
@@ -1785,7 +1785,7 @@ fn attachment_alias_resident_chain_selection() {
     let seed = vec![0u8; 8 * 8 * 4];
     req.colors[0].target_seed_rgba = Some(seed);
     assert!(matches!(
-        fragment_attachment_alias_sample(&req, 42),
+        fragment_attachment_alias_sample(&req, 42, None),
         Some((8, 8, AttachmentAliasSample::Seed(_, _)))
     ));
 }
@@ -1816,25 +1816,56 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
     };
 
     let (width, height, sample) =
-        fragment_attachment_alias_sample(&req, texture_ref).expect("GVA alias");
+        fragment_attachment_alias_sample(&req, texture_ref, None).expect("GVA alias");
     assert_eq!((width, height), (2, 1));
     let AttachmentAliasSample::Seed(actual, _) = sample else {
         panic!("Load alias must use the chained seed");
     };
     assert_eq!(actual, seed);
-    assert!(fragment_attachment_alias_sample(&req, texture_ref + 1).is_none());
+    assert!(fragment_attachment_alias_sample(&req, texture_ref + 1, None).is_none());
 
     req.colors[0].mapping_id = 9;
-    assert!(fragment_attachment_alias_sample(&req, texture_ref).is_none());
+    assert!(fragment_attachment_alias_sample(&req, texture_ref, None).is_none());
     req.colors[0].mapping_id = 0;
     req.colors[0].load_action = MTL_LOAD_ACTION_DONT_CARE;
-    assert!(fragment_attachment_alias_sample(&req, texture_ref).is_none());
+    assert!(fragment_attachment_alias_sample(&req, texture_ref, None).is_none());
     req.colors[0].load_action = MTL_LOAD_ACTION_CLEAR;
     req.colors[0].clear_color = [0.25, 0.5, 0.75, 1.0];
     assert_eq!(
-        fragment_attachment_alias_sample(&req, texture_ref),
+        fragment_attachment_alias_sample(&req, texture_ref, None),
         Some((2, 1, AttachmentAliasSample::Clear([0.25, 0.5, 0.75, 1.0])))
     );
+}
+
+/// Rendering one mip level of a texture while sampling it is not a read of the
+/// attachment when the attachment is another level: the bind starts at level
+/// 0, the attachment at level 1's GVA, and substituting the attachment's Clear
+/// blacked out every level of macOS 26's glass blur pyramid. The same GVA is
+/// still the attachment.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_bind_of_another_mip_level_of_the_attachments_texture_is_not_an_alias() {
+    let texture_ref = 278;
+    let (level0, level1) = (0x1f6_6000_u64, 0x1fc_a000_u64);
+    let req = DrawEncodeRequest {
+        colors: vec![ColorRtRequest {
+            slot: 0,
+            texture_ref,
+            mapping_id: 0,
+            target_gva: level1,
+            width: 160,
+            height: 160,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(fragment_attachment_alias_sample(&req, texture_ref, Some(level0)).is_none());
+    assert!(matches!(
+        fragment_attachment_alias_sample(&req, texture_ref, Some(level1)),
+        Some((160, 160, AttachmentAliasSample::Clear(_)))
+    ));
+    assert!(fragment_attachment_alias_sample(&req, texture_ref, None).is_some());
 }
 
 /// A half-float GVA attachment's LOAD seed comes out of its own pages at its own
@@ -1946,25 +1977,25 @@ fn a_secondary_attachment_sampled_at_another_index_aliases_its_own_resident() {
     });
     // Not a chained record, and still the secondary's resident: its Load is.
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 4),
+        fragment_attachment_alias_sample(&req, 4, None),
         Some((129, 194, AttachmentAliasSample::ResidentChain { slot: 1 }))
     );
     // A DontCare secondary aliases its resident too; the caller swaps in the
     // clear when the engine says that resident holds nothing yet.
     req.colors[1].load_action = MTL_LOAD_ACTION_DONT_CARE;
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 4),
+        fragment_attachment_alias_sample(&req, 4, None),
         Some((129, 194, AttachmentAliasSample::ResidentChain { slot: 1 }))
     );
     // A cleared secondary aliases its clear, whatever index samples it.
     req.colors[1].load_action = MTL_LOAD_ACTION_CLEAR;
     req.colors[1].clear_color = [0.0, 1.0, 0.0, 0.0];
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 4),
+        fragment_attachment_alias_sample(&req, 4, None),
         Some((129, 194, AttachmentAliasSample::Clear([0.0, 1.0, 0.0, 0.0])))
     );
     // A ref that is not attached is not an alias.
-    assert!(fragment_attachment_alias_sample(&req, 5).is_none());
+    assert!(fragment_attachment_alias_sample(&req, 5, None).is_none());
 }
 
 #[test]
