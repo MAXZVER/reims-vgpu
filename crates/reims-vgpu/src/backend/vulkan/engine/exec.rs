@@ -4655,6 +4655,14 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &barrier,
         );
+        // Census: what the chains cost in copied texels, per second.
+        crate::runtime::drain::note_store_route_n(
+            "sampled_pyramid_copy_bytes",
+            levels
+                .iter()
+                .map(|l| u64::from(l.width) * u64::from(l.height) * 4)
+                .sum(),
+        );
         for (mip, level) in levels.iter().enumerate() {
             let copy = [vk::ImageCopy::default()
                 .src_subresource(super::color_subresource_layers())

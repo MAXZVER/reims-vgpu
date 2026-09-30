@@ -1128,7 +1128,7 @@ fn sampled_base_level_gva(
     resource: Option<&crate::model::TaskResource>,
     page_shift: u32,
 ) -> Option<u64> {
-    if lab_no_m1fix() {
+    if lab_no_m1fix("alias") {
         return None;
     }
     let Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) = resource?.decoded() else {
@@ -1159,7 +1159,7 @@ fn sampled_mip_chain(
     img: &crate::backend::vulkan::engine::SampledImageResource,
 ) -> Option<Vec<crate::backend::vulkan::engine::TargetIdentity>> {
     use crate::backend::vulkan::engine::{SampledSource, TargetIdentity};
-    if lab_no_m1fix() {
+    if lab_no_m1fix("pyramid") {
         return None;
     }
     let SampledSource::Target(base @ TargetIdentity::Gva { format, .. }) = &img.source else {
@@ -1194,12 +1194,18 @@ fn sampled_mip_chain(
     Some(levels)
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_NO_M1FIX=1` narrows the three M1 fixes away
+/// TEMP (lab): `REIMS_VGPU_LAB_NO_M1FIX=1` narrows all three M1 fixes away
 /// (constexpr-sampler precedence, level-aware alias, sampled mip chain) for a
-/// same-conditions performance A/B.
-fn lab_no_m1fix() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_NO_M1FIX").is_ok_and(|v| v == "1"))
+/// same-conditions performance A/B; a comma list of `sampler`, `alias`,
+/// `pyramid` narrows only those.
+fn lab_no_m1fix(part: &str) -> bool {
+    static PARTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let parts = PARTS.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_NO_M1FIX")
+            .map(|v| v.split(',').map(|p| p.trim().to_string()).collect())
+            .unwrap_or_default()
+    });
+    parts.iter().any(|p| p == "1" || p == part)
 }
 
 /// TEMP (lab): whether `REIMS_VGPU_LAB_SMP_LINEAR` names this fragment entry.
@@ -9713,7 +9719,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // A constexpr sampler owns the binding metal2vulkan gave it; a guest
             // sampler bound at the same index is one this shader never reads.
             // See `spirv_bind::constexpr_sampler_bindings`.
-            let static_sampler_binds = if lab_no_m1fix() {
+            let static_sampler_binds = if lab_no_m1fix("sampler") {
                 Default::default()
             } else {
                 let mut binds =
