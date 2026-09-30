@@ -41,11 +41,13 @@ pub enum Mode {
 
 pub fn mode() -> Mode {
     static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("REIMS_VGPU_LAB_RUNS_FIX").as_deref() {
-        Ok("on") => Mode::On,
-        Ok("verify") => Mode::Verify,
-        _ => Mode::Off,
-    })
+    *MODE.get_or_init(
+        || match std::env::var("REIMS_VGPU_LAB_RUNS_FIX").as_deref() {
+            Ok("on") => Mode::On,
+            Ok("verify") => Mode::Verify,
+            _ => Mode::Off,
+        },
+    )
 }
 
 /// Windows remembered per mapping. A mapping is sampled through one or two
@@ -94,7 +96,10 @@ impl WindowCacheEntry {
 }
 
 /// Look `key` up in a mapping's windows.
-pub fn lookup(cache: &[WindowCacheEntry], key: &WindowKey) -> Option<(Arc<Vec<u64>>, Arc<Vec<GuestRun>>)> {
+pub fn lookup(
+    cache: &[WindowCacheEntry],
+    key: &WindowKey,
+) -> Option<(Arc<Vec<u64>>, Arc<Vec<GuestRun>>)> {
     cache
         .iter()
         .find(|e| e.matches(key))
@@ -103,7 +108,12 @@ pub fn lookup(cache: &[WindowCacheEntry], key: &WindowKey) -> Option<(Arc<Vec<u6
 
 /// Remember a window. Entries of a stale generation are dropped first (they can
 /// never match again), then the oldest if the mapping is still over its share.
-pub fn insert(cache: &mut Vec<WindowCacheEntry>, key: WindowKey, gpas: Arc<Vec<u64>>, runs: Arc<Vec<GuestRun>>) {
+pub fn insert(
+    cache: &mut Vec<WindowCacheEntry>,
+    key: WindowKey,
+    gpas: Arc<Vec<u64>>,
+    runs: Arc<Vec<GuestRun>>,
+) {
     cache.retain(|e| {
         e.map_generation == key.map_generation
             && e.control_key == key.control_key
@@ -142,7 +152,10 @@ mod tests {
     }
 
     fn window(tag: u64) -> (Arc<Vec<u64>>, Arc<Vec<GuestRun>>) {
-        (Arc::new(vec![tag * 4096]), Arc::new(vec![GuestRun::in_mapping(0x1000, 4096, 0, 4096).unwrap()]))
+        (
+            Arc::new(vec![tag * 4096]),
+            Arc::new(vec![GuestRun::in_mapping(0x1000, 4096, 0, 4096).unwrap()]),
+        )
     }
 
     #[test]
@@ -151,13 +164,28 @@ mod tests {
         let (g, r) = window(1);
         insert(&mut cache, key(3, 7, 0), Arc::clone(&g), Arc::clone(&r));
         let (hg, hr) = lookup(&cache, &key(3, 7, 0)).expect("same key hits");
-        assert!(Arc::ptr_eq(&hg, &g) && Arc::ptr_eq(&hr, &r), "a hit hands back the stored Arcs");
-        assert!(lookup(&cache, &key(4, 7, 0)).is_none(), "map_generation moved");
-        assert!(lookup(&cache, &key(3, 8, 0)).is_none(), "control layout moved");
-        assert!(lookup(&cache, &key(3, 7, 4096)).is_none(), "a different window of the mapping");
+        assert!(
+            Arc::ptr_eq(&hg, &g) && Arc::ptr_eq(&hr, &r),
+            "a hit hands back the stored Arcs"
+        );
+        assert!(
+            lookup(&cache, &key(4, 7, 0)).is_none(),
+            "map_generation moved"
+        );
+        assert!(
+            lookup(&cache, &key(3, 8, 0)).is_none(),
+            "control layout moved"
+        );
+        assert!(
+            lookup(&cache, &key(3, 7, 4096)).is_none(),
+            "a different window of the mapping"
+        );
         let mut k = key(3, 7, 0);
         k.mapping_pages = 9;
-        assert!(lookup(&cache, &k).is_none(), "the mapping's page count moved");
+        assert!(
+            lookup(&cache, &k).is_none(),
+            "the mapping's page count moved"
+        );
     }
 
     #[test]
@@ -170,11 +198,19 @@ mod tests {
         assert_eq!(cache.len(), WINDOWS_PER_MAPPING);
         let (g, r) = window(99);
         insert(&mut cache, key(1, 1, 99 * 4096), g, r);
-        assert_eq!(cache.len(), WINDOWS_PER_MAPPING, "the oldest window made room");
+        assert_eq!(
+            cache.len(),
+            WINDOWS_PER_MAPPING,
+            "the oldest window made room"
+        );
         assert!(lookup(&cache, &key(1, 1, 0)).is_none(), "the oldest went");
         let (g, r) = window(5);
         insert(&mut cache, key(2, 1, 0), g, r);
-        assert_eq!(cache.len(), 1, "a generation bump retires every window of the old list");
+        assert_eq!(
+            cache.len(),
+            1,
+            "a generation bump retires every window of the old list"
+        );
         assert!(lookup(&cache, &key(1, 1, 99 * 4096)).is_none());
         assert!(lookup(&cache, &key(2, 1, 0)).is_some());
     }

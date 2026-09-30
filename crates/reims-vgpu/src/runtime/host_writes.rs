@@ -718,7 +718,9 @@ mod tests {
                     1 => w.note_unknown(),
                     2 => w.note_mapping(Some(&[(next() % 4096) * P, (next() % 4096) * P])),
                     3 => w.note_mapping(None),
-                    _ => w.note_page_iter((0..(next() % 1200)).map(|i| ((next() % 64) * 1024 + i) * P)),
+                    _ => w.note_page_iter(
+                        (0..(next() % 1200)).map(|i| ((next() % 64) * 1024 + i) * P),
+                    ),
                 }
                 marks.push(w.epoch());
             }
@@ -731,10 +733,22 @@ mod tests {
             for window in &windows {
                 for &mark in &marks {
                     let walk = w.pages.verdict(mark, window, w.page_shift);
-                    assert_eq!(w.wrote_any_since_with(mark, window, true), walk, "shortcut on, mark {mark}");
-                    assert_eq!(w.wrote_any_since_with(mark, window, false), walk, "shortcut off, mark {mark}");
+                    assert_eq!(
+                        w.wrote_any_since_with(mark, window, true),
+                        walk,
+                        "shortcut on, mark {mark}"
+                    );
+                    assert_eq!(
+                        w.wrote_any_since_with(mark, window, false),
+                        walk,
+                        "shortcut off, mark {mark}"
+                    );
                     if mark == w.epoch() {
-                        assert_eq!(walk, HostWriteVerdict::Quiet, "the walk at the current epoch is Quiet");
+                        assert_eq!(
+                            walk,
+                            HostWriteVerdict::Quiet,
+                            "the walk at the current epoch is Quiet"
+                        );
                     }
                 }
                 assert_eq!(

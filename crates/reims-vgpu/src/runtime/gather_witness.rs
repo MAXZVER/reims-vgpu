@@ -1374,13 +1374,15 @@ pub(crate) fn lab_stated_verify() -> bool {
 
 fn lab_stated_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("REIMS_VGPU_LAB_STATED_VOUCH").as_deref() {
-        Ok("on") => 1,
-        Ok("verify") => 2,
-        Ok("witness") => 3,
-        Ok("verdict") => 4,
-        _ => 0,
-    })
+    *MODE.get_or_init(
+        || match std::env::var("REIMS_VGPU_LAB_STATED_VOUCH").as_deref() {
+            Ok("on") => 1,
+            Ok("verify") => 2,
+            Ok("witness") => 3,
+            Ok("verdict") => 4,
+            _ => 0,
+        },
+    )
 }
 
 /// TEMP (lab): at most this many `lab_v_*` detail lines per boot.

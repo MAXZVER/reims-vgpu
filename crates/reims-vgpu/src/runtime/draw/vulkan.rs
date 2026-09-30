@@ -15086,7 +15086,11 @@ mod vulkan_split_tests {
         let pages = 48u32;
         let (pfn_a, pfn_b) = (0x5a40u32, 0x5c00u32);
         for pfn in [pfn_a, pfn_b] {
-            host.map_range((pfn as u64) << PAGE_SHIFT_X86, (pages as usize) << PAGE_SHIFT_X86, 0);
+            host.map_range(
+                (pfn as u64) << PAGE_SHIFT_X86,
+                (pages as usize) << PAGE_SHIFT_X86,
+                0,
+            );
         }
         let mid = 917u32;
         assert!(state.map_surface(mid));
@@ -15107,7 +15111,10 @@ mod vulkan_split_tests {
 
         let walk = resolve(Mode::Off, &mut state, 0, span).expect("the walk resolves");
         assert_eq!(walk.0.len(), 32);
-        assert!(state.mappings.get(&mid).unwrap().window_cache.is_empty(), "the off arm remembers nothing");
+        assert!(
+            state.mappings.get(&mid).unwrap().window_cache.is_empty(),
+            "the off arm remembers nothing"
+        );
 
         let first = resolve(Mode::On, &mut state, 0, span).expect("a miss resolves");
         assert_eq!((*first.0).clone(), (*walk.0).clone());
@@ -15131,16 +15138,27 @@ mod vulkan_split_tests {
         assert_eq!(other.0.len(), 16);
         assert_eq!(other.0[0], ((pfn_a as u64) + 8) << PAGE_SHIFT_X86);
         assert!(!Arc::ptr_eq(&other.0, &first.0));
-        assert!(Arc::ptr_eq(&resolve(Mode::On, &mut state, 0, span).unwrap().0, &first.0));
+        assert!(Arc::ptr_eq(
+            &resolve(Mode::On, &mut state, 0, span).unwrap().0,
+            &first.0
+        ));
         assert_eq!(state.mappings.get(&mid).unwrap().window_cache.len(), 2);
 
         // The control layout moves (a task directory appears elsewhere): every
         // window of the mapping is asked again, and the answer is the walk's.
         state.gfx.root_page = 0x7777;
-        let control_moved = resolve(Mode::On, &mut state, 0, span).expect("still clear of the root page");
-        assert!(!Arc::ptr_eq(&control_moved.0, &first.0), "a moved control layout is a miss");
+        let control_moved =
+            resolve(Mode::On, &mut state, 0, span).expect("still clear of the root page");
+        assert!(
+            !Arc::ptr_eq(&control_moved.0, &first.0),
+            "a moved control layout is a miss"
+        );
         assert_eq!((*control_moved.0).clone(), (*walk.0).clone());
-        assert_eq!(state.mappings.get(&mid).unwrap().window_cache.len(), 1, "the stale windows were dropped");
+        assert_eq!(
+            state.mappings.get(&mid).unwrap().window_cache.len(),
+            1,
+            "the stale windows were dropped"
+        );
         // ...and when the moved layout now collides with the surface, the walk's
         // refusal is what the cache reports, not the window it remembered.
         state.gfx.root_page = pfn_a + 3;
@@ -15148,7 +15166,10 @@ mod vulkan_split_tests {
             resolve(Mode::On, &mut state, 0, span).is_none(),
             "a cache must not serve a window the collision check now refuses"
         );
-        assert!(resolve(Mode::Off, &mut state, 0, span).is_none(), "and that is what the walk says");
+        assert!(
+            resolve(Mode::Off, &mut state, 0, span).is_none(),
+            "and that is what the walk says"
+        );
         state.gfx.root_page = 0x7777;
 
         // The guest re-points the surface: the list changes and the generation
@@ -15160,12 +15181,23 @@ mod vulkan_split_tests {
             DeviceState::bump_map_generation(m);
         }
         let after = resolve(Mode::On, &mut state, 0, span).expect("the new list resolves");
-        assert!(!Arc::ptr_eq(&after.0, &before.0), "a new map_generation is a miss");
-        assert_eq!(after.0[0], (pfn_b as u64) << PAGE_SHIFT_X86, "the window names the new pages");
+        assert!(
+            !Arc::ptr_eq(&after.0, &before.0),
+            "a new map_generation is a miss"
+        );
+        assert_eq!(
+            after.0[0],
+            (pfn_b as u64) << PAGE_SHIFT_X86,
+            "the window names the new pages"
+        );
         let walk_after = resolve(Mode::Off, &mut state, 0, span).unwrap();
         assert_eq!((*after.0).clone(), (*walk_after.0).clone());
         assert_eq!((*after.1).clone(), (*walk_after.1).clone());
-        assert_eq!(state.mappings.get(&mid).unwrap().window_cache.len(), 1, "the old generation's windows are gone");
+        assert_eq!(
+            state.mappings.get(&mid).unwrap().window_cache.len(),
+            1,
+            "the old generation's windows are gone"
+        );
 
         // A list of a different length misses even where a writer forgot the bump.
         {
@@ -15173,14 +15205,20 @@ mod vulkan_split_tests {
             m.page_entries = entries(pfn_b, pages - 8);
         }
         let shorter = resolve(Mode::On, &mut state, 0, span).expect("40 pages still cover 32");
-        assert!(!Arc::ptr_eq(&shorter.0, &after.0), "the page count is part of the key");
+        assert!(
+            !Arc::ptr_eq(&shorter.0, &after.0),
+            "the page count is part of the key"
+        );
 
         // A window the list cannot cover is refused, cached or not.
         assert!(resolve(Mode::On, &mut state, 0, 64 * page).is_none());
 
         // Unmapping retires the mapping's windows with its list.
         assert!(state.unmap_surface(mid));
-        assert!(resolve(Mode::On, &mut state, 0, span).is_none(), "an unmapped surface serves nothing");
+        assert!(
+            resolve(Mode::On, &mut state, 0, span).is_none(),
+            "an unmapped surface serves nothing"
+        );
     }
 
     /// A stage that binds a sampler and no texture is still in the sampled band,
