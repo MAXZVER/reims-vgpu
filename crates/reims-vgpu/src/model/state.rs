@@ -9,7 +9,7 @@ use reims_vgpu_core::identity::{ObjectListRef, ResourceId};
 use reims_vgpu_core::namespace::Teardown;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Opaque device instance id (QEMU handle).
@@ -3398,7 +3398,14 @@ pub struct DeviceState {
     /// that restarted at 1 whenever the entry was re-created, and
     /// `evict_gva` re-creates it on every deferred GVA render Store arm. One
     /// boot's audit caught `(0xa4c000, 1)` naming two different 64x64 icons.
-    pub sampled_content_gen: u64,
+    ///
+    /// An atomic so that issuing one needs `&self`: the parallel pool's jobs
+    /// hold the device state shared and a plan that builds a fresh host copy
+    /// needs a generation for it. The uniqueness claim above is exactly what an
+    /// atomic increment gives, from any number of threads; the *order* values are
+    /// issued in across threads is unspecified, and nothing may depend on it —
+    /// generations are compared for equality and never for "newer".
+    pub sampled_content_gen: AtomicU64,
     /// Which guest pages this device has written, and when.
     ///
     /// The hypervisor dirty bitmap witnesses guest CPU stores and nothing else,
@@ -3734,7 +3741,7 @@ impl DeviceState {
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
             bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
             buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens::default(),
-            sampled_content_gen: 0,
+            sampled_content_gen: AtomicU64::new(0),
             host_writes: crate::runtime::host_writes::HostWrites::new(page_shift),
             guest_linear_scratch: Vec::new(),
             ref_texture_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -5865,12 +5872,18 @@ impl DeviceState {
     /// before" is the whole of the contract — see
     /// [`Self::sampled_content_gen`]. Never returns 0, which readers use for
     /// "no host content yet".
-    pub fn next_sampled_content_generation(&mut self) -> u64 {
-        self.sampled_content_gen = self.sampled_content_gen.wrapping_add(1);
-        if self.sampled_content_gen == 0 {
-            self.sampled_content_gen = 1;
+    pub fn next_sampled_content_generation(&self) -> u64 {
+        loop {
+            let issued = self
+                .sampled_content_gen
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            // Zero is skipped, not returned: the counter wrapped, and the next
+            // increment is the first value past the reserved one.
+            if issued != 0 {
+                return issued;
+            }
         }
-        self.sampled_content_gen
     }
 
     /// Issue the next recency stamp for [`HostSurface::last_touch`].
@@ -7238,5 +7251,63 @@ impl reims_vgpu_core::pipeline::UsageSource for PipelineUsage<'_> {
         stage: Option<reims_vgpu_protocol::render::ShaderStage>,
     ) -> Option<&reims_vgpu_core::pipeline::BindingUsage> {
         self.0.pipelines_ref().binding_usage(pipeline, stage)
+    }
+}
+
+#[cfg(test)]
+mod sampled_generation_tests {
+    use super::*;
+    use crate::model::PAGE_SHIFT_X86;
+
+    /// The contract the engine's sampled cache binds on: a generation is issued
+    /// once and never again, from any number of threads, and is never 0.
+    #[test]
+    fn a_generation_is_issued_once_across_threads_and_never_zero() {
+        const THREADS: usize = 8;
+        const EACH: usize = 20_000;
+        let state = Arc::new(DeviceState::new(DeviceId(1), PAGE_SHIFT_X86));
+        let mut all: Vec<u64> = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let state = Arc::clone(&state);
+                    s.spawn(move || {
+                        (0..EACH)
+                            .map(|_| state.next_sampled_content_generation())
+                            .collect::<Vec<u64>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().expect("issuer does not panic"))
+                .collect()
+        });
+        assert_eq!(all.len(), THREADS * EACH);
+        assert!(all.iter().all(|&g| g != 0), "0 means no host content yet");
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), THREADS * EACH, "a generation was issued twice");
+    }
+
+    /// Serially it is the sequence it always was: 1, 2, 3, ...
+    #[test]
+    fn serially_the_generations_count_up_from_one() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(state.next_sampled_content_generation(), 1);
+        assert_eq!(state.next_sampled_content_generation(), 2);
+        assert_eq!(state.next_sampled_content_generation(), 3);
+    }
+
+    /// The counter wrapping skips the reserved value rather than returning it,
+    /// exactly as the `&mut self` form it replaced did.
+    #[test]
+    fn a_wrapped_counter_skips_zero() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state
+            .sampled_content_gen
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(state.next_sampled_content_generation(), u64::MAX);
+        assert_eq!(state.next_sampled_content_generation(), 1, "0 is skipped");
+        assert_eq!(state.next_sampled_content_generation(), 2);
     }
 }
