@@ -824,6 +824,8 @@ struct LoopCensus {
     draws_held: u64,
     /// Draws that reached the presenter with a new frame.
     draws_fresh: u64,
+    /// TEMP lab: host `CursorMoved` deliveries forwarded to the guest.
+    cursor_moves: u64,
 }
 
 impl LoopCensus {
@@ -836,6 +838,7 @@ impl LoopCensus {
             draws_stale: 0,
             draws_held: 0,
             draws_fresh: 0,
+            cursor_moves: 0,
         }
     }
 
@@ -854,7 +857,7 @@ impl LoopCensus {
         }
         crate::observe::off(format!(
             "host_window_loop win_ms={} ticks={} redraws_asked={} draws={} \
-             draws_fresh={} draws_stale={} draws_held={}",
+             draws_fresh={} draws_stale={} draws_held={} cursor_moves={}",
             elapsed.as_millis(),
             self.ticks,
             self.redraws_asked,
@@ -862,6 +865,7 @@ impl LoopCensus {
             self.draws_fresh,
             self.draws_stale,
             self.draws_held,
+            self.cursor_moves,
         ));
         *self = Self::new();
     }
@@ -994,6 +998,7 @@ impl ApplicationHandler<FramePublished> for App {
                 self.apply_key_effect(effect);
             }
             WindowEvent::CursorMoved { position, .. } => {
+                self.loop_census.cursor_moves += 1;
                 self.pointer_move((position.x, position.y));
             }
             WindowEvent::MouseInput { state, button, .. } => {

@@ -1027,6 +1027,29 @@ impl SessionModel {
         }
     }
 
+    /// Run a transaction past a pipeline that has ended rather than leave it
+    /// parked on a wait nothing can discharge.
+    ///
+    /// Only for a pipeline the table holds as terminal (`Refused`/`Retired`) or
+    /// does not hold at all; a pipeline still building answers `false` and
+    /// keeps its waiters. See [`crate::ready::Scheduler::release_ended_pipeline_wait`]
+    /// for why running is the better of the two answers to stranded work on a
+    /// rail that resolves pipelines by reference when it encodes.
+    pub fn release_past_ended_pipeline(
+        &mut self,
+        ingress: IngressOrdinal,
+        pipeline: ResourceId,
+    ) -> bool {
+        let ended = self
+            .pipelines
+            .get(pipeline)
+            .is_none_or(|entry| entry.state.is_terminal());
+        ended
+            && self
+                .scheduler
+                .release_ended_pipeline_wait(ingress, pipeline)
+    }
+
     /// A completion word became readable: record the value the timeline now
     /// stands at, and release whatever was waiting for it.
     ///

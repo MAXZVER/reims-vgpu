@@ -1144,6 +1144,30 @@ fn spirv_uses_builtin(spv: &[u8], builtin: u32) -> bool {
     false
 }
 
+/// Count a translation taken inline because the async worker had it queued but
+/// unfinished when an encode needed it, and name the first per `(ref, stage)`.
+///
+/// Not a failure — the draw is served — but it is the population whose size says
+/// how often admission let a packet through ahead of its own translation.
+fn note_loading_translated_inline(pipeline_ref: u32, stage: &'static str) {
+    crate::runtime::drain::note_store_route("m2v_loading_translated_inline");
+    let stage_key = match stage {
+        "vertex" => 1u64,
+        "fragment" => 2,
+        _ => 3,
+    };
+    if crate::observe::first_sight(
+        "m2v_loading_translated_inline",
+        u64::from(pipeline_ref) << 8 | stage_key,
+    ) {
+        crate::observe::off(format!(
+            "m2v_loading_translated_inline pipe={pipeline_ref} stage={stage} (queued for the \
+             async worker and needed now; translated on the encoding thread instead of \
+             dropping the draw)"
+        ));
+    }
+}
+
 /// Translate `air` for `stage`, returning the whole [`CachedShader`] (SPIR-V +
 /// reflection) as a shared handle, so a consumer reads stage-interface facts
 /// (texture shapes, vertex builtins, descriptor bindings) from the reflection
@@ -1180,11 +1204,14 @@ pub fn translate_cached_reflected(
                 forget_if_transient(&mut c, id, &e);
                 return Err(e);
             }
-            Some(Entry::Loading) => {
-                return Err(M2vCacheDecline::TranslationPending {
-                    stage: stage_name(stage),
-                })
-            }
+            // Queued for the async worker but not done. The draw asking now is
+            // past every point that could have deferred it, so refusing costs
+            // the guest the draw: the device then stores the clear colour, and
+            // macOS 26's rounded-corner tiles and widget layers came out opaque
+            // black this way whenever a pipeline ref was re-pointed at new AIR
+            // just before a packet binding it was admitted. Translate here, as a
+            // miss does; the worker's later `put` of the same bytes is a no-op.
+            Some(Entry::Loading) => note_loading_translated_inline(pipeline_ref, stage_name(stage)),
             None => {}
         }
     }
@@ -1243,9 +1270,9 @@ pub fn translate_cached_kernel_reflected(
                 forget_if_transient(&mut c, id, &e);
                 return Err(e);
             }
-            Some(Entry::Loading) => {
-                return Err(M2vCacheDecline::TranslationPending { stage: "kernel" })
-            }
+            // See `translate_cached_reflected`: a dispatch that reaches a
+            // queued kernel translates it rather than being dropped.
+            Some(Entry::Loading) => note_loading_translated_inline(pipeline_ref, "kernel"),
             None => {}
         }
     }
@@ -1739,6 +1766,46 @@ mod tests {
         assert!(
             global().lock().unwrap().find(id).is_none(),
             "the transient failure outlived the instant it described"
+        );
+        reset_for_test();
+    }
+
+    /// A draw that reaches a shader the async worker has queued but not finished
+    /// translates it itself rather than being refused with
+    /// `m2v_translation_pending_at_sync_boundary`. The refusal made the device
+    /// store the clear colour — opaque black corner tiles and widget layers on
+    /// macOS 26 whenever a pipeline ref was re-pointed at new AIR.
+    #[test]
+    fn a_draw_reaching_a_queued_translation_translates_instead_of_refusing() {
+        let _guard = test_lock();
+        reset_for_test();
+        // Not real AIR, so the inline translation fails — and that failure is
+        // the proof it ran: a refusal would have been `TranslationPending`.
+        let air = b"air-queued-for-the-worker";
+        let id = ShaderId::render(Stage::Fragment, air);
+        global()
+            .lock()
+            .unwrap()
+            .put(id, &Arc::from(&air[..]), Entry::Loading);
+
+        let Err(err) = translate_cached_reflected(air, Stage::Fragment, 9) else {
+            panic!("garbage AIR cannot translate");
+        };
+        assert!(
+            !matches!(err, M2vCacheDecline::TranslationPending { .. }),
+            "a queued translation refused the draw: {err:?}"
+        );
+        let id = ShaderId::kernel(air, [8, 8, 1]);
+        global()
+            .lock()
+            .unwrap()
+            .put(id, &Arc::from(&air[..]), Entry::Loading);
+        let Err(err) = translate_cached_kernel_reflected(air, [8, 8, 1], 9) else {
+            panic!("garbage AIR cannot translate");
+        };
+        assert!(
+            !matches!(err, M2vCacheDecline::TranslationPending { .. }),
+            "a queued kernel translation refused the dispatch: {err:?}"
         );
         reset_for_test();
     }

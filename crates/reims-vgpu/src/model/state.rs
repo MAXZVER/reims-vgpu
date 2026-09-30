@@ -597,9 +597,23 @@ pub struct TaskResource {
     /// The model owns the slot and the drop; it does not own — and cannot name
     /// — the contents.
     rail: Mutex<Option<Box<dyn Any + Send + Sync>>>,
+    /// `observe::elapsed_us` when this resolution was last compared against the
+    /// guest's own object list, or 0 before the first comparison. See
+    /// [`Self::reexamination_due`].
+    reexamined_us: std::sync::atomic::AtomicU64,
 }
 
 impl TaskResource {
+    /// Shortest interval between two comparisons of one cached resolution
+    /// against the guest's object list.
+    ///
+    /// The comparison decides nothing, and making it on *every* memo hit made
+    /// it one of the drain's larger costs: ~10 000 page-table walks a second on
+    /// a 5K Tahoe desktop, against a disagreement count that has stayed at zero
+    /// on every rail. Once per resolution per interval still names a recycled
+    /// slot within the interval.
+    pub const REEXAMINE_INTERVAL_US: u64 = 100_000;
+
     pub fn new(entry: ListObjectEntry, descriptor: Arc<[u8]>) -> Self {
         Self {
             entry,
@@ -608,7 +622,26 @@ impl TaskResource {
             mapper_ref_texture_mapping: OnceLock::new(),
             lifetime: Arc::new(TaskResourceLifetime::new()),
             rail: Mutex::new(None),
+            reexamined_us: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Whether this resolution is due a comparison at `now_us`, taking the slot
+    /// when it is. The first hit always is.
+    pub fn reexamination_due(&self, now_us: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        let last = self.reexamined_us.load(Ordering::Relaxed);
+        if last != 0 && now_us.saturating_sub(last) < Self::REEXAMINE_INTERVAL_US {
+            return false;
+        }
+        self.reexamined_us.store(now_us.max(1), Ordering::Relaxed);
+        true
+    }
+
+    /// Make the next hit due, as if the interval had elapsed.
+    #[cfg(test)]
+    pub fn age_reexamination(&self) {
+        self.reexamined_us.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Resolve this resource's immutable construction descriptor once.
@@ -1955,6 +1988,34 @@ pub struct RenderFlushWitness {
     pub landed_us: u64,
 }
 
+/// A guest-write generation read for one mapping's page list, taken before the
+/// bytes it will vouch for were read from the guest or landed by this device.
+///
+/// A stamp (`MappingEntry::guest_write_gen_at_store`) says "this device's copy
+/// holds every guest write up to here". A generation read *after* the copy was
+/// made can fold in a write the copy never saw: the host's prefetch moves
+/// generations at any moment, mid-pass, and a page it folds between the copy and
+/// the read is then vouched for and never read again (whole stale 4 KiB pages of
+/// CPU-painted tiles, held until the guest happens to write them again). So a
+/// rail observes first and commits after — `runtime::mapper::observe_guest_write_gen`
+/// and `commit_guest_write_stamp`. Committing an older observation is always
+/// safe: a later currency check only re-reads pages the copy already has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GuestWriteObservation {
+    pub(crate) token: u64,
+    pub(crate) map_generation: u32,
+    pub(crate) gen_: u64,
+    /// TEMP (lab): `MappingEntry::guest_stated_gen` at the observation.
+    pub(crate) stated: u32,
+}
+
+impl GuestWriteObservation {
+    /// The generation a commit of this observation stamps. 0 is never live.
+    pub fn generation(&self) -> u64 {
+        self.gen_
+    }
+}
+
 /// IOSurface mapper registry entry keyed by mapping_id.
 #[derive(Clone, Debug, Default)]
 pub struct MappingEntry {
@@ -2048,6 +2109,15 @@ pub struct MappingEntry {
     /// Without it every caller repeats a host mapping attempt that cannot
     /// become possible until the guest changes the list.
     pub contig_refused_gen: Option<u32>,
+    /// `(map_generation, control layout key)` for which
+    /// `runtime::mapper::mapping_page_gpas` last proved this page list aliases
+    /// no transport or task-control page. `None` = not proved for any list.
+    ///
+    /// The proof is a pure function of the page list and the control-structure
+    /// layout, and `map_generation` names the list the way it does for
+    /// [`Self::contig_refused_gen`]. Re-deriving it sorted every page of the
+    /// surface once per draw bind: a 5K surface is ~10 800 pages.
+    pub control_clear: Option<(u32, u64)>,
     /// Live [`crate::runtime::host::HostOps::track_guest_writes`] token for the
     /// page list in [`Self::page_entries`], or 0 when the host cannot observe
     /// guest writes (or none has been asked for yet).
@@ -2084,6 +2154,50 @@ pub struct MappingEntry {
     /// never compares equal to a live generation (the host's first readable
     /// generation is 1).
     pub guest_write_gen_at_store: u64,
+    /// TEMP (lab, REIMS_VGPU_LAB_STATED_VOUCH): count of the guest's own
+    /// "host copy invalid" statements about this mapping (`clear_host_valid`),
+    /// and its value in the observation [`Self::guest_write_gen_at_store`] was
+    /// committed from.
+    pub guest_stated_gen: u32,
+    pub guest_stated_at_stamp: u32,
+    /// The guest-write generation observed when this surface's pass last took
+    /// its content from the guest's side — a seed from its pages, or a verdict
+    /// that the resident still is them — held for the Store that publishes the
+    /// pass, which stamps this instead of a generation read after the draws.
+    pub pending_guest_write_obs: Option<GuestWriteObservation>,
+    /// The guest CPU has stored into this surface's pixels while a device
+    /// resident held newer content for it.
+    ///
+    /// Such a surface is one the guest also reads with the CPU, and it does so
+    /// without naming it in `CmdSynchronizeResources` first: on the device this
+    /// protocol was written for, the GPU renders into guest memory directly, so
+    /// there is nothing to synchronize. Measured on WindowServer's own
+    /// 1920x1080 framebuffers, which it composites into and then copies between
+    /// with the CPU: with the lazy writeback the pages it copied *from* were
+    /// stale, the copies landed whole pages of an older frame, and the desktop
+    /// kept horizontal stale-line streaks; with every Store written back at once
+    /// the guest's pages matched the resident texel for texel and the streaks
+    /// were gone. So a surface that has shown this once takes the eager Store
+    /// from then on, and every other surface keeps the lazy one.
+    pub guest_cpu_shared: bool,
+    /// The guest has presented this surface (a DisplaySwap named it). The
+    /// surfaces WindowServer copies between with the CPU are its framebuffers,
+    /// and presentation is what makes a surface one — so this, and not "the guest
+    /// wrote it", is what [`Self::guest_cpu_shared`] is gated on: Safari's tiles
+    /// are CPU-written too, and writing every one of them back eagerly cost what
+    /// turning the lazy rail off everywhere does.
+    pub scanout_presented: bool,
+    /// Bumped by every landing of device bytes into this mapping's guest pages
+    /// (`mapper::write_mapping_bytes_only`). The page-diff writeback keeps a copy
+    /// of what it last landed and trusts it only while this has not moved since.
+    pub guest_bytes_seq: u64,
+    /// This mapping's guest-write generation when the page-diff writeback last
+    /// made its guest pages equal to the copy it diffs against (0 = never).
+    /// Pages the guest CPU wrote since are landed whatever the diff says: the
+    /// copy cannot see those stores, so a frame page equal to the copy can still
+    /// differ from the guest's bytes (WindowServer copies an older frame's
+    /// region in with the CPU, then redraws it on the GPU to what it was).
+    pub pay_diff_gen: u64,
     /// Task id that last owned this surface as a backing `OBJECT_TYPE_BACKING`
     /// object (0 = no non-trivial hint; task 0 is always probed first anyway).
     /// `resolve_backing_ex` probes this task right after task 0 so a
@@ -3461,6 +3575,13 @@ pub struct DeviceState {
     /// answer to the one question its page-set guard cannot ask: was the guest
     /// told this render was done before we wrote its bytes?
     pub completion_stamp_seq: u64,
+    /// The guest has CPU-written a presented framebuffer under a live resident:
+    /// its compositor fills back buffers by copying from the front one with the
+    /// CPU. From then on every presented framebuffer's frame is written back
+    /// when a DisplaySwap presents it (`writeback_debt::pay_cpu_shared_mapping`);
+    /// the buffers trade roles, so latching them one by one left the ones not yet
+    /// caught stale as copy sources.
+    pub guest_copies_framebuffers: bool,
     /// Census only: what this device has stamped, split by whether the value is
     /// still owed by the coalescing rail or already handed to publication.
     ///
@@ -3596,6 +3717,7 @@ impl DeviceState {
             retired_linear_residents: Vec::new(),
             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
             completion_stamp_seq: 0,
+            guest_copies_framebuffers: false,
             stamp_ledger: Default::default(),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -4472,6 +4594,21 @@ impl DeviceState {
             .pipelines()
             .get(pipeline)
             .map(|entry| entry.state.name())
+    }
+
+    /// Release a parked transaction past a pipeline that ended (retired or
+    /// refused, or absent from the table), so it runs instead of holding its
+    /// channel's publication head forever. See
+    /// [`reims_vgpu_core::session::SessionModel::release_past_ended_pipeline`].
+    pub fn release_past_ended_pipeline(
+        &self,
+        ingress: reims_vgpu_core::identity::IngressOrdinal,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .release_past_ended_pipeline(ingress, pipeline)
     }
 
     #[must_use]

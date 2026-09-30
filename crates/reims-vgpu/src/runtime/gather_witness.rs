@@ -660,9 +660,14 @@ impl GatherWitness {
 /// same precondition the gather itself relies on, read at the same point in the
 /// draw.
 pub(crate) unsafe fn fold_runs(runs: &[crate::runtime::guest_ram::GuestRun], span: u64) -> u128 {
+    let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_ng_fold_us"); // TEMP (lab)
     let mut a: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut b: u64 = 0xc2b2_ae3d_27d4_eb4f;
     let mut remaining = span;
+    let stride = fold_block_stride(span);
+    // Offset of the current run's first byte within the window, so the sampled
+    // blocks are the same window positions however the pages split into runs.
+    let mut at: u64 = 0;
     for run in runs {
         if remaining == 0 {
             break;
@@ -671,7 +676,33 @@ pub(crate) unsafe fn fold_runs(runs: &[crate::runtime::guest_ram::GuestRun], spa
         remaining -= n as u64;
         // SAFETY: caller's precondition — `host_ptr` is a stable RAMBlock alias
         // valid for at least `run.len` bytes, and `n <= run.len`.
-        let bytes = unsafe { std::slice::from_raw_parts(run.host_ptr() as *const u8, n) };
+        let run_bytes = unsafe { std::slice::from_raw_parts(run.host_ptr() as *const u8, n) };
+        let run_at = at;
+        at += n as u64;
+        if stride > 1 {
+            // A large window folds every `stride`-th block of `FOLD_BLOCK` bytes,
+            // at fixed window offsets, rather than every byte.
+            let mut off = 0usize;
+            while off < n {
+                let block = (run_at + off as u64) / FOLD_BLOCK;
+                let block_end = ((block + 1) * FOLD_BLOCK - run_at) as usize;
+                let end = block_end.min(n);
+                if block % stride == 0 {
+                    for chunk in run_bytes[off..end].chunks(8) {
+                        let mut w = [0u8; 8];
+                        w[..chunk.len()].copy_from_slice(chunk);
+                        let w = u64::from_le_bytes(w);
+                        a = (a ^ w).rotate_left(29).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                        b = b.rotate_left(7).wrapping_add(w ^ a);
+                    }
+                    b = b.wrapping_mul(0xff51_afd7_ed55_8ccd) ^ block;
+                }
+                off = end;
+            }
+            b = b.wrapping_mul(0xff51_afd7_ed55_8ccd) ^ (n as u64);
+            continue;
+        }
+        let bytes = run_bytes;
         let (words, tail) = bytes.split_at(n & !7);
         for chunk in words.chunks_exact(8) {
             let w = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
@@ -686,6 +717,44 @@ pub(crate) unsafe fn fold_runs(runs: &[crate::runtime::guest_ram::GuestRun], spa
         b = b.wrapping_mul(0xff51_afd7_ed55_8ccd) ^ (n as u64);
     }
     ((a as u128) << 64) | b as u128
+}
+
+/// Block granularity of a sampled fold: one guest page on x86.
+const FOLD_BLOCK: u64 = 4096;
+
+/// Windows up to this size fold every byte.
+///
+/// Above it the fold reads every `stride`-th block so that it touches about
+/// [`FOLD_SAMPLED_BYTES`]. A 4K video plane is 16.6 MB, and folding it whole on
+/// the drain thread took milliseconds a bind — 361 MB of reads in one census
+/// window on a driven macos-26 desktop, most of what the audit cost. The alarm
+/// this fold serves catches systematic staleness (a frame or a scroll moves most
+/// of a window's pages), which a fixed, evenly spread sample still sees; the
+/// sample is taken at fixed window offsets, so a baseline and its comparison
+/// read the same bytes.
+const FOLD_FULL_MAX: u64 = 2 << 20;
+
+/// Bytes a sampled fold aims to read.
+const FOLD_SAMPLED_BYTES: u64 = 1 << 20;
+
+/// Every how many blocks a fold of `span` bytes reads one (1 = every block).
+fn fold_block_stride(span: u64) -> u64 {
+    if span <= FOLD_FULL_MAX {
+        return 1;
+    }
+    let blocks = span.div_ceil(FOLD_BLOCK);
+    let want = (FOLD_SAMPLED_BYTES / FOLD_BLOCK).max(1);
+    blocks.div_ceil(want).max(1)
+}
+
+/// Bytes a fold of `span` bytes actually reads, for the cost census.
+pub(crate) fn fold_read_bytes(span: u64) -> u64 {
+    let stride = fold_block_stride(span);
+    if stride == 1 {
+        span
+    } else {
+        span.div_ceil(FOLD_BLOCK).div_ceil(stride) * FOLD_BLOCK
+    }
 }
 
 /// Every account of one bind's writers that is read out of device state, taken
@@ -1078,6 +1147,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     // page-exact question needs the epoch recorded at the *previous* bind, which
     // is inside the witness, and the ring that answers it is read through the
     // same device state.
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_ng_counts_us"); // TEMP (lab)
     let counts = WitnessReadings {
         pages_epoch: state.host_writes.epoch(),
         pages_wrote: state
@@ -1096,6 +1166,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
         },
         pending: PendingWrites::over(window.gpas),
     };
+    drop(lab_span);
     // Every bind, vouched or not, so the route is a denominator rather than a
     // tally of refusals — the reading wanted is what fraction of binds this
     // device has a copy in flight over, and a count with no denominator cannot
@@ -1118,7 +1189,9 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     // The guest's own statement about this resource, read before the witness is
     // touched for the same reason the host-write epoch is: it has to describe the
     // moment the inferred half is asked about, not a moment after it.
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_ng_observe_us"); // TEMP (lab)
     let seen = observe(&mut state.gather_witness, host, key, window, counts, fresh);
+    drop(lab_span);
 
     // Score the guest's stated account against the hypervisor's inferred one,
     // and both against the content audit. Nothing branches on the stated channel
@@ -1177,7 +1250,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     // `gw_audit_kb` is every byte the fold still reads, so the cost of keeping
     // the alarm is reported in the same units as the gathers it saves.
     if !matches!(seen.audit, ContentAudit::Skipped) {
-        note_store_route_n("gw_audit_kb", span / 1024);
+        note_store_route_n("gw_audit_kb", fold_read_bytes(span) / 1024);
     }
     match seen.audit {
         ContentAudit::Skipped => {}
@@ -1272,6 +1345,14 @@ pub struct GatheredIdentity {
     /// Generation vouched for these bytes, from
     /// `DeviceState::next_sampled_content_generation`.
     pub generation: u64,
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_STATED_VOUCH=on` lets the guest's stated channel
+/// stand in for this epoch's hypervisor sync (see `observe` and
+/// `mapper::mapping_guest_write_verdict`).
+pub(crate) fn lab_stated_vouch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_STATED_VOUCH").is_ok_and(|v| v == "on"))
 }
 
 /// The witness itself: ask both halves about the last bind of the same window,
@@ -1378,11 +1459,6 @@ fn observe<M: crate::runtime::host::HostOps>(
         .entries
         .get_mut(&key)
         .expect("the stale branch above returns for every absent key");
-    let gen = if entry.token == 0 {
-        0
-    } else {
-        host.guest_write_gen(entry.token).unwrap_or(0)
-    };
     // A generation of 0 on either side is "cannot tell": the token is unarmed,
     // was released with its pages, or has not survived the two harvests the
     // dirty adapter needs before it can answer at all.
@@ -1392,19 +1468,8 @@ fn observe<M: crate::runtime::host::HostOps>(
     // of this, and two spellings of it is one edit away from a witness that
     // vouches and reports a host write in the same breath.
     let host_quiet = pages_wrote.is_some_and(|seen| !seen.wrote());
-    let verdict = if gen == 0 || entry.gen == 0 {
-        GatherVerdict::Unarmed
-    } else if gen == entry.gen && host_quiet {
-        GatherVerdict::Vouched
-    } else {
-        GatherVerdict::Refused {
-            guest_wrote: gen != entry.gen,
-            host_wrote_pages: !host_quiet,
-        }
-    };
-    let vouched = matches!(verdict, GatherVerdict::Vouched);
 
-    // The guest's own account of the same writes the `gen` comparison above
+    // The guest's own account of the same writes the `gen` comparison below
     // infers, taken here so both answers describe one bind of one window. Only
     // a window addressed at *both* binds has a comparison to make; either side
     // absent is no answer rather than a quiet one.
@@ -1414,6 +1479,43 @@ fn observe<M: crate::runtime::host::HostOps>(
         _ => StatedGuestWrite::Unaddressed,
     };
     entry.stated_gen = stated_now;
+
+    // TEMP (lab, REIMS_VGPU_LAB_STATED_VOUCH=on): where the guest states the
+    // window quiet and this device wrote none of it, take the hypervisor's
+    // generation as of its last sync instead of waiting for this epoch's; a
+    // write the guest did not state is then refused one bind late. A stated
+    // write refuses whatever the hypervisor says.
+    let lab_stated = lab_stated_vouch();
+    let lagged = lab_stated
+        && matches!(key, GatherKey::Mapping { .. })
+        && matches!(stated, StatedGuestWrite::Quiet)
+        && host_quiet;
+    let stated_wrote = lab_stated && matches!(stated, StatedGuestWrite::Wrote);
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_ng_gen_us"); // TEMP (lab)
+    let gen = if entry.token == 0 {
+        0
+    } else if lagged {
+        crate::runtime::drain::note_store_route("lab_gw_lagged");
+        host.guest_write_gen_lagged(entry.token).unwrap_or(0)
+    } else {
+        host.guest_write_gen(entry.token).unwrap_or(0)
+    };
+    drop(lab_span);
+    let verdict = if gen == 0 || entry.gen == 0 {
+        GatherVerdict::Unarmed
+    } else if gen == entry.gen && host_quiet && !stated_wrote {
+        GatherVerdict::Vouched
+    } else {
+        GatherVerdict::Refused {
+            guest_wrote: gen != entry.gen || stated_wrote,
+            host_wrote_pages: !host_quiet,
+        }
+    };
+    if lagged && gen != 0 && gen != entry.gen {
+        // The lagged read itself caught a write the guest did not state.
+        crate::runtime::drain::note_store_route("lab_gw_lagged_caught");
+    }
+    let vouched = matches!(verdict, GatherVerdict::Vouched);
 
     // SAFETY (every `fold_runs` below): `runs` describe the window this draw is
     // about to gather from, so their pointers are live here for the same reason
@@ -1624,6 +1726,43 @@ mod tests {
     fn run_over(buf: &[u8]) -> GuestRun {
         GuestRun::whole(buf.as_ptr() as usize, buf.len() as u64)
             .expect("a fixture run covers its own span")
+    }
+
+    #[test]
+    fn a_large_window_folds_a_fixed_sample_of_about_a_megabyte() {
+        // A 4K video plane: 3840x2160 at two bytes a texel.
+        let plane = 3840 * 2160 * 2;
+        let read = fold_read_bytes(plane);
+        assert!(
+            read <= FOLD_SAMPLED_BYTES + FOLD_BLOCK && read >= FOLD_SAMPLED_BYTES / 2,
+            "a 16.6 MB plane read {read} bytes"
+        );
+        // At or below the full-fold bound nothing changes.
+        assert_eq!(fold_read_bytes(FOLD_FULL_MAX), FOLD_FULL_MAX);
+        assert_eq!(fold_block_stride(FOLD_FULL_MAX), 1);
+    }
+
+    #[test]
+    fn a_sampled_fold_sees_a_change_in_a_sampled_block_and_repeats_itself() {
+        let span = 8u64 << 20;
+        let stride = fold_block_stride(span);
+        assert!(stride > 1, "an 8 MB window is sampled");
+        let mut buf = vec![3u8; span as usize];
+        let base = unsafe { fold_runs(&[run_over(&buf)], span) };
+        // The same bytes fold the same: a baseline and its comparison agree.
+        assert_eq!(base, unsafe { fold_runs(&[run_over(&buf)], span) });
+        // Block 0 and the last sampled block are read.
+        let last_sampled = ((span / FOLD_BLOCK - 1) / stride) * stride;
+        for block in [0, stride, last_sampled] {
+            let at = (block * FOLD_BLOCK + 17) as usize;
+            buf[at] ^= 0x20;
+            let moved = unsafe { fold_runs(&[run_over(&buf)], span) };
+            assert_ne!(base, moved, "a change in sampled block {block} folded the same");
+            buf[at] ^= 0x20;
+        }
+        // Whole-frame change (a new video frame, a scroll) always moves it.
+        buf.iter_mut().for_each(|b| *b = 9);
+        assert_ne!(base, unsafe { fold_runs(&[run_over(&buf)], span) });
     }
 
     #[test]

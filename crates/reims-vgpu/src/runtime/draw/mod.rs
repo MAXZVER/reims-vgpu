@@ -877,7 +877,7 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
             return None;
         }
     };
-    let p = match decode_render_pipeline_descriptor(&desc) {
+    let mut p = match decode_render_pipeline_descriptor(&desc) {
         Ok(p) => p,
         Err(status) => {
             // The decoder's own name for what it refused, carried through rather
@@ -897,16 +897,26 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
             return None;
         }
     };
-    // Both stages are required to build a pipeline, and the two are reported
-    // apart because they are different guest mistakes — the compute sibling
+    // A vertex stage is required to build a pipeline — the compute sibling
     // names its one stage the same way, as `kernel_func_zero`.
     if p.vertex_func_ref == 0 {
         report.reason(task_id, pipeline_ref, "vertex_func_zero", "");
         return None;
     }
+    // A fragment stage is not. Metal allows a render pipeline whose
+    // `fragmentFunction` is nil: it rasterizes for depth and stencil only and
+    // writes no colour. macOS 26 builds these for its stencil masks (~1200 per
+    // login, every one refused here as `fragment_func_zero` until now, and the
+    // stencil-tested draws after them then covered nothing). The rail builds
+    // them with an empty fragment stage (`pipeline_resolve::no_fragment_stage`),
+    // so the "writes no colour" half is carried here, where the descriptor is
+    // decoded: every colour attachment's write mask is cleared.
     if p.fragment_func_ref == 0 {
-        report.reason(task_id, pipeline_ref, "fragment_func_zero", "");
-        return None;
+        crate::runtime::drain::note_store_route("pipeline_no_fragment_stage");
+        p.color0.write_mask = reims_vgpu_protocol::blend::ColorWriteMask::NONE;
+        for attachment in &mut p.color_attachments {
+            attachment.write_mask = reims_vgpu_protocol::blend::ColorWriteMask::NONE;
+        }
     }
     // The guest has created this pipeline object, which is the semantic model's
     // `Declared` and nothing more — no host work has started here, and both
@@ -3871,20 +3881,42 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
         } else {
             (texture_ref, 0, None)
         };
+    // TEMP (lab): name the base a failing view reads, once per (base, override).
+    let lab_view_miss = |state: &mut DeviceState, host: &M, path: &str| {
+        if tex_ref == texture_ref {
+            return;
+        }
+        let ot = objects::lookup_list_entry(state, host, task_id, tex_ref).map(|e| e.object_type);
+        let base_fmt = objects::lookup_list_entry(state, host, task_id, tex_ref)
+            .and_then(|e| objects::read_descriptor(state, host, task_id, &e))
+            .and_then(|d| decode_texture_descriptor(&d).ok())
+            .map(|t| (t.pixel_format, t.mipmap_level_count, t.extent()));
+        let key = (u64::from(tex_ref) << 32)
+            ^ u64::from(fmt_override.unwrap_or(0))
+            ^ (path.len() as u64) << 48;
+        if crate::observe::first_sight("lab_view_sample_miss", key) {
+            crate::observe::fail(format!(
+                "lab_view_sample_miss view={texture_ref} base={tex_ref} base_ot={ot:?} base={base_fmt:?} level={level} ov={fmt_override:?} path={path}"
+            ));
+        }
+    };
     // Mapper-ref-texture base through a view (format override may reinterpret BGRA storage).
     if let Some(mid) = objects::resolve_mapper_ref_texture(state, host, task_id, tex_ref) {
         if level != 0 {
+            lab_view_miss(state, host, "mapper_level");
             return None;
         }
         let source = mapping_declared_format(state, mid, fmt_override);
-        return load_mapper_ref_texture_mapping_rgba(state, host, mid, fmt_override).map(
-            |(_, _, r)| {
-                (
-                    r,
-                    SampledByteFormat::from_source(TexelLayout::Rgba8, source),
-                )
-            },
-        );
+        let loaded = load_mapper_ref_texture_mapping_rgba(state, host, mid, fmt_override);
+        if loaded.is_none() {
+            lab_view_miss(state, host, "mapper_load");
+        }
+        return loaded.map(|(_, _, r)| {
+            (
+                r,
+                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
+            )
+        });
     }
     // The only rung here that can answer in anything but RGBA8. The three above
     // convert unconditionally — `load_buffer_texture_rgba` and
@@ -3892,7 +3924,7 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     // they always produced rather than being handed a choice they cannot make.
     // All four still name the guest format their values were read from, because
     // a convert to RGBA8 reorders channels and does not decode.
-    load_linear_texture_host(
+    let loaded = load_linear_texture_host(
         state,
         host,
         task_id,
@@ -3901,7 +3933,11 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
         fmt_override,
         native,
         site,
-    )
+    );
+    if loaded.is_none() {
+        lab_view_miss(state, host, "linear_load");
+    }
+    loaded
 }
 
 #[cfg(test)]

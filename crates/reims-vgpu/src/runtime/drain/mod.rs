@@ -2596,6 +2596,32 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
         note_store_route("parked_translations_finished");
         for lease in leases {
             ready_lease(state, lease, "pipeline_lease_ready_pump");
+            // A lease the table would not ready names a pipeline that ended —
+            // the guest deleted it (or this device retired its name) while the
+            // packet was parked. Nothing will ever ready it, so without this
+            // the position stays parked, this pass re-plans it on every tranche
+            // (33 000 times a second on a driven macos-26 boot, drain duty
+            // 0.9), and its channel's publication head holds every packet
+            // behind it: WindowServer stopped presenting and the display froze
+            // on the boot logo. The packet runs instead; a draw whose pipeline
+            // is really gone refuses on its own, and the packet completes.
+            if !state.pipeline_is_ready(lease) && state.release_past_ended_pipeline(ingress, lease)
+            {
+                note_store_route("parked_released_past_ended_pipeline");
+                if crate::observe::first_sight(
+                    "parked_released_past_ended_pipeline",
+                    u64::from(lease.slot.0),
+                ) {
+                    crate::observe::fail(format!(
+                        "parked_released_past_ended_pipeline slot={} gen={} state={} (a parked \
+                         packet leased a pipeline that ended before it could be readied; run \
+                         rather than park forever)",
+                        lease.slot.0,
+                        lease.generation.0,
+                        state.pipeline_state(lease).unwrap_or("absent")
+                    ));
+                }
+            }
         }
     }
 }
@@ -2614,6 +2640,20 @@ fn run_parked<H: HostMemory + HostOps>(
     work: &crate::runtime::parked::ParkedWork,
 ) {
     let domain = work.domain();
+    // Every channel's doorbells bind the reads a parked packet makes: scoping
+    // them to the packet's own channel (lab, 2026-09-29) removed no syncs — the
+    // compositor's channel reads nearly every set — and would trust that no
+    // cross-channel dependency hides outside the packet's stamp waits.
+    run_parked_packet(state, host, ingress, work, domain);
+}
+
+fn run_parked_packet<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    ingress: reims_vgpu_core::identity::IngressOrdinal,
+    work: &crate::runtime::parked::ParkedWork,
+    domain: u32,
+) {
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
         process_root_packet(state, host, work.packet());
     } else {
@@ -3205,6 +3245,41 @@ pub fn write_stamp<H: HostMemory + HostOps>(
 /// for `maxThreadsPerThreadgroup` or `maxThreadgroupMemoryLength` is a device
 /// that can run nothing. Answering too much is a lie the guest acts on;
 /// answering too little is a zero it also acts on.
+/// TEMP (lab): `REIMS_VGPU_DEVICE_INFO_SET="18=0x20006,37=1008,44=-"` replaces,
+/// adds (`k=v`, decimal or `0x` hex) or withholds (`k=-`) device-info keys, so a
+/// macOS 26 experiment on what the guest is told needs no rebuild.
+fn lab_device_info_override(mut served: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    let Ok(spec) = std::env::var("REIMS_VGPU_DEVICE_INFO_SET") else {
+        return served;
+    };
+    for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((k, v)) = item.split_once('=') else {
+            continue;
+        };
+        let Ok(key) = k.trim().parse::<u32>() else {
+            continue;
+        };
+        served.retain(|&(have, _)| have != key);
+        let v = v.trim();
+        if v == "-" {
+            continue;
+        }
+        let value = match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16),
+            None => v.parse::<u32>(),
+        };
+        if let Ok(value) = value {
+            served.push((key, value));
+        }
+    }
+    served.sort_by_key(|&(key, _)| key);
+    crate::observe::fail(format!(
+        "device_info lab_override spec={spec} served={served:?}"
+    ));
+    eprintln!("reims-lab device_info override spec={spec} served={served:?}");
+    served
+}
+
 fn reply_device_info<H: HostMemory + HostOps>(
     host: &mut H,
     request: &crate::protocol::fifo::DeviceInfoRequest,
@@ -3241,7 +3316,7 @@ fn reply_device_info<H: HostMemory + HostOps>(
     // discrete part to an iGPU at the Vulkan floor, which is exactly the case a
     // fixed table gets wrong.
     let limits = crate::backend::selected().device_info_limits();
-    let served = crate::model::device_info_caps(&limits, version);
+    let served = lab_device_info_override(crate::model::device_info_caps(&limits, version));
     // Withhold every key the guest just said it does not parse. This is not a
     // reduction of what the device can do — a key the guest discards on arrival
     // buys nothing, and the slot it occupies is one fewer for a key the guest
@@ -4070,6 +4145,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
             .gfx
             .fifo_read
             .load(std::sync::atomic::Ordering::Acquire);
+        host.note_work_scope(crate::runtime::host::WorkScope::All);
         match arrival(&ring, host, head, state.gfx.fifo_written) {
             Arrival::Nothing => break,
             Arrival::Fault(fault) => {
@@ -4269,7 +4345,8 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     };
     let psz = page_size as usize;
 
-    shared_w32(host, gpa, DISPLAY_DESC_SERIAL, DISPLAY_SERIAL_NUMBER, psz);
+    let panel = display_panel();
+    shared_w32(host, gpa, DISPLAY_DESC_SERIAL, panel.serial, psz);
     let _ = gpa_map::write_bytes(
         host,
         gpa + DISPLAY_DESC_PRODUCT_NAME,
@@ -4284,8 +4361,8 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     // float pair is what `displayDimensionFloats` licenses at rung 0x2a and
     // above, and leaving it unwritten is a 0 x 0 mm panel to any guest that gets
     // there.
-    let (width_f32, width_mm) = display_dimension_mm(DISPLAY_WIDTH_MM);
-    let (height_f32, height_mm) = display_dimension_mm(DISPLAY_HEIGHT_MM);
+    let (width_f32, width_mm) = display_dimension_mm(panel.width_mm);
+    let (height_f32, height_mm) = display_dimension_mm(panel.height_mm);
     shared_w16(host, gpa, DISPLAY_DESC_WIDTH_MM, width_mm, psz);
     shared_w16(host, gpa, DISPLAY_DESC_HEIGHT_MM, height_mm, psz);
     shared_w32(
@@ -4315,22 +4392,25 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
         psz,
     );
 
-    const MODES: &[(u16, u16)] = &[
+    const BUILT_IN: &[(u16, u16)] = &[
         (DISPLAY_MODE_EFI_W, DISPLAY_MODE_EFI_H),
         (DISPLAY_MODE1_W, DISPLAY_MODE1_H),
         (DISPLAY_MODE2_W, DISPLAY_MODE2_H),
         (DISPLAY_MODE3_W, DISPLAY_MODE3_H),
     ];
+    let mut modes = vec![panel.native];
+    modes.extend(BUILT_IN.iter().copied().filter(|&m| m != panel.native));
+    let modes: &[(u16, u16)] = &modes;
     shared_w16(
         host,
         gpa,
         DISPLAY_DESC_TIMING_COUNT,
-        MODES.len() as u16,
+        modes.len() as u16,
         psz,
     );
 
     let mut encoded = [0u8; DISPLAY_DESC_TIMING_STRIDE as usize];
-    for (i, &(width, height)) in MODES.iter().enumerate() {
+    for (i, &(width, height)) in modes.iter().enumerate() {
         let Some(off) = display_timing_entry_offset(i as u32, page_size) else {
             return;
         };
@@ -4347,6 +4427,66 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
         }
         let _ = gpa_map::write_bytes(host, gpa + off, &encoded, psz);
     }
+}
+
+/// The panel this device announces: its native mode, physical size and serial.
+struct DisplayPanel {
+    native: (u16, u16),
+    width_mm: u16,
+    height_mm: u16,
+    serial: u32,
+}
+
+/// [`crate::config::DISPLAY_NATIVE`], resolved once.
+///
+/// The built-in panel is the 1920x1080, 48 x 27 cm one `model::regs` derives.
+/// A configured native mode gets the same treatment `DISPLAY_WIDTH_MM`'s doc
+/// gives the built-in one: the aspect reduced to lowest terms and scaled by a
+/// whole number of centimetres, picked so the panel is about 64 cm wide — for
+/// 5120x2160 that is 64 x 27 cm, ~203 DPI, where the guest offers HiDPI.
+fn display_panel() -> &'static DisplayPanel {
+    static PANEL: std::sync::OnceLock<DisplayPanel> = std::sync::OnceLock::new();
+    PANEL.get_or_init(|| {
+        let built_in = DisplayPanel {
+            native: (DISPLAY_MODE_EFI_W, DISPLAY_MODE_EFI_H),
+            width_mm: DISPLAY_WIDTH_MM,
+            height_mm: DISPLAY_HEIGHT_MM,
+            serial: DISPLAY_SERIAL_NUMBER,
+        };
+        let (_, value) = crate::config::read(crate::config::DISPLAY_NATIVE);
+        let Some(value) = value else {
+            return built_in;
+        };
+        let parsed = value
+            .trim()
+            .to_ascii_lowercase()
+            .split_once('x')
+            .and_then(|(w, h)| Some((w.trim().parse::<u16>().ok()?, h.trim().parse::<u16>().ok()?)))
+            .filter(|&(w, h)| (1..=8192).contains(&w) && (1..=8192).contains(&h));
+        let Some((w, h)) = parsed else {
+            crate::observe::fail(format!(
+                "display_native_refused value={value:?} (want WxH, each 1..=8192)"
+            ));
+            return built_in;
+        };
+        let (mut a, mut b) = (u32::from(w), u32::from(h));
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        let (rw, rh) = (u32::from(w) / a, u32::from(h) / a);
+        let k = (64 / rw.max(1)).max(1);
+        let panel = DisplayPanel {
+            native: (w, h),
+            width_mm: (rw * k * 10).min(u32::from(u16::MAX)) as u16,
+            height_mm: (rh * k * 10).min(u32::from(u16::MAX)) as u16,
+            serial: DISPLAY_SERIAL_NUMBER.wrapping_add((u32::from(w) << 16) | u32::from(h)),
+        };
+        crate::observe::off(format!(
+            "display_native {w}x{h} panel={}x{}mm serial={:#x}",
+            panel.width_mm, panel.height_mm, panel.serial
+        ));
+        panel
+    })
 }
 
 /// Sample cursor x/y/show from the display shared-state page (GPA +0xe00).
@@ -4748,6 +4888,13 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     state.present.present_mapping = mapping;
     state.present.host_mapping = mapping;
     state.present.valid = true;
+    if let Some(m) = state.mappings.get_mut(&mapping) {
+        m.scanout_presented = true;
+    }
+    // A presented framebuffer is what WindowServer copies from with the CPU,
+    // unannounced, to fill the next back buffer. Its frame has to be in its
+    // pages before anything after this swap can reach the guest.
+    crate::runtime::writeback_debt::pay_cpu_shared_mapping(state, host, mapping);
     // x86: present surface_id → backing object-list slot (heap index =
     // IOSurface getSurfaceID). Arm: MappingInternal page-table resolve.
     // Always attempt backing when pages empty; then iosfc/mapper path.
@@ -5118,6 +5265,111 @@ fn observe_page_table_nodes<H: HostMemory + HostOps>(
 /// to happen before the packet is applied. A range that no longer translates
 /// resolves to fewer pages than it spans, and that is not an error here — those
 /// pages are already gone and there is nothing left to watch.
+/// Hold the guest's hand-back of pages until every writeback this device has
+/// queued into them has landed.
+///
+/// The guest frees a span's pages before it submits the `UnmapMemory` that
+/// names it, on the strength of the completion it already read for the work
+/// that used them. A GPU-direct writeback is recorded into the command stream
+/// and not waited on, so between that completion and the copy landing there is
+/// a window in which the kernel can reuse the page — and the copy then lands in
+/// whatever it put there. One macOS 15 guest panicked in `kevent_register`
+/// with `RGBA16Float` texels inside a kqueue object, with every
+/// write-after-release guard at zero, because those guards run when a write is
+/// planned and nothing runs when it lands.
+///
+/// This is the release-side twin of the reader-side settles: cheap when the
+/// debt flag is clear (one atomic load, the common case), and a bounded fence
+/// wait otherwise. The page walk runs only when something is outstanding, and
+/// on this packet it often finds nothing — the guest unwired the span first —
+/// which reads as `Unnamed` and settles unconditionally, the fail-safe
+/// direction. An `Overlap` is the finding itself: a write still in flight into
+/// pages the guest has already released, reported once per task on the
+/// always-on channel so a later panic can be attributed rather than guessed.
+fn settle_released_span<H: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &H,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+) {
+    use crate::runtime::render_writeback::SettleSite;
+    let backend = crate::backend::selected();
+    if !backend.guest_writes_outstanding() {
+        return;
+    }
+    let pages: Vec<u64> = crate::runtime::gva_mem::task_gva_page_gpa_set(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        length,
+        state.page_shift,
+    )
+    .into_iter()
+    .collect();
+    let reach = if pages.is_empty() {
+        crate::backend::GuestWriteReach::Unnamed
+    } else {
+        backend.guest_writes_reaching(&pages)
+    };
+    settle_release(SettleSite::GuestRelease, reach, || {
+        format!(
+            "guest_release_reaches_outstanding_write family=unmap_memory task={task_id} \
+             gva={gva:#x} len={length:#x} pages={} (a writeback this device queued has not \
+             landed and the guest has already released these pages; settled here, which is \
+             the last point that can hold it)",
+            pages.len()
+        )
+    });
+}
+
+/// [`settle_released_span`] for `DeleteIOSurfaceBacking2`, whose pages are the
+/// mapping's own list rather than a span to walk.
+fn settle_released_mapping(state: &DeviceState, mapping_id: u32) {
+    use crate::runtime::render_writeback::SettleSite;
+    let backend = crate::backend::selected();
+    if !backend.guest_writes_outstanding() {
+        return;
+    }
+    let reach = match state.mapping_reach_pages(mapping_id) {
+        Some(pages) if !pages.is_empty() => backend.guest_writes_reaching(&pages),
+        _ => crate::backend::GuestWriteReach::Unnamed,
+    };
+    settle_release(SettleSite::BackingRelease, reach, || {
+        format!(
+            "guest_release_reaches_outstanding_write family=delete_iosurface_backing2 \
+             mid={mapping_id} (a writeback this device queued has not landed and the guest \
+             has already released this mapping's pages; settled here)"
+        )
+    });
+}
+
+/// The shared tail of the two release settles: count the answer under the
+/// site, report an overlap once per site, and wait unless the writeback is
+/// provably elsewhere.
+fn settle_release(
+    site: crate::runtime::render_writeback::SettleSite,
+    reach: crate::backend::GuestWriteReach,
+    finding: impl FnOnce() -> String,
+) {
+    use crate::backend::GuestWriteReach as Reach;
+    note_store_route(match reach {
+        Reach::Disjoint => site.route_disjoint(),
+        Reach::Overlap => site.route_overlap(),
+        Reach::Unnamed => site.route_unnamed(),
+    });
+    if reach == Reach::Overlap
+        && crate::observe::first_sight("guest_release_reaches_outstanding_write", site as u64)
+    {
+        crate::observe::fail(finding());
+    }
+    if reach == Reach::Disjoint {
+        return;
+    }
+    crate::runtime::render_writeback::settle_guest_writes(site);
+}
+
 fn note_released_or_remapped<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &H,
@@ -5421,6 +5673,12 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // views so the next ensure_gva_view re-walks. Does not invent
         // PTEs and does not destroy host_gva_surfaces content.
         if gva != 0 && length != 0 {
+            // Before anything else, because everything else here forgets the
+            // span: a writeback this device queued into these pages must land
+            // before the guest's allocator hands them to someone else.
+            if matches!(family, MapFamily::UnmapMemory) {
+                settle_released_span(state, host, task_id, gva, length);
+            }
             // Held bind resolutions over this range name pages the guest
             // has just remapped. Retired by range, which is exactly what
             // this notify carries.
@@ -5483,6 +5741,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // resolve proves which incarnation this delete was for
         // (fingerprint compare in mapper::resolve). A second delete
         // with no resolve between is genuinely dead: tear down fully.
+        // Same obligation as the unmap arm, keyed by the mapping whose pages
+        // are going back: a queued writeback into them must land first.
+        settle_released_mapping(state, object_id);
         let mode = if state.mapping_backing_condemned(object_id) {
             let _ = state.unmap_surface(object_id);
             "dead"
@@ -5533,6 +5794,13 @@ fn apply_map_family<H: HostMemory + HostOps>(
                         rec.object_id,
                         rec.ops,
                         ValiditySite::InvalidateResources,
+                    );
+                    crate::runtime::exec::pay_owed_before_guest_read(
+                        state,
+                        host,
+                        cmd.task_id,
+                        rec.object_id,
+                        rec.ops,
                     );
                     bumped = bumped.saturating_add(outcome.bumped);
                     if outcome.missed {
@@ -6760,6 +7028,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 break;
             }
         };
+        host.note_work_scope(crate::runtime::host::WorkScope::All);
         let ring = Ring::Child {
             page_gpas: &page_gpas,
             capacity: ring_length,
@@ -7899,6 +8168,15 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     if state.pending.host_action_yield {
         return;
     }
+    // Work a doorbell handed over may ask whether the guest wrote a surface's
+    // pages, and that answer is only as new as the last finished harvest. A
+    // doorbell that arrived after this wakeup waited for its harvest has not
+    // been covered yet; leave everything for the next wakeup, which that
+    // doorbell has already scheduled and which waits for it.
+    if !host.harvests_settled() {
+        note_store_route("drain_deferred_unharvested");
+        return;
+    }
     release_translation_order_holds(state);
     // Retry an already translation-held EXEC before allowing either the root
     // FIFO or a sibling child FIFO to overtake it. The guest is free to queue
@@ -7965,6 +8243,16 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
                     return;
                 }
             }
+        }
+        // A channel rung during this pass had its harvest asked for when it
+        // rang; serving it before that harvest finishes would answer its
+        // currency questions from an older one. It waits for the next wakeup.
+        if !host.harvests_settled() {
+            note_store_route("child_refill_deferred_unharvested");
+            // Everything in `mask` has just been served; the new rings stay in
+            // the doorbell word for the next wakeup to fold.
+            mask = 0;
+            break;
         }
         fold_rung_child_doorbells(state);
         // Only channels this pass has not already run: a channel rung again

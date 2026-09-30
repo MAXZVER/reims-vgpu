@@ -1,0 +1,2 @@
+# Line endings: LF in the index and in every checkout, whatever core.autocrlf says.
+* text=auto eol=lf

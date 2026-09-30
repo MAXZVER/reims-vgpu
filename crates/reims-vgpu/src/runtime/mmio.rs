@@ -73,6 +73,30 @@ pub fn gfx_read(state: &mut DeviceState, offset: u64, size: u32) -> u64 {
     }
 }
 
+/// The channel a gfx MMIO write rings — the writes [`gfx_write`] answers by
+/// scheduling a drain for one FIFO (0 = the root FIFO) — or `None` when the
+/// write is no doorbell. Pure in its arguments, so a shim can ask before the
+/// write is applied. A `u64` write is two `u32` registers, as in [`gfx_write`];
+/// if both halves ring, the root FIFO is named (a conservative merge is the
+/// shim's job, and no guest does this).
+pub fn gfx_write_doorbell_channel(offset: u64, data: u64, size: u32) -> Option<u32> {
+    match size {
+        MMIO_U64 if offset == GFX_REG_EFI_FB_START || offset == GFX_REG_FIFO_BASE_PAGE => None,
+        MMIO_U64 => gfx_write_doorbell_channel(offset, data & 0xffff_ffff, MMIO_U32)
+            .or_else(|| gfx_write_doorbell_channel(offset + MMIO_U32 as u64, data >> 32, MMIO_U32)),
+        MMIO_U32 => match offset {
+            GFX_REG_CONTROL_FIFO if data as u32 != 0 => Some(0),
+            GFX_REG_FIFO_WRITTEN | GFX_REG_MAIN_KICK => Some(0),
+            GFX_REG_CHILD_DOORBELL | GFX_REG_CHILD_REPLAY_DOORBELL => {
+                let ch = data as u32;
+                crate::model::is_child_channel(ch).then_some(ch)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Gfx MMIO write.
 pub fn gfx_write<H: HostMemory + HostOps>(
     state: &mut DeviceState,

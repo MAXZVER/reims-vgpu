@@ -224,9 +224,49 @@ struct StreamAccum {
     /// `ComputeAccum` outlives many dispatches; a render pass's state does not
     /// outlive the pass.
     unrepresentable: Option<StreamRefusal>,
+    /// TEMP (lab, REIMS_VGPU_LAB_PASS_EXTENT): the pass's own
+    /// `renderTargetWidth`/`Height`, `None` where it stated none.
+    lab_target_extent: Option<(u32, u32)>,
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PASS_EXTENT=on` gives a draw with no viewport or
+/// scissor of its own the pass's stated extent as its Metal default, instead of
+/// the attachment's.
+fn lab_pass_extent() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PASS_EXTENT").is_ok_and(|v| v == "on"))
 }
 
 impl StreamAccum {
+    /// TEMP (lab): give every draw already recorded with no viewport or scissor
+    /// of its own the pass's stated extent — the Metal default — instead of the
+    /// attachment's. The pass descriptor is the stream's tail, so the draws are
+    /// all in `draws` by the time the extent is known.
+    fn lab_apply_target_extent(&mut self, w: u32, h: u32) {
+        for d in self.draws.iter_mut() {
+            if d.viewports.is_empty() {
+                crate::runtime::drain::note_store_route("lab_pass_extent_default_vp");
+                if lab_pass_extent() {
+                    d.viewports.push([0.0, 0.0, w as f64, h as f64, 0.0, 1.0]);
+                }
+            }
+            if d.scissors.is_empty() {
+                crate::runtime::drain::note_store_route("lab_pass_extent_default_sc");
+                if lab_pass_extent() {
+                    d.scissors.push(ScissorRect {
+                        x: 0,
+                        y: 0,
+                        width: w,
+                        height: h,
+                    });
+                }
+            }
+        }
+        if !self.draws.is_empty() {
+            crate::runtime::drain::note_store_route("lab_pass_extent_tail_after_draws");
+        }
+    }
+
     /// The subset of [`Self::clears`] whose colour the guest may read back, so
     /// writing it into the guest's pages is publishing the pass's result rather
     /// than inventing one.
@@ -1004,7 +1044,7 @@ fn execute_submission<M: HostMemory + HostOps>(
     // pixels the guest has since overwritten has to go now — landing it later
     // would replace the guest's own bytes with a frame the guest has declared
     // stale.
-    consume_resource_table(state, task_id, resource_descs);
+    consume_resource_table(state, host, task_id, resource_descs);
 
     // One cursor for the whole packet, not one per buffer: a packet's
     // command-buffer table is one submission and the model resolved all of it
@@ -1188,7 +1228,12 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 ///
 /// The census that measured it is gone; a correlation with no counter-examples
 /// over 19 135 trials is a finding, not a thing to keep re-deriving per frame.
-fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
+fn consume_resource_table<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    descs: &[ExecResourceDesc],
+) {
     use crate::runtime::resource_validity::{apply, ValiditySite};
     let mut no_surface = 0u32;
     let mut unknown = 0u32;
@@ -1201,6 +1246,7 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
                 .fail_once(0);
         }
         let outcome = apply(state, task_id, d.object_id, d.ops, ValiditySite::ExecTable);
+        pay_owed_before_guest_read(state, host, task_id, d.object_id, d.ops);
         if !outcome.missed {
             continue;
         }
@@ -1214,6 +1260,30 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
     // opcode in the device and a per-record line would bury the fail view.
     crate::runtime::drain::note_store_route_n("validity_no_surface", no_surface as u64);
     crate::runtime::drain::note_store_route_n("validity_unknown_object", unknown as u64);
+}
+
+/// Land a frame this device still owes a resource the guest is about to read.
+///
+/// Byte +6 of a validity record (`clear_guest_valid`) is, on either reading of
+/// it, the guest about to look at the resource's pages — see
+/// `resource_validity::apply`, which raises `validity_guest_read_frame_owed`
+/// when a frame is still owed there and used to stop at the alarm. macOS 26
+/// raises it dozens of times a login, and a guest that reads a surface this
+/// device has rendered but not yet written back composites the previous frame:
+/// windows that update only when something else forces a writeback. So the
+/// debt is paid here, before the guest can look. Free when nothing is owed.
+pub(crate) fn pay_owed_before_guest_read<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    object_id: u32,
+    ops: crate::protocol::fifo::InvalidateValidityOps,
+) {
+    if ops.clear_guest_valid == 0 || object_id == 0 || state.pending_writebacks.is_empty() {
+        return;
+    }
+    crate::runtime::drain::note_store_route("validity_guest_read_paid");
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, object_id);
 }
 
 /// The one part of an `EXEC_INDIRECT2` resource-table record this device cannot
@@ -3298,6 +3368,29 @@ fn handle_render_binds<M: HostMemory + HostOps>(
             out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
         }
         RenderRecord::BindTextures(r) => {
+            // TEMP (lab): every distinct fragment texture bind shape, once — does
+            // the guest ever bind index 1 (macOS 26 icon draws sample tex1 unbound)?
+            if matches!(r.stage, reims_vgpu_protocol::render::ShaderStage::Fragment) {
+                let refs: Vec<u32> = r.entries.iter().map(|e| e.object_ref.get()).collect();
+                let mask = refs.iter().enumerate().fold(0u64, |m, (i, v)| {
+                    if *v != 0 && i < 32 {
+                        m | (1 << i)
+                    } else {
+                        m
+                    }
+                });
+                let key = (u64::from(task_id) << 48)
+                    ^ (u64::from(r.first) << 40)
+                    ^ ((refs.len() as u64) << 32)
+                    ^ mask;
+                if crate::observe::first_sight("lab_frag_tex_bind", key) {
+                    crate::observe::fail(format!(
+                        "lab_frag_tex_bind task={task_id} first={} count={} nonzero_mask={mask:#x} refs={refs:?}",
+                        r.first,
+                        refs.len()
+                    ));
+                }
+            }
             let cleared = apply_binds(
                 r.entries,
                 r.first,
@@ -3611,6 +3704,13 @@ fn handle_render_pass_state<M: HostMemory + HostOps>(
                 || descriptor.render_target_height.get() != 0
             {
                 note_pass_target_extent();
+                // TEMP (lab)
+                let (w, h) = (
+                    descriptor.render_target_width.get() as u32,
+                    descriptor.render_target_height.get() as u32,
+                );
+                acc.lab_target_extent = Some((w, h));
+                acc.lab_apply_target_extent(w, h);
             }
             {
                 // A depth or stencil attachment this device cannot bind used to
@@ -4954,6 +5054,28 @@ fn finish_stream<M: HostMemory + HostOps>(
     // guest store that would expose intermediate pixels to DisplaySwap.
     let will_draw = acc.saw_draw && !acc.color_slots.is_empty() && !acc.draws.is_empty();
     if !will_draw {
+        // TEMP (lab, REIMS_VGPU_LAB_CLEAR_LOG=1): every clear-only attachment,
+        // whether it reaches guest pages, and whether a lazy Store is owed on it.
+        if std::env::var("REIMS_VGPU_LAB_CLEAR_LOG").is_ok_and(|v| v == "1") {
+            for att in acc.clears.iter() {
+                let owed = state.pending_writebacks.has_gva(
+                    crate::runtime::writeback_debt::GvaResourceKey {
+                        task_id,
+                        texture_ref: att.texture_ref,
+                    },
+                );
+                crate::observe::fail(format!(
+                    "lab_clear_only task={task_id} ref={} store={} reaching={} owed={} color={:?} draws_seen={} t={}",
+                    att.texture_ref,
+                    att.store_action,
+                    store_action_publishes_single_sample(att.store_action),
+                    owed,
+                    att.clear_color,
+                    acc.saw_draw,
+                    crate::observe::elapsed_us() / 1000
+                ));
+            }
+        }
         for att in acc.clears_reaching_guest_pages() {
             if apply_clear(state, host, task_id, att) {
                 out.clears_applied += 1;
@@ -6125,6 +6247,16 @@ fn apply_clear<M: HostMemory + HostOps>(
             ClearImageEncoding::Rgba8 => draw::FrameRows::Rgba8(clear.pixels()),
             ClearImageEncoding::Native => draw::FrameRows::Native(clear.pixels()),
         };
+        // The clear replaces whatever a lazy Store still owes these pages; left
+        // standing, that debt keeps its resident authoritative and the next
+        // LOAD reloads the cleared-away frame. See
+        // `writeback_debt::supersede_gva_overlapping`.
+        crate::runtime::writeback_debt::supersede_gva_overlapping(
+            state,
+            task_id,
+            c0.target_gva,
+            u64::from(c0.row_stride).saturating_mul(u64::from(c0.height)),
+        );
         let ok = draw::write_gva_frame_within(
             state,
             host,

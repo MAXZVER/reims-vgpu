@@ -691,6 +691,10 @@ settle_sites! {
     /// console's rate its meaning. The split is what says which of the two the
     /// wait belongs to before anything is aimed at it.
     SampledMappingRead => "settle_sampled_mapping_read",
+    /// `exec::apply_clear` — a clear-only pass landing its clear colour in a
+    /// GVA target's guest pages. Writes this device already submitted into
+    /// those pages must land first, or they would overwrite the clear.
+    ClearOnlyGva => "settle_clear_only_gva",
     /// `drain::write_stamp` — the completion stamp's blocking fallback, taken
     /// when the GPU-ordered stamp path declined.
     CompletionStamp => "settle_completion_stamp",
@@ -714,6 +718,20 @@ settle_sites! {
     MappingBytesWrite => "settle_mapping_bytes_write",
     /// `mapper::read_mapping_bytes`.
     MappingBytesRead => "settle_mapping_bytes_read",
+    /// `drain::apply_map_family` on `UnmapMemory` — the guest handing a GVA
+    /// span's pages back to its allocator. Not a reader: the pages are about
+    /// to belong to someone else, and a writeback still queued into them lands
+    /// in whatever the kernel puts there next. A macOS 15 guest panicked with
+    /// `RGBA16Float` texels inside a kqueue object after exactly that, while
+    /// every write-after-release guard stayed at zero — they all fire at plan
+    /// time, and the GPU landing hundreds of microseconds later calls none of
+    /// them. The guest unwires the span before it submits this packet, so this
+    /// settle is already late for a copy that has landed; it is the last point
+    /// that can hold one that has not.
+    GuestRelease => "settle_guest_release",
+    /// `drain::apply_map_family` on `DeleteIOSurfaceBacking2` — the same
+    /// hand-back for a mapping's pages, keyed by mapping instead of by span.
+    BackingRelease => "settle_backing_release",
 }
 
 /// Block until every guest-page write this device has submitted has executed.

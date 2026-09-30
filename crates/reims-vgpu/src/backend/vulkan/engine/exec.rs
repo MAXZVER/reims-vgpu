@@ -116,6 +116,12 @@ impl BufferGatherRole {
         self.index_alignment.is_some()
     }
 
+    /// Bound as a storage buffer, which a shader may write — the one role a
+    /// direct bind on the import can land GPU output in guest RAM through.
+    pub(super) fn includes_storage(self) -> bool {
+        self.storage
+    }
+
     pub(super) fn is_storage_only(self) -> bool {
         self.storage && !self.vertex && self.index_alignment.is_none()
     }
@@ -778,6 +784,14 @@ unsafe fn import_guest_buffer_window(
     if !ctx.caps.host_pointer.is_available() {
         return None;
     }
+    // A storage binding placed on the import is guest RAM a shader may store
+    // to. Narrowed to reads, the source is gathered into a device-local copy
+    // instead (the next arm down), which is how an import-off host binds it.
+    if role.includes_storage()
+        && !crate::backend::vulkan::caps::host_pointer::guest_writes_allowed()
+    {
+        return None;
+    }
     let stretch = src.single_stretch()?;
     let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
         Ok(bound) => bound,
@@ -1209,6 +1223,63 @@ fn feedback_color_index(
         return None;
     };
     req.color_attachment_index(identity)
+}
+
+/// Whether a preserving pass that did not ask to load from its resident still
+/// starts from it: the resident is ready, the guest's load action keeps prior
+/// contents, and the request brought no seed of its own.
+///
+/// A seed outranks a ready resident. The draw path attaches one only after
+/// deciding the resident is not the attachment's current content, so letting
+/// the resident stand in for it reloads a frame the guest has since replaced.
+/// The resident is the seed only for a pass that arrived with none, where the
+/// alternative is `DONT_CARE` discarding what the pass does not repaint.
+fn preserve_from_ready_resident(
+    declared: Option<reims_vgpu_protocol::pass_action::LoadAction>,
+    resident_ready: bool,
+    explicit_seed: bool,
+) -> bool {
+    !explicit_seed
+        && resident_ready
+        && declared.is_some_and(|declared| declared.preserves_prior_contents())
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_FIX_SEED_OVER_RESIDENT=1` — the R2 fix under
+/// A/B: an explicit seed outranks a ready resident on a preserving pass.
+fn lab_fix_seed_over_resident() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_FIX_SEED_OVER_RESIDENT").is_ok_and(|v| v == "1")
+    })
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_SEEDWIN_LOG=1` logs every draw where a ready
+/// resident and an explicit seed compete (at most 6000 lines).
+fn lab_seedwin_log(req: &DrawRequest, applied: bool) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static N: AtomicU32 = AtomicU32::new(0);
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SEEDWIN_LOG").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    if N.fetch_add(1, Ordering::Relaxed) >= 6000 {
+        return;
+    }
+    let seed = if req.target_rgba8.is_some() {
+        "rgba8"
+    } else if req.target_guest_seed.is_some() {
+        "guest"
+    } else {
+        "gpu"
+    };
+    crate::observe::fail(format!(
+        "lab_seedwin dims={}x{} seed={seed} applied={applied} cont={} identity={:?} t={}",
+        req.width,
+        req.height,
+        req.continues_render_pass,
+        req.target_identity,
+        crate::observe::elapsed_us() / 1000
+    ));
 }
 
 /// `vkCmdCopyBufferToImage` requires `bufferOffset` to be a multiple of 4 and of
@@ -3023,8 +3094,52 @@ pub(crate) unsafe fn execute_draw_inner(
             super::reason::DrawReason::UsedBindingAbsentFromLayout { binding, fragment },
         ));
     }
-    // Resolve load action: resident > guest/host seed > Clear black.
-    let mut load_uses_gpu_content = req.load_from_target;
+    // Resolve load action: resident > guest/host seed > Clear black. A
+    // preserving guest pass may arrive without an explicit seed: on a later
+    // compositor damage draw, the existing resident is itself the seed.
+    // Leaving that pass as DONT_CARE permits Vulkan to discard untouched
+    // regions, which appears as stale/duplicated UI in the host window.
+    //
+    // Only an *unseeded* pass. A seed the request carries is the draw path's
+    // verdict that the resident is not this attachment's current content: it
+    // took the seed because the resident was refused (`gva_load_seed_elidable`,
+    // the mapper-ref-texture currency query) or because the pages were written
+    // behind it. macOS 26 clears a pooled glass mask with a clear-only pass,
+    // which writes only the guest pages, and loads it for the next layer; the
+    // resident still held the red mask, stood in for the cleared seed, and the
+    // mask came back as the red band over the Dock (R2).
+    let resident_ready = req.target_identity.as_ref().is_some_and(|identity| {
+        pools
+            .registry_get(identity)
+            .is_some_and(|slot| slot.content_ready)
+    });
+    let explicit_seed = req.target_rgba8.is_some()
+        || req.target_guest_seed.is_some()
+        || req.seed_from_target.is_some();
+    // TEMP (lab): the seed outranks the resident only under
+    // `REIMS_VGPU_LAB_FIX_SEED_OVER_RESIDENT=1` until the A/B is in; the main
+    // session flips the default when publishing.
+    let seed_outranks = lab_fix_seed_over_resident();
+    let preserving_existing_target = preserve_from_ready_resident(
+        req.color0_declared,
+        resident_ready,
+        explicit_seed && seed_outranks,
+    );
+    // Where the two rules disagree: a ready resident that would have replaced
+    // the seed. `preserve_resident_over_seed` is the old rule firing,
+    // `preserve_resident_seed_won` the new one declining to.
+    if !req.load_from_target
+        && explicit_seed
+        && preserve_from_ready_resident(req.color0_declared, resident_ready, false)
+    {
+        crate::runtime::drain::note_store_route(if seed_outranks {
+            "preserve_resident_seed_won"
+        } else {
+            "preserve_resident_over_seed"
+        });
+        lab_seedwin_log(req, seed_outranks);
+    }
+    let mut load_uses_gpu_content = req.load_from_target || preserving_existing_target;
     // output_bgra (computed with the batch decision above): BGRA output only
     // on the resident path (pooled targets stay RGBA); the whole
     // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
@@ -3051,6 +3166,13 @@ pub(crate) unsafe fn execute_draw_inner(
         || seed_bytes.is_some()
         || req.target_guest_seed.is_some()
         || req.seed_from_target.is_some()
+        // The mapper-ref-texture path supplies the guest allocation as the
+        // attachment's backing after the request is assembled. Keep the pass
+        // on LOAD from the outset when that backing was admitted; otherwise a
+        // damage-only draw can enter with DONT_CARE/CLEAR and destroy the
+        // pixels its scissor does not repaint.
+        || (req.load_guest_target_backing && req.guest_target_memory.is_some())
+        || preserving_existing_target
     {
         Color0Load::Preserve
     } else if req
@@ -4695,26 +4817,49 @@ pub(crate) unsafe fn execute_draw_inner(
         // skip keyed on the layout alone is what `ResidentAccess` exists to
         // stop, since a layout can be reached by a write that shares its name.
         //
-        // The second skip is the layout one, and it is sound only because both
-        // halves are asked. `layout() == layout()` says there is nothing to
-        // *place*, which is true for every resident once a colour target rests
-        // in one layout; `covered_by_pass_entry` says the pass's own incoming
-        // external dependency already makes the prior access *visible* to this
-        // draw's sampled read, which is a separate question and the one that
-        // carries the hazard. Asking only the first is exactly the mistake
-        // `ResidentAccess` exists to stop — a layout can be reached by a write
-        // that shares its name.
+        // A same-layout skip is sound only for a read-after-read. A
+        // `ColorWrite`/`ColorFeedback` resident can share the resting layout
+        // with `ShaderRead`, but it still needs an explicit visibility
+        // dependency when it is not an attachment of this pass. The render
+        // pass's external dependency is scoped to the pass's attachment
+        // accesses; relying on it for these secondary resident images is what
+        // lets a small glyph or button sample stale pixels. Keep the layout
+        // skip for read-only predecessors, but retain the barrier for writes.
         //
         // This is what retires `passmerge_outside_resident_layout`: the barrier
         // it charged is not moved earlier or made cheaper, it stops being owed.
+        let prior_is_write = matches!(
+            access,
+            super::pools::ResidentAccess::ColorWrite(_)
+                | super::pools::ResidentAccess::ColorFeedback(_)
+        );
+        // TEMP (lab): REIMS_VGPU_LAB_FORCE_SAMPLE_BARRIER=1 never skips, and widens
+        // the source scope to every write, to test whether the tracked access is
+        // what lets a composite read a resident's previous contents.
+        static LAB_FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lab_force = *LAB_FORCE
+            .get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_FORCE_SAMPLE_BARRIER").is_some());
         if !transitioned_resident.insert(identity.clone())
-            || access == next_access
-            || (access.layout() == next_access.layout() && access.covered_by_pass_entry())
+            || (!lab_force
+                && (access == next_access
+                    || (access.layout() == next_access.layout()
+                        && access.covered_by_pass_entry()
+                        && !prior_is_write)))
         {
             continue;
         }
         unsafe { outside_pass.before_record(PassObstacle::ResidentLayout, pools, &ctx.device, cb) };
-        let (src_stage, src_access) = access.source_scope();
+        let (src_stage, src_access) = if lab_force {
+            (
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_WRITE
+                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            )
+        } else {
+            access.source_scope()
+        };
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
@@ -7425,6 +7570,32 @@ mod tests {
             feedback_color_index(&req, &target_sample(unrelated), true),
             None
         );
+    }
+
+    /// A seed the request carries is the draw path's verdict on the
+    /// attachment's prior content, and a ready resident must not outrank it:
+    /// the resident stands in only for a preserving pass that arrived unseeded.
+    /// The R2 shape: a clear-only pass wrote a pooled mask's pages, the next
+    /// Load brought the cleared pages as its seed, and the resident still held
+    /// the mask.
+    #[test]
+    fn a_supplied_seed_outranks_a_ready_resident_on_a_preserving_pass() {
+        use reims_vgpu_protocol::pass_action::LoadAction;
+        assert!(preserve_from_ready_resident(Some(LoadAction::Load), true, false));
+        assert!(preserve_from_ready_resident(
+            Some(LoadAction::DontCare),
+            true,
+            false
+        ));
+        assert!(!preserve_from_ready_resident(Some(LoadAction::Load), true, true));
+        assert!(!preserve_from_ready_resident(
+            Some(LoadAction::DontCare),
+            true,
+            true
+        ));
+        assert!(!preserve_from_ready_resident(Some(LoadAction::Load), false, false));
+        assert!(!preserve_from_ready_resident(Some(LoadAction::Clear), true, false));
+        assert!(!preserve_from_ready_resident(None, true, false));
     }
 
     /// The invariant the whole type exists for: **where a resident sits does not

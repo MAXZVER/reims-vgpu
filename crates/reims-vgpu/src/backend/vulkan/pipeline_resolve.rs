@@ -569,6 +569,93 @@ fn ready<M: HostMemory + HostOps>(
     );
 }
 
+/// The fragment stage of a pipeline the guest built with no fragment function.
+///
+/// Metal rasterizes such a pipeline for depth and stencil and writes no colour;
+/// Vulkan needs no fragment stage for that either, but every consumer of
+/// [`ResolvedRenderPipeline`] reads a fragment module and its reflection, so
+/// the absence is carried as a module that does nothing: an entry point with
+/// no inputs, no outputs and no resources. Its reflection is empty for the
+/// same reason, so no binding, varying or render target is attributed to it.
+/// The colour writes it would otherwise leave undefined are masked off in the
+/// descriptor (`draw::load_render_pipeline`).
+pub(crate) fn no_fragment_stage() -> Arc<crate::runtime::m2v_cache::CachedShader> {
+    use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
+    static SHADER: OnceLock<Arc<crate::runtime::m2v_cache::CachedShader>> = OnceLock::new();
+    SHADER
+        .get_or_init(|| {
+            // OpCapability Shader; OpMemoryModel Logical GLSL450;
+            // OpEntryPoint Fragment %1 "main"; OpExecutionMode %1 OriginUpperLeft;
+            // %2 = OpTypeVoid; %3 = OpTypeFunction %2;
+            // %1 = OpFunction %2 None %3; %4 = OpLabel; OpReturn; OpFunctionEnd
+            const WORDS: [u32; 32] = [
+                0x0723_0203,
+                0x0001_0000,
+                0,
+                5,
+                0, //
+                0x0002_0011,
+                1, //
+                0x0003_000e,
+                0,
+                1, //
+                0x0005_000f,
+                4,
+                1,
+                0x6e69_616d,
+                0, //
+                0x0003_0010,
+                1,
+                7, //
+                0x0002_0013,
+                2, //
+                0x0003_0021,
+                3,
+                2, //
+                0x0005_0036,
+                2,
+                1,
+                0,
+                3, //
+                0x0002_00f8,
+                4,           //
+                0x0001_00fd, //
+                0x0001_0038, //
+            ];
+            let spirv = WORDS.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let reflection = Arc::new(ShaderReflection {
+                reflection_version: REFLECTION_VERSION,
+                descriptor_layout: Default::default(),
+                stage: ShaderStage::Fragment,
+                entry_point: None,
+                bindings: vec![],
+                argument_buffer_fields: vec![],
+                vertex_attributes: vec![],
+                varyings: vec![],
+                render_targets: vec![],
+                depth_members: vec![],
+                depth_qualifier: None,
+                stencil_members: vec![],
+                local_size: None,
+                max_work_group_size: None,
+                kernel_dispatch: None,
+                vertex_builtins: None,
+                tessellation: None,
+                imageblock_layouts: vec![],
+                implicit_imageblock_attachments: vec![],
+                fragment_imageblock: None,
+                datalayout: None,
+                runtime_sampler_specializations: vec![],
+                runtime_storage_image_specializations: vec![],
+                function_constants: vec![],
+            });
+            Arc::new(crate::runtime::m2v_cache::CachedShader::new(
+                spirv, reflection,
+            ))
+        })
+        .clone()
+}
+
 fn resolve_uncached_inner<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -607,17 +694,26 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         task_id,
         function_ref: desc.vertex_func_ref,
     })?;
-    let f_mtlb = load_mtlb(
-        state,
-        host,
-        task_id,
-        desc.fragment_func_ref,
-        AirLoadRail::Draw,
-    )
-    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
-        task_id,
-        function_ref: desc.fragment_func_ref,
-    })?;
+    // No fragment function is a depth/stencil-only pipeline, not a missing
+    // one: see `load_render_pipeline`, which has already cleared its colour
+    // write masks.
+    let f_mtlb = if desc.fragment_func_ref == 0 {
+        None
+    } else {
+        Some(
+            load_mtlb(
+                state,
+                host,
+                task_id,
+                desc.fragment_func_ref,
+                AirLoadRail::Draw,
+            )
+            .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+                task_id,
+                function_ref: desc.fragment_func_ref,
+            })?,
+        )
+    };
     enter(Phase::PipelineAir);
     let v_air = crate::runtime::mtlb::extract_air(&v_mtlb).map_err(|reason| {
         DrawPreparationDecline::VertexAirExtract {
@@ -625,12 +721,17 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
             reason,
         }
     })?;
-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb).map_err(|reason| {
-        DrawPreparationDecline::FragmentAirExtract {
-            function_ref: desc.fragment_func_ref,
-            reason,
-        }
-    })?;
+    let f_air = f_mtlb
+        .as_deref()
+        .map(|f_mtlb| {
+            crate::runtime::mtlb::extract_air(f_mtlb).map_err(|reason| {
+                DrawPreparationDecline::FragmentAirExtract {
+                    function_ref: desc.fragment_func_ref,
+                    reason,
+                }
+            })
+        })
+        .transpose()?;
     enter(Phase::PipelineXlate);
     let vertex = crate::runtime::m2v_cache::translate_cached_reflected(
         v_air,
@@ -641,15 +742,18 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         pipeline_ref,
         reason,
     })?;
-    let fragment = crate::runtime::m2v_cache::translate_cached_reflected(
-        f_air,
-        metal2vulkan::passes::Stage::Fragment,
-        pipeline_ref,
-    )
-    .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
-        pipeline_ref,
-        reason,
-    })?;
+    let fragment = match f_air {
+        Some(f_air) => crate::runtime::m2v_cache::translate_cached_reflected(
+            f_air,
+            metal2vulkan::passes::Stage::Fragment,
+            pipeline_ref,
+        )
+        .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
+            pipeline_ref,
+            reason,
+        })?,
+        None => no_fragment_stage(),
+    };
     // Both stages are SPIR-V now. What is left is this rail building the
     // pipeline object out of them, which is `Compiling`.
     crate::runtime::draw::advance_pipeline(
@@ -672,6 +776,38 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stand-in for a missing fragment function is a valid fragment module
+    /// that declares nothing, shared by every such pipeline.
+    ///
+    /// Valid, because `vkCreateGraphicsPipelines` is handed it and an invalid
+    /// module there is a driver crash rather than a refusal. Declaring nothing,
+    /// because every binding, varying or render target it named would be
+    /// attributed to a stage the guest never wrote.
+    #[test]
+    fn a_missing_fragment_function_becomes_an_empty_valid_fragment_module() {
+        let shader = no_fragment_stage();
+        let words = &shader.words;
+        assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
+        assert_eq!(shader.spirv.len(), words.len() * 4);
+        // OpEntryPoint Fragment %id "main"
+        let entry = words
+            .windows(5)
+            .find(|w| w[0] == 0x0005_000f)
+            .expect("one entry point");
+        assert_eq!(entry[1], 4, "execution model Fragment");
+        assert_eq!(entry[3..5], [0x6e69_616d, 0], "named main");
+        assert!(crate::runtime::spirv_bind::declared_binding_numbers(words).is_empty());
+        assert_eq!(
+            crate::runtime::spirv_bind::validate(words),
+            crate::runtime::spirv_bind::SpirvValidation::Accepted,
+            "spirv-val must accept it (skipped when the tool is absent)"
+        );
+        let r = &shader.reflection;
+        assert_eq!(r.stage, metal2vulkan::reflect::ShaderStage::Fragment);
+        assert!(r.bindings.is_empty() && r.render_targets.is_empty() && r.varyings.is_empty());
+        assert!(Arc::ptr_eq(&shader, &no_fragment_stage()), "built once");
+    }
     use crate::runtime::decode::resource::VertexAttribute;
 
     /// This rail's retained table, which is what these tests are about. Named

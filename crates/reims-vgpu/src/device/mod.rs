@@ -707,12 +707,8 @@ pub fn device_poll(id: u64) -> bool {
         .store(device.state.display.online_acked, Ordering::Release);
     slot.vbl_page_size
         .store(device.state.page_size(), Ordering::Release);
-    // Census both source polls and the independently time-gated VBL rate.
-    // Drive bounded maintenance from the poll heartbeat, which ticks even when
-    // the guest stops publishing. The wall clock returns already-dead resources
-    // and free-pool memory; it has no authority over live residency, which is
-    // governed by resource lifetime and allocation pressure.
-    crate::backend::selected().maintain(crate::observe::elapsed_ms() as u64);
+    // Aliases the previous tick's maintenance released. Needs the host view of
+    // the device's action queue, so it stays under `inner`.
     crate::runtime::mapper::drain_deferred_unmaps(&mut host);
     // Pre-boundary early-console → host window (headless-safe: the heartbeat
     // drives poll even under -display none). No-op post-boundary or with no
@@ -722,6 +718,21 @@ pub fn device_poll(id: u64) -> bool {
         let now_ns = host.mono_ns();
         window_publish::publish_window_early_frame(&slot, &device.state, &host, now_ns);
     }
+    drop(host);
+    drop(d);
+    // Census both source polls and the independently time-gated VBL rate.
+    // Drive bounded maintenance from the poll heartbeat, which ticks even when
+    // the guest stops publishing. The wall clock returns already-dead resources
+    // and free-pool memory; it has no authority over live residency, which is
+    // governed by resource lifetime and allocation pressure.
+    //
+    // After `inner` is released: maintenance touches only backend state, which
+    // the engine lock serializes, and its fence polls and graveyard releases are
+    // driver calls. Run under `inner` they held the drain worker off the device
+    // for their whole duration — at 5K a drain blocked on this lock was ~6% of
+    // its samples, with the heartbeat inside `maintain_resources` in most of
+    // them. The aliases it releases are unmapped by the next tick above.
+    crate::backend::selected().maintain(crate::observe::elapsed_ms() as u64);
     true
 }
 

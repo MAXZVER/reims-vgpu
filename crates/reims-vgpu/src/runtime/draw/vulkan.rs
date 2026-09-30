@@ -208,6 +208,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         engine_outcome = EngineDrawOutcome::of(&engine);
         match engine {
             Ok(M2vDrawSpan::Pixels { bytes, bgra }) => {
+                lab_dump_pixels(req, pass_w, pass_h, &bytes, bgra);
                 draw_rgba = Some(bytes);
                 draw_bgra = bgra;
                 crate::observe::line(format!(
@@ -216,6 +217,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 ));
             }
             Ok(M2vDrawSpan::ResidentChain) => {
+                if let Some(identity) = render_chain_identity(state, req) {
+                    lab_dump_draw(req, &identity, "chain");
+                    lab_pick_draw(req, &identity, "chain");
+                }
                 req.chain_resident_established = true;
                 crate::observe::line(format!(
                     "linux_m2v_draw ok resident_chain pipe={} {}x{} mid={} gva={:#x}",
@@ -227,6 +232,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 ));
             }
             Ok(M2vDrawSpan::ResidentGvaStore { identity }) => {
+                lab_dump_draw(req, &identity, "gvastore");
+                lab_pick_draw(req, &identity, "gvastore");
                 let _store_span = crate::runtime::chain_phase::CostSpan::new("gva_store_us");
                 note_mapper_ref_texture_store_route("gva_flush");
                 // Metal Store preserves the attachment in host GPU memory. It
@@ -249,6 +256,45 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 if landed {
                     note_mapper_ref_texture_store_route("gva_resident_authoritative");
                     gva_store_armed = true;
+                } else if let Some(c0) = req
+                    .colors
+                    .first()
+                    .filter(|c0| gva_store_needs_native_texels(c0.format))
+                    .cloned()
+                {
+                    // The synchronous block below lands `draw_rgba`, an eight-bit
+                    // readback, and a destination wider than that — RGBA16Float,
+                    // RG16Float — would be written back clamped to [0,1] and
+                    // quantised. macOS 26's glass shape maps are signed half
+                    // floats; landed that way, every later LOAD or sample of the
+                    // page read a map whose negative half was gone and the Dock's
+                    // glass composited solid red. `store_gva_frame` lands the
+                    // resident's own texels when the layouts agree.
+                    match crate::runtime::render_writeback::vulkan::store_gva_frame(
+                        state,
+                        host,
+                        req.task_id,
+                        &identity,
+                        &c0,
+                        c0.texture_ref,
+                        sync_store_pages.as_ref(),
+                        &[],
+                    ) {
+                        Ok(_) => {
+                            note_mapper_ref_texture_store_route("gva_store_sync_native");
+                            gva_store_armed = true;
+                        }
+                        Err(decline) => {
+                            crate::observe::Emit::decline(
+                                "gva_store_sync_native_declined",
+                                &decline,
+                            )
+                            .field("fmt", format!("{:#x}", c0.format))
+                            .field("geom", format!("{}x{}", c0.width, c0.height))
+                            .fail_once(u64::from(c0.format));
+                            draw_rgba = read_resident_chain(req, &identity);
+                        }
+                    }
                 } else {
                     // The copying rail: read the resident the draw just
                     // rendered into and let the synchronous Store block below
@@ -270,6 +316,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 identity,
                 guest_store,
             }) => {
+                lab_pick_draw(req, &identity, "surface");
                 // Into the same `t11_store_us` bucket the synchronous and `Owned`
                 // routes report, because the whole claim of this rail is that the
                 // bucket shrinks. Leaving it unbracketed would move the arm's cost
@@ -908,6 +955,900 @@ type LoadedLinearSample = (
     SampledByteFormat,
 );
 
+/// Whether a GVA Store into `format` must land the resident's own texels rather
+/// than an eight-bit readback: every declared layout that is not one of the two
+/// eight-bit colour orders, which is exactly where the RGBA8 round trip loses
+/// range or precision.
+pub(super) fn gva_store_needs_native_texels(format: u16) -> bool {
+    use crate::protocol::pixel_format::TexelLayout;
+    !matches!(
+        pixel_format::store_texel_order(format),
+        Some(TexelLayout::Rgba8 | TexelLayout::Bgra8) | None
+    )
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PICK=x,y;x,y` reads the listed pixels of every
+/// 1920-wide colour-0 target (any height; points below it are skipped) after each draw into it and
+/// logs any that changed **against that same target's previous reading**, with
+/// the draw's pipeline, load action, scissor and fragment binds — "which draw
+/// painted this pixel, and did a partial redraw lose what was there".
+/// `REIMS_VGPU_LAB_PICK_MAX` bounds the readbacks (default 400).
+fn lab_pick_draw(
+    req: &DrawEncodeRequest,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    kind: &str,
+) {
+    use crate::backend::vulkan::engine::TargetIdentity;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    static PICKS: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
+    static MAX: OnceLock<u32> = OnceLock::new();
+    static N: AtomicU32 = AtomicU32::new(0);
+    static LAST: OnceLock<Mutex<HashMap<String, Vec<[u8; 4]>>>> = OnceLock::new();
+    static PICKS2: OnceLock<Vec<((u32, u32), Vec<(u32, u32)>)>> = OnceLock::new();
+    let picks1 = PICKS.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PICK")
+            .ok()
+            .map(|v| {
+                v.split(';')
+                    .filter_map(|p| {
+                        let (x, y) = p.split_once(',')?;
+                        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    // `REIMS_VGPU_LAB_PICK2=WxH@x,y;x,y|WxH@x,y` — points for targets of exactly WxH.
+    let picks2 = PICKS2.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PICK2")
+            .ok()
+            .map(|v| {
+                v.split('|')
+                    .filter_map(|group| {
+                        let (wh, pts) = group.split_once('@')?;
+                        let (gw, gh) = wh.split_once('x')?;
+                        let pts = pts
+                            .split(';')
+                            .filter_map(|p| {
+                                let (x, y) = p.split_once(',')?;
+                                Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+                            })
+                            .collect();
+                        Some(((gw.trim().parse().ok()?, gh.trim().parse().ok()?), pts))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    let (w, h) = (identity.width(), identity.height());
+    let picks: &Vec<(u32, u32)> = if w == 1920 && !picks1.is_empty() {
+        picks1
+    } else if let Some((_, pts)) = picks2.iter().find(|(wh, _)| *wh == (w, h)) {
+        pts
+    } else {
+        return;
+    };
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PICK_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(400)
+    });
+    if !lab_gate_open() {
+        return;
+    }
+    // `REIMS_VGPU_LAB_PICK_WINDOW=from-to` (ms since start) bounds the probe in time.
+    static PWIN: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    if let Some((from, to)) = *PWIN.get_or_init(|| {
+        let v = std::env::var("REIMS_VGPU_LAB_PICK_WINDOW").ok()?;
+        let (a, b) = v.split_once('-')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    }) {
+        let now = crate::observe::elapsed_us() / 1000;
+        if now < from || now > to {
+            return;
+        }
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= max {
+        return;
+    }
+    let Ok(rb) = crate::backend::vulkan::engine::read_target(identity) else {
+        return;
+    };
+    let Some(rgba) = rb.into_rgba8() else {
+        return;
+    };
+    let key = match identity {
+        TargetIdentity::Surface { id, generation, .. } => format!("s{id}.{generation}"),
+        TargetIdentity::Texture { ref_, generation, .. } => format!("r{ref_}.{generation}"),
+        TargetIdentity::Gva { gva, generation, format, .. } => format!("g{gva:x}.{generation}.{format:?}"),
+        TargetIdentity::Anonymous { slot } => format!("a{slot}"),
+    };
+    let mut map = LAST
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let first = !map.contains_key(&key);
+    let last = map
+        .entry(key.clone())
+        .or_insert_with(|| vec![[0u8; 4]; picks.len()]);
+    let sc = req
+        .scissors
+        .first()
+        .map(|s| format!("{},{},{}x{}", s.x, s.y, s.width, s.height))
+        .unwrap_or_else(|| "-".into());
+    let t = crate::observe::elapsed_us() / 1000;
+    for (i, &(x, y)) in picks.iter().enumerate() {
+        if y >= h {
+            continue;
+        }
+        if x >= w {
+            continue;
+        }
+        let o = ((y as usize) * (w as usize) + x as usize) * 4;
+        let Some(px) = rgba.get(o..o + 4) else {
+            continue;
+        };
+        let px = [px[0], px[1], px[2], px[3]];
+        if px != last[i] || first {
+            crate::observe::fail(format!(
+                "lab_pick n={n} tgt={key}{} at={x},{y} {:?}->{:?} task={} pipe={} kind={kind} load={} sc={sc} srcs={:?} ds={} sref={:?} datt={} satt={} vtx={} t={t}",
+                if first { "(new)" } else { "" },
+                last[i],
+                px,
+                req.task_id,
+                req.pipeline_ref,
+                req.colors.first().map(|c| c.load_action).unwrap_or(0),
+                req.fragment_textures
+                    .iter()
+                    .map(|t| (t.index, t.texture_ref))
+                    .collect::<Vec<_>>(),
+                req.depth_stencil_ref,
+                req.stencil_ref,
+                req.depth_attach.is_some(),
+                req.stencil_attach.is_some(),
+                req.vertex_count
+            ));
+            last[i] = px;
+        }
+    }
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_GATE=PATH` — every lab probe (UBO, PICK, DUMP,
+/// PROBE_WH) additionally requires PATH to exist, checked at most every 250 ms,
+/// so a probe can be switched on and off around a guest action within one boot.
+/// Unset: always open (the probes' own env vars still gate them).
+/// TEMP (lab): `REIMS_VGPU_LAB_DUMP_WINDOW=from-to` (ms since start) bounds
+/// `REIMS_VGPU_LAB_DUMP` and `REIMS_VGPU_LAB_PROBE_WH` in time; unset = always.
+fn lab_dump_window_open() -> bool {
+    static WINDOW: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    match *WINDOW.get_or_init(|| {
+        let v = std::env::var("REIMS_VGPU_LAB_DUMP_WINDOW").ok()?;
+        let (a, b) = v.split_once('-')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    }) {
+        None => true,
+        Some((from, to)) => {
+            let now = crate::observe::elapsed_us() / 1000;
+            now >= from && now <= to
+        }
+    }
+}
+
+fn lab_gate_open() -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static OPEN: AtomicBool = AtomicBool::new(false);
+    let Some(path) = PATH.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GATE").ok()) else {
+        return true;
+    };
+    let now = crate::observe::elapsed_us() / 1000 + 1;
+    let last = LAST.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 250 {
+        return OPEN.load(Ordering::Relaxed);
+    }
+    LAST.store(now, Ordering::Relaxed);
+    let open = std::path::Path::new(path).exists();
+    if open != OPEN.swap(open, Ordering::Relaxed) {
+        crate::observe::fail(format!("lab_gate open={open}"));
+    }
+    open
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_UBO=pipe[,pipe]` logs the fragment buffers
+/// (reflected access, length, first 64 words) and fragment textures of draws
+/// with those pipelines, once per distinct (textures, bytes) digest and at most
+/// 120 lines — what a compositor shader was handed when its output went wrong.
+fn lab_ubo_draw(
+    req: &DrawEncodeRequest,
+    frag: &[(u32, crate::backend::vulkan::engine::BufferContent)],
+    entry: Option<&str>,
+    spirv: &[u8],
+    access: impl Fn(u32) -> String,
+) {
+    use std::collections::HashSet;
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock};
+    static SPEC: OnceLock<Vec<String>> = OnceLock::new();
+    static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    // Each item is a pipeline number, or `name@task` matching an entry point
+    // that contains `name` on that task (pipeline numbers move between boots).
+    let spec = SPEC.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_UBO")
+            .ok()
+            .map(|v| v.split(',').map(|p| p.trim().to_string()).collect())
+            .unwrap_or_default()
+    });
+    // `name@task@H` also requires colour 0 to be H texels high.
+    let hit = spec.iter().any(|item| {
+        let parts: Vec<&str> = item.split('@').collect();
+        match parts.as_slice() {
+            [name, task, rest @ ..] => {
+                (*task == "*" || task.parse() == Ok(req.task_id))
+                    && (*name == "*" || entry.is_some_and(|e| e.contains(name)))
+                    && rest.first().is_none_or(|h| {
+                        h.parse().ok() == req.colors.first().map(|c| c.height)
+                    })
+            }
+            _ => item.parse() == Ok(req.pipeline_ref),
+        }
+    });
+    if !hit || !lab_gate_open() {
+        return;
+    }
+    // `REIMS_VGPU_LAB_UBO_WINDOW=from-to` (ms since start) bounds the probe in time.
+    static WINDOW: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    if let Some((from, to)) = *WINDOW.get_or_init(|| {
+        let v = std::env::var("REIMS_VGPU_LAB_UBO_WINDOW").ok()?;
+        let (a, b) = v.split_once('-')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    }) {
+        let now = crate::observe::elapsed_us() / 1000;
+        if now < from || now > to {
+            return;
+        }
+    }
+    let tex: Vec<(u32, u32)> = req
+        .fragment_textures
+        .iter()
+        .map(|t| (t.index, t.texture_ref))
+        .collect();
+    let bufs: Vec<(u32, Vec<u8>)> = frag
+        .iter()
+        .map(|(i, c)| {
+            let b = c.cpu_bytes();
+            (*i, b[..b.len().min(256)].to_vec())
+        })
+        .collect();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    req.pipeline_ref.hash(&mut h);
+    tex.hash(&mut h);
+    bufs.hash(&mut h);
+    // TEMP (lab): every draw, not one per distinct binding set.
+    crate::observe::elapsed_us().hash(&mut h);
+    let digest = h.finish();
+    // TEMP (lab): `REIMS_VGPU_LAB_UBO_MAX` raises the 4000-line cap.
+    static MAX: OnceLock<usize> = OnceLock::new();
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_UBO_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4000)
+    });
+    {
+        let mut seen = SEEN
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= max || !seen.insert(digest) {
+            return;
+        }
+    }
+    // The module itself, once per (task, pipeline), for offline disassembly.
+    if crate::observe::first_sight(
+        "lab_ubo_spv",
+        (u64::from(req.task_id) << 32) | u64::from(req.pipeline_ref),
+    ) {
+        let _ = std::fs::create_dir_all("/tmp/labspv");
+        let _ = std::fs::write(
+            format!(
+                "/tmp/labspv/t{}-p{}-w{}.spv",
+                req.task_id,
+                req.pipeline_ref,
+                spirv.len() / 4
+            ),
+            spirv,
+        );
+    }
+    let colors: Vec<String> = req
+        .colors
+        .iter()
+        .map(|c| {
+            format!(
+                "s{}:ref{}/m{}/g{:x}:{}x{}:f{}:ld{}:st{}",
+                c.slot, c.texture_ref, c.mapping_id, c.target_gva, c.width, c.height, c.format,
+                c.load_action, c.store_action
+            )
+        })
+        .collect();
+    let vps: Vec<String> = req
+        .viewports
+        .iter()
+        .map(|v| format!("{},{},{}x{}", v[0], v[1], v[2], v[3]))
+        .collect();
+    let scs: Vec<String> = req
+        .scissors
+        .iter()
+        .map(|r| format!("{},{},{}x{}", r.x, r.y, r.width, r.height))
+        .collect();
+    let mut line = format!(
+        "lab_ubo pipe={} task={} entry={} spv_words={} tex={:?} rt=[{}] vp=[{}] sc=[{}] vtx={} inst={} first={} binst={} prim={} idx={:?} chain={} cont={} gvares={} t={}",
+        req.pipeline_ref,
+        req.task_id,
+        entry.unwrap_or("?"),
+        spirv.len() / 4,
+        tex,
+        colors.join(" "),
+        vps.join(" "),
+        scs.join(" "),
+        req.vertex_count,
+        req.instance_count,
+        req.first_vertex,
+        req.base_instance,
+        req.primitive_type,
+        req.indexed.as_ref().map(|i| format!("{i:?}")),
+        req.chain_from_resident,
+        req.continues_render_pass,
+        req.gva_load_from_resident,
+        crate::observe::elapsed_us() / 1000
+    );
+    for ((i, bytes), (_, c)) in bufs.iter().zip(frag.iter()) {
+        let b = req.fragment_buffers.iter().find(|b| b.index == *i);
+        let words: Vec<String> = bytes
+            .chunks_exact(4)
+            .map(|w| {
+                let u = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                let f = f32::from_bits(u);
+                if u == 0 {
+                    "0".to_string()
+                } else if f.is_finite() && f.abs() > 1e-6 && f.abs() < 1e7 {
+                    format!("{f:.4}")
+                } else {
+                    format!("#{u:x}")
+                }
+            })
+            .collect();
+        line.push_str(&format!(
+            " | buf{i} ref={} off={} acc={} len={} w=[{}]",
+            b.map(|b| b.buffer_ref).unwrap_or(0),
+            b.map(|b| b.offset).unwrap_or(0),
+            access(*i),
+            c.len(),
+            words.join(" ")
+        ));
+    }
+    crate::observe::fail(line);
+}
+
+/// TEMP (lab): with `REIMS_VGPU_LAB_PICK` set, name the texel layout, Vulkan
+/// format and first bytes of every guest-runs sampled source once per
+/// (task, ref, geometry, layout) — which format a small LUT texture was read as.
+/// TEMP (lab): `REIMS_VGPU_LAB_VTX=Xc,TcimXc_Isrc` logs, for draws whose
+/// fragment entry equals one of the names, each vertex attribute's format,
+/// offset and stride and the raw bytes of the first three vertices -- once per
+/// (task, pipeline, attribute layout, first-vertex bytes).
+fn lab_vtx_probe<A: LabVtxAttr>(req: &DrawEncodeRequest, entry: Option<&str>, attrs: &[A], vertex_count: u32, samplers: &str) {
+    use std::hash::{Hash, Hasher};
+    static WANT: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let want = WANT.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_VTX")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default()
+    });
+    let Some(entry) = entry else { return };
+    if want.is_empty() || !want.iter().any(|w| w == entry) {
+        return;
+    }
+    let mut desc = String::new();
+    let mut hs = std::collections::hash_map::DefaultHasher::new();
+    (req.task_id, req.pipeline_ref).hash(&mut hs);
+    for a in attrs {
+        let (loc, fmt, off, stride, content) = a.lab_parts();
+        let mut verts = Vec::new();
+        for i in 0..3u64 {
+            let at = (off as u64 + i * stride as u64) as usize;
+            if at + 16 <= content.len() {
+                verts.push(content[at..at + 16].iter().map(|b| format!("{b:02x}")).collect::<String>());
+            }
+        }
+        (loc, &fmt, off, stride).hash(&mut hs);
+        verts.first().hash(&mut hs);
+        desc.push_str(&format!(" L{loc}:{fmt}:off={off}:str={stride}:v=[{}]", verts.join(",")));
+    }
+    if !crate::observe::first_sight("lab_vtx_probe", hs.finish()) {
+        return;
+    }
+    crate::observe::fail(format!(
+        "lab_vtx task={} pipe={} entry={entry} vtx={vertex_count} smp=[{samplers}]{desc}",
+        req.task_id, req.pipeline_ref
+    ));
+}
+
+/// TEMP (lab): the parts of a staged vertex attribute `lab_vtx_probe` prints.
+trait LabVtxAttr {
+    fn lab_parts(&self) -> (u32, String, u32, u32, std::borrow::Cow<'_, [u8]>);
+}
+
+impl LabVtxAttr for crate::backend::vulkan::engine::VertexAttributeResource {
+    fn lab_parts(&self) -> (u32, String, u32, u32, std::borrow::Cow<'_, [u8]>) {
+        (self.location, format!("{:?}", self.format), self.offset, self.stride, self.content.cpu_bytes())
+    }
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_LUT=1` logs every change of a 256x1 sampled
+/// texture's first 64 bytes per (task, ref), with the pipeline, the host address
+/// of the first run and the time -- whether a pass switches LUT objects or one
+/// LUT's content changes under it.
+fn lab_lut_watch(
+    req: &DrawEncodeRequest,
+    texture_ref: u32,
+    w: u32,
+    h: u32,
+    runs: &crate::backend::vulkan::engine::GuestRunSource,
+) {
+    use std::hash::{Hash, Hasher};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LAST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(u32, u32), u64>>> =
+        std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_LUT").is_some()) {
+        return;
+    }
+    if w != 256 || h != 1 {
+        return;
+    }
+    let Some(run) = runs.runs.first() else {
+        return;
+    };
+    let skip = runs.source_offset as usize;
+    let n = 64usize.min(run.len().saturating_sub(skip as u64) as usize);
+    // SAFETY: same stable RAMBlock alias every CPU gather of these runs reads.
+    let bytes = unsafe { std::slice::from_raw_parts((run.host_ptr() as *const u8).add(skip), n) };
+    let mut hs = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hs);
+    (run.host_ptr() as usize).hash(&mut hs);
+    let digest = hs.finish();
+    let mut last = LAST
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if last.insert((req.task_id, texture_ref), digest) == Some(digest) {
+        return;
+    }
+    drop(last);
+    crate::observe::fail(format!(
+        "lab_lut task={} pipe={} ref={texture_ref} host={:#x}+{skip} len={} bytes={}",
+        req.task_id,
+        req.pipeline_ref,
+        run.host_ptr() as usize,
+        runs.total_len,
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    ));
+}
+
+fn lab_guest_runs_fmt(
+    req: &DrawEncodeRequest,
+    texture_ref: u32,
+    w: u32,
+    h: u32,
+    runs: &crate::backend::vulkan::engine::GuestRunSource,
+    layout: TexelLayout,
+    vkf: ash::vk::Format,
+    desc: Option<(u8, &[u8])>,
+) {
+    use std::hash::{Hash, Hasher};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PICK").is_ok()) {
+        return;
+    }
+    let mut hs = std::collections::hash_map::DefaultHasher::new();
+    (req.task_id, texture_ref, w, h, format!("{layout:?}"), desc.map(|d| d.1.to_vec())).hash(&mut hs);
+    if !crate::observe::first_sight("lab_guest_runs_fmt", hs.finish()) {
+        return;
+    }
+    let mut first = String::new();
+    if let Some(run) = runs.runs.first() {
+        let skip = runs.source_offset as usize;
+        let n = 32usize.min(run.len().saturating_sub(skip as u64) as usize);
+        // SAFETY: same stable RAMBlock alias every CPU gather of these runs reads.
+        let bytes = unsafe { std::slice::from_raw_parts((run.host_ptr() as *const u8).add(skip), n) };
+        first = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    }
+    crate::observe::fail(format!(
+        "lab_guest_runs_fmt task={} pipe={} ref={texture_ref} {w}x{h} layout={layout:?} vk={vkf:?} len={} first={first} ot={} desc={}",
+        req.task_id,
+        req.pipeline_ref,
+        runs.total_len,
+        desc.map(|d| d.0).unwrap_or(0),
+        desc.map(|d| d.1.iter().map(|b| format!("{b:02x}")).collect::<String>())
+            .unwrap_or_default()
+    ));
+}
+
+/// TEMP (lab): with `REIMS_VGPU_LAB_PICK` set, describe each sampled bind once
+/// per (task, pipeline, stage, index, ref): route, format, the guest view's
+/// swizzle and the folded mapping the image view gets.
+#[allow(clippy::too_many_arguments)]
+fn lab_sampled_bind(
+    req: &DrawEncodeRequest,
+    frag: bool,
+    index: u32,
+    texture_ref: u32,
+    w: u32,
+    h: u32,
+    pushed: Option<&crate::backend::vulkan::engine::SampledImageResource>,
+    view: Option<pixel_format::SwizzlePlan>,
+) {
+    use std::hash::{Hash, Hasher};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PICK").is_ok()) {
+        return;
+    }
+    let Some(img) = pushed else { return };
+    let route = match &img.source {
+        crate::backend::vulkan::engine::SampledSource::Bytes(_) => "bytes".to_string(),
+        crate::backend::vulkan::engine::SampledSource::Target(t) => format!("target:{t:?}"),
+        other => format!("{:?}", std::mem::discriminant(other)),
+    };
+    // Keyed on what the ref resolved TO as well, so a ref re-pointed at another
+    // resident logs again.
+    let mut hs = std::collections::hash_map::DefaultHasher::new();
+    (req.task_id, req.pipeline_ref, frag, index, texture_ref, w, h, &route).hash(&mut hs);
+    if !crate::observe::first_sight("lab_sampled_bind", hs.finish()) {
+        return;
+    }
+    crate::observe::fail(format!(
+        "lab_sampled_bind task={} pipe={} {} idx={index} ref={texture_ref} {w}x{h} fmt={:?} view={:?} folded={:?} route={}",
+        req.task_id,
+        req.pipeline_ref,
+        if frag { "frag" } else { "vert" },
+        img.format,
+        view.map(|v| v.source),
+        img.swizzle.source,
+        route.chars().take(160).collect::<String>()
+    ));
+}
+
+/// TEMP (lab): with `REIMS_VGPU_LAB_PICK` set, read back every sampled
+/// resident that is a 1920-wide strip (height 64..=160) right before the draw
+/// that samples it, and log its pixels at x=120 on a few rows — what the
+/// sampler is about to read, as opposed to what the last writer left.
+fn lab_sampled_strip_probe(
+    req: &DrawEncodeRequest,
+    texture_ref: u32,
+    pushed: Option<&crate::backend::vulkan::engine::SampledImageResource>,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static N: AtomicU32 = AtomicU32::new(0);
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PICK").is_ok()) {
+        return;
+    }
+    let Some(img) = pushed else { return };
+    let crate::backend::vulkan::engine::SampledSource::Target(identity) = &img.source else {
+        return;
+    };
+    let (w, h) = (identity.width(), identity.height());
+    if w != 1920 || !(64..=160).contains(&h) {
+        return;
+    }
+    if N.fetch_add(1, Ordering::Relaxed) >= 3000 {
+        return;
+    }
+    let Ok(rb) = crate::backend::vulkan::engine::read_target(identity) else {
+        return;
+    };
+    let Some(rgba) = rb.into_rgba8() else { return };
+    let mut rows = String::new();
+    for x in [120u32, 960, 1760, 1850] {
+        for y in [8u32, 48, 80, h - 8] {
+            let o = ((y as usize) * 1920 + x as usize) * 4;
+            if let Some(px) = rgba.get(o..o + 4) {
+                rows.push_str(&format!(" {x},{y}={:?}", [px[0], px[1], px[2], px[3]]));
+            }
+        }
+    }
+    crate::observe::fail(format!(
+        "lab_strip_probe task={} pipe={} ref={texture_ref} src={identity:?}{rows} t={}",
+        req.task_id,
+        req.pipeline_ref,
+        crate::observe::elapsed_us() / 1000
+    ));
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PROBE_WH=WxH[,WxH]` reads back every sampled
+/// resident of those sizes right before the draw that samples it and logs a
+/// 5x3 grid of texels (RGBA8 readback) — is a mask shaped, or uniform.
+fn lab_sampled_grid_probe(
+    req: &DrawEncodeRequest,
+    index: u32,
+    texture_ref: u32,
+    pushed: Option<&crate::backend::vulkan::engine::SampledImageResource>,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static WANT: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+    static N: AtomicU32 = AtomicU32::new(0);
+    let want = WANT.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PROBE_WH")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|p| {
+                        // TEMP (lab): `le<N>` = any size with both sides <= N, task != 1.
+                        if let Some(n) = p.trim().strip_prefix("le") {
+                            return Some((0, n.parse().ok()?));
+                        }
+                        let (w, h) = p.split_once('x')?;
+                        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    let Some(img) = pushed else { return };
+    let crate::backend::vulkan::engine::SampledSource::Target(identity) = &img.source else {
+        return;
+    };
+    let (w, h) = (identity.width(), identity.height());
+    let small = want
+        .iter()
+        .any(|&(a, b)| a == 0 && w <= b && h <= b && req.task_id != 1);
+    if !want.contains(&(w, h)) && !small {
+        return;
+    }
+    if !lab_gate_open() || !lab_dump_window_open() {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= 2000 {
+        return;
+    }
+    let Ok(rb) = crate::backend::vulkan::engine::read_target(identity) else {
+        return;
+    };
+    let Some(rgba) = rb.into_rgba8() else { return };
+    // TEMP (lab): the whole sampled image, beside the colour-0 dumps.
+    {
+        let dir = std::path::Path::new("/tmp/labdump");
+        let _ = std::fs::create_dir_all(dir);
+        let mut out = Vec::with_capacity(16 + rgba.len());
+        for v in [w, h, 0, 0] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&rgba);
+        let _ = std::fs::write(
+            dir.join(format!(
+                "s{n:04}-t{}-p{}-i{index}-r{texture_ref}.rgba",
+                req.task_id, req.pipeline_ref
+            )),
+            out,
+        );
+    }
+    let mut grid = String::new();
+    for fy in [0.2f32, 0.5, 0.8] {
+        for fx in [0.05f32, 0.25, 0.5, 0.75, 0.95] {
+            let (x, y) = ((w as f32 * fx) as usize, (h as f32 * fy) as usize);
+            let o = (y * w as usize + x) * 4;
+            if let Some(px) = rgba.get(o..o + 4) {
+                grid.push_str(&format!(" {x},{y}={:?}", [px[0], px[1], px[2], px[3]]));
+            }
+        }
+    }
+    crate::observe::fail(format!(
+        "lab_grid_probe task={} pipe={} idx={index} ref={texture_ref} src={identity:?}{grid} t={}",
+        req.task_id,
+        req.pipeline_ref,
+        crate::observe::elapsed_us() / 1000
+    ));
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_RESOLVE_CENSUS=1` — time `resolve_sampled_source`
+/// by the route it returned and by texture size (tiny = at most 64x64), and
+/// report the totals every 2 s.
+fn lab_resolve_census(ns: u64, loaded: Option<&(u32, u32, u32, SampledSourceRequest)>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_RESOLVE_CENSUS").is_some()) {
+        return;
+    }
+    // [route][size] -> (ns, n); route: 0 bytes 1 target 2 guest_runs 3 none
+    static NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static N: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    let (route, tiny) = match loaded {
+        Some((w, h, _, src)) => (
+            match src {
+                SampledSourceRequest::Bytes(..) => 0,
+                SampledSourceRequest::Target(..) => 1,
+                SampledSourceRequest::GuestRuns(..) => 2,
+            },
+            *w <= 64 && *h <= 64,
+        ),
+        None => (3, true),
+    };
+    let i = route * 2 + usize::from(!tiny);
+    NS[i].fetch_add(ns, Ordering::Relaxed);
+    N[i].fetch_add(1, Ordering::Relaxed);
+    let now = crate::observe::elapsed_us() / 1000;
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 2000 || LAST_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let names = ["bytes_tiny", "bytes_big", "target_tiny", "target_big", "runs_tiny", "runs_big", "none", "none_big"];
+    let mut line = String::from("lab_resolve_census");
+    for (k, name) in names.iter().enumerate() {
+        let n = N[k].swap(0, Ordering::Relaxed);
+        let t = NS[k].swap(0, Ordering::Relaxed);
+        if n > 0 {
+            line.push_str(&format!(" {name}={}us/{n}({:.1}us)", t / 1000, t as f64 / 1000.0 / n as f64));
+        }
+    }
+    crate::observe::fail(line);
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_SPV_ALL=1` writes every fragment module once per
+/// (task, pipeline) to `E:/tmp/labspv/tTASK-pPIPE-ENTRY-wWORDS.spv`.
+fn lab_spv_all(req: &DrawEncodeRequest, entry: Option<&str>, spirv: &[u8]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SPV_ALL").is_ok()) {
+        return;
+    }
+    if !crate::observe::first_sight(
+        "lab_spv_all",
+        (u64::from(req.task_id) << 32) | u64::from(req.pipeline_ref),
+    ) {
+        return;
+    }
+    let _ = std::fs::create_dir_all("/tmp/labspv");
+    let name: String = entry
+        .unwrap_or("unknown")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .take(80)
+        .collect();
+    let _ = std::fs::write(
+        format!(
+            "/tmp/labspv/t{}-p{}-{name}-w{}.spv",
+            req.task_id,
+            req.pipeline_ref,
+            spirv.len() / 4
+        ),
+        spirv,
+    );
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_DUMP=WxH` writes the resident colour-0 target of
+/// the first 80 draws of that geometry to `E:\tmp\labdump\NNN-task-pipe-kind.rgba`
+/// (a 16-byte header `w h 0 0` as little-endian u32, then RGBA8 rows), so a
+/// wrong layer can be looked at draw by draw.
+fn lab_dump_draw(
+    req: &DrawEncodeRequest,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    kind: &str,
+) {
+    let (w, h) = (identity.width(), identity.height());
+    let Some(n) = lab_dump_admit(req, w, h) else {
+        return;
+    };
+    let Ok(rb) = crate::backend::vulkan::engine::read_target(identity) else {
+        return;
+    };
+    let Some(rgba) = rb.into_rgba8() else {
+        return;
+    };
+    lab_dump_write(req, n, w, h, &rgba, kind);
+}
+
+/// TEMP (lab): the `Pixels` arm's readback (RGBA, or BGRA when `bgra`) under
+/// the same `REIMS_VGPU_LAB_DUMP` selection as [`lab_dump_draw`].
+fn lab_dump_pixels(req: &DrawEncodeRequest, w: u32, h: u32, bytes: &[u8], bgra: bool) {
+    if bytes.len() < (w as usize) * (h as usize) * 4 {
+        return;
+    }
+    let Some(n) = lab_dump_admit(req, w, h) else {
+        return;
+    };
+    let mut rgba = bytes[..(w as usize) * (h as usize) * 4].to_vec();
+    if bgra {
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+    }
+    lab_dump_write(req, n, w, h, &rgba, "pixels");
+}
+
+/// TEMP (lab): selection for the colour-0 dumps; `Some(sequence)` when admitted.
+fn lab_dump_admit(req: &DrawEncodeRequest, w: u32, h: u32) -> Option<u32> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+    static WANT: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
+    static N: AtomicU32 = AtomicU32::new(0);
+    let want = WANT.get_or_init(|| {
+        let Ok(v) = std::env::var("REIMS_VGPU_LAB_DUMP") else {
+            return Vec::new();
+        };
+        v.split(',')
+            .filter_map(|g| {
+                if let Some(n) = g.trim().strip_prefix("le") {
+                    return Some((0, n.parse().ok()?));
+                }
+                let (w, h) = g.split_once('x')?;
+                Some((w.parse().ok()?, h.parse().ok()?))
+            })
+            .collect()
+    });
+    // TEMP (lab): an item `le<N>` (parsed as `(0, N)`) takes any target of
+    // both sides <= N from a task other than WindowServer's (task 1).
+    let small = want
+        .iter()
+        .any(|&(a, b)| a == 0 && w <= b && h <= b && req.task_id != 1);
+    if !want.contains(&(w, h)) && !small {
+        return None;
+    }
+    if !lab_gate_open() {
+        return None;
+    }
+    if !lab_dump_window_open() {
+        return None;
+    }
+    static MAX: OnceLock<u32> = OnceLock::new();
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_DUMP_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(80)
+    });
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    (n < max).then_some(n)
+}
+
+/// TEMP (lab): write one colour-0 dump and its `lab_dump` line.
+fn lab_dump_write(req: &DrawEncodeRequest, n: u32, w: u32, h: u32, rgba: &[u8], kind: &str) {
+    let dir = std::path::Path::new("/tmp/labdump");
+    let _ = std::fs::create_dir_all(dir);
+    let mut out = Vec::with_capacity(16 + rgba.len());
+    for v in [w, h, 0, 0] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(rgba);
+    let name = format!(
+        "{n:04}-t{}-p{}-r{}-{kind}.rgba",
+        req.task_id,
+        req.pipeline_ref,
+        req.colors.first().map(|c| c.texture_ref).unwrap_or(0)
+    );
+    let _ = std::fs::write(dir.join(&name), out);
+    crate::observe::fail(format!(
+        "lab_dump file={name} fmt={} rt=[{}] load={} srcs={:?} t={}",
+        req.colors.first().map(|c| c.format).unwrap_or(0),
+        req.colors
+            .iter()
+            .map(|c| format!("s{}:ref{}:{}x{}:f{}", c.slot, c.texture_ref, c.width, c.height, c.format))
+            .collect::<Vec<_>>()
+            .join(" "),
+        req.colors.first().map(|c| c.load_action).unwrap_or(0),
+        req.fragment_textures
+            .iter()
+            .map(|t| (t.index, t.texture_ref))
+            .collect::<Vec<_>>(),
+        crate::observe::elapsed_us() / 1000
+    ));
+}
+
 /// Authoritative contents when a fragment texture aliases a GVA color target.
 ///
 /// A serialized Metal render stream may read `color(0)` through texture slot 0
@@ -932,22 +1873,36 @@ pub(super) enum AttachmentAliasSample<'a> {
     /// and a bind that samples them linear hands the shader an undecoded value
     /// the next attachment write then encodes a second time.
     Seed(&'a [u8], u16),
-    /// Records 2+ of a resident GVA chain: the prior record's content lives
-    /// on the engine-resident target, not in a CPU seed. Bound as a resident
-    /// sampled source (the engine snapshots on self-alias).
-    ResidentChain,
+    /// The attachment's prior content lives on its engine-resident image, not in
+    /// a CPU seed: records 2+ of a resident chain for colour 0, and any LOADed
+    /// secondary, whose image `build_secondary_targets` loads from and draws
+    /// into. `slot` names which attachment's image, because a pass may sample
+    /// any of them. Bound as a resident sampled source (the engine snapshots on
+    /// self-alias, secondaries included — `DrawRequest::writes_attachment`).
+    ResidentChain { slot: u32 },
 }
 
+/// The contents a fragment bind of `texture_ref` must read when that object is
+/// one of this pass's own GVA colour attachments.
+///
+/// # The attachment is found by the object, not by the bind index
+///
+/// A fragment texture bind names an object; whether that object is one of this
+/// pass's attachments is the whole question, and the texture index it is bound
+/// at has nothing to do with the colour slot it is attached at. This used to
+/// require the two to be equal, which only the `color(0)`-through-texture-0
+/// shape satisfies. macOS 26's icon renderer draws coverage into an `RG16Float`
+/// colour 1 and then, in the same pass, binds that attachment at fragment
+/// texture 5 to composite colour 0 from it (the `textureBarrier` idiom for a
+/// GPU without programmable blending). With the index rule the bind fell through
+/// to the attachment's guest pages — never written, its store action is
+/// DontCare — and every app icon composited transparent.
 pub(super) fn fragment_attachment_alias_sample<'a>(
     req: &'a DrawEncodeRequest,
-    texture_index: u32,
     texture_ref: u32,
 ) -> Option<(u32, u32, AttachmentAliasSample<'a>)> {
     let color = req.colors.iter().find(|color| {
-        color.slot == texture_index
-            && color.texture_ref == texture_ref
-            && color.mapping_id == 0
-            && color.target_gva != 0
+        color.texture_ref == texture_ref && color.mapping_id == 0 && color.target_gva != 0
     })?;
     let need = (color.width as usize)
         .checked_mul(color.height as usize)?
@@ -970,15 +1925,28 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
                     AttachmentAliasSample::Seed(seed, color.format),
                 ));
             }
-            if req.chain_from_resident {
+            // A secondary has no CPU seed and no chain flag of its own: its Load
+            // is always the registry resident (`build_secondary_targets`), so
+            // that resident is what the pass's earlier draws left there.
+            if req.chain_from_resident || color.slot != 0 {
                 return Some((
                     color.width,
                     color.height,
-                    AttachmentAliasSample::ResidentChain,
+                    AttachmentAliasSample::ResidentChain { slot: color.slot },
                 ));
             }
             None
         }
+        // A DontCare secondary starts the pass as `build_secondary_targets`
+        // decides — its resident if that holds content, else its clear — and a
+        // bind of it must read what the attachment holds, not the guest pages it
+        // never stores to. The caller settles which of the two it is, because
+        // only it can ask the engine whether the resident is ready.
+        MTL_LOAD_ACTION_DONT_CARE if color.slot != 0 => Some((
+            color.width,
+            color.height,
+            AttachmentAliasSample::ResidentChain { slot: color.slot },
+        )),
         _ => None,
     }
 }
@@ -1427,7 +2395,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 } {
                     crate::runtime::drain::note_store_route(route);
                 }
-                let guest_owned = currency.guest_owned_ranges();
+                let guest_owned = currency.guest_owned();
                 // Every rung under this one reads the guest's own pages, so a
                 // serve this rung refuses is corrected below it rather than
                 // held: the ladder takes the permissive standard.
@@ -1479,8 +2447,37 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         ));
                     }
                     note_mapper_ref_texture_sample_rung("t11rung_resident_refused", guest_write);
+                    if guest_owned.is_some() {
+                        note_guest_cpu_shared(state, mid);
+                    }
+                    // Reconcile the two halves in the resident when it can take
+                    // the guest's bytes as they are, and serve it: no readback,
+                    // no wait, and only the guest's pages move. A view that
+                    // remaps channels cannot bind the resident at all, so it
+                    // keeps the merge and the byte rungs below.
+                    if may_bind_resident {
+                        if let Some(owned) = guest_owned {
+                            if overlay_guest_writes_onto_resident(
+                                state,
+                                host,
+                                mid,
+                                w,
+                                h,
+                                &resident_id,
+                                owned,
+                            ) {
+                                let format = resident_id.resident_format();
+                                return Some((
+                                    w,
+                                    h,
+                                    mid,
+                                    SampledSourceRequest::Target(resident_id, format),
+                                ));
+                            }
+                        }
+                    }
                     match guest_owned {
-                        Some(ranges) => {
+                        Some(owned) => {
                             // The merge is what makes falling through sound: it
                             // puts the resident's half into every page the guest
                             // did not write, so the rungs below read a surface
@@ -1503,7 +2500,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                                 w,
                                 h,
                                 &resident_id,
-                                ranges,
+                                &owned.ranges,
                             ) {
                                 crate::runtime::drain::note_store_route(
                                     "t11sample_resident_merge_unlanded",
@@ -1812,23 +2809,94 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // the rung a `RGBA16Float` display-profile LUT actually lands on, because
     // the three rungs above are reached only for a resource the draw already
     // knows is a linear texture.
-    let (mut bytes, layout) = load_sampled_rgba_static(
+    // TEMP (lab): which step of the last-resort rung refuses, once per ref.
+    let lab_miss = |step: &str, detail: String| {
+        if crate::observe::first_sight(
+            "lab_sampled_tail_miss",
+            u64::from(texture_ref) ^ ((step.len() as u64) << 40),
+        ) {
+            crate::observe::fail(format!(
+                "lab_sampled_tail_miss ref={texture_ref} step={step} {detail}"
+            ));
+        }
+    };
+    let Some((mut bytes, layout)) = load_sampled_rgba_static(
         state,
         host,
         task_id,
         texture_ref,
         native_uploads_asking_host(),
         crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
-    )?;
-    let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
-    let tex = decode_texture_descriptor(&desc).ok()?;
-    let (w, h) = tex.extent()?;
-    let planes = tex.levels.first()?.planes();
+    ) else {
+        lab_miss("load", String::new());
+        return None;
+    };
+    // A texture view has no texture descriptor of its own: its record names a
+    // base texture, a level and a format override, and `load_sampled_rgba_static`
+    // has just read that level of that base. The geometry therefore comes from
+    // the base's descriptor at the view's level. Reading the view's own record
+    // here instead (52 bytes, which no texture descriptor fits in) refused every
+    // viewed sample after its bytes had already been loaded — macOS 26 samples
+    // its icon masks through `A8Unorm` views and lost ~100 draws a login to it.
+    let view = super::resolve_texture_view(state, host, task_id, texture_ref);
+    let descriptor_ref = view.as_ref().map_or(texture_ref, |v| v.base_texture_ref);
+    let Some((_entry, desc)) = sampled_texture_descriptor(state, host, task_id, descriptor_ref)
+    else {
+        lab_miss(
+            "descriptor",
+            format!("base={descriptor_ref} bytes={}", bytes.len()),
+        );
+        return None;
+    };
+    let tex = match decode_texture_descriptor(&desc) {
+        Ok(tex) => tex,
+        Err(e) => {
+            lab_miss(
+                "decode",
+                format!(
+                    "base={descriptor_ref} desc_len={} err={e:?} bytes={}",
+                    desc.len(),
+                    bytes.len()
+                ),
+            );
+            return None;
+        }
+    };
+    let level_index = view.as_ref().map_or(0, |v| v.level);
+    let Some(level) = tex.level(level_index) else {
+        lab_miss(
+            "level",
+            format!(
+                "base={descriptor_ref} level={level_index} fmt={:#x}",
+                tex.pixel_format
+            ),
+        );
+        return None;
+    };
+    let (w, h) = if view.is_some() {
+        (level.width, level.height)
+    } else {
+        let Some(extent) = tex.extent() else {
+            lab_miss("extent", format!("fmt={:#x}", tex.pixel_format));
+            return None;
+        };
+        extent
+    };
+    let planes = level.planes();
     let need = (w as usize)
         .saturating_mul(h as usize)
         .saturating_mul(planes as usize)
         .saturating_mul(layout.layout().bytes_per_texel() as usize);
     if bytes.len() < need {
+        lab_miss(
+            "short",
+            format!(
+                "{w}x{h} planes={planes} bpt={} fmt={:#x} bytes={} need={need}",
+                layout.layout().bytes_per_texel(),
+                tex.pixel_format,
+                bytes.len()
+            ),
+        );
         return None;
     }
     bytes.truncate(need);
@@ -2376,6 +3444,75 @@ fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
             total_len: span,
             row_length_texels,
             pages: guest_page_window(host, gpas, page, base_off % page, span),
+            direct_image: None,
+        },
+        format: source_format,
+    })
+}
+
+/// The GVA twin of [`try_mapper_ref_texture_target_guest_seed`]: a colour LOAD
+/// seed that carries the attachment's own texels out of its guest pages, for a
+/// destination whose eight-bit seed would lose them.
+///
+/// The only other seed a GVA target has is `seed_color_load`, which answers in
+/// RGBA8 — exact for eight-bit colour and a clamped, quantised copy for a half
+/// float. A pass that LOADs a signed shape map (macOS 26's glass) through it
+/// composites onto a map whose negative half is gone, and each such pass writes
+/// the damage back. `None` hands the caller back to that seed, unchanged.
+///
+/// Debts owed to this texture are paid first, as the mapping twin pays its
+/// mapping's, so the pages hold this device's latest Store and not the frame
+/// before it.
+pub(super) fn try_gva_target_guest_seed<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c0: &ColorRtRequest,
+    target_format: ash::vk::Format,
+) -> Option<crate::backend::vulkan::engine::GuestTargetSeed> {
+    use crate::backend::vulkan::engine::{GuestRunSource, GuestTargetSeed};
+
+    if c0.target_gva == 0 || c0.width == 0 || c0.height == 0 || c0.mapping_id != 0 {
+        return None;
+    }
+    if !guest_run_alias_available(host) {
+        return None;
+    }
+    let layout = pixel_format::store_texel_order(c0.format)?;
+    let source_format = translate::pixel::vk_texel_layout(layout);
+    if source_format != target_format {
+        return None;
+    }
+    let (span, row_length_texels) = strided_window_extent(
+        c0.width,
+        c0.height,
+        u64::from(layout.bytes_per_texel()),
+        u64::from(c0.row_stride),
+    )?;
+    if c0.texture_ref != 0 {
+        crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, c0.texture_ref);
+    }
+    let page = state.page_size();
+    let head_off = c0.target_gva % page;
+    let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        c0.target_gva,
+        span,
+        state.page_shift,
+    );
+    if gpas.len() as u64 != (head_off + span).div_ceil(page) {
+        return None;
+    }
+    let runs = coalesce_pages_to_runs(host, &gpas, page, head_off, span)?;
+    Some(GuestTargetSeed {
+        source: GuestRunSource {
+            runs: std::sync::Arc::new(runs),
+            source_offset: 0,
+            total_len: span,
+            row_length_texels,
+            pages: guest_page_window(host, gpas, page, head_off, span),
             direct_image: None,
         },
         format: source_format,
@@ -3029,6 +4166,9 @@ fn guest_page_window<M: HostOps>(
                 // overflowing range. A merely scattered window is now a success
                 // with several runs, counted above.
                 MapRefusal::Scattered { .. } => "zc_buf_untileable",
+                // A read site: `references_for_runs` never produces this, only
+                // the write licences' `write_refusal` does.
+                MapRefusal::WritesNarrowed => "zc_buf_writes_narrowed",
             });
             None
         }
@@ -3090,6 +4230,110 @@ fn band_runs(runs: usize) -> &'static str {
 /// `span` — a partial gather would hand the GPU a short buffer, which is a
 /// wrong frame rather than a slow one.
 fn coalesce_pages_to_runs<M: HostOps>(
+    host: &mut M,
+    window: &[u64],
+    page: u64,
+    head_off: u64,
+    span: u64,
+) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
+    use crate::backend::vulkan::engine;
+    // A stable host's `map_pages` over a GPA-sequential stretch returns QEMU's
+    // own RAMBlock alias, valid for the life of the VM and never unmapped here,
+    // so one window of GPAs always yields the same runs. Rebuilding them was the
+    // dearest part of a sampled bind: a 4K video plane is ~4000 scattered pages,
+    // hundreds of stretches and hundreds of `map_pages` calls — ~200 us a bind,
+    // a quarter of the drain on a driven macos-26 desktop. The memo is keyed by
+    // the window itself (compared in full on a hit), so it cannot hand one
+    // window's runs to another.
+    let memo_ok = host.map_pages_stable() && window.len() >= RUN_MEMO_MIN_PAGES;
+    if memo_ok {
+        if let Some(runs) = run_memo().lookup(window, page, head_off, span) {
+            crate::runtime::drain::note_store_route("guest_runs_memo_hit");
+            return Some(runs);
+        }
+        crate::runtime::drain::note_store_route("guest_runs_memo_miss");
+    }
+    let runs = coalesce_pages_to_runs_uncached(host, window, page, head_off, span)?;
+    if memo_ok {
+        run_memo().insert(window, page, head_off, span, &runs);
+    }
+    Some(runs)
+}
+
+/// Smallest window worth remembering: below this the rebuild is a handful of
+/// `map_pages` calls and the comparison would cost about as much.
+const RUN_MEMO_MIN_PAGES: usize = 16;
+
+/// Windows remembered at once. Enough for every large sampled surface a
+/// desktop binds in a frame (planes, wallpaper, window backings); the memo is
+/// cleared whole when it fills, which is rare and costs one rebuild each.
+const RUN_MEMO_CAP: usize = 256;
+
+struct RunMemoEntry {
+    page: u64,
+    head_off: u64,
+    span: u64,
+    window: Vec<u64>,
+    runs: Vec<crate::backend::vulkan::engine::GuestRun>,
+}
+
+#[derive(Default)]
+struct RunMemo {
+    entries: std::collections::HashMap<u64, RunMemoEntry>,
+}
+
+impl RunMemo {
+    fn key(window: &[u64], page: u64, head_off: u64, span: u64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (window, page, head_off, span).hash(&mut h);
+        h.finish()
+    }
+
+    fn lookup(
+        &self,
+        window: &[u64],
+        page: u64,
+        head_off: u64,
+        span: u64,
+    ) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
+        let e = self.entries.get(&Self::key(window, page, head_off, span))?;
+        (e.page == page && e.head_off == head_off && e.span == span && e.window == window)
+            .then(|| e.runs.clone())
+    }
+
+    fn insert(
+        &mut self,
+        window: &[u64],
+        page: u64,
+        head_off: u64,
+        span: u64,
+        runs: &[crate::backend::vulkan::engine::GuestRun],
+    ) {
+        if self.entries.len() >= RUN_MEMO_CAP {
+            self.entries.clear();
+        }
+        self.entries.insert(
+            Self::key(window, page, head_off, span),
+            RunMemoEntry {
+                page,
+                head_off,
+                span,
+                window: window.to_vec(),
+                runs: runs.to_vec(),
+            },
+        );
+    }
+}
+
+fn run_memo() -> std::sync::MutexGuard<'static, RunMemo> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<RunMemo>> = std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn coalesce_pages_to_runs_uncached<M: HostOps>(
     host: &mut M,
     window: &[u64],
     page: u64,
@@ -3564,7 +4808,11 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     if !guest_run_alias_available(host) {
         return None;
     }
+    // TEMP (lab): per-step cost of the big guest-run bind.
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_mwgr_gpas_us");
     let gpas = mapper::mapping_page_gpas(state, host, mid)?;
+    drop(lab_span);
+    let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_mwgr_runs_us");
     let page = state.page_size();
     if (gpas.len() as u64).saturating_mul(page) < base_off.checked_add(span)? {
         return None;
@@ -3964,6 +5212,45 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
 /// input stage. Unlike the Metal fallback, this does not materialize the index
 /// array on the CPU: Vulkan consumes the bounded resource directly when the
 /// command buffer executes.
+/// The largest `vertex_id` an indexed draw's vertex shader can observe: the
+/// largest of its `index_count` indices plus `baseVertex`.
+///
+/// `None` — keep the draw unbounded — when the bytes do not cover the count, the
+/// ordinal is not an index type, `baseVertex` is negative, or an index is the
+/// type's all-ones value: that is Metal's primitive-restart index, and whether
+/// the pipeline treats it as a restart or as a vertex is not this function's to
+/// decide, so a draw carrying one is not narrowed at all.
+fn indexed_vertex_max(info: &IndexedDrawInfo, bytes: &[u8]) -> Option<u64> {
+    use crate::protocol::render::IndexType as Contract;
+    let count = info.index_count as usize;
+    let max = match Contract::parse(u16::try_from(info.index_type).ok()?)? {
+        Contract::Uint16 => {
+            let raw = bytes.get(..count.checked_mul(2)?)?;
+            let m = raw
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .max()?;
+            if m == u16::MAX {
+                return None;
+            }
+            u64::from(m)
+        }
+        Contract::Uint32 => {
+            let raw = bytes.get(..count.checked_mul(4)?)?;
+            let m = raw
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .max()?;
+            if m == u32::MAX {
+                return None;
+            }
+            u64::from(m)
+        }
+    };
+    let base = u64::try_from(info.base_vertex).ok()?;
+    max.checked_add(base)
+}
+
 fn load_index_content_reason<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -4602,6 +5889,17 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // because a linear texture's bytes may alias a surface this device owes a
     // frame and only `pay_for_texture` resolves one id namespace to the other.
     crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+    // And whatever this task owes over the same allocation under another
+    // reference (a view of it was the render target): the name misses those.
+    if let Some(allocation_gva) = tex.allocation_base_gva(state.page_shift) {
+        crate::runtime::writeback_debt::pay_gva_overlapping(
+            state,
+            host,
+            task_id,
+            allocation_gva,
+            tex.allocation_size,
+        );
+    }
     // Retain the texture's complete allocation once. A sampled image needs the
     // allocation base, level offset and row pitch together; reducing it to the
     // level's page runs would throw away the resource shape and force a copy.
@@ -4885,6 +6183,7 @@ pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_mwgr_gather_us");
     let seen = crate::runtime::gather_witness::note_gather(
         state,
         host,
@@ -4897,13 +6196,17 @@ pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
             page_size: page,
         },
     );
+    drop(lab_span);
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_mwgr_pages_us");
+    let lab_pages = guest_page_window(host, gpas, page as u64, base_off % page as u64, span);
+    drop(lab_span);
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
             source_offset: 0,
             total_len: span,
             row_length_texels,
-            pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
+            pages: lab_pages,
             direct_image: None,
         },
         native,
@@ -5012,6 +6315,7 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_mwgr_gather_us");
     let seen = crate::runtime::gather_witness::note_gather(
         state,
         host,
@@ -5024,13 +6328,17 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
             page_size: page,
         },
     );
+    drop(lab_span);
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_mwgr_pages_us");
+    let lab_pages = guest_page_window(host, gpas, page as u64, base_off % page as u64, span);
+    drop(lab_span);
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
             source_offset: 0,
             total_len: span,
             row_length_texels,
-            pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
+            pages: lab_pages,
             direct_image: None,
         },
         native,
@@ -6555,6 +7863,77 @@ fn note_mapper_ref_texture_store_route(route: &'static str) {
 /// what Vulkan ought to do: `backend::metal::render` attaches every entry of
 /// this same colour list at its own slot number and has never degraded, so the
 /// two arms disagreed about one wire form and only one of them was silent.
+/// The residency identity of one secondary colour attachment: the key its image
+/// is created under, and so the key a draw that samples it must name.
+///
+/// Shared by [`build_secondary_targets`], which renders into it, and the
+/// fragment attachment alias, which samples it — two spellings of this key would
+/// let a pass read an image no draw wrote. `None` when the attachment has
+/// neither a GVA nor a mapping to be named by.
+pub(super) fn secondary_attachment_identity<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c: &ColorRtRequest,
+    format: ash::vk::Format,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    use crate::backend::vulkan::engine::TargetIdentity;
+    // Identity mirrors the primary namespaces: normal-texture linear GVA, else
+    // mapper-ref-texture surface.
+    //
+    // A secondary GVA is named by its own backing pages, exactly like color0
+    // — the primary's generation describes a different address (a secondary
+    // equal to the primary is rejected by the caller), so it takes its own walk.
+    // Without one this attachment is keyed on `(gva, width, height)` alone
+    // and two guest allocations reusing that address at that geometry share
+    // one GPU image — the wrong-content class `74748d2` closed for color0.
+    Some(if c.target_gva != 0 {
+        TargetIdentity::Gva {
+            gva: c.target_gva,
+            width: c.width,
+            height: c.height,
+            generation: if c.texture_ref != 0 {
+                crate::runtime::writeback_debt::gva_resource_generation(
+                    state,
+                    host,
+                    crate::runtime::writeback_debt::GvaResourceKey {
+                        task_id,
+                        texture_ref: c.texture_ref,
+                    },
+                    c.target_gva,
+                    u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
+                )
+            } else {
+                gva_span_alloc_generation(
+                    state,
+                    host,
+                    task_id,
+                    c.target_gva,
+                    c.row_stride,
+                    c.height,
+                )
+            },
+            // The format this attachment's image is actually created with,
+            // not a re-derivation of it. `registry_ensure_attachment` takes
+            // `format` — resolved by the caller's `color_attachment` — so
+            // answering the key from anything else lets the identity claim
+            // one format while the image holds another. It did: a
+            // `R16G16_SFLOAT` secondary is admitted by `color_attachment`
+            // and got an identity saying eight-bit RGBA.
+            format,
+        }
+    } else if c.mapping_id != 0 {
+        crate::backend::vulkan::present_identity::surface_identity(
+            state,
+            c.mapping_id,
+            c.width,
+            c.height,
+        )
+    } else {
+        return None;
+    })
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "every argument is a distinct wire-derived input to the attachment set"
@@ -6572,7 +7951,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
 > {
-    use crate::backend::vulkan::engine::{SecondaryColorTarget, TargetIdentity};
+    use crate::backend::vulkan::engine::SecondaryColorTarget;
     use crate::runtime::census::present_proxy::SecondaryMrtRefusal;
     if colors.len() <= 1 {
         return Ok(Vec::new());
@@ -6630,58 +8009,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             }
         };
         let format = attachment.vk;
-        // Identity mirrors the primary namespaces: normal-texture linear GVA, else
-        // mapper-ref-texture surface.
-        //
-        // A secondary GVA is named by its own backing pages, exactly like color0
-        // — the primary's generation describes a different address (a secondary
-        // equal to the primary is rejected above), so it takes its own walk.
-        // Without one this attachment is keyed on `(gva, width, height)` alone
-        // and two guest allocations reusing that address at that geometry share
-        // one GPU image — the wrong-content class `74748d2` closed for color0.
-        let identity = if c.target_gva != 0 {
-            TargetIdentity::Gva {
-                gva: c.target_gva,
-                width: c.width,
-                height: c.height,
-                generation: if c.texture_ref != 0 {
-                    crate::runtime::writeback_debt::gva_resource_generation(
-                        state,
-                        host,
-                        crate::runtime::writeback_debt::GvaResourceKey {
-                            task_id,
-                            texture_ref: c.texture_ref,
-                        },
-                        c.target_gva,
-                        u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
-                    )
-                } else {
-                    gva_span_alloc_generation(
-                        state,
-                        host,
-                        task_id,
-                        c.target_gva,
-                        c.row_stride,
-                        c.height,
-                    )
-                },
-                // The format this attachment's image is actually created with,
-                // not a re-derivation of it. `registry_ensure_attachment` takes
-                // `format` — resolved just above by `color_attachment` — so
-                // answering the key from anything else lets the identity claim
-                // one format while the image holds another. It did: a
-                // `R16G16_SFLOAT` secondary is admitted by `color_attachment`
-                // and got an identity saying eight-bit RGBA.
-                format,
-            }
-        } else if c.mapping_id != 0 {
-            crate::backend::vulkan::present_identity::surface_identity(
-                state,
-                c.mapping_id,
-                c.width,
-                c.height,
-            )
-        } else {
+        let Some(identity) = secondary_attachment_identity(state, host, task_id, c, format) else {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::NoIdentity,
                 c.width,
@@ -7100,6 +8428,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Binds);
     crate::runtime::bind_phase::note_bind();
 
+    let mut early_index = req
+        .indexed
+        .as_ref()
+        .map(|idx| load_index_content_reason(state, host, req.task_id, idx));
+
     // The two modules in the numbering this draw will use, from the translation
     // cache. Each carries the walks of its own numbering beside it — see
     // `m2v_cache::ShaderVariant` — so nothing here re-walks a module per draw.
@@ -7130,13 +8463,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the attribute walk, holds only the indices that actually carried
         // bytes, and decides storage binding.
         let bind_plan = &resolved.bind_plan;
+        // An indexed draw's indices bound the vertex_id its vertex shader can
+        // see, so they are read before the vertex binds they narrow and the same
+        // content is handed to the index bind below. Without this every indexed
+        // draw staged each vertex-indexed `device T*` buffer whole — ~2 GB/s on
+        // a driven CSS animation, ~200 KB a draw for a handful of quads.
+        let indexed_vertex_max = match (req.indexed.as_ref(), early_index.as_ref()) {
+            (Some(idx), Some(Ok(crate::backend::vulkan::engine::BufferContent::Bytes(bytes)))) => {
+                indexed_vertex_max(idx, bytes)
+            }
+            _ => None,
+        };
         let render_buffer_bounds = crate::runtime::spirv_bind::RenderBufferIndexBounds::new(
             req.first_vertex,
             req.vertex_count,
             req.base_instance,
             req.instance_count,
             req.indexed.is_some(),
-        );
+        )
+        .with_indexed_vertex_max(indexed_vertex_max);
         let mut vtx_storage: Vec<(u32, crate::backend::vulkan::engine::BufferContent)> = Vec::new();
         // The three `bind_phase` spans below divide `chain_phase`'s `binds_us`,
         // which is this draw path's largest column and covered three costs with
@@ -7251,6 +8596,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             frag_storage.push((b.index, content));
         }
         drop(fragment_span);
+        lab_spv_all(req, f_shader.reflection.entry_point.as_deref(), &f_shader.spirv);
+        lab_ubo_draw(req, &frag_storage, f_shader.reflection.entry_point.as_deref(), &f_shader.spirv, |i| {
+            format!(
+                "{:?}",
+                crate::runtime::spirv_bind::reflected_buffer_access(&f_shader.reflection, i)
+            )
+        });
         // Stage-in attributes from pipeline vertex block + bound buffer bytes.
         let mut attrs: Vec<crate::backend::vulkan::engine::VertexAttributeResource> = Vec::new();
         let mut stage_in_bufs: std::collections::BTreeSet<u32> = Default::default();
@@ -7646,7 +8998,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         crate::runtime::sampled_phase::Part::ResolveAlias,
                     );
                     let attachment_alias = frag_stage
-                        .then(|| fragment_attachment_alias_sample(req, index, texture_ref))
+                        .then(|| fragment_attachment_alias_sample(req, texture_ref))
                         .flatten();
                     if let Some((aw, ah, alias)) = attachment_alias {
                         match alias {
@@ -7670,8 +9022,31 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
                                 ),
                             ),
-                            AttachmentAliasSample::ResidentChain => {
-                                let identity = render_chain_identity(state, req).ok_or({
+                            AttachmentAliasSample::ResidentChain { slot } => {
+                                let color = req.colors.iter().find(|color| {
+                                    color.slot == slot && color.texture_ref == texture_ref
+                                });
+                                let format = color.and_then(|color| {
+                                    translate::pixel::color_attachment(color.format)
+                                        .ok()
+                                        .map(|resolved| resolved.0.vk)
+                                });
+                                // Colour 0 is the chain's own resident; a secondary is
+                                // named exactly as the pass that drew into it named it.
+                                let identity = if slot == 0 {
+                                    render_chain_identity(state, req)
+                                } else {
+                                    color.zip(format).and_then(|(color, format)| {
+                                        secondary_attachment_identity(
+                                            state,
+                                            host,
+                                            req.task_id,
+                                            color,
+                                            format,
+                                        )
+                                    })
+                                }
+                                .ok_or({
                                     DrawError::DrawPreparation(
                                         DrawPreparationDecline::AttachmentAliasIdentityMissing {
                                             index,
@@ -7679,25 +9054,48 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                         },
                                     )
                                 })?;
-                                (
-                                    identity.width(),
-                                    identity.height(),
-                                    SampledSourceRequest::Target(
-                                        identity.clone(),
-                                        req.colors
-                                            .iter()
-                                            .find(|color| {
-                                                color.slot == index
-                                                    && color.texture_ref == texture_ref
-                                            })
-                                            .and_then(|color| {
-                                                translate::pixel::color_attachment(color.format)
-                                                    .ok()
-                                                    .map(|resolved| resolved.0.vk)
-                                            })
-                                            .unwrap_or_else(|| identity.resident_format()),
-                                    ),
-                                )
+                                crate::observe::verbose(|| {
+                                    format!(
+                                        "attachment_alias_resident task={} pipe={} index={index} \
+                                         ref={texture_ref} slot={slot} fmt={:?} resident={:?} \
+                                         identity={identity:?} chain={}",
+                                        req.task_id,
+                                        req.pipeline_ref,
+                                        format,
+                                        identity.resident_format(),
+                                        req.chain_from_resident as u8
+                                    )
+                                });
+                                let dont_care_unready = color.is_some_and(|color| {
+                                    color.load_action == MTL_LOAD_ACTION_DONT_CARE
+                                }) && !crate::backend::vulkan::engine::resident_content_ready(
+                                    &identity,
+                                );
+                                if dont_care_unready {
+                                    // The attachment clears; so does its view.
+                                    let clear =
+                                        color.map(|color| color.clear_color).unwrap_or([0.0; 4]);
+                                    let (aw, ah) = (identity.width(), identity.height());
+                                    (
+                                        aw,
+                                        ah,
+                                        SampledSourceRequest::Bytes(
+                                            std::sync::Arc::new(solid_rgba8(aw, ah, &clear)),
+                                            None,
+                                            SampledByteFormat::synthesised(TexelLayout::Rgba8),
+                                            crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
+                                        ),
+                                    )
+                                } else {
+                                    (
+                                        identity.width(),
+                                        identity.height(),
+                                        SampledSourceRequest::Target(
+                                            identity.clone(),
+                                            format.unwrap_or_else(|| identity.resident_format()),
+                                        ),
+                                    )
+                                }
                             }
                         }
                     } else {
@@ -7705,14 +9103,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         let _s = crate::runtime::sampled_phase::Span::open(
                             crate::runtime::sampled_phase::Part::ResolveSource,
                         );
-                        let Some(loaded) = resolve_sampled_source(
+                        let lab_resolve_t0 = std::time::Instant::now();
+                        let lab_resolved = resolve_sampled_source(
                             state,
                             host,
                             req.task_id,
                             texture_ref,
                             texture_resource.clone(),
                             view_swizzle.is_none(),
-                        ) else {
+                        );
+                        lab_resolve_census(lab_resolve_t0.elapsed().as_nanos() as u64, lab_resolved.as_ref());
+                        let Some(loaded) = lab_resolved else {
                             let detail = sample_miss_detail(state, host, req.task_id, texture_ref);
                             return Err(DrawError::DrawPreparation(
                                 DrawPreparationDecline::TextureResolveMissing {
@@ -7724,6 +9125,23 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             ));
                         };
                         let (rw, rh, mid, src) = loaded;
+                        if let SampledSourceRequest::GuestRuns(runs, ..) = &src {
+                            lab_lut_watch(req, texture_ref, rw, rh, runs);
+                        }
+                        if let SampledSourceRequest::GuestRuns(runs, layout, vkf, ..) = &src {
+                            lab_guest_runs_fmt(
+                                req,
+                                texture_ref,
+                                rw,
+                                rh,
+                                runs,
+                                *layout,
+                                *vkf,
+                                texture_resource
+                                    .as_deref()
+                                    .map(|r| (r.entry.object_type, &r.descriptor[..])),
+                            );
+                        }
                         // What a texture ref resolved to, reported whenever it
                         // changes. The plane draw ring records the refs a pass
                         // sampled, and a ref is only a number: a layer turns
@@ -8030,6 +9448,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // need it, and there is no case left to forget.
                     swizzle: view_swizzle.unwrap_or_default().after(&sampled_components),
                 });
+                lab_sampled_bind(req, frag_stage, index, texture_ref, tw, th, images.last(), view_swizzle);
+                lab_sampled_strip_probe(req, texture_ref, images.last());
+                lab_sampled_grid_probe(req, index, texture_ref, images.last());
                 Ok(())
             };
             for t in req.vertex_textures.iter() {
@@ -8110,6 +9531,29 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                  pipe={} idx={index} binding={img_bind} kind={kind:?} 1x1",
                 req.pipeline_ref
             ));
+            // TEMP (lab): which draws these are, once per (task, pipeline).
+            if crate::observe::first_sight(
+                "lab_unbound_tex_draw",
+                (u64::from(req.task_id) << 32) | u64::from(req.pipeline_ref),
+            ) {
+                crate::observe::fail(format!(
+                    "lab_unbound_tex_draw task={} pipe={} idx={index} entry={} provided={:?}",
+                    req.task_id,
+                    req.pipeline_ref,
+                    f_shader.reflection.entry_point.as_deref().unwrap_or("?"),
+                    req.fragment_textures
+                        .iter()
+                        .map(|t| (t.index, t.texture_ref))
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            // TEMP (lab): REIMS_VGPU_LAB_NEUTRAL=white makes the stand-in opaque
+            // white, to learn whether the unbound texture decides the output.
+            let lab_texel = if std::env::var("REIMS_VGPU_LAB_NEUTRAL").as_deref() == Ok("white") {
+                [1.0f64; 4]
+            } else {
+                [0.0; 4]
+            };
             images.push(crate::backend::vulkan::engine::SampledImageResource {
                 binding: img_bind,
                 array_element: 0,
@@ -8124,7 +9568,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // texels, not one. `layers` is 1 for every other shape here, so
                 // the repeat is the identity for them.
                 source: crate::backend::vulkan::engine::SampledSource::Bytes(std::sync::Arc::new(
-                    crate::protocol::pixel_format::solid_rgba8(1, 1, &[0.0; 4])
+                    crate::protocol::pixel_format::solid_rgba8(1, 1, &lab_texel)
                         .repeat(shape.layers.max(1) as usize),
                 )),
                 byte_origin: crate::backend::vulkan::engine::SampledByteOrigin::Synthetic,
@@ -8268,10 +9712,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // generation when the guest recycled a page, and the identity must
         // name that new generation rather than the one paired with the retired
         // alias.
+        let span_backing = crate::runtime::chain_phase::CostSpan::new("seedx_backing_us");
         let mapper_ref_texture_guest_backing =
             mapper_ref_texture_guest_target_backing(state, host, req);
         let mapper_ref_texture_resident_target =
             mapper_ref_texture_store_identity(state, req, writeback_guest);
+        drop(span_backing);
         if req.chain_from_resident && render_chain_identity(state, req).is_some() {
             // The serialized chain names the resident it intends to load;
             // existence and readiness are engine state and are validated
@@ -8283,8 +9729,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Colour0's LOAD seed was skipped by `mrt_draw_request` because the
         // engine still held what the render Store published into its guest
         // pages. Honour that here, or put the seed back.
+        let span_gva = crate::runtime::chain_phase::CostSpan::new("seedx_gva_us");
         let mut gva_load_identity =
             honour_gva_load_elision(state, host, req, &mut chain_load_from_target);
+        drop(span_gva);
+        let span_currency = crate::runtime::chain_phase::CostSpan::new("seedx_currency_us");
         // Mapper-ref-texture composite Load. A retained guest-allocation target is the
         // guest's texture resource itself, so its LOAD is authoritative without
         // comparing two copies. A device-allocation target is a mirror: only
@@ -8370,6 +9819,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // elision, so revalidating by re-reading would move ~237 GB of guest
         // memory a session. The bitmap answers the same question in a word.
         if !chain_load_from_target {
+            // Before anything below reads the guest's pages or a verdict about
+            // them: the Store that publishes this pass stamps this, not a
+            // generation read after the draws (see `GuestWriteObservation`).
+            if let Some(mid) = req.colors.first().map(|c| c.mapping_id).filter(|m| *m != 0) {
+                crate::runtime::mapper::note_pass_guest_observation(state, host, mid);
+            }
             if let Some((identity, mapping_epoch)) =
                 mapper_ref_texture_load_currency_query(state, req)
             {
@@ -8388,19 +9843,57 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             resource_lease::resident_target_backing(&resource, &identity)
                         })
                 });
-                let (resident_current, guest_wrote) =
-                    mapper_ref_texture_load_resident_is_current(backing, || {
+                let (resident_current, guest_wrote) = mapper_ref_texture_load_resident_is_current(
+                    backing,
+                    || {
                         let resident_epoch =
                             crate::backend::vulkan::engine::resident_content_epoch(&identity);
                         let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
+                        let epoch_current =
+                            mapper_ref_texture_resident_is_current(mapping_epoch, resident_epoch);
                         let guest_wrote =
                             mapper_ref_texture_guest_wrote_since_store(state, host, mapping_id);
-                        (
-                            mapper_ref_texture_resident_is_current(mapping_epoch, resident_epoch)
-                                && !guest_wrote,
-                            guest_wrote,
-                        )
-                    });
+                        // The resident is the surface apart from what the guest
+                        // CPU painted since: lay that over it and the LOAD needs
+                        // no seed, instead of paying the debt back into the pages
+                        // and uploading the whole surface from them.
+                        let span_rec =
+                            crate::runtime::chain_phase::CostSpan::new("seedx_reconcile_us");
+                        let reconciled = epoch_current
+                            && guest_wrote
+                            && reconcile_guest_writes_for_load(
+                                state, host, mapping_id, w, h, &identity,
+                            );
+                        drop(span_rec);
+                        // TEMP lab diagnostic: why the resident's epoch is behind.
+                        if !epoch_current && guest_wrote {
+                            use std::sync::atomic::{AtomicU32, Ordering};
+                            static SEEN: AtomicU32 = AtomicU32::new(0);
+                            if SEEN.fetch_add(1, Ordering::Relaxed) < 40 {
+                                let m = state.mappings.get(&mapping_id);
+                                crate::observe::off(format!(
+                                    "seedq_stale_diag mid={mapping_id} {w}x{h} map_epoch={:?}                                      res_epoch={:?} presented={} debt={} identity={:?}",
+                                    mapping_epoch,
+                                    resident_epoch,
+                                    m.is_some_and(|m| m.scanout_presented),
+                                    state.pending_writebacks.get(mapping_id).is_some(),
+                                    identity,
+                                ));
+                            }
+                        }
+                        // TEMP lab census: which half refuses the elision.
+                        crate::runtime::drain::note_store_route(
+                            match (epoch_current, guest_wrote, reconciled) {
+                                (false, false, _) => "seedq_epoch_stale",
+                                (false, true, _) => "seedq_epoch_stale_gw",
+                                (true, true, false) => "seedq_gw_unreconciled",
+                                (true, true, true) => "seedq_gw_reconciled",
+                                (true, false, _) => "seedq_clean",
+                            },
+                        );
+                        (epoch_current && (!guest_wrote || reconciled), guest_wrote)
+                    },
+                );
                 if resident_current {
                     chain_load_from_target = true;
                     crate::runtime::drain::note_store_route("mapper_ref_texture_seed_elided");
@@ -8427,6 +9920,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
+        drop(span_currency);
+        let _span_provide = crate::runtime::chain_phase::CostSpan::new("seedx_provide_us");
         if let Some(c0) = req.colors.first() {
             // Out of contract is DontCare here, same as on the Metal arm, and
             // it says so through the same helper — this arm used to take an
@@ -8502,7 +9997,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // that layer being dropped, and everything outside the
                     // geometry this pass draws goes blank.
                     let mut seed_door = "none";
-                    if let Some(seed) = c0.target_seed_rgba.as_ref() {
+                    // A GVA target wider than eight-bit colour takes its prior
+                    // content out of its own pages at its own width before the
+                    // eight-bit colour seed is considered; see
+                    // `try_gva_target_guest_seed`.
+                    let native_seed = (c0.mapping_id == 0
+                        && gva_store_needs_native_texels(c0.format))
+                    .then(|| {
+                        try_gva_target_guest_seed(
+                            state,
+                            host,
+                            req.task_id,
+                            c0,
+                            gva_resident_format(c0.format),
+                        )
+                    })
+                    .flatten();
+                    if let Some(seed) = native_seed {
+                        seed_door = "gva_guest_seed";
+                        crate::runtime::drain::note_store_route("gva_guest_seed_native");
+                        target_guest_seed = Some(seed);
+                    } else if let Some(seed) = c0.target_seed_rgba.as_ref() {
                         seed_door = "color_seed";
                         if seed.len() == (w as usize) * (h as usize) * 4 {
                             // seed_color_load selected this by RT provenance.
@@ -8787,8 +10302,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     reason: IndexLoadReason::TypeUnsupported,
                 })
             })?;
-            let content =
-                load_index_content_reason(state, host, req.task_id, idx).map_err(|reason| {
+            let content = early_index
+                .take()
+                .unwrap_or_else(|| load_index_content_reason(state, host, req.task_id, idx))
+                .map_err(|reason| {
                     DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad { reason })
                 })?;
             resources.indexed = Some(crate::backend::vulkan::engine::IndexedDrawResource {
@@ -9017,6 +10534,29 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // substitution for a guest that issued no `setBlendColorRed:` is the
         // one this device has always made.
         resources.blend_color = req.blend_color.unwrap_or([0.0; 4]);
+        // TEMP (lab): the colour-0 blend state once per (task, pipeline).
+        static LAB_PICK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LAB_PICK.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_PICK").is_some())
+            && crate::observe::first_sight(
+                "lab_blend",
+                (u64::from(req.task_id) << 32) | u64::from(req.pipeline_ref),
+            )
+        {
+            crate::observe::fail(format!(
+                "lab_blend task={} pipe={} enabled={} src_rgb={:?} dst_rgb={:?} op_rgb={:?} src_a={:?} dst_a={:?} op_a={:?} mask={:?} blend_color={:?}",
+                req.task_id,
+                req.pipeline_ref,
+                pd.color0.blending_enabled,
+                pd.color0.src_rgb,
+                pd.color0.dst_rgb,
+                pd.color0.op_rgb,
+                pd.color0.src_alpha,
+                pd.color0.dst_alpha,
+                pd.color0.op_alpha,
+                pd.color0.write_mask,
+                req.blend_color
+            ));
+        }
         if pd.color0.blending_enabled {
             resources.blend = Some(BlendStateResource {
                 src_rgb: pd.color0.src_rgb,
@@ -9314,6 +10854,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ));
         });
 
+        static LAB_VTX_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lab_vtx_on = *LAB_VTX_ON.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_VTX").is_some());
+        let lab_smp: String = if !lab_vtx_on { String::new() } else { resources
+            .samplers
+            .iter()
+            .map(|s| {
+                format!(
+                    "b{}:un={}:min={:?}:mag={:?}:u={:?}:v={:?}",
+                    s.binding,
+                    s.unnormalized_coordinates as u8,
+                    s.min_filter,
+                    s.mag_filter,
+                    s.address_mode_u,
+                    s.address_mode_v
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";") };
+        if lab_vtx_on {
+            lab_vtx_probe(req, f_shader.reflection.entry_point.as_deref(), &resources.vertex_attributes, vertex_count, &lab_smp);
+        }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleTrail);
         // Asked of the module rather than of m2v's reflection, which is the
         // whole point: the render path's existing unbound guard walks
@@ -10191,6 +11752,47 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
     identity: &crate::backend::vulkan::engine::TargetIdentity,
     guest_owned: &[(u64, u64)],
 ) -> bool {
+    let stride = width.saturating_mul(RGBA8_BPP);
+    // Consume the readback in place when the pool can lend it, as the deferred
+    // render flush does. The copying form below allocates a whole-frame `Vec`,
+    // fills it from the staging buffer, then publishes a second whole-frame
+    // copy to the surface cache — on a Windows/WHPX Safari animation that ran
+    // ~47 merges a second, and the fresh allocation's first-touch faults made
+    // its `memmove` the drain worker's largest single cost. The lease makes it
+    // one pass from the staging buffer into the guest's pages.
+    //
+    // Any `None` or refusal (uncached readback memory, a resident not in
+    // scanout order or too wide to lend) takes the copying form, unchanged.
+    match crate::backend::vulkan::engine::read_target_leased(identity) {
+        Ok(Some(leased)) if leased.bgra => {
+            let ok = mapping_write::write_bgra8_skipping_uncached(
+                state,
+                host,
+                mapping_id,
+                leased.bytes(),
+                stride,
+                width,
+                height,
+                guest_owned,
+            );
+            let bytes = leased.bytes().len();
+            // Ended before anything below can reach the engine: a lease holder
+            // may not take the engine lock (see `engine::LeasedFrame`).
+            drop(leased);
+            if !ok {
+                crate::observe::fail(format!(
+                    "sampled_resident_merge_fail mid={mapping_id} {width}x{height} \
+                     stage=writeback runs={} bytes={bytes} rail=leased",
+                    guest_owned.len(),
+                ));
+                return false;
+            }
+            crate::runtime::drain::note_store_route("t11sample_resident_merged_leased");
+            return true;
+        }
+        Ok(leased) => drop(leased),
+        Err(_) => {}
+    }
     let readback = match crate::backend::vulkan::engine::read_target(identity) {
         Ok(rb) => rb,
         Err(e) => {
@@ -10211,7 +11813,6 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
         ));
         return false;
     };
-    let stride = width.saturating_mul(RGBA8_BPP);
     if !mapping_write::write_bgra8_skipping(
         state,
         host,
@@ -10236,6 +11837,542 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
     // recomputes; it is a parameter here because the readback needs it.
     crate::runtime::drain::note_store_route("t11sample_resident_merged");
     true
+}
+
+/// Whether a resident whose epoch still matches its surface can carry an
+/// attachment LOAD although the guest wrote the surface's allocation since.
+///
+/// The coarse witness moves for a write anywhere in the allocation, so it is
+/// narrowed to the pixel window first, under the strict standard a LOAD seed
+/// needs — a stale seed is held, because the pass composites onto it and its
+/// Store publishes the composite back over the guest's pages:
+///
+/// - written elsewhere (a header, a sibling plane, padding): the window's
+///   texels are the resident's; the stamp is left alone because other host
+///   copies of the allocation are not this caller's to vouch for;
+/// - written inside the window with named pages: those pages are laid over the
+///   resident ([`overlay_guest_writes_onto_resident`]), which re-takes the stamp;
+/// - anything the host cannot name: not current, and the seed reads the pages.
+fn reconcile_guest_writes_for_load<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) -> bool {
+    if !resident_overlay_allowed() {
+        return false;
+    }
+    // TEMP lab bisect: 0 = off, 1 = elsewhere only, 2 = overlay only, else both.
+    static LAB_RECONCILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let lab = LAB_RECONCILE
+        .get_or_init(|| std::env::var("REIMS_LAB_LOAD_RECONCILE").unwrap_or_default())
+        .as_str();
+    let span_cur = crate::runtime::chain_phase::CostSpan::new("seedx_surfcur_us");
+    let currency = surface_currency(state, host, mapping_id, width, height);
+    drop(span_cur);
+    match currency {
+        SurfaceCurrency::WroteElsewhere if lab == "0" || lab == "2" => false,
+        SurfaceCurrency::WrotePixels(_) if lab == "0" || lab == "1" => false,
+        SurfaceCurrency::WroteElsewhere => {
+            crate::runtime::drain::note_store_route("load_seed_guest_wrote_elsewhere");
+            true
+        }
+        SurfaceCurrency::WrotePixels(owned) => {
+            note_guest_cpu_shared(state, mapping_id);
+            let _span_ov = crate::runtime::chain_phase::CostSpan::new("seedx_overlay_us");
+            crate::runtime::drain::note_store_route_n(
+                "seedx_overlay_ranges",
+                owned.ranges.len() as u64,
+            );
+            let landed = overlay_guest_writes_onto_resident(
+                state, host, mapping_id, width, height, identity, &owned,
+            );
+            if landed {
+                crate::runtime::drain::note_store_route("load_seed_overlaid");
+            }
+            landed
+        }
+        SurfaceCurrency::Unwritten(_) => {
+            crate::runtime::drain::note_store_route("seedq_currency_unwritten");
+            false
+        }
+        SurfaceCurrency::WroteUnknown => {
+            crate::runtime::drain::note_store_route("seedq_currency_unknown");
+            false
+        }
+    }
+}
+
+/// Latch [`crate::model::MappingEntry::guest_cpu_shared`]: the guest CPU wrote
+/// this surface's pixels under a live resident, so its Stores are written back
+/// at once from now on. Reported once per mapping.
+fn note_guest_cpu_shared(state: &mut DeviceState, mapping_id: u32) {
+    let Some(m) = state.mappings.get_mut(&mapping_id) else {
+        return;
+    };
+    if m.guest_cpu_shared || !m.scanout_presented {
+        return;
+    }
+    m.guest_cpu_shared = true;
+    state.guest_copies_framebuffers = true;
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return;
+    };
+    crate::runtime::drain::note_store_route("guest_cpu_shared_latched");
+    crate::observe::off(format!(
+        "guest_cpu_shared mid={mapping_id} {}x{} (guest CPU wrote under a live resident;          its debt is paid before every completion stamp)",
+        m.width, m.height
+    ));
+}
+
+/// Whether [`overlay_guest_writes_onto_resident`] may run, as
+/// [`crate::config::RESIDENT_OVERLAY`] narrows it. Latched: the answer must not
+/// change between two binds of one surface.
+fn resident_overlay_allowed() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        let narrowed = matches!(
+            crate::config::read(crate::config::RESIDENT_OVERLAY).0,
+            crate::config::Switch::Off
+        );
+        if narrowed {
+            crate::observe::off(format!(
+                "resident_overlay narrowed=1 var={} (guest writes under a live resident \
+                 take the whole-frame merge)",
+                crate::config::RESIDENT_OVERLAY
+            ));
+        }
+        !narrowed
+    })
+}
+
+/// Lay the pages the guest wrote under a live resident over that resident, on
+/// the GPU, and keep the resident as the surface.
+///
+/// The GPU-side twin of [`merge_guest_writes_into_pages`], with the same
+/// page-granular answer: every page the guest wrote comes from guest RAM, every
+/// other page from the resident. The merge builds that answer in the guest's
+/// pages — a whole-frame readback, a wait, a whole-frame scatter into guest RAM,
+/// and then a whole-frame upload for the draw — and this builds it in the
+/// resident by copying only the guest's pages in. See
+/// `engine::overlay_guest_bytes_onto_resident` for what that removed.
+///
+/// # What stays true afterwards
+///
+/// - The resident holds both halves, so the guest-write stamp is re-taken: the
+///   device has adopted the guest's stores, exactly as the merge's skipping
+///   write does.
+/// - The host byte cache does not hold them, so it is dropped — the stamp would
+///   otherwise vouch for it.
+/// - The mapping's content epoch does not move and no writeback debt is paid or
+///   superseded: the resident is still the surface it was, now with the guest's
+///   stores in it, and a later payment lands those unchanged.
+///
+/// Returns `false`, having changed nothing, whenever the copy cannot land the
+/// guest's bytes unconverted; the caller then merges as before.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the surface, its geometry, the resident, and the ranges the guest owns"
+)]
+fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    guest_owned: &crate::runtime::surface_currency::GuestOwned,
+) -> bool {
+    use crate::backend::vulkan::engine::{ResidentOverlay, ResidentOverlaySpan};
+    if !resident_overlay_allowed() {
+        return false;
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return false;
+    };
+    let Some((base_off, bpr, format)) = mapping_write::resident_gpu_plane(m, width, height) else {
+        crate::runtime::drain::note_store_route("resident_overlay_no_plane");
+        return false;
+    };
+    if format != pixel_format::MTL_FORMAT_BGRA8_UNORM
+        && format != pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
+    {
+        crate::runtime::drain::note_store_route("resident_overlay_plane_not_bgra8");
+        return false;
+    }
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let pitch = u64::from(bpr);
+    let extent_end = u64::from(height - 1) * pitch + u64::from(width) * u64::from(RGBA8_BPP);
+    let mut spans = Vec::with_capacity(guest_owned.ranges.len());
+    let mut staged = 0u64;
+    for &(start, end) in &guest_owned.ranges {
+        if end <= base_off {
+            continue;
+        }
+        let window_start = start.saturating_sub(base_off);
+        let window_end = (end - base_off).min(extent_end);
+        if window_start >= window_end {
+            continue;
+        }
+        spans.push(ResidentOverlaySpan {
+            window_start,
+            window_end,
+            staged_offset: staged,
+        });
+        staged += window_end - window_start;
+    }
+    if crate::runtime::writeback_debt::fb_copy_replay_enabled() {
+        if let Some(landed) = replay_framebuffer_copy(
+            state,
+            host,
+            mapping_id,
+            width,
+            height,
+            identity,
+            &spans,
+            base_off,
+            pitch,
+            guest_owned,
+        ) {
+            return landed;
+        }
+    }
+    // A GPU copy into guest pages still in flight would tear the read below.
+    crate::backend::vulkan::engine::quiesce_guest_writes();
+    let mut bytes = vec![0u8; staged as usize];
+    for span in &spans {
+        let lo = span.staged_offset as usize;
+        let hi = lo + (span.window_end - span.window_start) as usize;
+        if !crate::runtime::mapper::read_guest_owned_bytes(
+            state,
+            host,
+            mapping_id,
+            base_off + span.window_start,
+            &mut bytes[lo..hi],
+        ) {
+            crate::runtime::drain::note_store_route("resident_overlay_read_failed");
+            return false;
+        }
+    }
+    // TEMP lab diagnostic: what the overlay is about to lay down.
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        if SEEN.fetch_add(1, Ordering::Relaxed) < 60 {
+            let px = bytes.chunks_exact(4);
+            let n = px.len().max(1);
+            let (mut white, mut zero, mut opaque) = (0usize, 0usize, 0usize);
+            for p in bytes.chunks_exact(4) {
+                if p == [0xff, 0xff, 0xff, 0xff] {
+                    white += 1;
+                }
+                if p == [0, 0, 0, 0] {
+                    zero += 1;
+                }
+                if p[3] == 0xff {
+                    opaque += 1;
+                }
+            }
+            let debt = state.pending_writebacks.get(mapping_id).is_some();
+            // How much of each guest-owned span actually differs from the
+            // resident: a true small guest write differs in a few texels, a
+            // stale page in most of them.
+            if let Ok(rb) = crate::backend::vulkan::engine::read_target(identity) {
+                if let Some(res) = rb.into_bgra8() {
+                    let tight = (width as u64) * 4;
+                    let (mut diff, mut total, mut spans_mostly, mut spans_few) =
+                        (0u64, 0u64, 0u32, 0u32);
+                    for span in &spans {
+                        let (mut sd, mut st) = (0u64, 0u64);
+                        let mut w = span.window_start;
+                        while w + 4 <= span.window_end {
+                            let (row, col) = (w / pitch, w % pitch);
+                            if col + 4 <= tight {
+                                let ri = (row * tight + col) as usize;
+                                let gi = (span.staged_offset + (w - span.window_start)) as usize;
+                                if ri + 4 <= res.len() && gi + 4 <= bytes.len() {
+                                    st += 1;
+                                    if res[ri..ri + 4] != bytes[gi..gi + 4] {
+                                        sd += 1;
+                                    }
+                                }
+                            }
+                            w += 4;
+                        }
+                        diff += sd;
+                        total += st;
+                        if st > 0 && sd * 2 > st {
+                            spans_mostly += 1;
+                        } else if sd > 0 {
+                            spans_few += 1;
+                        }
+                    }
+                    crate::observe::off(format!(
+                        "resident_overlay_cmp mid={mapping_id} spans={} texels={total} \
+                         differ={diff} spans_mostly_differ={spans_mostly} spans_few_differ={spans_few}",
+                        spans.len()
+                    ));
+                }
+            }
+            crate::observe::off(format!(
+                "resident_overlay_diag mid={mapping_id} {width}x{height} base={base_off:#x} \
+                 pitch={pitch} spans={} bytes={} window={} white={:.2} zero={:.2} opaque={:.2} \
+                 debt={debt} epoch={}",
+                spans.len(),
+                bytes.len(),
+                extent_end,
+                white as f64 / n as f64,
+                zero as f64 / n as f64,
+                opaque as f64 / n as f64,
+                state
+                    .mappings
+                    .get(&mapping_id)
+                    .map_or(0, |m| m.surface_content_epoch),
+            ));
+        }
+    }
+    let overlay = ResidentOverlay {
+        bytes: &bytes,
+        spans: &spans,
+        pitch_bytes: pitch,
+        width,
+        height,
+    };
+    match crate::backend::vulkan::engine::overlay_guest_bytes_onto_resident(identity, &overlay) {
+        Ok(Ok(_regions)) => {}
+        Ok(Err(decline)) => {
+            crate::runtime::drain::note_store_route(decline.slug());
+            return false;
+        }
+        Err(e) => {
+            crate::observe::fail(format!(
+                "resident_overlay_fail mid={mapping_id} {width}x{height} spans={} bytes={} err={e:?}",
+                spans.len(),
+                bytes.len()
+            ));
+            return false;
+        }
+    }
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    for &(start, end) in &guest_owned.ranges {
+        state.invalidate_storage_residency_window(mapping_id, start, end);
+    }
+    // The generation the ranges were listed against, not a fresh one: a page
+    // the host folded after the list was taken was not read above, and a fresh
+    // stamp would vouch for the resident's old bytes there for good.
+    crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, guest_owned.seen);
+    crate::runtime::drain::note_store_route("t11sample_resident_overlaid");
+    true
+}
+
+/// Replay, resident to resident, the CPU copy the guest made into a presented
+/// framebuffer from the one presented last. See [`crate::config::FB_COPY_REPLAY`].
+///
+/// The guest's compositor fills a back buffer by copying from the front buffer
+/// the region the back buffer lacks; afterwards the back buffer *is* the front
+/// buffer's frame. With the swap payment gone the front buffer's pages hold a
+/// stale frame and so do the back buffer's own untouched bytes, so neither half
+/// of a written page is right in guest RAM — but the front buffer's resident
+/// holds its frame, and copying the written pages' texels from it lands what the
+/// guest meant, whole pages included.
+///
+/// `None` hands the surface back to the upload: not a presented framebuffer, no
+/// other one presented, or the source owes no frame (its pages are current, so
+/// the guest copied the truth).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the surface, its geometry, the resident, and the ranges the guest owns"
+)]
+fn replay_framebuffer_copy<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    spans: &[crate::backend::vulkan::engine::ResidentOverlaySpan],
+    base_off: u64,
+    pitch: u64,
+    guest_owned: &crate::runtime::surface_currency::GuestOwned,
+) -> Option<bool> {
+    let m = state.mappings.get(&mapping_id)?;
+    if !m.scanout_presented || !m.guest_cpu_shared {
+        return None;
+    }
+    // Every other presented framebuffer of this geometry whose frame is still
+    // owed — its resident holds the frame and its pages do not. Usually one
+    // (double buffering) and never more than a few, so the scan is cheap.
+    let mut candidates: Vec<(
+        u32,
+        u64,
+        u64,
+        crate::backend::vulkan::engine::TargetIdentity,
+    )> = Vec::new();
+    for (&mid, cand) in state.mappings.iter() {
+        if mid == mapping_id
+            || !cand.scanout_presented
+            || cand.width != width
+            || cand.height != height
+        {
+            continue;
+        }
+        let Some((cand_base, cand_bpr, cand_format)) =
+            mapping_write::resident_gpu_plane(cand, width, height)
+        else {
+            continue;
+        };
+        if u64::from(cand_bpr) != pitch
+            || (cand_format != pixel_format::MTL_FORMAT_BGRA8_UNORM
+                && cand_format != pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB)
+        {
+            continue;
+        }
+        let Some(debt) = state.pending_writebacks.get(mid) else {
+            continue;
+        };
+        if debt.width != width
+            || debt.height != height
+            || debt.map_generation != cand.map_generation
+        {
+            continue;
+        }
+        let Some(ident) = debt
+            .target
+            .get::<crate::backend::vulkan::engine::TargetIdentity>()
+            .cloned()
+        else {
+            continue;
+        };
+        candidates.push((mid, cand_base, debt.seq, ident));
+    }
+    if candidates.is_empty() {
+        crate::runtime::drain::note_store_route("fb_replay_no_owed_source");
+        return None;
+    }
+    // Which one the guest copied from: the bytes it wrote are the source's
+    // stale bytes at the same offsets. Compared on a bounded sample from every
+    // span; the most recently stored candidate wins a tie.
+    const SAMPLE_BYTES_PER_SPAN: u64 = 4096;
+    const SAMPLE_BYTES_TOTAL: u64 = 256 * 1024;
+    let mut dst_sample: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut budget = SAMPLE_BYTES_TOTAL;
+    for span in spans {
+        if budget == 0 {
+            break;
+        }
+        let len = (span.window_end - span.window_start)
+            .min(SAMPLE_BYTES_PER_SPAN)
+            .min(budget)
+            & !3;
+        if len == 0 {
+            continue;
+        }
+        let mut buf = vec![0u8; len as usize];
+        if !crate::runtime::mapper::read_guest_owned_bytes(
+            state,
+            host,
+            mapping_id,
+            base_off + span.window_start,
+            &mut buf,
+        ) {
+            crate::runtime::drain::note_store_route("fb_replay_read_failed");
+            return None;
+        }
+        budget -= len;
+        dst_sample.push((span.window_start, buf));
+    }
+    let mut best: Option<(
+        u32,
+        crate::backend::vulkan::engine::TargetIdentity,
+        u64,
+        u64,
+        u64,
+    )> = None;
+    for (mid, cand_base, seq, ident) in candidates {
+        let (mut same, mut total) = (0u64, 0u64);
+        for (window_start, want) in &dst_sample {
+            let mut have = vec![0u8; want.len()];
+            if !crate::runtime::mapper::read_guest_owned_bytes(
+                state,
+                host,
+                mid,
+                cand_base + window_start,
+                &mut have,
+            ) {
+                total = 0;
+                break;
+            }
+            for (a, b) in want.chunks_exact(4).zip(have.chunks_exact(4)) {
+                total += 1;
+                same += u64::from(a == b);
+            }
+        }
+        let better = match &best {
+            None => true,
+            Some((_, _, b_same, b_total, b_seq)) => {
+                // same/total > b_same/b_total, cross-multiplied; newer wins ties.
+                let (l, r) = (same * (*b_total).max(1), *b_same * total.max(1));
+                l > r || (l == r && seq > *b_seq)
+            }
+        };
+        if total > 0 && better {
+            best = Some((mid, ident, same, total, seq));
+        }
+    }
+    let Some((src_mid, src_identity, same, total, _)) = best else {
+        crate::runtime::drain::note_store_route("fb_replay_read_failed");
+        return None;
+    };
+    // TEMP lab diagnostic: the choice and how well it matched.
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        if SEEN.fetch_add(1, Ordering::Relaxed) < 60 {
+            crate::observe::off(format!(
+                "fb_replay_diag dst={mapping_id} src={src_mid} front={} spans={} sampled={total}                  same={same}",
+                state.present.present_mapping,
+                spans.len()
+            ));
+        }
+    }
+    if same * 10 < total * 9 {
+        crate::runtime::drain::note_store_route("fb_replay_no_match");
+        return None;
+    }
+    match crate::backend::vulkan::engine::copy_resident_spans(
+        &src_identity,
+        identity,
+        spans,
+        pitch,
+        width,
+        height,
+    ) {
+        Ok(Ok(_)) => {}
+        Ok(Err(decline)) => {
+            crate::runtime::drain::note_store_route(decline.slug());
+            crate::runtime::drain::note_store_route("fb_replay_declined");
+            return None;
+        }
+        Err(e) => {
+            crate::observe::fail(format!(
+                "fb_replay_fail dst={mapping_id} src={src_mid} {width}x{height} spans={} err={e:?}",
+                spans.len()
+            ));
+            return None;
+        }
+    }
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    for &(start, end) in &guest_owned.ranges {
+        state.invalidate_storage_residency_window(mapping_id, start, end);
+    }
+    // The generation the ranges were listed against (see the overlay).
+    crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, guest_owned.seen);
+    crate::runtime::drain::note_store_route("fb_replay_copied");
+    Some(true)
 }
 
 /// Census only: which rung of the backing sampled ladder served this bind, and,
@@ -10427,7 +12564,7 @@ fn stamp_mapper_ref_texture_resident<M: HostMemory + HostOps>(
         crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
     }
     if let Some(mapping_id) = req.colors.first().map(|c| c.mapping_id).filter(|m| *m != 0) {
-        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        crate::runtime::mapper::commit_pass_guest_stamp(state, host, mapping_id);
     }
 }
 
@@ -10758,7 +12895,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     if plan == SurfaceStorePlan::DeferCopy
         && arm_surface_writeback_debt(state, host, mapping_id, identity, width, height)
     {
-        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        crate::runtime::mapper::commit_pass_guest_stamp(state, host, mapping_id);
         return true;
     }
     if plan == SurfaceStorePlan::SynchronizeGuestBacking {
@@ -10792,7 +12929,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     // The guest half of the write witness, recorded here rather than by the caller because this
     // rail returns straight out of `encode_draw` — it never reaches
     // `stamp_mapper_ref_texture_resident`, and it is where nearly all mapper-ref-texture Stores go.
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    crate::runtime::mapper::commit_pass_guest_stamp(state, host, mapping_id);
     true
 }
 
@@ -12313,10 +14450,10 @@ mod vulkan_split_tests {
         // content epoch does not move and this is the only witness that sees it.
         host.guest_wrote_page(gpa);
         assert_eq!(
-            surface_currency(&state, &host, mid, w, h),
+            surface_currency(&state, &host, mid, w, h).guest_owned_ranges(),
             // Whole-page, because the hypervisor's witness has page granularity
             // and the surface's one page is the whole of its mapping offsets.
-            SurfaceCurrency::WrotePixels(vec![(0, 1u64 << PAGE_SHIFT_X86)]),
+            Some(&[(0, 1u64 << PAGE_SHIFT_X86)][..]),
             "the write has to land inside the sampled window, or the rung under \
              test is being asked the wrong question"
         );

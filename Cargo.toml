@@ -35,3 +35,8 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 incremental = true
+
+# Windows/Tahoe edition: the translator with the macOS 26 fixes, kept beside this
+# checkout (MacOnIntel/metal2vulkan, branch windows-tahoe) until they land upstream.
+[patch."https://github.com/steelbrain/metal2vulkan.git"]
+metal2vulkan = { path = "../metal2vulkan" }

@@ -422,6 +422,16 @@ impl crate::observe::Decline for GuestRamRegionsError {
 
 crate::observe::decline::decline_display!(GuestRamRegionsError);
 
+/// Which doorbells bind the guest-write generation reads that follow
+/// ([`HostOps::note_work_scope`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkScope {
+    /// Every guest store ordered before the latest doorbell of any channel.
+    All,
+    /// Only the stores ordered before this channel's own doorbells (0 = root).
+    Channel(u32),
+}
+
 /// Services the device cannot provide itself (time, wake, action enqueue,
 /// guest CPU / KVA access for the IOSurface mapper path).
 pub trait HostOps {
@@ -468,6 +478,25 @@ pub trait HostOps {
     fn map_pages_stable(&self) -> bool {
         false
     }
+
+    /// Whether every dirty-log harvest a guest doorbell has asked for has
+    /// finished, so the guest-write witness covers every store ordered before
+    /// the doorbells seen so far.
+    ///
+    /// A shim may harvest off the vCPU so a doorbell does not hold the guest in
+    /// the MMIO exit for the whole accelerator sync. The drain then has to ask
+    /// this before it serves work a doorbell handed over; a `false` means that
+    /// work waits for the drain's next wakeup, which the same doorbell has
+    /// already scheduled. Default `true`: a host that harvests inline, or has no
+    /// witness at all, is always settled.
+    fn harvests_settled(&self) -> bool {
+        true
+    }
+
+    /// Which doorbells bind the generation reads that follow, until the next
+    /// call: every channel's as of now, or one channel's for a packet about to
+    /// run that waits on no other channel's stamps. Default: nothing to note.
+    fn note_work_scope(&self, _scope: WorkScope) {}
 
     /// Current packed-alias levels and cumulative lifetime totals. `None`
     /// means this host does not construct or cannot report such aliases.
@@ -601,6 +630,15 @@ pub trait HostOps {
     /// "every write is observed by some later read", not "immediately".
     fn guest_write_gen(&self, _token: u64) -> Option<u64> {
         None
+    }
+
+    /// TEMP (lab, `REIMS_VGPU_LAB_STATED_VOUCH`): the generation `token`'s set
+    /// was last brought up to date to, without waiting for it to be synced for
+    /// the current epoch. Never newer than [`Self::guest_write_gen`]; a write
+    /// it misses is seen by a later read. Hosts without a lagged answer give the
+    /// synced one.
+    fn guest_write_gen_lagged(&self, token: u64) -> Option<u64> {
+        self.guest_write_gen(token)
     }
 
     /// Which pages of `token`'s set the host has observed written since

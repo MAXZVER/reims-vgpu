@@ -1558,8 +1558,13 @@ mod tests {
         assert!(classed.topology().dynamic);
         assert!(!classed.topology().unrestricted);
         assert_eq!(
-            key(PrimitiveType::LineStrip, classed.topology()),
+            key(PrimitiveType::Line, classed.topology()),
             TopologyKey::Class(TopologyClass::Line)
+        );
+        // A strip restarts, so it keeps its own pipeline on every rung.
+        assert_eq!(
+            key(PrimitiveType::LineStrip, classed.topology()),
+            TopologyKey::Exact(PrimitiveType::LineStrip)
         );
         // The extension is asked for by name, because 1.2 is below the
         // promotion.

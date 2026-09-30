@@ -1225,6 +1225,58 @@ fn a_surface_colliding_with_several_control_structures_names_the_first() {
     );
 }
 
+/// A page list proved clear of control pages stays proved only while neither
+/// side moves. `mapping_page_gpas` remembers the proof per `map_generation`;
+/// a control structure landing on one of the surface's pages afterwards must
+/// still be caught, and a new page list must be proved afresh.
+#[test]
+fn a_remembered_clear_verdict_does_not_outlive_a_control_layout_change() {
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    use crate::runtime::host::FakeHost;
+    let valid = |pfn: u32| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    state.mappings.insert(
+        5,
+        crate::model::MappingEntry {
+            mapped: true,
+            map_generation: 1,
+            page_entries: vec![valid(0x700), valid(0x701), valid(0x702)],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        mapping_page_gpas(&mut state, &mut host, 5),
+        Some(vec![0x700_000, 0x701_000, 0x702_000])
+    );
+    assert!(state.mappings[&5].control_clear.is_some());
+    // Same list, same layout: served from the proof.
+    assert!(mapping_page_gpas(&mut state, &mut host, 5).is_some());
+
+    // Each region the check compares, moved onto a surface page, is caught.
+    state.gfx.root_page = 0x701;
+    assert_eq!(mapping_page_gpas(&mut state, &mut host, 5), None);
+    state.gfx.root_page = 0;
+    assert!(mapping_page_gpas(&mut state, &mut host, 5).is_some());
+
+    state.child_rings[3].page_gpas = vec![0x702_000];
+    assert_eq!(mapping_page_gpas(&mut state, &mut host, 5), None);
+    state.child_rings[3].page_gpas.clear();
+
+    state.define_task(4, 0x4000_0000, 0x700);
+    assert_eq!(mapping_page_gpas(&mut state, &mut host, 5), None);
+    state.define_task(4, 0x4000_0000, 0x900);
+    assert!(mapping_page_gpas(&mut state, &mut host, 5).is_some());
+
+    // A new list under a new generation is proved again, not inherited.
+    {
+        let m = state.mappings.get_mut(&5).unwrap();
+        m.page_entries = vec![valid(0x900)];
+        m.map_generation = 2;
+    }
+    assert_eq!(mapping_page_gpas(&mut state, &mut host, 5), None);
+}
+
 #[test]
 fn stable_view_without_a_vulkan_import_unmaps_at_mapping_retirement() {
     let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);

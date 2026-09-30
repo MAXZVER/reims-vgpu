@@ -203,6 +203,122 @@ switches! {
 /// comparable across compositing regimes and only one pair matched.
 pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 
+/// `off` keeps the guest-RAM import for the GPU's *reads* of guest memory —
+/// gathers into device-local images and buffers, vertex and index binds — and
+/// takes every rail by which the GPU would *write* guest RAM through it onto
+/// the copying rails instead: the direct render/compute Store licences
+/// (`licence_gva_plane`, `licence_mapper_ref_texture_surface`), storage-buffer
+/// binds placed straight on the import, and shared (guest-backed) render
+/// targets.
+///
+/// # Why a narrowing exists
+///
+/// With the import on, GPU-direct writes have been seen landing in guest pages
+/// the guest had already released and reused — `AppleParavirtPageTable.cpp`
+/// assertion panics on x86 Ventura and Tahoe, over KVM and WHPX, and corrupted
+/// allocations on arm64 (upstream issues #70, #71, #100) — while the same boots
+/// with the import off run clean at roughly half the frame rate. This switch
+/// splits the two directions so the question "is it the reads or the writes"
+/// can be answered on a live guest: it keeps the reads and gives up the writes,
+/// whose fallbacks are the same CPU rails an import-off host runs.
+///
+/// It answered it: narrowed this way, a Windows/WHPX x86 Ventura guest that
+/// dies within ~40 s of boot with the import on runs clean — so the reads are
+/// not what corrupts it. It is not a speed-up on that host (an RTX 4060, where
+/// GPU-side gathers out of host memory are PCIe copies): the CPU gathers go to
+/// zero, but the readbacks the writes now need cost more than they save, and
+/// one boot drew 13.8 present_hz on a Safari animation against 25.5 on the
+/// copying rails. See [`GUEST_IMPORT_SURFACE_WRITES`] for the narrower switch
+/// that keeps most of the writes.
+///
+/// Narrowing only, as every switch here: it cannot enable an import the host
+/// refuses, and with the import off it changes nothing.
+///
+/// # What it does not preserve
+///
+/// Render-stage storage-buffer *writes*. With the import on they reach guest
+/// RAM only through a direct bind; with this narrowing (as with the import off)
+/// such a bind is gathered into a device-local copy that nothing reads back.
+/// Compute storage buffers are unaffected: they are staged and written back by
+/// the CPU on every rail.
+pub const GUEST_IMPORT_WRITES: &str = "REIMS_VGPU_GUEST_IMPORT_WRITES";
+
+/// `off` keeps every GPU-direct write into guest RAM except one: a render or
+/// compute Store landed straight into a mapper-ref-texture surface (an
+/// IOSurface mapping) through `licence_mapper_ref_texture_surface`. That write
+/// takes the copying rail — readback, then a CPU write over a fresh walk of the
+/// guest's page table.
+///
+/// # Why this one
+///
+/// Bisected on a Windows/WHPX x86 Ventura guest with the import on, one boot
+/// per arm, each arm leaving one GPU write class on and the others on the
+/// copying rails:
+///
+/// ```text
+/// GPU-direct writes left on                         guest
+/// all                                               dies ~40 s into boot
+/// all but deferred debt payments (local experiment) dies ~40 s into boot
+/// storage-buffer direct binds + mapping licence     dies ~40 s into boot
+/// storage-buffer direct binds + GVA-plane licence   boots, drives anim/scroll
+/// storage-buffer direct binds only                  boots, drives anim/scroll
+/// ```
+///
+/// So the mapping licence is the class that kills the guest here (the
+/// `AppleParavirtPageTable` assertion family of upstream #70/#71/#100), and it
+/// does so for eager Stores too, not only for debts. Narrowing it alone keeps
+/// the import's read side and its GVA and storage-buffer writes. Whether that
+/// is faster than the copying rails is not settled on this host: one fast boot
+/// each read 30.1 against 25.5 present_hz on a Safari animation, but boots here
+/// split between two frame-rate populations, so that is not an A/B.
+///
+/// The narrowed arm then ran a soak on the same host: boot plus 380 s of
+/// continuous Safari animation, wheel scrolling, window drags and Mission
+/// Control (16 scenarios), no panic — against four boots with the mapping
+/// licence on, all dead within ~40 s. One host and one guest, so this names
+/// the class that kills this pairing; it is not proof the other classes are
+/// safe everywhere.
+pub const GUEST_IMPORT_SURFACE_WRITES: &str = "REIMS_VGPU_GUEST_IMPORT_SURFACE_WRITES";
+
+/// `off` reconciles a surface the guest CPU wrote under a live resident by the
+/// whole-frame merge (read the resident back, land it around the guest's pages,
+/// upload the pages again) instead of laying the guest-written pages over the
+/// resident on the GPU.
+///
+/// Narrowing-only: both arms produce the same page-granular texels — pages the
+/// guest wrote come from guest RAM, every other page from the resident — and
+/// the overlay declines to the merge whenever it cannot copy the guest's bytes
+/// unconverted. What differs is the cost and where the reconciled surface
+/// lives afterwards: in the resident, or in the guest's pages.
+pub const RESIDENT_OVERLAY: &str = "REIMS_VGPU_RESIDENT_OVERLAY";
+
+/// `off` writes each presented framebuffer back into guest RAM when a
+/// DisplaySwap presents it, once the guest has been seen copying between
+/// presented framebuffers with its CPU — the whole-frame payment that keeps the
+/// copy source current.
+///
+/// Unset, the copy is replayed on the GPU instead. The guest's compositor fills
+/// a back buffer by copying, with the CPU, the region the front buffer has and
+/// the back buffer lacks, so once the copy has run the back buffer's content is
+/// the front buffer's. The pages it wrote are therefore copied resident to
+/// resident rather than uploaded from guest bytes the device never wrote back,
+/// and the front buffer's frame stays owed in the ledger — paid only if a
+/// reader asks for it. A whole-frame readback per swap is 8 MB at 1920x1080 and
+/// 44 MB at 5120x2160.
+///
+/// Opt-in (`on`) for now: with no swap payment every framebuffer's pages
+/// converge on the same stale bytes, and the byte match that picks the copy
+/// source stops being evidence (lab: ~60% of copies matched no candidate).
+pub const FB_COPY_REPLAY: &str = "REIMS_VGPU_FB_COPY_REPLAY";
+
+/// `off` writes a presented framebuffer back into guest RAM whole at each swap
+/// payment instead of page by page. Unset, the GPU compares the frame against
+/// the copy its pages were last written from and only the changed 4 KiB pages
+/// cross PCIe and are landed (lab, 5120x2160 guest on an RTX 4060: CSS
+/// animation ~93 -> ~100-106 fps, wheel scroll ~64 -> ~71, drag ~23 -> ~28-30).
+/// Both arms leave the same bytes in guest RAM.
+pub const PAY_DIFF: &str = "REIMS_VGPU_PAY_DIFF";
+
 /// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when
 /// the device advertises `VK_KHR_push_descriptor` and the layout fits its
 /// reported limit.
@@ -1210,6 +1326,18 @@ pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
 }
 
 choices! {
+
+/// **A choice, not a switch.** `WxH` makes that the display's native mode: the first timing element, which
+/// the guest reports as the panel's native pixels and picks by default on a
+/// display it has not seen before. The announced panel takes that aspect in
+/// whole centimetres, about 64 cm wide, so a 5120x2160 native mode reads as a
+/// ~200 DPI panel and the guest defaults to its 2x scaled resolution; the serial
+/// number moves with it, so the guest does not reuse the display arrangement it
+/// saved for the 1920x1080 panel. The built-in modes follow it in the list.
+///
+/// Unset keeps the 1920x1080 panel. A value that does not parse as two sizes
+/// in 1..=8192 is refused on the failure channel and ignored.
+pub const DISPLAY_NATIVE: &str = "REIMS_VGPU_DISPLAY_NATIVE";
 
 /// **A choice, not a switch.** Which execution rail this process runs guest work
 /// on, when the binary carries more than one.

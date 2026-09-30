@@ -72,13 +72,35 @@ pub enum SurfaceCurrency {
     /// The guest wrote pages inside this pixel window. Carries the
     /// mapping-offset ranges the guest now owns, ascending and merged, which is
     /// exactly the `skip` list a merge that must preserve the guest's stores
-    /// needs.
-    WrotePixels(Vec<(u64, u64)>),
+    /// needs, and the generation those ranges were listed against.
+    WrotePixels(GuestOwned),
     /// The guest wrote the allocation and the host cannot name where.
     /// Indistinguishable from [`Self::WrotePixels`] to a consumer that must be
     /// right, but it cannot be merged either — there is no page list to
     /// preserve.
     WroteUnknown,
+}
+
+/// Where the guest wrote, and the generation observed before that list was
+/// taken.
+///
+/// A consumer that adopts the ranges into its copy stamps `seen` — never a
+/// generation read afterwards, which could fold in a write the list did not
+/// name (see [`mapper::GuestWriteObservation`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestOwned {
+    pub ranges: Vec<(u64, u64)>,
+    pub seen: mapper::GuestWriteObservation,
+}
+
+impl GuestOwned {
+    /// Ranges with no observation behind them: commits as "no stamp".
+    pub fn unobserved(ranges: Vec<(u64, u64)>) -> Self {
+        Self {
+            ranges,
+            seen: mapper::GuestWriteObservation::default(),
+        }
+    }
 }
 
 /// The evidence a consumer requires of the witness before it will serve a
@@ -162,7 +184,16 @@ impl SurfaceCurrency {
     /// means.
     pub fn guest_owned_ranges(&self) -> Option<&[(u64, u64)]> {
         match self {
-            Self::WrotePixels(ranges) => Some(ranges.as_slice()),
+            Self::WrotePixels(owned) => Some(owned.ranges.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// The ranges together with the generation they were listed against, for a
+    /// consumer that adopts them into its copy and must stamp what it saw.
+    pub fn guest_owned(&self) -> Option<&GuestOwned> {
+        match self {
+            Self::WrotePixels(owned) => Some(owned),
             _ => None,
         }
     }
@@ -209,6 +240,10 @@ fn narrow_to_window<M: HostOps>(
     else {
         return SurfaceCurrency::WroteUnknown;
     };
+    // Observed before the list: `guest_written_pages` names every page moved
+    // past the stamp up to at least this generation, so a copy that adopts the
+    // list may stamp this and nothing later.
+    let seen = mapper::observe_current_guest_write_gen(state, host, mapping_id);
     let Some(pages) = host.guest_written_pages(m.guest_write_token, m.guest_write_gen_at_store)
     else {
         return SurfaceCurrency::WroteUnknown;
@@ -222,7 +257,7 @@ fn narrow_to_window<M: HostOps>(
         return SurfaceCurrency::WroteUnknown;
     }
     if ranges_touch_window(&ranges, base_off, span_end) {
-        SurfaceCurrency::WrotePixels(ranges)
+        SurfaceCurrency::WrotePixels(GuestOwned { ranges, seen })
     } else {
         SurfaceCurrency::WroteElsewhere
     }
@@ -262,7 +297,7 @@ mod tests {
             );
         }
         for state in [
-            SurfaceCurrency::WrotePixels(vec![(0, 4096)]),
+            SurfaceCurrency::WrotePixels(GuestOwned::unobserved(vec![(0, 4096)])),
             SurfaceCurrency::WroteUnknown,
         ] {
             for standard in [
@@ -316,7 +351,8 @@ mod tests {
     #[test]
     fn a_skip_list_comes_only_from_named_pages() {
         assert_eq!(
-            SurfaceCurrency::WrotePixels(vec![(0, 4096)]).guest_owned_ranges(),
+            SurfaceCurrency::WrotePixels(GuestOwned::unobserved(vec![(0, 4096)]))
+                .guest_owned_ranges(),
             Some(&[(0u64, 4096u64)][..])
         );
         assert_eq!(SurfaceCurrency::WroteUnknown.guest_owned_ranges(), None);

@@ -1708,11 +1708,17 @@ mod tests {
                 expected,
                 "{key_topology:?}"
             );
-            // Never restarting: Metal has no primitive-restart index and a
-            // guest's largest index would silently cut its strip.
+            // Restarting exactly when the declared topology is a strip, as
+            // Metal's indexed strips do.
             assert_eq!(
                 build.input_assembly().primitive_restart_enable,
-                vk::FALSE,
+                if expected == vk::PrimitiveTopology::LINE_STRIP
+                    || expected == vk::PrimitiveTopology::TRIANGLE_STRIP
+                {
+                    vk::TRUE
+                } else {
+                    vk::FALSE
+                },
                 "{key_topology:?}"
             );
             // And the declaration is only half the answer. A key that serves

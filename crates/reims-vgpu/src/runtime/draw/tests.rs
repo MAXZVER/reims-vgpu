@@ -1771,21 +1771,21 @@ fn attachment_alias_resident_chain_selection() {
         ..Default::default()
     });
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 0, 42),
+        fragment_attachment_alias_sample(&req, 42),
         None,
         "unarmed LOAD without seed must not alias"
     );
     req.chain_from_resident = true;
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 0, 42),
-        Some((8, 8, AttachmentAliasSample::ResidentChain)),
+        fragment_attachment_alias_sample(&req, 42),
+        Some((8, 8, AttachmentAliasSample::ResidentChain { slot: 0 })),
         "armed chain aliases from the resident target"
     );
     // CPU seed still wins when present (record after a non-resident hop).
     let seed = vec![0u8; 8 * 8 * 4];
     req.colors[0].target_seed_rgba = Some(seed);
     assert!(matches!(
-        fragment_attachment_alias_sample(&req, 0, 42),
+        fragment_attachment_alias_sample(&req, 42),
         Some((8, 8, AttachmentAliasSample::Seed(_, _)))
     ));
 }
@@ -1816,26 +1816,155 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
     };
 
     let (width, height, sample) =
-        fragment_attachment_alias_sample(&req, 0, texture_ref).expect("GVA alias");
+        fragment_attachment_alias_sample(&req, texture_ref).expect("GVA alias");
     assert_eq!((width, height), (2, 1));
     let AttachmentAliasSample::Seed(actual, _) = sample else {
         panic!("Load alias must use the chained seed");
     };
     assert_eq!(actual, seed);
-    assert!(fragment_attachment_alias_sample(&req, 1, texture_ref).is_none());
-    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref + 1).is_none());
+    assert!(fragment_attachment_alias_sample(&req, texture_ref + 1).is_none());
 
     req.colors[0].mapping_id = 9;
-    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
+    assert!(fragment_attachment_alias_sample(&req, texture_ref).is_none());
     req.colors[0].mapping_id = 0;
     req.colors[0].load_action = MTL_LOAD_ACTION_DONT_CARE;
-    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
+    assert!(fragment_attachment_alias_sample(&req, texture_ref).is_none());
     req.colors[0].load_action = MTL_LOAD_ACTION_CLEAR;
     req.colors[0].clear_color = [0.25, 0.5, 0.75, 1.0];
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 0, texture_ref),
+        fragment_attachment_alias_sample(&req, texture_ref),
         Some((2, 1, AttachmentAliasSample::Clear([0.25, 0.5, 0.75, 1.0])))
     );
+}
+
+/// A half-float GVA attachment's LOAD seed comes out of its own pages at its own
+/// width, so a signed shape map is loaded as it was stored rather than through
+/// the eight-bit colour seed that clamps it.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_half_float_gva_load_seed_carries_its_own_texels() {
+    crate::runtime::guest_ram_map::reset();
+    use crate::model::PAGE_SHIFT_ARM64E;
+    use crate::protocol::pixel_format as pf;
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    crate::runtime::gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 4);
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+    let mut c0 = ColorRtRequest {
+        slot: 0,
+        texture_ref: 0,
+        mapping_id: 0,
+        target_gva: page, // GVA page 1
+        width: 4,
+        height: 2,
+        row_stride: 64,
+        format: pf::MTL_FORMAT_RGBA16_FLOAT,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        ..Default::default()
+    };
+    let want = ash::vk::Format::R16G16B16A16_SFLOAT;
+    let seed = try_gva_target_guest_seed(&mut state, &mut host, 1, &c0, want)
+        .expect("a half-float plane over walkable pages seeds natively");
+    assert_eq!(seed.format, want);
+    assert_eq!(
+        seed.source.total_len,
+        64 + 4 * 8,
+        "one full row plus the tight last row"
+    );
+    assert_eq!(
+        seed.source.row_length_texels, 8,
+        "a 64-byte row is 8 half4 texels"
+    );
+    // An attachment built in another format cannot take these bytes.
+    assert!(try_gva_target_guest_seed(
+        &mut state,
+        &mut host,
+        1,
+        &c0,
+        ash::vk::Format::R8G8B8A8_UNORM
+    )
+    .is_none());
+    // Nor may a mapping-backed target take the GVA door.
+    c0.mapping_id = 3;
+    assert!(try_gva_target_guest_seed(&mut state, &mut host, 1, &c0, want).is_none());
+    crate::runtime::guest_ram_map::reset();
+}
+
+/// The eager GVA Store lands an eight-bit readback, which is exact only for the
+/// two eight-bit colour orders. Every wider layout must take the native rail, or
+/// a signed half-float glass map is written back clamped to [0,1].
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn only_eight_bit_colour_gva_stores_may_land_an_eight_bit_readback() {
+    use crate::protocol::pixel_format as pf;
+    for eight_bit in [
+        pf::MTL_FORMAT_BGRA8_UNORM,
+        pf::MTL_FORMAT_BGRA8_UNORM_SRGB,
+        pf::MTL_FORMAT_RGBA8_UNORM,
+        pf::MTL_FORMAT_RGBA8_UNORM_SRGB,
+    ] {
+        assert!(!gva_store_needs_native_texels(eight_bit), "{eight_bit:#x}");
+    }
+    for wide in [pf::MTL_FORMAT_RGBA16_FLOAT, pf::MTL_FORMAT_RG16_FLOAT] {
+        assert!(gva_store_needs_native_texels(wide), "{wide:#x}");
+    }
+    // A format with no declared store layout keeps the old rail, which reports
+    // its own conversion refusal.
+    assert!(!gva_store_needs_native_texels(0xffff));
+}
+
+/// A pass may sample any of its own attachments at any texture index. macOS 26's
+/// icon renderer binds its `RG16Float` colour 1 at fragment texture 5 and
+/// composites colour 0 from it inside the same pass; resolving that bind from the
+/// attachment's guest pages read DontCare-stored zeros and every icon came out
+/// transparent. The alias is decided by the object and carries the slot, so the
+/// bind names the secondary's resident rather than colour 0's.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_secondary_attachment_sampled_at_another_index_aliases_its_own_resident() {
+    let mut req = DrawEncodeRequest::default();
+    req.colors.push(ColorRtRequest {
+        slot: 0,
+        texture_ref: 3,
+        mapping_id: 8,
+        width: 129,
+        height: 194,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        ..Default::default()
+    });
+    req.colors.push(ColorRtRequest {
+        slot: 1,
+        texture_ref: 4,
+        mapping_id: 0,
+        target_gva: 0x178000,
+        width: 129,
+        height: 194,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        ..Default::default()
+    });
+    // Not a chained record, and still the secondary's resident: its Load is.
+    assert_eq!(
+        fragment_attachment_alias_sample(&req, 4),
+        Some((129, 194, AttachmentAliasSample::ResidentChain { slot: 1 }))
+    );
+    // A DontCare secondary aliases its resident too; the caller swaps in the
+    // clear when the engine says that resident holds nothing yet.
+    req.colors[1].load_action = MTL_LOAD_ACTION_DONT_CARE;
+    assert_eq!(
+        fragment_attachment_alias_sample(&req, 4),
+        Some((129, 194, AttachmentAliasSample::ResidentChain { slot: 1 }))
+    );
+    // A cleared secondary aliases its clear, whatever index samples it.
+    req.colors[1].load_action = MTL_LOAD_ACTION_CLEAR;
+    req.colors[1].clear_color = [0.0, 1.0, 0.0, 0.0];
+    assert_eq!(
+        fragment_attachment_alias_sample(&req, 4),
+        Some((129, 194, AttachmentAliasSample::Clear([0.0, 1.0, 0.0, 0.0])))
+    );
+    // A ref that is not attached is not an alias.
+    assert!(fragment_attachment_alias_sample(&req, 5).is_none());
 }
 
 #[test]
@@ -3612,6 +3741,198 @@ fn mrt_draw_request_texture_view_mip_level_view_of_linear_as_color_rt() {
     );
     assert_eq!((c0.width, c0.height), (32, 16), "level-1 dims");
     assert_eq!(c0.row_stride, 128, "level-1 row stride");
+}
+
+/// A two-level linear texture (object type 3) and a ranged texture view
+/// (object type 8) over its level 1, both in task 1's object list, with each
+/// level's texels in guest memory. Returns the view's ref and level 1's bytes
+/// as stored.
+///
+/// Level 0 is 64x32 and filled with `0xee`; level 1 is 32x16 at allocation
+/// offset `0x2000`, tight, filled with a counting pattern — so a sample that
+/// read the wrong level differs in its bytes as well as its extent.
+#[cfg(feature = "backend-vulkan")]
+fn level_one_view_of_a_linear_texture(
+    state: &mut DeviceState,
+    host: &mut FakeHost,
+    base_format: u16,
+    view_format: u16,
+) -> (u32, Vec<u8>) {
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE,
+        OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_LEVEL_RECORDS,
+        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_MIP_LEVEL_RECORD_LEN,
+        TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE,
+        TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE,
+        TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH, TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN,
+        TEXTURE_VIEW_DESC_LEVEL_BASE, TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_OPCODE,
+        TEXTURE_VIEW_DESC_PIXEL_FORMAT, TEXTURE_VIEW_DESC_SLICE_BASE,
+        TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_DESC_TEXTURE_REF,
+        TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_OPCODE_RANGED,
+    };
+
+    let bpp = crate::protocol::pixel_format::bytes_per_pixel(base_format)
+        .expect("fixture base format has a texel size");
+    let (w0, h0, w1, h1) = (64u32, 32u32, 32u32, 16u32);
+    // The allocation is GVA page 2 of the eight the task maps; the object list
+    // and both descriptors sit in page 0.
+    let (handle, level1_offset) = (2u32, 0x2000u64);
+    let alloc_gva = u64::from(handle) << PAGE_SHIFT_ARM64E;
+
+    gva_mem::define_task_pages_arm64e(host, state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    let base_ref = 5u32;
+    let body = TEXTURE_DESC_BASE_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    let mut b = vec![0u8; body];
+    st64(&mut b[0..], 0x4000); // allocation_size
+    st32(&mut b[8..], handle);
+    st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 2);
+    st32(&mut b[TEXTURE_DESC_USED_SIZE..], w0 * h0 * bpp);
+    st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], w0 * bpp);
+    st32(&mut b[TEXTURE_DESC_WIDTH..], w0);
+    st32(&mut b[TEXTURE_DESC_WIDTH + 4..], h0);
+    let rec = TEXTURE_DESC_LEVEL_RECORDS;
+    st64(&mut b[rec + TEXTURE_LEVEL_OFFSET..], level1_offset);
+    st64(&mut b[rec + TEXTURE_LEVEL_SIZE..], u64::from(w1 * h1 * bpp));
+    st64(
+        &mut b[rec + TEXTURE_LEVEL_ROW_STRIDE..],
+        u64::from(w1 * bpp),
+    );
+    st32(&mut b[rec + TEXTURE_LEVEL_WIDTH..], w1);
+    st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT..], h1);
+    st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT + 4..], 1); // depth
+    st16(
+        &mut b[TEXTURE_DESC_PIXEL_FORMAT + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN..],
+        base_format,
+    );
+    let base_desc_gva = 0x200u64;
+    write_task_gva_arm64e(host, &state.tasks[1], base_desc_gva, &b);
+    let off = list_object_entry_offset(base_ref, 32).unwrap();
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut le[0..],
+        (OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8),
+    );
+    le[4..12].copy_from_slice(&base_desc_gva.to_le_bytes());
+    write_task_gva_arm64e(host, &state.tasks[1], off, &le);
+
+    let view_ref = 8u32;
+    let len = TEXTURE_VIEW_MIN_RANGED;
+    let mut desc = vec![0u8; len];
+    st32(
+        &mut desc[TEXTURE_VIEW_DESC_OPCODE..],
+        TEXTURE_VIEW_OPCODE_RANGED,
+    );
+    st32(&mut desc[TEXTURE_VIEW_DESC_LEN..], len as u32);
+    st32(&mut desc[TEXTURE_VIEW_DESC_TEXTURE_REF..], view_ref);
+    st32(&mut desc[TEXTURE_VIEW_DESC_BASE_REF..], base_ref);
+    st16(&mut desc[TEXTURE_VIEW_DESC_PIXEL_FORMAT..], view_format);
+    st16(
+        &mut desc[TEXTURE_VIEW_DESC_TEXTURE_TYPE..],
+        TEXTURE_VIEW_MTL_TYPE_2D,
+    );
+    st64(&mut desc[TEXTURE_VIEW_DESC_LEVEL_BASE..], 1);
+    st64(&mut desc[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 1);
+    st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
+    st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
+    let desc_gva = 0x400u64;
+    write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
+    let off = list_object_entry_offset(view_ref, 32).unwrap();
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut le[0..],
+        (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8),
+    );
+    le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(host, &state.tasks[1], off, &le);
+
+    let level0 = vec![0xeeu8; (w0 * h0 * bpp) as usize];
+    write_task_gva_arm64e(host, &state.tasks[1], alloc_gva, &level0);
+    let level1: Vec<u8> = (0..w1 * h1 * bpp).map(|i| (i * 7 + 3) as u8).collect();
+    write_task_gva_arm64e(host, &state.tasks[1], alloc_gva + level1_offset, &level1);
+    (view_ref, level1)
+}
+
+/// A texture view has no texture descriptor of its own, so the last-resort
+/// sampled rung takes its geometry from the base texture's descriptor at the
+/// view's level — the level whose bytes it has just loaded through the view.
+///
+/// It used to decode the view's own 52-byte record as a texture descriptor,
+/// which cannot fit one: every viewed sample of a linear texture was refused as
+/// a missing texture after its bytes had loaded. The extent asserted is level
+/// 1's, not the base's, and the payload is exactly that level's worth of texels
+/// in the layout the loader reports.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_view_of_a_linear_texture_samples_at_its_level_from_the_base_descriptor() {
+    use crate::protocol::pixel_format::TexelLayout;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let (view_ref, level1) = level_one_view_of_a_linear_texture(
+        &mut state,
+        &mut host,
+        MTL_FORMAT_BGRA8_UNORM,
+        MTL_FORMAT_BGRA8_UNORM,
+    );
+
+    let (w, h, mid, src) = resolve_sampled_source(&mut state, &mut host, 1, view_ref, None, false)
+        .expect("a view of a linear texture must sample");
+    assert_eq!((w, h), (32, 16), "the view's level, not the base's 64x32");
+    assert_eq!(mid, 0, "a linear texture is no mapping");
+    let SampledSourceRequest::Bytes(bytes, _, format, _) = src else {
+        panic!("the last-resort rung serves bytes");
+    };
+    assert_eq!(
+        bytes.len(),
+        (w * h * format.layout().bytes_per_texel()) as usize,
+        "exactly one level-1 image, in the layout the loader reports"
+    );
+    assert_eq!(format.layout(), TexelLayout::Bgra8);
+    assert_eq!(
+        bytes.as_slice(),
+        level1.as_slice(),
+        "level 1's texels as stored"
+    );
+}
+
+/// The same rung with the view reinterpreting its base: macOS 26 samples its
+/// icon masks through `A8Unorm` views of `R8Unorm` textures. The one stored
+/// byte is alpha under the view's format — red under the base's — and the
+/// extent is still the view level's.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn an_a8_view_of_an_r8_texture_samples_the_byte_as_alpha_at_the_view_level() {
+    use crate::protocol::pixel_format::{MTL_FORMAT_A8_UNORM, MTL_FORMAT_R8_UNORM};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let (view_ref, level1) = level_one_view_of_a_linear_texture(
+        &mut state,
+        &mut host,
+        MTL_FORMAT_R8_UNORM,
+        MTL_FORMAT_A8_UNORM,
+    );
+
+    let (w, h, _, src) = resolve_sampled_source(&mut state, &mut host, 1, view_ref, None, false)
+        .expect("an A8 view of an R8 texture must sample");
+    assert_eq!((w, h), (32, 16), "the view's level, not the base's 64x32");
+    let SampledSourceRequest::Bytes(bytes, _, format, _) = src else {
+        panic!("the last-resort rung serves bytes");
+    };
+    let bpt = format.layout().bytes_per_texel() as usize;
+    assert_eq!(bytes.len(), w as usize * h as usize * bpt);
+    assert_eq!(bpt, 4, "the A8 row rail widens each texel to RGBA8");
+    for (texel, stored) in bytes.chunks_exact(bpt).zip(&level1) {
+        assert_eq!(
+            texel,
+            &[0, 0, 0, *stored],
+            "the view's format, not the base's, decides the channel"
+        );
+    }
 }
 
 #[test]
@@ -8154,4 +8475,73 @@ fn both_spellings_of_the_channel_exchange_agree_and_are_their_own_inverse() {
              function serve both directions"
         );
     }
+}
+
+/// A stamp vouches only for what the copy saw.
+///
+/// The host's prefetch moves generations at any moment, so a generation read
+/// *after* the copy was made can fold in a guest write the copy never saw. The
+/// resident is then vouched for with the old bytes in that page, and nothing
+/// re-reads it until the guest happens to write it again (whole black 4 KiB rows
+/// in a new CPU-painted tile, held for seconds on the Dell). The rails observe
+/// before the copy and commit after.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_guest_write_between_observation_and_copy_is_not_vouched_for() {
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::runtime::host::FakeHost;
+    use crate::runtime::mapper::{
+        commit_guest_write_stamp, commit_pass_guest_stamp, note_pass_guest_observation,
+        observe_guest_write_gen, stamp_guest_write_gen,
+    };
+
+    let entry_for =
+        |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page = state.page_size();
+    assert!(state.map_surface(7));
+    let gpas = [0x40 * page, 0x91 * page];
+    state
+        .mappings
+        .get_mut(&7)
+        .expect("mapped above")
+        .page_entries = gpas.iter().map(|g| entry_for(*g)).collect();
+
+    // Observed before the copy; the guest paints a page before the copy lands.
+    let seen = observe_guest_write_gen(&mut state, &mut host, 7);
+    assert_ne!(seen.generation(), 0, "FakeHost arms on the first read");
+    host.guest_wrote_page(gpas[1]);
+    commit_guest_write_stamp(&mut state, 7, seen);
+    assert!(
+        mapper_ref_texture_guest_wrote_since_store(&state, &host, 7),
+        "the write landed after the observation, so the copy may not hold it"
+    );
+
+    // The order this replaces: a generation read after the copy folds it in.
+    stamp_guest_write_gen(&mut state, &mut host, 7);
+    assert!(
+        !mapper_ref_texture_guest_wrote_since_store(&state, &host, 7),
+        "a fresh stamp vouches for the write — the defect"
+    );
+
+    // The pass form: observed at the LOAD, committed by the Store.
+    note_pass_guest_observation(&mut state, &mut host, 7);
+    host.guest_wrote_page(gpas[0]);
+    commit_pass_guest_stamp(&mut state, &mut host, 7);
+    assert!(mapper_ref_texture_guest_wrote_since_store(&state, &host, 7));
+    assert_eq!(
+        state.mappings[&7].pending_guest_write_obs, None,
+        "a Store consumes the observation it stamped"
+    );
+
+    // An observation for a page list the mapping no longer has stamps nothing.
+    let stale = observe_guest_write_gen(&mut state, &mut host, 7);
+    state
+        .mappings
+        .get_mut(&7)
+        .expect("mapped above")
+        .map_generation += 1;
+    commit_guest_write_stamp(&mut state, 7, stale);
+    assert_eq!(state.mappings[&7].guest_write_gen_at_store, 0);
 }

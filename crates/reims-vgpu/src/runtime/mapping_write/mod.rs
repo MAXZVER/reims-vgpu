@@ -642,6 +642,42 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
     )
 }
 
+/// [`write_bgra8_uncached`], leaving `skip` untouched: the borrowed-frame
+/// writer for a caller that must also preserve the guest's own stores.
+///
+/// The resident merge in the sampled ladder is that caller. It reads a resident
+/// back through `engine::LeasedFrame` and lands it around the pages the guest
+/// wrote, so it holds a borrow of a staging buffer (no frame of its own for the
+/// cache to share) and a skip list (which the whole-frame writers do not take).
+/// The cache entry is dropped for the reason [`write_bgra8_uncached`] gives,
+/// and the pages this write lands are what a later reader falls through to.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
+)]
+pub fn write_bgra8_skipping_uncached<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
+) -> bool {
+    write_bgra8_inner(
+        state,
+        host,
+        mapping_id,
+        src,
+        CacheOutcome::Invalidate,
+        src_stride,
+        width,
+        height,
+        skip,
+    )
+}
+
 /// The plane of `m` that [`vulkan::write_bgra8_from_resident_gpu`] would write a frame
 /// of this extent into, as `(surface_offset, row_stride, pixel_format)`.
 ///
@@ -741,6 +777,10 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             SurfaceWriteRefusal::SourceStride { src_stride, width },
         );
     }
+    // Before the landing: the stamps below vouch for pages this write puts in
+    // place, and a generation read after it could fold in a guest write that
+    // landed meanwhile (see `GuestWriteObservation`).
+    let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);
     let Some(m) = state.mappings.get(&mapping_id) else {
         return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
@@ -782,6 +822,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // it. What this write is about to land is the same surface at the same
     // geometry (`GeometryMoved` above refuses anything else), so the owed frame
     // is superseded rather than lost.
+    let lab_t0 = std::time::Instant::now();
     if skip.is_empty() {
         crate::runtime::writeback_debt::settle_for_mapping(
             state,
@@ -798,9 +839,11 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     }
     // Taken after the flush, because the flush can invalidate this mapping, and
     // once for the whole frame, because the loop below writes a row at a time.
+    let lab_t1 = std::time::Instant::now();
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "bgra8") else {
         return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
+    let lab_t2 = std::time::Instant::now();
     let bpr = bpr_u32 as usize;
     let Some(tight) = pixel_format::tight_row_bytes(mw, format) else {
         return refuse(mapping_id, SurfaceWriteRefusal::FormatRowLength { format });
@@ -856,7 +899,9 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     let frame_bytes = (mh as u64).saturating_mul(tight as u64);
 
     // Fast path: one packed view, poke rows in place.
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+    let lab_contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
+    let lab_t3 = std::time::Instant::now();
+    if let Some((ptr, _)) = lab_contig {
         note_surface_write_path(true, frame_bytes);
         let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
@@ -1053,6 +1098,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             land_started.elapsed().as_micros() as u64,
         );
     }
+    lab_mapw_diag(lab_t0, lab_t1, lab_t2, lab_t3);
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
     if !skip.is_empty() {
@@ -1098,7 +1144,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         // It is honest as well as necessary: the stamp says "no host-side copy
         // is known stale relative to these pages", and after the two retirements
         // above there is no host-side copy at all.
-        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
         return true;
     }
     let cache_started = std::time::Instant::now();
@@ -1134,9 +1180,39 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // `gw_clean` 0 because only the Vulkan Store rails ever stamped, and the
     // copy that rung serves is written here. Unstamped, the reader cannot tell a
     // surface the guest has rewritten from one it has not, and must assume the
-    // worst on every bind.
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    // worst on every bind. Stamped with what was observed before the landing.
+    crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
     true
+}
+
+/// TEMP lab diagnostic: where a mapping write's time goes before the landing.
+fn lab_mapw_diag(
+    t0: std::time::Instant,
+    t1: std::time::Instant,
+    t2: std::time::Instant,
+    t3: std::time::Instant,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static N: AtomicU64 = AtomicU64::new(0);
+    static SETTLE: AtomicU64 = AtomicU64::new(0);
+    static VOUCH: AtomicU64 = AtomicU64::new(0);
+    static CONTIG: AtomicU64 = AtomicU64::new(0);
+    static BODY: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::Instant::now();
+    SETTLE.fetch_add((t1 - t0).as_micros() as u64, Relaxed);
+    VOUCH.fetch_add((t2 - t1).as_micros() as u64, Relaxed);
+    CONTIG.fetch_add((t3 - t2).as_micros() as u64, Relaxed);
+    BODY.fetch_add((now - t3).as_micros() as u64, Relaxed);
+    let n = N.fetch_add(1, Relaxed) + 1;
+    if n % 200 == 0 {
+        crate::observe::off(format!(
+            "mapw_phase_diag n=200 settle_us={} vouch_us={} contig_us={} body_us={}",
+            SETTLE.swap(0, Relaxed) / 200,
+            VOUCH.swap(0, Relaxed) / 200,
+            CONTIG.swap(0, Relaxed) / 200,
+            BODY.swap(0, Relaxed) / 200
+        ));
+    }
 }
 
 /// What becomes of this device's own copy of the frame a Store lands.
@@ -1208,6 +1284,8 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     if !scanout_extent_ok(width, height) {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }
+    // Before the landing, as in `write_bgra8_inner`.
+    let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);
     let rgba_stride = width.saturating_mul(RGBA8_BPP);
     let need = (height as usize).saturating_mul(rgba_stride as usize);
     if rgba.len() < need {
@@ -1607,8 +1685,8 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // `gw_clean` 0 because only the Vulkan Store rails ever stamped, and the
     // copy that rung serves is written here. Unstamped, the reader cannot tell a
     // surface the guest has rewritten from one it has not, and must assume the
-    // worst on every bind.
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    // worst on every bind. Stamped with what was observed before the landing.
+    crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
     true
 }
 

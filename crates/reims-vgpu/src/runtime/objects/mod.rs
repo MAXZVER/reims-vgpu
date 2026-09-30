@@ -1735,6 +1735,12 @@ fn note_stale_task_resource<M: HostMemory>(
     obj_ref: u32,
     cached: &TaskResource,
 ) {
+    // `task_resource_reexamine_deferred` is the denominator of what the
+    // interval skipped. See `TaskResource::REEXAMINE_INTERVAL_US`.
+    if !cached.reexamination_due(crate::observe::elapsed_us()) {
+        crate::runtime::drain::note_store_route("task_resource_reexamine_deferred");
+        return;
+    }
     let Some(entry) = lookup_list_entry(state, host, task_id, obj_ref) else {
         // The guest's list no longer answers for this reference at all. Counted
         // apart from the comparisons: it is not a disagreement about what the

@@ -1630,7 +1630,21 @@ pub fn stamp_guest_write_gen<M: HostMemory + HostOps>(
     host: &mut M,
     mapping_id: u32,
 ) {
-    let gen_ = match crate::runtime::mapper::ensure_guest_write_token(state, host, mapping_id) {
+    let seen = observe_guest_write_gen(state, host, mapping_id);
+    commit_guest_write_stamp(state, mapping_id, seen);
+}
+
+pub use crate::model::GuestWriteObservation;
+
+/// Observe a mapping's guest-write generation, registering its pages for
+/// tracking the first time. See [`GuestWriteObservation`].
+pub fn observe_guest_write_gen<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) -> GuestWriteObservation {
+    let token = crate::runtime::mapper::ensure_guest_write_token(state, host, mapping_id);
+    let gen_ = match token {
         None => {
             // The host cannot watch these pages: no dirty bitmap, or the mapping
             // has no page list to name. Counted, because a rail whose
@@ -1653,8 +1667,92 @@ pub fn stamp_guest_write_gen<M: HostMemory + HostOps>(
             }
         },
     };
+    let m = state.mappings.get(&mapping_id);
+    GuestWriteObservation {
+        token: token.unwrap_or(0),
+        map_generation: m.map_or(0, |m| m.map_generation),
+        gen_,
+        stated: m.map_or(0, |m| m.guest_stated_gen),
+    }
+}
+
+/// Observe the generation of a mapping whose token already watches its current
+/// page list, without registering anything: the read-only half for a currency
+/// check. A mapping without such a token observes 0, which commits as "no stamp".
+pub(crate) fn observe_current_guest_write_gen<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+) -> GuestWriteObservation {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return GuestWriteObservation::default();
+    };
+    if m.guest_write_token == 0 || m.guest_write_token_gen != m.map_generation {
+        return GuestWriteObservation::default();
+    }
+    GuestWriteObservation {
+        token: m.guest_write_token,
+        map_generation: m.map_generation,
+        gen_: host.guest_write_gen(m.guest_write_token).unwrap_or(0),
+        stated: m.guest_stated_gen,
+    }
+}
+
+/// Observe the generation a pass's content is about to be taken against — before
+/// its LOAD reads the guest's pages or trusts a verdict about them — and hold it
+/// on the mapping for the Store that publishes the pass. A later LOAD of a new
+/// pass replaces it: the content the next Store publishes is taken there.
+pub fn note_pass_guest_observation<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    let seen = observe_guest_write_gen(state, host, mapping_id);
     if let Some(m) = state.mappings.get_mut(&mapping_id) {
-        m.guest_write_gen_at_store = gen_;
+        m.pending_guest_write_obs = Some(seen);
+    }
+}
+
+/// The Store half of [`note_pass_guest_observation`]: stamp what the pass's
+/// LOAD observed. A pass that never took content from the guest's side (a
+/// clear, a chain with no LOAD decision) has nothing pending and is stamped as
+/// before, with a generation read now.
+pub fn commit_pass_guest_stamp<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    match state
+        .mappings
+        .get_mut(&mapping_id)
+        .and_then(|m| m.pending_guest_write_obs.take())
+    {
+        Some(seen) => {
+            crate::runtime::drain::note_store_route("t11_gw_stamp_observed");
+            commit_guest_write_stamp(state, mapping_id, seen);
+        }
+        None => {
+            crate::runtime::drain::note_store_route("t11_gw_stamp_fresh");
+            stamp_guest_write_gen(state, host, mapping_id);
+        }
+    }
+}
+
+/// Stamp a mapping with an earlier observation, once the copy it vouches for
+/// has been made. Stamps 0 — fail the currency test — when the observation was
+/// for a token or page list the mapping no longer has.
+pub fn commit_guest_write_stamp(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    seen: GuestWriteObservation,
+) {
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        let current = seen.token != 0
+            && m.guest_write_token == seen.token
+            && m.map_generation == seen.map_generation
+            && m.guest_write_token_gen == m.map_generation;
+        m.guest_write_gen_at_store = if current { seen.gen_ } else { 0 };
+        m.guest_stated_at_stamp = seen.stated;
     }
 }
 
@@ -1735,7 +1833,19 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     {
         return GuestWriteVerdict::NoStamp;
     }
-    match host.guest_write_gen(m.guest_write_token) {
+    // TEMP (lab, REIMS_VGPU_LAB_STATED_VOUCH=on): the guest has stated no write
+    // since the observation the stamp came from, so take the hypervisor's
+    // generation as of its last sync rather than waiting for this epoch's; a
+    // write the guest did not state is then seen one read late.
+    let gen_ = if crate::runtime::gather_witness::lab_stated_vouch()
+        && m.guest_stated_gen == m.guest_stated_at_stamp
+    {
+        crate::runtime::drain::note_store_route("lab_gwv_lagged");
+        host.guest_write_gen_lagged(m.guest_write_token)
+    } else {
+        host.guest_write_gen(m.guest_write_token)
+    };
+    match gen_ {
         Some(gen_) if gen_ == m.guest_write_gen_at_store => GuestWriteVerdict::Clean,
         Some(_) => GuestWriteVerdict::Wrote,
         None => GuestWriteVerdict::Unreadable,
@@ -1819,6 +1929,10 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     if gpas.is_empty() || gpas.len() != m.page_entries.len() {
         return None;
     }
+    let clear = (m.map_generation, control_layout_key(state, gpas.len()));
+    if m.control_clear == Some(clear) {
+        return Some(gpas);
+    }
     if let Some((gpa, owner)) = { first_control_page_collision(state, &gpas) } {
         crate::observe::fail(format!(
             "mapping_pages fail reason=control_page_collision mid={mapping_id} gpa={gpa:#x} owner={owner} pages={}",
@@ -1826,7 +1940,48 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
         ));
         return None;
     }
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.control_clear = Some(clear);
+    }
     Some(gpas)
+}
+
+/// Fingerprint of every region [`first_control_page_collision`] compares a
+/// surface against, folded with the surface's page count.
+///
+/// A proof that a page list aliases no control page stays true exactly while
+/// neither side moves; `map_generation` covers the list and this covers the
+/// other side. It reads the same fields the check reads, in the same order, so
+/// a region the check starts comparing must be added here too. A changed key
+/// only re-runs the check; it never skips one.
+fn control_layout_key(state: &DeviceState, pages: usize) -> u64 {
+    fn mix(h: u64, x: u64) -> u64 {
+        // splitmix64 finalizer over the running state.
+        let mut z = (h ^ x).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+    let mut h = mix(pages as u64, state.page_shift as u64);
+    h = mix(h, state.gfx.root_page as u64);
+    h = mix(h, state.gfx.fifo_base_page as u64);
+    h = mix(h, state.gfx.fifo_length as u64);
+    h = mix(h, state.iosfc.ring_base);
+    for (i, ring) in state.child_rings.iter().enumerate() {
+        if ring.page_gpas.is_empty() {
+            continue;
+        }
+        h = mix(h, ((i as u64) << 32) | ring.page_gpas.len() as u64);
+        for &gpa in &ring.page_gpas {
+            h = mix(h, gpa);
+        }
+    }
+    for (id, task) in state.tasks.live() {
+        if task.directory_pfn != 0 {
+            h = mix(h, ((id as u64) << 32) | task.directory_pfn as u64);
+        }
+    }
+    h
 }
 
 /// A render surface must never alias pages that the device knows are live
@@ -2101,7 +2256,7 @@ pub(crate) fn note_physical_page_write_footprint(
     footprint.visit_window(off, len, crate::observe::footprint::note_written_range);
 }
 
-fn note_page_write_footprint(
+pub(crate) fn note_page_write_footprint(
     page_size: u64,
     off: u64,
     len: u64,
@@ -2212,6 +2367,71 @@ impl RectStride {
     }
 }
 
+/// Copy `n` bytes into guest RAM with streaming stores where the CPU has them.
+///
+/// Landing a frame in guest pages ran at 2-3 GB/s against ~9 GB/s for the
+/// readback's own memcpy of the same bytes: the destination is cold, so every
+/// line an ordinary store touches is first read for ownership and later written
+/// back. A non-temporal store writes the line without reading it, and a frame
+/// landed in guest RAM is not read again by this process, so there is nothing
+/// for the cache to keep.
+///
+/// # Safety
+/// `src` and `dst` must be valid for `n` bytes and not overlap.
+unsafe fn write_guest_bytes(src: *const u8, dst: *mut u8, n: usize) {
+    // TEMP lab A/B: REIMS_LAB_STREAM_WRITE=off takes the plain copy.
+    static STREAM: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
+        std::env::var("REIMS_LAB_STREAM_WRITE").map_or(true, |v| v != "off")
+    });
+    #[cfg(target_arch = "x86_64")]
+    {
+        if *STREAM && n >= 4096 && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the feature was detected just above; the ranges are the
+            // caller's.
+            unsafe { stream_copy_avx2(src, dst, n) };
+            return;
+        }
+    }
+    let _ = &STREAM;
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, n) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn stream_copy_avx2(src: *const u8, dst: *mut u8, n: usize) {
+    use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_stream_si256, _mm_sfence};
+    // Ordinary stores up to the first 32-byte boundary of the destination, which
+    // is what a streaming store requires.
+    let head = (dst as usize).wrapping_neg() & 31;
+    let head = head.min(n);
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, head) };
+    let mut off = head;
+    while off + 128 <= n {
+        unsafe {
+            let a = _mm256_loadu_si256(src.add(off) as *const __m256i);
+            let b = _mm256_loadu_si256(src.add(off + 32) as *const __m256i);
+            let c = _mm256_loadu_si256(src.add(off + 64) as *const __m256i);
+            let d = _mm256_loadu_si256(src.add(off + 96) as *const __m256i);
+            _mm256_stream_si256(dst.add(off) as *mut __m256i, a);
+            _mm256_stream_si256(dst.add(off + 32) as *mut __m256i, b);
+            _mm256_stream_si256(dst.add(off + 64) as *mut __m256i, c);
+            _mm256_stream_si256(dst.add(off + 96) as *mut __m256i, d);
+        }
+        off += 128;
+    }
+    while off + 32 <= n {
+        unsafe {
+            let a = _mm256_loadu_si256(src.add(off) as *const __m256i);
+            _mm256_stream_si256(dst.add(off) as *mut __m256i, a);
+        }
+        off += 32;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(src.add(off), dst.add(off), n - off) };
+    // Streaming stores are weakly ordered: fence them before anything that
+    // publishes these bytes (a completion stamp, an interrupt) can be issued.
+    _mm_sfence();
+}
+
 pub(crate) enum RunCopy<'a> {
     Write(&'a [u8]),
     Read(&'a mut [u8]),
@@ -2274,7 +2494,7 @@ impl RunCopy<'_> {
     ) {
         match self {
             Self::Write(buf) => unsafe {
-                std::ptr::copy_nonoverlapping(
+                write_guest_bytes(
                     buf.as_ptr().add(buf_off),
                     (host_ptr as *mut u8).add(host_off),
                     n,
@@ -2599,7 +2819,7 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
         ));
         return false;
     }
-    copy_mapping_runs(
+    let ok = copy_mapping_runs(
         state,
         host,
         mapping_id,
@@ -2607,7 +2827,11 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
         RunCopy::Write(buf),
         only,
         "mapping_write",
-    )
+    );
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.guest_bytes_seq = m.guest_bytes_seq.wrapping_add(1);
+    }
+    ok
 }
 
 /// Read mapping linear `[off, off+buf.len())` via packed map_pages runs.
@@ -2663,6 +2887,40 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
         RunCopy::Read(buf),
         None,
         "mapping_read",
+    )
+}
+
+/// Read bytes the guest itself wrote since the mapping's guest-write stamp.
+///
+/// [`read_mapping_bytes`] settles the mapping's writeback debt first, because
+/// its callers want the surface's *content* and an unpaid resident is newer
+/// than the pages. This caller wants the opposite: exactly the guest's own
+/// stores, to lay over that resident. Paying the debt first would read the
+/// resident back and land it over those very pages — a whole-frame round trip
+/// that destroys what it was asked for. So the debt is left owed: after the
+/// overlay the resident holds the guest's stores too, and paying it later lands
+/// them unchanged.
+///
+/// A GPU copy into guest pages still in flight is a different obligation — the
+/// bytes would be torn — and the caller quiesces those before reading.
+pub(crate) fn read_guest_owned_bytes<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    buf: &mut [u8],
+) -> bool {
+    if buf.is_empty() {
+        return true;
+    }
+    copy_mapping_runs(
+        state,
+        host,
+        mapping_id,
+        off,
+        RunCopy::Read(buf),
+        None,
+        "mapping_read_guest_owned",
     )
 }
 

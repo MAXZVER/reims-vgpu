@@ -28,6 +28,7 @@ mod guest_scatter;
 mod host_ram;
 pub mod init_decline;
 mod linear_target_import;
+mod page_diff;
 mod pools;
 mod queue_owner;
 /// This rail's half of a serialized resource's rail state: the resident-target
@@ -1303,7 +1304,50 @@ pub fn window_present_frame(
     if let Err(DrawError::DeviceLost(_)) = out {
         device_lost::note_device_lost_seen();
     }
+    if out.is_ok() {
+        if let Some(source) = source {
+            lab_frame_dump(source);
+        }
+    }
     out
+}
+
+/// TEMP lab instrument: every few seconds, read the presented resident back and
+/// write it as a PPM under `REIMS_LAB_FRAME_DUMP` (a directory). Host-window
+/// captures go blank while the host session is locked; this does not.
+#[cfg(feature = "host-window")]
+fn lab_frame_dump(source: &WindowPresentSource) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static DIR: once_cell::sync::Lazy<Option<String>> =
+        once_cell::sync::Lazy::new(|| std::env::var("REIMS_LAB_FRAME_DUMP").ok());
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let Some(dir) = DIR.as_ref() else {
+        return;
+    };
+    let now = crate::observe::elapsed_us() / 1000;
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 4000 {
+        return;
+    }
+    LAST_MS.store(now, Ordering::Relaxed);
+    let Ok(rb) = read_target(&source.identity) else {
+        return;
+    };
+    let Some(bgra) = rb.into_bgra8() else {
+        return;
+    };
+    let (w, h) = (source.width as usize, source.height as usize);
+    if bgra.len() < w * h * 4 {
+        return;
+    }
+    let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+    out.reserve(w * h * 3);
+    for px in bgra[..w * h * 4].chunks_exact(4) {
+        out.extend_from_slice(&[px[2], px[1], px[0]]);
+    }
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let _ = std::fs::write(format!("{dir}/frame-{n:04}-{now}.ppm"), out);
 }
 
 /// Destroy the engine-owned surface while the native AppKit window still
@@ -2120,6 +2164,7 @@ fn resident_present_decision(
     // recording below: the resolution and the decision must be of one slot, for
     // the same reason the recording and the decision are one transaction.
     let resolved = pools::slot_window_resolution(slot);
+    lab_present_note(identity);
     pools.note_window_published(Some(identity));
     // Read *after* the recording, so a removal racing this transaction is either
     // ordered before it — and then this stamp is already the post-bump value and
@@ -2131,6 +2176,35 @@ fn resident_present_decision(
         epoch: pools::window_source_epoch(),
         resolved,
     })
+}
+
+/// TEMP (lab): with `REIMS_VGPU_LAB_PICK` set, log each change of the resident
+/// the window is published against (at most 4000 lines), so a `lab_pick`
+/// timeline can be read against what was actually on screen.
+fn lab_present_note(identity: &TargetIdentity) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    static ON: OnceLock<bool> = OnceLock::new();
+    static N: AtomicU32 = AtomicU32::new(0);
+    static LAST: Mutex<Option<TargetIdentity>> = Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PICK").is_ok()) {
+        return;
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_ref() == Some(identity) || N.fetch_add(1, Ordering::Relaxed) >= 4000 {
+        return;
+    }
+    *last = Some(identity.clone());
+    let key = match identity {
+        TargetIdentity::Surface { id, generation, .. } => format!("s{id}.{generation}"),
+        TargetIdentity::Texture { ref_, generation, .. } => format!("r{ref_}.{generation}"),
+        TargetIdentity::Gva { gva, generation, .. } => format!("g{gva:x}.{generation}"),
+        TargetIdentity::Anonymous { slot } => format!("a{slot}"),
+    };
+    crate::observe::fail(format!(
+        "lab_present tgt={key} t={}",
+        crate::observe::elapsed_us() / 1000
+    ));
 }
 
 /// A window publish's two outputs: when it happened, and what it resolved to.
@@ -3520,6 +3594,330 @@ impl Drop for LeasedFrame {
     }
 }
 
+/// The pages of a resident's frame that differ from what its guest pages were
+/// last written from, and their bytes. See [`page_diff`].
+pub struct ChangedPages {
+    /// Indices of changed 4 KiB pages of the packed frame, ascending.
+    pub pages: Vec<u32>,
+    /// The frame-shaped host buffer the pages were copied into, each at its own
+    /// offset (the whole frame when `full`). Valid until the next call: the
+    /// caller lands from it before returning to the drain.
+    pub frame_ptr: *const u8,
+    /// Every page was taken: the shadow was new or out of date.
+    pub full: bool,
+    /// Packed frame size in bytes (`width * height * 4`).
+    pub frame_bytes: u64,
+}
+
+/// After the caller landed a [`read_target_changed_pages`] answer: the key the
+/// shadow now stands for (the mapping's `guest_bytes_seq` moved with the landing).
+pub fn page_diff_set_key(mapping_id: u32, key: (u32, u32, u32, u64)) {
+    let mut st = page_diff::STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = st.as_mut().and_then(|s| s.shadows.get_mut(&mapping_id)) {
+        s.key = key;
+    }
+}
+
+/// Forget a mapping's shadow (its landing failed; the pages hold neither frame).
+pub fn page_diff_forget(mapping_id: u32) {
+    let mut st = page_diff::STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = st.as_mut().and_then(|s| s.shadows.get_mut(&mapping_id)) {
+        s.key = (u32::MAX, 0, 0, u64::MAX);
+    }
+}
+
+/// Record one command buffer on the engine's own entry machinery, submit it and
+/// wait for it, exactly as the host-delivered readback does.
+unsafe fn page_diff_submit(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &EngineCounters,
+    record: impl FnOnce(ash::vk::CommandBuffer),
+) -> Result<(), DrawError> {
+    let ops = target_readback_ops();
+    let appended = pools.batch_open_recording();
+    let (cb, fence) = match appended {
+        Some(pair) => pair,
+        None => pools.begin_entry(ctx, counters)?,
+    };
+    if appended.is_none() {
+        unsafe {
+            pools.begin_slot_recording(
+                ctx,
+                cb,
+                gpu_span::Kind::Readback,
+                ops.reset_cb,
+                ops.begin_cb,
+            )?
+        };
+    }
+    unsafe { pools.close_open_pass(&ctx.device, cb) };
+    record(cb);
+    if appended.is_some() {
+        pools.batch_flush(ctx, counters)?;
+    } else {
+        unsafe { pools.gpu_span_seal_current(ctx, cb) };
+        ctx.device
+            .end_command_buffer(cb)
+            .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
+        let cbs = [cb];
+        ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
+            .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
+        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        pools.finish_entry_async(&ctx.device, sealed);
+    }
+    pools.wait_entry_fence(ctx, counters, fence)?;
+    Ok(())
+}
+
+/// Read back only the pages of `identity`'s frame that changed since the frame
+/// last written for `mapping_id` under `key`, updating the shadow to this frame.
+///
+/// `key` is `(map_generation, width, height, guest_bytes_seq)` as the caller
+/// will leave it after landing the answer; a shadow under a different key is
+/// replaced and the whole frame is returned. `Ok(None)` is a routing answer:
+/// the resident is not four-byte scanout colour, or the kernel is unavailable,
+/// and the caller takes the whole-frame readback.
+pub fn read_target_changed_pages(
+    identity: &TargetIdentity,
+    mapping_id: u32,
+    key: (u32, u32, u32, u64),
+    force: &[u32],
+) -> Result<Option<ChangedPages>, DrawError> {
+    use ash::vk;
+    use reims_vgpu_vulkan::memory::MemoryClass;
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let (snap, layout) = readback_snapshot(pools, identity)?;
+    if !layout.is_four_byte_color() || !snap.bgra() || snap.guest_backing.is_some() {
+        return Ok(None);
+    }
+    let (w, h) = (snap.width, snap.height);
+    let frame_bytes = u64::from(w) * u64::from(h) * 4;
+    let pages = frame_bytes.div_ceil(page_diff::PAGE_BYTES);
+    let padded = pages * page_diff::PAGE_BYTES;
+
+    let mut st_guard = page_diff::STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let device_handle = ash::vk::Handle::as_raw(ctx.device.handle());
+    if st_guard.as_ref().is_none_or(|s| s.device != device_handle) {
+        // A new device: the old handles are dead. Leak them rather than destroy
+        // objects of a device that no longer exists.
+        if let Some(old) = st_guard.take() {
+            std::mem::forget(old);
+        }
+        *st_guard = Some(page_diff::PageDiffState {
+            device: device_handle,
+            ..Default::default()
+        });
+    }
+    let st = st_guard.as_mut().expect("just set");
+    if !unsafe { st.ensure_pipeline(ctx) } {
+        return Ok(None);
+    }
+    unsafe {
+        page_diff::PageDiffState::ensure(
+            ctx,
+            &mut st.cur,
+            padded,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryClass::DeviceLocal,
+        )?;
+        page_diff::PageDiffState::ensure(
+            ctx,
+            &mut st.flags,
+            pages * 4,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryClass::Readback,
+        )?;
+        page_diff::PageDiffState::ensure(
+            ctx,
+            &mut st.out,
+            padded,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryClass::Readback,
+        )?;
+    }
+    let fresh = unsafe { st.ensure_shadow(ctx, mapping_id, key, padded)? };
+    let read_access = pools::ResidentAccess::transfer_read(false);
+    let (cur, flags, out) = (
+        st.cur.as_ref().expect("ensured"),
+        st.flags.as_ref().expect("ensured"),
+        st.out.as_ref().expect("ensured"),
+    );
+    let prev = &st.shadows.get(&mapping_id).expect("ensured").prev;
+    let pipe = st.pipeline.as_ref().expect("ensured");
+    if !fresh {
+        unsafe { pipe.write_set(&ctx.device, cur, prev, flags, padded, pages) };
+    }
+    let (cur_b, prev_b, flags_b, out_b) = (cur.buffer, prev.buffer, flags.buffer, out.buffer);
+    let (pl_layout, pl, set) = (pipe.layout, pipe.pipeline, pipe.set);
+    unsafe {
+        page_diff_submit(ctx, pools, counters, |cb| {
+            let d = &ctx.device;
+            let to_src = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(RESIDENT_READ_SRC_ACCESS)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(snap.layout)
+                .new_layout(read_access.layout())
+                .image(snap.image)
+                .subresource_range(color_subresource_range())];
+            d.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                feedback_transition_dependency(snap.layout),
+                &[],
+                &[],
+                &to_src,
+            );
+            let region = [vk::BufferImageCopy::default()
+                .image_subresource(color_subresource_layers())
+                .image_extent(vk::Extent3D {
+                    width: w,
+                    height: h,
+                    depth: 1,
+                })];
+            d.cmd_copy_image_to_buffer(cb, snap.image, read_access.layout(), cur_b, &region);
+            let after_copy = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::TRANSFER_READ
+                        | vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::SHADER_WRITE,
+                )];
+            if fresh {
+                // The whole frame goes to the guest, and the shadow becomes it.
+                d.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &after_copy,
+                    &[],
+                    &[],
+                );
+                let whole = [vk::BufferCopy::default().size(frame_bytes)];
+                d.cmd_copy_buffer(cb, cur_b, prev_b, &whole);
+                d.cmd_copy_buffer(cb, cur_b, out_b, &whole);
+            } else {
+                d.cmd_fill_buffer(cb, flags_b, 0, pages * 4, 0);
+                d.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &after_copy,
+                    &[],
+                    &[],
+                );
+                d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pl);
+                d.cmd_bind_descriptor_sets(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pl_layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                let push = [pages as u32, page_diff::WORDS_PER_PAGE];
+                let bytes: &[u8] = std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 8);
+                d.cmd_push_constants(cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+                d.cmd_dispatch(cb, pages as u32, 1, 1);
+            }
+            let to_host = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::TRANSFER_READ)];
+            d.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &to_host,
+                &[],
+                &[],
+            );
+        })?;
+    }
+    pools.registry_note_access(identity, read_access);
+
+    let changed: Vec<u32> = if fresh {
+        (0..pages as u32).collect()
+    } else {
+        unsafe { flags.invalidate(&ctx.device)? };
+        let f = unsafe { std::slice::from_raw_parts(flags.mapped.cast::<u32>(), pages as usize) };
+        // Pages the caller must land whatever the diff says (the guest CPU
+        // wrote them since the copy was taken). Unflagged, their `prev` already
+        // equals the frame, so landing them from `cur` keeps the copy true.
+        (0..pages as u32)
+            .filter(|&p| f[p as usize] != 0 || force.binary_search(&p).is_ok())
+            .collect()
+    };
+    if !fresh && !changed.is_empty() {
+        // Second trip: only the changed pages cross to host memory, packed.
+        let mut regions: Vec<vk::BufferCopy> = Vec::new();
+        let mut i = 0usize;
+        while i < changed.len() {
+            let start = changed[i];
+            let mut end = start + 1;
+            while i + 1 < changed.len() && changed[i + 1] == end {
+                end += 1;
+                i += 1;
+            }
+            let len = u64::from(end - start) * page_diff::PAGE_BYTES;
+            let at = u64::from(start) * page_diff::PAGE_BYTES;
+            // Same offset on both sides: `out` is frame-shaped, so the caller
+            // lands straight out of it with a run list and no repacking.
+            regions.push(
+                vk::BufferCopy::default()
+                    .src_offset(at)
+                    .dst_offset(at)
+                    .size(len),
+            );
+            i += 1;
+        }
+        unsafe {
+            page_diff_submit(ctx, pools, counters, |cb| {
+                let d = &ctx.device;
+                d.cmd_copy_buffer(cb, cur_b, out_b, &regions);
+                let to_host = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                d.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &to_host,
+                    &[],
+                    &[],
+                );
+            })?;
+        }
+    }
+    unsafe { out.invalidate(&ctx.device)? };
+    let n = if fresh {
+        frame_bytes
+    } else {
+        changed.len() as u64 * page_diff::PAGE_BYTES
+    };
+    counters.note_target_read(n, TargetReadDelivery::Host);
+    Ok(Some(ChangedPages {
+        pages: changed,
+        frame_ptr: out.mapped,
+        full: fresh,
+        frame_bytes,
+    }))
+}
+
 /// Read a resident target back and keep the bytes in the staging buffer.
 ///
 /// The borrowing form of [`read_target`], for a caller that consumes the frame
@@ -3686,6 +4084,7 @@ impl GuestPageTarget {
     fn geometry(&self) -> reims_vgpu_paging::regions::WindowGeometry {
         reims_vgpu_paging::regions::WindowGeometry {
             pitch_bytes: self.pitch_bytes(),
+            bytes_per_texel: self.bytes_per_texel(),
             width_texels: self.width,
             height_texels: self.height,
         }
@@ -3705,6 +4104,22 @@ impl GuestPageTarget {
     /// rectangle path, which does.
     fn rows_are_dense(&self) -> bool {
         self.pitch_bytes() == u64::from(self.width) * self.bytes_per_texel()
+    }
+
+    /// `Some((need, have))` when the texels this target describes do not fit
+    /// the guest pages its runs cover.
+    ///
+    /// The relation `plan_guest_copy` is documented to leave to its caller:
+    /// `references_for_runs` clips a window to the pages it was given and
+    /// never refuses a short one, so a target can name more texels than it has
+    /// pages for. The render rail checks this before planning
+    /// (`GuestWriteDecline::WindowTooSmall`); the compute rail called the
+    /// planner directly and did not. Neutral in its answer so a caller outside
+    /// the engine can name its own refusal.
+    pub(crate) fn window_shortfall(&self) -> Option<(u64, u64)> {
+        let need = self.extent_end();
+        let have = self.window_bytes();
+        (need > have).then_some((need, have))
     }
 }
 
@@ -3868,6 +4283,438 @@ pub fn copy_target_to_guest_pages(
     // image while this function is running, only after it returns.
     record_guest_write_debt(pools, GuestWriteSource::ResidentTarget(identity), pages);
     Ok(())
+}
+
+/// Guest bytes to lay over a resident, in the resident's own window terms.
+///
+/// Built by the runtime, which alone knows the mapping's page list and which of
+/// its pages the guest wrote. Each span is a contiguous stretch of the pixel
+/// window — `[window_start, window_end)`, byte offsets from the window's first
+/// texel — staged back to back in `bytes` starting at `staged_offset`.
+pub struct ResidentOverlay<'a> {
+    pub bytes: &'a [u8],
+    pub spans: &'a [ResidentOverlaySpan],
+    /// Guest row pitch in bytes.
+    pub pitch_bytes: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One contiguous stretch of a [`ResidentOverlay`].
+#[derive(Clone, Copy, Debug)]
+pub struct ResidentOverlaySpan {
+    pub window_start: u64,
+    pub window_end: u64,
+    pub staged_offset: u64,
+}
+
+/// Why [`overlay_guest_bytes_onto_resident`] left the resident alone.
+///
+/// Every arm is a routing answer: nothing was recorded, and the caller still
+/// has its own way to reconcile the two halves of the surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayDecline {
+    /// The resident is not a single-sample image with ready content.
+    NotReady,
+    /// The resident's extent is not the window's.
+    GeometryMoved,
+    /// The resident's stored texels are not four-byte scanout order, so guest
+    /// bytes copied in unconverted would land swapped or misaligned.
+    NotScanoutOrder,
+    /// The resident *is* the guest allocation; there is no second copy to fix.
+    GuestBacked,
+    /// A span is not whole texels inside the window, or the staged bytes do not
+    /// cover it.
+    SpanOutsideWindow,
+}
+
+impl OverlayDecline {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NotReady => "resident_overlay_not_ready",
+            Self::GeometryMoved => "resident_overlay_geometry_moved",
+            Self::NotScanoutOrder => "resident_overlay_not_scanout_order",
+            Self::GuestBacked => "resident_overlay_guest_backed",
+            Self::SpanOutsideWindow => "resident_overlay_span_outside_window",
+        }
+    }
+}
+
+/// Lay the guest's own stores over a live resident, on the queue, and leave the
+/// resident as the surface.
+///
+/// # What this replaces
+///
+/// The sampled ladder's answer to "the guest CPU wrote pages under a live
+/// resident" was to read the whole resident back, wait for it, scatter it into
+/// every page the guest did *not* write, and then upload the whole surface again
+/// from those pages for the draw. On a Windows/WHPX Safari animation that ran
+/// ~100 times a second on a 5K-wide composite: 234 ms/s of fence waits, 1.2 GB/s
+/// landed in guest RAM and 2.35 GB/s staged back up, with the GPU busy 29 % of
+/// the time.
+///
+/// The merge it produced is page-granular: guest-written pages come from guest
+/// RAM, every other page from the resident. Copying the guest-written pages into
+/// the resident gives the same texels without either whole-frame pass, and
+/// without the wait.
+///
+/// # Ordering
+///
+/// Appended to the open batch when there is one — the draws already recorded
+/// there may have produced the resident, and the draw about to be recorded is
+/// the one that samples it — otherwise its own entry, submitted without a wait.
+/// The trailing barrier makes the transfer write visible to every later command
+/// in submission order and returns the image to the layout the registry already
+/// records, so the registry's access needs no change. The staging slot travels
+/// with the entry's cleanup and is recycled when its fence retires.
+pub fn overlay_guest_bytes_onto_resident(
+    identity: &TargetIdentity,
+    overlay: &ResidentOverlay<'_>,
+) -> Result<Result<u32, OverlayDecline>, DrawError> {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let Ok(snap) = resident_read_snapshot(pools, identity) else {
+        return Ok(Err(OverlayDecline::NotReady));
+    };
+    if snap.guest_backing.is_some() {
+        return Ok(Err(OverlayDecline::GuestBacked));
+    }
+    // The copy returns the image to the layout the registry records, which has to
+    // be one a barrier may name as its destination and one that needs no
+    // feedback-loop dependency to leave and re-enter.
+    if matches!(
+        snap.layout,
+        ash::vk::ImageLayout::UNDEFINED
+            | ash::vk::ImageLayout::PREINITIALIZED
+            | ash::vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+    ) {
+        return Ok(Err(OverlayDecline::NotReady));
+    }
+    if snap.width != overlay.width || snap.height != overlay.height {
+        return Ok(Err(OverlayDecline::GeometryMoved));
+    }
+    const BPT: u64 = 4;
+    let four_byte = crate::backend::vulkan::translate::pixel::bytes_per_texel(snap.format)
+        .is_some_and(|b| u64::from(b) == BPT);
+    if !snap.bgra() || !four_byte {
+        return Ok(Err(OverlayDecline::NotScanoutOrder));
+    }
+    let geom = reims_vgpu_paging::regions::WindowGeometry {
+        pitch_bytes: overlay.pitch_bytes,
+        bytes_per_texel: BPT,
+        width_texels: overlay.width,
+        height_texels: overlay.height,
+    };
+    if overlay.pitch_bytes % BPT != 0 || overlay.pitch_bytes < u64::from(overlay.width) * BPT {
+        return Ok(Err(OverlayDecline::SpanOutsideWindow));
+    }
+    let row_length_texels = (overlay.pitch_bytes / BPT) as u32;
+    let mut regions = Vec::new();
+    for span in overlay.spans {
+        let len = span.window_end.saturating_sub(span.window_start);
+        let staged_end = span.staged_offset.checked_add(len);
+        if span.window_start % BPT != 0
+            || span.window_end % BPT != 0
+            || span.staged_offset % BPT != 0
+            || staged_end.is_none_or(|end| end > overlay.bytes.len() as u64)
+        {
+            return Ok(Err(OverlayDecline::SpanOutsideWindow));
+        }
+        for r in reims_vgpu_paging::regions::plan_regions(&geom, span.window_start, span.window_end)
+        {
+            regions.push(
+                ash::vk::BufferImageCopy::default()
+                    .buffer_offset(span.staged_offset + (r.window_offset - span.window_start))
+                    .buffer_row_length(row_length_texels)
+                    .buffer_image_height(0)
+                    .image_subresource(color_subresource_layers())
+                    .image_offset(ash::vk::Offset3D {
+                        x: r.x as i32,
+                        y: r.y as i32,
+                        z: 0,
+                    })
+                    .image_extent(ash::vk::Extent3D {
+                        width: r.width,
+                        height: r.height,
+                        depth: 1,
+                    }),
+            );
+        }
+    }
+    if regions.is_empty() {
+        // Every span fell in row padding or past the last texel: nothing of the
+        // resident's differs from what the guest wrote.
+        return Ok(Ok(0));
+    }
+    unsafe {
+        let staging = pools.acquire_staging(ctx, overlay.bytes.len() as u64, counters)?;
+        pools.write_staging(ctx, &staging, overlay.bytes)?;
+        let appended = pools.batch_open_recording();
+        let (cb, fence) = match appended {
+            Some(pair) => pair,
+            None => {
+                let pair = pools.begin_entry(ctx, counters)?;
+                pools.begin_slot_recording(
+                    ctx,
+                    pair.0,
+                    gpu_span::Kind::Draw,
+                    VkOp::ResidentOverlayResetCb,
+                    VkOp::ResidentOverlayBeginCb,
+                )?;
+                pair
+            }
+        };
+        pools.close_open_pass(&ctx.device, cb);
+        let to_transfer = [ash::vk::ImageMemoryBarrier::default()
+            .src_access_mask(RESIDENT_READ_SRC_ACCESS)
+            .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(snap.layout)
+            .new_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(snap.image)
+            .subresource_range(color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::ALL_COMMANDS,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            feedback_transition_dependency(snap.layout),
+            &[],
+            &[],
+            &to_transfer,
+        );
+        ctx.device.cmd_copy_buffer_to_image(
+            cb,
+            staging.buffer,
+            snap.image,
+            ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
+        );
+        let back = [ash::vk::ImageMemoryBarrier::default()
+            .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(RESIDENT_READ_SRC_ACCESS | ash::vk::AccessFlags::TRANSFER_READ)
+            .old_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(snap.layout)
+            .image(snap.image)
+            .subresource_range(color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::PipelineStageFlags::ALL_COMMANDS,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &back,
+        );
+        if appended.is_none() {
+            pools.gpu_span_seal_current(ctx, cb);
+            ctx.device
+                .end_command_buffer(cb)
+                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentOverlayEndCb, e)))?;
+            let cbs = [cb];
+            ctx.submit_guest_work(&cbs, fence)
+                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentOverlaySubmit, e)))?;
+            let sealed = pools.seal_entry(Vec::new(), Vec::new());
+            pools.finish_entry_async(&ctx.device, sealed);
+        }
+    }
+    Ok(Ok(regions.len() as u32))
+}
+
+/// Copy the same window spans from one resident into another, on the queue.
+///
+/// The GPU replay of a guest CPU copy between two presented framebuffers: the
+/// guest filled `dst`'s pages by copying from `src`'s, and `src`'s pages were
+/// never written back, so the bytes it copied are stale while `src`'s resident
+/// holds the frame. Copying resident to resident lands what the guest meant.
+///
+/// Spans are `[window_start, window_end)` byte offsets in the shared window
+/// geometry (both surfaces have the same extent and pitch); `staged_offset` is
+/// unused. Ordering, layouts and submission follow
+/// [`overlay_guest_bytes_onto_resident`]: appended to the open batch when there
+/// is one, both images returned to the layouts the registry records.
+pub fn copy_resident_spans(
+    src: &TargetIdentity,
+    dst: &TargetIdentity,
+    spans: &[ResidentOverlaySpan],
+    pitch_bytes: u64,
+    width: u32,
+    height: u32,
+) -> Result<Result<u32, OverlayDecline>, DrawError> {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let (Ok(s), Ok(d)) = (
+        resident_read_snapshot(pools, src),
+        resident_read_snapshot(pools, dst),
+    ) else {
+        return Ok(Err(OverlayDecline::NotReady));
+    };
+    if s.guest_backing.is_some() || d.guest_backing.is_some() {
+        return Ok(Err(OverlayDecline::GuestBacked));
+    }
+    if s.image == d.image {
+        return Ok(Err(OverlayDecline::NotReady));
+    }
+    let bad_layout = |l: ash::vk::ImageLayout| {
+        matches!(
+            l,
+            ash::vk::ImageLayout::UNDEFINED
+                | ash::vk::ImageLayout::PREINITIALIZED
+                | ash::vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+        )
+    };
+    if bad_layout(s.layout) || bad_layout(d.layout) {
+        return Ok(Err(OverlayDecline::NotReady));
+    }
+    if s.width != width || s.height != height || d.width != width || d.height != height {
+        return Ok(Err(OverlayDecline::GeometryMoved));
+    }
+    const BPT: u64 = 4;
+    let four_byte = |f| {
+        crate::backend::vulkan::translate::pixel::bytes_per_texel(f)
+            .is_some_and(|b| u64::from(b) == BPT)
+    };
+    if !s.bgra() || !d.bgra() || !four_byte(s.format) || !four_byte(d.format) {
+        return Ok(Err(OverlayDecline::NotScanoutOrder));
+    }
+    if pitch_bytes % BPT != 0 || pitch_bytes < u64::from(width) * BPT {
+        return Ok(Err(OverlayDecline::SpanOutsideWindow));
+    }
+    let geom = reims_vgpu_paging::regions::WindowGeometry {
+        pitch_bytes,
+        bytes_per_texel: BPT,
+        width_texels: width,
+        height_texels: height,
+    };
+    let mut regions = Vec::new();
+    for span in spans {
+        if span.window_start % BPT != 0 || span.window_end % BPT != 0 {
+            return Ok(Err(OverlayDecline::SpanOutsideWindow));
+        }
+        for r in reims_vgpu_paging::regions::plan_regions(&geom, span.window_start, span.window_end)
+        {
+            let at = ash::vk::Offset3D {
+                x: r.x as i32,
+                y: r.y as i32,
+                z: 0,
+            };
+            regions.push(
+                ash::vk::ImageCopy::default()
+                    .src_subresource(color_subresource_layers())
+                    .src_offset(at)
+                    .dst_subresource(color_subresource_layers())
+                    .dst_offset(at)
+                    .extent(ash::vk::Extent3D {
+                        width: r.width,
+                        height: r.height,
+                        depth: 1,
+                    }),
+            );
+        }
+    }
+    if regions.is_empty() {
+        return Ok(Ok(0));
+    }
+    unsafe {
+        let appended = pools.batch_open_recording();
+        let (cb, fence) = match appended {
+            Some(pair) => pair,
+            None => {
+                let pair = pools.begin_entry(ctx, counters)?;
+                pools.begin_slot_recording(
+                    ctx,
+                    pair.0,
+                    gpu_span::Kind::Draw,
+                    VkOp::ResidentOverlayResetCb,
+                    VkOp::ResidentOverlayBeginCb,
+                )?;
+                pair
+            }
+        };
+        pools.close_open_pass(&ctx.device, cb);
+        let to_transfer = [
+            ash::vk::ImageMemoryBarrier::default()
+                .src_access_mask(RESIDENT_READ_SRC_ACCESS)
+                .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
+                .old_layout(s.layout)
+                .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(s.image)
+                .subresource_range(color_subresource_range()),
+            ash::vk::ImageMemoryBarrier::default()
+                .src_access_mask(RESIDENT_READ_SRC_ACCESS)
+                .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(d.layout)
+                .new_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .image(d.image)
+                .subresource_range(color_subresource_range()),
+        ];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::ALL_COMMANDS,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            feedback_transition_dependency(s.layout) | feedback_transition_dependency(d.layout),
+            &[],
+            &[],
+            &to_transfer,
+        );
+        ctx.device.cmd_copy_image(
+            cb,
+            s.image,
+            ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            d.image,
+            ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
+        );
+        let back = [
+            ash::vk::ImageMemoryBarrier::default()
+                .src_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(RESIDENT_READ_SRC_ACCESS)
+                .old_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(s.layout)
+                .image(s.image)
+                .subresource_range(color_subresource_range()),
+            ash::vk::ImageMemoryBarrier::default()
+                .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(RESIDENT_READ_SRC_ACCESS | ash::vk::AccessFlags::TRANSFER_READ)
+                .old_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(d.layout)
+                .image(d.image)
+                .subresource_range(color_subresource_range()),
+        ];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::PipelineStageFlags::ALL_COMMANDS,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &back,
+        );
+        if appended.is_none() {
+            pools.gpu_span_seal_current(ctx, cb);
+            ctx.device
+                .end_command_buffer(cb)
+                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentOverlayEndCb, e)))?;
+            let cbs = [cb];
+            ctx.submit_guest_work(&cbs, fence)
+                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentOverlaySubmit, e)))?;
+            let sealed = pools.seal_entry(Vec::new(), Vec::new());
+            pools.finish_entry_async(&ctx.device, sealed);
+        }
+    }
+    Ok(Ok(regions.len() as u32))
 }
 
 /// Build the copy plan that lands one frame in a guest-page destination.
@@ -4048,6 +4895,17 @@ pub(super) enum GuestWriteSource<'a> {
     /// through a residency registry, which is popped out of the ring's live set
     /// at acquire time and is therefore reclaimable while the fence still runs.
     RingEntry,
+}
+
+/// Arm the write debt and its page ledger without a device or a ledger entry,
+/// for a test of a caller that must settle before handing pages back. With no
+/// device context the settle has nothing to wait on and clears the flag, which
+/// is exactly the observable a caller's test needs: the flag going down proves
+/// the caller asked.
+#[cfg(test)]
+pub(crate) fn arm_guest_write_debt_for_tests(pages: &[u64]) {
+    arm_guest_write_pages(pages);
+    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
 }
 
 pub(super) fn record_guest_write_debt(
@@ -4651,20 +5509,79 @@ unsafe fn plan_guest_copies(
 ) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)>, DrawError> {
     use host_ram::GuestWriteDecline;
     let geom = dst.geometry();
+    let invalid = || DrawError::GuestPageWrite(GuestWriteDecline::InvalidCopyRegion);
+    let bpt = crate::backend::vulkan::translate::pixel::bytes_per_texel(dst.format)
+        .map(u64::from)
+        .ok_or_else(invalid)?;
+    if bpt == 0
+        || geom.bytes_per_texel != bpt
+        || u64::from(dst.row_length_texels).checked_mul(bpt) != Some(geom.pitch_bytes)
+        || dst.row_length_texels < dst.width
+    {
+        return Err(invalid());
+    }
     let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)> = Vec::new();
     for run in &dst.runs {
         let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
             .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
         // `head` is what the granularity rounding added in front of the byte the
         // caller asked for, so the run's first requested byte sits here.
-        let base = bound.offset + bound.head;
+        let base = bound.offset.checked_add(bound.head).ok_or_else(invalid)?;
         let start = run.window_offset;
-        let end = start.saturating_add(run.guest.requested());
+        let end = start
+            .checked_add(run.guest.requested())
+            .ok_or_else(invalid)?;
+        let run_end = base
+            .checked_add(run.guest.requested())
+            .ok_or_else(invalid)?;
+        let bound_end = bound.offset.checked_add(bound.len).ok_or_else(invalid)?;
+        let allocation_size_bytes = run.guest.import().len();
+        if start % bpt != 0
+            || end % bpt != 0
+            || base % bpt != 0
+            || run_end > bound_end
+            || bound_end > allocation_size_bytes
+        {
+            return Err(invalid());
+        }
         for r in reims_vgpu_paging::regions::plan_regions(&geom, start, end) {
+            let offset = r
+                .window_offset
+                .checked_sub(start)
+                .and_then(|delta| base.checked_add(delta))
+                .ok_or_else(invalid)?;
+            let span = u64::from(r.height)
+                .checked_sub(1)
+                .and_then(|rows| rows.checked_mul(geom.pitch_bytes))
+                .and_then(|rows| {
+                    u64::from(r.width)
+                        .checked_mul(bpt)
+                        .and_then(|width| rows.checked_add(width))
+                })
+                .ok_or_else(invalid)?;
+            let planned_end = offset.checked_add(span).ok_or_else(invalid)?;
+            let expected = u64::from(r.y)
+                .checked_mul(geom.pitch_bytes)
+                .and_then(|row| {
+                    u64::from(r.x)
+                        .checked_mul(bpt)
+                        .and_then(|x| row.checked_add(x))
+                });
+            if r.width == 0
+                || r.height == 0
+                || offset % bpt != 0
+                || expected != Some(r.window_offset)
+                || u64::from(r.x) + u64::from(r.width) > u64::from(dst.width)
+                || u64::from(r.y) + u64::from(r.height) > u64::from(dst.height)
+                || planned_end > run_end
+                || planned_end > allocation_size_bytes
+            {
+                return Err(invalid());
+            }
             let region = ash::vk::BufferImageCopy::default()
                 // The rectangle's own offset is in window bytes; `- start`
                 // re-bases it onto this run, which is what `base` names.
-                .buffer_offset(base + (r.window_offset - start))
+                .buffer_offset(offset)
                 // In texels. This is the buffer-side row stride, and it is what
                 // makes a merged multi-row rectangle name consecutive guest
                 // rows — valid because within one run the guest bytes are
@@ -5575,12 +6492,25 @@ pub fn maintain_resources(now_ms: u64) {
         ref mut owner,
         ref mut pools,
         ref counters,
+        #[cfg(feature = "host-window")]
+        ref mut window_presenter,
         ..
     } = &mut *guard;
     let Some(ctx) = owner.ctx.as_ref() else {
         return;
     };
-    let result = unsafe { pools.advance_graveyard_maintenance(ctx, counters) };
+    // Retire finished window presents first: the graveyard release below
+    // reads the in-flight count they hold, and nothing else lowers it while
+    // the window keeps presenting (see `WindowPresenter::retire_finished`).
+    #[cfg(feature = "host-window")]
+    let result = match window_presenter.as_mut() {
+        Some(presenter) => unsafe { presenter.retire_finished(ctx) },
+        None => Ok(()),
+    };
+    #[cfg(not(feature = "host-window"))]
+    let result: Result<(), DrawError> = Ok(());
+    let result =
+        result.and_then(|()| unsafe { pools.advance_graveyard_maintenance(ctx, counters) });
     if let Err(error) = result {
         if matches!(error, DrawError::DeviceLost(_)) {
             device_lost::note_device_lost_seen();
@@ -6655,4 +7585,26 @@ mod run_table_arena_tests {
         assert!(places.is_empty());
         assert_eq!(packed.len(), 4);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn rgba32_destination_geometry_preserves_format_texel_size() {
+    let dst = GuestPageTarget {
+        runs: Vec::new(),
+        row_length_texels: 1536,
+        width: 1504,
+        height: 6016,
+        format: ash::vk::Format::R32G32B32A32_UINT,
+        shared_backing: None,
+    };
+    let geom = dst.geometry();
+    assert_eq!(geom.bytes_per_texel, 16);
+    assert_eq!(geom.pitch_bytes, 24576);
+    assert_eq!(geom.extent_end(), dst.extent_end());
+    assert_eq!(geom.extent_end(), 147848704);
+    let regions = reims_vgpu_paging::regions::plan_regions(&geom, 0, 4096);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(regions[0].width, 256);
+    assert_eq!(u64::from(regions[0].width) * dst.bytes_per_texel(), 4096);
 }

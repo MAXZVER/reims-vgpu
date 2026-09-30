@@ -41,6 +41,20 @@ pub(super) fn neutral_sampled_image_bindings(spirv: &[u32], bound: &[u32]) -> Ve
         .collect()
 }
 
+/// Separate samplers the kernel statically uses that nothing in `supplied`
+/// covers — the bindings [`NeutralSamplerUnreflected`] backstops with the
+/// default sampler. Only a separate `OpTypeSampler` qualifies: a combined
+/// image-sampler is a different descriptor type.
+pub(super) fn unreflected_sampler_bindings(spirv: &[u32], supplied: &[u32]) -> Vec<u32> {
+    crate::runtime::spirv_bind::separate_sampler_bindings(spirv)
+        .into_iter()
+        .filter(|binding| {
+            !supplied.contains(binding)
+                && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding).is_violation()
+        })
+        .collect()
+}
+
 /// Side length of the texture substituted for a sampled image the kernel
 /// samples and the guest never bound.
 ///
@@ -79,6 +93,30 @@ impl crate::observe::Decline for NeutralSampledImage {
             ("width", self.width.to_string()),
             ("height", self.height.to_string()),
         ]
+    }
+}
+
+/// A sampler the kernel statically uses that neither the guest nor the
+/// translator's reflection supplied, given the normalized default sampler so
+/// the pipeline layout can describe it.
+///
+/// The same repair [`NeutralSampledImage`] is for a texture, and on the fail
+/// channel for the same reason: the sample runs with a filter and address mode
+/// this device chose. macOS 26 reaches it from kernels that bind a guest
+/// sampler at index 0 and read a second one at binding 161 that reflection
+/// never names (48 dispatches a login, every one refused as
+/// `used_binding_absent_from_layout` before this).
+pub(super) struct NeutralSamplerUnreflected {
+    binding: u32,
+}
+
+impl crate::observe::Decline for NeutralSamplerUnreflected {
+    fn slug(&self) -> &'static str {
+        "compute_neutral_sampler_unreflected"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("binding", self.binding.to_string())]
     }
 }
 
@@ -158,6 +196,22 @@ pub(super) fn direct_destination<M: HostMemory + HostOps>(
         Some(pages),
     ) {
         Ok(licence) => {
+            if let Some((need, have)) = licence.target.window_shortfall() {
+                if crate::observe::first_sight(
+                    "compute_dst_window_too_small",
+                    u64::from(tex.binding),
+                ) {
+                    crate::observe::fail(format!(
+                        "compute_dst_window_too_small bind={} gva={gva:#x} dims={width}x{height} \
+                         fmt={pixel_format:#x} need={need} have={have} (the storage image names \
+                         more texels than its guest pages hold; a direct landing would write \
+                         past them, so it takes the pooled readback)",
+                        tex.binding
+                    ));
+                }
+                crate::runtime::drain::note_store_route("compute_dst_host_window_too_small");
+                return ComputeImageDestination::Host;
+            }
             crate::runtime::drain::note_store_route("compute_dst_guest_pages");
             // A split of the line above, so the two add up to it. Worth counting
             // separately because the resident half is the half that needs the
@@ -248,6 +302,22 @@ pub(super) fn mapper_ref_texture_destination<M: HostMemory + HostOps>(
         },
     ) {
         Ok(licence) => {
+            if let Some((need, have)) = licence.target.window_shortfall() {
+                if crate::observe::first_sight(
+                    "compute_dst_window_too_small",
+                    u64::from(tex.binding),
+                ) {
+                    crate::observe::fail(format!(
+                        "compute_dst_window_too_small bind={} mid={mapping_id} dims={width}x{height} \
+                         need={need} have={have} (the storage image names more texels than its \
+                         guest pages hold; a direct landing would write past them, so it takes \
+                         the pooled readback)",
+                        tex.binding
+                    ));
+                }
+                crate::runtime::drain::note_store_route("compute_dst_host_window_too_small");
+                return ComputeImageDestination::Host;
+            }
             crate::runtime::drain::note_store_route("compute_dst_guest_pages");
             crate::runtime::drain::note_store_route(if tex.rail.residency.is_some() {
                 "compute_dst_guest_pages_mapper_ref_texture_resident"
@@ -883,6 +953,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         );
                     log_storage_image_access(acc.pipeline_ref, binding, storage_access, bytes);
                 }
+                lab_compute_tex(state, host, task_id, acc.pipeline_ref, binding, t.texture_ref, is_storage, s.width, s.height, s.pixel_format, &s.bytes);
                 staged_tex.push(s);
             }
             Err(e) => {
@@ -1019,6 +1090,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     }) {
         crate::runtime::spirv_bind::ensure_storage_write_without_format_capability(&mut spirv);
     }
+    lab_compute_spv(task_id, acc.pipeline_ref, &storage_formats, &spirv);
     // Compute-side analog of the render resident gates: a deferred storage
     // writeback leaves guest-visible bytes GPU-resident-only until a flush
     // choke point lands them, so it requires the device's
@@ -1276,6 +1348,59 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     ),
                 );
             }
+        }
+    }
+
+    // Backstop for a sampler the module uses and reflection does not name: the
+    // two loops above only reach bindings reflection lists.
+    let supplied: Vec<u32> = samplers.iter().map(|sampler| sampler.binding).collect();
+    for binding in unreflected_sampler_bindings(&spirv, &supplied) {
+        crate::observe::Emit::decline(
+            "compute_linux_sampler",
+            &NeutralSamplerUnreflected { binding },
+        )
+        .field("pipe", acc.pipeline_ref)
+        .fail_once((u64::from(acc.pipeline_ref) << 32) | u64::from(binding));
+        samplers.push(crate::backend::vulkan::engine::SamplerResource::normalized_default(binding));
+    }
+
+    // TEMP (lab): a module binding the layout below will not declare refuses in
+    // the engine as `used_binding_absent_from_layout` with only the number.
+    // Name everything about it once per pipeline: the SPIR-V type behind each
+    // missing binding and what the guest and the reflection each supplied.
+    {
+        let words: &[u32] = &spirv;
+        let supplied = |b: u32| {
+            storage_buffers.iter().any(|x| x.binding == b)
+                || sampled_images.iter().any(|x| x.binding == b)
+                || samplers.iter().any(|x| x.binding == b)
+                || storage_images.iter().any(|x| x.binding == b)
+        };
+        let missing: Vec<u32> = crate::runtime::spirv_bind::declared_binding_numbers(words)
+            .into_iter()
+            .filter(|b| !supplied(*b))
+            .filter(|b| crate::runtime::spirv_bind::descriptor_static_use(words, *b).is_violation())
+            .collect();
+        if !missing.is_empty()
+            && crate::observe::first_sight(
+                "lab_compute_binding_absent",
+                u64::from(acc.pipeline_ref),
+            )
+        {
+            let types: Vec<String> = missing
+                .iter()
+                .map(|b| format!("{b}:{}", lab_spirv_binding_type(words, *b)))
+                .collect();
+            crate::observe::fail(format!(
+                "lab_compute_binding_absent pipe={} missing=[{}] guest_samplers={:?} reflected_samplers={:?} sampled={:?} storage_images={:?} buffers={:?}",
+                acc.pipeline_ref,
+                types.join(","),
+                acc.samplers.iter().map(|s| s.index).collect::<Vec<_>>(),
+                reflected_samplers.iter().map(|s| s.binding).collect::<Vec<_>>(),
+                sampled_images.iter().map(|x| x.binding).collect::<Vec<_>>(),
+                storage_images.iter().map(|x| x.binding).collect::<Vec<_>>(),
+                storage_buffers.iter().map(|x| x.binding).collect::<Vec<_>>(),
+            ));
         }
     }
 
@@ -1976,4 +2101,145 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
             multisample_target: Some(identity),
         },
     })
+}
+
+/// TEMP (lab): the SPIR-V type chain behind a descriptor binding, as opcode
+/// names, for `lab_compute_binding_absent`.
+fn lab_spirv_binding_type(words: &[u32], binding: u32) -> String {
+    let mut defs: std::collections::HashMap<u32, (u16, Vec<u32>)> =
+        std::collections::HashMap::new();
+    let mut target = None;
+    let mut i = 5;
+    while i < words.len() {
+        let wc = (words[i] >> 16) as usize;
+        let op = (words[i] & 0xffff) as u16;
+        if wc == 0 || i + wc > words.len() {
+            break;
+        }
+        let ops = words[i + 1..i + wc].to_vec();
+        if op == 71 && ops.len() >= 3 && ops[1] == 33 && ops[2] == binding {
+            target = Some(ops[0]);
+        }
+        // Types (19..=39, 4108..) define their result id first; OpVariable (59)
+        // defines it second, after the result type.
+        if (19..=39).contains(&op) && !ops.is_empty() {
+            defs.insert(ops[0], (op, ops.clone()));
+        } else if op == 59 && ops.len() >= 2 {
+            defs.insert(ops[1], (op, ops.clone()));
+        }
+        i += wc;
+    }
+    let name = |op: u16| match op {
+        25 => "Image",
+        26 => "Sampler",
+        27 => "SampledImage",
+        28 => "Array",
+        29 => "RuntimeArray",
+        30 => "Struct",
+        32 => "Pointer",
+        59 => "Variable",
+        _ => "op",
+    };
+    let Some(mut id) = target else {
+        return "undecorated".into();
+    };
+    let mut chain = Vec::new();
+    for _ in 0..6 {
+        let Some((op, ops)) = defs.get(&id) else {
+            break;
+        };
+        chain.push(format!("{}({op})", name(*op)));
+        id = match *op {
+            59 => ops[0],           // variable -> its pointer type
+            32 => ops[2],           // pointer -> pointee
+            27 | 28 | 29 => ops[1], // sampled image / array -> element
+            _ => break,
+        };
+    }
+    chain.join(">")
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_CSPV=1` writes each specialized compute module
+/// once per (task, pipeline, storage formats) to
+/// `E:/tmp/labspv/cT-pP-<formats>-wN.spv`.
+fn lab_compute_spv<A: std::fmt::Debug, B: std::fmt::Debug, C: std::fmt::Debug>(
+    task_id: u32,
+    pipeline_ref: u32,
+    storage_formats: &[(u32, A, B, C)],
+    spirv: &[u32],
+) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_CSPV").is_some()) {
+        return;
+    }
+    let fmts: String = storage_formats
+        .iter()
+        .map(|(b, _, _, spec)| format!("b{b}{spec:?}"))
+        .collect::<Vec<_>>()
+        .join("_");
+    let key = crate::backend::hash::hash_u64(
+        (u64::from(task_id) << 32) | u64::from(pipeline_ref),
+        crate::backend::hash::hash_u64(spirv.len() as u64, fmts.len() as u64),
+    );
+    if !crate::observe::first_sight("lab_compute_spv", key) {
+        return;
+    }
+    let _ = std::fs::create_dir_all("/tmp/labspv");
+    let bytes: Vec<u8> = spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let _ = std::fs::write(
+        format!("/tmp/labspv/c{task_id}-p{pipeline_ref}-{fmts}-w{}.spv", spirv.len()),
+        bytes,
+    );
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_CSPV=1` also logs, once per (task, pipeline,
+/// binding, ref), each texture a compute dispatch stages: object type, format,
+/// extent and the raw list entry + descriptor bytes.
+#[allow(clippy::too_many_arguments)]
+fn lab_compute_tex<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    binding: u32,
+    texture_ref: u32,
+    is_storage: bool,
+    width: u32,
+    height: u32,
+    pixel_format: u16,
+    bytes: &[u8],
+) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_CSPV").is_some()) {
+        return;
+    }
+    let key = crate::backend::hash::hash_u64(
+        (u64::from(task_id) << 32) | u64::from(pipeline_ref),
+        (u64::from(binding) << 32) | u64::from(texture_ref),
+    );
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let mid = bytes.len() / 2 & !15;
+    let content = format!(
+        "len={} head={} mid={}",
+        bytes.len(),
+        hex(&bytes[..bytes.len().min(16)]),
+        hex(&bytes[mid.min(bytes.len())..(mid + 16).min(bytes.len())])
+    );
+    if !crate::observe::first_sight("lab_compute_tex", key) {
+        return;
+    }
+    let entry = objects::lookup_list_entry(state, host, task_id, texture_ref);
+    let (ot, desc) = match entry.as_ref() {
+        Some(e) => (
+            e.object_type,
+            objects::read_descriptor(state, host, task_id, e)
+                .map(|d| d.iter().take(160).map(|b| format!("{b:02x}")).collect::<String>())
+                .unwrap_or_default(),
+        ),
+        None => (0, String::new()),
+    };
+    crate::observe::fail(format!(
+        "lab_compute_tex task={task_id} pipe={pipeline_ref} bind={binding} ref={texture_ref}          storage={} ot={ot} {width}x{height} fmt={pixel_format:#x} {content} desc={desc}",
+        is_storage as u8
+    ));
 }

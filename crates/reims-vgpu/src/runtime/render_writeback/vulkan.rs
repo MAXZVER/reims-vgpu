@@ -33,8 +33,84 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
+    let stored = store_render_frame_inner(state, host, mapping_id, identity, width, height);
+    if stored {
+        lab_probe_small_frame(state, host, mapping_id, width, height);
+    }
+    stored
+}
+
+/// TEMP (lab): what the guest will read back from a small surface (icon-sized)
+/// right after this device landed a frame in it — once per mapping for an
+/// all-zero landing and once for a non-zero one.
+fn lab_probe_small_frame<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) {
+    if u64::from(width) * u64::from(height) > 256 * 256 {
+        return;
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return;
+    };
+    let page_size = state.page_size();
+    let shift = page_size.trailing_zeros();
+    let mut buf = vec![0u8; page_size as usize];
+    let (mut nonzero, mut total, mut alpha_hi) = (0usize, 0usize, 0usize);
+    let bpp = crate::protocol::pixel_format::bytes_per_pixel(m.format).unwrap_or(4) as usize;
+    let mut unreadable = 0usize;
+    for &entry in m.page_entries.iter().take(128) {
+        let Some(gpa) = crate::protocol::iosurface_pages::entry_gpa_shift(entry, shift) else {
+            unreadable += 1;
+            continue;
+        };
+        if host.read_gpa(gpa, &mut buf).is_ok() {
+            total += buf.len();
+            nonzero += buf.iter().filter(|b| **b != 0).count();
+            // texels with any non-zero byte (alpha_hi reused as "non-empty texels")
+            alpha_hi += buf
+                .chunks_exact(bpp.max(1))
+                .filter(|t| t.iter().any(|b| *b != 0))
+                .count();
+        } else {
+            unreadable += 1;
+        }
+    }
+    let key = (u64::from(mapping_id) << 1) | u64::from(nonzero > 0);
+    if crate::observe::first_sight("lab_small_frame", key) {
+        crate::observe::fail(format!(
+            "lab_small_frame mid={mapping_id} {width}x{height} fmt={:#x} pages={} unreadable={unreadable} nonzero_bytes={nonzero}/{total} nonempty_texels={alpha_hi}",
+            m.format,
+            m.page_entries.len()
+        ));
+    }
+}
+
+fn store_render_frame_inner<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+) -> bool {
     let started = std::time::Instant::now();
     crate::runtime::drain::note_store_route("surface_flush");
+    if crate::runtime::writeback_debt::pay_diff_enabled()
+        && state
+            .mappings
+            .get(&mapping_id)
+            .is_some_and(|m| m.scanout_presented)
+    {
+        if let Some(done) =
+            store_changed_pages(state, host, mapping_id, identity, width, height, started)
+        {
+            return done;
+        }
+    }
     // The GPU writes the guest's pages directly. Tried first because when it
     // works there is nothing left to do: no staging buffer is mapped and no
     // host pass over the frame happens at all.
@@ -215,6 +291,155 @@ pub fn store_guest_backed_frame(
     crate::runtime::drain::note_store_route("render_flush_gpu_direct");
     finish(state, mapping_id, identity, bytes as usize, started, true);
     Ok(())
+}
+
+/// [`store_render_frame`] for a presented framebuffer, moving only the pages the
+/// GPU found changed (`engine::read_target_changed_pages`). `None` hands the
+/// frame back to the whole-frame arms.
+fn store_changed_pages<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+    started: std::time::Instant,
+) -> Option<bool> {
+    let m = state.mappings.get(&mapping_id)?;
+    let (base_off, bpr, format) =
+        crate::runtime::mapping_write::resident_gpu_plane(m, width, height)?;
+    if u64::from(bpr) != u64::from(width) * 4
+        || (format != crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
+            && format != crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB)
+    {
+        crate::runtime::drain::note_store_route("pay_diff_plane_not_packed_bgra");
+        return None;
+    }
+    let key = (m.map_generation, width, height, m.guest_bytes_seq);
+    let (token, baseline) = (m.guest_write_token, m.pay_diff_gen);
+    let frame_bytes = u64::from(width) * u64::from(height) * 4;
+    // The generation this landing will stand for, read before it: a guest store
+    // racing the landing then counts as written since, and is landed next time.
+    let gen_now = if token != 0 {
+        host.guest_write_gen(token).filter(|&g| g != 0)
+    } else {
+        None
+    };
+    let force = match (baseline, gen_now) {
+        (0, _) | (_, None) => None,
+        (b, Some(g)) if g == b => Some(Vec::new()),
+        (b, Some(_)) => host.guest_written_pages(token, b).map(|pages| {
+            let ranges =
+                crate::runtime::mapper::mapping_offsets_of_pages(state, mapping_id, &pages);
+            forced_frame_pages(&ranges, base_off, frame_bytes)
+        }),
+    };
+    let force = match force {
+        Some(f) => f,
+        None => {
+            // No witness to say which guest pages moved since the copy was
+            // taken: land the whole frame and take the copy again.
+            crate::runtime::drain::note_store_route("pay_diff_unwitnessed_full");
+            crate::backend::vulkan::engine::page_diff_forget(mapping_id);
+            Vec::new()
+        }
+    };
+    crate::runtime::drain::note_store_route_n("pay_diff_pages_forced", force.len() as u64);
+    let (_, vouched) = crate::runtime::mapper::vouch_mapping_pages_verdict(state, host, mapping_id);
+    let vouched = vouched?;
+    let changed = match crate::backend::vulkan::engine::read_target_changed_pages(
+        identity, mapping_id, key, &force,
+    ) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            crate::runtime::drain::note_store_route("pay_diff_declined");
+            return None;
+        }
+        Err(e) => {
+            crate::observe::Emit::decline("pay_diff_failed", &e)
+                .field("mapping", mapping_id)
+                .fail_once(u64::from(mapping_id));
+            return None;
+        }
+    };
+    let page = 4096u64;
+    let frame_len = changed.frame_bytes as usize;
+    // SAFETY: `frame_ptr` is the engine's mapped page-diff host buffer, at least
+    // `frame_bytes` long, written by the call above and not touched again until
+    // the next payment — which runs on this same drain thread after this one.
+    let frame = unsafe { std::slice::from_raw_parts(changed.frame_ptr, frame_len) };
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &p in &changed.pages {
+        let lo = u64::from(p) * page;
+        let hi = (lo + page).min(changed.frame_bytes);
+        match runs.last_mut() {
+            Some(last) if last.1 == base_off + lo => last.1 = base_off + hi,
+            _ => runs.push((base_off + lo, base_off + hi)),
+        }
+    }
+    crate::runtime::drain::note_store_route(if changed.full {
+        "pay_diff_full"
+    } else {
+        "pay_diff_pages"
+    });
+    crate::runtime::drain::note_store_route_n("pay_diff_pages_landed", changed.pages.len() as u64);
+    if !runs.is_empty()
+        && !crate::runtime::mapper::write_mapping_bytes_only(
+            state,
+            host,
+            mapping_id,
+            base_off,
+            frame,
+            Some(&runs),
+            &vouched,
+        )
+    {
+        crate::backend::vulkan::engine::page_diff_forget(mapping_id);
+        if let Some(m) = state.mappings.get_mut(&mapping_id) {
+            m.pay_diff_gen = 0;
+        }
+        crate::observe::fail(format!(
+            "render_store_lost mapping={mapping_id} {width}x{height} reason=pay_diff_write_refused"
+        ));
+        return Some(false);
+    }
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.pay_diff_gen = gen_now.unwrap_or(0);
+    }
+    state.invalidate_storage_residency_window(mapping_id, base_off, base_off + changed.frame_bytes);
+    let _ = state.mark_mapping_written(mapping_id);
+    if let Some(m) = state.mappings.get(&mapping_id) {
+        crate::backend::vulkan::engine::page_diff_set_key(
+            mapping_id,
+            (m.map_generation, width, height, m.guest_bytes_seq),
+        );
+    }
+    finish(state, mapping_id, identity, frame_len, started, false);
+    Some(true)
+}
+
+/// The 4 KiB frame pages (the diff's unit, counted from `base_off`) that a set of
+/// guest-written mapping-offset ranges touches, ascending. A guest page that
+/// straddles two frame pages forces both.
+fn forced_frame_pages(ranges: &[(u64, u64)], base_off: u64, frame_bytes: u64) -> Vec<u32> {
+    const PAGE: u64 = 4096;
+    let end = base_off + frame_bytes;
+    let mut out: Vec<u32> = Vec::new();
+    for &(s, e) in ranges {
+        if e <= base_off || s >= end {
+            continue;
+        }
+        let lo = (s.max(base_off) - base_off) / PAGE;
+        let hi = (e.min(end) - base_off).div_ceil(PAGE);
+        for p in lo..hi {
+            if out.last() != Some(&(p as u32)) {
+                out.push(p as u32);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 fn finish_needs_registry_handoff(guest_backed: bool) -> bool {
@@ -557,6 +782,22 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         }
     };
     crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+    // Arm the write witness exactly as the direct arm does: the pages now hold
+    // this resident's frame, texel for texel on the native arm and byte for byte
+    // on the eight-bit one. Without it a later LOAD or sample never reads quiet
+    // and re-reads the pages through the eight-bit seed rail — which for a float
+    // target is not "a re-read" but a clamped, quantised copy of it. Only for a
+    // whole-frame landing: a store that skipped ranges left guest bytes in the
+    // plane that the resident does not hold.
+    if skip.is_empty() {
+        if let (Some(key), Some(gpas)) = (
+            crate::backend::vulkan::gva_witness_key(identity),
+            pages.ordered_complete(c0.target_gva, state.page_size()),
+        ) {
+            let gpas = gpas.to_vec();
+            crate::runtime::gva_store_witness::note_store(state, host, key, &gpas);
+        }
+    }
     crate::runtime::drain::note_store_route("gva_flush_copied");
     Ok(extent)
 }
@@ -832,6 +1073,12 @@ pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
     if !in_page.is_multiple_of(bpt) {
         return Err(GvaWritebackDecline::OffsetNotTexelAligned { in_page });
     }
+    // The GPU is about to write these pages: an operator who narrowed the
+    // import to reads sends this Store down the copying rail, the same decline
+    // a host without the import takes.
+    if let Some(refusal) = crate::runtime::guest_ram_map::write_refusal() {
+        return Err(GvaWritebackDecline::GuestRefRefused { refusal });
+    }
     let runs =
         crate::runtime::guest_ram_map::references_for_runs(host, gpas, page_size, in_page, extent)
             .map_err(|refusal| GvaWritebackDecline::GuestRefRefused { refusal })?;
@@ -862,6 +1109,14 @@ pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
     // under-recorded — the direction that costs a re-read instead of a wrong
     // frame.
     state.note_host_wrote_pages(gpas.to_vec());
+    // The boot-wide write footprint, so a panic's page number can be looked up
+    // against this rail too. The mapper-ref licence marks it; this one did not,
+    // and a page this rail wrote read as "never written by this device".
+    // Marked over the copy's extent within the walked pages, before the
+    // submit — the over-recording direction, as the mapper's own note says.
+    crate::runtime::mapper::note_page_write_footprint(page_size, in_page, extent, |i| {
+        gpas.get(i).map(|&gpa| Some(gpa))
+    });
     Ok(GvaPlaneLicence {
         target,
         gpas: gpas.to_vec(),
@@ -904,14 +1159,12 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
     // witness records is compared against that same ring — capturing it first
     // would have every target permanently invalidated by its own Store.
     //
-    // Only this rail stamps. Both copying arms — the eager `gva_store_sync` and
-    // [`land_gva_frame_bytes`] behind this call — leave no witness, so their
-    // targets never read quiet and never take the shortcut this arms. That is
-    // safe and deliberate rather than an oversight: it is the arm a host without
-    // the guest-RAM import takes, and it already pays a blocking readback per
-    // Store, so the shortcut is worth less there and the rails stay easier to
-    // tell apart. The frame is in the guest's pages either way; what a missing
-    // stamp costs is a re-read, never a wrong image.
+    // The copying arm of [`store_gva_frame`] stamps too, for a whole-frame
+    // landing. It used not to, on the argument that a missing stamp costs a
+    // re-read and never a wrong image; that holds for eight-bit colour only. The
+    // re-read is the eight-bit seed rail, so for a float target it *is* a wrong
+    // image — the clamped one. The eager eight-bit `gva_store_sync` still leaves
+    // none, which is safe for the formats it now carries.
     if let Some(key) = crate::backend::vulkan::gva_witness_key(identity) {
         crate::runtime::gva_store_witness::note_store(state, host, key, gpas);
     }

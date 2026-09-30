@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # vm/boot-windows.sh — boot the macos-13 rail on a Windows host (WHPX + native Vulkan).
-# Run from an MSYS2 MINGW64 shell. Expects the rail files under C:/hackintosh/vm/.
+# Run from an MSYS2 MINGW64 or UCRT64 shell. Expects the rail files under
+# C:/hackintosh/vm/ unless VM_DIR points elsewhere.
 set -euo pipefail
-VM_DIR="C:/hackintosh/vm"
+VM_DIR="${VM_DIR:-C:/hackintosh/vm}"
 QEMU="${QEMU_BIN:-$(dirname "$0")/../vendor/qemu/build/qemu-system-x86_64.exe}"
 DEVICE="${DEVICE:-reims-vgpu-pci}"
 ACCEL="${ACCEL:-whpx}"

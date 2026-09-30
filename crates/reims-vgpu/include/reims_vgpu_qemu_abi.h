@@ -21,7 +21,18 @@
 extern "C" {
 #endif
 
-/* v20: map_pages fills ReimsVgpuMapPagesFailure when it refuses a view.
+/* v23: ReimsVgpuHostOps.note_work_scope — which doorbells bind the generation
+ *      reads that follow (every channel's, or one channel's for a packet with
+ *      no stamp waits).
+ * v22: ReimsVgpuHostOps.irq_pulse — raise a device interrupt now, from any
+ *      thread, without the BQL, when the shim can prove that is safe (an MSI
+ *      whose target region needs no lock). 0 means "queue it as before".
+ * v21: ReimsVgpuHostOps.harvests_settled — whether every dirty-log harvest a
+ *      guest doorbell has asked for has finished. A shim that harvests off the
+ *      vCPU lets the ringing vCPU go at once; the drain then asks this before it
+ *      serves work a doorbell handed over, and leaves the work for its next
+ *      wakeup rather than answer a currency question from an older harvest.
+ * v20: map_pages fills ReimsVgpuMapPagesFailure when it refuses a view.
  * v19: ReimsVgpuHostOps.page_alias_census reports the packed page views the
  *      shim currently owns and their cumulative lifetime totals.
  * v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
@@ -94,7 +105,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 20u
+#define REIMS_VGPU_QEMU_ABI_VERSION 23u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -378,6 +389,34 @@ typedef struct ReimsVgpuHostOps {
                                    uint64_t *out, size_t max);
     /* Current packed map_pages aliases and cumulative lifetime totals. */
     int (*page_alias_census)(void *ctx, ReimsVgpuPageAliasCensus *out);
+    /*
+     * Non-zero when every dirty-log harvest a doorbell has asked for has
+     * finished, so guest_write_gen and guest_written_pages reflect every guest
+     * store ordered before any doorbell seen so far. Never blocks; safe from
+     * any thread. NULL means the shim harvests inline at the doorbell, which is
+     * always settled.
+     */
+    int (*harvests_settled)(void *ctx);
+    /*
+     * Raise the interrupt for REIMS_VGPU_HOST_ACTION_IRQ_GFX / _IRQ_IOSFC now,
+     * from the calling thread, which may hold the device lock and not the BQL.
+     * Returns 1 when it was raised, 0 when the shim cannot do that safely here
+     * and the caller must queue the pulse for the action BH instead. NULL is a
+     * shim that always queues.
+     */
+    int (*irq_pulse)(void *ctx, uint32_t kind);
+    /*
+     * Which guest stores the generation reads that follow owe, until the next
+     * call. REIMS_VGPU_WORK_SCOPE_ALL: every store ordered before the latest
+     * doorbell of any channel as of now (the drain calls it after reading a
+     * ring's tail, and after running a packet). A channel number: only the
+     * stores ordered before that channel's own doorbells — a packet with no
+     * stamp waits, about to run, was handed over by one of them and depends on
+     * no other channel's work. A shim that syncs its witness per doorbell need
+     * not re-sync for doorbells that do not bind the work at hand. NULL: every
+     * read answers for the latest doorbell, which is always correct.
+     */
+    void (*note_work_scope)(void *ctx, uint32_t scope);
 } ReimsVgpuHostOps;
 
 /*
@@ -472,6 +511,12 @@ int reims_vgpu_qemu_gfx_read(uint64_t handle, uint64_t offset, uint32_t size,
                       uint64_t *out_val);
 int reims_vgpu_qemu_gfx_write(uint64_t handle, uint64_t offset, uint64_t data,
                        uint32_t size);
+/* note_work_scope: every channel's doorbells. */
+#define REIMS_VGPU_WORK_SCOPE_ALL 0xffffffffu
+/* The channel a gfx write rings (0 for the root FIFO), or -1 when the write is
+ * no doorbell. Pure; ask it before the write. */
+int reims_vgpu_qemu_gfx_write_doorbell_channel(uint64_t offset, uint64_t data,
+                                        uint32_t size);
 int reims_vgpu_qemu_iosfc_read(uint64_t handle, uint64_t offset, uint32_t size,
                         uint64_t *out_val);
 int reims_vgpu_qemu_iosfc_write(uint64_t handle, uint64_t offset, uint64_t data,

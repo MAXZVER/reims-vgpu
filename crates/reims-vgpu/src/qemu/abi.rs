@@ -94,7 +94,7 @@ use std::slice;
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
 /// v20 gives `map_pages` a structured per-call failure output.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 20;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 23;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -426,6 +426,27 @@ pub unsafe extern "C" fn reims_vgpu_qemu_gfx_write(
             }
         },
         REIMS_VGPU_QEMU_ERR_PANIC,
+    )
+}
+
+/// `note_work_scope`'s "every channel" value; mirrors the ABI header.
+pub const REIMS_VGPU_WORK_SCOPE_ALL: u32 = 0xffff_ffff;
+
+/// The channel a gfx write rings, or -1 (see
+/// [`crate::runtime::mmio::gfx_write_doorbell_channel`]). Pure.
+#[no_mangle]
+pub extern "C" fn reims_vgpu_qemu_gfx_write_doorbell_channel(
+    offset: u64,
+    data: u64,
+    size: u32,
+) -> c_int {
+    unwind_safe(
+        "reims_vgpu_qemu_gfx_write_doorbell_channel",
+        || match crate::runtime::mmio::gfx_write_doorbell_channel(offset, data, size) {
+            Some(ch) => c_int::try_from(ch).unwrap_or(-1),
+            None => -1,
+        },
+        -1,
     )
 }
 

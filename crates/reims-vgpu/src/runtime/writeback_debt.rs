@@ -621,6 +621,38 @@ impl PendingWritebacks {
             .collect()
     }
 
+    /// Every plane debt of `task_id` whose frame window overlaps the guest span
+    /// `[gva, gva + span)`, taken out of the ledger, whatever reference armed it.
+    ///
+    /// A GVA debt is keyed by the reference its Store named, but a later read may
+    /// name the same pages through another reference of the same task: a texture
+    /// view of the target, or a second texture placed over the same allocation.
+    /// The name misses those; the address does not. GVAs are per task, so the
+    /// task bounds the search and no other address space is reached.
+    pub fn take_gva_overlapping(
+        &mut self,
+        task_id: u32,
+        gva: u64,
+        span: u64,
+    ) -> Vec<(GvaPlaneKey, GvaWritebackDebt)> {
+        let end = gva.saturating_add(span);
+        let planes: Vec<GvaPlaneKey> = self
+            .gva_debts
+            .iter()
+            .filter(|(plane, debt)| {
+                let debt_end = debt.gva.saturating_add(
+                    u64::from(debt.row_stride).saturating_mul(u64::from(debt.height)),
+                );
+                plane.resource.task_id == task_id && debt.gva < end && gva < debt_end
+            })
+            .map(|(plane, _)| *plane)
+            .collect();
+        planes
+            .into_iter()
+            .filter_map(|plane| self.gva_debts.remove(&plane).map(|debt| (plane, debt)))
+            .collect()
+    }
+
     fn take_gva_plane(&mut self, plane: GvaPlaneKey) -> Option<GvaWritebackDebt> {
         self.gva_debts.remove(&plane)
     }
@@ -710,6 +742,97 @@ pub fn lazy_writeback_enabled() -> bool {
         let on = !matches!(state, crate::config::Switch::Off);
         crate::observe::off(format!(
             "lazy_writeback on={on} switch={state:?} value={}",
+            value.unwrap_or_else(|| "<unset>".into())
+        ));
+        on
+    })
+}
+
+/// Pay every debt owed to a surface the guest reads with its CPU, before the
+/// guest is told the work that produced it is done.
+///
+/// [`crate::model::MappingEntry::guest_cpu_shared`] names those surfaces:
+/// presented framebuffers WindowServer copies between with the CPU, without
+/// naming them in a synchronize first. Their pages must hold the frame by the
+/// time the completion stamp lets the guest touch them. Paying here instead of
+/// at each Store lets the Stores of one frame replace one another in the ledger
+/// first, so a framebuffer composited in several passes is written back once.
+pub fn pay_cpu_shared<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
+    if state.pending_writebacks.is_empty() {
+        return;
+    }
+    let owed: Vec<u32> = state
+        .pending_writebacks
+        .mappings_by_age()
+        .into_iter()
+        .filter(|mid| state.mappings.get(mid).is_some_and(|m| m.guest_cpu_shared))
+        .collect();
+    for mapping_id in owed {
+        if let Some(debt) = state.pending_writebacks.take(mapping_id) {
+            pay(state, host, mapping_id, debt, "wbdebt_paid_cpu_shared");
+        }
+    }
+}
+
+/// [`pay_cpu_shared`] for one mapping: the framebuffer a DisplaySwap has just
+/// presented, which is the one WindowServer reads next.
+pub fn pay_cpu_shared_mapping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    if state.pending_writebacks.is_empty()
+        || !state.guest_copies_framebuffers
+        || !state
+            .mappings
+            .get(&mapping_id)
+            .is_some_and(|m| m.scanout_presented)
+    {
+        return;
+    }
+    if fb_copy_replay_enabled() {
+        // The copy this payment serves is replayed on the GPU from this
+        // mapping's resident (`runtime::draw` overlay), which the debt keeps
+        // pinned. The frame stays owed to any reader that names it.
+        if state.pending_writebacks.get(mapping_id).is_some() {
+            crate::runtime::drain::note_store_route("wbdebt_cpu_shared_left_for_replay");
+        }
+        return;
+    }
+    if let Some(debt) = state.pending_writebacks.take(mapping_id) {
+        pay(state, host, mapping_id, debt, "wbdebt_paid_cpu_shared");
+    }
+}
+
+/// Whether presented framebuffers are written back page by page (see
+/// [`crate::config::PAY_DIFF`]). Latched for the process.
+pub fn pay_diff_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = !matches!(
+            crate::config::read(crate::config::PAY_DIFF).0,
+            crate::config::Switch::Off
+        );
+        crate::observe::off(format!("pay_diff on={on}"));
+        on
+    })
+}
+
+/// Whether the guest's CPU copies between presented framebuffers are replayed
+/// resident to resident instead of served by a writeback at each swap, as
+/// [`crate::config::FB_COPY_REPLAY`] narrows it. Latched for the process.
+pub fn fb_copy_replay_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let (state, value) = crate::config::read(crate::config::FB_COPY_REPLAY);
+        // Opt-in while the copy-source inference is not sound: with no swap
+        // payment every framebuffer's pages converge on the same stale bytes,
+        // so a byte match stops naming the buffer the guest copied from.
+        let on = matches!(state, crate::config::Switch::On);
+        crate::observe::off(format!(
+            "fb_copy_replay on={on} switch={state:?} value={}",
             value.unwrap_or_else(|| "<unset>".into())
         ));
         on
@@ -1236,6 +1359,14 @@ pub(crate) fn arm_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
     if c0.texture_ref == 0 || window.generation == 0 {
         return false;
     }
+    // The switch that narrows the surface rail to the eager Store narrows this
+    // one too: a GVA debt is the same deferral into a different ledger, and a
+    // guest CPU reader that never synchronizes sees the same stale pages
+    // through either.
+    if !lazy_writeback_enabled() {
+        crate::runtime::drain::note_store_route("gvadebt_arm_lazy_off");
+        return false;
+    }
     // The resident the payment will name is derived from `c0` and this
     // generation; the caller's own resident was derived the same way. See
     // [`GvaWindow`] — the derivation is only sound while the two agree, so a
@@ -1558,6 +1689,7 @@ pub fn settle_for_texture<M: HostMemory + HostOps>(
         });
     }
     pay_for_texture(state, host, task_id, texture_ref);
+    pay_gva_overlapping(state, host, task_id, gva, span);
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
         let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
@@ -1566,6 +1698,39 @@ pub fn settle_for_texture<M: HostMemory + HostOps>(
         );
         (gpas.len() as u64 == want).then_some(gpas)
     });
+}
+
+/// Pay every GVA frame this task owes over the pages `[gva, gva + span)`,
+/// whatever reference armed it — the half of a read's obligation the name
+/// cannot reach.
+///
+/// macOS 26 renders its icon layers into linear targets and samples them back
+/// through a different reference (a texture view of the target): the debt is
+/// keyed by the Store's reference, `pay_for_texture` under the sampled one
+/// finds nothing (`wbdebt_texture_owes_nothing`), and the sample reads guest
+/// pages that never received the frame — every such icon came out transparent.
+/// Free when nothing is owed.
+pub fn pay_gva_overlapping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    span: u64,
+) {
+    if state.pending_writebacks.is_empty() || span == 0 {
+        return;
+    }
+    let owed = state
+        .pending_writebacks
+        .take_gva_overlapping(task_id, gva, span);
+    if owed.is_empty() {
+        return;
+    }
+    let rail = crate::backend::selected();
+    for (plane, debt) in owed {
+        crate::runtime::drain::note_store_route("gvadebt_paid_overlap");
+        let _ = pay_gva(rail, state, host, plane, debt, GvaPaySite::Named);
+    }
 }
 
 /// [`settle_for_mapping`] for a caller that is **about to land the owed frame
@@ -1600,6 +1765,45 @@ pub fn supersede_for_mapping(
         crate::runtime::drain::note_store_route("wbdebt_superseded_by_skipping_write");
     }
     crate::runtime::render_writeback::settle_guest_writes(site);
+}
+
+/// Drop every GVA debt of `task_id` over `[gva, gva + span)` because the caller
+/// is about to write newer content over the whole window: a clear-only pass
+/// landing its clear colour in the guest pages.
+///
+/// A debt says the resident its Store produced is the authoritative copy of
+/// these pages, and [`gva_resident_authoritative`] lets the next colour LOAD
+/// take that resident without reading the pages. A clear-only pass writes only
+/// the pages, so with the debt left standing the LOAD that follows it reloads
+/// the frame the clear replaced — and paying the debt later would write that
+/// frame over the clear as well. macOS 26's compositor reuses one pooled
+/// texture for a glass mask (a red gradient drawn and Stored), then clears it
+/// with a pass that has no draws and loads it for the next layer: the reloaded
+/// mask is the red band over the Dock and under Control Center.
+///
+/// So the debt is dropped, not paid, and its resident released: the clear is
+/// the same resource's newer content over its whole window. Writes already
+/// submitted into these pages are settled first, as [`supersede_for_mapping`]
+/// does, so none of them lands after the clear.
+pub fn supersede_gva_overlapping(state: &mut DeviceState, task_id: u32, gva: u64, span: u64) {
+    if !state.pending_writebacks.is_empty() && span != 0 {
+        let owed = state
+            .pending_writebacks
+            .take_gva_overlapping(task_id, gva, span);
+        if !owed.is_empty() {
+            let rail = crate::backend::selected();
+            crate::runtime::drain::note_store_route_n(
+                "gvadebt_superseded_by_clear",
+                owed.len() as u64,
+            );
+            for (_, debt) in owed {
+                release_gva(rail, debt);
+            }
+        }
+    }
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::ClearOnlyGva,
+    );
 }
 
 /// [`settle_for_mapping`] for a caller that cannot name the mapping it is about
@@ -1680,6 +1884,8 @@ fn pay<M: HostMemory + HostOps>(
         return;
     }
     crate::runtime::drain::note_store_route(route);
+    // Before the landing (see `GuestWriteObservation`).
+    let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);
     if !rail.pay_surface_writeback(
         state,
         host,
@@ -1696,7 +1902,7 @@ fn pay<M: HostMemory + HostOps>(
             debt.width, debt.height
         ));
     }
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

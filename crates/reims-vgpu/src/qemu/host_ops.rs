@@ -141,6 +141,15 @@ pub struct ReimsVgpuHostOps {
     >,
     pub page_alias_census:
         Option<unsafe extern "C" fn(ctx: *mut c_void, out: *mut PageAliasCensus) -> i32>,
+    /// Non-zero when every dirty-log harvest a doorbell asked for has finished.
+    /// Never blocks. `None` is a shim that harvests inline, which is always
+    /// settled.
+    pub harvests_settled: Option<unsafe extern "C" fn(ctx: *mut c_void) -> c_int>,
+    /// Raise an IRQ pulse now, from any thread, without the BQL; 1 when raised,
+    /// 0 when the caller must queue it for the action BH instead.
+    pub irq_pulse: Option<unsafe extern "C" fn(ctx: *mut c_void, kind: u32) -> c_int>,
+    /// Which doorbells bind the generation reads that follow; see the ABI header.
+    pub note_work_scope: Option<unsafe extern "C" fn(ctx: *mut c_void, scope: u32)>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -180,6 +189,9 @@ impl ReimsVgpuHostOps {
             is_ram_gpa: None,
             guest_ram_regions: None,
             notify_actions: None,
+            harvests_settled: None,
+            irq_pulse: None,
+            note_work_scope: None,
         }
     }
 }
@@ -430,6 +442,19 @@ impl HostOps for QemuHost<'_> {
         let prompt = self.prompt;
         match action.kind {
             HostActionKind::IrqGfxPulse | HostActionKind::IrqIosfcPulse => {
+                // Raised in place when the shim can: the queue's only purpose
+                // for a pulse is to reach a thread holding the BQL, and on a
+                // host whose interrupt injection needs none that hop is pure
+                // latency — measured at ~0.2-0.5 ms mean and 5-11 ms tails,
+                // long enough for a VBL pulse to coalesce into the next one.
+                if let Some(pulse) = self.ops.irq_pulse {
+                    // SAFETY: QEMU owns the live ctx; the shim documents this
+                    // as callable from any thread holding the device lock.
+                    if unsafe { pulse(self.ops.ctx, action.kind as u32) } != 0 {
+                        crate::runtime::drain::note_store_route("irq_pulse_direct");
+                        return;
+                    }
+                }
                 let mut q = prompt.lock();
                 // Coalesce: an undelivered pulse of the same kind already
                 // covers this one (status bits accumulate in the r2c regs).
@@ -633,6 +658,25 @@ impl HostOps for QemuHost<'_> {
         self.ops.map_pages_stable != 0
     }
 
+    fn note_work_scope(&self, scope: crate::runtime::host::WorkScope) {
+        if let Some(callback) = self.ops.note_work_scope {
+            let raw = match scope {
+                crate::runtime::host::WorkScope::All => crate::qemu::abi::REIMS_VGPU_WORK_SCOPE_ALL,
+                crate::runtime::host::WorkScope::Channel(ch) => ch,
+            };
+            // SAFETY: QEMU owns the live ctx; the callback takes a leaf lock.
+            unsafe { callback(self.ops.ctx, raw) }
+        }
+    }
+
+    fn harvests_settled(&self) -> bool {
+        match self.ops.harvests_settled {
+            // SAFETY: QEMU owns the live ctx; the callback never blocks.
+            Some(callback) => (unsafe { callback(self.ops.ctx) }) != 0,
+            None => true,
+        }
+    }
+
     fn page_alias_census(&self) -> Option<PageAliasCensus> {
         let callback = self.ops.page_alias_census?;
         let mut out = PageAliasCensus::default();
@@ -742,6 +786,19 @@ impl HostOps for QemuHost<'_> {
         // 0 is the shim's "unknown token, or not yet armed" answer. Reading it
         // as a generation would let two pre-arm checks agree and vouch for a
         // resident nothing has ever validated.
+        (gen_ != 0).then_some(gen_)
+    }
+
+    fn guest_write_gen_lagged(&self, token: u64) -> Option<u64> {
+        // TEMP (lab): the shim reads bit 63 of the token as "answer from the
+        // last sync, do not sync now" (REIMS_VGPU_DIRTY_TOKEN_LAGGED). Tokens
+        // are a sequential counter and never reach it.
+        if token == 0 || token >> 63 != 0 {
+            return None;
+        }
+        let f = self.ops.guest_write_gen?;
+        // SAFETY: QEMU owns ctx; the shim answers from its own lock.
+        let gen_ = unsafe { f(self.ops.ctx, token | (1 << 63)) };
         (gen_ != 0).then_some(gen_)
     }
 
