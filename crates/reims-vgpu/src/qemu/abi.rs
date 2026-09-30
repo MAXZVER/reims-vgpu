@@ -502,6 +502,44 @@ pub unsafe extern "C" fn reims_vgpu_qemu_iosfc_write(
     )
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_STALL=PERIOD_MS:STALL_MS[:AFTER_MS]` — every
+/// PERIOD_MS of device time (after AFTER_MS since start) the drain thread sleeps
+/// STALL_MS before draining, so a host hiccup (or a debugger freeze) can be
+/// replayed deterministically while the guest keeps submitting. Logs
+/// `lab_drain_stall n=` once per stall.
+fn lab_drain_stall() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SPEC: std::sync::OnceLock<Option<(u64, u64, u64)>> = std::sync::OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let Some((period, stall, after)) = *SPEC.get_or_init(|| {
+        let v = std::env::var("REIMS_VGPU_LAB_STALL").ok()?;
+        let mut it = v.split(':').map(|x| x.trim().parse::<u64>());
+        let period = it.next()?.ok()?;
+        let stall = it.next()?.ok()?;
+        let after = it.next().and_then(|x| x.ok()).unwrap_or(0);
+        Some((period.max(1), stall, after))
+    }) else {
+        return;
+    };
+    let now = crate::observe::elapsed_us() / 1000;
+    if now < after {
+        return;
+    }
+    let next = NEXT.load(Ordering::Relaxed);
+    if next == 0 {
+        NEXT.store(now + period, Ordering::Relaxed);
+        return;
+    }
+    if now < next {
+        return;
+    }
+    NEXT.store(now + period, Ordering::Relaxed);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(stall));
+    crate::observe::off(format!("lab_drain_stall n={n} stall_ms={stall}"));
+}
+
 /// BH body: drain pending FIFOs (GPA via HostOps). Then pop actions with
 /// [`reims_vgpu_qemu_device_pop_action`].
 #[no_mangle]
@@ -518,6 +556,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {
             // an MMIO store, and telling those apart is what makes a stalled
             // guest attributable.
             crate::backend::selected().note_drain_thread();
+            lab_drain_stall();
             if device_drain(handle) {
                 REIMS_VGPU_QEMU_OK
             } else {

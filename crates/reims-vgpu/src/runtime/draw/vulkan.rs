@@ -1161,6 +1161,121 @@ fn lab_gate_open() -> bool {
     open
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_COVER=WxH@x,y;x,y` — which draws on a WxH colour-0
+/// target could write a given texel (the point lies inside the draw's scissor,
+/// or the whole target when it has none), without reading anything back: a
+/// cheap picker that does not change timing. Lines: `lab_cover_draw` per draw
+/// and `lab_cover_tex` per sampled image of such a draw (its resolved source and
+/// content identity). Honours `REIMS_VGPU_LAB_GATE`; at most
+/// `REIMS_VGPU_LAB_COVER_MAX` (default 100000) lines.
+fn lab_cover_point(req: &DrawEncodeRequest) -> Option<usize> {
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Option<((u32, u32), Vec<(u32, u32)>)>> = OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        let v = std::env::var("REIMS_VGPU_LAB_COVER").ok()?;
+        let (wh, pts) = v.split_once('@')?;
+        let (w, h) = wh.split_once('x')?;
+        let pts = pts
+            .split(';')
+            .filter_map(|p| {
+                let (x, y) = p.split_once(',')?;
+                Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+            })
+            .collect();
+        Some(((w.trim().parse().ok()?, h.trim().parse().ok()?), pts))
+    });
+    let ((w, h), pts) = spec.as_ref()?;
+    let c0 = req.colors.first()?;
+    if (c0.width, c0.height) != (*w, *h) {
+        return None;
+    }
+    let (sx, sy, sw, sh) = req
+        .scissors
+        .first()
+        .map(|s| (s.x, s.y, s.width, s.height))
+        .unwrap_or((0, 0, *w, *h));
+    pts.iter()
+        .position(|&(x, y)| x >= sx && y >= sy && x < sx.saturating_add(sw) && y < sy.saturating_add(sh))
+}
+
+fn lab_cover_budget() -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_COVER_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000)
+    });
+    lab_gate_open() && N.fetch_add(1, Ordering::Relaxed) < max
+}
+
+fn lab_cover_draw(req: &DrawEncodeRequest, entry: Option<&str>) {
+    let Some(pt) = lab_cover_point(req) else {
+        return;
+    };
+    if !lab_cover_budget() {
+        return;
+    }
+    let c0 = &req.colors[0];
+    crate::observe::fail(format!(
+        "lab_cover_draw pt={pt} task={} pipe={} entry={} sc={:?} rt=ref{}/m{}/g{:x}:f{}:ld{}:st{} vtx={} inst={} tex={:?} chain={} cont={} gvares={}",
+        req.task_id,
+        req.pipeline_ref,
+        entry.unwrap_or("?"),
+        req.scissors.first().map(|s| (s.x, s.y, s.width, s.height)),
+        c0.texture_ref,
+        c0.mapping_id,
+        c0.target_gva,
+        c0.format,
+        c0.load_action,
+        c0.store_action,
+        req.vertex_count,
+        req.instance_count,
+        req.fragment_textures
+            .iter()
+            .map(|t| (t.index, t.texture_ref))
+            .collect::<Vec<_>>(),
+        req.chain_from_resident,
+        req.continues_render_pass,
+        req.gva_load_from_resident
+    ));
+}
+
+fn lab_cover_tex(
+    req: &DrawEncodeRequest,
+    index: u32,
+    texture_ref: u32,
+    img: &crate::backend::vulkan::engine::SampledImageResource,
+) {
+    let Some(pt) = lab_cover_point(req) else {
+        return;
+    };
+    if !lab_cover_budget() {
+        return;
+    }
+    let src = match &img.source {
+        crate::backend::vulkan::engine::SampledSource::Bytes(b) => format!("bytes(len={})", b.len()),
+        crate::backend::vulkan::engine::SampledSource::Target(t) => format!("target({t:?})"),
+        crate::backend::vulkan::engine::SampledSource::GuestRuns(g, vouch) => format!(
+            "guest_runs(runs={} len={} first_ptr={:?} vouch={vouch:?})",
+            g.runs.len(),
+            g.total_len,
+            g.runs.first().map(|r| format!("{:?}", r).chars().take(60).collect::<String>())
+        ),
+    };
+    crate::observe::fail(format!(
+        "lab_cover_tex pt={pt} task={} pipe={} idx={index} ref={texture_ref} {}x{} fmt={:?} ident={:?} src={src}",
+        req.task_id,
+        req.pipeline_ref,
+        img.width,
+        img.height,
+        img.format,
+        img.identity.as_ref().map(|i| (i.key, i.generation))
+    ));
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_UBO=pipe[,pipe]` logs the fragment buffers
 /// (reflected access, length, first 64 words) and fragment textures of draws
 /// with those pipelines, once per distinct (textures, bytes) digest and at most
@@ -8705,6 +8820,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         }
         drop(fragment_span);
         lab_spv_all(req, f_shader.reflection.entry_point.as_deref(), &f_shader.spirv);
+        lab_cover_draw(req, f_shader.reflection.entry_point.as_deref());
         lab_ubo_draw(req, &frag_storage, f_shader.reflection.entry_point.as_deref(), &f_shader.spirv, |i| {
             format!(
                 "{:?}",
@@ -9559,6 +9675,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 lab_sampled_bind(req, frag_stage, index, texture_ref, tw, th, images.last(), view_swizzle);
                 lab_sampled_strip_probe(req, texture_ref, images.last());
                 lab_sampled_grid_probe(req, index, texture_ref, images.last());
+                if let Some(img) = images.last() {
+                    lab_cover_tex(req, index, texture_ref, img);
+                }
                 Ok(())
             };
             for t in req.vertex_textures.iter() {

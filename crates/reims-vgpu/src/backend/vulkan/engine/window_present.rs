@@ -1748,6 +1748,7 @@ impl WindowPresenter {
         if presented {
             self.cadence_presents = self.cadence_presents.saturating_add(1);
             self.cadence_direct = self.cadence_direct.saturating_add(u64::from(direct));
+            lab_present_gap_note();
         } else {
             self.cadence_busy = self.cadence_busy.saturating_add(1);
         }
@@ -1767,6 +1768,7 @@ impl WindowPresenter {
             },
             self.cadence_offered,
         ));
+        lab_present_gap_report();
         self.cadence_started = Instant::now();
         self.cadence_presents = 0;
         self.cadence_direct = 0;
@@ -1865,6 +1867,53 @@ fn swapchain_recreated_line(
 /// swapchain having no free image, which is the display's own pacing, and
 /// `no_area` is a surface with no swapchain at all — a minimized window, which
 /// is not a rate problem and resolves by itself.
+/// TEMP (lab): `REIMS_VGPU_LAB_PRESENT_GAPS=1` — the spread of the gaps
+/// between successive presents, reported beside each `host_window_cadence`
+/// window as `lab_present_gaps n= p50_ms= p95_ms= p99_ms= max_ms=`: a rate per
+/// second hides the stutter a drag feels.
+fn lab_present_gaps_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_PRESENT_GAPS").is_some())
+}
+
+static LAB_PRESENT_GAPS: std::sync::Mutex<(Option<Instant>, Vec<u32>)> =
+    std::sync::Mutex::new((None, Vec::new()));
+
+fn lab_present_gap_note() {
+    if !lab_present_gaps_on() {
+        return;
+    }
+    let now = Instant::now();
+    let mut g = LAB_PRESENT_GAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(last) = g.0.replace(now) {
+        let us = now.duration_since(last).as_micros().min(u128::from(u32::MAX)) as u32;
+        g.1.push(us);
+    }
+}
+
+fn lab_present_gap_report() {
+    if !lab_present_gaps_on() {
+        return;
+    }
+    let mut gaps = {
+        let mut g = LAB_PRESENT_GAPS.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut g.1)
+    };
+    if gaps.is_empty() {
+        return;
+    }
+    gaps.sort_unstable();
+    let at = |q: f64| gaps[((gaps.len() - 1) as f64 * q).round() as usize] as f64 / 1000.0;
+    crate::observe::off(format!(
+        "lab_present_gaps n={} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} max_ms={:.2}",
+        gaps.len(),
+        at(0.5),
+        at(0.95),
+        at(0.99),
+        at(1.0)
+    ));
+}
+
 struct CadenceBusy {
     total: u64,
     fence: u64,
