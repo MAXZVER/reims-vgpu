@@ -3359,14 +3359,27 @@ fn declare_alias_for<M: HostMemory>(
     entry: &ListObjectEntry,
     descriptor: &[u8],
 ) {
+    if access_exact() {
+        declare_alias_ungated(state, host, task_id, name, entry, descriptor);
+    }
+}
+
+/// [`declare_alias_for`] with the switch already answered, so a test states
+/// the behaviour the switch selects without a process-wide environment read.
+fn declare_alias_ungated<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    name: reims_vgpu_core::identity::ResourceId,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) {
     use crate::runtime::drain::note_store_route as note;
 
-    if !access_exact()
-        || !matches!(
-            entry.object_type,
-            OBJECT_TYPE_REF_TEXTURE | OBJECT_TYPE_TEXTURE_VIEW
-        )
-    {
+    if !matches!(
+        entry.object_type,
+        OBJECT_TYPE_REF_TEXTURE | OBJECT_TYPE_TEXTURE_VIEW
+    ) {
         return;
     }
     let depth = ALIAS_DECLARING.with(|d| d.get());

@@ -5021,6 +5021,19 @@ impl DeviceState {
             .declare_alias(reims_vgpu_core::identity::TaskId(task_id), name, alias)
     }
 
+    /// The alias a name was declared with, for a test.
+    #[cfg(test)]
+    pub(crate) fn alias_of(
+        &self,
+        task_id: u32,
+        name: reims_vgpu_core::identity::ResourceId,
+    ) -> Option<reims_vgpu_core::lifecycle::Aliasing> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alias_of(reims_vgpu_core::identity::TaskId(task_id), name)
+    }
+
     /// Retire a name: stop it resolving, and leave accepted work alone.
     ///
     /// `None` when the slot held nothing this device had named — the guest
@@ -6412,6 +6425,143 @@ mod device_access_tests {
             .access(&participation(resource, AccessMode::Read))
             .expect("declared and resident");
         assert_eq!(intent.domain, DOMAIN);
+    }
+
+    /// What the walk is handed for a name declared as a window onto another
+    /// resource: the base's memory, the record's own mode, and the ordering
+    /// that follows — through the door the walk actually uses.
+    #[test]
+    fn a_view_declared_as_an_alias_is_ordered_against_its_base_through_the_walks_door() {
+        use reims_vgpu_core::access::{requires_edge, AccessKey, ResourceKey, SubresourceRange};
+        use reims_vgpu_core::lifecycle::Aliasing;
+
+        let (state, base) = state_with_one_resource();
+        let view = state
+            .declare_object(TASK, 8, Storage::NoBytes)
+            .expect("the task is open")
+            .id;
+        let window = SubresourceRange::one(0, 2);
+        let mut access = state.task_access(TaskId(TASK), DOMAIN);
+
+        // Before anyone says what it is, the name is what it always was.
+        let undeclared = access
+            .access(&participation(view, AccessMode::Read))
+            .expect("a live name with no bytes");
+        assert_eq!(
+            undeclared.key,
+            reims_vgpu_core::access::AccessKey::DomainOnly
+        );
+
+        assert_eq!(
+            state.declare_alias(
+                TASK,
+                view,
+                Aliasing::TextureView {
+                    base,
+                    window: Some(window)
+                }
+            ),
+            Ok(true)
+        );
+        for mode in [
+            AccessMode::Read,
+            AccessMode::Write,
+            AccessMode::ReadWrite,
+            AccessMode::Unknown,
+        ] {
+            let through = access
+                .access(&participation(view, mode))
+                .expect("the alias resolves");
+            assert_eq!(through.mode, mode, "the record's mode, exactly");
+            assert_eq!(
+                through.key,
+                AccessKey::Subresource(
+                    ResourceKey {
+                        backing: BACKING,
+                        heap: None
+                    },
+                    window
+                )
+            );
+            assert_eq!(through.output_content_version, None);
+        }
+        let write_base = access
+            .access(&participation(base, AccessMode::Write))
+            .expect("the base");
+        let read_view = access
+            .access(&participation(view, AccessMode::Read))
+            .expect("the view");
+        assert!(requires_edge(&write_base, &read_view));
+    }
+
+    /// A texture over a surface is ordered against the surface the device's
+    /// mapper holds *now*: the same identity a present of that surface reads, a
+    /// different one once the pages move, and `DomainOnly` while nothing is
+    /// mapped.
+    #[test]
+    fn a_surface_alias_meets_the_present_of_its_surface_and_follows_the_mapping() {
+        use reims_vgpu_core::access::{requires_edge, AccessIntent, AccessKey, ResourceKey};
+        use reims_vgpu_core::identity::MappingId;
+        use reims_vgpu_core::lifecycle::Aliasing;
+        use reims_vgpu_core::resolve::MappingResolver as _;
+
+        let (mut state, _) = state_with_one_resource();
+        let texture = state
+            .declare_object(TASK, 9, Storage::NoBytes)
+            .expect("the task is open")
+            .id;
+        let mid = 21u32;
+        assert_eq!(
+            state.declare_alias(TASK, texture, Aliasing::Surface(MappingId(mid))),
+            Ok(true)
+        );
+        let mut draw = |state: &DeviceState| {
+            state
+                .task_access(TaskId(TASK), DOMAIN)
+                .access(&participation(texture, AccessMode::Write))
+                .expect("a live name")
+        };
+        assert_eq!(
+            draw(&state).key,
+            AccessKey::DomainOnly,
+            "nothing is mapped, so there is no surface to name"
+        );
+
+        assert!(state.map_surface(mid));
+        let first = draw(&state);
+        let surface = state.backing(MappingId(mid)).expect("mapped");
+        let key = ResourceKey {
+            backing: surface,
+            heap: None,
+        };
+        assert_eq!(first.key, AccessKey::Whole(key));
+        // The shape a present of that surface is built with.
+        let present = AccessIntent {
+            domain: DOMAIN,
+            key: AccessKey::Whole(key),
+            mode: AccessMode::Read,
+            api_stages: 0,
+            input_content_version: None,
+            output_content_version: None,
+        };
+        assert!(
+            requires_edge(&first, &present),
+            "a draw into it, then the frame"
+        );
+
+        // The mapping's pages moved: an alias that had cached the old identity
+        // would keep naming storage the mapping no longer has.
+        let entry = state.mappings.get_mut(&mid).expect("mapped");
+        DeviceState::bump_map_generation(entry);
+        let moved = draw(&state);
+        assert_ne!(moved.key, first.key);
+        assert_eq!(
+            moved.key,
+            AccessKey::Whole(ResourceKey {
+                backing: state.backing(MappingId(mid)).expect("still mapped"),
+                heap: None
+            })
+        );
     }
 
     /// A name the task never declared refuses with the owner's own slug, and

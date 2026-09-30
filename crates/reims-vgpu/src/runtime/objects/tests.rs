@@ -4699,3 +4699,187 @@ fn a_cached_resolution_is_reexamined_at_most_once_per_interval() {
     r.age_reexamination();
     assert!(r.reexamination_due(1_000 + iv + 2));
 }
+
+/// A ref texture is declared a window onto its surface, a view a window onto
+/// its base, and what the walk is then handed is the surface's memory — the
+/// thing both used to hide behind `DomainOnly`.
+///
+/// Through the guest's own object list, so the descriptors are what a driver
+/// wrote and the derivation is the one that runs: the ref texture's surface id
+/// is its mapping id, the view's base is named by reading the list, and the
+/// view's level and slice range is the view's own.
+#[test]
+fn a_ref_texture_and_a_view_over_it_are_declared_windows_and_the_walk_resolves_them() {
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
+        TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
+        TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_OPCODE, TEXTURE_VIEW_DESC_SLICE_BASE,
+        TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_DESC_TEXTURE_REF, TEXTURE_VIEW_MIN_RANGED,
+        TEXTURE_VIEW_OPCODE_RANGED,
+    };
+    use crate::runtime::gva_mem::{define_task_pages_arm64e, write_task_gva_arm64e};
+    use reims_vgpu_core::access::{
+        AccessKey, AccessMode, AccessSource as _, Participation, ParticipationExtent, ResourceKey,
+        SubresourceRange,
+    };
+    use reims_vgpu_core::identity::{ChannelId, MappingId, TaskId};
+    use reims_vgpu_core::lifecycle::Aliasing;
+    use reims_vgpu_core::resolve::MappingResolver as _;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 256));
+    let (texture_ref, view_ref) = (3u32, 8u32);
+    let surface = 9u32;
+
+    let put =
+        |host: &mut FakeHost, state: &DeviceState, obj_ref: u32, ty: u8, gva: u64, desc: &[u8]| {
+            write_task_gva_arm64e(host, &state.tasks[1], gva, desc);
+            let off = list_object_entry_offset(obj_ref, 256).expect("in range");
+            let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+            st32(&mut le[0..], u32::from(ty) | ((desc.len() as u32) << 8));
+            le[4..12].copy_from_slice(&gva.to_le_bytes());
+            write_task_gva_arm64e(host, &state.tasks[1], off, &le);
+        };
+    let mut ref_desc = vec![0u8; TYPE5_MIN_LEN];
+    st32(
+        &mut ref_desc[reims_vgpu_wire::device_desc::TYPE5_SURFACE_ID..],
+        surface,
+    );
+    put(
+        &mut host,
+        &state,
+        texture_ref,
+        OBJECT_TYPE_REF_TEXTURE,
+        0x200,
+        &ref_desc,
+    );
+
+    let mut view_desc = vec![0u8; TEXTURE_VIEW_MIN_RANGED];
+    st32(
+        &mut view_desc[TEXTURE_VIEW_DESC_OPCODE..],
+        TEXTURE_VIEW_OPCODE_RANGED,
+    );
+    st32(
+        &mut view_desc[TEXTURE_VIEW_DESC_LEN..],
+        TEXTURE_VIEW_MIN_RANGED as u32,
+    );
+    st32(&mut view_desc[TEXTURE_VIEW_DESC_TEXTURE_REF..], view_ref);
+    st32(&mut view_desc[TEXTURE_VIEW_DESC_BASE_REF..], texture_ref);
+    st64(&mut view_desc[TEXTURE_VIEW_DESC_LEVEL_BASE..], 1);
+    st64(&mut view_desc[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 2);
+    st64(&mut view_desc[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
+    st64(&mut view_desc[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
+    put(
+        &mut host,
+        &state,
+        view_ref,
+        OBJECT_TYPE_TEXTURE_VIEW,
+        0x300,
+        &view_desc,
+    );
+
+    // Named the way the walk names them. Without the switch nothing is
+    // declared, and both are the `DomainOnly` they have always been.
+    let view = name_resource(&state, &host, 1, view_ref).expect("the view names itself");
+    let texture = name_resource(&state, &host, 1, texture_ref).expect("and so does its base");
+    let domain = ChannelId(1);
+    let walk = |state: &DeviceState| {
+        state
+            .task_access(TaskId(1), domain)
+            .access(&Participation {
+                resource: view,
+                extent: ParticipationExtent::Subresource(SubresourceRange::one(0, 0)),
+                mode: AccessMode::Write,
+                api_stages: 0,
+            })
+            .expect("a live name")
+    };
+    assert_eq!(walk(&state).key, AccessKey::DomainOnly);
+
+    // The derivation, with the switch answered: base first, as naming does.
+    for (name, obj_ref) in [(texture, texture_ref), (view, view_ref)] {
+        let entry = lookup_list_entry(&state, &host, 1, obj_ref).expect("listed");
+        let desc = read_descriptor(&state, &host, 1, &entry).expect("readable");
+        declare_alias_ungated(&state, &host, 1, name, &entry, &desc);
+    }
+    assert_eq!(
+        state.alias_of(1, texture),
+        Some(Aliasing::Surface(MappingId(surface))),
+        "a ref texture's surface id is its mapping id"
+    );
+    assert_eq!(
+        state.alias_of(1, view),
+        Some(Aliasing::TextureView {
+            base: texture,
+            window: Some(SubresourceRange {
+                base_level: 1,
+                level_count: 2,
+                base_slice: 0,
+                slice_count: 1,
+                plane: 0
+            })
+        }),
+        "a view's base is the name of the slot its record points at, and its window is its own"
+    );
+
+    // No surface mapped yet: still `DomainOnly`, because there is nothing to name.
+    assert_eq!(walk(&state).key, AccessKey::DomainOnly);
+    assert!(state.map_surface(surface));
+    let key = ResourceKey {
+        backing: state.backing(MappingId(surface)).expect("mapped"),
+        heap: None,
+    };
+    let resolved = walk(&state);
+    assert_eq!(resolved.key, AccessKey::Whole(key));
+    assert_eq!(resolved.mode, AccessMode::Write, "and never a weaker one");
+}
+
+/// What a descriptor cannot say stays unsaid and is counted: a ref texture with
+/// no surface and a view with no base are not aliases of anything.
+#[test]
+fn a_descriptor_that_names_nothing_declares_no_alias() {
+    use crate::runtime::decode::resource::ListObjectEntry;
+    use crate::runtime::drain::store_route_count;
+
+    let host = FakeHost::new();
+    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let entry = |object_type: u8| ListObjectEntry {
+        object_type,
+        descriptor_length: 0,
+        descriptor_gva: 0,
+    };
+
+    let no_surface = store_route_count("alias_ref_texture_no_surface");
+    let zero = vec![0u8; TYPE5_MIN_LEN];
+    assert_eq!(
+        alias_of_descriptor(&state, &host, 1, &entry(OBJECT_TYPE_REF_TEXTURE), &zero),
+        None
+    );
+    assert_eq!(
+        store_route_count("alias_ref_texture_no_surface"),
+        no_surface + 1,
+        "surface id zero is the wire's nothing-to-show, not a surface"
+    );
+
+    let short = store_route_count("alias_ref_texture_short");
+    assert_eq!(
+        alias_of_descriptor(&state, &host, 1, &entry(OBJECT_TYPE_REF_TEXTURE), &[0u8; 3]),
+        None
+    );
+    assert_eq!(store_route_count("alias_ref_texture_short"), short + 1);
+
+    let undecodable = store_route_count("alias_view_undecodable");
+    assert_eq!(
+        alias_of_descriptor(
+            &state,
+            &host,
+            1,
+            &entry(OBJECT_TYPE_TEXTURE_VIEW),
+            &[0u8; 4]
+        ),
+        None
+    );
+    assert_eq!(store_route_count("alias_view_undecodable"), undecodable + 1);
+}
