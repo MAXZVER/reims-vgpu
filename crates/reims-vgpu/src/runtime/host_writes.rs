@@ -144,7 +144,7 @@ impl HostWriteVerdict {
 struct PageEpochs {
     /// Last epoch at which this device wrote each guest page. The page number
     /// itself selects a chunk and a cell; only populated chunks are allocated.
-    chunks: std::collections::HashMap<u64, Box<EpochChunk>>,
+    chunks: std::collections::HashMap<u64, Box<EpochChunk>, ChunkKeyHash>,
     /// Newest write that could not name its pages. Fail-closed for any reader
     /// older than it, exactly as the ring's `Unknown` entry is.
     unnamed_at: u64,
@@ -168,6 +168,34 @@ struct PageEpochs {
 const EPOCH_CHUNK_BYTES: usize = 1usize << crate::model::PAGE_SHIFT_X86;
 const EPOCHS_PER_CHUNK: usize = EPOCH_CHUNK_BYTES / std::mem::size_of::<u64>();
 const _: () = assert!(EPOCHS_PER_CHUNK.is_power_of_two());
+
+/// Hasher for [`PageEpochs::chunks`]: the key is a chunk number, a device-local
+/// integer no guest can choose to collide, so SipHash's flood resistance buys
+/// nothing there. It cost one full SipHash per scattered surface page on every
+/// vouched draw bind, a measurable share of the 5K drain.
+type ChunkKeyHash = std::hash::BuildHasherDefault<ChunkKeyHasher>;
+
+/// One multiply by the 64-bit golden ratio: odd, so a bijection on `u64`, and
+/// it carries the chunk number's varying low bits into the high bits the table
+/// takes its control tag from.
+#[derive(Default)]
+struct ChunkKeyHasher(u64);
+
+impl std::hash::Hasher for ChunkKeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ b as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+
+    fn write_u64(&mut self, key: u64) {
+        self.0 = (self.0 ^ key).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
 
 #[derive(Debug)]
 struct EpochChunk {
