@@ -1160,6 +1160,55 @@ fn lab_alias_other_level(
     other
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_FIX_PYRAMID=1` — the level identities of a
+/// mipmapped GVA texture bound through its level-0 resident, when the device
+/// rendered every level (each level's plane is declared at its own extent).
+/// macOS 26's Liquid Glass renders a blur pyramid level by level and samples it
+/// at an explicit LOD; bound as level 0 alone the blur never reaches the glass.
+fn lab_sampled_pyramid(
+    state: &DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    resource: Option<&crate::model::TaskResource>,
+    img: &crate::backend::vulkan::engine::SampledImageResource,
+) -> Option<Vec<crate::backend::vulkan::engine::TargetIdentity>> {
+    use crate::backend::vulkan::engine::{SampledSource, TargetIdentity};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_FIX_PYRAMID").is_ok_and(|v| v == "1")) {
+        return None;
+    }
+    let SampledSource::Target(base @ TargetIdentity::Gva { format, .. }) = &img.source else {
+        return None;
+    };
+    let Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) = resource?.decoded() else {
+        return None;
+    };
+    if tex.mipmap_level_count < 2 {
+        return None;
+    }
+    let key = crate::runtime::writeback_debt::GvaResourceKey { task_id, texture_ref };
+    let mut levels = Vec::with_capacity(tex.mipmap_level_count as usize);
+    for level in 0..tex.mipmap_level_count {
+        let (gva, layout) = tex.level_gva(level, state.page_shift)?;
+        let span = layout.row_stride.saturating_mul(u64::from(layout.height));
+        let generation = crate::runtime::writeback_debt::gva_plane_generation(state, key, gva, span)?;
+        let identity = TargetIdentity::Gva {
+            gva,
+            width: layout.width,
+            height: layout.height,
+            generation,
+            format: *format,
+        };
+        if level == 0 && &identity != base {
+            crate::runtime::drain::note_store_route("lab_pyramid_base_mismatch");
+            return None;
+        }
+        levels.push(identity);
+    }
+    crate::runtime::drain::note_store_route("lab_pyramid_named");
+    Some(levels)
+}
+
 /// TEMP (lab): whether `REIMS_VGPU_LAB_SMP_LINEAR` names this fragment entry.
 fn lab_smp_linear(entry: Option<&str>) -> bool {
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -8950,6 +8999,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Fragment sampled resources use +FRAG_SAMPLED when either both stages
         // sample or fragment buffers moved into the sampled/static-sampler band.
         let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> = Vec::new();
+        // TEMP (lab): guest mip chains, see `lab_sampled_pyramid`.
+        let mut lab_pyramids: Vec<crate::backend::vulkan::engine::types::SampledPyramid> = Vec::new();
         let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
         // Where each provisioned sampler's state came from, keyed by binding, for
@@ -9501,6 +9552,21 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // need it, and there is no case left to forget.
                     swizzle: view_swizzle.unwrap_or_default().after(&sampled_components),
                 });
+                if let Some(levels) = images.last().and_then(|img| {
+                    lab_sampled_pyramid(
+                        state,
+                        req.task_id,
+                        texture_ref,
+                        texture_resource.as_deref(),
+                        img,
+                    )
+                }) {
+                    lab_pyramids.push(crate::backend::vulkan::engine::types::SampledPyramid {
+                        binding: img_bind,
+                        array_element,
+                        levels,
+                    });
+                }
                 lab_sampled_bind(req, frag_stage, index, texture_ref, tw, th, images.last(), view_swizzle);
                 lab_sampled_strip_probe(req, texture_ref, images.last());
                 lab_sampled_grid_probe(req, index, texture_ref, images.last());
@@ -10424,6 +10490,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.continues_render_pass = req.continues_render_pass;
         resources.render_pass_continues = req.render_pass_continues;
         resources.samplers = samplers;
+        resources.sampled_pyramids = std::mem::take(&mut lab_pyramids);
         // Load seed always goes to the GPU (workstream D3). Premult One/OMSA is
         // hardware blend over the Load-seeded target — identical math to the
         // retired software `src + seed*(1-src.a)` path. Sampled alpha is

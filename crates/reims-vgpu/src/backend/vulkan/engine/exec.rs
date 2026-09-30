@@ -1154,6 +1154,25 @@ enum PreparedSampled {
         next_access: super::pools::ResidentAccess,
         image: SampledSlot,
     },
+    /// TEMP (lab): a guest mip chain whose levels are separate residents,
+    /// copied level by level into one mipmapped scratch image before the pass
+    /// (the snapshot arm's lifetime). `levels[i]` fills mip `i`.
+    Pyramid {
+        binding: u32,
+        array_element: u32,
+        levels: Vec<PyramidLevel>,
+        image: SampledSlot,
+    },
+}
+
+/// TEMP (lab): one source level of [`PreparedSampled::Pyramid`].
+struct PyramidLevel {
+    identity: super::types::TargetIdentity,
+    image: vk::Image,
+    access: super::pools::ResidentAccess,
+    next_access: super::pools::ResidentAccess,
+    width: u32,
+    height: u32,
 }
 
 impl PreparedSampled {
@@ -1164,6 +1183,7 @@ impl PreparedSampled {
             | Self::Resident { binding, .. }
             | Self::Feedback { binding, .. }
             | Self::Snapshot { binding, .. }
+            | Self::Pyramid { binding, .. }
             | Self::GuestDirect { binding, .. }
             | Self::GuestGather { binding, .. } => *binding,
         }
@@ -1176,6 +1196,7 @@ impl PreparedSampled {
             | Self::Resident { array_element, .. }
             | Self::Feedback { array_element, .. }
             | Self::Snapshot { array_element, .. }
+            | Self::Pyramid { array_element, .. }
             | Self::GuestDirect { array_element, .. }
             | Self::GuestGather { array_element, .. } => *array_element,
         }
@@ -1188,6 +1209,7 @@ impl PreparedSampled {
             Self::Resident { view, .. } => *view,
             Self::Feedback { view, .. } => *view,
             Self::Snapshot { image, .. } => image.view,
+            Self::Pyramid { image, .. } => image.view,
             Self::GuestDirect { view, .. } => *view,
             Self::GuestGather { image, .. } => image.view,
         }
@@ -4109,6 +4131,42 @@ pub(crate) unsafe fn execute_draw_inner(
                 // `used_binding_absent_from_layout`, so the whole draw was lost.
                 let self_slot = req.attachment_slot(identity);
                 let swizzled = !resource.swizzle.is_identity();
+                // TEMP (lab): a whole guest mip chain when the runtime named one
+                // and every level is a ready resident of its own extent.
+                if self_slot.is_none() && !swizzled {
+                    if let Some(pyramid) = req.sampled_pyramids.iter().find(|p| {
+                        p.binding == resource.binding
+                            && p.array_element == resource.array_element
+                            && p.levels.first() == Some(identity)
+                    }) {
+                        match pyramid_levels(pools, pyramid, resource.width, resource.height) {
+                            Some(levels) => {
+                                let key = SampledKey {
+                                    levels: levels.len() as u32,
+                                    ..SampledKey::of(resource)
+                                };
+                                let image =
+                                    pools.acquire_attachment_snapshot(ctx, key, counters)?;
+                                crate::runtime::drain::note_store_route("sampled_pyramid_bound");
+                                sampled.push(PreparedSampled::Pyramid {
+                                    binding: resource.binding,
+                                    array_element: resource.array_element,
+                                    levels,
+                                    image,
+                                });
+                                counters
+                                    .sampled_gpu_binds
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                continue;
+                            }
+                            None => {
+                                crate::runtime::drain::note_store_route(
+                                    "sampled_pyramid_incomplete",
+                                );
+                            }
+                        }
+                    }
+                }
                 if let Some(_attachment_index) = feedback_color_index(
                     req,
                     resource,
@@ -4543,6 +4601,80 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image(image.image)
             .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
+    }
+
+    // TEMP (lab): guest mip chains, one copy per level into the scratch pyramid.
+    let mut pyramid_sources = std::collections::HashSet::new();
+    for sampled_image in &sampled {
+        let PreparedSampled::Pyramid { levels, image, .. } = sampled_image else {
+            continue;
+        };
+        unsafe { outside_pass.before_record(PassObstacle::Snapshot, pools, &ctx.device, cb) };
+        for level in levels {
+            if pyramid_sources.insert(level.identity.clone()) {
+                barrier_resident_for_transfer_read(
+                    &ctx.device,
+                    cb,
+                    level.image,
+                    level.access,
+                    level.next_access,
+                );
+            }
+        }
+        let range = super::color_subresource_range_levels(levels.len() as u32);
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(image.image)
+            .subresource_range(range)];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
+        for (mip, level) in levels.iter().enumerate() {
+            let copy = [vk::ImageCopy::default()
+                .src_subresource(super::color_subresource_layers())
+                .dst_subresource(vk::ImageSubresourceLayers {
+                    mip_level: mip as u32,
+                    ..super::color_subresource_layers()
+                })
+                .extent(vk::Extent3D {
+                    width: level.width,
+                    height: level.height,
+                    depth: 1,
+                })];
+            ctx.device.cmd_copy_image(
+                cb,
+                level.image,
+                level.next_access.layout(),
+                image.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &copy,
+            );
+        }
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(image.image)
+            .subresource_range(range)];
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::TRANSFER,
@@ -5879,6 +6011,13 @@ pub(crate) unsafe fn execute_draw_inner(
             } if req.attachment_slot(identity).is_none() => {
                 pools.registry_note_access(identity, *next_access)
             }
+            PreparedSampled::Pyramid { levels, .. } => {
+                for level in levels {
+                    if req.attachment_slot(&level.identity).is_none() {
+                        pools.registry_note_access(&level.identity, level.next_access);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -6611,6 +6750,38 @@ pub(super) unsafe fn barrier_resident_for_transfer_read(
             &barrier,
         );
     }
+}
+
+/// TEMP (lab): every level of `pyramid` as a ready, single-sample resident
+/// of exactly its mip extent under a base of `width` x `height`, or `None`.
+fn pyramid_levels(
+    pools: &super::pools::ResourcePools,
+    pyramid: &super::types::SampledPyramid,
+    width: u32,
+    height: u32,
+) -> Option<Vec<PyramidLevel>> {
+    if pyramid.levels.len() < 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(pyramid.levels.len());
+    for (mip, identity) in pyramid.levels.iter().enumerate() {
+        let (w, h) = ((width >> mip).max(1), (height >> mip).max(1));
+        let slot = pools.registry_get(identity)?;
+        if !slot.content_ready || slot.sample_count > 1 || slot.width != w || slot.height != h {
+            return None;
+        }
+        out.push(PyramidLevel {
+            identity: identity.clone(),
+            image: slot.image,
+            access: slot.access,
+            next_access: super::pools::ResidentAccess::transfer_read(
+                slot.memory.is_guest_imported(),
+            ),
+            width: w,
+            height: h,
+        });
+    }
+    Some(out)
 }
 
 #[cfg(test)]

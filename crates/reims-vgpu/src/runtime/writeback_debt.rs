@@ -1212,6 +1212,16 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
 /// ways, in which case each draw would mint a generation and no resident could
 /// ever be reused. The line names both declarations so that reading can be made
 /// from a log rather than from a rebuild.
+/// TEMP (lab): the generation [`gva_resource_generation`] would answer for one
+/// plane of a resource, without declaring anything. `None` when this device
+/// never declared that plane at `span` — nothing rendered it — which is the
+/// answer a sampled mip chain needs before it names a level's resident.
+pub fn gva_plane_generation(state: &DeviceState, key: GvaResourceKey, gva: u64, span: u64) -> Option<u64> {
+    let (generation, declared_span, has_pages) =
+        state.pending_writebacks.gva_resource_status(key.plane(gva))?;
+    (declared_span == span && has_pages).then_some(generation)
+}
+
 pub fn gva_resource_generation<M: HostMemory>(
     state: &mut DeviceState,
     host: &M,

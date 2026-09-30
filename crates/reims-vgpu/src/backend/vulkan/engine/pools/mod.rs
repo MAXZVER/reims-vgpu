@@ -1466,6 +1466,9 @@ pub(crate) struct SampledSlot {
     /// channels. Identity is the overwhelmingly common case and keeps its own
     /// free list, so a rare swizzled bind cannot fragment the hot one.
     pub swizzle: crate::protocol::pixel_format::SwizzlePlan,
+    /// Mip levels the image and its view carry. `1` for every bind but a guest
+    /// mip chain assembled from its levels' residents (`PreparedSampled::Pyramid`).
+    pub levels: u32,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1519,6 +1522,9 @@ pub(crate) struct SampledKey {
     pub(crate) kind: reims_vgpu_core::texture_shape::TextureKind,
     pub(crate) format: ash::vk::Format,
     pub(crate) swizzle: crate::protocol::pixel_format::SwizzlePlan,
+    /// Mip levels, part of the shape: a one-level slot cannot hold a pyramid,
+    /// and a pyramid's view is not a one-level bind's.
+    pub(crate) levels: u32,
 }
 
 impl SampledKey {
@@ -1537,6 +1543,7 @@ impl SampledKey {
             kind: r.kind,
             format: r.format,
             swizzle: r.swizzle,
+            levels: 1,
         }
     }
 
@@ -1546,7 +1553,8 @@ impl SampledKey {
     /// (most plainly through component swizzles), so they keep the general
     /// sampled pool rather than entering the attachment-count-sized pool.
     pub(crate) fn is_plain_2d_identity_view(self) -> bool {
-        self.layers == 1
+        self.levels == 1
+            && self.layers == 1
             && self.kind == reims_vgpu_core::texture_shape::TextureKind::D2
             && self.swizzle.is_identity()
     }
@@ -1561,6 +1569,7 @@ impl SampledSlot {
             kind: self.kind,
             format: self.format,
             swizzle: self.swizzle,
+            levels: self.levels,
         }
     }
 
@@ -1580,6 +1589,7 @@ impl SampledSlot {
             kind: self.kind,
             format: self.format,
             swizzle: self.swizzle,
+            levels: self.levels,
         }
     }
 }

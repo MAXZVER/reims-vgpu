@@ -143,6 +143,7 @@ mod tests {
             kind: reims_vgpu_core::texture_shape::TextureKind::D2,
             format: ash::vk::Format::R8G8B8A8_UNORM,
             swizzle: Default::default(),
+            levels: 1,
         }
     }
 
