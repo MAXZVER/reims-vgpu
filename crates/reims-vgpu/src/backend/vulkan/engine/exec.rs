@@ -1154,9 +1154,10 @@ enum PreparedSampled {
         next_access: super::pools::ResidentAccess,
         image: SampledSlot,
     },
-    /// TEMP (lab): a guest mip chain whose levels are separate residents,
-    /// copied level by level into one mipmapped scratch image before the pass
-    /// (the snapshot arm's lifetime). `levels[i]` fills mip `i`.
+    /// A guest mip chain whose levels are separate residents, copied level by
+    /// level into one mipmapped scratch image before the pass, with the
+    /// snapshot arm's lifetime. `levels[i]` fills mip `i`. See
+    /// [`super::types::SampledPyramid`].
     Pyramid {
         binding: u32,
         array_element: u32,
@@ -1165,7 +1166,7 @@ enum PreparedSampled {
     },
 }
 
-/// TEMP (lab): one source level of [`PreparedSampled::Pyramid`].
+/// One source level of [`PreparedSampled::Pyramid`].
 struct PyramidLevel {
     identity: super::types::TargetIdentity,
     image: vk::Image,
@@ -4131,8 +4132,9 @@ pub(crate) unsafe fn execute_draw_inner(
                 // `used_binding_absent_from_layout`, so the whole draw was lost.
                 let self_slot = req.attachment_slot(identity);
                 let swizzled = !resource.swizzle.is_identity();
-                // TEMP (lab): a whole guest mip chain when the runtime named one
-                // and every level is a ready resident of its own extent.
+                // A whole guest mip chain when the runtime named one and every
+                // level is a ready resident of its own extent; otherwise level 0
+                // alone, as before, counted.
                 if self_slot.is_none() && !swizzled {
                     if let Some(pyramid) = req.sampled_pyramids.iter().find(|p| {
                         p.binding == resource.binding
@@ -4612,7 +4614,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
-    // TEMP (lab): guest mip chains, one copy per level into the scratch pyramid.
+    // Guest mip chains: one copy per level into the scratch pyramid.
     let mut pyramid_sources = std::collections::HashSet::new();
     for sampled_image in &sampled {
         let PreparedSampled::Pyramid { levels, image, .. } = sampled_image else {
@@ -6752,8 +6754,26 @@ pub(super) unsafe fn barrier_resident_for_transfer_read(
     }
 }
 
-/// TEMP (lab): every level of `pyramid` as a ready, single-sample resident
-/// of exactly its mip extent under a base of `width` x `height`, or `None`.
+/// Whether one registry resident can stand as mip `mip` of a chain whose base is
+/// `width` x `height`: content ready, single-sample, and exactly that level's
+/// extent. Anything else refuses the whole chain rather than binding a level
+/// whose texels are not the one the shader's LOD names.
+fn pyramid_level_admissible(
+    mip: usize,
+    width: u32,
+    height: u32,
+    slot: (u32, u32, bool, u32),
+) -> bool {
+    let (slot_width, slot_height, ready, samples) = slot;
+    let shift = u32::try_from(mip).unwrap_or(u32::MAX);
+    ready
+        && samples <= 1
+        && slot_width == width.checked_shr(shift).unwrap_or(0).max(1)
+        && slot_height == height.checked_shr(shift).unwrap_or(0).max(1)
+}
+
+/// Every level of `pyramid` as a ready, single-sample resident of exactly its
+/// mip extent under a base of `width` x `height`, or `None`.
 fn pyramid_levels(
     pools: &super::pools::ResourcePools,
     pyramid: &super::types::SampledPyramid,
@@ -6765,11 +6785,21 @@ fn pyramid_levels(
     }
     let mut out = Vec::with_capacity(pyramid.levels.len());
     for (mip, identity) in pyramid.levels.iter().enumerate() {
-        let (w, h) = ((width >> mip).max(1), (height >> mip).max(1));
         let slot = pools.registry_get(identity)?;
-        if !slot.content_ready || slot.sample_count > 1 || slot.width != w || slot.height != h {
+        if !pyramid_level_admissible(
+            mip,
+            width,
+            height,
+            (
+                slot.width,
+                slot.height,
+                slot.content_ready,
+                slot.sample_count,
+            ),
+        ) {
             return None;
         }
+        let (w, h) = (slot.width, slot.height);
         out.push(PyramidLevel {
             identity: identity.clone(),
             image: slot.image,
@@ -7650,6 +7680,19 @@ mod tests {
             identity: None,
             swizzle: Default::default(),
         }
+    }
+
+    /// A pyramid level is its resident only at exactly its mip extent, ready and
+    /// single-sample; odd extents round down and never below one texel.
+    #[test]
+    fn a_pyramid_level_stands_only_at_its_own_mip_extent() {
+        assert!(pyramid_level_admissible(0, 320, 320, (320, 320, true, 1)));
+        assert!(pyramid_level_admissible(3, 320, 320, (40, 40, true, 1)));
+        assert!(pyramid_level_admissible(2, 5, 3, (1, 1, true, 1)));
+        assert!(!pyramid_level_admissible(1, 320, 320, (320, 320, true, 1)));
+        assert!(!pyramid_level_admissible(1, 320, 320, (160, 160, false, 1)));
+        assert!(!pyramid_level_admissible(1, 320, 320, (160, 160, true, 4)));
+        assert!(!pyramid_level_admissible(40, 320, 320, (0, 0, true, 1)));
     }
 
     /// Capability and view shape jointly select the native feedback contract.

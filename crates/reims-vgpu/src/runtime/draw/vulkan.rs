@@ -1121,51 +1121,34 @@ fn lab_pick_draw(
 /// PROBE_WH) additionally requires PATH to exist, checked at most every 250 ms,
 /// so a probe can be switched on and off around a guest action within one boot.
 /// Unset: always open (the probes' own env vars still gate them).
-/// TEMP (lab): `REIMS_VGPU_LAB_ALIAS_LEVEL=1` — a fragment bind of this pass's
-/// own texture is not a self-alias when the attachment is a different mip
-/// level: the attachment's target GVA is not the sampled texture's level-0
-/// GVA. macOS 26's variable blur renders level N of one texture while sampling
-/// level N-1 of it; the alias rule substituted the level's Clear and every
-/// level above the base came out black (M1).
-fn lab_alias_other_level(
-    req: &DrawEncodeRequest,
-    texture_ref: u32,
+/// The GVA of level 0 of a sampled plain texture, which is where a bind of it
+/// starts reading. `None` for a view or a descriptor that does not decode: the
+/// caller then keeps the object-only alias rule.
+fn sampled_base_level_gva(
     resource: Option<&crate::model::TaskResource>,
     page_shift: u32,
-) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_ALIAS_LEVEL").is_ok_and(|v| v == "1")) {
-        return false;
-    }
-    let Some(color) = req
-        .colors
-        .iter()
-        .find(|c| c.texture_ref == texture_ref && c.mapping_id == 0 && c.target_gva != 0)
-    else {
-        return false;
+) -> Option<u64> {
+    let Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) = resource?.decoded() else {
+        return None;
     };
-    let Some(resource) = resource else {
-        return false;
-    };
-    let Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) = resource.decoded() else {
-        return false;
-    };
-    let other = tex.mipmap_level_count > 1
-        && tex
-            .level_gva(0, page_shift)
-            .is_some_and(|(base, _)| base != color.target_gva);
-    if other {
-        crate::runtime::drain::note_store_route("lab_alias_other_level");
-    }
-    other
+    tex.level_gva(0, page_shift).map(|(gva, _)| gva)
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_FIX_PYRAMID=1` — the level identities of a
-/// mipmapped GVA texture bound through its level-0 resident, when the device
-/// rendered every level (each level's plane is declared at its own extent).
-/// macOS 26's Liquid Glass renders a blur pyramid level by level and samples it
-/// at an explicit LOD; bound as level 0 alone the blur never reaches the glass.
-fn lab_sampled_pyramid(
+/// The level residents of a mipmapped GVA texture bound through its level-0
+/// resident, when this device rendered every level.
+///
+/// A resident is one image at one level, so a sampled `Target` bind names level
+/// 0 alone and every explicit-LOD sample clamps to it. macOS 26's Liquid Glass
+/// renders its blur pyramid level by level — each level a GVA render target of
+/// its own — and samples it at an explicit LOD; bound as level 0 the blur never
+/// reached the glass, and menus and sidebars showed a sharp, low-resolution
+/// backdrop with a bright rim at the glass edge.
+///
+/// A level is named only when its plane is declared at its own extent
+/// (`writeback_debt::gva_plane_generation`): that is the proof this device
+/// rendered it. The engine refuses the chain again at bind time if any level is
+/// not a ready resident of its mip extent, and then binds level 0 as before.
+fn sampled_mip_chain(
     state: &DeviceState,
     task_id: u32,
     texture_ref: u32,
@@ -1173,10 +1156,6 @@ fn lab_sampled_pyramid(
     img: &crate::backend::vulkan::engine::SampledImageResource,
 ) -> Option<Vec<crate::backend::vulkan::engine::TargetIdentity>> {
     use crate::backend::vulkan::engine::{SampledSource, TargetIdentity};
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_FIX_PYRAMID").is_ok_and(|v| v == "1")) {
-        return None;
-    }
     let SampledSource::Target(base @ TargetIdentity::Gva { format, .. }) = &img.source else {
         return None;
     };
@@ -1200,12 +1179,12 @@ fn lab_sampled_pyramid(
             format: *format,
         };
         if level == 0 && &identity != base {
-            crate::runtime::drain::note_store_route("lab_pyramid_base_mismatch");
+            crate::runtime::drain::note_store_route("sampled_mip_chain_base_mismatch");
             return None;
         }
         levels.push(identity);
     }
-    crate::runtime::drain::note_store_route("lab_pyramid_named");
+    crate::runtime::drain::note_store_route("sampled_mip_chain_named");
     Some(levels)
 }
 
@@ -1996,13 +1975,30 @@ pub(super) enum AttachmentAliasSample<'a> {
 /// GPU without programmable blending). With the index rule the bind fell through
 /// to the attachment's guest pages — never written, its store action is
 /// DontCare — and every app icon composited transparent.
+///
+/// # The object is not the whole answer either
+///
+/// A pass may render one mip level of a texture while sampling another — the
+/// hazard-free way to build a pyramid, and exactly how macOS 26's Liquid Glass
+/// blur renders level N from level N-1 of one texture. The attachment is then
+/// the same object at a different level, and treating the bind as a read of
+/// the attachment substituted that level's Clear: every level above the base
+/// came out transparent black. `sampled_base_gva` is the GVA of the first level
+/// the bind reads (the texture's level 0); when the attachment starts anywhere
+/// else, the bind reads other texels and resolves as an ordinary sample. `None`
+/// (a view, or an undecodable descriptor) keeps the object rule.
 pub(super) fn fragment_attachment_alias_sample<'a>(
     req: &'a DrawEncodeRequest,
     texture_ref: u32,
+    sampled_base_gva: Option<u64>,
 ) -> Option<(u32, u32, AttachmentAliasSample<'a>)> {
     let color = req.colors.iter().find(|color| {
         color.texture_ref == texture_ref && color.mapping_id == 0 && color.target_gva != 0
     })?;
+    if sampled_base_gva.is_some_and(|base| base != color.target_gva) {
+        crate::runtime::drain::note_store_route("attachment_alias_other_level");
+        return None;
+    }
     let need = (color.width as usize)
         .checked_mul(color.height as usize)?
         .checked_mul(RGBA8_BPP as usize)?;
@@ -8999,8 +8995,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Fragment sampled resources use +FRAG_SAMPLED when either both stages
         // sample or fragment buffers moved into the sampled/static-sampler band.
         let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> = Vec::new();
-        // TEMP (lab): guest mip chains, see `lab_sampled_pyramid`.
-        let mut lab_pyramids: Vec<crate::backend::vulkan::engine::types::SampledPyramid> = Vec::new();
+        // Guest mip chains the sampled binds read whole; see `sampled_mip_chain`.
+        let mut mip_chains: Vec<crate::backend::vulkan::engine::types::SampledPyramid> = Vec::new();
         let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
         // Where each provisioned sampler's state came from, keyed by binding, for
@@ -9099,11 +9095,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         crate::runtime::sampled_phase::Part::ResolveAlias,
                     );
                     let attachment_alias = frag_stage
-                        .then(|| fragment_attachment_alias_sample(req, texture_ref))
-                        .flatten()
-                        .filter(|_| {
-                            !lab_alias_other_level(req, texture_ref, texture_resource.as_deref(), state.page_shift)
-                        });
+                        .then(|| {
+                            fragment_attachment_alias_sample(
+                                req,
+                                texture_ref,
+                                sampled_base_level_gva(texture_resource.as_deref(), state.page_shift),
+                            )
+                        })
+                        .flatten();
                     if let Some((aw, ah, alias)) = attachment_alias {
                         match alias {
                             AttachmentAliasSample::Clear(clear) => (
@@ -9553,7 +9552,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     swizzle: view_swizzle.unwrap_or_default().after(&sampled_components),
                 });
                 if let Some(levels) = images.last().and_then(|img| {
-                    lab_sampled_pyramid(
+                    sampled_mip_chain(
                         state,
                         req.task_id,
                         texture_ref,
@@ -9561,7 +9560,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         img,
                     )
                 }) {
-                    lab_pyramids.push(crate::backend::vulkan::engine::types::SampledPyramid {
+                    mip_chains.push(crate::backend::vulkan::engine::types::SampledPyramid {
                         binding: img_bind,
                         array_element,
                         levels,
@@ -10490,7 +10489,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.continues_render_pass = req.continues_render_pass;
         resources.render_pass_continues = req.render_pass_continues;
         resources.samplers = samplers;
-        resources.sampled_pyramids = std::mem::take(&mut lab_pyramids);
+        resources.sampled_pyramids = std::mem::take(&mut mip_chains);
         // Load seed always goes to the GPU (workstream D3). Premult One/OMSA is
         // hardware blend over the Load-seeded target — identical math to the
         // retired software `src + seed*(1-src.a)` path. Sampled alpha is

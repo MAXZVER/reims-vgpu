@@ -441,8 +441,9 @@ impl ColorAttachmentState {
     }
 }
 
-/// TEMP (lab): one sampled binding's mip chain, level 0 first; every entry is
-/// a registry resident of exactly that level's extent.
+/// One sampled binding's mip chain, level 0 first; every entry names the
+/// registry resident a draw rendered into that level. The engine binds the
+/// chain only when each is ready at exactly its mip extent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampledPyramid {
     pub binding: u32,
@@ -511,11 +512,11 @@ pub struct DrawRequest {
     pub vertex_attributes: Vec<VertexAttributeResource>,
     pub storage_buffers: Vec<StorageBufferResource>,
     pub sampled_images: Vec<SampledImageResource>,
-    /// TEMP (lab): guest mip chains to sample whole. A [`SampledSource::Target`]
-    /// bind at one of these (binding, element) pairs names only level 0's
-    /// resident; each level of a mipmapped GVA texture the device rendered is a
-    /// resident of its own, and a shader that samples an explicit LOD needs all
-    /// of them in one image. See `PreparedSampled::Pyramid`.
+    /// Guest mip chains to sample whole. A [`SampledSource::Target`] bind at
+    /// one of these (binding, element) pairs names only level 0's resident;
+    /// each level of a mipmapped GVA texture this device rendered is a resident
+    /// of its own, and a shader that samples an explicit LOD needs all of them
+    /// in one image.
     pub sampled_pyramids: Vec<SampledPyramid>,
     pub samplers: Vec<SamplerResource>,
     /// CPU Load seed for the color target, in the order
