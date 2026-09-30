@@ -327,6 +327,17 @@ pub const FB_COPY_REPLAY: &str = "REIMS_VGPU_FB_COPY_REPLAY";
 /// animation 106 against 114-118 fps; the boot was bimodal before).
 pub const PRESENT_PAYMENT: &str = "REIMS_VGPU_PRESENT_PAYMENT";
 
+/// `off` refuses a backing surface declared with the `'A008'` FourCC (one 8-bit
+/// component per texel) as a colour attachment, as it was before the FourCC was
+/// named. Unset, it is `MTLPixelFormatR8Unorm`.
+///
+/// AppKit's full-screen transition allocates the window's mask surface in that
+/// format (lab, 5120x2176, `bytes_per_row` == width, the guest's own ref-texture
+/// view over it reads `R8Unorm`). Refused, every draw into it failed
+/// (`rt_resolve reason=rt_backing_base_format`), the mask stayed empty, and the
+/// window's document area showed the window chrome's grey instead of its content.
+pub const BACKING_A008: &str = "REIMS_VGPU_BACKING_A008";
+
 /// `off` writes a presented framebuffer back into guest RAM whole at each swap
 /// payment instead of page by page. Unset, the GPU compares the frame against
 /// the copy its pages were last written from and only the changed 4 KiB pages

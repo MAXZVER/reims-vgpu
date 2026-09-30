@@ -642,6 +642,26 @@ fn fourcc_420f_not_bgra_and_multiplanar() {
     assert_eq!(iosurface_pixel_format_to_mtl(0xdead_beef), 0);
 }
 
+/// `'A008'` is one 8-bit component per texel, which is what the surface's own
+/// geometry says (lab: 5120x2176 with `bytes_per_row` 5120) and what the view the
+/// guest binds over it declares (`R8Unorm`).
+#[test]
+fn a008_is_a_single_r8_component() {
+    use crate::protocol::pixel_format as pf;
+    assert_eq!(
+        iosurface_pixel_format_to_mtl(0x4130_3038),
+        pf::MTL_FORMAT_R8_UNORM
+    );
+    assert_eq!(
+        device_desc_format_to_mtl(0x4130_3038),
+        pf::MTL_FORMAT_R8_UNORM
+    );
+    // The stride the surface declared is the tight stride for one byte a texel.
+    assert_eq!(pf::tight_row_bytes(5120, pf::MTL_FORMAT_R8_UNORM), Some(5120));
+    // A neighbour nobody has seen stays refused.
+    assert_eq!(iosurface_pixel_format_to_mtl(0x4130_3039), 0);
+}
+
 /// A small value is not an MTLPixelFormat ordinal in disguise.
 ///
 /// The converter used to return `pixel_format as u16` for anything at or

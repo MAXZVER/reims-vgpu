@@ -724,9 +724,37 @@ pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
         // 'R8  ' / 'RG08' if ever seen as OSType:
         0x5238_2020 => MTL_FORMAT_R8_UNORM,
         0x5247_3038 => MTL_FORMAT_RG8_UNORM,
+        // 'A008' — one 8-bit component per texel. Seen as the mask surface of a
+        // full-screen window transition (macos-26 TextEdit, 5120x2176): the
+        // backing record's `bytes_per_row` is the width (one byte a texel) and
+        // its `length` 0xaa0000 is that stride times 2176, and the ref-texture
+        // view the guest binds over the same allocation declares `0xa`
+        // (`MTLPixelFormatR8Unorm`), reported as `rt_ref_texture_view_differs
+        // sid=48 view=5120x2176 fmt=0xa ... base fmt=0x0`. Two independent
+        // sources agree, which is why it is stated rather than proposed. Before
+        // this arm the surface reached `rt_backing_base_format` as a zero, every
+        // draw into it failed, and the window's document area kept the chrome's
+        // grey.
+        0x4130_3038 if backing_a008_enabled() => MTL_FORMAT_R8_UNORM,
         // Unknown FourCC: 0 — callers fail closed (no BGRA invent).
         _ => 0,
     }
+}
+
+/// Whether the `'A008'` backing FourCC is named (see
+/// [`crate::config::BACKING_A008`]). Latched for the process.
+fn backing_a008_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let (state, value) = crate::config::read(crate::config::BACKING_A008);
+        let on = !matches!(state, crate::config::Switch::Off);
+        crate::observe::off(format!(
+            "backing_a008 named={on} switch={state:?} value={}",
+            value.unwrap_or_else(|| "<unset>".into())
+        ));
+        on
+    })
 }
 
 /// Decode one backing plane record.
