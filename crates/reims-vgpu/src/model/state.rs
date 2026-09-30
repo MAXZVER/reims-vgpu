@@ -4846,6 +4846,51 @@ impl DeviceState {
         ))
     }
 
+    /// The dependency graph's own census, once a second, or `None` between
+    /// windows.
+    ///
+    /// **The numbers the graph has always kept and nothing exported.**
+    /// [`reims_vgpu_core::depend::Census`] counts every access admitted by the
+    /// rung of the precision ladder it arrived on, every hazard edge drawn, and
+    /// — separately — the edges and the comparisons that exist only because an
+    /// access was `DomainOnly` or its direction was `Unknown`. Those last two
+    /// are the price of imprecision stated in the graph's own units, and the
+    /// route counters beside it (`access_mode_*`) count *accesses*, which is a
+    /// different population: one `Unknown` slot on a hot buffer is one access
+    /// and thousands of edges.
+    ///
+    /// Cumulative since the model was built, like every other census here, so a
+    /// reader takes differences across the window it cares about. Quiet until
+    /// something has been admitted.
+    pub fn dependency_graph_census(&self) -> Option<String> {
+        const WINDOW_MS: u64 = 1000;
+        static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = crate::observe::elapsed_ms() as u64;
+        let last = LAST_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < WINDOW_MS {
+            return None;
+        }
+        let (census, live, slots) = {
+            let session = self.session.lock().expect("session");
+            let graph = session.graph();
+            (graph.census(), graph.live_accesses(), graph.entries())
+        };
+        if census.accesses == 0 {
+            return None;
+        }
+        LAST_MS.store(now, Ordering::Relaxed);
+        Some(format!(
+            "dependency_graph accesses={} edges={} rung1={} rung2={} rung3={}              domain_only_comparisons={} edges_from_unknown_mode={} live={live} slots={slots}",
+            census.accesses,
+            census.edges,
+            census.by_rung[0],
+            census.by_rung[1],
+            census.by_rung[2],
+            census.domain_only_comparisons,
+            census.edges_from_unknown_mode,
+        ))
+    }
+
     /// The open child domains as the bit mask this device's registers speak in.
     ///
     /// Derived on each ask rather than mirrored into a field: a mirror is the
