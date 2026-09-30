@@ -1455,10 +1455,53 @@ fn observe<M: crate::runtime::host::HostOps>(
     // Copied out before the entry is borrowed mutably: the policy belongs to the
     // witness and the decisions that read it belong to one of its entries.
     let density = witness.audit;
+    let binds = witness.binds;
     let entry = witness
         .entries
         .get_mut(&key)
         .expect("the stale branch above returns for every absent key");
+    let mut routes = Vec::new();
+    let observation = decide_warm(
+        entry,
+        &*host,
+        key,
+        runs,
+        span,
+        pages_wrote,
+        pending,
+        stated_now,
+        pages_epoch,
+        fresh_generation,
+        density,
+        &mut routes,
+    );
+    entry.last_seen = binds;
+    for route in routes {
+        crate::runtime::drain::note_store_route(route);
+    }
+    observation
+}
+
+/// The warm half of [`observe`]: a window already tracked with the same page
+/// set, decided from its entry and this bind's readings. Rewrites the entry in
+/// place, except `last_seen` (the caller's bind count), and collects the census
+/// routes it takes instead of noting them, so the same decision can run on a
+/// clone of the entry off the drain thread ([`plan_gather`]) and be applied later.
+#[allow(clippy::too_many_arguments)]
+fn decide_warm<M: crate::runtime::host::HostOps>(
+    entry: &mut Entry,
+    host: &M,
+    key: GatherKey,
+    runs: &[crate::runtime::guest_ram::GuestRun],
+    span: u64,
+    pages_wrote: Option<crate::runtime::host_writes::HostWriteVerdict>,
+    pending: PendingWrites,
+    stated_now: Option<u32>,
+    pages_epoch: u64,
+    fresh_generation: u64,
+    density: AuditDensity,
+    routes: &mut Vec<&'static str>,
+) -> GatherObservation {
     // A generation of 0 on either side is "cannot tell": the token is unarmed,
     // was released with its pages, or has not survived the two harvests the
     // dirty adapter needs before it can answer at all.
@@ -1495,7 +1538,7 @@ fn observe<M: crate::runtime::host::HostOps>(
     let gen = if entry.token == 0 {
         0
     } else if lagged {
-        crate::runtime::drain::note_store_route("lab_gw_lagged");
+        routes.push("lab_gw_lagged");
         host.guest_write_gen_lagged(entry.token).unwrap_or(0)
     } else {
         host.guest_write_gen(entry.token).unwrap_or(0)
@@ -1513,7 +1556,7 @@ fn observe<M: crate::runtime::host::HostOps>(
     };
     if lagged && gen != 0 && gen != entry.gen {
         // The lagged read itself caught a write the guest did not state.
-        crate::runtime::drain::note_store_route("lab_gw_lagged_caught");
+        routes.push("lab_gw_lagged_caught");
     }
     let vouched = matches!(verdict, GatherVerdict::Vouched);
 
@@ -1614,7 +1657,6 @@ fn observe<M: crate::runtime::host::HostOps>(
     }
     entry.gen = gen;
     entry.pages_epoch = pages_epoch;
-    entry.last_seen = witness.binds;
     GatherObservation {
         verdict,
         audit,
