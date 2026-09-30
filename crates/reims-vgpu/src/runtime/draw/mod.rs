@@ -988,14 +988,16 @@ pub(crate) fn publish_pipeline_usage<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("pipeline_usage_unnamed");
         return;
     };
-    crate::runtime::drain::note_store_route(if state.publish_pipeline_usage(name, usage) {
-        "pipeline_usage_published"
-    } else {
-        // The same population `pipeline_advance_declined` describes: a build
-        // finishing after the guest's delete, or a rail with no retained
-        // pipeline state re-walking one the table has already retired.
-        "pipeline_usage_declined"
-    });
+    crate::runtime::drain::note_store_route(
+        if state.publish_pipeline_usage(task_id, name, usage) {
+            "pipeline_usage_published"
+        } else {
+            // The same population `pipeline_advance_declined` describes: a build
+            // finishing after the guest's delete, or a rail with no retained
+            // pipeline state re-walking one the table has already retired.
+            "pipeline_usage_declined"
+        },
+    );
 }
 
 /// Step the pipeline `pipeline_ref` names along its build.

@@ -682,7 +682,7 @@ pub fn device_packet<M: crate::runtime::host::HostMemory>(
     // held for exactly one packet's walk. Safe to hold across it because every
     // other owner the walk reaches — the namespaces and the access source — is
     // the `lifecycle` owner's and not this one's.
-    let usages = state.pipeline_usage();
+    let usages = state.pipeline_usage(task.0);
     let no_streams: [Vec<u8>; 0] = [];
     packet(
         fifo,

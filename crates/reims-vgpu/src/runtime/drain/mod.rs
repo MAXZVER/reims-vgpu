@@ -2286,7 +2286,10 @@ fn admit_and_park<H: HostMemory + HostOps>(
             .payload
             .exec()
             .and_then(|work| work.usage_census.first_unanswered_pipeline);
-        if unanswered.is_some_and(|id| state.pipeline_usage_published(id)) {
+        if unanswered
+            .zip(claiming_task)
+            .is_some_and(|(id, task)| state.pipeline_usage_published(task, id))
+        {
             match crate::runtime::ingress::device_packet(
                 state,
                 host,
@@ -2317,8 +2320,8 @@ fn admit_and_park<H: HostMemory + HostOps>(
                                 id.generation.0,
                                 claiming_task,
                                 state.pipeline_state(id).unwrap_or("unleased"),
-                                state.pipeline_usage_published(id),
-                                state.pipeline_usage_wanted(id),
+                                state.pipeline_usage_published(claiming_task.unwrap_or(0), id),
+                                state.pipeline_usage_wanted(claiming_task.unwrap_or(0), id),
                             ));
                         }
                     }
@@ -2350,6 +2353,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
     let ingress = transaction.identity.ingress;
     lab_dag_admit(
         state,
+        claiming_task,
         &transaction,
         &admission.admitted.hazard_waits,
         admission.admitted.ready,
@@ -2536,7 +2540,7 @@ pub(crate) fn lab_note_memo_skip(state: &DeviceState, task_id: u32, pipeline_ref
         note_store_route("lab_memo_skip_unnamed");
         return;
     };
-    let published = state.pipeline_usage_published(name);
+    let published = state.pipeline_usage_published(task_id, name);
     note_store_route(if published {
         "lab_memo_skip_published"
     } else {
@@ -2624,6 +2628,7 @@ static LAB_DAG_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 
 fn lab_dag_admit(
     state: &DeviceState,
+    task: Option<u32>,
     transaction: &reims_vgpu_core::transaction::DeviceTransaction,
     hazards: &[reims_vgpu_core::identity::IngressOrdinal],
     ready: bool,
@@ -2688,7 +2693,7 @@ fn lab_dag_admit(
                 id.generation.0,
                 at_walk.unwrap_or("?"),
                 state.pipeline_state(id).unwrap_or("unleased"),
-                u8::from(state.pipeline_usage_published(id)),
+                u8::from(task.is_some_and(|task| state.pipeline_usage_published(task, id))),
                 c.draws_with_no_stage_published + c.dispatches_with_no_stage_published,
             ))
         })

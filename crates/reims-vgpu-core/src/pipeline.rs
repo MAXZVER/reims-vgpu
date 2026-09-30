@@ -28,7 +28,7 @@
 //! result may be dropped.
 
 use crate::access::AccessMode;
-use crate::identity::{ResourceId, SessionGeneration};
+use crate::identity::{ResourceId, SessionGeneration, TaskId};
 use reims_vgpu_protocol::render::ShaderStage;
 use std::collections::HashMap;
 
@@ -459,8 +459,30 @@ pub struct PipelineTable {
     /// or un-builds it removes this too, because a reflection is a fact about a
     /// build and a pipeline that has to be built again has not published
     /// anything about the build that will replace it.
-    usage: HashMap<ResourceId, PublishedUsage>,
+    ///
+    /// Keyed by the pipeline **and the task whose shader it describes**, because
+    /// the pipeline's own key is not enough: an id is an object-list slot and
+    /// that slot's generation, and every task numbers its own list from the same
+    /// small integers, so two tasks' pipelines at slot 30, generation 1, are one
+    /// id. A driven Tahoe desktop has a hundred and fifty such ids shared between
+    /// its tasks. Keyed by the id alone, the first task to publish answered for
+    /// all of them — the narrower footprint derived from *another task's shader*
+    /// that the rule above exists to prevent. `None` is a caller that names no
+    /// task, which is how every caller that predates this spoke, and all of them
+    /// share the one key.
+    usage: HashMap<(Option<TaskId>, ResourceId), PublishedUsage>,
     census: Census,
+}
+
+/// Forget every reflection published for `id`, whichever task published it.
+///
+/// What every event that ends or rebuilds a pipeline has to do: those events
+/// are about the pipeline's id and not about one task's claim on it.
+fn drop_usage_of(
+    usage: &mut HashMap<(Option<TaskId>, ResourceId), PublishedUsage>,
+    id: &ResourceId,
+) {
+    usage.retain(|(_, published), _| published != id);
 }
 
 impl UsageSource for PipelineTable {
@@ -469,7 +491,23 @@ impl UsageSource for PipelineTable {
         pipeline: ResourceId,
         stage: Option<ShaderStage>,
     ) -> Option<&BindingUsage> {
-        self.usage.get(&pipeline)?.stage(stage)
+        self.binding_usage_of(None, pipeline, stage)
+    }
+}
+
+impl PipelineTable {
+    /// One stage of the reflection published for `owner`'s use of `pipeline`.
+    ///
+    /// `owner` is the task whose shader the reflection describes, or `None` for
+    /// the caller that names none. See [`Self::usage`]'s field documentation.
+    #[must_use]
+    pub fn binding_usage_of(
+        &self,
+        owner: Option<TaskId>,
+        pipeline: ResourceId,
+        stage: Option<ShaderStage>,
+    ) -> Option<&BindingUsage> {
+        self.usage.get(&(owner, pipeline))?.stage(stage)
     }
 }
 
@@ -639,7 +677,13 @@ impl PipelineTable {
     /// pass is what lands it.
     #[must_use]
     pub fn usage_published(&self, id: ResourceId) -> bool {
-        self.usage.contains_key(&id)
+        self.usage_published_by(None, id)
+    }
+
+    /// [`Self::usage_published`] for `owner`'s reflection of the pipeline.
+    #[must_use]
+    pub fn usage_published_by(&self, owner: Option<TaskId>, id: ResourceId) -> bool {
+        self.usage.contains_key(&(owner, id))
     }
 
     /// Whether publishing this pipeline's usage now would land: the table
@@ -659,7 +703,14 @@ impl PipelineTable {
     /// [`Self::usage_wanted`] for a caller publishing to `to`.
     #[must_use]
     pub fn usage_wanted_by(&self, id: ResourceId, to: PublishTo) -> bool {
-        self.pipelines.get(&id).is_some_and(|p| to.takes(p.state)) && !self.usage.contains_key(&id)
+        self.usage_wanted_for(None, id, to)
+    }
+
+    /// [`Self::usage_wanted_by`] for a reflection `owner` would publish.
+    #[must_use]
+    pub fn usage_wanted_for(&self, owner: Option<TaskId>, id: ResourceId, to: PublishTo) -> bool {
+        self.pipelines.get(&id).is_some_and(|p| to.takes(p.state))
+            && !self.usage.contains_key(&(owner, id))
     }
 
     /// Advance a pipeline. Returns whether the step was legal and taken.
@@ -715,7 +766,7 @@ impl PipelineTable {
                 // behind it would be answered for a later pipeline that
                 // reused the id, which is a narrower footprint derived from
                 // another object's shader.
-                self.usage.remove(&id);
+                drop_usage_of(&mut self.usage, &id);
             }
             _ => {}
         }
@@ -745,7 +796,7 @@ impl PipelineTable {
             // one it held, and a reflection published for a deleted pipeline
             // (see [`PublishTo`]) described that one. The next publication is
             // the new build's.
-            self.usage.remove(&id);
+            drop_usage_of(&mut self.usage, &id);
             return false;
         }
         if p.state != PipelineState::Ready {
@@ -754,7 +805,7 @@ impl PipelineTable {
         p.state = PipelineState::Translating;
         // The build this described is the one the executor just said it no
         // longer holds. What the rebuild publishes is the rebuild's.
-        self.usage.remove(&id);
+        drop_usage_of(&mut self.usage, &id);
         self.census.withdrawn += 1;
         true
     }
@@ -772,7 +823,7 @@ impl PipelineTable {
         self.census.refused += 1;
         // A build that will not happen publishes nothing, and anything already
         // published described a build this refusal supersedes.
-        self.usage.remove(&id);
+        drop_usage_of(&mut self.usage, &id);
         true
     }
 
@@ -947,13 +998,25 @@ impl PipelineTable {
         usage: PublishedUsage,
         to: PublishTo,
     ) -> bool {
+        self.publish_usage_as(None, id, usage, to)
+    }
+
+    /// [`Self::publish_usage_to`] for the reflection of `owner`'s pipeline: what
+    /// lands is answered to that task's walks and to no other's.
+    pub fn publish_usage_as(
+        &mut self,
+        owner: Option<TaskId>,
+        id: ResourceId,
+        usage: PublishedUsage,
+        to: PublishTo,
+    ) -> bool {
         let Some(p) = self.pipelines.get(&id) else {
             return false;
         };
         if !to.takes(p.state) {
             return false;
         }
-        self.usage.insert(id, usage);
+        self.usage.insert((owner, id), usage);
         true
     }
 
@@ -1014,7 +1077,7 @@ impl PipelineTable {
             false
         });
         for id in &out.removed {
-            self.usage.remove(id);
+            drop_usage_of(&mut self.usage, id);
         }
         out.destroy.sort_unstable();
         out.removed.sort_unstable();
@@ -1069,7 +1132,7 @@ impl PipelineTable {
             // incarnation that just ended. The shader is the guest's and does
             // not change, but the pipeline these were published against is
             // gone, and a rebuild republishes.
-            self.usage.remove(id);
+            drop_usage_of(&mut self.usage, id);
             rebuilding.push(*id);
         }
         rebuilding.sort_unstable();
@@ -1088,7 +1151,8 @@ impl PipelineTable {
         // Belt and braces against a retired entry that reached this table by
         // some door other than `advance`: an entry here with no pipeline beside
         // it would be answered for whatever next takes the id.
-        self.usage.retain(|id, _| self.pipelines.contains_key(id));
+        self.usage
+            .retain(|(_, id), _| self.pipelines.contains_key(id));
     }
 
     #[must_use]
@@ -1336,6 +1400,109 @@ mod tests {
             t.usage_wanted_by(id(1), PublishTo::LiveAndDeleted),
             "the rebuild's is next"
         );
+    }
+
+    /// Two tasks whose pipelines have the same id each get the reflection of
+    /// their own shader, and a third task is answered neither.
+    ///
+    /// The id is a slot and a generation and every task numbers its own object
+    /// list from the same integers, so this is not a corner: it is the ordinary
+    /// shape of a desktop with several clients. Keyed by the id alone the first
+    /// publication answered for all of them.
+    #[test]
+    fn two_tasks_sharing_a_pipeline_id_are_answered_their_own_reflections() {
+        use reims_vgpu_protocol::render::ShaderStage;
+        let usage = |mode| {
+            PublishedUsage::render(Some(BindingUsage::new(vec![Some(mode)], Vec::new())), None)
+        };
+        let (a, b, c) = (Some(TaskId(1)), Some(TaskId(3)), Some(TaskId(9)));
+        let slot0 = |t: &PipelineTable, owner| {
+            t.binding_usage_of(owner, id(1), Some(ShaderStage::Vertex))
+                .and_then(|u| u.buffer(0))
+        };
+        let mut t = PipelineTable::new();
+        assert!(t.declare(id(1), GEN));
+        assert!(t.publish_usage_as(a, id(1), usage(AccessMode::Read), PublishTo::Live));
+        assert!(
+            t.usage_wanted_for(b, id(1), PublishTo::Live),
+            "a's publication does not cover b"
+        );
+        assert!(t.publish_usage_as(b, id(1), usage(AccessMode::Write), PublishTo::Live));
+
+        assert_eq!(slot0(&t, a), Some(AccessMode::Read));
+        assert_eq!(slot0(&t, b), Some(AccessMode::Write));
+        assert_eq!(
+            slot0(&t, c),
+            None,
+            "a task that published nothing is answered nothing"
+        );
+        assert_eq!(
+            slot0(&t, None),
+            None,
+            "and neither is a caller naming no task"
+        );
+        assert!(t.usage_published_by(a, id(1)) && t.usage_published_by(b, id(1)));
+        assert!(!t.usage_published_by(c, id(1)));
+        assert!(t.usage_wanted_for(c, id(1), PublishTo::Live));
+    }
+
+    /// Everything that ends or rebuilds a pipeline ends every task's reflection
+    /// of it: those events are about the id, not about one task's claim.
+    #[test]
+    fn ending_a_pipeline_ends_every_tasks_reflection_of_it() {
+        let usage = || {
+            PublishedUsage::render(
+                Some(BindingUsage::new(vec![Some(AccessMode::Read)], Vec::new())),
+                None,
+            )
+        };
+        let (a, b) = (Some(TaskId(1)), Some(TaskId(3)));
+        let ready = || {
+            let mut t = PipelineTable::new();
+            assert!(t.declare(id(1), GEN));
+            for step in [
+                PipelineState::Translating,
+                PipelineState::Compiling,
+                PipelineState::Ready,
+            ] {
+                assert!(t.advance(id(1), step));
+            }
+            assert!(t.publish_usage_as(a, id(1), usage(), PublishTo::Live));
+            assert!(t.publish_usage_as(b, id(1), usage(), PublishTo::Live));
+            t
+        };
+        let held = |t: &PipelineTable| {
+            (
+                t.usage_published_by(a, id(1)),
+                t.usage_published_by(b, id(1)),
+            )
+        };
+
+        let mut t = ready();
+        assert_eq!(held(&t), (true, true));
+        assert!(t.withdraw(id(1)));
+        assert_eq!(held(&t), (false, false), "withdrawn");
+
+        let mut t = ready();
+        assert!(t.retire(id(1)));
+        assert_eq!(held(&t), (false, false), "retired");
+
+        // A refusal is a step only a pipeline still building can take.
+        let mut t = PipelineTable::new();
+        assert!(t.declare(id(1), GEN));
+        assert!(t.publish_usage_as(a, id(1), usage(), PublishTo::Live));
+        assert!(t.publish_usage_as(b, id(1), usage(), PublishTo::Live));
+        assert_eq!(held(&t), (true, true));
+        assert!(t.refuse(id(1), RefusalReason::TranslationFailed("test")));
+        assert_eq!(held(&t), (false, false), "refused");
+
+        let mut t = ready();
+        assert!(!t.device_lost().is_empty());
+        assert_eq!(held(&t), (false, false), "device lost");
+
+        let mut t = ready();
+        let _ = t.generation_closed(GEN);
+        assert_eq!(held(&t), (false, false), "generation closed");
     }
 
     /// A pipeline is wanted exactly while the table holds it, it has not ended,

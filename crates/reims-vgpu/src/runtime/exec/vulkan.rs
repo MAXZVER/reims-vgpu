@@ -70,7 +70,7 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             if crate::runtime::objects::access_exact()
                 && state
                     .object_name(task_id, pipeline_ref)
-                    .is_some_and(|name| state.pipeline_usage_wanted(name))
+                    .is_some_and(|name| state.pipeline_usage_wanted(task_id, name))
                 && crate::backend::vulkan::pipeline_resolve::publish_memoized_usage(
                     state,
                     host,
@@ -174,7 +174,7 @@ fn publish_render_usage<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("pipeline_usage_unnamed");
         return;
     };
-    if state.pipeline_usage_published(name) {
+    if state.pipeline_usage_published(task_id, name) {
         crate::runtime::drain::note_store_route("render_usage_already_published");
         return;
     }
@@ -311,7 +311,7 @@ fn publish_kernel_usage<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("pipeline_usage_unnamed");
         return;
     };
-    if state.pipeline_usage_published(name) {
+    if state.pipeline_usage_published(task_id, name) {
         crate::runtime::drain::note_store_route("compute_usage_already_published");
         return;
     }

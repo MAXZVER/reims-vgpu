@@ -516,7 +516,7 @@ fn publish_usage_if_unpublished<M: HostMemory + HostOps>(
         note_store_route("pipeline_usage_unnamed");
         return;
     };
-    if state.pipeline_usage_published(name) {
+    if state.pipeline_usage_published(task_id, name) {
         note_store_route("render_usage_already_published");
         return;
     }

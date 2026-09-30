@@ -4524,6 +4524,7 @@ impl DeviceState {
     /// [`reims_vgpu_core::pipeline::PipelineTable::publish_usage`].
     pub fn publish_pipeline_usage(
         &self,
+        task_id: u32,
         pipeline: reims_vgpu_core::identity::ResourceId,
         usage: reims_vgpu_core::pipeline::PublishedUsage,
     ) -> bool {
@@ -4531,7 +4532,12 @@ impl DeviceState {
             .lock()
             .expect("session")
             .pipelines()
-            .publish_usage_to(pipeline, usage, self.usage_scope())
+            .publish_usage_as(
+                Self::usage_owner(task_id),
+                pipeline,
+                usage,
+                self.usage_scope(),
+            )
     }
 
     /// Whether an executor has already published this pipeline's reflection.
@@ -4543,23 +4549,40 @@ impl DeviceState {
     /// the memo is the model's and not the rail's.
     pub fn pipeline_usage_published(
         &self,
+        task_id: u32,
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> bool {
         self.session
             .lock()
             .expect("session")
             .pipelines()
-            .usage_published(pipeline)
+            .usage_published_by(Self::usage_owner(task_id), pipeline)
     }
 
     /// Whether publishing this pipeline's usage now would land. See
     /// [`reims_vgpu_core::pipeline::PipelineTable::usage_wanted`].
-    pub fn pipeline_usage_wanted(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
+    pub fn pipeline_usage_wanted(
+        &self,
+        task_id: u32,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> bool {
         self.session
             .lock()
             .expect("session")
             .pipelines()
-            .usage_wanted_by(pipeline, self.usage_scope())
+            .usage_wanted_for(Self::usage_owner(task_id), pipeline, self.usage_scope())
+    }
+
+    /// Whose reflection a publication or a lookup is about.
+    ///
+    /// A pipeline's id is an object-list slot and its generation, and every
+    /// task numbers its own list from the same small integers, so one id can be
+    /// several tasks' pipelines. With `REIMS_VGPU_ACCESS_EXACT` on, a reflection
+    /// is published for — and answered to — the task whose shader it describes.
+    /// Off, every caller shares the one key, which is what this has always been.
+    fn usage_owner(task_id: u32) -> Option<reims_vgpu_core::identity::TaskId> {
+        crate::runtime::objects::access_exact()
+            .then_some(reims_vgpu_core::identity::TaskId(task_id))
     }
 
     /// Which pipelines a reflection is published for on this device.
@@ -4585,8 +4608,11 @@ impl DeviceState {
     /// [`Self::task_access`] and the name resolvers are the `lifecycle` owner's,
     /// which is a different lock.
     #[must_use]
-    pub fn pipeline_usage(&self) -> PipelineUsage<'_> {
-        PipelineUsage(self.session.lock().expect("session"))
+    pub fn pipeline_usage(&self, task_id: u32) -> PipelineUsage<'_> {
+        PipelineUsage(
+            self.session.lock().expect("session"),
+            Self::usage_owner(task_id),
+        )
     }
 
     /// A pipeline finished building and is usable.
@@ -6632,6 +6658,62 @@ mod device_access_tests {
         );
     }
 
+    /// With the switch on, a reflection is answered to the task whose shader it
+    /// describes; off, every task shares the one key it always shared.
+    ///
+    /// The id is a slot and a generation and every task numbers its own list from
+    /// the same integers, so pipeline 30 of task 1 and pipeline 30 of task 3 are
+    /// one id. A reflection published for the first, answered to the second, is a
+    /// footprint derived from another task's shader.
+    #[test]
+    fn a_reflection_is_answered_to_the_task_that_published_it_only_with_the_switch_on() {
+        use reims_vgpu_core::access::AccessMode;
+        use reims_vgpu_core::identity::ResourceId;
+        use reims_vgpu_core::pipeline::{BindingUsage, PublishedUsage, UsageSource as _};
+        use reims_vgpu_protocol::render::ShaderStage;
+
+        let pipeline = ResourceId {
+            slot: reims_vgpu_core::identity::ObjectListRef(30),
+            generation: reims_vgpu_core::identity::SlotGeneration::default().next(),
+        };
+        let usage = || {
+            PublishedUsage::render(
+                Some(BindingUsage::new(vec![Some(AccessMode::Read)], Vec::new())),
+                None,
+            )
+        };
+        let answered = |state: &DeviceState, task: u32| {
+            state
+                .pipeline_usage(task)
+                .binding_usage(pipeline, Some(ShaderStage::Vertex))
+                .is_some()
+        };
+        let build = || {
+            let state = DeviceState::new(DeviceId(1), 12);
+            assert!(state.declare_pipeline(pipeline));
+            state
+        };
+
+        let state = build();
+        crate::runtime::objects::with_access_exact(true, || {
+            assert!(state.publish_pipeline_usage(1, pipeline, usage()));
+            assert!(answered(&state, 1), "the task that published is answered");
+            assert!(!answered(&state, 3), "another task with the same id is not");
+            assert!(state.pipeline_usage_published(1, pipeline));
+            assert!(!state.pipeline_usage_published(3, pipeline));
+            assert!(state.pipeline_usage_wanted(3, pipeline));
+        });
+
+        let state = build();
+        crate::runtime::objects::with_access_exact(false, || {
+            assert!(state.publish_pipeline_usage(1, pipeline, usage()));
+            assert!(
+                answered(&state, 3),
+                "switch off: one key for every task, as it always was"
+            );
+        });
+    }
+
     /// A name the task never declared refuses with the owner's own slug, and
     /// refuses rather than resolving to whatever the slot used to hold.
     #[test]
@@ -7491,7 +7573,10 @@ mod slot_table_reach_tests {
 ///
 /// See [`DeviceState::pipeline_usage`] for why this is a guard and not a
 /// lookup.
-pub struct PipelineUsage<'a>(std::sync::MutexGuard<'a, reims_vgpu_core::session::SessionModel>);
+pub struct PipelineUsage<'a>(
+    std::sync::MutexGuard<'a, reims_vgpu_core::session::SessionModel>,
+    Option<reims_vgpu_core::identity::TaskId>,
+);
 
 impl std::fmt::Debug for PipelineUsage<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -7505,6 +7590,8 @@ impl reims_vgpu_core::pipeline::UsageSource for PipelineUsage<'_> {
         pipeline: reims_vgpu_core::identity::ResourceId,
         stage: Option<reims_vgpu_protocol::render::ShaderStage>,
     ) -> Option<&reims_vgpu_core::pipeline::BindingUsage> {
-        self.0.pipelines_ref().binding_usage(pipeline, stage)
+        self.0
+            .pipelines_ref()
+            .binding_usage_of(self.1, pipeline, stage)
     }
 }
