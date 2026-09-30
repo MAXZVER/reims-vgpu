@@ -125,6 +125,11 @@ struct BoundDevice {
     vbl_last_us: AtomicU64,
     /// QEMU HostOps (GPA / clock / schedule worker). None in pure unit tests.
     ops: Option<ReimsVgpuHostOps>,
+    /// The device's parallel worker pool, when its shim can register worker
+    /// threads with RCU. The same pool `DeviceState::par` hands the draw rails;
+    /// held here as well so `device_destroy` can stop and join its threads
+    /// without taking the device lock.
+    par: Option<Arc<crate::runtime::par::Pool>>,
     /// Host-owned presentation window ([[host-window]]), once
     /// `device_window_start` has spawned it. `None` on a normal QEMU-display
     /// boot (the window is opt-in behind `REIMS_VGPU_WINDOW`).
@@ -225,7 +230,20 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     // says so on the fail channel at create, in front of the guest work that
     // would otherwise be the first to notice.
     crate::observe::off(format!("backend_selected name={}", backend_name()));
-    let dev = Device::new(DeviceId(id), page_shift);
+    let mut dev = Device::new(DeviceId(id), page_shift);
+    // Built cold: no thread exists until a scope wants one, so a device whose
+    // switches are all off runs exactly as before. `None` for a shim that offers
+    // no RCU registration for worker threads (the sysbus one), which is how the
+    // pool stays off where nobody verified a second guest-memory reader.
+    let par = ops
+        .as_ref()
+        .and_then(|ops| {
+            crate::runtime::par::Pool::new(ops, &crate::runtime::par::Settings::from_env())
+        })
+        .map(Arc::new);
+    if let Some(pool) = &par {
+        dev.state.install_par_pool(Arc::clone(pool));
+    }
     let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
     let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
@@ -256,6 +274,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             vbl_page_size: AtomicU64::new(0),
             vbl_last_us: AtomicU64::new(0),
             ops,
+            par,
             #[cfg(feature = "host-window")]
             window: Mutex::new(None),
             #[cfg(feature = "host-window")]
@@ -345,7 +364,15 @@ pub fn device_reset(id: u64) -> bool {
 }
 
 pub fn device_destroy(id: u64) -> bool {
-    DEVICES.lock().remove(&id).is_some()
+    let removed = DEVICES.lock().remove(&id);
+    // Stop and join the worker pool here, on the destroy path, rather than
+    // leaving it to the last `Arc<BoundDevice>` to drop: the shim calls this
+    // before it unrealizes the device, and a worker registered with RCU must be
+    // gone by then. Idempotent, and the drain thread has already been joined.
+    if let Some(pool) = removed.as_ref().and_then(|slot| slot.par.as_ref()) {
+        pool.shutdown();
+    }
+    removed.is_some()
 }
 
 pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
@@ -555,6 +582,9 @@ pub fn device_drain(id: u64) -> bool {
     // time through every call. See `census::tranche_elapsed_us`.
     crate::runtime::drain::note_tranche_started(crate::observe::elapsed_us());
     device.drain(&mut host);
+    // TEMP (lab): REIMS_VGPU_LAB_PAR_SELFTEST. A no-op fork-join on this thread,
+    // under this lock, to measure the pool; free when the switch is unset.
+    crate::runtime::par::selftest::tick(&device.state);
     // The tail is timed apart from `Device::drain` because it is inside
     // `drain_us` and inside no `DrainPhase`, and that residue is a third of the
     // drain worker's wall clock on every workload measured — 933 ms a second of

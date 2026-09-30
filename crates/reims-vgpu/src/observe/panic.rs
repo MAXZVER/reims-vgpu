@@ -135,7 +135,7 @@ const WHITESPACE_STANDIN: char = '_';
 /// `catch_unwind` yields `Box<dyn Any>`; `panic!("literal")` puts a `&'static
 /// str` inside and `panic!("{fmt}")` a `String`. Anything else — a payload from
 /// `panic_any` — has no textual form, and saying so beats an empty field.
-fn payload_text(payload: &(dyn Any + Send)) -> String {
+pub(crate) fn payload_text(payload: &(dyn Any + Send)) -> String {
     let raw = payload
         .downcast_ref::<&'static str>()
         .map(|s| (*s).to_string())

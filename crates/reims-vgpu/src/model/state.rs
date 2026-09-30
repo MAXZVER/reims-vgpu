@@ -3605,7 +3605,27 @@ pub struct DeviceState {
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
+    /// The parallel worker pool of the device this state belongs to, when its
+    /// shim can register worker threads for RCU; see [`crate::runtime::par`].
+    ///
+    /// Owned by the bound device, which stops it on destroy; this is the door the
+    /// draw rails reach it through, because they hold a `DeviceState` and
+    /// nothing else of the device. Carried across [`Self::reset`] — the threads
+    /// are the device's, not the guest lifetime's — and `None` for every device
+    /// made without host ops and every shim that offers no registration.
+    par: Option<Arc<crate::runtime::par::Pool>>,
 }
+
+// The parallel pool's jobs hold `&DeviceState` from several threads at once, so
+// the state being `Sync` is a claim the design rests on, not a convenience. It
+// held structurally when it was first asserted (no `Cell`/`RefCell` in the
+// model, the two locks are `Mutex`, the rail slot is `Send + Sync` by its
+// trait); this keeps it true: a field that breaks it fails here, at the
+// definition, rather than at some distant scope call.
+const _: () = {
+    const fn assert_sync<T: Sync>() {}
+    assert_sync::<DeviceState>();
+};
 
 /// Domain tag for ch-event segment events (matches event_sync::Domain::Event).
 pub const FENCE_DOMAIN_EVENT: u8 = 1;
@@ -3749,6 +3769,7 @@ impl DeviceState {
             mapper_ref_texture_memo_scratch: Vec::new(),
             gva_host_views: Vec::new(),
             view_stale_reads: 0,
+            par: None,
         }
     }
 
@@ -4098,6 +4119,9 @@ impl DeviceState {
         let intr_fault = Arc::clone(&self.gfx.interrupt_fault);
         let fifo_read = Arc::clone(&self.gfx.fifo_read);
         let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
+        // The pool's threads belong to the device, and a reset is a guest
+        // lifetime boundary, not the device's.
+        let par = self.par.take();
         intr_disp.store(0, Ordering::Release);
         intr_gpu.store(0, Ordering::Release);
         intr_fault.store(0, Ordering::Release);
@@ -4106,6 +4130,7 @@ impl DeviceState {
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
         *self = Self::new(id, page_shift);
+        self.par = par;
         self.gfx.interrupt_status_disp = intr_disp;
         self.gfx.interrupt_status_gpu = intr_gpu;
         self.gfx.interrupt_fault = intr_fault;
@@ -5886,6 +5911,17 @@ impl DeviceState {
         }
     }
 
+    /// The parallel worker pool of this device, when it has one.
+    pub fn par(&self) -> Option<&crate::runtime::par::Pool> {
+        self.par.as_deref()
+    }
+
+    /// Give this state the pool its bound device created. Called once, at
+    /// device creation, before any guest work exists.
+    pub fn install_par_pool(&mut self, pool: Arc<crate::runtime::par::Pool>) {
+        self.par = Some(pool);
+    }
+
     /// Issue the next recency stamp for [`HostSurface::last_touch`].
     ///
     /// Strictly increasing, so the smallest stamp in
@@ -7309,5 +7345,35 @@ mod sampled_generation_tests {
         assert_eq!(state.next_sampled_content_generation(), u64::MAX);
         assert_eq!(state.next_sampled_content_generation(), 1, "0 is skipped");
         assert_eq!(state.next_sampled_content_generation(), 2);
+    }
+
+    /// A reset is a guest-lifetime boundary: the counter restarts (as it did)
+    /// and the device's worker pool, which is not the guest's, survives it.
+    #[test]
+    fn reset_restarts_generations_and_keeps_the_pool() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut table = crate::qemu::host_ops::ReimsVgpuHostOps::null();
+        unsafe extern "C" fn nothing(_ctx: *mut std::os::raw::c_void) {}
+        table.thread_attach = Some(nothing);
+        table.thread_detach = Some(nothing);
+        let pool = Arc::new(
+            crate::runtime::par::Pool::new(
+                &table,
+                &crate::runtime::par::Settings {
+                    workers: 0,
+                    worker_spin: std::time::Duration::ZERO,
+                    join_spin: std::time::Duration::ZERO,
+                },
+            )
+            .expect("the table offers the registration pair"),
+        );
+        state.install_par_pool(Arc::clone(&pool));
+        assert_eq!(state.next_sampled_content_generation(), 1);
+        state.reset();
+        assert_eq!(state.next_sampled_content_generation(), 1, "restarted");
+        assert!(
+            std::ptr::eq(state.par().expect("the pool survived the reset"), &*pool),
+            "the same pool, not a rebuilt one"
+        );
     }
 }
