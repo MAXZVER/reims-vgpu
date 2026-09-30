@@ -1485,6 +1485,20 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         .filter(|texture| texture.is_storage)
         .zip(output_images)
     {
+        // TEMP (lab): `REIMS_VGPU_LAB_CDUMP=1` (under the lab gate) — what each
+        // storage output of a dispatch actually holds, before it lands.
+        crate::runtime::draw::vulkan::lab_compute_output_dump(
+            task_id,
+            acc.pipeline_ref,
+            t.binding,
+            t.width,
+            t.height,
+            t.pixel_format,
+            match &result {
+                ComputeImageResult::Bytes(bytes) => Some(&bytes[..]),
+                ComputeImageResult::Landed { .. } => None,
+            },
+        );
         match result {
             ComputeImageResult::Bytes(bytes) => {
                 t.bytes = bytes;

@@ -316,6 +316,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 identity,
                 guest_store,
             }) => {
+                lab_dump_draw(req, &identity, "surface");
                 lab_pick_draw(req, &identity, "surface");
                 // Into the same `t11_store_us` bucket the synchronous and `Owned`
                 // routes report, because the whole claim of this rail is that the
@@ -1570,6 +1571,101 @@ fn lab_sampled_strip_probe(
     ));
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_CDUMP=1` — one compute storage output as read
+/// back (`/tmp/labdump/cNNNN-tT-pP-bB.rgba`, header `w h bytes_per_texel mtl_format`)
+/// and a `lab_cdump` line with its non-zero census; `Landed` outputs (copied
+/// straight to guest pages) are logged without bytes. Gated like the other
+/// lab dumps (`REIMS_VGPU_LAB_GATE`), task 1 excluded, both sides <= 512.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lab_compute_output_dump(
+    task_id: u32,
+    pipeline_ref: u32,
+    binding: u32,
+    w: u32,
+    h: u32,
+    mtl_format: u16,
+    bytes: Option<&[u8]>,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static N: AtomicU32 = AtomicU32::new(0);
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CDUMP").is_ok()) {
+        return;
+    }
+    if task_id == 1 || w > 512 || h > 512 || !lab_gate_open() {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= 3000 {
+        return;
+    }
+    let Some(bytes) = bytes else {
+        crate::observe::fail(format!(
+            "lab_cdump n={n} task={task_id} pipe={pipeline_ref} bind={binding} {w}x{h} fmt={mtl_format:#x} landed"
+        ));
+        return;
+    };
+    let texels = (w as usize).max(1) * (h as usize).max(1);
+    let bpt = (bytes.len() / texels) as u32;
+    let nonzero = bytes.iter().filter(|&&b| b != 0).count();
+    let name = format!("c{n:04}-t{task_id}-p{pipeline_ref}-b{binding}.rgba");
+    let dir = std::path::Path::new("/tmp/labdump");
+    let _ = std::fs::create_dir_all(dir);
+    let mut out = Vec::with_capacity(16 + bytes.len());
+    for v in [w, h, bpt, u32::from(mtl_format)] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(bytes);
+    let _ = std::fs::write(dir.join(&name), out);
+    crate::observe::fail(format!(
+        "lab_cdump n={n} task={task_id} pipe={pipeline_ref} bind={binding} {w}x{h} fmt={mtl_format:#x} len={} bpt={bpt} nonzero={nonzero} file={name}",
+        bytes.len()
+    ));
+}
+
+/// TEMP (lab): one CPU-origin sampled bind (`SampledSource::Bytes`) as the
+/// engine will upload it: `/tmp/labdump/bNNNN-tT-pP-iI-rR.rgba`, header
+/// `w h bytes_per_texel vk_format`, then the raw bytes; and a `lab_bytes_probe`
+/// line with the non-zero census — whether a glyph bitmap is empty before
+/// the GPU ever sees it.
+fn lab_sampled_bytes_dump(
+    req: &DrawEncodeRequest,
+    index: u32,
+    texture_ref: u32,
+    img: &crate::backend::vulkan::engine::SampledImageResource,
+    bytes: &[u8],
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= 3000 {
+        return;
+    }
+    let (w, h) = (img.width, img.height);
+    let texels = (w as usize).max(1) * (h as usize).max(1);
+    let bpt = (bytes.len() / texels) as u32;
+    let nonzero = bytes.iter().filter(|&&b| b != 0).count();
+    let dir = std::path::Path::new("/tmp/labdump");
+    let _ = std::fs::create_dir_all(dir);
+    let mut out = Vec::with_capacity(16 + bytes.len());
+    for v in [w, h, bpt, img.format.as_raw() as u32] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(bytes);
+    let name = format!(
+        "b{n:04}-t{}-p{}-i{index}-r{texture_ref}.rgba",
+        req.task_id, req.pipeline_ref
+    );
+    let _ = std::fs::write(dir.join(&name), out);
+    crate::observe::fail(format!(
+        "lab_bytes_probe file={name} {w}x{h} len={} bpt={bpt} vkfmt={:?} origin={:?} ident={} nonzero={nonzero}",
+        bytes.len(),
+        img.format,
+        img.byte_origin,
+        img.identity.is_some()
+    ));
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_PROBE_WH=WxH[,WxH]` reads back every sampled
 /// resident of those sizes right before the draw that samples it and logs a
 /// 5x3 grid of texels (RGBA8 readback) — is a mask shaped, or uniform.
@@ -1600,8 +1696,20 @@ fn lab_sampled_grid_probe(
             .unwrap_or_default()
     });
     let Some(img) = pushed else { return };
-    let crate::backend::vulkan::engine::SampledSource::Target(identity) = &img.source else {
-        return;
+    let identity = match &img.source {
+        crate::backend::vulkan::engine::SampledSource::Target(identity) => identity,
+        // TEMP (lab): CPU-origin binds too, as the bytes the engine uploads.
+        crate::backend::vulkan::engine::SampledSource::Bytes(bytes) => {
+            let (w, h) = (img.width, img.height);
+            let small = want
+                .iter()
+                .any(|&(a, b)| a == 0 && w <= b && h <= b && req.task_id != 1);
+            if (want.contains(&(w, h)) || small) && lab_gate_open() && lab_dump_window_open() {
+                lab_sampled_bytes_dump(req, index, texture_ref, img, bytes);
+            }
+            return;
+        }
+        _ => return,
     };
     let (w, h) = (identity.width(), identity.height());
     let small = want
