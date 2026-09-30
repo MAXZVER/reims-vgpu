@@ -1128,6 +1128,9 @@ fn sampled_base_level_gva(
     resource: Option<&crate::model::TaskResource>,
     page_shift: u32,
 ) -> Option<u64> {
+    if lab_no_m1fix() {
+        return None;
+    }
     let Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) = resource?.decoded() else {
         return None;
     };
@@ -1156,6 +1159,9 @@ fn sampled_mip_chain(
     img: &crate::backend::vulkan::engine::SampledImageResource,
 ) -> Option<Vec<crate::backend::vulkan::engine::TargetIdentity>> {
     use crate::backend::vulkan::engine::{SampledSource, TargetIdentity};
+    if lab_no_m1fix() {
+        return None;
+    }
     let SampledSource::Target(base @ TargetIdentity::Gva { format, .. }) = &img.source else {
         return None;
     };
@@ -1186,6 +1192,14 @@ fn sampled_mip_chain(
     }
     crate::runtime::drain::note_store_route("sampled_mip_chain_named");
     Some(levels)
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_NO_M1FIX=1` narrows the three M1 fixes away
+/// (constexpr-sampler precedence, level-aware alias, sampled mip chain) for a
+/// same-conditions performance A/B.
+fn lab_no_m1fix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_NO_M1FIX").is_ok_and(|v| v == "1"))
 }
 
 /// TEMP (lab): whether `REIMS_VGPU_LAB_SMP_LINEAR` names this fragment entry.
@@ -9699,7 +9713,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // A constexpr sampler owns the binding metal2vulkan gave it; a guest
             // sampler bound at the same index is one this shader never reads.
             // See `spirv_bind::constexpr_sampler_bindings`.
-            let static_sampler_binds = {
+            let static_sampler_binds = if lab_no_m1fix() {
+                Default::default()
+            } else {
                 let mut binds =
                     crate::runtime::spirv_bind::constexpr_sampler_bindings(&v_variant.samplers);
                 binds.extend(crate::runtime::spirv_bind::constexpr_sampler_bindings(
