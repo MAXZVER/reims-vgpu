@@ -2527,6 +2527,22 @@ fn classify_resident_content(content_ready: bool, guest_imported: bool) -> Resid
 /// ago — which is all a lock-held read ever was, the lock being released before
 /// the caller acts on it.
 pub fn resident_content_backing(identity: &TargetIdentity) -> ResidentContentBacking {
+    // TEMP (lab): `REIMS_VGPU_LAB_READINESS_LOCKED=1` answers from the registry
+    // under the engine lock, as this function did before the table existed. An
+    // A/B switch for the one behaviour change the table made on the serial path
+    // (the read no longer waits for whoever holds ENGINE), so a difference
+    // between the arms is attributable to exactly that.
+    static LOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *LOCKED.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_READINESS_LOCKED").is_some()) {
+        let guard = lock_engine();
+        return guard
+            .pools
+            .registry_get(identity)
+            .map(|slot| {
+                classify_resident_content(slot.content_ready, slot.memory.is_guest_imported())
+            })
+            .unwrap_or(ResidentContentBacking::NotReady);
+    }
     pools::readiness::lookup(identity)
         .map(|r| classify_resident_content(r.ready, r.guest_imported))
         .unwrap_or(ResidentContentBacking::NotReady)
