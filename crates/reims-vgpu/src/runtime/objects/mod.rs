@@ -2987,43 +2987,6 @@ fn note_backing_identity(
         crate::runtime::drain::note_store_route("backing_identity_minted");
         return;
     };
-    // TEMP (lab, access precision): what a texture that could not be identified
-    // looks like, once per (task, ref) — the model names these DomainOnly.
-    if matches!(refusal, BackingIdRefusal::Unresolved(_))
-        && matches!(
-            entry.object_type,
-            OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
-        )
-        && crate::runtime::drain::lab_dag_window()
-        && crate::observe::first_sight(
-            "lab_texture_unresolved",
-            (u64::from(task_id) << 32) | u64::from(obj_ref),
-        )
-    {
-        let shape = crate::runtime::decode::resource::decode_texture_descriptor(descriptor)
-            .map(|t| {
-                format!(
-                    "handle={:#x} alloc={} levels={} dims={}x{}x{} fmt={:#x} samples={:?}                      used={} stride={}",
-                    t.handle,
-                    t.allocation_size,
-                    t.mipmap_level_count,
-                    t.width,
-                    t.height,
-                    t.depth,
-                    t.pixel_format,
-                    t.sample_count,
-                    t.used_size,
-                    t.row_stride,
-                )
-            })
-            .unwrap_or_else(|e| format!("undecodable={e:?}"));
-        crate::observe::fail(format!(
-            "lab_texture_unresolved task={task_id} ref={obj_ref} type={} desc_len={} {shape}              heap_placement={}",
-            entry.object_type,
-            entry.descriptor_length,
-            crate::runtime::decode::resource::descriptor_is_heap_placement(descriptor),
-        ));
-    }
     if !matches!(refusal, BackingIdRefusal::HeapPlaced) {
         return;
     }
@@ -3084,6 +3047,9 @@ pub fn resolve_resource<M: HostMemory>(
     // object's bytes rather than a flattening of it. See `declare_object_name`
     // for why an undescribable storage is `None` here and not `NoBytes`.
     let storage = declared_storage(state, task_id, obj_ref, &entry, &descriptor).ok();
+    if storage.is_none() {
+        lab_note_unidentified(task_id, obj_ref, &entry, &descriptor, "construct");
+    }
     // Naming is idempotent, and a name may already exist without a memo: a
     // reference is named the first time *anything* asks what it names, and a
     // lifetime packet asks without constructing. Declaring again here would give
@@ -3332,9 +3298,65 @@ pub fn name_resource<M: HostMemory>(
     let entry = lookup_list_entry(state, host, task_id, obj_ref)?;
     let descriptor: Arc<[u8]> = Arc::from(read_descriptor(state, host, task_id, &entry)?);
     let storage = declared_storage(state, task_id, obj_ref, &entry, &descriptor).ok();
+    if storage.is_none() {
+        lab_note_unidentified(task_id, obj_ref, &entry, &descriptor, "name");
+    }
     let name = declare_object_name(state, task_id, obj_ref, storage).ok()?;
     declare_alias_for(state, host, task_id, name, &entry, &descriptor);
     Some(name)
+}
+
+/// TEMP (lab, access precision): a buffer or texture whose storage this device
+/// could not identify when it was named, once per (task, ref). Such a name is
+/// declared `NoBytes` and stays so for the life of the name, whatever the
+/// descriptor says later; the model orders it `DomainOnly`.
+fn lab_note_unidentified(
+    task_id: u32,
+    obj_ref: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+    site: &'static str,
+) {
+    if !matches!(
+        entry.object_type,
+        OBJECT_TYPE_BUFFER | OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
+    ) || !crate::observe::first_sight(
+        "lab_unidentified",
+        (u64::from(task_id) << 32) | u64::from(obj_ref),
+    ) {
+        return;
+    }
+    let shape = crate::runtime::decode::resource::decode_texture_descriptor(descriptor)
+        .ok()
+        .filter(|_| entry.object_type != OBJECT_TYPE_BUFFER)
+        .map(|t| {
+            format!(
+                "handle={:#x} alloc={} levels={} dims={}x{}x{} fmt={:#x} samples={:?} used={} stride={}",
+                t.handle,
+                t.allocation_size,
+                t.mipmap_level_count,
+                t.width,
+                t.height,
+                t.depth,
+                t.pixel_format,
+                t.sample_count,
+                t.used_size,
+                t.row_stride,
+            )
+        })
+        .unwrap_or_default();
+    let head: String = descriptor
+        .iter()
+        .take(48)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    crate::observe::fail(format!(
+        "lab_unidentified site={site} task={task_id} ref={obj_ref} type={} desc_len={} {shape} \
+         heap_placement={} head={head}",
+        entry.object_type,
+        entry.descriptor_length,
+        crate::runtime::decode::resource::descriptor_is_heap_placement(descriptor),
+    ));
 }
 
 /// Whether the ordering model is to state byte-less names exactly. See
