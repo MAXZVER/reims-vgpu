@@ -307,6 +307,23 @@ impl Scheduler {
         }
     }
 
+    /// The transactions parked on `pipeline`, without changing what they wait
+    /// for. For an observer: [`Self::pipeline_ready`] and
+    /// [`Self::pipeline_refused`] take the list.
+    #[must_use]
+    pub fn pipeline_waiters(&self, pipeline: PipelineId) -> Vec<IngressOrdinal> {
+        self.waiters_by_pipeline
+            .get(&pipeline)
+            .map(|waiters| {
+                waiters
+                    .iter()
+                    .copied()
+                    .filter(|w| self.pending.contains_key(w))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// A pipeline will never be usable: name the transactions that can
     /// therefore never be ready.
     ///

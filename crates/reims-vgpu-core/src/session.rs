@@ -944,6 +944,23 @@ impl SessionModel {
         &mut self.pipelines
     }
 
+    /// The pipeline table, read-only.
+    ///
+    /// The read half of [`Self::pipelines`], so a caller that only asks — the
+    /// walk's usage source — does not need `&mut SessionModel` and cannot step
+    /// a pipeline's state by accident.
+    #[must_use]
+    pub fn pipelines_ref(&self) -> &crate::pipeline::PipelineTable {
+        &self.pipelines
+    }
+
+    /// The transactions parked on `pipeline`. See
+    /// [`crate::ready::Scheduler::pipeline_waiters`].
+    #[must_use]
+    pub fn pipeline_waiters(&self, pipeline: PipelineId) -> Vec<IngressOrdinal> {
+        self.scheduler.pipeline_waiters(pipeline)
+    }
+
     /// A pipeline finished building: record it, and release what was held for
     /// it.
     ///
@@ -958,16 +975,6 @@ impl SessionModel {
     /// compile that finishes after the guest deleted the pipeline, which must
     /// not resurrect it — and must not release work either, since that work
     /// cannot be admitted against a retired pipeline in the first place.
-    /// The pipeline table, read-only.
-    ///
-    /// The read half of [`Self::pipelines`], so a caller that only asks — the
-    /// walk's usage source — does not need `&mut SessionModel` and cannot step
-    /// a pipeline's state by accident.
-    #[must_use]
-    pub fn pipelines_ref(&self) -> &crate::pipeline::PipelineTable {
-        &self.pipelines
-    }
-
     pub fn pipeline_ready(&mut self, pipeline: PipelineId) -> bool {
         if !self
             .pipelines

@@ -2338,6 +2338,13 @@ fn admit_and_park<H: HostMemory + HostOps>(
         }
     }
     note_access_modes(state, &built);
+    state.lab_pipeline_admission(
+        lease_task,
+        built
+            .payload
+            .exec()
+            .map_or(&[][..], |work| &work.pipeline_leases),
+    );
     let admission = match state.admit_packet(&built) {
         Ok(admission) => admission,
         Err(refusal) => {
@@ -2355,6 +2362,14 @@ fn admit_and_park<H: HostMemory + HostOps>(
     };
     let mut transaction = admission.admitted.transaction;
     let ingress = transaction.identity.ingress;
+    state.lab_pipeline_admitted(
+        ingress,
+        lease_task,
+        transaction
+            .payload
+            .exec()
+            .map_or(&[][..], |work| &work.pipeline_leases),
+    );
     lab_dag_admit(
         state,
         claiming_task,
@@ -3031,6 +3046,7 @@ fn run_parked_packet<H: HostMemory + HostOps>(
     work: &crate::runtime::parked::ParkedWork,
     domain: u32,
 ) {
+    state.lab_pipeline_ran(ingress);
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
         process_root_packet(state, host, work.packet());
     } else {

@@ -900,7 +900,10 @@ impl PipelineTable {
     /// returning `Ok` — otherwise a list whose third pipeline is refused
     /// charges two leases for a transaction that never ran, and the number that
     /// says whether compilation starts early enough grows with refusals.
-    fn peek(&self, id: PipelineId, generation: SessionGeneration) -> Lease {
+    ///
+    /// Public because an observer that only wants to know is owed the same
+    /// question answered the same way.
+    pub fn peek(&self, id: PipelineId, generation: SessionGeneration) -> Lease {
         let Some(p) = self.pipelines.get(&id) else {
             return Lease::Absent(AbsentBecause::Undeclared);
         };

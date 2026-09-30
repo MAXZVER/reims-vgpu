@@ -4,6 +4,7 @@
 //! ApplePV-shaped model. No parsing of wire bytes here; no backend execution.
 
 pub(crate) mod content_cache;
+mod lab_pipeline_shadow;
 mod lru_memo;
 mod regs;
 mod state;

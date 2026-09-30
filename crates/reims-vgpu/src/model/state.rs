@@ -3123,6 +3123,10 @@ pub struct DeviceState {
     /// keep "which state changes, from where" a list a reader can enumerate,
     /// instead of a public field any call site can reach into.
     session: Mutex<reims_vgpu_core::session::SessionModel>,
+    /// TEMP (lab, pipeline ids): the pipeline table as it would be named per
+    /// task, stepped beside the real one. See
+    /// [`crate::model::lab_pipeline_shadow`].
+    lab_shadow: super::lab_pipeline_shadow::LabShadow,
     /// The bytes every admitted position is executed from, keyed by the
     /// ordinal [`Self::admit_packet`] issued.
     ///
@@ -3666,6 +3670,7 @@ impl DeviceState {
             session: Mutex::new(reims_vgpu_core::session::SessionModel::new(
                 reims_vgpu_core::identity::SessionId(id.0 as u32),
             )),
+            lab_shadow: Default::default(),
             parked: crate::runtime::parked::ParkedStore::new(),
             translation_deferred_mask: 0,
             translation_order_hold_mask: 0,
@@ -4445,9 +4450,13 @@ impl DeviceState {
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
-        let mut session = self.session.lock().expect("session");
-        let generation = session.generation();
-        session.pipelines().declare(id, generation)
+        let (declared, generation) = {
+            let mut session = self.session.lock().expect("session");
+            let generation = session.generation();
+            (session.pipelines().declare(id, generation), generation)
+        };
+        self.lab_shadow.declare(task_id, pipeline, generation);
+        declared
     }
 
     /// How a transaction of `task_id` names its pipelines in the ordering plane.
@@ -4501,7 +4510,9 @@ impl DeviceState {
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> reims_vgpu_core::session::Ended {
         let id = self.pipeline_id(task_id, pipeline);
-        self.session.lock().expect("session").pipeline_retired(id)
+        let ended = self.session.lock().expect("session").pipeline_retired(id);
+        self.lab_shadow.retire(task_id, pipeline, &ended);
+        ended
     }
 
     /// Step a declared pipeline along its build, from the rail that is
@@ -4526,11 +4537,14 @@ impl DeviceState {
         next: reims_vgpu_core::pipeline::PipelineState,
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
-        self.session
+        let took = self
+            .session
             .lock()
             .expect("session")
             .pipelines()
-            .advance(id, next)
+            .advance(id, next);
+        self.lab_shadow.advance(task_id, pipeline, next);
+        took
     }
 
     /// This rail no longer holds a translation for a pipeline the model called
@@ -4544,11 +4558,14 @@ impl DeviceState {
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
-        self.session
+        let took = self
+            .session
             .lock()
             .expect("session")
             .pipelines()
-            .withdraw(id)
+            .withdraw(id);
+        self.lab_shadow.withdraw(task_id, pipeline, took);
+        took
     }
 
     /// What an executor found its shaders do with each bound slot.
@@ -4570,6 +4587,19 @@ impl DeviceState {
         usage: reims_vgpu_core::pipeline::PublishedUsage,
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
+        if super::lab_pipeline_shadow::enabled() {
+            // TEMP (lab): the shadow table takes every task's reflection; the
+            // real one keeps the first published, which is what it holds when
+            // the rail is not asked again.
+            self.lab_shadow.publish(task_id, pipeline, &usage);
+            let mut session = self.session.lock().expect("session");
+            if session.pipelines().usage_published(id) {
+                return false;
+            }
+            return session
+                .pipelines()
+                .publish_usage_to(id, usage, self.usage_scope());
+        }
         self.session
             .lock()
             .expect("session")
@@ -4590,11 +4620,16 @@ impl DeviceState {
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
-        self.session
+        let real = self
+            .session
             .lock()
             .expect("session")
             .pipelines()
-            .usage_published(id)
+            .usage_published(id);
+        // TEMP (lab): asked for the task, so a reflection is built for each
+        // task that binds the pipeline; skipped only when both tables hold one.
+        real && (!super::lab_pipeline_shadow::enabled()
+            || self.lab_shadow.usage_published(task_id, pipeline))
     }
 
     /// Whether publishing this pipeline's usage now would land. See
@@ -4605,11 +4640,14 @@ impl DeviceState {
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
-        self.session
+        let real = self
+            .session
             .lock()
             .expect("session")
             .pipelines()
-            .usage_wanted_by(id, self.usage_scope())
+            .usage_wanted_by(id, self.usage_scope());
+        real || (super::lab_pipeline_shadow::enabled()
+            && self.lab_shadow.usage_wanted(task_id, pipeline))
     }
 
     /// Which pipelines a reflection is published for on this device.
@@ -4639,6 +4677,8 @@ impl DeviceState {
         PipelineUsage(
             self.session.lock().expect("session"),
             self.pipeline_scope(task_id),
+            task_id,
+            &self.lab_shadow,
         )
     }
 
@@ -4654,7 +4694,59 @@ impl DeviceState {
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
-        self.session.lock().expect("session").pipeline_ready(id)
+        let waiters = if super::lab_pipeline_shadow::enabled() {
+            self.session
+                .lock()
+                .expect("session")
+                .pipeline_waiters(id)
+        } else {
+            Vec::new()
+        };
+        let took = self.session.lock().expect("session").pipeline_ready(id);
+        self.lab_shadow.ready(task_id, pipeline, &waiters, took);
+        took
+    }
+
+    /// TEMP (lab, pipeline ids): what the real table and the per-task shadow
+    /// each say about a packet about to be admitted with `leases`.
+    pub fn lab_pipeline_admission(
+        &self,
+        task_id: u32,
+        leases: &[reims_vgpu_core::identity::ResourceId],
+    ) {
+        if !super::lab_pipeline_shadow::enabled() || leases.is_empty() {
+            return;
+        }
+        let (generation, real) = {
+            let session = self.session.lock().expect("session");
+            let generation = session.generation();
+            let real: Vec<reims_vgpu_core::pipeline::Lease> = leases
+                .iter()
+                .map(|&lease| {
+                    session
+                        .pipelines_ref()
+                        .peek(reims_vgpu_core::pipeline::PipelineId::shared(lease), generation)
+                })
+                .collect();
+            (generation, real)
+        };
+        self.lab_shadow
+            .admission(task_id, leases, generation, &real);
+    }
+
+    /// TEMP (lab, pipeline ids): a packet that leases pipelines was admitted.
+    pub fn lab_pipeline_admitted(
+        &self,
+        ingress: reims_vgpu_core::identity::IngressOrdinal,
+        task_id: u32,
+        leases: &[reims_vgpu_core::identity::ResourceId],
+    ) {
+        self.lab_shadow.note_admitted(ingress, task_id, leases);
+    }
+
+    /// TEMP (lab, pipeline ids): a packet that leased pipelines ran.
+    pub fn lab_pipeline_ran(&self, ingress: reims_vgpu_core::identity::IngressOrdinal) {
+        self.lab_shadow.forget(ingress);
     }
 
     /// Whether a declared pipeline has already reached `Ready`.
@@ -4740,10 +4832,13 @@ impl DeviceState {
         reason: reims_vgpu_core::pipeline::RefusalReason,
     ) -> reims_vgpu_core::session::Ended {
         let id = self.pipeline_id(task_id, pipeline);
-        self.session
+        let ended = self
+            .session
             .lock()
             .expect("session")
-            .pipeline_refused(id, reason)
+            .pipeline_refused(id, reason);
+        self.lab_shadow.refuse(task_id, pipeline, reason, &ended);
+        ended
     }
 
     /// Give one packet an ordering position in the model.
@@ -7721,6 +7816,8 @@ mod slot_table_reach_tests {
 pub struct PipelineUsage<'a>(
     std::sync::MutexGuard<'a, reims_vgpu_core::session::SessionModel>,
     reims_vgpu_core::pipeline::PipelineScope,
+    u32,
+    &'a super::lab_pipeline_shadow::LabShadow,
 );
 
 impl std::fmt::Debug for PipelineUsage<'_> {
@@ -7735,8 +7832,11 @@ impl reims_vgpu_core::pipeline::UsageSource for PipelineUsage<'_> {
         pipeline: reims_vgpu_core::identity::ResourceId,
         stage: Option<reims_vgpu_protocol::render::ShaderStage>,
     ) -> Option<&reims_vgpu_core::pipeline::BindingUsage> {
-        self.0
+        let real = self
+            .0
             .pipelines_ref()
-            .binding_usage_of(self.1.id(pipeline), stage)
+            .binding_usage_of(self.1.id(pipeline), stage);
+        self.3.lookup(self.2, pipeline, stage, real);
+        real
     }
 }

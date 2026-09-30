@@ -2409,6 +2409,47 @@ mod device_tests {
         assert_eq!(built.domain, ChannelId(1));
     }
 
+    /// The packet states how the model is to name the pipelines its records
+    /// bind, and the task is the submission's.
+    ///
+    /// The references in the records are ids in that task's object list, so the
+    /// model cannot tell whose pipeline is meant from the id; the walk's own
+    /// lookups (`DeviceState::pipeline_usage`) and the admission's waits are named
+    /// under this one scope, and a packet carrying a different one from the walk's
+    /// would wait on, or be narrowed by, a pipeline that is not its own.
+    #[test]
+    fn a_packet_names_its_pipelines_under_the_scope_of_its_submissions_task() {
+        use reims_vgpu_core::pipeline::PipelineScope;
+
+        let state = device_with_texture();
+        let host = FakeHost::new();
+        let submission = ExecSubmission::stated(TASK, vec![one_blit_stream(TEXTURE)]);
+        let drained = exec_packet(Vec::new());
+        let scope = |per_task: bool| {
+            crate::runtime::objects::with_pipeline_per_task(per_task, || {
+                let built = device_packet(
+                    &state,
+                    &host,
+                    Fifo::child(1).expect("a child channel"),
+                    SESSION,
+                    SLOT,
+                    &drained,
+                    reads(Some(&submission)),
+                )
+                .expect("a well-framed blit over a declared texture");
+                let Payload::Exec(work) = built.payload else {
+                    panic!("an exec opcode is the exec class");
+                };
+                work.pipelines
+            })
+        };
+        assert_eq!(
+            scope(true),
+            PipelineScope::Task(reims_vgpu_core::identity::TaskId(TASK))
+        );
+        assert_eq!(scope(false), PipelineScope::Shared);
+    }
+
     /// A ref the task never declared refuses the whole packet, rather than
     /// yielding a transaction that is missing the edge the record asked for.
     #[test]
