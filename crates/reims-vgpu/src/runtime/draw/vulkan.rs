@@ -1121,6 +1121,56 @@ fn lab_pick_draw(
 /// PROBE_WH) additionally requires PATH to exist, checked at most every 250 ms,
 /// so a probe can be switched on and off around a guest action within one boot.
 /// Unset: always open (the probes' own env vars still gate them).
+/// TEMP (lab): `REIMS_VGPU_LAB_ALIAS_LEVEL=1` — a fragment bind of this pass's
+/// own texture is not a self-alias when the attachment is a different mip
+/// level: the attachment's target GVA is not the sampled texture's level-0
+/// GVA. macOS 26's variable blur renders level N of one texture while sampling
+/// level N-1 of it; the alias rule substituted the level's Clear and every
+/// level above the base came out black (M1).
+fn lab_alias_other_level(
+    req: &DrawEncodeRequest,
+    texture_ref: u32,
+    resource: Option<&crate::model::TaskResource>,
+    page_shift: u32,
+) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_ALIAS_LEVEL").is_ok_and(|v| v == "1")) {
+        return false;
+    }
+    let Some(color) = req
+        .colors
+        .iter()
+        .find(|c| c.texture_ref == texture_ref && c.mapping_id == 0 && c.target_gva != 0)
+    else {
+        return false;
+    };
+    let Some(resource) = resource else {
+        return false;
+    };
+    let Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) = resource.decoded() else {
+        return false;
+    };
+    let other = tex.mipmap_level_count > 1
+        && tex
+            .level_gva(0, page_shift)
+            .is_some_and(|(base, _)| base != color.target_gva);
+    if other {
+        crate::runtime::drain::note_store_route("lab_alias_other_level");
+    }
+    other
+}
+
+/// TEMP (lab): whether `REIMS_VGPU_LAB_SMP_LINEAR` names this fragment entry.
+fn lab_smp_linear(entry: Option<&str>) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_SMP_LINEAR")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default()
+    });
+    !names.is_empty() && entry.is_some_and(|e| names.iter().any(|n| e.contains(n.as_str())))
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_DUMP_WINDOW=from-to` (ms since start) bounds
 /// `REIMS_VGPU_LAB_DUMP` and `REIMS_VGPU_LAB_PROBE_WH` in time; unset = always.
 fn lab_dump_window_open() -> bool {
@@ -8999,7 +9049,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     );
                     let attachment_alias = frag_stage
                         .then(|| fragment_attachment_alias_sample(req, texture_ref))
-                        .flatten();
+                        .flatten()
+                        .filter(|_| {
+                            !lab_alias_other_level(req, texture_ref, texture_resource.as_deref(), state.page_shift)
+                        });
                     if let Some((aw, ah, alias)) = attachment_alias {
                         match alias {
                             AttachmentAliasSample::Clear(clear) => (
@@ -9609,6 +9662,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     if let Some((min_bits, max_bits)) = lod_clamp {
                         sampler.lod_min = min_bits;
                         sampler.lod_max = max_bits;
+                    }
+                    // TEMP (lab): `REIMS_VGPU_LAB_SMP_LINEAR=name[,name]` makes the
+                    // guest samplers of fragment entries containing a name linear
+                    // with linear mips and no LOD cap (M1: menu glass blur).
+                    if frag_stage && lab_smp_linear(f_shader.reflection.entry_point.as_deref()) {
+                        sampler.min_filter = 1;
+                        sampler.mag_filter = 1;
+                        sampler.mip_filter = 2;
+                        sampler.lod_max = f32::MAX.to_bits();
+                        crate::runtime::drain::note_store_route("lab_smp_linear_forced");
                     }
                     samplers.push(sampler);
                 } else {
