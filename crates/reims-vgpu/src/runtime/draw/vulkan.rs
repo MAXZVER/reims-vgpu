@@ -5277,7 +5277,7 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
             return Some(bound);
         }
     }
-    // TEMP (lab, REIMS_VGPU_LAB_FIX_WHOLE_RUNS=1): no packed alias on this host.
+    // TEMP (lab, on unless REIMS_VGPU_LAB_FIX_WHOLE_RUNS=0): no packed alias on this host.
     // Walk the whole allocation once and serve this and every later offset of
     // the reference from those runs, instead of one exact-window walk and one
     // registry entry per offset. Only where the window would gather anyway (no
@@ -5341,11 +5341,12 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     })
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_FIX_WHOLE_RUNS=1` -- see
-/// [`crate::runtime::bound_buffers::WholeRuns`].
+/// TEMP (lab): whole-allocation run lists for buffers that have no backend
+/// import -- see [`crate::runtime::bound_buffers::WholeRuns`]. On by default;
+/// `REIMS_VGPU_LAB_FIX_WHOLE_RUNS=0` turns it off (the control arm of an A/B).
 fn lab_fix_whole_runs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_FIX_WHOLE_RUNS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_FIX_WHOLE_RUNS").map_or(true, |v| v != "0"))
 }
 
 /// TEMP (lab): make sure `(task, reference)` holds its whole allocation's runs,

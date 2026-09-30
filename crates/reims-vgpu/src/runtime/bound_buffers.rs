@@ -149,7 +149,7 @@ impl PackedBufferResolution {
 /// One task buffer's whole allocation as host-pointer runs, for a host that can
 /// alias guest pages for the CPU but cannot import them into the backend.
 ///
-/// TEMP (lab, `REIMS_VGPU_LAB_FIX_WHOLE_RUNS=1`): the packed alias is the
+/// TEMP (lab, on by default; `REIMS_VGPU_LAB_FIX_WHOLE_RUNS=0` turns it off): the packed alias is the
 /// registry's answer to buffer-plus-offset binding, but it needs a backend
 /// import, and without one every bind fell to the exact-window fallback, which
 /// keys per offset. A compositor that streams its geometry through one ring
