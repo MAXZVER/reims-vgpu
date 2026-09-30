@@ -1387,7 +1387,9 @@ fn lab_frame_snap_take(dir: &str, now: u64) -> Option<String> {
     static PENDING: std::sync::Mutex<Option<Pending>> = std::sync::Mutex::new(None);
     static POLLED: AtomicU64 = AtomicU64::new(0);
     let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    if pending.is_none() && now.saturating_sub(POLLED.load(Ordering::Relaxed)) >= 15 {
+    // A new request replaces an unfinished one: a static screen may never
+    // present the frames an earlier burst still waits for.
+    if now.saturating_sub(POLLED.load(Ordering::Relaxed)) >= 15 {
         POLLED.store(now, Ordering::Relaxed);
         let path = format!("{dir}/snap");
         if let Ok(text) = std::fs::read_to_string(&path) {
