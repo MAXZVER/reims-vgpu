@@ -534,6 +534,35 @@ fn publish_usage_if_unpublished<M: HostMemory + HostOps>(
     crate::runtime::draw::publish_pipeline_usage(state, host, task_id, pipeline_ref, usage);
 }
 
+/// Publish the usage of a pipeline whose translation the memo already holds,
+/// from the memo's own resolution.
+///
+/// The pre-scan skips a pipeline the memo holds, which is right for the question
+/// it asks — will executing this wait for a translation — and leaves a pipeline
+/// memoized by a path that did not publish, or whose publication the model
+/// declined while it held the pipeline as something it would not take one for,
+/// without a usage for as long as the memo stands. The memo already holds what a
+/// publication is built from: the resolved pipeline carries both stages'
+/// reflections and the vertex bind plan. So this reads no guest memory and
+/// translates nothing, which is the property that makes it safe to ask per
+/// packet.
+///
+/// `true` when the memo held the pipeline. Whether the model took the usage is
+/// its own answer, counted by [`crate::runtime::draw::publish_pipeline_usage`].
+pub fn publish_memoized_usage<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+) -> bool {
+    let Some(resolved) = retained(state).and_then(|states| states.get(task_id, pipeline_ref))
+    else {
+        return false;
+    };
+    publish_usage_if_unpublished(state, host, task_id, pipeline_ref, &resolved);
+    true
+}
+
 /// Tell the ordering plane this pipeline is usable, which releases the exec
 /// transactions parked on its lease.
 ///

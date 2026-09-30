@@ -55,25 +55,32 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             // it, and this pass is where a packet's pipelines are published
             // before admission readies them. A pipeline that was memoized by a
             // path that did not publish — or whose publication the model
-            // declined before it held the pipeline — stays `Unknown` for every
-            // packet that binds it, for as long as this `continue` stands.
+            // declined while it would take none for that pipeline — stays
+            // `Unknown` for every packet that binds it, for as long as this
+            // `continue` stands.
             //
-            // So when the model *wants* the usage (holds the pipeline, it has
-            // not ended, nothing is published) the pass goes on to publish it.
-            // The translation is cached, so the cost is the AIR extraction,
-            // paid once per pipeline and not per packet.
+            // So when the model *wants* the usage (see
+            // `PipelineTable::usage_wanted_by`) it is published from the memo's
+            // own resolution, which holds the reflections: no guest read and no
+            // translation, and nothing here can make the packet wait.
             //
             // Behind [`crate::runtime::objects::access_exact`]: publishing
             // earlier narrows the accesses of every later packet, which changes
             // which of them the model may release ahead of which.
-            let wanted = crate::runtime::objects::access_exact()
+            if crate::runtime::objects::access_exact()
                 && state
                     .object_name(task_id, pipeline_ref)
-                    .is_some_and(|name| state.pipeline_usage_wanted(name));
-            if !wanted {
-                continue;
+                    .is_some_and(|name| state.pipeline_usage_wanted(name))
+                && crate::backend::vulkan::pipeline_resolve::publish_memoized_usage(
+                    state,
+                    host,
+                    task_id,
+                    pipeline_ref,
+                )
+            {
+                crate::runtime::drain::note_store_route("access_memo_hit_publishes_usage");
             }
-            crate::runtime::drain::note_store_route("access_memo_hit_publishes_usage");
+            continue;
         }
         let air_started = std::time::Instant::now();
         // The MTLB containers, not owned copies of the AIR inside them: the two
