@@ -85,6 +85,94 @@ pub(crate) const PAGE_DIFF_SPIRV: [u32; 369] = [
     0x00010038,
 ];
 
+/// `shaders/page_diff_one_trip.spvasm` (assembled the same way): the compare of
+/// [`PAGE_DIFF_SPIRV`] and, for every page it flags or the host pre-marked in
+/// `flags`, the copy of that page into `out` — one submission where the two-trip
+/// form needed a second one to fetch the pages the first one named.
+pub(crate) const PAGE_DIFF_ONE_TRIP_SPIRV: [u32; 556] = [
+    0x07230203, 0x00010000, 0x00070000, 0x0000005c, 0x00000000, 0x00020011, 0x00000001, 0x0003000e,
+    0x00000000, 0x00000001, 0x0007000f, 0x00000005, 0x00000001, 0x6e69616d, 0x00000000, 0x00000002,
+    0x00000003, 0x00060010, 0x00000001, 0x00000011, 0x00000100, 0x00000001, 0x00000001, 0x00040047,
+    0x00000002, 0x0000000b, 0x0000001a, 0x00040047, 0x00000003, 0x0000000b, 0x0000001b, 0x00040047,
+    0x00000004, 0x00000006, 0x00000004, 0x00050048, 0x00000005, 0x00000000, 0x00000023, 0x00000000,
+    0x00030047, 0x00000005, 0x00000003, 0x00040047, 0x00000006, 0x00000022, 0x00000000, 0x00040047,
+    0x00000006, 0x00000021, 0x00000000, 0x00030047, 0x00000006, 0x00000018, 0x00040047, 0x00000007,
+    0x00000022, 0x00000000, 0x00040047, 0x00000007, 0x00000021, 0x00000001, 0x00040047, 0x00000008,
+    0x00000022, 0x00000000, 0x00040047, 0x00000008, 0x00000021, 0x00000002, 0x00040047, 0x00000009,
+    0x00000022, 0x00000000, 0x00040047, 0x00000009, 0x00000021, 0x00000003, 0x00030047, 0x00000009,
+    0x00000019, 0x00050048, 0x0000000a, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000000a,
+    0x00000001, 0x00000023, 0x00000004, 0x00030047, 0x0000000a, 0x00000002, 0x00020013, 0x0000000b,
+    0x00030021, 0x0000000c, 0x0000000b, 0x00040015, 0x0000000d, 0x00000020, 0x00000000, 0x00040015,
+    0x0000000e, 0x00000020, 0x00000001, 0x00020014, 0x0000000f, 0x00040017, 0x00000010, 0x0000000d,
+    0x00000003, 0x00040020, 0x00000011, 0x00000001, 0x00000010, 0x0004003b, 0x00000011, 0x00000002,
+    0x00000001, 0x0004003b, 0x00000011, 0x00000003, 0x00000001, 0x0003001d, 0x00000004, 0x0000000d,
+    0x0003001e, 0x00000005, 0x00000004, 0x00040020, 0x00000012, 0x00000002, 0x00000005, 0x0004003b,
+    0x00000012, 0x00000006, 0x00000002, 0x0004003b, 0x00000012, 0x00000007, 0x00000002, 0x0004003b,
+    0x00000012, 0x00000008, 0x00000002, 0x0004003b, 0x00000012, 0x00000009, 0x00000002, 0x0004001e,
+    0x0000000a, 0x0000000d, 0x0000000d, 0x00040020, 0x00000013, 0x00000009, 0x0000000a, 0x0004003b,
+    0x00000013, 0x00000014, 0x00000009, 0x00040020, 0x00000015, 0x00000009, 0x0000000d, 0x00040020,
+    0x00000016, 0x00000002, 0x0000000d, 0x00040020, 0x00000017, 0x00000004, 0x0000000d, 0x0004003b,
+    0x00000017, 0x00000018, 0x00000004, 0x0004002b, 0x0000000e, 0x00000019, 0x00000000, 0x0004002b,
+    0x0000000e, 0x0000001a, 0x00000001, 0x0004002b, 0x0000000d, 0x0000001b, 0x00000000, 0x0004002b,
+    0x0000000d, 0x0000001c, 0x00000001, 0x0004002b, 0x0000000d, 0x0000001d, 0x00000002, 0x0004002b,
+    0x0000000d, 0x0000001e, 0x00000100, 0x0004002b, 0x0000000d, 0x0000001f, 0x00000108, 0x0003002a,
+    0x0000000f, 0x00000020, 0x00050036, 0x0000000b, 0x00000001, 0x00000000, 0x0000000c, 0x000200f8,
+    0x00000021, 0x0004003d, 0x00000010, 0x00000022, 0x00000002, 0x00050051, 0x0000000d, 0x00000023,
+    0x00000022, 0x00000000, 0x0004003d, 0x00000010, 0x00000024, 0x00000003, 0x00050051, 0x0000000d,
+    0x00000025, 0x00000024, 0x00000000, 0x00050041, 0x00000015, 0x00000026, 0x00000014, 0x00000019,
+    0x0004003d, 0x0000000d, 0x00000027, 0x00000026, 0x00050041, 0x00000015, 0x00000028, 0x00000014,
+    0x0000001a, 0x0004003d, 0x0000000d, 0x00000029, 0x00000028, 0x000500ae, 0x0000000f, 0x0000002a,
+    0x00000023, 0x00000027, 0x000300f7, 0x0000002b, 0x00000000, 0x000400fa, 0x0000002a, 0x0000002b,
+    0x0000002c, 0x000200f8, 0x0000002c, 0x00050084, 0x0000000d, 0x0000002d, 0x00000023, 0x00000029,
+    0x000500aa, 0x0000000f, 0x0000002e, 0x00000025, 0x0000001b, 0x000300f7, 0x0000002f, 0x00000000,
+    0x000400fa, 0x0000002e, 0x00000030, 0x0000002f, 0x000200f8, 0x00000030, 0x00060041, 0x00000016,
+    0x00000031, 0x00000008, 0x00000019, 0x00000023, 0x0004003d, 0x0000000d, 0x00000032, 0x00000031,
+    0x000500ab, 0x0000000f, 0x00000033, 0x00000032, 0x0000001b, 0x000600a9, 0x0000000d, 0x00000034,
+    0x00000033, 0x0000001c, 0x0000001b, 0x0003003e, 0x00000018, 0x00000034, 0x000200f9, 0x0000002f,
+    0x000200f8, 0x0000002f, 0x000400e0, 0x0000001d, 0x0000001d, 0x0000001f, 0x000200f9, 0x00000035,
+    0x000200f8, 0x00000035, 0x000700f5, 0x0000000d, 0x00000036, 0x00000025, 0x0000002f, 0x00000037,
+    0x00000038, 0x000700f5, 0x0000000f, 0x00000039, 0x00000020, 0x0000002f, 0x0000003a, 0x00000038,
+    0x000400f6, 0x0000003b, 0x00000038, 0x00000000, 0x000200f9, 0x0000003c, 0x000200f8, 0x0000003c,
+    0x000500b0, 0x0000000f, 0x0000003d, 0x00000036, 0x00000029, 0x000400fa, 0x0000003d, 0x0000003e,
+    0x0000003b, 0x000200f8, 0x0000003e, 0x00050080, 0x0000000d, 0x0000003f, 0x0000002d, 0x00000036,
+    0x00060041, 0x00000016, 0x00000040, 0x00000006, 0x00000019, 0x0000003f, 0x0004003d, 0x0000000d,
+    0x00000041, 0x00000040, 0x00060041, 0x00000016, 0x00000042, 0x00000007, 0x00000019, 0x0000003f,
+    0x0004003d, 0x0000000d, 0x00000043, 0x00000042, 0x000500ab, 0x0000000f, 0x00000044, 0x00000041,
+    0x00000043, 0x000300f7, 0x00000045, 0x00000000, 0x000400fa, 0x00000044, 0x00000046, 0x00000045,
+    0x000200f8, 0x00000046, 0x0003003e, 0x00000042, 0x00000041, 0x000200f9, 0x00000045, 0x000200f8,
+    0x00000045, 0x000500a6, 0x0000000f, 0x0000003a, 0x00000039, 0x00000044, 0x000200f9, 0x00000038,
+    0x000200f8, 0x00000038, 0x00050080, 0x0000000d, 0x00000037, 0x00000036, 0x0000001e, 0x000200f9,
+    0x00000035, 0x000200f8, 0x0000003b, 0x000300f7, 0x00000047, 0x00000000, 0x000400fa, 0x00000039,
+    0x00000048, 0x00000047, 0x000200f8, 0x00000048, 0x0003003e, 0x00000018, 0x0000001c, 0x000200f9,
+    0x00000047, 0x000200f8, 0x00000047, 0x000400e0, 0x0000001d, 0x0000001d, 0x0000001f, 0x0004003d,
+    0x0000000d, 0x00000049, 0x00000018, 0x000500ab, 0x0000000f, 0x0000004a, 0x00000049, 0x0000001b,
+    0x000300f7, 0x0000004b, 0x00000000, 0x000400fa, 0x0000004a, 0x0000004c, 0x0000004b, 0x000200f8,
+    0x0000004c, 0x000200f9, 0x0000004d, 0x000200f8, 0x0000004d, 0x000700f5, 0x0000000d, 0x0000004e,
+    0x00000025, 0x0000004c, 0x0000004f, 0x00000050, 0x000400f6, 0x00000051, 0x00000050, 0x00000000,
+    0x000200f9, 0x00000052, 0x000200f8, 0x00000052, 0x000500b0, 0x0000000f, 0x00000053, 0x0000004e,
+    0x00000029, 0x000400fa, 0x00000053, 0x00000054, 0x00000051, 0x000200f8, 0x00000054, 0x00050080,
+    0x0000000d, 0x00000055, 0x0000002d, 0x0000004e, 0x00060041, 0x00000016, 0x00000056, 0x00000006,
+    0x00000019, 0x00000055, 0x0004003d, 0x0000000d, 0x00000057, 0x00000056, 0x00060041, 0x00000016,
+    0x00000058, 0x00000009, 0x00000019, 0x00000055, 0x0003003e, 0x00000058, 0x00000057, 0x000200f9,
+    0x00000050, 0x000200f8, 0x00000050, 0x00050080, 0x0000000d, 0x0000004f, 0x0000004e, 0x0000001e,
+    0x000200f9, 0x0000004d, 0x000200f8, 0x00000051, 0x000300f7, 0x00000059, 0x00000000, 0x000400fa,
+    0x0000002e, 0x0000005a, 0x00000059, 0x000200f8, 0x0000005a, 0x00060041, 0x00000016, 0x0000005b,
+    0x00000008, 0x00000019, 0x00000023, 0x0003003e, 0x0000005b, 0x0000001c, 0x000200f9, 0x00000059,
+    0x000200f8, 0x00000059, 0x000200f9, 0x0000004b, 0x000200f8, 0x0000004b, 0x000200f9, 0x0000002b,
+    0x000200f8, 0x0000002b, 0x000100fd, 0x00010038,
+];
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_ONE_TRIP=on` answers a page-diff payment with
+/// one submission and one wait instead of two. Latched for the process.
+pub(crate) fn one_trip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_PAY_ONE_TRIP").is_ok_and(|v| v == "on");
+        crate::observe::off(format!("pay_diff_one_trip on={on}"));
+        on
+    })
+}
+
 /// A buffer this module owns outright: its own `vkAllocateMemory`, alive across
 /// payments. The pools recycle their slots at each fence, and a shadow has to
 /// hold a frame from one swap to the next.
@@ -182,6 +270,19 @@ impl OwnedBuffer {
         })
     }
 
+    /// Make the host's writes visible to the device, for a non-coherent type.
+    pub(crate) unsafe fn flush(&self, device: &ash::Device) -> Result<(), DrawError> {
+        if self.coherent || self.mapped.is_null() {
+            return Ok(());
+        }
+        let range = [vk::MappedMemoryRange::default()
+            .memory(self.memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)];
+        unsafe { device.flush_mapped_memory_ranges(&range) }
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ReadbackInvalidate, e)))
+    }
+
     /// Make the device's writes visible to the host, for a non-coherent type.
     pub(crate) unsafe fn invalidate(&self, device: &ash::Device) -> Result<(), DrawError> {
         if self.coherent || self.mapped.is_null() {
@@ -213,25 +314,32 @@ pub(crate) struct DiffPipeline {
     pub layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
     pub set: vk::DescriptorSet,
+    /// The one-trip kernel (four bindings, copies the pages it flags).
+    pub one_trip: bool,
 }
 
 impl DiffPipeline {
-    unsafe fn create(ctx: &DeviceContext) -> Result<Self, DrawError> {
+    unsafe fn create(ctx: &DeviceContext, one_trip: bool) -> Result<Self, DrawError> {
         let device = &ctx.device;
+        let code: &[u32] = if one_trip {
+            &PAGE_DIFF_ONE_TRIP_SPIRV
+        } else {
+            &PAGE_DIFF_SPIRV
+        };
         let module = unsafe {
-            device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(&PAGE_DIFF_SPIRV),
-                None,
-            )
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None)
         }
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ScatterCreateShaderModule, e)))?;
-        let bindings = [0u32, 1, 2].map(|b| {
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(b)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-        });
+        let binding_count: u32 = if one_trip { 4 } else { 3 };
+        let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = (0..binding_count)
+            .map(|b| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            })
+            .collect();
         let dsl = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -264,7 +372,7 @@ impl DiffPipeline {
             .map_err(|(_, e)| DrawError::VkCall(VkCall::new(VkOp::ScatterCreatePipeline, e)))?[0];
         let sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(3)];
+            .descriptor_count(binding_count)];
         let dpool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -288,16 +396,19 @@ impl DiffPipeline {
             layout,
             pipeline,
             set,
+            one_trip,
         })
     }
 
-    /// Point the set at this payment's three buffers.
+    /// Point the set at this payment's buffers (`out` is the fourth binding of
+    /// the one-trip kernel and is ignored by the two-trip one).
     pub(crate) unsafe fn write_set(
         &self,
         device: &ash::Device,
         cur: &OwnedBuffer,
         prev: &OwnedBuffer,
         flags: &OwnedBuffer,
+        out: &OwnedBuffer,
         frame: u64,
         pages: u64,
     ) {
@@ -314,14 +425,21 @@ impl DiffPipeline {
                 .buffer(flags.buffer)
                 .offset(0)
                 .range(pages * 4),
+            vk::DescriptorBufferInfo::default()
+                .buffer(out.buffer)
+                .offset(0)
+                .range(frame),
         ];
-        let writes = [0usize, 1, 2].map(|i| {
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.set)
-                .dst_binding(i as u32)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(std::slice::from_ref(&infos[i]))
-        });
+        let n = if self.one_trip { 4 } else { 3 };
+        let writes: Vec<vk::WriteDescriptorSet<'_>> = (0..n)
+            .map(|i| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&infos[i]))
+            })
+            .collect();
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 }
@@ -352,7 +470,7 @@ impl PageDiffState {
     /// The compare kernel, created on first use; `None` after a refusal.
     pub(crate) unsafe fn ensure_pipeline(&mut self, ctx: &DeviceContext) -> bool {
         if self.pipeline.is_none() && !self.refused {
-            match unsafe { DiffPipeline::create(ctx) } {
+            match unsafe { DiffPipeline::create(ctx, one_trip_enabled()) } {
                 Ok(p) => self.pipeline = Some(p),
                 Err(e) => {
                     self.refused = true;

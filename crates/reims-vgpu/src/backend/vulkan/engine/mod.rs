@@ -3823,7 +3823,7 @@ pub fn read_target_changed_pages(
             ctx,
             &mut st.out,
             padded,
-            vk::BufferUsageFlags::TRANSFER_DST,
+            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
             MemoryClass::Readback,
         )?;
     }
@@ -3836,8 +3836,23 @@ pub fn read_target_changed_pages(
     );
     let prev = &st.shadows.get(&mapping_id).expect("ensured").prev;
     let pipe = st.pipeline.as_ref().expect("ensured");
+    let one_trip = pipe.one_trip;
     if !fresh {
-        unsafe { pipe.write_set(&ctx.device, cur, prev, flags, padded, pages) };
+        unsafe { pipe.write_set(&ctx.device, cur, prev, flags, out, padded, pages) };
+    }
+    if !fresh && one_trip {
+        // The kernel copies every page it flags, so the pages the caller must
+        // land whatever the compare says are marked before it runs.
+        unsafe {
+            let f = std::slice::from_raw_parts_mut(flags.mapped.cast::<u32>(), pages as usize);
+            f.fill(0);
+            for &p in force {
+                if let Some(slot) = f.get_mut(p as usize) {
+                    *slot = 1;
+                }
+            }
+            flags.flush(&ctx.device)?;
+        }
     }
     let (cur_b, prev_b, flags_b, out_b) = (cur.buffer, prev.buffer, flags.buffer, out.buffer);
     let (pl_layout, pl, set) = (pipe.layout, pipe.pipeline, pipe.set);
@@ -3890,7 +3905,9 @@ pub fn read_target_changed_pages(
                 d.cmd_copy_buffer(cb, cur_b, prev_b, &whole);
                 d.cmd_copy_buffer(cb, cur_b, out_b, &whole);
             } else {
-                d.cmd_fill_buffer(cb, flags_b, 0, pages * 4, 0);
+                if !one_trip {
+                    d.cmd_fill_buffer(cb, flags_b, 0, pages * 4, 0);
+                }
                 d.cmd_pipeline_barrier(
                     cb,
                     vk::PipelineStageFlags::TRANSFER,
@@ -3938,11 +3955,12 @@ pub fn read_target_changed_pages(
         // Pages the caller must land whatever the diff says (the guest CPU
         // wrote them since the copy was taken). Unflagged, their `prev` already
         // equals the frame, so landing them from `cur` keeps the copy true.
+        // The one-trip kernel has flagged and copied those itself.
         (0..pages as u32)
             .filter(|&p| f[p as usize] != 0 || force.binary_search(&p).is_ok())
             .collect()
     };
-    if !fresh && !changed.is_empty() {
+    if !fresh && !changed.is_empty() && !one_trip {
         // Second trip: only the changed pages cross to host memory, packed.
         let mut regions: Vec<vk::BufferCopy> = Vec::new();
         let mut i = 0usize;

@@ -1,0 +1,188 @@
+; page_diff_one_trip: page_diff plus the copy of every page it flags into `out`,
+; so one submission answers "which pages changed" and "what do they hold".
+; Pages the host marked in `flags` before the dispatch (the guest CPU wrote them
+; since the shadow was taken) are copied whatever the compare says.
+;
+; GLSL equivalent (hand-assembled: no glslc on the Windows lab host):
+;
+;   #version 450
+;   layout(local_size_x = 256) in;
+;   layout(std430, set = 0, binding = 0) readonly buffer Cur   { uint cur[];   };
+;   layout(std430, set = 0, binding = 1)          buffer Prev  { uint prev[];  };
+;   layout(std430, set = 0, binding = 2)          buffer Flags { uint flags[]; };
+;   layout(std430, set = 0, binding = 3) writeonly buffer Out  { uint out_[];  };
+;   layout(push_constant) uniform Push { uint page_count; uint words_per_page; } pc;
+;   shared uint any_changed;
+;   void main() {
+;       uint p = gl_WorkGroupID.x;
+;       if (p >= pc.page_count) return;
+;       uint base = p * pc.words_per_page;
+;       if (gl_LocalInvocationID.x == 0u) any_changed = (flags[p] != 0u) ? 1u : 0u;
+;       barrier();
+;       bool diff = false;
+;       for (uint i = gl_LocalInvocationID.x; i < pc.words_per_page; i += 256) {
+;           uint c = cur[base + i];
+;           uint pv = prev[base + i];
+;           if (c != pv) { prev[base + i] = c; }
+;           diff = diff || (c != pv);
+;       }
+;       if (diff) any_changed = 1u;
+;       barrier();
+;       if (any_changed != 0u) {
+;           for (uint i = gl_LocalInvocationID.x; i < pc.words_per_page; i += 256)
+;               out_[base + i] = cur[base + i];
+;           if (gl_LocalInvocationID.x == 0u) flags[p] = 1u;
+;       }
+;   }
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %wgid %lid
+               OpExecutionMode %main LocalSize 256 1 1
+               OpDecorate %wgid BuiltIn WorkgroupId
+               OpDecorate %lid BuiltIn LocalInvocationId
+               OpDecorate %rta ArrayStride 4
+               OpMemberDecorate %Buf 0 Offset 0
+               OpDecorate %Buf BufferBlock
+               OpDecorate %cur DescriptorSet 0
+               OpDecorate %cur Binding 0
+               OpDecorate %cur NonWritable
+               OpDecorate %prev DescriptorSet 0
+               OpDecorate %prev Binding 1
+               OpDecorate %flags DescriptorSet 0
+               OpDecorate %flags Binding 2
+               OpDecorate %out DescriptorSet 0
+               OpDecorate %out Binding 3
+               OpDecorate %out NonReadable
+               OpMemberDecorate %Push 0 Offset 0
+               OpMemberDecorate %Push 1 Offset 4
+               OpDecorate %Push Block
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+       %bool = OpTypeBool
+     %v3uint = OpTypeVector %uint 3
+  %ptr_in_v3 = OpTypePointer Input %v3uint
+       %wgid = OpVariable %ptr_in_v3 Input
+        %lid = OpVariable %ptr_in_v3 Input
+        %rta = OpTypeRuntimeArray %uint
+        %Buf = OpTypeStruct %rta
+  %ptr_u_Buf = OpTypePointer Uniform %Buf
+        %cur = OpVariable %ptr_u_Buf Uniform
+       %prev = OpVariable %ptr_u_Buf Uniform
+      %flags = OpVariable %ptr_u_Buf Uniform
+        %out = OpVariable %ptr_u_Buf Uniform
+       %Push = OpTypeStruct %uint %uint
+%ptr_pc_Push = OpTypePointer PushConstant %Push
+         %pc = OpVariable %ptr_pc_Push PushConstant
+%ptr_pc_uint = OpTypePointer PushConstant %uint
+ %ptr_u_uint = OpTypePointer Uniform %uint
+%ptr_wg_uint = OpTypePointer Workgroup %uint
+        %any = OpVariable %ptr_wg_uint Workgroup
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+   %uint_256 = OpConstant %uint 256
+   %uint_264 = OpConstant %uint 264
+      %false = OpConstantFalse %bool
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %wg = OpLoad %v3uint %wgid
+          %p = OpCompositeExtract %uint %wg 0
+       %lid3 = OpLoad %v3uint %lid
+         %l0 = OpCompositeExtract %uint %lid3 0
+   %pcnt_ptr = OpAccessChain %ptr_pc_uint %pc %int_0
+       %pcnt = OpLoad %uint %pcnt_ptr
+    %wpp_ptr = OpAccessChain %ptr_pc_uint %pc %int_1
+        %wpp = OpLoad %uint %wpp_ptr
+        %oob = OpUGreaterThanEqual %bool %p %pcnt
+               OpSelectionMerge %done None
+               OpBranchConditional %oob %done %body
+       %body = OpLabel
+       %base = OpIMul %uint %p %wpp
+        %is0 = OpIEqual %bool %l0 %uint_0
+               OpSelectionMerge %initdone None
+               OpBranchConditional %is0 %init %initdone
+       %init = OpLabel
+      %fptr0 = OpAccessChain %ptr_u_uint %flags %int_0 %p
+         %f0 = OpLoad %uint %fptr0
+     %forced = OpINotEqual %bool %f0 %uint_0
+   %anyinit = OpSelect %uint %forced %uint_1 %uint_0
+               OpStore %any %anyinit
+               OpBranch %initdone
+   %initdone = OpLabel
+               OpControlBarrier %uint_2 %uint_2 %uint_264
+               OpBranch %head
+       %head = OpLabel
+          %i = OpPhi %uint %l0 %initdone %inext %cont
+       %diff = OpPhi %bool %false %initdone %dnext %cont
+               OpLoopMerge %exit %cont None
+               OpBranch %cond
+       %cond = OpLabel
+         %lt = OpULessThan %bool %i %wpp
+               OpBranchConditional %lt %lbody %exit
+      %lbody = OpLabel
+        %idx = OpIAdd %uint %base %i
+       %cptr = OpAccessChain %ptr_u_uint %cur %int_0 %idx
+          %c = OpLoad %uint %cptr
+       %pptr = OpAccessChain %ptr_u_uint %prev %int_0 %idx
+         %pv = OpLoad %uint %pptr
+         %ne = OpINotEqual %bool %c %pv
+               OpSelectionMerge %smerge None
+               OpBranchConditional %ne %store %smerge
+      %store = OpLabel
+               OpStore %pptr %c
+               OpBranch %smerge
+     %smerge = OpLabel
+      %dnext = OpLogicalOr %bool %diff %ne
+               OpBranch %cont
+       %cont = OpLabel
+      %inext = OpIAdd %uint %i %uint_256
+               OpBranch %head
+       %exit = OpLabel
+               OpSelectionMerge %setmerge None
+               OpBranchConditional %diff %setany %setmerge
+     %setany = OpLabel
+               OpStore %any %uint_1
+               OpBranch %setmerge
+   %setmerge = OpLabel
+               OpControlBarrier %uint_2 %uint_2 %uint_264
+       %anyv = OpLoad %uint %any
+     %docopy = OpINotEqual %bool %anyv %uint_0
+               OpSelectionMerge %copydone None
+               OpBranchConditional %docopy %copypre %copydone
+    %copypre = OpLabel
+               OpBranch %chead
+      %chead = OpLabel
+         %ci = OpPhi %uint %l0 %copypre %cinext %ccont
+               OpLoopMerge %cexit %ccont None
+               OpBranch %ccond
+      %ccond = OpLabel
+        %clt = OpULessThan %bool %ci %wpp
+               OpBranchConditional %clt %cbody %cexit
+      %cbody = OpLabel
+       %cidx = OpIAdd %uint %base %ci
+        %cpp = OpAccessChain %ptr_u_uint %cur %int_0 %cidx
+         %cv = OpLoad %uint %cpp
+        %opp = OpAccessChain %ptr_u_uint %out %int_0 %cidx
+               OpStore %opp %cv
+               OpBranch %ccont
+      %ccont = OpLabel
+     %cinext = OpIAdd %uint %ci %uint_256
+               OpBranch %chead
+      %cexit = OpLabel
+               OpSelectionMerge %cfmerge None
+               OpBranchConditional %is0 %setf %cfmerge
+       %setf = OpLabel
+       %fptr = OpAccessChain %ptr_u_uint %flags %int_0 %p
+               OpStore %fptr %uint_1
+               OpBranch %cfmerge
+    %cfmerge = OpLabel
+               OpBranch %copydone
+   %copydone = OpLabel
+               OpBranch %done
+       %done = OpLabel
+               OpReturn
+               OpFunctionEnd
