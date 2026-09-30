@@ -2604,6 +2604,12 @@ pub(crate) fn selected_within(
         )
 }
 
+/// TEMP (lab): rides on `REIMS_VGPU_LAB_PAY_ONE_TRIP=on`. Latched.
+fn lab_skip_unselected_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PAY_ONE_TRIP").is_ok_and(|v| v == "on"))
+}
+
 /// Copy `[off, off+len)` between a caller buffer and the mapping's guest pages.
 ///
 /// One packed contig view when the mapping has one that covers the range;
@@ -2686,6 +2692,16 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         let copy_lo = off.max(run_mlo);
         let copy_hi = need_end.min(run_mhi);
         if copy_lo >= copy_hi {
+            continue;
+        }
+        // TEMP (lab, with `REIMS_VGPU_LAB_PAY_ONE_TRIP=on`): a run the selection
+        // touches nowhere has nothing to move, and importing it only to unmap it
+        // again was 10 800 map/unmap pairs a frame for ~1 600 changed pages.
+        if lab_skip_unselected_runs()
+            && only.is_some()
+            && selected_within(only, copy_lo, copy_hi).next().is_none()
+        {
+            crate::runtime::drain::note_store_route("mapping_run_skipped_unselected");
             continue;
         }
         let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
