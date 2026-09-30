@@ -50,6 +50,42 @@ pub fn resident_target_backing(
 /// A `bool` beside the backing would have said the same thing and would not
 /// have said which of the two the backing came from; the warm arm is the whole
 /// reason this path exists and it is the arm that must stay off the census.
+/// The backing a resource's lease already holds for `identity`, or `None` when
+/// answering would mean acquiring one.
+///
+/// The half of [`resident_target_backing`] that reads and never retains: it
+/// takes no engine lock and inserts no lease, so a thread that must not
+/// mutate device state — a parallel sampled-source plan — can ask it. `None`
+/// is "not answerable without the acquiring path", not "not ready": the
+/// caller that gets it defers to [`resident_target_backing`] on the thread
+/// that may acquire.
+pub fn resident_target_backing_warm(
+    resource: &TaskResource,
+    identity: &TargetIdentity,
+) -> Option<ResidentContentBacking> {
+    resource
+        .with_rail_state(|held: &mut ResidentTargets| {
+            held.0
+                .get(identity)
+                .filter(|lease| lease.matches(identity))
+                .map(ResidentResourceLease::backing)
+        })
+        .flatten()
+}
+
+/// Give `resource` a warm lease for `identity`, as an earlier acquiring bind
+/// would have. Tests only: the engine registry a real lease names is absent.
+#[cfg(test)]
+pub(crate) fn seed_warm_lease_for_test(
+    resource: &TaskResource,
+    identity: &TargetIdentity,
+    backing: ResidentContentBacking,
+) {
+    let _ = resident_target_backing_with(resource, identity, |identity| {
+        Some(ResidentResourceLease::test_new(identity.clone(), backing))
+    });
+}
+
 enum Retention {
     /// The resource already held a live lease for this identity.
     Warm(ResidentContentBacking),

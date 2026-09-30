@@ -19,6 +19,12 @@ use crate::runtime::census::srgb_census;
 use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 use crate::runtime::surface_currency::{surface_currency, CurrencyStandard, SurfaceCurrency};
+
+mod sample_plan;
+#[allow(unused_imports)]
+pub(crate) use sample_plan::{plan_sampled_source, SampleBail, SampleInvalid, SamplePlan};
+#[allow(unused_imports)]
+use sample_plan::commit_sampled_plan;
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
@@ -2759,141 +2765,44 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 ));
             }
         }
-        if let Some(m) = state.mappings.get(&mid) {
-            if m.has_geom && m.width > 0 && m.height > 0 {
-                let (w, h) = (m.width, m.height);
-                // Compute the resident-surface identity once and reuse it for
-                // both the readiness check and the direct bind.
-                let resident_id =
-                    crate::backend::vulkan::present_identity::surface_identity(state, mid, w, h);
-                // `content_ready` only. The obvious strengthening — also require
-                // the resident's `content_epoch` to match the mapping's, as the
-                // attachment LOAD elision does — was tried and reverted, because
-                // `content_epoch` is not free for this rung to reinterpret. The
-                // deferred flush uses the same field as its own identity check
-                // ("is this still the resident my window was armed on"), so
-                // withholding the stamp to disqualify a resident *here* made
-                // every later window on that resident report
-                // `resident_epoch_drift` and drop its frame: `deferred_flush_lost`
-                // went from 17 to 3 161 on one boot and the screen stayed black.
-                //
-                // Separating the two meanings is worth doing and is not this
-                // change. What guards this rung today is the guest-write witness
-                // below, which is the witness the LOAD elision's epoch pair
-                // cannot supply anyway.
-                let resident_backing = resolved_resource
+        // The resident rungs decide in [`sample_plan::surface_top`], the one
+        // function a parallel plan takes the same decision through. This ladder
+        // may acquire a lease to answer the backing; a plan may only read a warm
+        // one.
+        match sample_plan::surface_top(state, host, mid, may_bind_resident, |identity| {
+            Some(
+                resolved_resource
                     .as_ref()
                     .filter(|resource| {
                         resource_type_owns_surface_resident(resource.entry.object_type)
                     })
-                    .map(|resource| resource_lease::resident_target_backing(resource, &resident_id))
+                    .map(|resource| resource_lease::resident_target_backing(resource, identity))
                     // An unclassified ref has no resource object to own a
                     // lease. Keep its existing query path so compatibility
                     // traffic still reaches the copying rails.
                     .unwrap_or_else(|| {
-                        crate::backend::vulkan::engine::resident_content_backing(&resident_id)
-                    });
-                let resident_ready = resident_backing
-                    != crate::backend::vulkan::engine::ResidentContentBacking::NotReady;
-                if resident_ready {
-                    crate::runtime::drain::note_store_route(match resident_backing {
-                        crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation => {
-                            "t11sample_ready_guest_allocation"
-                        }
-                        crate::backend::vulkan::engine::ResidentContentBacking::DeviceAllocation => {
-                            "t11sample_ready_device_allocation"
-                        }
-                        crate::backend::vulkan::engine::ResidentContentBacking::NotReady => {
-                            unreachable!("resident_ready excludes this arm")
-                        }
-                    });
-                }
-                // A render attachment and a sampled binding name the same
-                // texture resource. When that resource's storage is the guest
-                // allocation itself, a guest CPU write changes the resource;
-                // it cannot make a second resident copy stale because there is
-                // no second copy. Bind it directly before entering the currency
-                // ladder, which exists for device-allocation mirrors.
-                //
-                // A non-identity view still falls through. The target bind
-                // cannot carry that view's channel remap yet, so treating it as
-                // direct would preserve the bytes and sample the wrong logical
-                // channels.
-                if guest_allocation_sample_is_direct(resident_backing, may_bind_resident) {
-                    crate::runtime::drain::note_store_route("t11rung_resident");
-                    let format = resident_id.resident_format();
-                    return Some((w, h, mid, SampledSourceRequest::Target(resident_id, format)));
-                }
-
-                // What the hypervisor can say about the guest's own stores into
-                // this surface since the Store that produced our copies of it.
-                // Asked once here and used by every rung below, because every
-                // rung below either serves a host-side copy — whose currency
-                // this is the only witness for — or reads the pages and does
-                // not care. The host-cache rung used to ask it privately; the
-                // resident rung above it asked nothing at all.
-                //
-                // Two stages: the token's generation says whether the guest
-                // wrote the *allocation*, and only when it did is the page list
-                // enumerated to say whether it wrote the *pixels*. The second
-                // stage costs a page-list walk and is paid on the minority of
-                // binds the first stage flags.
-                let currency = surface_currency(state, host, mid, w, h);
-                // The coarse column the rung census reports under. Taken from
-                // the same answer the serving decision uses, so the two cannot
-                // describe different asks.
-                let guest_write = currency.verdict();
-                if let Some(route) = match &currency {
-                    SurfaceCurrency::Unwritten(_) => None,
-                    SurfaceCurrency::WrotePixels(_) => Some("t11sample_gw_wrote_pixels"),
-                    SurfaceCurrency::WroteElsewhere => Some("t11sample_gw_wrote_elsewhere"),
-                    SurfaceCurrency::WroteUnknown => Some("t11sample_gw_wrote_unknown"),
-                } {
+                        crate::backend::vulkan::engine::resident_content_backing(identity)
+                    }),
+            )
+        }) {
+            Err(_) => {}
+            Ok(top) => {
+                for route in &top.routes {
                     crate::runtime::drain::note_store_route(route);
                 }
-                let guest_owned = currency.guest_owned();
-                // Every rung under this one reads the guest's own pages, so a
-                // serve this rung refuses is corrected below it rather than
-                // held: the ladder takes the permissive standard.
-                let guest_replaced = !currency.serves(CurrencyStandard::NoContraryEvidence);
-
-                // A ready resident target is authoritative after a product
-                // Store — but only while nothing has replaced the bytes it is a
-                // copy of. A mapper-ref-texture surface's pages are plain guest RAM and the
-                // guest CPU stores into them with no device operation, so a
-                // resident produced for one tenant of the surface keeps claiming
-                // to hold its pixels after the guest has painted different ones
-                // there. This is the same question `mapper_ref_texture_guest_wrote_since_store`
-                // asks before the attachment LOAD elision reuses a resident, and
-                // the same one the host-cache rung below asks before serving its
-                // copy. This rung asked neither, and it is the largest of the
-                // three: one 14-round Finder boot measured 92 730 binds here
-                // against the cache rung's 14 396.
-                //
-                // It also sits *above* both rungs that read the guest's own
-                // pages, so a stale bind here is never corrected by anything
-                // below it — the wrong image is held for as long as the guest
-                // keeps re-binding the same surface, which is what "renders
-                // correctly for a few frames then stays corrupted" looks like
-                // from inside the guest.
-                //
-                // Refusing is not enough on its own, because neither copy is the
-                // surface once both sides have written it. The refusal merges
-                // them into the guest's pages first — see
-                // [`merge_guest_writes_into_pages`] — and every rung below then
-                // reads a surface that holds both halves.
-                // A bind whose view remaps channels cannot take a resident
-                // directly — the engine hands the swizzle to the image view and
-                // the direct bind has none — so it falls straight to a byte rung
-                // that can apply it. Counted on its own route and *outside* the
-                // refusal below: nothing was replaced and there is nothing to
-                // merge, so borrowing `_refused` would report a repaint that did
-                // not happen and run a merge for it.
-                if resident_ready && !guest_replaced && !may_bind_resident {
-                    note_mapper_ref_texture_sample_rung("t11rung_resident_swizzled", guest_write);
-                } else if resident_ready {
-                    if !guest_replaced {
-                        note_mapper_ref_texture_sample_rung("t11rung_resident", guest_write);
+                let guest_write = top.guest_write();
+                let guest_replaced = top.guest_replaced();
+                let resident_ready = top.resident_ready();
+                let sample_plan::SurfaceTop {
+                    w,
+                    h,
+                    resident_id,
+                    currency,
+                    outcome,
+                    ..
+                } = top;
+                match outcome {
+                    sample_plan::TopOutcome::Direct | sample_plan::TopOutcome::Resident => {
                         let format = resident_id.resident_format();
                         return Some((
                             w,
@@ -2902,88 +2811,91 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                             SampledSourceRequest::Target(resident_id, format),
                         ));
                     }
-                    note_mapper_ref_texture_sample_rung("t11rung_resident_refused", guest_write);
-                    if guest_owned.is_some() {
-                        note_guest_cpu_shared(state, mid);
-                    }
-                    // Reconcile the two halves in the resident when it can take
-                    // the guest's bytes as they are, and serve it: no readback,
-                    // no wait, and only the guest's pages move. A view that
-                    // remaps channels cannot bind the resident at all, so it
-                    // keeps the merge and the byte rungs below.
-                    if may_bind_resident {
-                        if let Some(owned) = guest_owned {
-                            if overlay_guest_writes_onto_resident(
-                                state,
-                                host,
-                                mid,
-                                w,
-                                h,
-                                &resident_id,
-                                owned,
-                            ) {
-                                let format = resident_id.resident_format();
-                                return Some((
+                    sample_plan::TopOutcome::Refused => {
+                        let guest_owned = currency.as_ref().and_then(SurfaceCurrency::guest_owned);
+                        if guest_owned.is_some() {
+                            note_guest_cpu_shared(state, mid);
+                        }
+                        // Reconcile the two halves in the resident when it can take
+                        // the guest's bytes as they are, and serve it: no readback,
+                        // no wait, and only the guest's pages move. A view that
+                        // remaps channels cannot bind the resident at all, so it
+                        // keeps the merge and the byte rungs below.
+                        if may_bind_resident {
+                            if let Some(owned) = guest_owned {
+                                if overlay_guest_writes_onto_resident(
+                                    state,
+                                    host,
+                                    mid,
                                     w,
                                     h,
+                                    &resident_id,
+                                    owned,
+                                ) {
+                                    let format = resident_id.resident_format();
+                                    return Some((
+                                        w,
+                                        h,
+                                        mid,
+                                        SampledSourceRequest::Target(resident_id, format),
+                                    ));
+                                }
+                            }
+                        }
+                        match guest_owned {
+                            Some(owned) => {
+                                // The merge is what makes falling through sound: it
+                                // puts the resident's half into every page the guest
+                                // did not write, so the rungs below read a surface
+                                // holding both. When it does not land, that premise
+                                // is false — the halves are still split, and the
+                                // pages below hold only the guest's, which for a
+                                // composite the Store deliberately left GPU-side is
+                                // nothing at all. Falling through anyway is how a
+                                // sampled backdrop comes back blank.
+                                //
+                                // So refuse the bind instead of choosing a half.
+                                // `merge_guest_writes_into_pages` has already named
+                                // the stage that failed on the fail channel; this
+                                // turns its `false` into a decline the draw reports,
+                                // which is what its doc asks the caller for.
+                                if !merge_guest_writes_into_pages(
+                                    state,
+                                    host,
                                     mid,
-                                    SampledSourceRequest::Target(resident_id, format),
-                                ));
+                                    w,
+                                    h,
+                                    &resident_id,
+                                    &owned.ranges,
+                                ) {
+                                    crate::runtime::drain::note_store_route(
+                                        "t11sample_resident_merge_unlanded",
+                                    );
+                                    return None;
+                                }
                             }
+                            // `Unknown`: the host named no pages, so there is no
+                            // list to preserve and no merge to make. The rungs below
+                            // read whatever the guest's pages hold, which is the only
+                            // source not known to be stale.
+                            None => crate::runtime::drain::note_store_route(
+                                "t11sample_resident_unmergeable",
+                            ),
+                        }
+                        // A resident that stops matching its surface is a real
+                        // correction, not routine control flow: without this line a
+                        // boot cannot tell "the guest never rewrites its sampled
+                        // surfaces" from "the witness is never armed". Latched per
+                        // mapping so a surface the guest repaints every frame stays
+                        // at one line.
+                        if crate::observe::first_sight("sampled_resident_stale", u64::from(mid)) {
+                            crate::observe::off(format!(
+                                "sampled_resident_stale mid={mid} {w}x{h} \
+                                 (guest wrote pages inside the sampled window; reading them instead)"
+                            ));
                         }
                     }
-                    match guest_owned {
-                        Some(owned) => {
-                            // The merge is what makes falling through sound: it
-                            // puts the resident's half into every page the guest
-                            // did not write, so the rungs below read a surface
-                            // holding both. When it does not land, that premise
-                            // is false — the halves are still split, and the
-                            // pages below hold only the guest's, which for a
-                            // composite the Store deliberately left GPU-side is
-                            // nothing at all. Falling through anyway is how a
-                            // sampled backdrop comes back blank.
-                            //
-                            // So refuse the bind instead of choosing a half.
-                            // `merge_guest_writes_into_pages` has already named
-                            // the stage that failed on the fail channel; this
-                            // turns its `false` into a decline the draw reports,
-                            // which is what its doc asks the caller for.
-                            if !merge_guest_writes_into_pages(
-                                state,
-                                host,
-                                mid,
-                                w,
-                                h,
-                                &resident_id,
-                                &owned.ranges,
-                            ) {
-                                crate::runtime::drain::note_store_route(
-                                    "t11sample_resident_merge_unlanded",
-                                );
-                                return None;
-                            }
-                        }
-                        // `Unknown`: the host named no pages, so there is no
-                        // list to preserve and no merge to make. The rungs below
-                        // read whatever the guest's pages hold, which is the only
-                        // source not known to be stale.
-                        None => crate::runtime::drain::note_store_route(
-                            "t11sample_resident_unmergeable",
-                        ),
-                    }
-                    // A resident that stops matching its surface is a real
-                    // correction, not routine control flow: without this line a
-                    // boot cannot tell "the guest never rewrites its sampled
-                    // surfaces" from "the witness is never armed". Latched per
-                    // mapping so a surface the guest repaints every frame stays
-                    // at one line.
-                    if crate::observe::first_sight("sampled_resident_stale", u64::from(mid)) {
-                        crate::observe::off(format!(
-                            "sampled_resident_stale mid={mid} {w}x{h} \
-                             (guest wrote pages inside the sampled window; reading them instead)"
-                        ));
-                    }
+                    sample_plan::TopOutcome::Swizzled | sample_plan::TopOutcome::NotReady => {}
                 }
 
                 // Falling through because the resident is *gone* is not the same
@@ -3038,30 +2950,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // reliance on it should stay visible, not because a firing means
                 // something was lost.
                 if !resident_ready {
-                    if let Some((cause, since_ms)) =
-                        crate::backend::vulkan::engine::resident_absent_after_reclaim(&resident_id)
-                    {
-                        crate::runtime::drain::note_store_route("t11sample_reclaimed_from_pages");
-                        // How long after we destroyed it the guest came back.
-                        // This is the half `resident_resample_peak_ms` cannot
-                        // see: that peak only observes residents that survived
-                        // to be read, so every gap longer than the cutoff is
-                        // censored out of it and a reclaim policy tuned from it
-                        // is tuned from data it destroyed the tail of. A
-                        // resident read here had gone at least
-                        // `IDLE_MAINTENANCE_START_MS + since_ms` between uses.
-                        crate::runtime::drain::note_store_route(reclaimed_resample_band(since_ms));
-                        if crate::observe::first_sight("sampled_resident_reclaimed", u64::from(mid))
-                        {
-                            crate::observe::fail(format!(
-                                "sampled_resident_reclaimed reason=sampled_resident_reclaimed \
-                                 mid={mid} {w}x{h} prior={} since_reclaim_ms={since_ms} \
-                                 (reclaimed after its pixels were copied out; re-reading \
-                                 its guest pages costs an upload, not a frame)",
-                                cause.slug()
-                            ));
-                        }
-                    }
+                    note_sampled_resident_absence(mid, w, h, &resident_id);
                 }
 
                 // 1) Host cache — the other host-side copy of these pages, and
@@ -3080,57 +2969,8 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     .then(|| crate::runtime::surface_cache::get_shared_with_gen(state, mid, w, h))
                     .flatten()
                 {
-                    // Uploaded in the order the cache already holds. This rung's
-                    // bytes are BGRA8 by construction — it is a backing scanout
-                    // cache — and `B8G8R8A8_UNORM` is a Vulkan-mandatory sampled
-                    // format with linear filtering, so declaring the layout costs
-                    // nothing and the hardware reads the channels the guest
-                    // stored. What stood here rebuilt the whole frame into RGBA8
-                    // first: a 1.7 MB allocation plus a full read+write pass on
-                    // every bind, ~116 binds a second live, to reach bytes the
-                    // sampler could already address. The linear rail reached the
-                    // same conclusion (`linear_native_upload_format(.., true)`).
-                    //
-                    // The view swizzle applied at bind is a *logical* channel
-                    // remap from the guest descriptor and composes with the
-                    // physical format rather than substituting for it, so this
-                    // does not double-swap.
-                    //
-                    // The generation is the cache entry's own `host_gen`, which
-                    // every writer of `host_surfaces` re-takes from
-                    // `next_sampled_content_generation` in the same breath as it
-                    // changes the bytes — so an unchanged pair is a statement
-                    // that the frame has not moved, and the engine can bind what
-                    // it already holds instead of re-digesting 1.7 MB to find
-                    // out. See [`LinearSampleIdentity`] for the key namespace.
-                    //
-                    // A 0 generation is an entry never stored into.
-                    // `get_shared_with_gen` already refuses those — it requires
-                    // bytes — but a false "unchanged" is the one wrong answer
-                    // here that binds a stale frame, so it is not left to that
-                    // alone.
-                    let identity = (host_gen != 0).then_some(LinearSampleIdentity {
-                        key: (1u64 << 62) | mid as u64,
-                        generation: host_gen,
-                    });
                     note_mapper_ref_texture_sample_rung("t11rung_host_cache", guest_write);
-                    // BGRA8 by construction — it is a backing scanout cache — but
-                    // the *values* in it are the surface's, and this cache is
-                    // filled from a writeback that reorders channels and decodes
-                    // nothing. So the transfer function is the mapping's declared
-                    // one, exactly as it is on the guest-page rungs below.
-                    let source = crate::runtime::draw::mapping_declared_format(state, mid, None);
-                    return Some((
-                        w,
-                        h,
-                        mid,
-                        SampledSourceRequest::Bytes(
-                            bgra,
-                            identity,
-                            SampledByteFormat::from_source(TexelLayout::Bgra8, source),
-                            crate::backend::vulkan::engine::SampledByteOrigin::SurfaceHostCache,
-                        ),
-                    ));
+                    return Some((w, h, mid, host_cache_request(state, mid, bgra, host_gen)));
                 }
 
                 // 2) Guest pages, which are what the surface *is*. Reached only
@@ -3367,6 +3207,95 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
         ),
     ))
+}
+
+/// Report that a sampled surface fell past its resident because the resident
+/// was reclaimed, with how long after the reclaim the guest came back. See the
+/// fall-through comment in [`resolve_sampled_source`].
+fn note_sampled_resident_absence(
+    mid: u32,
+    w: u32,
+    h: u32,
+    resident_id: &crate::backend::vulkan::engine::TargetIdentity,
+) {
+    if let Some((cause, since_ms)) =
+        crate::backend::vulkan::engine::resident_absent_after_reclaim(&resident_id)
+    {
+        crate::runtime::drain::note_store_route("t11sample_reclaimed_from_pages");
+        // How long after we destroyed it the guest came back.
+        // This is the half `resident_resample_peak_ms` cannot
+        // see: that peak only observes residents that survived
+        // to be read, so every gap longer than the cutoff is
+        // censored out of it and a reclaim policy tuned from it
+        // is tuned from data it destroyed the tail of. A
+        // resident read here had gone at least
+        // `IDLE_MAINTENANCE_START_MS + since_ms` between uses.
+        crate::runtime::drain::note_store_route(reclaimed_resample_band(since_ms));
+        if crate::observe::first_sight("sampled_resident_reclaimed", u64::from(mid)) {
+            crate::observe::fail(format!(
+                "sampled_resident_reclaimed reason=sampled_resident_reclaimed \
+                 mid={mid} {w}x{h} prior={} since_reclaim_ms={since_ms} \
+                 (reclaimed after its pixels were copied out; re-reading \
+                 its guest pages costs an upload, not a frame)",
+                cause.slug()
+            ));
+        }
+    }
+}
+
+/// The host-cache rung's serve: the cached BGRA8 frame, the generation that
+/// names it, and the transfer function it carries.
+fn host_cache_request(
+    state: &DeviceState,
+    mid: u32,
+    bgra: std::sync::Arc<Vec<u8>>,
+    host_gen: u64,
+) -> SampledSourceRequest {
+    // Uploaded in the order the cache already holds. This rung's
+    // bytes are BGRA8 by construction — it is a backing scanout
+    // cache — and `B8G8R8A8_UNORM` is a Vulkan-mandatory sampled
+    // format with linear filtering, so declaring the layout costs
+    // nothing and the hardware reads the channels the guest
+    // stored. What stood here rebuilt the whole frame into RGBA8
+    // first: a 1.7 MB allocation plus a full read+write pass on
+    // every bind, ~116 binds a second live, to reach bytes the
+    // sampler could already address. The linear rail reached the
+    // same conclusion (`linear_native_upload_format(.., true)`).
+    //
+    // The view swizzle applied at bind is a *logical* channel
+    // remap from the guest descriptor and composes with the
+    // physical format rather than substituting for it, so this
+    // does not double-swap.
+    //
+    // The generation is the cache entry's own `host_gen`, which
+    // every writer of `host_surfaces` re-takes from
+    // `next_sampled_content_generation` in the same breath as it
+    // changes the bytes — so an unchanged pair is a statement
+    // that the frame has not moved, and the engine can bind what
+    // it already holds instead of re-digesting 1.7 MB to find
+    // out. See [`LinearSampleIdentity`] for the key namespace.
+    //
+    // A 0 generation is an entry never stored into.
+    // `get_shared_with_gen` already refuses those — it requires
+    // bytes — but a false "unchanged" is the one wrong answer
+    // here that binds a stale frame, so it is not left to that
+    // alone.
+    let identity = (host_gen != 0).then_some(LinearSampleIdentity {
+        key: (1u64 << 62) | mid as u64,
+        generation: host_gen,
+    });
+    // BGRA8 by construction — it is a backing scanout cache — but
+    // the *values* in it are the surface's, and this cache is
+    // filled from a writeback that reorders channels and decodes
+    // nothing. So the transfer function is the mapping's declared
+    // one, exactly as it is on the guest-page rungs below.
+    let source = crate::runtime::draw::mapping_declared_format(state, mid, None);
+    SampledSourceRequest::Bytes(
+        bgra,
+        identity,
+        SampledByteFormat::from_source(TexelLayout::Bgra8, source),
+        crate::backend::vulkan::engine::SampledByteOrigin::SurfaceHostCache,
+    )
 }
 
 /// Whether a decoded resource object owns the resident reached by the surface
