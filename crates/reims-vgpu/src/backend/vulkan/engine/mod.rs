@@ -1326,11 +1326,21 @@ fn lab_frame_dump(source: &WindowPresentSource) {
         return;
     };
     let now = crate::observe::elapsed_us() / 1000;
-    let last = LAST_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < 4000 {
-        return;
+    // TEMP (lab): an on-demand request beats the periodic dump.
+    let tag = lab_frame_snap_take(dir, now);
+    if tag.is_none() {
+        static INTERVAL: once_cell::sync::Lazy<u64> = once_cell::sync::Lazy::new(|| {
+            std::env::var("REIMS_LAB_FRAME_DUMP_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4000)
+        });
+        let last = LAST_MS.load(Ordering::Relaxed);
+        if *INTERVAL == 0 || now.saturating_sub(last) < *INTERVAL {
+            return;
+        }
+        LAST_MS.store(now, Ordering::Relaxed);
     }
-    LAST_MS.store(now, Ordering::Relaxed);
     let Ok(rb) = read_target(&source.identity) else {
         return;
     };
@@ -1347,7 +1357,76 @@ fn lab_frame_dump(source: &WindowPresentSource) {
         out.extend_from_slice(&[px[2], px[1], px[0]]);
     }
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let _ = std::fs::write(format!("{dir}/frame-{n:04}-{now}.ppm"), out);
+    // TEMP (lab): written under a temporary name and renamed, so a host script
+    // polling for the file never reads a half-written frame.
+    let name = match tag {
+        Some(tag) => format!("{dir}/frame-{n:04}-{now}-{tag}.ppm"),
+        None => format!("{dir}/frame-{n:04}-{now}.ppm"),
+    };
+    let tmp = format!("{name}.part");
+    if std::fs::write(&tmp, out).is_ok() {
+        let _ = std::fs::rename(&tmp, &name);
+    }
+}
+
+/// TEMP (lab): on-demand frame dumps for `REIMS_LAB_FRAME_DUMP`. A file
+/// `{dir}/snap` holding `TAG [COUNT [GAP_MS]]` asks for COUNT (default 1)
+/// presented frames at least GAP_MS (default 0) apart, named `…-TAG.ppm`; the
+/// file is removed when the request is taken. The file is looked for at most
+/// every 15 ms. Returns the tag when this present should be dumped.
+#[cfg(feature = "host-window")]
+fn lab_frame_snap_take(dir: &str, now: u64) -> Option<String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    struct Pending {
+        tag: String,
+        left: u32,
+        total: u32,
+        gap: u64,
+        next: u64,
+    }
+    static PENDING: std::sync::Mutex<Option<Pending>> = std::sync::Mutex::new(None);
+    static POLLED: AtomicU64 = AtomicU64::new(0);
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.is_none() && now.saturating_sub(POLLED.load(Ordering::Relaxed)) >= 15 {
+        POLLED.store(now, Ordering::Relaxed);
+        let path = format!("{dir}/snap");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let _ = std::fs::remove_file(&path);
+            let mut it = text.split_whitespace();
+            let tag: String = it
+                .next()
+                .unwrap_or("snap")
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .take(48)
+                .collect();
+            let left = it
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1u32)
+                .clamp(1, 64);
+            let gap = it.next().and_then(|v| v.parse().ok()).unwrap_or(0u64);
+            *pending = Some(Pending {
+                tag,
+                left,
+                total: left,
+                gap,
+                next: now,
+            });
+        }
+    }
+    let p = pending.as_mut()?;
+    if now < p.next {
+        return None;
+    }
+    let seq = p.total - p.left + 1;
+    p.left -= 1;
+    p.next = now + p.gap;
+    let tag = format!("{}-{seq:02}", p.tag);
+    if p.left == 0 {
+        *pending = None;
+    }
+    Some(tag)
 }
 
 /// Destroy the engine-owned surface while the native AppKit window still
