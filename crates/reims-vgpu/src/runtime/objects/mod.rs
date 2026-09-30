@@ -3058,6 +3058,24 @@ pub fn resolve_resource<M: HostMemory>(
     let name = match state.object_name(task_id, obj_ref) {
         Some(existing) => {
             crate::runtime::drain::note_store_route("object_named_before_constructed");
+            // TEMP (lab, access precision): a name the model holds with no bytes
+            // that construction now finds to own some.
+            if matches!(
+                storage,
+                Some(reims_vgpu_core::lifecycle::Storage::Dedicated { .. })
+            ) && !state.name_owns_bytes(task_id, existing)
+            {
+                crate::runtime::drain::note_store_route("lab_named_nobytes_constructed_dedicated");
+                if crate::observe::first_sight(
+                    "lab_named_nobytes_constructed_dedicated",
+                    (u64::from(task_id) << 32) | u64::from(obj_ref),
+                ) {
+                    crate::observe::fail(format!(
+                        "lab_named_nobytes_constructed_dedicated task={task_id} ref={obj_ref}                          type={} gen={} (the model holds this name with no bytes; the slot's                          object owns storage)",
+                        entry.object_type, existing.generation.0
+                    ));
+                }
+            }
             existing
         }
         None => {

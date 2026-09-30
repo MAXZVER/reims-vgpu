@@ -5115,6 +5115,16 @@ impl DeviceState {
             .declare_alias(reims_vgpu_core::identity::TaskId(task_id), name, alias)
     }
 
+    /// TEMP (lab, access precision): whether the model holds this name over
+    /// bytes of its own.
+    pub fn name_owns_bytes(&self, task_id: u32, name: reims_vgpu_core::identity::ResourceId) -> bool {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolve(reims_vgpu_core::identity::TaskId(task_id), name)
+            .is_ok_and(|extent| extent.length > 0)
+    }
+
     /// The alias a name was declared with, for a test.
     #[cfg(test)]
     pub(crate) fn alias_of(
