@@ -751,7 +751,7 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 ///
 /// # What it changes
 ///
-/// Five things, all of them about what the model *knows*:
+/// Six things, all of them about what the model *knows*:
 ///
 /// - a texture view, a buffer texture and a surface-backed ref texture stop
 ///   being `DomainOnly` and are ordered against the memory they are a window
@@ -766,7 +766,10 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 ///   once the pre-scan has published it;
 /// - a reflection is published for, and answered to, the task whose shader it
 ///   describes, because a pipeline's id is a slot and a generation and every
-///   task numbers its own list from the same integers.
+///   task numbers its own list from the same integers;
+/// - a name the model holds with no bytes is given the storage construction
+///   finds under it, where it used to stay `DomainOnly` for the life of the name
+///   (`reims_vgpu_core::lifecycle::Lifecycle::attach_storage`).
 ///
 /// # Why it is not the default
 ///
@@ -776,9 +779,10 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// discharged, and exact accesses draw fewer edges. So with this on, a packet can
 /// be ready while an earlier packet of its own channel is still parked — on a
 /// translation, on a stamp, on host paint — and then it runs first. Measured on a
-/// driven macos-26 desktop that is one packet in a thousand to ten thousand. It
-/// is what the model's schedule equivalence permits and what exact accesses are
-/// for, and it is also a change to the order this device executes in, made on the
+/// driven macos-26 desktop at 5120x2160 that is between one packet in three
+/// thousand and one in thirty, reaching up to 34 packets back in its channel,
+/// depending on how many translations were still cold. It is what the model's
+/// schedule equivalence permits and what exact accesses are for, and it is also a change to the order this device executes in, made on the
 /// strength of a claim about a guest (that the accesses are exact) rather than of
 /// a measurement of the frames it produces. A claim of that shape gets a binary
 /// that runs both ways until the measurement exists, and the default stays on the
