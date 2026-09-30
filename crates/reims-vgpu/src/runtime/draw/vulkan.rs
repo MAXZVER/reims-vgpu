@@ -1160,12 +1160,6 @@ fn lab_alias_other_level(
     other
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_FIX_STATIC_SAMPLER=1` — see the push loop.
-fn lab_fix_static_sampler() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_FIX_STATIC_SAMPLER").is_ok_and(|v| v == "1"))
-}
-
 /// TEMP (lab): whether `REIMS_VGPU_LAB_SMP_LINEAR` names this fragment entry.
 fn lab_smp_linear(entry: Option<&str>) -> bool {
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -9637,25 +9631,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             });
         }
         {
-            // TEMP (lab): `REIMS_VGPU_LAB_FIX_STATIC_SAMPLER=1` — a constexpr
-            // sampler owns the binding metal2vulkan gave it. The guest's encoder
-            // keeps whatever it last bound at a sampler index, and a shader with
-            // no argument sampler at that index never reads it; provisioning it
-            // anyway took the constexpr sampler's binding first-writer-wins, so
-            // macOS 26's glass shaders sampled their blur through a stale
-            // nearest, non-mipmapped sampler (M1: blocky menu backdrop).
-            let static_sampler_binds: std::collections::BTreeSet<u32> =
-                if lab_fix_static_sampler() {
-                    v_variant
-                        .samplers
-                        .iter()
-                        .chain(f_variant.samplers.iter())
-                        .filter(|r| r.static_state.is_some())
-                        .map(|r| r.binding)
-                        .collect()
-                } else {
-                    Default::default()
-                };
+            // A constexpr sampler owns the binding metal2vulkan gave it; a guest
+            // sampler bound at the same index is one this shader never reads.
+            // See `spirv_bind::constexpr_sampler_bindings`.
+            let static_sampler_binds = {
+                let mut binds =
+                    crate::runtime::spirv_bind::constexpr_sampler_bindings(&v_variant.samplers);
+                binds.extend(crate::runtime::spirv_bind::constexpr_sampler_bindings(
+                    &f_variant.samplers,
+                ));
+                binds
+            };
             let mut push_smp = |index: u32,
                                 sampler_ref: u32,
                                 lod_clamp: Option<(u32, u32)>,
@@ -9668,6 +9654,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 };
                 let smp_bind = SAMPLER_BINDING_BASE + index + base_off;
                 if static_sampler_binds.contains(&smp_bind) {
+                    // Counted: the draws whose shader samples through its own
+                    // constexpr state while the encoder still holds a sampler
+                    // at that index.
                     crate::runtime::drain::note_store_route("sampler_guest_yields_to_constexpr");
                     return Ok(());
                 }
@@ -9776,26 +9765,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             );
                         }
                     } else if reflected.static_state.is_some() {
-                        // TEMP (lab): a constexpr sampler whose binding a
-                        // guest-bound sampler already took (M1 hypothesis).
-                        crate::runtime::drain::note_store_route("lab_static_sampler_shadowed");
-                        if crate::observe::first_sight(
-                            "lab_static_sampler_shadowed",
-                            (u64::from(req.task_id) << 32) | u64::from(req.pipeline_ref),
-                        ) {
-                            crate::observe::fail(format!(
-                                "lab_static_sampler_shadowed task={} pipe={} stage={stage} binding={} entry={} static={:?} guest={:?}",
-                                req.task_id,
-                                req.pipeline_ref,
-                                reflected.binding,
-                                f_shader.reflection.entry_point.as_deref().unwrap_or("?"),
-                                reflected.static_state,
-                                req.fragment_samplers
-                                    .iter()
-                                    .map(|s| (s.index, s.sampler_ref))
-                                    .collect::<Vec<_>>(),
-                            ));
-                        }
+                        // A constexpr sampler whose binding something else
+                        // already provisioned. Guest samplers yield to it above,
+                        // so this is a healthy zero; a firing means two
+                        // reflected samplers named one binding.
+                        crate::runtime::drain::note_store_route("sampler_constexpr_binding_taken");
                     }
                 }
             }

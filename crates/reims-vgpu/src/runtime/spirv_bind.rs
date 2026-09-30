@@ -2501,6 +2501,33 @@ pub fn reflected_sampler_descriptors(
     descriptors
 }
 
+/// The bindings a shader's AIR constexpr samplers occupy in the numbering of
+/// its executable variant.
+///
+/// A constexpr sampler is part of the shader: every sample through it uses the
+/// state the AIR embeds, whatever the encoder has bound. metal2vulkan places it
+/// in the same sampler band as the argument samplers, at a slot no argument
+/// sampler of *this* shader uses — but the guest's encoder still carries
+/// whatever it last bound at that Metal index, for a shader it drew with
+/// earlier. Metal never reads such a binding; provisioning it anyway takes the
+/// constexpr sampler's binding first, and the draw samples through a sampler
+/// the shader never named. A guest sampler at one of these bindings is
+/// therefore not provisioned.
+///
+/// macOS 26's Liquid Glass shaders are the case that found this. Their
+/// constexpr sampler is linear with linear mips; the stale index-0 sampler was
+/// nearest and not mipmapped, so every menu backdrop sampled its blur as
+/// blocks.
+pub fn constexpr_sampler_bindings(
+    descriptors: &[ReflectedSamplerDescriptor],
+) -> std::collections::BTreeSet<u32> {
+    descriptors
+        .iter()
+        .filter(|descriptor| descriptor.static_state.is_some())
+        .map(|descriptor| descriptor.binding)
+        .collect()
+}
+
 /// Resolve a Metal texture-table index through the final reflection interface.
 /// An exact scalar declaration wins over an enclosing array range.
 pub fn reflected_texture_descriptor(
@@ -4598,6 +4625,29 @@ mod more_tests {
                 raw_words: [0x807b_ff00_0008_0a49, 0],
             }),
         }
+    }
+
+    /// A constexpr sampler claims the binding metal2vulkan gave it, so a stale
+    /// guest sampler at the same Metal index cannot take it; an argument
+    /// sampler claims nothing, because the guest's object is what it reads.
+    #[test]
+    fn a_constexpr_sampler_claims_its_binding_and_an_argument_sampler_does_not() {
+        let state = static_sampler_binding(M2V_SAMPLER_BINDING_BASE).static_sampler;
+        assert!(state.is_some());
+        let descriptors = [
+            ReflectedSamplerDescriptor {
+                binding: SAMPLER_BINDING_BASE,
+                static_state: state,
+            },
+            ReflectedSamplerDescriptor {
+                binding: SAMPLER_BINDING_BASE + 1,
+                static_state: None,
+            },
+        ];
+        let claimed = constexpr_sampler_bindings(&descriptors);
+        assert!(claimed.contains(&SAMPLER_BINDING_BASE));
+        assert!(!claimed.contains(&(SAMPLER_BINDING_BASE + 1)));
+        assert_eq!(claimed.len(), 1);
     }
 
     #[test]
