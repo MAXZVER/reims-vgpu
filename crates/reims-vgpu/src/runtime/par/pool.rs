@@ -543,6 +543,12 @@ impl Pool {
         }
         *lifecycle = Lifecycle::Running(handles);
         self.state.store(RUNNING, Ordering::Release);
+        crate::observe::off(format!(
+            "par_pool_started workers={} worker_spin_us={} join_spin_us={}",
+            self.shared.workers,
+            self.shared.worker_spin.as_micros(),
+            self.shared.join_spin.as_micros()
+        ));
         true
     }
 
@@ -571,10 +577,31 @@ impl Pool {
         }
         self.shared.hand_off.lock().stopping = true;
         self.shared.wake.notify_all();
+        let joined = handles.len();
         for handle in handles {
             // A helper that panicked outside a job has nothing more to say
             // than the panic report already made.
             let _ = handle.join();
+        }
+        if joined > 0 {
+            // The evidence that teardown reached every helper before the shim
+            // unrealizes the device: each one detached from RCU and exited.
+            let stats = self.stats();
+            crate::observe::off(format!(
+                "par_pool_stopped workers={} joined={joined} detached={} scopes={} jobs={} helped={} job_panics={} accepted={}",
+                stats.workers,
+                stats.detached,
+                stats.scopes,
+                stats.jobs,
+                stats.helped_jobs,
+                stats.job_panics,
+                stats
+                    .accepted
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            ));
         }
     }
 }
