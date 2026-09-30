@@ -4141,7 +4141,13 @@ pub(crate) unsafe fn execute_draw_inner(
                             && p.array_element == resource.array_element
                             && p.levels.first() == Some(identity)
                     }) {
-                        match pyramid_levels(pools, pyramid, resource.width, resource.height) {
+                        match pyramid_levels(
+                            pools,
+                            pyramid,
+                            resource.width,
+                            resource.height,
+                            |level| req.attachment_slot(level).is_some(),
+                        ) {
                             Some(levels) => {
                                 let key = SampledKey {
                                     levels: levels.len() as u32,
@@ -6774,17 +6780,24 @@ fn pyramid_level_admissible(
 
 /// Every level of `pyramid` as a ready, single-sample resident of exactly its
 /// mip extent under a base of `width` x `height`, or `None`.
+///
+/// The chain stops at the first level this draw renders into. A pass that
+/// builds level N samples the levels below it, and the levels from N up are
+/// undefined to read while it writes them; copying the attachment would also
+/// move it out of the layout the pass's own barrier assumes. Fewer than two
+/// levels left is no chain at all — level 0 binds alone, as before.
 fn pyramid_levels(
     pools: &super::pools::ResourcePools,
     pyramid: &super::types::SampledPyramid,
     width: u32,
     height: u32,
+    is_attachment: impl Fn(&super::types::TargetIdentity) -> bool,
 ) -> Option<Vec<PyramidLevel>> {
-    if pyramid.levels.len() < 2 {
-        return None;
-    }
     let mut out = Vec::with_capacity(pyramid.levels.len());
     for (mip, identity) in pyramid.levels.iter().enumerate() {
+        if is_attachment(identity) {
+            break;
+        }
         let slot = pools.registry_get(identity)?;
         if !pyramid_level_admissible(
             mip,
@@ -6811,7 +6824,7 @@ fn pyramid_levels(
             height: h,
         });
     }
-    Some(out)
+    (out.len() >= 2).then_some(out)
 }
 
 #[cfg(test)]
