@@ -2591,6 +2591,7 @@ pub fn resident_absent_after_reclaim(
     identity: &TargetIdentity,
 ) -> Option<(types::ResidentReclaim, u64)> {
     let guard = lock_engine();
+    lab_verify_readiness(&guard.pools, identity);
     if guard.pools.registry_get(identity).is_some() {
         return None;
     }
@@ -2613,7 +2614,46 @@ pub fn resident_absent_after_reclaim(
 /// resolves to `None` and therefore to the seed.
 pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
     let guard = lock_engine();
+    lab_verify_readiness(&guard.pools, identity);
     guard.pools.registry_get(identity)?.content_epoch
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_READINESS_VERIFY=1` compares the lock-free
+/// [`pools::readiness`] table with the registry, for one identity, at every
+/// call that already holds the engine lock and reads the registry.
+///
+/// The table is written in the same critical section as every change to what it
+/// mirrors, and `the_registry_writes_a_residents_content_state_in_exactly_one_place`
+/// holds the door shut in source; this is the live proof that the two agree on a
+/// real boot. Under the lock no writer can be between the registry's change and
+/// the publish, so any disagreement is a missed publish and never a race.
+/// `readiness_checked` counts the comparisons (a zero means the switch reached
+/// nothing) and `readiness_mismatch` the disagreements, which also leave a fail
+/// line naming both views, at most twenty of them.
+fn lab_verify_readiness(pools: &ResourcePools, identity: &TargetIdentity) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_READINESS_VERIFY").is_some()) {
+        return;
+    }
+    static REPORTED: AtomicU64 = AtomicU64::new(0);
+    let registry = pools.registry_get(identity).map(|slot| {
+        (
+            slot.content_ready,
+            slot.memory.is_guest_imported(),
+            slot.content_epoch,
+        )
+    });
+    let table =
+        pools::readiness::lookup(identity).map(|r| (r.ready, r.guest_imported, r.content_epoch));
+    crate::runtime::drain::note_store_route("readiness_checked");
+    if registry != table {
+        crate::runtime::drain::note_store_route("readiness_mismatch");
+        if REPORTED.fetch_add(1, Ordering::Relaxed) < 20 {
+            crate::observe::fail(format!(
+                "readiness_mismatch identity={identity:?} registry={registry:?} table={table:?}"
+            ));
+        }
+    }
 }
 
 /// What the registry says about an identity's content stamp, with the two ways
@@ -2650,6 +2690,7 @@ pub enum ResidentContent {
 /// before it believes a resident still holds its frame.
 pub fn resident_content_state(identity: &TargetIdentity) -> ResidentContent {
     let guard = lock_engine();
+    lab_verify_readiness(&guard.pools, identity);
     match guard.pools.registry_get(identity) {
         None => ResidentContent::Absent,
         Some(slot) => match slot.content_epoch {
