@@ -1505,6 +1505,89 @@ mod tests {
         );
     }
 
+    /// What exact accesses are for, at the graph: two packets that read one
+    /// buffer and write two different ones are independent once their pipeline's
+    /// reflection is published, and ordered before it is.
+    ///
+    /// Written at the dependency graph and not at the walk because the walk's
+    /// answer is only interesting for what it lets the graph do. Without a
+    /// publication every bound slot is `Unknown`, which conflicts with everything
+    /// naming the same memory — including the shared read, which two readers
+    /// would otherwise never conflict on — so the second packet waits for the
+    /// first. With one, the shared slot is a read, each packet's write is its
+    /// own, and there is nothing to wait for. The pair is the smallest shape of
+    /// what a drag of overlapping windows does a hundred times a frame.
+    #[test]
+    fn a_published_reflection_is_what_makes_two_draws_independent_in_the_graph() {
+        use crate::depend::DependencyGraph;
+        use crate::identity::IngressOrdinal;
+        use crate::pipeline::{BindingUsage, PipelineState, PipelineTable, PublishedUsage};
+        use reims_vgpu_protocol::render::ShaderStage;
+
+        let pipeline = res(9);
+        let mut table = PipelineTable::new();
+        assert!(table.declare(pipeline, crate::identity::SessionGeneration::FIRST));
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            assert!(table.advance(pipeline, step));
+        }
+        assert!(table.publish_usage(
+            pipeline,
+            PublishedUsage::render(
+                Some(BindingUsage::new(
+                    vec![Some(AccessMode::Read), Some(AccessMode::Write)],
+                    Vec::new(),
+                )),
+                Some(BindingUsage::new(Vec::new(), Vec::new())),
+            )
+        ));
+
+        let packet = |usages: &dyn crate::pipeline::UsageSource, written: u32| {
+            let mut b = ExecBuilder::with_usage(usages);
+            b.begin_segment(
+                SegmentKind::Render.wire_type(),
+                SegmentLifetime::SELF_CONTAINED,
+            )
+            .expect("open");
+            // Slot 0 is the shared read, slot 1 this packet's own target.
+            let entries = bind_arena(&mut b, &[res(7), res(written)]);
+            for op in [
+                ResolvedOperation::Render(RenderOp::BindBuffers {
+                    stage: ShaderStage::Vertex,
+                    first: 0,
+                    entries,
+                }),
+                ResolvedOperation::Render(RenderOp::SetPipeline { pipeline }),
+                a_draw(),
+            ] {
+                b.record(op, &mut StubRegistry(ChannelId(1)))
+                    .expect("record");
+            }
+            b.accesses.clone()
+        };
+        let waits = |usages: &dyn crate::pipeline::UsageSource| {
+            let mut graph = DependencyGraph::new();
+            assert!(graph
+                .admit(IngressOrdinal(1), &packet(usages, 8))
+                .is_empty());
+            graph.admit(IngressOrdinal(2), &packet(usages, 18))
+        };
+
+        assert_eq!(
+            waits(&crate::pipeline::NoUsage),
+            vec![IngressOrdinal(1)],
+            "nothing published: every slot might be written, so the second packet waits"
+        );
+        assert_eq!(
+            waits(&table),
+            Vec::<IngressOrdinal>::new(),
+            "published: a shared read and two separate writes have nothing to order"
+        );
+    }
+
     /// A pipeline's reflection does not outlive the build it described.
     ///
     /// Every door that un-builds or unnames a pipeline drops it, and the reason
