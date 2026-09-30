@@ -2238,7 +2238,9 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // then ready) unreachable on the packet that first builds the kernel. The
     // step is the guest's fact and the walk's own list; taking it earlier
     // states the same thing at the first moment it is known.
+    let claiming_task = arrived.submission.as_ref().map(|s| s.task_id());
     for &lease in leases {
+        lab_note_pipeline_claim(lease, claiming_task);
         note_store_route(if state.declare_pipeline(lease) {
             "pipeline_declared"
         } else {
@@ -2300,6 +2302,26 @@ fn admit_and_park<H: HostMemory + HostOps>(
                 Ok(mut again) => {
                     drop_unresolvable_stamp_waits(state, &packet, &mut again);
                     note_store_route("access_rewalked");
+                    // TEMP (lab, access precision): the usage the pre-scan just
+                    // published did not answer the walk that asked for it.
+                    if let Some(id) = again
+                        .payload
+                        .exec()
+                        .and_then(|work| work.usage_census.first_unanswered_pipeline)
+                    {
+                        note_store_route("lab_rewalk_still_unanswered");
+                        if crate::observe::first_sight("lab_rewalk_still_unanswered", u64::from(id.slot.0)) {
+                            crate::observe::fail(format!(
+                                "lab_rewalk_still_unanswered slot={} gen={} task={:?} model_pipeline={}                                  published={} wanted={}",
+                                id.slot.0,
+                                id.generation.0,
+                                claiming_task,
+                                state.pipeline_state(id).unwrap_or("unleased"),
+                                state.pipeline_usage_published(id),
+                                state.pipeline_usage_wanted(id),
+                            ));
+                        }
+                    }
                     built = again;
                 }
                 // The first walk is still a valid admission: conservative, and
@@ -2527,6 +2549,39 @@ pub(crate) fn lab_note_memo_skip(state: &DeviceState, task_id: u32, pipeline_ref
             name.slot.0,
             name.generation.0,
             state.pipeline_state(name).unwrap_or("unleased"),
+        ));
+    }
+}
+
+/// TEMP (lab, access precision): the ordering plane keys a pipeline by its
+/// object-list slot and that slot's generation, and neither names a task. Two
+/// tasks that each have a pipeline at slot 30, generation 1, are one entry in
+/// its table — one deletion retires both, and a reflection published for one is
+/// answered for the other. Say when a second task binds an id a first one did.
+fn lab_note_pipeline_claim(lease: reims_vgpu_core::identity::ResourceId, task: Option<u32>) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    let Some(task) = task else {
+        return;
+    };
+    static CLAIMS: OnceLock<Mutex<HashMap<(u32, u32), u32>>> = OnceLock::new();
+    let mut claims = CLAIMS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let key = (lease.slot.0, lease.generation.0 as u32);
+    let first = *claims.entry(key).or_insert(task);
+    if first == task {
+        return;
+    }
+    note_store_route("lab_pipeline_id_shared_packets");
+    if crate::observe::first_sight(
+        "lab_pipeline_id_shared",
+        (u64::from(task) << 40) | (u64::from(first) << 32) | u64::from(lease.slot.0),
+    ) {
+        crate::observe::fail(format!(
+            "lab_pipeline_id_shared slot={} gen={} first_task={first} this_task={task}              (one pipeline-table entry for two tasks' pipelines)",
+            lease.slot.0, lease.generation.0
         ));
     }
 }
