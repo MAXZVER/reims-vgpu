@@ -3295,6 +3295,109 @@ fn coalesce_pages_to_runs<M: HostOps>(
     head_off: u64,
     span: u64,
 ) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
+    // A stable host's `map_pages` over a GPA-sequential stretch returns QEMU's
+    // own RAMBlock alias, valid for the life of the VM and never unmapped here,
+    // so one window of GPAs always yields the same runs. Rebuilding them was the
+    // dearest part of a sampled bind: a 4K video plane is ~4000 scattered pages,
+    // hundreds of stretches and hundreds of `map_pages` calls — ~200 us a bind,
+    // a quarter of the drain on a driven macos-26 desktop. The memo is keyed by
+    // the window itself (compared in full on a hit), so it cannot hand one
+    // window's runs to another.
+    let memo_ok = host.map_pages_stable() && window.len() >= RUN_MEMO_MIN_PAGES;
+    if memo_ok {
+        if let Some(runs) = run_memo().lookup(window, page, head_off, span) {
+            crate::runtime::drain::note_store_route("guest_runs_memo_hit");
+            return Some(runs);
+        }
+        crate::runtime::drain::note_store_route("guest_runs_memo_miss");
+    }
+    let runs = coalesce_pages_to_runs_uncached(host, window, page, head_off, span)?;
+    if memo_ok {
+        run_memo().insert(window, page, head_off, span, &runs);
+    }
+    Some(runs)
+}
+
+/// Smallest window worth remembering: below this the rebuild is a handful of
+/// `map_pages` calls and the comparison would cost about as much.
+const RUN_MEMO_MIN_PAGES: usize = 16;
+
+/// Windows remembered at once. Enough for every large sampled surface a
+/// desktop binds in a frame (planes, wallpaper, window backings); the memo is
+/// cleared whole when it fills, which is rare and costs one rebuild each.
+const RUN_MEMO_CAP: usize = 256;
+
+struct RunMemoEntry {
+    page: u64,
+    head_off: u64,
+    span: u64,
+    window: Vec<u64>,
+    runs: Vec<crate::backend::vulkan::engine::GuestRun>,
+}
+
+#[derive(Default)]
+struct RunMemo {
+    entries: std::collections::HashMap<u64, RunMemoEntry>,
+}
+
+impl RunMemo {
+    fn key(window: &[u64], page: u64, head_off: u64, span: u64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (window, page, head_off, span).hash(&mut h);
+        h.finish()
+    }
+
+    fn lookup(
+        &self,
+        window: &[u64],
+        page: u64,
+        head_off: u64,
+        span: u64,
+    ) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
+        let e = self.entries.get(&Self::key(window, page, head_off, span))?;
+        (e.page == page && e.head_off == head_off && e.span == span && e.window == window)
+            .then(|| e.runs.clone())
+    }
+
+    fn insert(
+        &mut self,
+        window: &[u64],
+        page: u64,
+        head_off: u64,
+        span: u64,
+        runs: &[crate::backend::vulkan::engine::GuestRun],
+    ) {
+        if self.entries.len() >= RUN_MEMO_CAP {
+            self.entries.clear();
+        }
+        self.entries.insert(
+            Self::key(window, page, head_off, span),
+            RunMemoEntry {
+                page,
+                head_off,
+                span,
+                window: window.to_vec(),
+                runs: runs.to_vec(),
+            },
+        );
+    }
+}
+
+fn run_memo() -> std::sync::MutexGuard<'static, RunMemo> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<RunMemo>> = std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn coalesce_pages_to_runs_uncached<M: HostOps>(
+    host: &mut M,
+    window: &[u64],
+    page: u64,
+    head_off: u64,
+    span: u64,
+) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
     use crate::backend::vulkan::engine;
     let stretches = reims_vgpu_paging::runs::coalesce_window(window, page, head_off, span)?;
     let mut runs: Vec<engine::GuestRun> = Vec::with_capacity(stretches.len());
