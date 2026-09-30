@@ -1111,6 +1111,39 @@ impl ApplicationHandler<FramePublished> for App {
     }
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_PRESENT_GAPS=1` also times the host window's
+/// `window_present` call and reports `lab_host_present n= p50_us= p95_us=
+/// max_us= sum_ms=` once a second -- whether the host side is what caps the
+/// presented rate below the published one.
+fn lab_host_present_note(took: std::time::Duration) {
+    use std::sync::Mutex;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ACC: Mutex<(Option<std::time::Instant>, Vec<u32>)> = Mutex::new((None, Vec::new()));
+    if !*ON.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_PRESENT_GAPS").is_some()) {
+        return;
+    }
+    let mut acc = ACC.lock().unwrap_or_else(|e| e.into_inner());
+    acc.1.push(took.as_micros().min(u128::from(u32::MAX)) as u32);
+    let started = *acc.0.get_or_insert_with(std::time::Instant::now);
+    if started.elapsed() < std::time::Duration::from_secs(1) {
+        return;
+    }
+    let mut v = std::mem::take(&mut acc.1);
+    acc.0 = Some(std::time::Instant::now());
+    drop(acc);
+    v.sort_unstable();
+    let at = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
+    let sum: u64 = v.iter().map(|&x| u64::from(x)).sum();
+    crate::observe::off(format!(
+        "lab_host_present n={} p50_us={} p95_us={} max_us={} sum_ms={}",
+        v.len(),
+        at(0.5),
+        at(0.95),
+        at(1.0),
+        sum / 1000
+    ));
+}
+
 /// Whether `about_to_wait` should ask the platform for a redraw on this wake.
 ///
 /// The whole rule, and the reason the loop is allowed to sleep: a tick with no
@@ -1407,10 +1440,12 @@ impl App {
             return;
         }
         self.loop_census.draws_fresh += 1;
+        let lab_t0 = std::time::Instant::now(); // TEMP (lab)
         let result = crate::backend::selected().window_present(
             frame.as_ref().and_then(|frame| frame.resident.as_ref()),
             frame.as_deref().map(window_cpu_frame),
         );
+        lab_host_present_note(lab_t0.elapsed());
         match result {
             Ok(WindowPresentOutcome::Busy) => {}
             Ok(WindowPresentOutcome::Presented {
