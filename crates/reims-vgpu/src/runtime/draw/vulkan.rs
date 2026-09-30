@@ -10860,14 +10860,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .samplers
             .iter()
             .map(|s| {
+                // TEMP (lab): mip filter, LOD clamps and where the state came from.
                 format!(
-                    "b{}:un={}:min={:?}:mag={:?}:u={:?}:v={:?}",
+                    "b{}:un={}:min={:?}:mag={:?}:mip={:?}:lod={}..{}:u={:?}:v={:?}:o={}",
                     s.binding,
                     s.unnormalized_coordinates as u8,
                     s.min_filter,
                     s.mag_filter,
+                    s.mip_filter,
+                    f32::from_bits(s.lod_min),
+                    f32::from_bits(s.lod_max),
                     s.address_mode_u,
-                    s.address_mode_v
+                    s.address_mode_v,
+                    sampler_origin.get(&s.binding).map(|b| *b as char).unwrap_or('?')
                 )
             })
             .collect::<Vec<_>>()
