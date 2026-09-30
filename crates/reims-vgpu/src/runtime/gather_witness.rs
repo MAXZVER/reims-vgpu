@@ -1351,7 +1351,15 @@ pub struct GatheredIdentity {
 /// stand in for this epoch's hypervisor sync (see `observe` and
 /// `mapper::mapping_guest_write_verdict`).
 pub(crate) fn lab_stated_vouch() -> bool {
-    lab_stated_mode() == 1
+    matches!(lab_stated_mode(), 1 | 3)
+}
+
+/// TEMP (lab): the verdict half of the stated channel - `mapping_guest_write_verdict`
+/// answering from the lagged generation. `on` is both halves; `witness` (the
+/// sampled-window witness only) and `verdict` (the surface-currency verdict only)
+/// split them for attribution.
+pub(crate) fn lab_stated_verdict() -> bool {
+    matches!(lab_stated_mode(), 1 | 4)
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_STATED_VOUCH=verify` behaves exactly like the
@@ -1369,6 +1377,8 @@ fn lab_stated_mode() -> u8 {
     *MODE.get_or_init(|| match std::env::var("REIMS_VGPU_LAB_STATED_VOUCH").as_deref() {
         Ok("on") => 1,
         Ok("verify") => 2,
+        Ok("witness") => 3,
+        Ok("verdict") => 4,
         _ => 0,
     })
 }

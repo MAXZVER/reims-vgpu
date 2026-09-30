@@ -1874,7 +1874,7 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     // generation as of its last sync rather than waiting for this epoch's; a
     // write the guest did not state is then seen one read late.
     let lab_unstated = m.guest_stated_gen == m.guest_stated_at_stamp;
-    let gen_ = if crate::runtime::gather_witness::lab_stated_vouch() && lab_unstated {
+    let gen_ = if crate::runtime::gather_witness::lab_stated_verdict() && lab_unstated {
         crate::runtime::drain::note_store_route("lab_gwv_lagged");
         host.guest_write_gen_lagged(m.guest_write_token)
     } else if crate::runtime::gather_witness::lab_stated_verify() && lab_unstated {
