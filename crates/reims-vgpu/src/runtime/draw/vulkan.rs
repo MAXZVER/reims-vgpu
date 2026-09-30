@@ -316,6 +316,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 identity,
                 guest_store,
             }) => {
+                lab_dump_draw(req, &identity, "surface");
                 lab_pick_draw(req, &identity, "surface");
                 // Into the same `t11_store_us` bucket the synchronous and `Owned`
                 // routes report, because the whole claim of this rail is that the
@@ -1258,6 +1259,121 @@ fn lab_gate_open() -> bool {
     open
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_COVER=WxH@x,y;x,y` — which draws on a WxH colour-0
+/// target could write a given texel (the point lies inside the draw's scissor,
+/// or the whole target when it has none), without reading anything back: a
+/// cheap picker that does not change timing. Lines: `lab_cover_draw` per draw
+/// and `lab_cover_tex` per sampled image of such a draw (its resolved source and
+/// content identity). Honours `REIMS_VGPU_LAB_GATE`; at most
+/// `REIMS_VGPU_LAB_COVER_MAX` (default 100000) lines.
+fn lab_cover_point(req: &DrawEncodeRequest) -> Option<usize> {
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Option<((u32, u32), Vec<(u32, u32)>)>> = OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        let v = std::env::var("REIMS_VGPU_LAB_COVER").ok()?;
+        let (wh, pts) = v.split_once('@')?;
+        let (w, h) = wh.split_once('x')?;
+        let pts = pts
+            .split(';')
+            .filter_map(|p| {
+                let (x, y) = p.split_once(',')?;
+                Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+            })
+            .collect();
+        Some(((w.trim().parse().ok()?, h.trim().parse().ok()?), pts))
+    });
+    let ((w, h), pts) = spec.as_ref()?;
+    let c0 = req.colors.first()?;
+    if (c0.width, c0.height) != (*w, *h) {
+        return None;
+    }
+    let (sx, sy, sw, sh) = req
+        .scissors
+        .first()
+        .map(|s| (s.x, s.y, s.width, s.height))
+        .unwrap_or((0, 0, *w, *h));
+    pts.iter()
+        .position(|&(x, y)| x >= sx && y >= sy && x < sx.saturating_add(sw) && y < sy.saturating_add(sh))
+}
+
+fn lab_cover_budget() -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_COVER_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000)
+    });
+    lab_gate_open() && N.fetch_add(1, Ordering::Relaxed) < max
+}
+
+fn lab_cover_draw(req: &DrawEncodeRequest, entry: Option<&str>) {
+    let Some(pt) = lab_cover_point(req) else {
+        return;
+    };
+    if !lab_cover_budget() {
+        return;
+    }
+    let c0 = &req.colors[0];
+    crate::observe::fail(format!(
+        "lab_cover_draw pt={pt} task={} pipe={} entry={} sc={:?} rt=ref{}/m{}/g{:x}:f{}:ld{}:st{} vtx={} inst={} tex={:?} chain={} cont={} gvares={}",
+        req.task_id,
+        req.pipeline_ref,
+        entry.unwrap_or("?"),
+        req.scissors.first().map(|s| (s.x, s.y, s.width, s.height)),
+        c0.texture_ref,
+        c0.mapping_id,
+        c0.target_gva,
+        c0.format,
+        c0.load_action,
+        c0.store_action,
+        req.vertex_count,
+        req.instance_count,
+        req.fragment_textures
+            .iter()
+            .map(|t| (t.index, t.texture_ref))
+            .collect::<Vec<_>>(),
+        req.chain_from_resident,
+        req.continues_render_pass,
+        req.gva_load_from_resident
+    ));
+}
+
+fn lab_cover_tex(
+    req: &DrawEncodeRequest,
+    index: u32,
+    texture_ref: u32,
+    img: &crate::backend::vulkan::engine::SampledImageResource,
+) {
+    let Some(pt) = lab_cover_point(req) else {
+        return;
+    };
+    if !lab_cover_budget() {
+        return;
+    }
+    let src = match &img.source {
+        crate::backend::vulkan::engine::SampledSource::Bytes(b) => format!("bytes(len={})", b.len()),
+        crate::backend::vulkan::engine::SampledSource::Target(t) => format!("target({t:?})"),
+        crate::backend::vulkan::engine::SampledSource::GuestRuns(g, vouch) => format!(
+            "guest_runs(runs={} len={} first_ptr={:?} vouch={vouch:?})",
+            g.runs.len(),
+            g.total_len,
+            g.runs.first().map(|r| format!("{:?}", r).chars().take(60).collect::<String>())
+        ),
+    };
+    crate::observe::fail(format!(
+        "lab_cover_tex pt={pt} task={} pipe={} idx={index} ref={texture_ref} {}x{} fmt={:?} ident={:?} src={src}",
+        req.task_id,
+        req.pipeline_ref,
+        img.width,
+        img.height,
+        img.format,
+        img.identity.as_ref().map(|i| (i.key, i.generation))
+    ));
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_UBO=pipe[,pipe]` logs the fragment buffers
 /// (reflected access, length, first 64 words) and fragment textures of draws
 /// with those pipelines, once per distinct (textures, bytes) digest and at most
@@ -1668,6 +1784,101 @@ fn lab_sampled_strip_probe(
     ));
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_CDUMP=1` — one compute storage output as read
+/// back (`/tmp/labdump/cNNNN-tT-pP-bB.rgba`, header `w h bytes_per_texel mtl_format`)
+/// and a `lab_cdump` line with its non-zero census; `Landed` outputs (copied
+/// straight to guest pages) are logged without bytes. Gated like the other
+/// lab dumps (`REIMS_VGPU_LAB_GATE`), task 1 excluded, both sides <= 512.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lab_compute_output_dump(
+    task_id: u32,
+    pipeline_ref: u32,
+    binding: u32,
+    w: u32,
+    h: u32,
+    mtl_format: u16,
+    bytes: Option<&[u8]>,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static N: AtomicU32 = AtomicU32::new(0);
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CDUMP").is_ok()) {
+        return;
+    }
+    if task_id == 1 || w > 512 || h > 512 || !lab_gate_open() {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= 3000 {
+        return;
+    }
+    let Some(bytes) = bytes else {
+        crate::observe::fail(format!(
+            "lab_cdump n={n} task={task_id} pipe={pipeline_ref} bind={binding} {w}x{h} fmt={mtl_format:#x} landed"
+        ));
+        return;
+    };
+    let texels = (w as usize).max(1) * (h as usize).max(1);
+    let bpt = (bytes.len() / texels) as u32;
+    let nonzero = bytes.iter().filter(|&&b| b != 0).count();
+    let name = format!("c{n:04}-t{task_id}-p{pipeline_ref}-b{binding}.rgba");
+    let dir = std::path::Path::new("/tmp/labdump");
+    let _ = std::fs::create_dir_all(dir);
+    let mut out = Vec::with_capacity(16 + bytes.len());
+    for v in [w, h, bpt, u32::from(mtl_format)] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(bytes);
+    let _ = std::fs::write(dir.join(&name), out);
+    crate::observe::fail(format!(
+        "lab_cdump n={n} task={task_id} pipe={pipeline_ref} bind={binding} {w}x{h} fmt={mtl_format:#x} len={} bpt={bpt} nonzero={nonzero} file={name}",
+        bytes.len()
+    ));
+}
+
+/// TEMP (lab): one CPU-origin sampled bind (`SampledSource::Bytes`) as the
+/// engine will upload it: `/tmp/labdump/bNNNN-tT-pP-iI-rR.rgba`, header
+/// `w h bytes_per_texel vk_format`, then the raw bytes; and a `lab_bytes_probe`
+/// line with the non-zero census — whether a glyph bitmap is empty before
+/// the GPU ever sees it.
+fn lab_sampled_bytes_dump(
+    req: &DrawEncodeRequest,
+    index: u32,
+    texture_ref: u32,
+    img: &crate::backend::vulkan::engine::SampledImageResource,
+    bytes: &[u8],
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= 3000 {
+        return;
+    }
+    let (w, h) = (img.width, img.height);
+    let texels = (w as usize).max(1) * (h as usize).max(1);
+    let bpt = (bytes.len() / texels) as u32;
+    let nonzero = bytes.iter().filter(|&&b| b != 0).count();
+    let dir = std::path::Path::new("/tmp/labdump");
+    let _ = std::fs::create_dir_all(dir);
+    let mut out = Vec::with_capacity(16 + bytes.len());
+    for v in [w, h, bpt, img.format.as_raw() as u32] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(bytes);
+    let name = format!(
+        "b{n:04}-t{}-p{}-i{index}-r{texture_ref}.rgba",
+        req.task_id, req.pipeline_ref
+    );
+    let _ = std::fs::write(dir.join(&name), out);
+    crate::observe::fail(format!(
+        "lab_bytes_probe file={name} {w}x{h} len={} bpt={bpt} vkfmt={:?} origin={:?} ident={} nonzero={nonzero}",
+        bytes.len(),
+        img.format,
+        img.byte_origin,
+        img.identity.is_some()
+    ));
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_PROBE_WH=WxH[,WxH]` reads back every sampled
 /// resident of those sizes right before the draw that samples it and logs a
 /// 5x3 grid of texels (RGBA8 readback) — is a mask shaped, or uniform.
@@ -1698,8 +1909,20 @@ fn lab_sampled_grid_probe(
             .unwrap_or_default()
     });
     let Some(img) = pushed else { return };
-    let crate::backend::vulkan::engine::SampledSource::Target(identity) = &img.source else {
-        return;
+    let identity = match &img.source {
+        crate::backend::vulkan::engine::SampledSource::Target(identity) => identity,
+        // TEMP (lab): CPU-origin binds too, as the bytes the engine uploads.
+        crate::backend::vulkan::engine::SampledSource::Bytes(bytes) => {
+            let (w, h) = (img.width, img.height);
+            let small = want
+                .iter()
+                .any(|&(a, b)| a == 0 && w <= b && h <= b && req.task_id != 1);
+            if (want.contains(&(w, h)) || small) && lab_gate_open() && lab_dump_window_open() {
+                lab_sampled_bytes_dump(req, index, texture_ref, img, bytes);
+            }
+            return;
+        }
+        _ => return,
     };
     let (w, h) = (identity.width(), identity.height());
     let small = want
@@ -5054,6 +5277,21 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
             return Some(bound);
         }
     }
+    // TEMP (lab, on unless REIMS_VGPU_LAB_FIX_WHOLE_RUNS=0): no packed alias on this host.
+    // Walk the whole allocation once and serve this and every later offset of
+    // the reference from those runs, instead of one exact-window walk and one
+    // registry entry per offset. Only where the window would gather anyway (no
+    // page references into a backend import) and only for binds the floor
+    // admits; anything else keeps the exact-window rail below.
+    if lab_fix_whole_runs()
+        && gather_eligible
+        && ensure_whole_runs(state, host, task_id, buffer_ref, gva, size)
+    {
+        if let Some(bound) = whole_runs_bind(state, task_id, buffer_ref, offset, extent_cap) {
+            crate::runtime::drain::note_store_route("zc_buffer_whole_bound");
+            return Some(bound);
+        }
+    }
     // No settle here, for the reason `try_linear_sample_zero_copy` states at
     // length: this rail hands the engine guest-RAM runs and the *GPU* reads them
     // when the draw's command buffer executes, so a guest-page writeback — a GPU
@@ -5100,6 +5338,83 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         source_offset: 0,
         runs: std::sync::Arc::new(runs),
         pages,
+    })
+}
+
+/// TEMP (lab): whole-allocation run lists for buffers that have no backend
+/// import -- see [`crate::runtime::bound_buffers::WholeRuns`]. On by default;
+/// `REIMS_VGPU_LAB_FIX_WHOLE_RUNS=0` turns it off (the control arm of an A/B).
+fn lab_fix_whole_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_FIX_WHOLE_RUNS").map_or(true, |v| v != "0"))
+}
+
+/// TEMP (lab): make sure `(task, reference)` holds its whole allocation's runs,
+/// walking the task page table once if it does not. `false` when the whole
+/// allocation does not walk (an unmapped tail page, an untileable span) or when
+/// this host would reference the pages through a backend import instead of
+/// gathering them -- in both cases the exact-window rail stays in charge.
+fn ensure_whole_runs<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    buffer_ref: u32,
+    gva: u64,
+    size: u64,
+) -> bool {
+    if state
+        .bound_buffers
+        .whole(task_id, buffer_ref)
+        .is_some_and(|w| w.gva == gva && w.size == size)
+    {
+        return true;
+    }
+    let Ok((gpas, runs)) = task_gva_guest_run_window(state, host, task_id, gva, size) else {
+        crate::runtime::drain::note_store_route("zc_buffer_whole_refused");
+        return false;
+    };
+    let page = state.page_size();
+    if guest_page_window(host, gpas, page, gva % page, size).is_some() {
+        crate::runtime::drain::note_store_route("zc_buffer_whole_importable");
+        return false;
+    }
+    crate::runtime::drain::note_store_route("zc_buffer_whole_walked");
+    state.bound_buffers.insert_whole(
+        task_id,
+        buffer_ref,
+        crate::runtime::bound_buffers::WholeRuns {
+            gva,
+            size,
+            runs: std::sync::Arc::new(runs),
+        },
+    );
+    true
+}
+
+/// TEMP (lab): one offset bind sliced out of a held whole-allocation run list,
+/// under the same floor and cap the exact-window rail applies.
+fn whole_runs_bind(
+    state: &DeviceState,
+    task_id: u32,
+    buffer_ref: u32,
+    offset: u64,
+    extent_cap: Option<u64>,
+) -> Option<crate::runtime::bound_buffers::BoundBuffer> {
+    if !lab_fix_whole_runs() {
+        return None;
+    }
+    let whole = state.bound_buffers.whole(task_id, buffer_ref)?;
+    if offset >= whole.size {
+        return None;
+    }
+    let full = host_alloc_len(whole.size - offset).filter(|&n| n > 0)? as u64;
+    let span = gather_span_if_eligible(full, extent_cap)?;
+    Some(crate::runtime::bound_buffers::BoundBuffer {
+        gva: whole.gva.checked_add(offset)?,
+        span,
+        source_offset: offset,
+        runs: std::sync::Arc::clone(&whole.runs),
+        pages: None,
     })
 }
 
@@ -5225,6 +5540,12 @@ fn held_buffer_content(
             }
         }
     }
+    // TEMP (lab, REIMS_VGPU_LAB_FIX_WHOLE_RUNS=1): a held whole-allocation run
+    // list answers every offset of the reference, like the packed alias above.
+    if let Some(bound) = whole_runs_bind(state, task_id, buffer_ref, offset, extent_cap) {
+        crate::runtime::drain::note_store_route("zc_buffer_whole_held");
+        return Some(bound_buffer_content(&bound));
+    }
     // The registry is keyed on the same cap the walk uses, or a lookup could
     // answer with a shorter span than this shader needs.
     // A held resolution answers before anything is resolved at all: the walk
@@ -5274,7 +5595,7 @@ fn load_buffer_content_resolved<M: HostMemory + HostOps>(
             let packed = matches!(
                 state.bound_buffers.packed(task_id, buffer_ref),
                 Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(_))
-            );
+            ) || state.bound_buffers.whole(task_id, buffer_ref).is_some();
             if !packed {
                 state
                     .bound_buffers
@@ -8712,6 +9033,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         }
         drop(fragment_span);
         lab_spv_all(req, f_shader.reflection.entry_point.as_deref(), &f_shader.spirv);
+        lab_cover_draw(req, f_shader.reflection.entry_point.as_deref());
         lab_ubo_draw(req, &frag_storage, f_shader.reflection.entry_point.as_deref(), &f_shader.spirv, |i| {
             format!(
                 "{:?}",
@@ -9589,6 +9911,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 lab_sampled_bind(req, frag_stage, index, texture_ref, tw, th, images.last(), view_swizzle);
                 lab_sampled_strip_probe(req, texture_ref, images.last());
                 lab_sampled_grid_probe(req, index, texture_ref, images.last());
+                if let Some(img) = images.last() {
+                    lab_cover_tex(req, index, texture_ref, img);
+                }
                 Ok(())
             };
             for t in req.vertex_textures.iter() {

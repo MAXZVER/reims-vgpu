@@ -146,6 +146,36 @@ impl PackedBufferResolution {
     }
 }
 
+/// One task buffer's whole allocation as host-pointer runs, for a host that can
+/// alias guest pages for the CPU but cannot import them into the backend.
+///
+/// TEMP (lab, on by default; `REIMS_VGPU_LAB_FIX_WHOLE_RUNS=0` turns it off): the packed alias is the
+/// registry's answer to buffer-plus-offset binding, but it needs a backend
+/// import, and without one every bind fell to the exact-window fallback, which
+/// keys per offset. A compositor that streams its geometry through one ring
+/// buffer binds it at a new offset on nearly every draw, so each of those binds
+/// walked the task page table and added a registry entry: a Tahoe window drag
+/// at 1080p grew the registry from 37k to 63k entries over ~19 references in
+/// sixteen seconds, and every `CmdMapMemory2`/`CmdUnmapMemory` then scanned all
+/// of them in `retire_range`. The runs of the whole allocation are the same
+/// answer for every offset, exactly as the packed alias is, and the CPU gather
+/// skips to the offset (`GuestRunSource::source_offset`).
+#[derive(Clone, Debug)]
+pub struct WholeRuns {
+    pub gva: u64,
+    pub size: u64,
+    pub runs: Arc<Vec<GuestRun>>,
+}
+
+impl WholeRuns {
+    fn overlaps(&self, gva: u64, len: u64) -> bool {
+        if len == 0 || self.size == 0 {
+            return false;
+        }
+        self.gva < gva.saturating_add(len) && gva < self.gva.saturating_add(self.size)
+    }
+}
+
 /// A resolved bind: where this reference's bytes live, as the engine binds them.
 ///
 /// Both lists are `Arc`ed by the producer already, so a lookup hands the draw
@@ -276,6 +306,8 @@ pub fn note_registry_levels(state: &crate::model::DeviceState) {
 pub struct BoundBuffers {
     held: HashMap<Key, BoundBuffer>,
     packed: HashMap<(u32, u32), PackedBufferResolution>,
+    /// TEMP (lab): see [`WholeRuns`].
+    whole: HashMap<(u32, u32), WholeRuns>,
 }
 
 impl BoundBuffers {
@@ -352,6 +384,16 @@ impl BoundBuffers {
         self.packed.insert((task_id, buffer_ref), packed);
     }
 
+    /// TEMP (lab): the whole-allocation runs held for a reference, if any.
+    pub fn whole(&self, task_id: u32, buffer_ref: u32) -> Option<&WholeRuns> {
+        self.whole.get(&(task_id, buffer_ref))
+    }
+
+    /// TEMP (lab): hold a reference's whole-allocation runs.
+    pub fn insert_whole(&mut self, task_id: u32, buffer_ref: u32, whole: WholeRuns) {
+        self.whole.insert((task_id, buffer_ref), whole);
+    }
+
     /// Drop everything held for one task.
     ///
     /// The answer for a page-table root change, a new object list, or a deleted
@@ -360,6 +402,7 @@ impl BoundBuffers {
         let before = self.held.len();
         self.held.retain(|k, _| k.task != task_id);
         self.packed.retain(|(task, _), _| *task != task_id);
+        self.whole.retain(|(task, _), _| *task != task_id);
         before - self.held.len()
     }
 
@@ -393,6 +436,7 @@ impl BoundBuffers {
         self.held
             .retain(|k, _| k.task != task_id || k.buffer_ref != buffer_ref);
         self.packed.remove(&(task_id, buffer_ref));
+        self.whole.remove(&(task_id, buffer_ref));
         before - self.held.len()
     }
 
@@ -405,6 +449,8 @@ impl BoundBuffers {
             .retain(|k, b| k.task != task_id || !b.overlaps(gva, len));
         self.packed
             .retain(|(task, _), b| *task != task_id || !b.overlaps(gva, len));
+        self.whole
+            .retain(|(task, _), w| *task != task_id || !w.overlaps(gva, len));
         before - self.held.len()
     }
 
@@ -412,6 +458,7 @@ impl BoundBuffers {
     pub fn clear(&mut self) {
         self.held.clear();
         self.packed.clear();
+        self.whole.clear();
     }
 
     /// How many resolutions are held, for the census.
@@ -527,6 +574,45 @@ mod tests {
         // A retirement is keyed on task and reference, so it takes all three.
         assert_eq!(b.retire_ref(1, 1), 3);
         assert!(b.is_empty());
+    }
+
+    fn whole(gva: u64, size: u64) -> WholeRuns {
+        WholeRuns {
+            gva,
+            size,
+            runs: Arc::new(Vec::new()),
+        }
+    }
+
+    /// TEMP (lab): a whole-allocation run list answers for its reference at
+    /// every offset, so it has to leave through every rule a per-offset
+    /// resolution leaves through -- or a bind after a remap would gather from
+    /// pages the guest no longer maps there.
+    #[test]
+    fn whole_runs_follow_every_retirement_rule() {
+        let mut b = BoundBuffers::default();
+        b.insert_whole(1, 1, whole(0x10000, 0x4000)); // [0x10000,0x14000)
+        b.insert_whole(1, 2, whole(0x20000, 0x1000));
+        b.insert_whole(2, 1, whole(0x10000, 0x4000));
+        assert!(b.whole(1, 1).is_some());
+
+        // A range notify inside the allocation retires it; one beside it does not.
+        b.retire_range(1, 0x14000, 0x1000);
+        assert!(b.whole(1, 1).is_some(), "adjacent range, no overlap");
+        b.retire_range(1, 0x13fff, 1);
+        assert!(b.whole(1, 1).is_none(), "the last byte moved");
+        assert!(b.whole(2, 1).is_some(), "another task's same range survives");
+
+        b.retire_ref(1, 2);
+        assert!(b.whole(1, 2).is_none());
+
+        b.insert_whole(1, 3, whole(0x30000, 0x1000));
+        b.retire_task(1);
+        assert!(b.whole(1, 3).is_none());
+        assert!(b.whole(2, 1).is_some());
+
+        b.clear();
+        assert!(b.whole(2, 1).is_none());
     }
 
     /// A map/unmap notify retires exactly the resolutions whose bytes moved,
