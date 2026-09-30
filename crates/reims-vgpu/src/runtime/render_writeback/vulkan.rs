@@ -305,6 +305,14 @@ fn store_changed_pages<M: HostMemory + HostOps>(
     height: u32,
     started: std::time::Instant,
 ) -> Option<bool> {
+    // TEMP (lab, REIMS_VGPU_LAB_PAY_SKIP=1): pay nothing. The guest's pages go
+    // stale, so this is only an upper bound on what a free payment would buy
+    // (drain duty and present_hz over a short window), never a mode to run.
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SKIP.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PAY_SKIP").is_ok_and(|v| v == "1")) {
+        crate::runtime::drain::note_store_route("lab_pay_skipped");
+        return Some(true);
+    }
     let m = state.mappings.get(&mapping_id)?;
     let (base_off, bpr, format) =
         crate::runtime::mapping_write::resident_gpu_plane(m, width, height)?;

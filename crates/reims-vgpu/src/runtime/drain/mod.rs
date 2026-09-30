@@ -2160,6 +2160,16 @@ fn admit_and_park<H: HostMemory + HostOps>(
 ) {
     use reims_vgpu_core::identity::StampSlot;
 
+    if state.lab_hold_since.is_some() {
+        note_store_route("lab_hold_admitted");
+        note_store_route(if packet.opcode == CHILD_OP_DISPLAY_SWAP
+            || packet.opcode == CHILD_OP_DISPLAY_TRANSACTION2
+        {
+            "lab_hold_admitted_present"
+        } else {
+            "lab_hold_admitted_other"
+        });
+    }
     let arrived = arrival_work(state, host, fifo, &packet);
     let session = state.session_generation();
     let built = crate::runtime::ingress::device_packet(
