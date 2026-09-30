@@ -329,6 +329,27 @@ pub(super) fn note_slot_empty<M: HostMemory>(
 /// driven macos-26 boot reaches a few dozen times — the misses themselves are
 /// three times that, and repeats of a slot already watched cost nothing.
 fn note_list_population<M: HostMemory>(state: &DeviceState, host: &M, task_id: u32, ref_: u32) {
+    // Once per `(task, ref)` for the life of the device. The ledger re-admits a
+    // ref whose watch ended, and a ref that misses every frame ends and is
+    // re-admitted every frame: a driven macos-26 boot wrote this line ~115 000
+    // times in 28 minutes (most of a 161 MB log), each one a fresh 341-entry read
+    // of the guest's list. The first reading is the one that answers the
+    // question; the repeats only cost the drain.
+    {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        const REPORTED_CAP: usize = 4096;
+        static REPORTED: OnceLock<Mutex<HashSet<(u32, u32)>>> = OnceLock::new();
+        let mut reported = REPORTED
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if reported.contains(&(task_id, ref_)) || reported.len() >= REPORTED_CAP {
+            crate::runtime::drain::note_store_route("slot_empty_population_repeat");
+            return;
+        }
+        reported.insert((task_id, ref_));
+    }
     let Some(pop) = first_page_population(state, host, task_id) else {
         // The list's own first page did not read, which the per-slot walk would
         // have reported as `Unreadable` rather than `SlotEmpty` — so reaching
