@@ -276,6 +276,19 @@ pub struct DeviceLoss {
     pub released: Vec<Release>,
 }
 
+/// What a task's end took with it. See [`SessionModel::task_ended`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[must_use = "the ended task's pipelines are host objects nothing else will destroy, and its stranded work is a channel head nothing else will release"]
+pub struct TaskEnded {
+    /// How many pipelines the task owned, in any state.
+    pub removed: usize,
+    /// The ones a host object exists for, in id order.
+    pub destroy: Vec<PipelineId>,
+    /// Transactions that were waiting for one of them, in ingress order and each
+    /// named once.
+    pub stranded: Vec<IngressOrdinal>,
+}
+
 /// What a guest reset closed.
 ///
 /// The generation and the pipelines are one value because they are one event.
@@ -449,6 +462,31 @@ impl SessionModel {
         stranded.dedup();
         Reset {
             generation: self.generation,
+            destroy: taken.destroy,
+            stranded,
+        }
+    }
+
+    /// A task's address space ended, by deletion or by redefinition under the
+    /// same id: take its pipelines out, and name the transactions that were
+    /// parked on them.
+    ///
+    /// The per-task half of [`Self::reset`], with the same two answers for the
+    /// same two callers. The waiters come back rather than being dropped or made
+    /// ready: a pipeline that no longer exists answers `release_past_ended_pipeline`
+    /// as an ended one, which is how a position parked on it runs rather than
+    /// holds its channel's head forever.
+    pub fn task_ended(&mut self, task: crate::identity::TaskId) -> TaskEnded {
+        let taken = self.pipelines.task_ended(task);
+        let mut stranded: Vec<IngressOrdinal> = taken
+            .removed
+            .iter()
+            .flat_map(|id| self.scheduler.pipeline_refused(*id))
+            .collect();
+        stranded.sort_unstable();
+        stranded.dedup();
+        TaskEnded {
+            removed: taken.removed.len(),
             destroy: taken.destroy,
             stranded,
         }
@@ -1676,6 +1714,59 @@ mod tests {
             s.admit(&packet_leasing_shared(resource)),
             Err(Refusal::PipelineUnusable(LeaseRefusal::Absent { .. }))
         ));
+    }
+
+    /// A task's end takes its pipelines and strands only the work parked on them;
+    /// a task of the same object-list id keeps its own.
+    #[test]
+    fn a_task_ending_strands_its_own_waiters_and_leaves_another_tasks_alone() {
+        use crate::identity::TaskId;
+        use crate::pipeline::{PipelineScope, PipelineState};
+
+        let resource = res(9);
+        let (one, three) = (
+            PipelineScope::Task(TaskId(1)).id(resource),
+            PipelineScope::Task(TaskId(3)).id(resource),
+        );
+        let leased = |task: u32| {
+            let mut p = packet(0x37);
+            let Payload::Exec(work) = &mut p.payload else {
+                panic!("an EXEC");
+            };
+            work.pipeline_leases.push(resource);
+            work.pipelines = PipelineScope::Task(TaskId(task));
+            p
+        };
+        let mut s = session();
+        let g = s.generation();
+        for p in [one, three] {
+            assert!(s.pipelines().declare(p, g));
+            for step in [PipelineState::Translating, PipelineState::Compiling] {
+                assert!(s.pipelines().advance(p, step));
+            }
+        }
+        let a = s.admit(&leased(1)).expect("accepted");
+        let b = s.admit(&leased(3)).expect("accepted");
+        assert_eq!(s.scheduler().waiting_on_pipelines(), 2);
+
+        let ended = s.task_ended(TaskId(1));
+        assert_eq!(ended.removed, 1);
+        assert_eq!(ended.destroy, vec![one], "it was compiling: a host object");
+        assert_eq!(ended.stranded, vec![a.transaction.identity.ingress]);
+        // The stranded packet is still parked until the caller runs it past the
+        // pipeline that no longer exists, which the table answers as an ended one.
+        assert_eq!(s.scheduler().waiting_on_pipelines(), 2);
+        assert!(s.release_past_ended_pipeline(a.transaction.identity.ingress, one));
+        assert_eq!(s.take_ready(), vec![a.transaction.identity.ingress]);
+        assert_eq!(s.scheduler().waiting_on_pipelines(), 1, "task 3's wait stands");
+
+        // Task 3 still builds and releases its own packet.
+        assert!(s.pipeline_ready(three));
+        assert_eq!(s.take_ready(), vec![b.transaction.identity.ingress]);
+
+        // The id is task 1's again: a fresh incarnation declares it anew.
+        assert!(s.pipelines().declare(one, g));
+        assert_eq!(s.task_ended(TaskId(99)), TaskEnded::default());
     }
 
     /// A packet leasing `resource` under the shared naming.

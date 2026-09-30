@@ -1128,6 +1128,47 @@ impl PipelineTable {
         out
     }
 
+    /// A task's address space ended: every pipeline it named can never be named
+    /// again.
+    ///
+    /// The per-task half of [`Self::generation_closed`], and needed for the same
+    /// reason once a pipeline is the task's own (see [`PipelineId`]): the object
+    /// list is the task's, so when the task is deleted or redefined under the same
+    /// id its names go with it and the new incarnation numbers its list from the
+    /// start again. Entries left behind would answer for the new incarnation's
+    /// pipelines that share their (slot, generation) — a dead task's `Ready`
+    /// standing for a pipeline nobody has built, its tombstone refusing one the
+    /// guest has just created.
+    ///
+    /// Removes every pipeline the task owns, whatever its state, and returns them
+    /// as [`Self::generation_closed`] does, for the same two callers: the host
+    /// objects to destroy and the waits nothing can now discharge. Pipelines
+    /// named [`PipelineId::shared`] belong to no task and are not touched.
+    #[must_use = "a pipeline nobody destroys is a host object nothing frees, and one nobody names is a wait nothing discharges"]
+    pub fn task_ended(&mut self, task: TaskId) -> Closed {
+        let mut out = Closed::default();
+        self.pipelines.retain(|id, p| {
+            if id.task() != Some(task) {
+                return true;
+            }
+            if matches!(
+                p.state,
+                PipelineState::Translating | PipelineState::Compiling | PipelineState::Ready
+            ) {
+                self.census.retired += 1;
+                out.destroy.push(*id);
+            }
+            out.removed.push(*id);
+            false
+        });
+        for id in &out.removed {
+            self.usage.remove(id);
+        }
+        out.destroy.sort_unstable();
+        out.removed.sort_unstable();
+        out
+    }
+
     /// The host device incarnation ended: every build it performed is gone.
     ///
     /// Returns the pipelines whose build has to start again, in id order.
@@ -1599,6 +1640,53 @@ mod tests {
         let mut t = ready();
         let _ = t.generation_closed(GEN);
         assert!(!t.usage_published(id(1)), "generation closed");
+    }
+
+    /// A task's end takes its pipelines and only its own, and the next
+    /// incarnation of the id starts clean.
+    #[test]
+    fn a_task_ending_removes_its_pipelines_and_no_one_elses() {
+        let resource = id(7).resource();
+        let (a, b) = (
+            PipelineId::of(TaskId(1), resource),
+            PipelineId::of(TaskId(3), resource),
+        );
+        let shared = PipelineId::shared(resource);
+        let usage = || PublishedUsage::compute(BindingUsage::new(vec![], vec![]));
+        let mut t = PipelineTable::new();
+        for p in [a, b, shared] {
+            assert!(t.declare(p, GEN));
+            assert!(t.publish_usage(p, usage()));
+        }
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            assert!(t.advance(a, step));
+        }
+        assert!(t.retire(b));
+
+        let ended = t.task_ended(TaskId(1));
+        assert_eq!(ended.removed, vec![a]);
+        assert_eq!(ended.destroy, vec![a], "a had a host build to destroy");
+        assert!(t.get(a).is_none());
+        assert!(!t.usage_published(a));
+        assert_eq!(t.lease(b, GEN), Lease::Absent(AbsentBecause::Retired), "b is untouched");
+        assert!(t.usage_published(shared), "a shared pipeline belongs to no task");
+
+        // The task is redefined under the same id: its first pipeline with the
+        // same slot and generation is a new one.
+        assert!(t.declare(a, GEN));
+        assert_eq!(t.lease(a, GEN), Lease::Pending);
+        assert!(!t.usage_published(a));
+
+        // A tombstone goes with its task too, and a task that named nothing
+        // ends without a word.
+        let ended = t.task_ended(TaskId(3));
+        assert_eq!(ended.removed, vec![b]);
+        assert!(ended.destroy.is_empty(), "a retired pipeline has nothing to destroy");
+        assert!(t.task_ended(TaskId(99)).removed.is_empty());
     }
 
     /// A pipeline is wanted exactly while the table holds it, it has not ended,

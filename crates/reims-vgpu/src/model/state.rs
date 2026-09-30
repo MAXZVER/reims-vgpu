@@ -5357,6 +5357,36 @@ impl DeviceState {
                 "task_namespace_teardowns",
                 acted.teardowns.len() as u64,
             );
+            self.end_task_pipelines(task_id);
+        }
+    }
+
+    /// A task's address space ended — deleted, or redefined under the same id —
+    /// and the pipelines it named end with it.
+    ///
+    /// Only where a pipeline is the task's own
+    /// ([`crate::runtime::objects::pipeline_per_task`]): named by the id alone the
+    /// table cannot say which entries are a task's. Needed because the next
+    /// incarnation numbers its object list from the start again, so an entry left
+    /// behind would answer for a pipeline of the same (slot, generation) that
+    /// nobody has built. The work parked on them is named by the model and is run
+    /// past them by the drain's own pump, the same way it is for a deleted
+    /// pipeline.
+    fn end_task_pipelines(&self, task_id: u32) {
+        if !crate::runtime::objects::pipeline_per_task() {
+            return;
+        }
+        let ended = self
+            .session
+            .lock()
+            .expect("session")
+            .task_ended(reims_vgpu_core::identity::TaskId(task_id));
+        if ended.removed > 0 {
+            crate::runtime::drain::note_store_route_n("pipeline_task_ended", ended.removed as u64);
+            crate::runtime::drain::note_store_route_n(
+                "pipeline_task_ended_stranded",
+                ended.stranded.len() as u64,
+            );
         }
     }
 
@@ -5452,7 +5482,12 @@ impl DeviceState {
             "task_namespace_teardowns",
             acted.teardowns.len() as u64,
         );
-        acted.redefined.pop()
+        let redefined = acted.redefined.pop();
+        if redefined.is_some() {
+            // The previous address space ended under the same id.
+            self.end_task_pipelines(task_id);
+        }
+        redefined
     }
 
     pub fn delete_object(&mut self, task_id: u32, ref_: u32) -> bool {
@@ -6929,6 +6964,52 @@ mod device_access_tests {
         });
     }
 
+    /// A task's address space ending — deleted, or redefined under the same id —
+    /// takes the pipelines it named and no one else's.
+    ///
+    /// The next incarnation numbers its object list from the start again, so an
+    /// entry left behind would stand for a pipeline of the same slot and
+    /// generation that nobody has built.
+    #[test]
+    fn a_task_ending_ends_its_pipelines_with_per_task_naming_on() {
+        use reims_vgpu_core::identity::ResourceId;
+        use reims_vgpu_core::pipeline::PipelineState;
+
+        let pipeline = ResourceId {
+            slot: reims_vgpu_core::identity::ObjectListRef(30),
+            generation: reims_vgpu_core::identity::SlotGeneration::default().next(),
+        };
+        let ready = |state: &DeviceState, task: u32| {
+            state.declare_pipeline(task, pipeline);
+            assert!(state.advance_pipeline(task, pipeline, PipelineState::Translating));
+            assert!(state.advance_pipeline(task, pipeline, PipelineState::Compiling));
+            assert!(state.ready_pipeline(task, pipeline));
+        };
+        crate::runtime::objects::with_pipeline_per_task(true, || {
+            let mut state = DeviceState::new(DeviceId(1), 12);
+            state.define_task(1, 0x1000, 2);
+            state.define_task(3, 0x1000, 3);
+            ready(&state, 1);
+            ready(&state, 3);
+
+            // Redefined under the same id: its pipelines go, task 3's stay.
+            state.define_task(1, 0x1000, 4);
+            assert_eq!(state.pipeline_state(1, pipeline), None);
+            assert_eq!(state.pipeline_state(3, pipeline), Some("ready"));
+            assert!(
+                state.declare_pipeline(1, pipeline),
+                "the new incarnation's pipeline is new"
+            );
+            assert_eq!(state.pipeline_state(1, pipeline), Some("declared"));
+
+            // Deleted: the same.
+            ready(&state, 1);
+            assert!(state.delete_task(1));
+            assert_eq!(state.pipeline_state(1, pipeline), None);
+            assert_eq!(state.pipeline_state(3, pipeline), Some("ready"));
+        });
+    }
+
     /// `REIMS_VGPU_ACCESS_EXACT` implies per-task naming: the reflection it
     /// answers must be the asking task's.
     #[test]
@@ -7832,11 +7913,14 @@ impl reims_vgpu_core::pipeline::UsageSource for PipelineUsage<'_> {
         pipeline: reims_vgpu_core::identity::ResourceId,
         stage: Option<reims_vgpu_protocol::render::ShaderStage>,
     ) -> Option<&reims_vgpu_core::pipeline::BindingUsage> {
-        let real = self
-            .0
-            .pipelines_ref()
-            .binding_usage_of(self.1.id(pipeline), stage);
-        self.3.lookup(self.2, pipeline, stage, real);
+        let id = self.1.id(pipeline);
+        let real = self.0.pipelines_ref().binding_usage_of(id, stage);
+        let state = if real.is_none() {
+            self.0.pipelines_ref().get(id).map(|p| p.state)
+        } else {
+            None
+        };
+        self.3.lookup(self.2, pipeline, stage, real, state);
         real
     }
 }

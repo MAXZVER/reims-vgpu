@@ -22,7 +22,9 @@
 //! task, so a reflection is built for each task that binds the pipeline, and the
 //! real table keeps the first one published (what it does without this).
 //! On with `REIMS_VGPU_LAB_DAG` set and the real table not already per task;
-//! counted while the DAG window is open.
+//! counted for the whole boot (the store-route lines carry a second-resolution
+//! time, so `scratchpad/ppcensus.py` splits them into the DAG window and the
+//! rest).
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -44,11 +46,6 @@ pub(crate) fn enabled() -> bool {
         && !crate::runtime::objects::pipeline_per_task()
 }
 
-/// Whether the census is counting: the DAG window is open.
-fn counting() -> bool {
-    crate::runtime::drain::lab_dag_window()
-}
-
 #[derive(Default)]
 pub(crate) struct LabShadow {
     inner: Mutex<Inner>,
@@ -64,14 +61,54 @@ struct Inner {
     waiting: HashMap<IngressOrdinal, (u32, Vec<ResourceId>)>,
 }
 
-/// 0 ready, 1 wait, 2 refused or absent.
-fn verdict(lease: Lease) -> u8 {
+/// 0 ready, 1 wait, 2 retired (tolerated: no wait, no refusal), 3 refused or
+/// absent otherwise.
+fn verdict(lease: Lease) -> usize {
     match lease {
         Lease::Ready => 0,
         Lease::Pending => 1,
-        Lease::Refused(_) | Lease::Absent(_) => 2,
+        Lease::Absent(reims_vgpu_core::pipeline::AbsentBecause::Retired) => 2,
+        Lease::Refused(_) | Lease::Absent(_) => 3,
     }
 }
+
+/// What the real table does with a lease of each verdict: 0 runs, 1 waits,
+/// 2 refuses. A retired lease runs.
+const fn outcome(verdict: usize) -> usize {
+    match verdict {
+        0 | 2 => 0,
+        1 => 1,
+        _ => 2,
+    }
+}
+
+/// `[shared verdict][own verdict]`, one route each.
+const LEASE_PAIR: [[&str; 4]; 4] = [
+    [
+        "lab_pp_lease_ready_ready",
+        "lab_pp_lease_ready_wait",
+        "lab_pp_lease_ready_retired",
+        "lab_pp_lease_ready_refused",
+    ],
+    [
+        "lab_pp_lease_wait_ready",
+        "lab_pp_lease_wait_wait",
+        "lab_pp_lease_wait_retired",
+        "lab_pp_lease_wait_refused",
+    ],
+    [
+        "lab_pp_lease_retired_ready",
+        "lab_pp_lease_retired_wait",
+        "lab_pp_lease_retired_retired",
+        "lab_pp_lease_retired_refused",
+    ],
+    [
+        "lab_pp_lease_refused_ready",
+        "lab_pp_lease_refused_wait",
+        "lab_pp_lease_refused_retired",
+        "lab_pp_lease_refused_refused",
+    ],
+];
 
 fn id(task: u32, name: ResourceId) -> PipelineId {
     PipelineId::of(TaskId(task), name)
@@ -157,7 +194,7 @@ impl LabShadow {
             return;
         }
         let mut g = self.lock();
-        if real_took && counting() {
+        if real_took {
             note_store_route(if g.state(task, name) == Some(PipelineState::Ready) {
                 "lab_pp_withdraw_own"
             } else {
@@ -183,7 +220,7 @@ impl LabShadow {
             return;
         }
         let mut g = self.lock();
-        if real_took && counting() {
+        if real_took {
             g.reached(
                 task,
                 name,
@@ -204,7 +241,7 @@ impl LabShadow {
             return;
         }
         let mut g = self.lock();
-        if ended.took && counting() {
+        if ended.took {
             note_store_route_n("lab_pp_retire_tombstoned_others", g.live_others(task, name));
             g.reached(
                 task,
@@ -226,7 +263,7 @@ impl LabShadow {
             return;
         }
         let mut g = self.lock();
-        if ended.took && counting() {
+        if ended.took {
             note_store_route_n("lab_pp_refuse_spoils_others", g.live_others(task, name));
             g.reached(
                 task,
@@ -279,28 +316,26 @@ impl LabShadow {
     /// What the real table (`real`, one lease each) and this one say about a
     /// packet about to be admitted with `leases`.
     pub(crate) fn admission(&self, task: u32, leases: &[ResourceId], generation: SessionGeneration, real: &[Lease]) {
-        if !enabled() || !counting() || leases.is_empty() {
+        if !enabled() || leases.is_empty() {
             return;
         }
         let mut g = self.lock();
-        let (mut worst_real, mut worst_own) = (0u8, 0u8);
+        let (mut worst_real, mut worst_own) = (0usize, 0usize);
+        let mut tombstoned_by_other = false;
         for (&lease, &shared) in leases.iter().zip(real) {
             let own = g.table.lease(id(task, lease), generation);
             let (s, t) = (verdict(shared), verdict(own));
-            worst_real = worst_real.max(s);
-            worst_own = worst_own.max(t);
+            worst_real = worst_real.max(outcome(s));
+            worst_own = worst_own.max(outcome(t));
             note_store_route("lab_pp_lease");
-            if s != t {
+            note_store_route(LEASE_PAIR[s][t]);
+            // The shared entry is a tombstone and this task's own pipeline is
+            // live: another task's delete ended this task's pipeline's name.
+            if s == 2 && matches!(t, 0 | 1) {
+                tombstoned_by_other = true;
+            }
+            if outcome(s) != outcome(t) {
                 note_store_route("lab_pp_lease_diverge");
-                note_store_route(match (s, t) {
-                    (1, 0) => "lab_pp_lease_spurious_wait",
-                    (0, 1) => "lab_pp_lease_early",
-                    (2, 0) => "lab_pp_lease_spurious_refuse",
-                    (0, 2) => "lab_pp_lease_missed_refuse",
-                    (1, 2) => "lab_pp_lease_wait_vs_own_refuse",
-                    (2, 1) => "lab_pp_lease_refuse_vs_own_wait",
-                    _ => "lab_pp_lease_other",
-                });
                 if crate::observe::first_sight("lab_pp_lease_diverge", u64::from(lease.slot.0)) {
                     crate::observe::fail(format!(
                         "lab_pp_lease_diverge slot={} gen={} task={task} shared={shared:?} own={own:?}",
@@ -310,15 +345,18 @@ impl LabShadow {
             }
         }
         note_store_route("lab_pp_admit");
+        if tombstoned_by_other {
+            note_store_route("lab_pp_admit_tombstoned_by_other");
+        }
         note_store_route(match (worst_real, worst_own) {
-            (0, 0) => "lab_pp_admit_ready_ready",
-            (0, 1) => "lab_pp_admit_ready_wait",
-            (0, 2) => "lab_pp_admit_ready_refuse",
-            (1, 0) => "lab_pp_admit_wait_ready",
+            (0, 0) => "lab_pp_admit_run_run",
+            (0, 1) => "lab_pp_admit_run_wait",
+            (0, _) => "lab_pp_admit_run_refuse",
+            (1, 0) => "lab_pp_admit_wait_run",
             (1, 1) => "lab_pp_admit_wait_wait",
-            (1, 2) => "lab_pp_admit_wait_refuse",
-            (2, 0) => "lab_pp_admit_refuse_ready",
-            (2, 1) => "lab_pp_admit_refuse_wait",
+            (1, _) => "lab_pp_admit_wait_refuse",
+            (_, 0) => "lab_pp_admit_refuse_run",
+            (_, 1) => "lab_pp_admit_refuse_wait",
             _ => "lab_pp_admit_refuse_refuse",
         });
     }
@@ -331,8 +369,9 @@ impl LabShadow {
         name: ResourceId,
         stage: Option<ShaderStage>,
         real: Option<&BindingUsage>,
+        real_state: Option<PipelineState>,
     ) {
-        if !enabled() || !counting() {
+        if !enabled() {
             return;
         }
         let g = self.lock();
@@ -341,7 +380,16 @@ impl LabShadow {
         match (real, own) {
             (None, None) => note_store_route("lab_pp_usage_none"),
             (Some(_), None) => note_store_route("lab_pp_usage_borrowed"),
-            (None, Some(_)) => note_store_route("lab_pp_usage_missed"),
+            (None, Some(_)) => {
+                note_store_route("lab_pp_usage_missed");
+                // Why the shared entry has nothing: a tombstone (another task's
+                // delete, or this one's), or no reflection yet.
+                note_store_route(match real_state {
+                    Some(PipelineState::Retired) => "lab_pp_usage_missed_shared_retired",
+                    Some(_) => "lab_pp_usage_missed_shared_unpublished",
+                    None => "lab_pp_usage_missed_shared_absent",
+                });
+            }
             (Some(shared), Some(own)) if shared == own => note_store_route("lab_pp_usage_same"),
             (Some(shared), Some(own)) => {
                 note_store_route("lab_pp_usage_diff");
