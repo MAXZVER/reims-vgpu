@@ -2033,6 +2033,10 @@ fn publish_word<H: HostMemory + HostOps>(
     slot: u32,
     value: u32,
 ) {
+    if state.lab_hold_since.is_some() {
+        state.lab_held_words.push((domain, slot, value));
+        return;
+    }
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
         if write_root_stamp(state, host, value) {
             state
@@ -2402,6 +2406,36 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
     }
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_HOLD_PRESENT_STAMP=1` holds the completion words
+/// a DisplaySwap releases until the settle loop has run everything else it
+/// could, and counts what ran meanwhile (`lab_hold_*`): the work a payment that
+/// overlapped the GPU could have hidden behind.
+fn lab_hold_present_stamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_HOLD_PRESENT_STAMP").is_ok_and(|v| v == "1"))
+}
+
+/// Publish the held words in order. `true` when there were any, so the settle
+/// loop runs again for what they released.
+fn lab_flush_held_words<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) -> bool {
+    let Some(since) = state.lab_hold_since.take() else {
+        return false;
+    };
+    let words = std::mem::take(&mut state.lab_held_words);
+    note_store_route("lab_hold_swaps");
+    note_store_route_n("lab_hold_packets", u64::from(state.lab_hold_packets));
+    note_store_route_n("lab_hold_exec_us", state.lab_hold_exec_us);
+    note_store_route_n("lab_hold_ms_x1000", since.elapsed().as_micros() as u64);
+    if state.lab_hold_packets > 0 {
+        note_store_route("lab_hold_swaps_with_work");
+    }
+    let had = !words.is_empty();
+    for (domain, slot, value) in words {
+        publish_word(state, host, domain, slot, value);
+    }
+    had
+}
+
 /// Advance what the model is waiting on, then run everything it has released.
 ///
 /// Called after each admission and at the end of each drain, on both rings. It
@@ -2671,6 +2705,19 @@ fn run_parked_packet<H: HostMemory + HostOps>(
         let started = std::time::Instant::now();
         let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
         census::note_drain_proc(work.packet().opcode, started.elapsed().as_nanos() as u64);
+        if lab_hold_present_stamp() {
+            if state.lab_hold_since.is_some() {
+                state.lab_hold_packets += 1;
+                state.lab_hold_exec_us += started.elapsed().as_micros() as u64;
+            } else if matches!(
+                work.packet().opcode,
+                CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3
+            ) {
+                state.lab_hold_since = Some(std::time::Instant::now());
+                state.lab_hold_packets = 0;
+                state.lab_hold_exec_us = 0;
+            }
+        }
         if was_draining == 0 {
             state.draining_mask &= !bit;
         }
@@ -7105,6 +7152,9 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     // may still be holding positions that became runnable while it was working,
     // and leaving one unrun is a guest waiting on a word that never arrives.
     settle_model_work(state, host);
+    if lab_flush_held_words(state, host) {
+        settle_model_work(state, host);
+    }
 
     state.draining_mask &= !bit;
     state.draining_channel = prev_channel;
@@ -8271,6 +8321,9 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     }
     // Whatever the refill cap left, handed back to the next wakeup.
     state.pending.child_mask |= mask;
+    if lab_flush_held_words(state, host) {
+        settle_model_work(state, host);
+    }
     // The successor of `retry_stamp_held_timelines`, which walked channels in
     // id order and re-offered the ones held on a slot a higher-numbered channel
     // publishes. There is no walk to get out of order any more: a released

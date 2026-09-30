@@ -3582,6 +3582,12 @@ pub struct DeviceState {
     /// the buffers trade roles, so latching them one by one left the ones not yet
     /// caught stale as copy sources.
     pub guest_copies_framebuffers: bool,
+    /// TEMP (lab, REIMS_VGPU_LAB_HOLD_PRESENT_STAMP): completion words held back
+    /// from the DisplaySwap that started the hold to the end of the settle loop.
+    pub lab_held_words: Vec<(u32, u32, u32)>,
+    pub lab_hold_since: Option<std::time::Instant>,
+    pub lab_hold_packets: u32,
+    pub lab_hold_exec_us: u64,
     /// Census only: what this device has stamped, split by whether the value is
     /// still owed by the coalescing rail or already handed to publication.
     ///
@@ -3718,6 +3724,10 @@ impl DeviceState {
             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
             completion_stamp_seq: 0,
             guest_copies_framebuffers: false,
+            lab_held_words: Vec::new(),
+            lab_hold_since: None,
+            lab_hold_packets: 0,
+            lab_hold_exec_us: 0,
             stamp_ledger: Default::default(),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
