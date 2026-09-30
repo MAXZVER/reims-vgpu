@@ -69,6 +69,9 @@ struct Watch {
     /// guest never publishes would be indistinguishable from it on the first
     /// sample.
     closing_sweep: u64,
+    /// Earliest `elapsed_us` at which the next re-read is due. See
+    /// [`Ledger::RECHECK_MAX_INTERVAL_US`].
+    next_due_us: u64,
 }
 
 /// The watch set, with its capacity in the type that carries it.
@@ -97,6 +100,17 @@ struct Ledger {
 impl Ledger {
     const CAPACITY: usize = 1024;
 
+    /// Re-read interval ceiling for a watch that has been waiting a long time.
+    ///
+    /// A watch is re-read after at most `age / RECHECK_AGE_DIVISOR` of its own
+    /// age, capped here, so a fresh miss is still sampled every tranche and a
+    /// fill is timed to within ~6% of its age. Re-reading every watch every
+    /// tranche made the residue the cost: a Tahoe boot holds ~800 slots the
+    /// guest never publishes, and walking each through the task page table on
+    /// all ~290 tranches a second was ~40 ms of drain time per second.
+    const RECHECK_MAX_INTERVAL_US: u64 = 250_000;
+    const RECHECK_AGE_DIVISOR: u64 = 16;
+
     fn new() -> Self {
         Self {
             watches: std::collections::HashMap::new(),
@@ -122,6 +136,7 @@ impl Ledger {
             Watch {
                 recorded_us: now_us,
                 closing_sweep: self.sweep.saturating_add(1),
+                next_due_us: 0,
             },
         );
         true
@@ -136,14 +151,24 @@ impl Ledger {
     /// first re-read is the same instant as the miss, so a slot the guest
     /// publishes a microsecond afterwards is indistinguishable from one it never
     /// publishes.
-    fn begin_sweep(&mut self) -> Vec<(WatchKey, Watch)> {
+    ///
+    /// A watch also waits out its re-read interval, which grows with its age
+    /// (see [`Self::RECHECK_MAX_INTERVAL_US`]); the copy handed back is the
+    /// watch as it stood before this sweep scheduled its next read.
+    fn begin_sweep(&mut self, now_us: u64) -> Vec<(WatchKey, Watch)> {
         self.sweep = self.sweep.saturating_add(1);
         let sweep_now = self.sweep;
-        self.watches
-            .iter()
-            .filter(|(_, w)| w.closing_sweep < sweep_now)
-            .map(|(k, w)| (*k, *w))
-            .collect()
+        let mut due = Vec::new();
+        for (k, w) in self.watches.iter_mut() {
+            if w.closing_sweep >= sweep_now || now_us < w.next_due_us {
+                continue;
+            }
+            due.push((*k, *w));
+            let age = now_us.saturating_sub(w.recorded_us);
+            w.next_due_us =
+                now_us + (age / Self::RECHECK_AGE_DIVISOR).min(Self::RECHECK_MAX_INTERVAL_US);
+        }
+        due
     }
 
     /// The level line, or `None` when nothing is watched. Takes `now` rather
@@ -523,15 +548,15 @@ fn note_ended_detail(task_id: u32, ref_: u32, miss: ListMiss, age_us: u64) {
 /// lookup used. Returns early with the lock untouched when nothing is watched,
 /// which is every tranche on every rail that does not produce the miss.
 pub fn sweep<M: HostMemory>(state: &DeviceState, host: &M) {
+    let now = crate::observe::elapsed_us();
     let due = ledger()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .begin_sweep();
+        .begin_sweep(now);
     if due.is_empty() {
         return;
     }
 
-    let now = crate::observe::elapsed_us();
     let mut retired: Vec<WatchKey> = Vec::new();
     for (key, watch) in due {
         let (task_id, ref_) = key;
@@ -669,14 +694,14 @@ mod tests {
         let mut ledger = Ledger::new();
         // Tranche 1: the miss is recorded, then the tranche's own sweep runs.
         ledger.admit((2, 5), 0);
-        assert!(ledger.begin_sweep().is_empty());
+        assert!(ledger.begin_sweep(0).is_empty());
         // Tranche 2's sweep is the first that may read it, and it hands back the
         // watch as recorded — the age it reports is measured from the miss.
         let recorded = ledger.watches[&(2, 5)];
-        assert_eq!(ledger.begin_sweep(), vec![((2, 5), recorded)]);
+        assert_eq!(ledger.begin_sweep(0), vec![((2, 5), recorded)]);
         // And it stays due until something retires it — a slot the guest never
         // publishes must keep being asked until the task dies.
-        assert_eq!(ledger.begin_sweep().len(), 1);
+        assert_eq!(ledger.begin_sweep(0).len(), 1);
     }
 
     /// A miss recorded by a *later* tranche must not be answered by the sweep
@@ -685,17 +710,41 @@ mod tests {
     fn a_sweep_does_not_pick_up_a_watch_admitted_after_it_began() {
         let mut ledger = Ledger::new();
         ledger.admit((1, 1), 0);
-        assert!(ledger.begin_sweep().is_empty());
+        assert!(ledger.begin_sweep(0).is_empty());
         ledger.admit((1, 2), 0);
         // Only the older watch: `(1, 2)` was admitted during this sweep's own
         // tranche and has not yet had a later one.
         assert_eq!(
             ledger
-                .begin_sweep()
+                .begin_sweep(0)
                 .into_iter()
                 .map(|(k, _)| k)
                 .collect::<Vec<_>>(),
             vec![(1, 1)]
+        );
+    }
+
+    /// A slot the guest never publishes is still asked, but less often the
+    /// longer it has waited: after 1.6 s the next read is 100 ms away, and no
+    /// wait stretches it past the ceiling.
+    #[test]
+    fn a_long_waiting_watch_is_reread_at_an_interval_that_grows_with_its_age() {
+        let mut ledger = Ledger::new();
+        ledger.admit((3, 7), 0);
+        assert!(ledger.begin_sweep(0).is_empty());
+        assert_eq!(ledger.begin_sweep(1_600_000).len(), 1);
+        assert!(ledger.begin_sweep(1_650_000).is_empty());
+        assert_eq!(ledger.begin_sweep(1_700_000).len(), 1);
+        // Very old: capped at the ceiling.
+        assert_eq!(ledger.begin_sweep(60_000_000).len(), 1);
+        assert!(ledger
+            .begin_sweep(60_000_000 + Ledger::RECHECK_MAX_INTERVAL_US - 1)
+            .is_empty());
+        assert_eq!(
+            ledger
+                .begin_sweep(60_000_000 + Ledger::RECHECK_MAX_INTERVAL_US)
+                .len(),
+            1
         );
     }
 }
