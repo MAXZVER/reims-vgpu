@@ -2987,6 +2987,43 @@ fn note_backing_identity(
         crate::runtime::drain::note_store_route("backing_identity_minted");
         return;
     };
+    // TEMP (lab, access precision): what a texture that could not be identified
+    // looks like, once per (task, ref) — the model names these DomainOnly.
+    if matches!(refusal, BackingIdRefusal::Unresolved(_))
+        && matches!(
+            entry.object_type,
+            OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
+        )
+        && crate::runtime::drain::lab_dag_window()
+        && crate::observe::first_sight(
+            "lab_texture_unresolved",
+            (u64::from(task_id) << 32) | u64::from(obj_ref),
+        )
+    {
+        let shape = crate::runtime::decode::resource::decode_texture_descriptor(descriptor)
+            .map(|t| {
+                format!(
+                    "handle={:#x} alloc={} levels={} dims={}x{}x{} fmt={:#x} samples={:?}                      used={} stride={}",
+                    t.handle,
+                    t.allocation_size,
+                    t.mipmap_level_count,
+                    t.width,
+                    t.height,
+                    t.depth,
+                    t.pixel_format,
+                    t.sample_count,
+                    t.used_size,
+                    t.row_stride,
+                )
+            })
+            .unwrap_or_else(|e| format!("undecodable={e:?}"));
+        crate::observe::fail(format!(
+            "lab_texture_unresolved task={task_id} ref={obj_ref} type={} desc_len={} {shape}              heap_placement={}",
+            entry.object_type,
+            entry.descriptor_length,
+            crate::runtime::decode::resource::descriptor_is_heap_placement(descriptor),
+        ));
+    }
     if !matches!(refusal, BackingIdRefusal::HeapPlaced) {
         return;
     }
