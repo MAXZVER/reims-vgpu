@@ -2074,6 +2074,15 @@ pub struct MappingEntry {
     /// Without it every caller repeats a host mapping attempt that cannot
     /// become possible until the guest changes the list.
     pub contig_refused_gen: Option<u32>,
+    /// `(map_generation, control layout key)` for which
+    /// `runtime::mapper::mapping_page_gpas` last proved this page list aliases
+    /// no transport or task-control page. `None` = not proved for any list.
+    ///
+    /// The proof is a pure function of the page list and the control-structure
+    /// layout, and `map_generation` names the list the way it does for
+    /// [`Self::contig_refused_gen`]. Re-deriving it sorted every page of the
+    /// surface once per draw bind: a 5K surface is ~10 800 pages.
+    pub control_clear: Option<(u32, u64)>,
     /// Live [`crate::runtime::host::HostOps::track_guest_writes`] token for the
     /// page list in [`Self::page_entries`], or 0 when the host cannot observe
     /// guest writes (or none has been asked for yet).

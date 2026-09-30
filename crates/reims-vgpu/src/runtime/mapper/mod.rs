@@ -1916,6 +1916,10 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     if gpas.is_empty() || gpas.len() != m.page_entries.len() {
         return None;
     }
+    let clear = (m.map_generation, control_layout_key(state, gpas.len()));
+    if m.control_clear == Some(clear) {
+        return Some(gpas);
+    }
     if let Some((gpa, owner)) = { first_control_page_collision(state, &gpas) } {
         crate::observe::fail(format!(
             "mapping_pages fail reason=control_page_collision mid={mapping_id} gpa={gpa:#x} owner={owner} pages={}",
@@ -1923,7 +1927,48 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
         ));
         return None;
     }
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.control_clear = Some(clear);
+    }
     Some(gpas)
+}
+
+/// Fingerprint of every region [`first_control_page_collision`] compares a
+/// surface against, folded with the surface's page count.
+///
+/// A proof that a page list aliases no control page stays true exactly while
+/// neither side moves; `map_generation` covers the list and this covers the
+/// other side. It reads the same fields the check reads, in the same order, so
+/// a region the check starts comparing must be added here too. A changed key
+/// only re-runs the check; it never skips one.
+fn control_layout_key(state: &DeviceState, pages: usize) -> u64 {
+    fn mix(h: u64, x: u64) -> u64 {
+        // splitmix64 finalizer over the running state.
+        let mut z = (h ^ x).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+    let mut h = mix(pages as u64, state.page_shift as u64);
+    h = mix(h, state.gfx.root_page as u64);
+    h = mix(h, state.gfx.fifo_base_page as u64);
+    h = mix(h, state.gfx.fifo_length as u64);
+    h = mix(h, state.iosfc.ring_base);
+    for (i, ring) in state.child_rings.iter().enumerate() {
+        if ring.page_gpas.is_empty() {
+            continue;
+        }
+        h = mix(h, ((i as u64) << 32) | ring.page_gpas.len() as u64);
+        for &gpa in &ring.page_gpas {
+            h = mix(h, gpa);
+        }
+    }
+    for (id, task) in state.tasks.live() {
+        if task.directory_pfn != 0 {
+            h = mix(h, ((id as u64) << 32) | task.directory_pfn as u64);
+        }
+    }
+    h
 }
 
 /// A render surface must never alias pages that the device knows are live
