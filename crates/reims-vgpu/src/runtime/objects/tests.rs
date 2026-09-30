@@ -4932,4 +4932,3 @@ fn a_name_is_declared_a_window_only_when_the_switch_is_on() {
         "switch on: the first naming declares what the descriptor says"
     );
 }
-
