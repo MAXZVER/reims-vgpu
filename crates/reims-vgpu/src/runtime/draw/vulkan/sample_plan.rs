@@ -586,20 +586,20 @@ pub(crate) fn plan_sampled_source<M: HostMemory + HostOps>(
     })
 }
 
-/// Re-check a plan's reads at the point the serial ladder would resolve the bind,
-/// and take it: note its routes and return the serve.
+/// Re-check a plan's reads at the point the serial ladder would resolve the bind.
 ///
-/// `Err` drops the plan; the caller then runs [`resolve_sampled_source`], which
-/// is exactly what it would have run without one.
-pub(super) fn commit_sampled_plan<M: HostOps>(
+/// `Err` drops the plan for this bind; the caller then runs
+/// [`resolve_sampled_source`], which is exactly what it would have run without
+/// one. Validation reads only, so a plan may be validated again for a later bind.
+pub(super) fn validate_sampled_plan<M: HostOps>(
     state: &DeviceState,
     host: &M,
-    plan: SamplePlan,
+    plan: &SamplePlan,
     task_id: u32,
     texture_ref: u32,
     resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
     may_bind_resident: bool,
-) -> Result<(u32, u32, u32, SampledSourceRequest), SampleInvalid> {
+) -> Result<(), SampleInvalid> {
     if plan.task_id != task_id
         || plan.texture_ref != texture_ref
         || plan.may_bind_resident != may_bind_resident
@@ -643,23 +643,70 @@ pub(super) fn commit_sampled_plan<M: HostOps>(
             return Err(SampleInvalid::HostCache);
         }
     }
-    for route in &plan.routes {
-        crate::runtime::drain::note_store_route(route);
-    }
-    if plan.absent_resident {
-        note_sampled_resident_absence(plan.mid, plan.w, plan.h, &plan.resident_id);
+    Ok(())
+}
+
+/// Take a validated plan: its serve, and (with `note`) the census routes and
+/// the reclaim report the serial ladder would have made for the same bind.
+/// Taking changes no device state, which is why one plan serves every bind of
+/// its ref for as long as it validates.
+pub(super) fn take_sampled_plan(
+    state: &DeviceState,
+    plan: &SamplePlan,
+    note: bool,
+) -> (u32, u32, u32, SampledSourceRequest) {
+    if note {
+        for route in &plan.routes {
+            crate::runtime::drain::note_store_route(route);
+        }
+        if plan.absent_resident {
+            note_sampled_resident_absence(plan.mid, plan.w, plan.h, &plan.resident_id);
+        }
     }
     let (w, h, mid) = (plan.w, plan.h, plan.mid);
-    Ok(match plan.serve {
+    match &plan.serve {
         PlannedServe::Target(identity) => {
             let format = identity.resident_format();
-            (w, h, mid, SampledSourceRequest::Target(identity, format))
+            (
+                w,
+                h,
+                mid,
+                SampledSourceRequest::Target(identity.clone(), format),
+            )
         }
         PlannedServe::HostCache(bgra) => {
             let host_gen = plan.reads.host_gen.unwrap_or(0);
-            (w, h, mid, host_cache_request(state, mid, bgra, host_gen))
+            (
+                w,
+                h,
+                mid,
+                host_cache_request(state, mid, bgra.clone(), host_gen),
+            )
         }
-    })
+    }
+}
+
+/// Validate and take a plan in one step.
+#[cfg(test)]
+pub(super) fn commit_sampled_plan<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    plan: &SamplePlan,
+    task_id: u32,
+    texture_ref: u32,
+    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
+    may_bind_resident: bool,
+) -> Result<(u32, u32, u32, SampledSourceRequest), SampleInvalid> {
+    validate_sampled_plan(
+        state,
+        host,
+        plan,
+        task_id,
+        texture_ref,
+        resource,
+        may_bind_resident,
+    )?;
+    Ok(take_sampled_plan(state, plan, true))
 }
 
 #[cfg(test)]
@@ -768,7 +815,7 @@ mod tests {
             ]
         );
         let (w, h, mid, planned) =
-            commit_sampled_plan(&state, &host, plan, 1, texture_ref, Some(&res), true)
+            commit_sampled_plan(&state, &host, &plan, 1, texture_ref, Some(&res), true)
                 .expect("nothing moved between plan and commit");
         let (sw, sh, smid, serial) =
             resolve_sampled_source(&mut state, &mut host, 1, texture_ref, Some(res), true)
@@ -791,7 +838,7 @@ mod tests {
             [0u8, 255, 0, 255].repeat(4 * 3),
         );
         assert_eq!(
-            commit_sampled_plan(&state, &host, plan, 1, texture_ref, Some(&res), true).err(),
+            commit_sampled_plan(&state, &host, &plan, 1, texture_ref, Some(&res), true).err(),
             Some(SampleInvalid::HostCache)
         );
     }
@@ -803,7 +850,7 @@ mod tests {
         let plan = plan_sampled_source(&state, &host, 1, texture_ref, res.clone(), true).unwrap();
         state.mappings.get_mut(&surface_id).unwrap().map_generation += 1;
         assert_eq!(
-            commit_sampled_plan(&state, &host, plan, 1, texture_ref, Some(&res), true).err(),
+            commit_sampled_plan(&state, &host, &plan, 1, texture_ref, Some(&res), true).err(),
             Some(SampleInvalid::Mapping)
         );
     }
@@ -814,12 +861,12 @@ mod tests {
         let res = resource(&state, &host, texture_ref);
         let plan = plan_sampled_source(&state, &host, 1, texture_ref, res.clone(), true).unwrap();
         assert_eq!(
-            commit_sampled_plan(&state, &host, plan, 1, texture_ref, None, true).err(),
+            commit_sampled_plan(&state, &host, &plan, 1, texture_ref, None, true).err(),
             Some(SampleInvalid::Resource)
         );
         let plan = plan_sampled_source(&state, &host, 1, texture_ref, res.clone(), true).unwrap();
         assert_eq!(
-            commit_sampled_plan(&state, &host, plan, 1, texture_ref, Some(&res), false).err(),
+            commit_sampled_plan(&state, &host, &plan, 1, texture_ref, Some(&res), false).err(),
             Some(SampleInvalid::Key)
         );
     }
@@ -874,7 +921,7 @@ mod tests {
             ]
         );
         let (_, _, _, planned) =
-            commit_sampled_plan(&state, &host, plan, 1, texture_ref, Some(&res), true).unwrap();
+            commit_sampled_plan(&state, &host, &plan, 1, texture_ref, Some(&res), true).unwrap();
         let (_, _, _, serial) =
             resolve_sampled_source(&mut state, &mut host, 1, texture_ref, Some(res), true).unwrap();
         match (planned, serial) {
@@ -914,7 +961,7 @@ mod tests {
             ResidentContentBacking::DeviceAllocation,
         );
         assert_eq!(
-            commit_sampled_plan(&state, &host, plan, 1, texture_ref, Some(&res), true).err(),
+            commit_sampled_plan(&state, &host, &plan, 1, texture_ref, Some(&res), true).err(),
             Some(SampleInvalid::Backing)
         );
     }

@@ -5290,6 +5290,23 @@ fn finish_stream<M: HostMemory + HostOps>(
             .iter()
             .filter(|pd| pd.pipeline_ref != 0 && pd.draw.vertex_count > 0)
             .collect();
+        // TEMP (lab, REIMS_VGPU_LAB_PAR_PREFETCH): plan the stream's sampled
+        // sources on the worker pool before its draws encode; the plans live
+        // until the end of this block.
+        #[cfg(feature = "backend-vulkan")]
+        let _prefetch = (crate::backend::selected().rail() == crate::backend::Rail::Vulkan)
+            .then(|| {
+                crate::runtime::draw::vulkan::prefetch_stream(
+                    &*state,
+                    task_id,
+                    draw_list.iter().flat_map(|pd| {
+                        [
+                            pd.fragment_textures.as_slice(),
+                            pd.vertex_textures.as_slice(),
+                        ]
+                    }),
+                )
+            });
         let mut chain_rgba: Option<Vec<u8>> = None;
         // Occlusion counts, keyed by the guest byte offset each lands at.
         //

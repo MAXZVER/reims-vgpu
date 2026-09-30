@@ -23,8 +23,8 @@ use crate::runtime::surface_currency::{surface_currency, CurrencyStandard, Surfa
 mod sample_plan;
 #[allow(unused_imports)]
 pub(crate) use sample_plan::{plan_sampled_source, SampleBail, SampleInvalid, SamplePlan};
-#[allow(unused_imports)]
-use sample_plan::commit_sampled_plan;
+mod prefetch;
+pub(crate) use prefetch::prefetch_stream;
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
@@ -9597,14 +9597,34 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             crate::runtime::sampled_phase::Part::ResolveSource,
                         );
                         let lab_resolve_t0 = std::time::Instant::now();
-                        let lab_resolved = resolve_sampled_source(
-                            state,
-                            host,
+                        // TEMP (lab, REIMS_VGPU_LAB_PAR_PREFETCH): a stream plan
+                        // validated here serves the bind (on) or is compared with
+                        // the serial ladder (shadow); otherwise the ladder runs.
+                        let prefetched = prefetch::prefetched_source(
+                            &*state,
+                            &*host,
                             req.task_id,
                             texture_ref,
-                            texture_resource.clone(),
+                            texture_resource.as_ref(),
                             view_swizzle.is_none(),
                         );
+                        let lab_resolved = match prefetched {
+                            prefetch::Prefetched::Serve(served) => Some(served),
+                            other => {
+                                let serial = resolve_sampled_source(
+                                    state,
+                                    host,
+                                    req.task_id,
+                                    texture_ref,
+                                    texture_resource.clone(),
+                                    view_swizzle.is_none(),
+                                );
+                                if let prefetch::Prefetched::Shadow(planned) = other {
+                                    prefetch::shadow_compare(texture_ref, &planned, serial.as_ref());
+                                }
+                                serial
+                            }
+                        };
                         lab_resolve_census(lab_resolve_t0.elapsed().as_nanos() as u64, lab_resolved.as_ref());
                         let Some(loaded) = lab_resolved else {
                             let detail = sample_miss_detail(state, host, req.task_id, texture_ref);
