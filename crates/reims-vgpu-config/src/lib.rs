@@ -311,6 +311,22 @@ pub const RESIDENT_OVERLAY: &str = "REIMS_VGPU_RESIDENT_OVERLAY";
 /// source stops being evidence (lab: ~60% of copies matched no candidate).
 pub const FB_COPY_REPLAY: &str = "REIMS_VGPU_FB_COPY_REPLAY";
 
+/// `off` leaves the payment of each presented framebuffer at its DisplaySwap
+/// waiting for the device to see the guest CPU store into a presented framebuffer
+/// under a live resident. Unset, the payment is armed at the first present.
+///
+/// WindowServer fills a back buffer by copying from the front buffer with the
+/// CPU, so the front buffer's pages have to hold its frame by the next swap; the
+/// detection that used to arm it (a guest store landing on a presented surface,
+/// seen by a LOAD or a sample) is a race against the surface's first zero-fill
+/// and fired on only about half of the boots. The other half ran the lazy rail
+/// for framebuffers too and paid for it elsewhere: twice the foreground dirty
+/// syncs (epochs 400 against 300 a second, 330 against 150 ms of drain a
+/// second in them) and 15-35 ms of resolve per frame more, which together cost
+/// more than the ~110 payments a second saved (lab, 5120x2160, RTX 4060: CSS
+/// animation 106 against 114-118 fps; the boot was bimodal before).
+pub const PRESENT_PAYMENT: &str = "REIMS_VGPU_PRESENT_PAYMENT";
+
 /// `off` writes a presented framebuffer back into guest RAM whole at each swap
 /// payment instead of page by page. Unset, the GPU compares the frame against
 /// the copy its pages were last written from and only the changed 4 KiB pages

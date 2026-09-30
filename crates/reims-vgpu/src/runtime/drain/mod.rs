@@ -4891,10 +4891,10 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     if let Some(m) = state.mappings.get_mut(&mapping) {
         m.scanout_presented = true;
     }
-    // TEMP (lab, REIMS_VGPU_LAB_FORCE_LATCH): take the eager presented-frame
-    // payment from the first present on, instead of waiting for a detected guest
-    // CPU write to latch it (which only happens on some boots).
-    crate::runtime::writeback_debt::lab_force_latch(state, mapping);
+    // The presented frame is paid at its swap from the first present on, not
+    // from whenever a guest CPU store into a presented surface is first caught
+    // (a race that half the boots lose): see `config::PRESENT_PAYMENT`.
+    crate::runtime::writeback_debt::arm_present_payment(state, mapping);
     // A presented framebuffer is what WindowServer copies from with the CPU,
     // unannounced, to fill the next back buffer. Its frame has to be in its
     // pages before anything after this swap can reach the guest.

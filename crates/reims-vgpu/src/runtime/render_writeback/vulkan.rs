@@ -320,11 +320,14 @@ fn store_changed_pages<M: HostMemory + HostOps>(
     let frame_bytes = u64::from(width) * u64::from(height) * 4;
     // The generation this landing will stand for, read before it: a guest store
     // racing the landing then counts as written since, and is landed next time.
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_gen_us"); // TEMP (lab)
     let gen_now = if token != 0 {
         host.guest_write_gen(token).filter(|&g| g != 0)
     } else {
         None
     };
+    drop(lab_span);
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_force_us"); // TEMP (lab)
     let force = match (baseline, gen_now) {
         (0, _) | (_, None) => None,
         (b, Some(g)) if g == b => Some(Vec::new()),
@@ -344,9 +347,13 @@ fn store_changed_pages<M: HostMemory + HostOps>(
             Vec::new()
         }
     };
+    drop(lab_span);
     crate::runtime::drain::note_store_route_n("pay_diff_pages_forced", force.len() as u64);
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_vouch_us"); // TEMP (lab)
     let (_, vouched) = crate::runtime::mapper::vouch_mapping_pages_verdict(state, host, mapping_id);
+    drop(lab_span);
     let vouched = vouched?;
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_read_us"); // TEMP (lab)
     let changed = match crate::backend::vulkan::engine::read_target_changed_pages(
         identity, mapping_id, key, &force,
     ) {
@@ -362,6 +369,7 @@ fn store_changed_pages<M: HostMemory + HostOps>(
             return None;
         }
     };
+    drop(lab_span);
     let page = 4096u64;
     let frame_len = changed.frame_bytes as usize;
     // SAFETY: `frame_ptr` is the engine's mapped page-diff host buffer, at least
@@ -383,6 +391,7 @@ fn store_changed_pages<M: HostMemory + HostOps>(
         "pay_diff_pages"
     });
     crate::runtime::drain::note_store_route_n("pay_diff_pages_landed", changed.pages.len() as u64);
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_land_us"); // TEMP (lab)
     if !runs.is_empty()
         && !crate::runtime::mapper::write_mapping_bytes_only(
             state,
@@ -403,6 +412,8 @@ fn store_changed_pages<M: HostMemory + HostOps>(
         ));
         return Some(false);
     }
+    drop(lab_span);
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_tail_us"); // TEMP (lab)
     if let Some(m) = state.mappings.get_mut(&mapping_id) {
         m.pay_diff_gen = gen_now.unwrap_or(0);
     }
@@ -414,6 +425,7 @@ fn store_changed_pages<M: HostMemory + HostOps>(
             (m.map_generation, width, height, m.guest_bytes_seq),
         );
     }
+    drop(lab_span);
     finish(state, mapping_id, identity, frame_len, started, false);
     Some(true)
 }

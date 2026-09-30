@@ -781,36 +781,36 @@ pub fn pay_cpu_shared<M: HostMemory + HostOps>(state: &mut DeviceState, host: &m
     }
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_FORCE_LATCH` — `global` sets only
-/// `guest_copies_framebuffers` at the first present (every presented frame is paid
-/// at its swap, as after a natural latch); `all` also latches every presented
-/// mapping (`guest_cpu_shared`, paid before every completion stamp).
-pub fn lab_force_latch(state: &mut DeviceState, mapping_id: u32) {
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    let mode = *MODE.get_or_init(|| {
-        match std::env::var("REIMS_VGPU_LAB_FORCE_LATCH").as_deref() {
-            Ok("global") => 1,
-            Ok("all") => 2,
-            _ => 0,
-        }
-    });
-    if mode == 0 {
+/// Whether presented framebuffers are paid at their swap from the first present
+/// (see [`crate::config::PRESENT_PAYMENT`]). Latched for the process.
+pub fn present_payment_armed_at_first_present() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let (state, value) = crate::config::read(crate::config::PRESENT_PAYMENT);
+        // Only an explicit `off` narrows to the detected latch, for the reason
+        // [`lazy_writeback_enabled`] gives.
+        let on = !matches!(state, crate::config::Switch::Off);
+        crate::observe::off(format!(
+            "present_payment at_first_present={on} switch={state:?} value={}",
+            value.unwrap_or_else(|| "<unset>".into())
+        ));
+        on
+    })
+}
+
+/// Arm the presented-frame payment (`guest_copies_framebuffers`) at the first
+/// DisplaySwap instead of waiting for the detection in `note_guest_cpu_shared`.
+/// The per-mapping latch (`guest_cpu_shared`) still waits for the detection.
+pub fn arm_present_payment(state: &mut DeviceState, mapping_id: u32) {
+    if state.guest_copies_framebuffers || !present_payment_armed_at_first_present() {
         return;
     }
-    if !state.guest_copies_framebuffers {
-        state.guest_copies_framebuffers = true;
-        crate::observe::off(format!(
-            "lab_force_latch mode={mode} first_mid={mapping_id} (presented frames are paid at their swap from now on)"
-        ));
-    }
-    if mode == 2 {
-        if let Some(m) = state.mappings.get_mut(&mapping_id) {
-            if !m.guest_cpu_shared {
-                m.guest_cpu_shared = true;
-                crate::runtime::drain::note_store_route("lab_force_latch_mapping");
-            }
-        }
-    }
+    state.guest_copies_framebuffers = true;
+    crate::runtime::drain::note_store_route("present_payment_armed_at_first_present");
+    crate::observe::off(format!(
+        "present_payment_armed first_mid={mapping_id} (presented frames are paid at their swap from now on)"
+    ));
 }
 
 /// [`pay_cpu_shared`] for one mapping: the framebuffer a DisplaySwap has just
