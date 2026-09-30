@@ -781,6 +781,38 @@ pub fn pay_cpu_shared<M: HostMemory + HostOps>(state: &mut DeviceState, host: &m
     }
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_FORCE_LATCH` — `global` sets only
+/// `guest_copies_framebuffers` at the first present (every presented frame is paid
+/// at its swap, as after a natural latch); `all` also latches every presented
+/// mapping (`guest_cpu_shared`, paid before every completion stamp).
+pub fn lab_force_latch(state: &mut DeviceState, mapping_id: u32) {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        match std::env::var("REIMS_VGPU_LAB_FORCE_LATCH").as_deref() {
+            Ok("global") => 1,
+            Ok("all") => 2,
+            _ => 0,
+        }
+    });
+    if mode == 0 {
+        return;
+    }
+    if !state.guest_copies_framebuffers {
+        state.guest_copies_framebuffers = true;
+        crate::observe::off(format!(
+            "lab_force_latch mode={mode} first_mid={mapping_id} (presented frames are paid at their swap from now on)"
+        ));
+    }
+    if mode == 2 {
+        if let Some(m) = state.mappings.get_mut(&mapping_id) {
+            if !m.guest_cpu_shared {
+                m.guest_cpu_shared = true;
+                crate::runtime::drain::note_store_route("lab_force_latch_mapping");
+            }
+        }
+    }
+}
+
 /// [`pay_cpu_shared`] for one mapping: the framebuffer a DisplaySwap has just
 /// presented, which is the one WindowServer reads next.
 pub fn pay_cpu_shared_mapping<M: HostMemory + HostOps>(
