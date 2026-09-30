@@ -45,6 +45,9 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             task_id,
             pipeline_ref,
         ) {
+            if crate::runtime::drain::lab_dag_window() {
+                crate::runtime::drain::lab_note_memo_skip(state, task_id, pipeline_ref);
+            }
             continue;
         }
         let air_started = std::time::Instant::now();

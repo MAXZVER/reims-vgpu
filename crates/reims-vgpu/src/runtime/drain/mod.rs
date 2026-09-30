@@ -2440,6 +2440,32 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// TEMP (lab, access precision): the pre-scan found this pipeline's translation
+/// already memoized and skipped it without publishing; say whether the model
+/// holds its usage, and in which state the pipeline is. A pipeline that is
+/// skipped here and was never published stays `Unknown` for every later walk.
+pub(crate) fn lab_note_memo_skip(state: &DeviceState, task_id: u32, pipeline_ref: u32) {
+    let Some(name) = state.object_name(task_id, pipeline_ref) else {
+        note_store_route("lab_memo_skip_unnamed");
+        return;
+    };
+    let published = state.pipeline_usage_published(name);
+    note_store_route(if published {
+        "lab_memo_skip_published"
+    } else {
+        "lab_memo_skip_unpublished"
+    });
+    if !published && crate::observe::first_sight("lab_memo_skip_unpublished", u64::from(name.slot.0))
+    {
+        crate::observe::fail(format!(
+            "lab_memo_skip_unpublished slot={} gen={} model_pipeline={}",
+            name.slot.0,
+            name.generation.0,
+            state.pipeline_state(name).unwrap_or("unleased"),
+        ));
+    }
+}
+
 /// TEMP (lab, access precision): whether the DAG census window is open.
 pub(crate) fn lab_dag_window() -> bool {
     lab_dag_on()
