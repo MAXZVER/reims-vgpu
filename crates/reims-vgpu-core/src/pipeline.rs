@@ -384,6 +384,26 @@ pub trait UsageSource: core::fmt::Debug {
         pipeline: ResourceId,
         stage: Option<ShaderStage>,
     ) -> Option<&BindingUsage>;
+
+    /// Whether a draw or dispatch whose pipeline has a stage nothing is
+    /// published for touches memory the walk cannot enumerate.
+    ///
+    /// `false` is the answer the model has always given: an unanswered stage
+    /// leaves the slots the draw binds `Unknown`, which orders them against
+    /// every access to the same resources. That covers what the *bindings*
+    /// name and nothing behind them. A shader whose stage could not be
+    /// published is exactly the shader that cannot say: one that reads through
+    /// an argument buffer reaches resources no binding names, and
+    /// `Unknown` slots do not order against those. With this `true` such a
+    /// draw also carries an [`crate::access::ParticipationExtent::Unbounded`]
+    /// participation and is ordered against everything in its domain.
+    ///
+    /// A statement by the caller because it is a cost it chooses: every
+    /// unanswered draw is then a full barrier in its domain, which is nothing
+    /// while few draws are unanswered and a great deal while most are.
+    fn unanswered_is_unbounded(&self) -> bool {
+        false
+    }
 }
 
 /// Nothing is published, for a caller with no executor answer to give.

@@ -2012,6 +2012,13 @@ impl Lifecycle {
         participation: &Participation,
         mappings: &dyn MappingResolver,
     ) -> Result<AccessIntent, Refusal> {
+        // An unbounded participation names no memory, so there is no name to
+        // resolve: what it is a participation *of* is the operation, not a
+        // resource, and a name that has since been deleted must not refuse the
+        // packet that binds it.
+        if matches!(participation.extent, ParticipationExtent::Unbounded) {
+            return Ok(participation.resolve_no_bytes(domain));
+        }
         let t = self
             .tasks
             .get_mut(&task)
@@ -2103,13 +2110,18 @@ impl Lifecycle {
                 .window(range.offset, range.length)
                 .map_or(whole, ParticipationExtent::Range),
             ParticipationExtent::Subresource(range) => ParticipationExtent::Subresource(range),
-            ParticipationExtent::Whole => whole,
+            // Answered before the name was looked up; the arm exists so the
+            // match is exhaustive, and it is the whole of the resource because
+            // that is the widest thing this function can name.
+            ParticipationExtent::Whole | ParticipationExtent::Unbounded => whole,
         };
         let bytes = match extent {
             ParticipationExtent::Range(range) => Some(range),
             // The whole of a dedicated resource is the extent it was declared
             // with, which the content authority already knows.
-            ParticipationExtent::Whole => self.content.extent(key.backing),
+            ParticipationExtent::Whole | ParticipationExtent::Unbounded => {
+                self.content.extent(key.backing)
+            }
             ParticipationExtent::Subresource(_) => None,
         };
         let input = bytes.map_or_else(
@@ -6130,6 +6142,32 @@ mod tests {
         // exist.
         assert_eq!(intent.input_content_version, None);
         assert_eq!(intent.output_content_version, None);
+    }
+
+    /// An unbounded participation needs no name: it is a participation of the
+    /// operation, and a name the guest has deleted since, or never declared, does
+    /// not refuse the packet that carries it.
+    #[test]
+    fn an_unbounded_participation_resolves_with_no_name_at_all() {
+        let (mut l, dedicated_name) = with_one_resource(0x1000);
+        let unbounded = |resource| Participation {
+            resource,
+            extent: ParticipationExtent::Unbounded,
+            mode: AccessMode::Unknown,
+            api_stages: 0,
+        };
+        // A live dedicated name: still not keyed by its backing.
+        let live = l
+            .access(TASK, ChannelId(2), &unbounded(dedicated_name))
+            .expect("unbounded");
+        assert_eq!(live.key, crate::access::AccessKey::DomainOnly);
+        assert_eq!(live.mode, AccessMode::Unknown);
+        assert_eq!(live.output_content_version, None, "nothing is reserved");
+        // A name nothing declared, in a task nothing defined.
+        let nowhere = l
+            .access(TaskId(99), ChannelId(2), &unbounded(name(40)))
+            .expect("it names no memory, so it resolves nothing");
+        assert_eq!(nowhere.key, crate::access::AccessKey::DomainOnly);
     }
 
     /// It over-orders rather than under-orders: the key meets every other

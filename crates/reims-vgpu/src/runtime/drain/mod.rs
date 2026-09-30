@@ -2491,6 +2491,7 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
     };
     let census = &work.usage_census;
     for (route, n) in [
+        ("access_unbounded_footprint", census.footprints_unbounded),
         ("draw_usage_no_pipeline", census.draws_without_a_pipeline),
         ("draw_usage_no_stage", census.draws_with_no_stage_published),
         (

@@ -6451,6 +6451,7 @@ impl reims_vgpu_core::access::AccessSource for DeviceAccess<'_> {
                             ParticipationExtent::Range(_) => 'R',
                             ParticipationExtent::Subresource(_) => 'S',
                             ParticipationExtent::Whole => 'W',
+                            ParticipationExtent::Unbounded => 'U',
                         },
                     );
                 }
@@ -7011,9 +7012,12 @@ mod device_access_tests {
     }
 
     /// `REIMS_VGPU_ACCESS_EXACT` implies per-task naming: the reflection it
-    /// answers must be the asking task's.
+    /// answers must be the asking task's. It also says a pipeline nothing is
+    /// published for touches what its slots do not name — the argument-buffer
+    /// gap exact accesses would otherwise open — which the default does not.
     #[test]
-    fn exact_accesses_imply_per_task_naming() {
+    fn exact_accesses_imply_per_task_naming_and_an_unbounded_unanswered_footprint() {
+        use reims_vgpu_core::pipeline::UsageSource as _;
         let state = DeviceState::new(DeviceId(1), 12);
         crate::runtime::objects::with_pipeline_per_task(false, || {
             crate::runtime::objects::with_access_exact(true, || {
@@ -7023,11 +7027,13 @@ mod device_access_tests {
                         reims_vgpu_core::identity::TaskId(4)
                     )
                 );
+                assert!(state.pipeline_usage(4).unanswered_is_unbounded());
             });
             assert_eq!(
                 state.pipeline_scope(4),
                 reims_vgpu_core::pipeline::PipelineScope::Shared
             );
+            assert!(!state.pipeline_usage(4).unanswered_is_unbounded());
         });
     }
 
@@ -7922,5 +7928,15 @@ impl reims_vgpu_core::pipeline::UsageSource for PipelineUsage<'_> {
         };
         self.3.lookup(self.2, pipeline, stage, real, state);
         real
+    }
+
+    /// With `REIMS_VGPU_ACCESS_EXACT` on, a draw through a pipeline nothing is
+    /// published for is ordered against everything in its domain. Exact accesses
+    /// are what make the slots a draw binds the whole of what it touches, and a
+    /// shader that could not be reflected is the one that can reach memory no
+    /// binding names (an argument buffer); off, the slots it binds are all the
+    /// model has ever said about it.
+    fn unanswered_is_unbounded(&self) -> bool {
+        crate::runtime::objects::access_exact()
     }
 }

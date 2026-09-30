@@ -751,7 +751,8 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 ///
 /// # What it changes
 ///
-/// Six things, all of them about what the model *knows*:
+/// Seven things, six about what the model *knows* and one about what it will not
+/// claim to:
 ///
 /// - a texture view, a buffer texture and a surface-backed ref texture stop
 ///   being `DomainOnly` and are ordered against the memory they are a window
@@ -771,6 +772,10 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// - a name the model holds with no bytes is given the storage construction
 ///   finds under it, where it used to stay `DomainOnly` for the life of the name
 ///   (`reims_vgpu_core::lifecycle::Lifecycle::attach_storage`).
+/// - a draw or dispatch through a pipeline nothing is published for is ordered
+///   against everything in its domain, on top of the slots it binds
+///   (`reims_vgpu_core::pipeline::UsageSource::unanswered_is_unbounded`). See
+///   below for what that is for.
 ///
 /// # Why it is not the default
 ///
@@ -790,8 +795,28 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// side that changes nothing.
 ///
 /// Exactness is also only as complete as the model's knowledge of what a packet
-/// touches: memory reached through argument buffers or an indirect command buffer
-/// is not in any access, and `DomainOnly` used to over-order it by accident.
+/// touches, and two things a packet can touch are in no access: memory reached
+/// through an argument buffer, and whatever an indirect command buffer's commands
+/// bind. `DomainOnly` used to over-order both by accident, because so many names
+/// were `DomainOnly`; exact accesses take the accident away. So two rules keep
+/// them ordered on purpose:
+///
+/// - an indirect command buffer's execution is `Unknown` over the whole domain
+///   (`reims_vgpu_core::access::ParticipationExtent::Unbounded`), whatever this
+///   switch says — the commands write their targets, and a packet reading one got
+///   no edge to it. No driven rail sends one;
+/// - with this on, a draw or dispatch whose pipeline has a stage nothing is
+///   published for is ordered against everything in its domain. The stage a rail
+///   refuses to publish is the shader that reads through an argument buffer, so
+///   this is the unanswered shader and not a guess about it. It costs nothing
+///   while few draws are unanswered (well under 1 % of a driven desktop's draws
+///   with this on) and a great deal while most are, which is why it is not the
+///   default.
+///
+/// What is still in no access: a resource the guest makes resident with
+/// `useResource`/`useHeap` and a shader reaches through an address written into an
+/// ordinary buffer. The residency rows are unresolved and a reflection cannot tell
+/// such a buffer from data.
 ///
 /// # Why it is not the widening this module forbids
 ///

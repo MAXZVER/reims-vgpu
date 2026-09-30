@@ -718,6 +718,29 @@ mod tests {
         assert_eq!(s.waiting_on_pipelines(), 0);
     }
 
+    /// Two tasks' pipelines with one object-list id are two waits: one finishing
+    /// releases its own task's transactions and nobody else's.
+    #[test]
+    fn a_pipeline_finishing_releases_only_its_own_tasks_waiters() {
+        use crate::identity::TaskId;
+        let resource = pipe(4).resource();
+        let (one, three) = (
+            PipelineId::of(TaskId(1), resource),
+            PipelineId::of(TaskId(3), resource),
+        );
+        let mut s = Scheduler::new();
+        assert!(!s.admit(ord(1), &[], &[], &[one], None));
+        assert!(!s.admit(ord(2), &[], &[], &[three], None));
+        assert_eq!(s.pipeline_waiters(one), vec![ord(1)]);
+        assert_eq!(s.pipeline_waiters(three), vec![ord(2)]);
+
+        s.pipeline_ready(one);
+        assert_eq!(s.take_ready(), vec![ord(1)], "task 1's build is task 1's");
+        assert_eq!(s.pipeline_waiters(three), vec![ord(2)]);
+        assert_eq!(s.pipeline_refused(three), vec![ord(2)]);
+        assert!(s.pipeline_waiters(three).is_empty());
+    }
+
     /// A pipeline is one prerequisite among three, and discharging it alone
     /// does not make a transaction ready.
     #[test]

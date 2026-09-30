@@ -565,6 +565,17 @@ pub enum ParticipationExtent {
     /// the texture's whole pyramid and whose level count the record does not
     /// carry.
     Whole,
+    /// The operation touches memory this device cannot enumerate: an indirect
+    /// command buffer's commands, the resources behind an argument buffer, a
+    /// shader nobody has reflected. The resource it names is the operation's
+    /// cause, not its footprint, and is not resolved.
+    ///
+    /// Resolves to [`AccessKey::DomainOnly`], which meets every access in its
+    /// domain — with the mode the participation states, so `Unknown` orders
+    /// against readers and writers alike. It is the one honest answer to "what
+    /// does this touch" when the answer is not in any record, and it only ever
+    /// over-orders.
+    Unbounded,
 }
 
 impl Participation {
@@ -581,12 +592,18 @@ impl Participation {
         input_content_version: Option<ContentVersion>,
         output_content_version: Option<ContentVersion>,
     ) -> AccessIntent {
+        // No key to name, and no bytes to carry a version: the answer is the
+        // one a name with no bytes gets.
+        if matches!(self.extent, ParticipationExtent::Unbounded) {
+            return self.resolve_no_bytes(domain);
+        }
         AccessIntent {
             domain,
             key: match self.extent {
                 ParticipationExtent::Range(r) => AccessKey::Range(resource, r),
                 ParticipationExtent::Subresource(s) => AccessKey::Subresource(resource, s),
                 ParticipationExtent::Whole => AccessKey::Whole(resource),
+                ParticipationExtent::Unbounded => AccessKey::DomainOnly,
             },
             mode: self.mode,
             api_stages: self.api_stages,
@@ -884,6 +901,39 @@ mod tests {
             input_content_version: None,
             output_content_version: None,
         }
+    }
+
+    /// An unbounded participation resolves to `DomainOnly` with the mode it
+    /// states, whatever resource it names and whatever key it is handed, and
+    /// carries no versions.
+    #[test]
+    fn an_unbounded_participation_resolves_to_domain_only_with_its_own_mode() {
+        let participation = |mode| Participation {
+            resource: ResourceId {
+                slot: crate::identity::ObjectListRef(3),
+                generation: crate::identity::SlotGeneration::default(),
+            },
+            extent: ParticipationExtent::Unbounded,
+            mode,
+            api_stages: 0x5,
+        };
+        for mode in [AccessMode::Read, AccessMode::Unknown] {
+            let got = participation(mode).resolve(
+                ChannelId(4),
+                key(9),
+                Some(ContentVersion(1)),
+                Some(ContentVersion(2)),
+            );
+            assert_eq!(got.key, AccessKey::DomainOnly);
+            assert_eq!(got.mode, mode);
+            assert_eq!(got.domain, ChannelId(4));
+            assert_eq!((got.input_content_version, got.output_content_version), (None, None));
+            assert_eq!(got.api_stages, 0x5);
+        }
+        // It meets everything in its domain, and an Unknown one meets readers.
+        let unknown = participation(AccessMode::Unknown).resolve(ChannelId(1), key(9), None, None);
+        assert!(requires_edge(&unknown, &intent(AccessKey::Whole(key(77)), AccessMode::Read)));
+        assert!(requires_edge(&intent(AccessKey::Whole(key(77)), AccessMode::Read), &unknown));
     }
 
     #[test]

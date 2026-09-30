@@ -574,6 +574,27 @@ pub struct ExecBuilder<'u> {
     usage_census: UsageCensus,
 }
 
+/// What a draw or dispatch through an unanswered pipeline touches beyond the
+/// slots it binds, when the usage source says that cannot be enumerated: the
+/// whole of its domain. See [`crate::pipeline::UsageSource::unanswered_is_unbounded`].
+fn unbounded_footprint(
+    usages: &dyn crate::pipeline::UsageSource,
+    pipeline: ResourceId,
+    out: &mut Vec<Participation>,
+    census: &mut UsageCensus,
+) {
+    if !usages.unanswered_is_unbounded() {
+        return;
+    }
+    out.push(Participation {
+        resource: pipeline,
+        extent: crate::access::ParticipationExtent::Unbounded,
+        mode: crate::access::AccessMode::Unknown,
+        api_stages: 0,
+    });
+    census.footprints_unbounded = census.footprints_unbounded.saturating_add(1);
+}
+
 /// The binding state of whichever encoder is open.
 ///
 /// **What makes a draw's footprint the draw's, and not just its index
@@ -652,6 +673,11 @@ impl EncoderBindings {
                 let had_a_table = vertex.is_some() || fragment.is_some();
                 state.footprint_into(vertex, fragment, out);
                 census.note_unknowns(&out[before..], had_a_table);
+                if let Some(pipeline) = bound {
+                    if vertex.is_none() || fragment.is_none() {
+                        unbounded_footprint(usages, pipeline, out, census);
+                    }
+                }
             }
             (Self::Compute(state), ResolvedOperation::Compute(ComputeOp::Dispatch(_))) => {
                 let bound = state.pipeline;
@@ -661,6 +687,11 @@ impl EncoderBindings {
                 let had_a_table = kernel.is_some();
                 state.footprint_into(kernel, out);
                 census.note_unknowns(&out[before..], had_a_table);
+                if let Some(pipeline) = bound {
+                    if kernel.is_none() {
+                        unbounded_footprint(usages, pipeline, out, census);
+                    }
+                }
             }
             _ => {}
         }
@@ -1044,6 +1075,10 @@ pub struct UsageCensus {
     pub unknown_participations_from_a_table: u32,
     /// `Unknown` participations emitted because there was no table to ask.
     pub unknown_participations_with_no_table: u32,
+    /// Draws and dispatches that carried an unbounded participation: a pipeline
+    /// with a stage nothing was published for, under a [`crate::pipeline::UsageSource`]
+    /// that says such a footprint cannot be enumerated.
+    pub footprints_unbounded: u32,
     /// The first pipeline a draw or dispatch found unanswered.
     ///
     /// A count says how much was lost and never which pipeline lost it, and the
@@ -1409,6 +1444,117 @@ mod tests {
             .iter()
             .filter(|a| backing(a.key) != Some(BackingId(5)))
             .all(|a| a.mode == AccessMode::Unknown));
+    }
+
+    /// A usage source that answers nothing and says so: what a draw through an
+    /// unanswered pipeline touches beyond its slots cannot be enumerated.
+    #[derive(Debug)]
+    struct Unenumerable<'a>(&'a crate::pipeline::PipelineTable);
+
+    impl crate::pipeline::UsageSource for Unenumerable<'_> {
+        fn binding_usage(
+            &self,
+            pipeline: ResourceId,
+            stage: Option<reims_vgpu_protocol::render::ShaderStage>,
+        ) -> Option<&crate::pipeline::BindingUsage> {
+            crate::pipeline::UsageSource::binding_usage(self.0, pipeline, stage)
+        }
+
+        fn unanswered_is_unbounded(&self) -> bool {
+            true
+        }
+    }
+
+    /// A draw through a pipeline whose stage nothing was published for touches
+    /// what its slots do not name, and says so; one the reflection answered in
+    /// full does not.
+    ///
+    /// The argument-buffer gap. A shader that reads through an argument buffer
+    /// reaches resources no binding names, and its stage is the one a rail
+    /// refuses to publish; `Unknown` on the slots it binds does not order
+    /// against those resources. So under a source that says an unanswered
+    /// footprint is unbounded, the draw carries an `Unbounded` participation —
+    /// `DomainOnly`, `Unknown`, ordered against everything in its domain — and
+    /// under the default answer it carries none.
+    #[test]
+    fn a_draw_through_an_unanswered_pipeline_is_unbounded_only_when_the_source_says_so() {
+        use crate::pipeline::{
+            BindingUsage, PipelineId, PipelineState, PipelineTable, PublishedUsage,
+        };
+        use reims_vgpu_protocol::render::ShaderStage;
+
+        let (answered, one_stage, unanswered) = (res(9), res(10), res(11));
+        let mut table = PipelineTable::new();
+        for p in [answered, one_stage, unanswered] {
+            let id = PipelineId::shared(p);
+            assert!(table.declare(id, crate::identity::SessionGeneration::FIRST));
+            for step in [
+                PipelineState::Translating,
+                PipelineState::Compiling,
+                PipelineState::Ready,
+            ] {
+                assert!(table.advance(id, step));
+            }
+        }
+        let stage = || Some(BindingUsage::new(vec![Some(AccessMode::Read)], Vec::new()));
+        assert!(table.publish_usage(
+            PipelineId::shared(answered),
+            PublishedUsage::render(stage(), stage())
+        ));
+        assert!(table.publish_usage(
+            PipelineId::shared(one_stage),
+            PublishedUsage::render(stage(), None)
+        ));
+
+        let unbounded_in = |usages: &dyn crate::pipeline::UsageSource, pipeline: ResourceId| {
+            let mut b = ExecBuilder::with_usage(usages);
+            b.begin_segment(
+                SegmentKind::Render.wire_type(),
+                SegmentLifetime::SELF_CONTAINED,
+            )
+            .expect("open");
+            let entries = bind_arena(&mut b, &[res(7)]);
+            b.record(
+                ResolvedOperation::Render(RenderOp::BindBuffers {
+                    stage: ShaderStage::Vertex,
+                    first: 0,
+                    entries,
+                }),
+                &mut StubRegistry(ChannelId(1)),
+            )
+            .expect("bind");
+            b.record(
+                ResolvedOperation::Render(RenderOp::SetPipeline { pipeline }),
+                &mut StubRegistry(ChannelId(1)),
+            )
+            .expect("set pipeline");
+            b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+                .expect("draw");
+            let unbounded: Vec<_> = b
+                .accesses
+                .iter()
+                .filter(|a| a.key == AccessKey::DomainOnly)
+                .collect();
+            assert_eq!(
+                b.usage_census.footprints_unbounded as usize,
+                unbounded.len(),
+                "the census counts what the walk declared"
+            );
+            for a in &unbounded {
+                assert_eq!(a.mode, AccessMode::Unknown);
+            }
+            unbounded.len()
+        };
+
+        // The default answer is the one the model has always given.
+        assert_eq!(unbounded_in(&table, unanswered), 0);
+        assert_eq!(unbounded_in(&table, one_stage), 0);
+        // Under the stricter one, an unanswered stage is unbounded — one refused
+        // stage is enough — and a pipeline answered in full is not.
+        let strict = Unenumerable(&table);
+        assert_eq!(unbounded_in(&strict, unanswered), 1);
+        assert_eq!(unbounded_in(&strict, one_stage), 1);
+        assert_eq!(unbounded_in(&strict, answered), 0);
     }
 
     /// A published reflection narrows the draw's footprint, and an unpublished

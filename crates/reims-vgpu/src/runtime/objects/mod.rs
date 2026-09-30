@@ -3333,9 +3333,55 @@ pub fn name_resource<M: HostMemory>(
     if storage.is_none() {
         lab_note_unidentified(task_id, obj_ref, &entry, &descriptor, "name");
     }
+    lab_note_named_without_bytes(task_id, obj_ref, &entry, storage.as_ref());
     let name = declare_object_name(state, task_id, obj_ref, storage).ok()?;
     declare_alias_for(state, host, task_id, name, &entry, &descriptor);
     Some(name)
+}
+
+/// TEMP (lab, stale names): what kind of object a name is when it is first
+/// declared with no bytes, by the list entry's object type. The residual
+/// `DomainOnly` participations are on names the rails never construct; this says
+/// what those are.
+fn lab_note_named_without_bytes(
+    task_id: u32,
+    obj_ref: u32,
+    entry: &ListObjectEntry,
+    storage: Option<&reims_vgpu_core::lifecycle::Storage>,
+) {
+    if matches!(
+        storage,
+        Some(reims_vgpu_core::lifecycle::Storage::Dedicated { .. })
+    ) {
+        return;
+    }
+    let route = match entry.object_type {
+        1 => "lab_nb_type_1",
+        2 => "lab_nb_type_2",
+        3 => "lab_nb_type_3",
+        4 => "lab_nb_type_4",
+        5 => "lab_nb_type_5",
+        6 => "lab_nb_type_6",
+        7 => "lab_nb_type_7",
+        8 => "lab_nb_type_8",
+        9 => "lab_nb_type_9",
+        10 => "lab_nb_type_10",
+        11 => "lab_nb_type_11",
+        12 => "lab_nb_type_12",
+        _ => "lab_nb_type_other",
+    };
+    crate::runtime::drain::note_store_route(route);
+    if crate::observe::first_sight(
+        "lab_named_without_bytes",
+        (u64::from(task_id) << 32) | u64::from(obj_ref),
+    ) {
+        crate::observe::fail(format!(
+            "lab_named_without_bytes task={task_id} ref={obj_ref} type={} desc_len={} storage_answer={}",
+            entry.object_type,
+            entry.descriptor_length,
+            if storage.is_some() { "no_bytes" } else { "undescribable" },
+        ));
+    }
 }
 
 /// TEMP (lab, access precision): a buffer or texture whose storage this device
