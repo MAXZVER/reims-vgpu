@@ -413,6 +413,7 @@ fn store_changed_pages<M: HostMemory + HostOps>(
         return Some(false);
     }
     drop(lab_span);
+    lab_pay_verify(state, host, mapping_id, identity, base_off, changed.frame_bytes);
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_tail_us"); // TEMP (lab)
     if let Some(m) = state.mappings.get_mut(&mapping_id) {
         m.pay_diff_gen = gen_now.unwrap_or(0);
@@ -428,6 +429,51 @@ fn store_changed_pages<M: HostMemory + HostOps>(
     drop(lab_span);
     finish(state, mapping_id, identity, frame_len, started, false);
     Some(true)
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_VERIFY=1` — after a page-diff landing, read the
+/// whole resident back and the mapping's guest pages, and count the 4 KiB pages
+/// that differ (`pay_verify_pages` / `pay_verify_bad_pages`). The guest CPU can
+/// write the mapping between the landing and the read, so the count is compared
+/// between arms, not against zero.
+fn lab_pay_verify<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    base_off: u64,
+    frame_bytes: u64,
+) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PAY_VERIFY").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    let Ok(rb) = crate::backend::vulkan::engine::read_target(identity) else {
+        return;
+    };
+    let Some(bgra) = rb.into_bgra8() else {
+        return;
+    };
+    let len = (frame_bytes as usize).min(bgra.len());
+    let mut guest = vec![0u8; len];
+    if !crate::runtime::mapper::read_guest_owned_bytes(state, host, mapping_id, base_off, &mut guest)
+    {
+        crate::runtime::drain::note_store_route("pay_verify_unreadable");
+        return;
+    }
+    let mut bad = 0u64;
+    let mut pages = 0u64;
+    for (g, r) in guest.chunks(4096).zip(bgra[..len].chunks(4096)) {
+        pages += 1;
+        if g != r {
+            bad += 1;
+        }
+    }
+    crate::runtime::drain::note_store_route_n("pay_verify_pages", pages);
+    crate::runtime::drain::note_store_route_n("pay_verify_bad_pages", bad);
+    if bad > 0 {
+        crate::runtime::drain::note_store_route("pay_verify_bad_frames");
+    }
 }
 
 /// The 4 KiB frame pages (the diff's unit, counted from `base_off`) that a set of
