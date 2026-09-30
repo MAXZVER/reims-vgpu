@@ -4883,3 +4883,53 @@ fn a_descriptor_that_names_nothing_declares_no_alias() {
     );
     assert_eq!(store_route_count("alias_view_undecodable"), undecodable + 1);
 }
+
+/// The switch is what decides whether the model is told anything: off, naming a
+/// ref texture declares no alias and its access is the `DomainOnly` it has
+/// always been; on, the same naming declares the surface.
+#[test]
+fn a_name_is_declared_a_window_only_when_the_switch_is_on() {
+    use crate::runtime::gva_mem::{define_task_pages_arm64e, write_task_gva_arm64e};
+    use reims_vgpu_core::identity::MappingId;
+    use reims_vgpu_core::lifecycle::Aliasing;
+
+    let build = || {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        assert!(state.set_object_list(1, 0, 256));
+        let mut desc = vec![0u8; TYPE5_MIN_LEN];
+        st32(
+            &mut desc[reims_vgpu_wire::device_desc::TYPE5_SURFACE_ID..],
+            9,
+        );
+        write_task_gva_arm64e(&mut host, &state.tasks[1], 0x200, &desc);
+        let off =
+            crate::runtime::decode::resource::list_object_entry_offset(3, 256).expect("in range");
+        let mut le = [0u8; crate::runtime::decode::resource::OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut le[0..],
+            u32::from(OBJECT_TYPE_REF_TEXTURE) | ((desc.len() as u32) << 8),
+        );
+        le[4..12].copy_from_slice(&0x200u64.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+        (host, state)
+    };
+
+    let (host, state) = build();
+    let off = with_access_exact(false, || name_resource(&state, &host, 1, 3)).expect("named");
+    assert_eq!(
+        state.alias_of(1, off),
+        None,
+        "switch off: nothing is declared"
+    );
+
+    let (host, state) = build();
+    let on = with_access_exact(true, || name_resource(&state, &host, 1, 3)).expect("named");
+    assert_eq!(
+        state.alias_of(1, on),
+        Some(Aliasing::Surface(MappingId(9))),
+        "switch on: the first naming declares what the descriptor says"
+    );
+}
+

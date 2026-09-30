@@ -3303,6 +3303,10 @@ pub fn name_resource<M: HostMemory>(
 /// Whether the ordering model is to state byte-less names exactly. See
 /// [`crate::config::ACCESS_EXACT`]; read once.
 pub(crate) fn access_exact() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ACCESS_EXACT.with(std::cell::Cell::get) {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
@@ -3310,6 +3314,23 @@ pub(crate) fn access_exact() -> bool {
             crate::config::Switch::On
         )
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's answer to [`access_exact`], for the thread that asked. The real
+    /// answer is read from the process environment once, so a test cannot state
+    /// both arms of the switch through it.
+    static TEST_ACCESS_EXACT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with [`access_exact`] answering `on` on this thread.
+#[cfg(test)]
+pub(crate) fn with_access_exact<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = TEST_ACCESS_EXACT.with(|c| c.replace(Some(on)));
+    let out = f();
+    TEST_ACCESS_EXACT.with(|c| c.set(before));
+    out
 }
 
 /// How deep a declaration may nest: naming a view names its base, which may be
