@@ -4531,7 +4531,7 @@ impl DeviceState {
             .lock()
             .expect("session")
             .pipelines()
-            .publish_usage(pipeline, usage)
+            .publish_usage_to(pipeline, usage, self.usage_scope())
     }
 
     /// Whether an executor has already published this pipeline's reflection.
@@ -4559,7 +4559,20 @@ impl DeviceState {
             .lock()
             .expect("session")
             .pipelines()
-            .usage_wanted(pipeline)
+            .usage_wanted_by(pipeline, self.usage_scope())
+    }
+
+    /// Which pipelines a reflection is published for on this device.
+    ///
+    /// A deleted pipeline the guest still binds takes one only with
+    /// `REIMS_VGPU_ACCESS_EXACT` on: it changes what the walk is answered, and
+    /// through that which packets the model may release ahead of which.
+    fn usage_scope(&self) -> reims_vgpu_core::pipeline::PublishTo {
+        if crate::runtime::objects::access_exact() {
+            reims_vgpu_core::pipeline::PublishTo::LiveAndDeleted
+        } else {
+            reims_vgpu_core::pipeline::PublishTo::Live
+        }
     }
 
     /// The published reflections, for the length of one packet's walk.

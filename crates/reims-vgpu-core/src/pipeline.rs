@@ -404,6 +404,49 @@ impl UsageSource for NoUsage {
     }
 }
 
+/// Which pipelines an executor may publish a reflection for.
+///
+/// # A deleted pipeline is still bound, and this is what that costs
+///
+/// [`PipelineTable::waits_for`] already says the guest deletes pipelines and
+/// goes on binding them — a command buffer recorded before the delete still
+/// names the object, and the guest is entitled to submit it — so a retired
+/// pipeline is not an absent one. [`PipelineTable::publish_usage`] refuses it
+/// all the same, and [`PipelineTable::retire`] drops what was published: the
+/// table's own reading was that "nothing may bind" a deleted pipeline. A driven
+/// Tahoe desktop binds them thousands of times a second. Every draw through one
+/// reaches the walk with no reflection and orders every slot it binds against
+/// everything, for as long as the pipeline is bound — six in ten of a window
+/// drag's unanswered draws were exactly these.
+///
+/// A reflection is a fact about a *build*, and a retired pipeline's build is
+/// still what executes. So the executor that holds it may publish for it, and
+/// the answer is keyed by the pipeline's name, which carries a generation: a
+/// later occupant of the slot is another name and cannot be answered with this
+/// one's reflection. What it may not do is outlive a change of shader under the
+/// name — [`PipelineTable::withdraw`] drops a retired entry's reflection for
+/// exactly that, the way it does a live one's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishTo {
+    /// Pipelines the guest has not deleted: what the table has always accepted.
+    Live,
+    /// Those, and a pipeline the guest deleted and still binds.
+    ///
+    /// Never a refused pipeline — that build does not exist — and never one the
+    /// table does not hold.
+    LiveAndDeleted,
+}
+
+impl PublishTo {
+    const fn takes(self, state: PipelineState) -> bool {
+        match state {
+            PipelineState::Refused => false,
+            PipelineState::Retired => matches!(self, Self::LiveAndDeleted),
+            _ => true,
+        }
+    }
+}
+
 /// The pipeline objects of one session.
 #[derive(Debug, Default)]
 pub struct PipelineTable {
@@ -610,10 +653,13 @@ impl PipelineTable {
     /// packet that names a retired pipeline and land nothing.
     #[must_use]
     pub fn usage_wanted(&self, id: ResourceId) -> bool {
-        self.pipelines
-            .get(&id)
-            .is_some_and(|p| !p.state.is_terminal())
-            && !self.usage.contains_key(&id)
+        self.usage_wanted_by(id, PublishTo::Live)
+    }
+
+    /// [`Self::usage_wanted`] for a caller publishing to `to`.
+    #[must_use]
+    pub fn usage_wanted_by(&self, id: ResourceId, to: PublishTo) -> bool {
+        self.pipelines.get(&id).is_some_and(|p| to.takes(p.state)) && !self.usage.contains_key(&id)
     }
 
     /// Advance a pipeline. Returns whether the step was legal and taken.
@@ -693,6 +739,15 @@ impl PipelineTable {
         let Some(p) = self.pipelines.get_mut(&id) else {
             return false;
         };
+        if p.state == PipelineState::Retired {
+            // Not a step: a deleted pipeline has nowhere to go back to. But the
+            // executor has just said the translation under this name is not the
+            // one it held, and a reflection published for a deleted pipeline
+            // (see [`PublishTo`]) described that one. The next publication is
+            // the new build's.
+            self.usage.remove(&id);
+            return false;
+        }
         if p.state != PipelineState::Ready {
             return false;
         }
@@ -881,10 +936,21 @@ impl PipelineTable {
     /// after a rebuild is the rebuild's own answer and never the previous
     /// build's.
     pub fn publish_usage(&mut self, id: ResourceId, usage: PublishedUsage) -> bool {
+        self.publish_usage_to(id, usage, PublishTo::Live)
+    }
+
+    /// [`Self::publish_usage`], for a caller that says which pipelines it may
+    /// publish for. See [`PublishTo`].
+    pub fn publish_usage_to(
+        &mut self,
+        id: ResourceId,
+        usage: PublishedUsage,
+        to: PublishTo,
+    ) -> bool {
         let Some(p) = self.pipelines.get(&id) else {
             return false;
         };
-        if p.state.is_terminal() {
+        if !to.takes(p.state) {
             return false;
         }
         self.usage.insert(id, usage);
@@ -1188,6 +1254,87 @@ mod tests {
         assert!(
             !t.usage_published(id(1)),
             "a retired pipeline holds no answer, and a rail that thought it did              would never publish for the name that replaces it"
+        );
+    }
+
+    /// A pipeline the guest deleted and still binds can be given a reflection,
+    /// one the table never held cannot, and a refused build has none to give.
+    ///
+    /// The default scope is what the table has always done; only a caller that
+    /// asks for [`PublishTo::LiveAndDeleted`] reaches a tombstone.
+    #[test]
+    fn a_deleted_pipeline_takes_a_reflection_only_from_a_caller_that_asks() {
+        let usage = || {
+            PublishedUsage::render(
+                Some(BindingUsage::new(vec![Some(AccessMode::Read)], Vec::new())),
+                None,
+            )
+        };
+        let answered = |t: &PipelineTable| {
+            crate::pipeline::UsageSource::binding_usage(t, id(1), Some(ShaderStage::Vertex))
+                .is_some()
+        };
+        let mut t = PipelineTable::new();
+        assert!(t.declare(id(1), GEN));
+        assert!(t.retire(id(1)));
+        assert!(
+            !t.usage_wanted(id(1)),
+            "by default a deleted pipeline is not wanted"
+        );
+        assert!(
+            !t.publish_usage(id(1), usage()),
+            "and is refused, as it always was"
+        );
+        assert!(!answered(&t));
+
+        assert!(t.usage_wanted_by(id(1), PublishTo::LiveAndDeleted));
+        assert!(t.publish_usage_to(id(1), usage(), PublishTo::LiveAndDeleted));
+        assert!(
+            answered(&t),
+            "the walk is answered for the pipeline it still binds"
+        );
+        assert!(
+            !t.usage_wanted_by(id(1), PublishTo::LiveAndDeleted),
+            "and it is no longer wanted"
+        );
+
+        // Never a pipeline that was not held, and never a refused build.
+        assert!(!t.publish_usage_to(id(2), usage(), PublishTo::LiveAndDeleted));
+        assert!(!t.usage_wanted_by(id(2), PublishTo::LiveAndDeleted));
+        assert!(t.declare(id(3), GEN));
+        assert!(t.refuse(id(3), RefusalReason::TranslationFailed("test")));
+        assert!(!t.publish_usage_to(id(3), usage(), PublishTo::LiveAndDeleted));
+        assert!(!t.usage_wanted_by(id(3), PublishTo::LiveAndDeleted));
+    }
+
+    /// The executor saying it no longer holds the translation under a deleted
+    /// pipeline's name drops the reflection that described the old one, without
+    /// pretending the pipeline moved.
+    #[test]
+    fn a_withdrawal_under_a_deleted_name_drops_its_reflection_and_moves_nothing() {
+        let usage = || {
+            PublishedUsage::render(
+                Some(BindingUsage::new(vec![Some(AccessMode::Read)], Vec::new())),
+                None,
+            )
+        };
+        let mut t = PipelineTable::new();
+        assert!(t.declare(id(1), GEN));
+        assert!(t.retire(id(1)));
+        assert!(t.publish_usage_to(id(1), usage(), PublishTo::LiveAndDeleted));
+        assert!(t.usage_published(id(1)));
+        assert!(
+            !t.withdraw(id(1)),
+            "a deleted pipeline has no state to go back to"
+        );
+        assert!(
+            !t.usage_published(id(1)),
+            "but what was published described the translation the executor just let go"
+        );
+        assert_eq!(t.get(id(1)).map(|p| p.state), Some(PipelineState::Retired));
+        assert!(
+            t.usage_wanted_by(id(1), PublishTo::LiveAndDeleted),
+            "the rebuild's is next"
         );
     }
 
