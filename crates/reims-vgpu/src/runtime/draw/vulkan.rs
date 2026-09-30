@@ -9746,6 +9746,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 ),
                             );
                         }
+                    } else if reflected.static_state.is_some() {
+                        // TEMP (lab): a constexpr sampler whose binding a
+                        // guest-bound sampler already took (M1 hypothesis).
+                        crate::runtime::drain::note_store_route("lab_static_sampler_shadowed");
+                        if crate::observe::first_sight(
+                            "lab_static_sampler_shadowed",
+                            (u64::from(req.task_id) << 32) | u64::from(req.pipeline_ref),
+                        ) {
+                            crate::observe::fail(format!(
+                                "lab_static_sampler_shadowed task={} pipe={} stage={stage} binding={} entry={} static={:?} guest={:?}",
+                                req.task_id,
+                                req.pipeline_ref,
+                                reflected.binding,
+                                f_shader.reflection.entry_point.as_deref().unwrap_or("?"),
+                                reflected.static_state,
+                                req.fragment_samplers
+                                    .iter()
+                                    .map(|s| (s.index, s.sampler_ref))
+                                    .collect::<Vec<_>>(),
+                            ));
+                        }
                     }
                 }
             }
