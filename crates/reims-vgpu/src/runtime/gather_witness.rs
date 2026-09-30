@@ -777,7 +777,7 @@ pub(crate) fn fold_read_bytes(span: u64) -> u64 {
 /// binds a minute, because guest pages are reachable under more than one mapping
 /// id. Neither is a rule this device could use, so neither is a count it still
 /// takes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WitnessReadings {
     /// `HostWrites::epoch()` now, to be recorded for the next bind to ask against.
     pages_epoch: u64,
@@ -1111,96 +1111,39 @@ pub struct GatherOutcome {
     pub vouch: GatherVouch,
 }
 
-/// Record one zero-copy sampled gather against the guest-write witness, and
-/// report it to the census.
-///
-/// Called from the producers with the window already resolved, so it adds a
-/// page-set compare and one content fold and changes no behaviour.
-///
-/// # Why this does not return an `Option`
-///
-/// It used to, and the `Option` was `Some` on every path: the identity was read
-/// back with `vouched_identity`, which answered "is this window tracked", and
-/// [`observe`] leaves an entry for every key it is given — the re-point branch
-/// inserts one and returns, the overflow evictor never evicts the key it was
-/// asked about, and the surviving branch holds a `&mut` to one. The engine spent
-/// a boot counting `identity.is_some()` as the witness's verdict and read the
-/// resulting zero as "the witness never refused a gather". It cannot refuse
-/// through this return value at all; [`GatherVouch`] is where the verdict lives.
-#[must_use = "the identity is what lets the engine skip the gather; dropping it \
-              silently keeps the copy"]
-pub fn note_gather<M: crate::runtime::host::HostOps>(
-    state: &mut crate::model::DeviceState,
-    host: &mut M,
-    rail: GatherRail,
-    key: GatherKey,
-    window: GatherWindow<'_>,
-) -> GatherOutcome {
-    use crate::runtime::drain::{note_store_route, note_store_route_n};
-
-    let span = window.span;
-    let (rail_count, rail_kb) = rail.names();
-    note_store_route(rail_count);
-    note_store_route_n(rail_kb, span / 1024);
-
-    // Both writers' accounts, taken before the witness is touched: the
-    // page-exact question needs the epoch recorded at the *previous* bind, which
-    // is inside the witness, and the ring that answers it is read through the
-    // same device state.
-    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_ng_counts_us"); // TEMP (lab)
-    let counts = WitnessReadings {
+/// What one bind of `key`'s window reads from device state before the witness
+/// decides: the host-write epoch and verdict, the guest's stated generation and
+/// the pending guest writes. Reads only, so a plan off the drain thread takes
+/// the same readings the serial path does.
+fn witness_readings(
+    state: &crate::model::DeviceState,
+    key: &GatherKey,
+    gpas: &[u64],
+) -> WitnessReadings {
+    WitnessReadings {
         pages_epoch: state.host_writes.epoch(),
         pages_wrote: state
             .gather_witness
-            .previous_pages_epoch(&key)
-            .map(|since| state.host_writes.wrote_any_since(since, window.gpas)),
+            .previous_pages_epoch(key)
+            .map(|since| state.host_writes.wrote_any_since(since, gpas)),
         // The guest's own statement about this resource, read at the same moment
         // as the inferred half so the two describe one bind of one window. A task
         // GVA span is not what the guest addresses its statements to, so the
         // channel has nothing to say about that shape of key.
-        stated_gen: match key {
+        stated_gen: match *key {
             GatherKey::Mapping { mid, .. } => {
                 state.mappings.get(&mid).map(|m| m.content_generation)
             }
             GatherKey::TaskGva { .. } => None,
         },
-        pending: PendingWrites::over(window.gpas),
-    };
-    drop(lab_span);
-    // Every bind, vouched or not, so the route is a denominator rather than a
-    // tally of refusals — the reading wanted is what fraction of binds this
-    // device has a copy in flight over, and a count with no denominator cannot
-    // say whether a repair moved it.
-    note_store_route(counts.pending.route());
-    // Report the host-write half's grounds, not just its answer. Three of its
-    // four non-quiet values are this device declining to rule a write out rather
-    // than one that landed here, and they want different repairs — name the
-    // writer's pages, widen the ring, or stop writing the window at all. Taken
-    // for every bind that had a previous one to ask about, so the split covers
-    // the vouched binds too and `gw_hw_quiet` is the denominator.
-    if let Some(verdict) = counts.pages_wrote {
-        note_store_route(verdict.route());
+        pending: PendingWrites::over(gpas),
     }
-    // A generation is issued from the device-global counter and never reused, so
-    // it is taken before the witness runs and spent only if the witness refuses
-    // to vouch for the previous one. An unspent generation is not a leak: the
-    // counter's whole contract is that a value is issued once and never again.
-    let fresh = state.next_sampled_content_generation();
-    // The guest's own statement about this resource, read before the witness is
-    // touched for the same reason the host-write epoch is: it has to describe the
-    // moment the inferred half is asked about, not a moment after it.
-    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_ng_observe_us"); // TEMP (lab)
-    let seen = observe(&mut state.gather_witness, host, key, window, counts, fresh);
-    drop(lab_span);
+}
 
-    // Score the guest's stated account against the hypervisor's inferred one,
-    // and both against the content audit. Nothing branches on the stated channel
-    // yet; this cross is what says whether anything may.
-    //
-    // The reading wanted is one cell: `gwst_would_save`, the binds the inferred
-    // half refused and the guest says were quiet. That is the gather work the
-    // stated channel would recover. `gwst_stated_stricter` is the opposite cell
-    // and costs nothing but a gather that would have happened anyway.
+/// The census routes (and the one refusal) an observation implies, noted by the
+/// serial path right after it observes and by a plan's commit when it applies.
+fn note_observation(seen: &GatherObservation, key: GatherKey, span: u64) {
+    use crate::runtime::drain::{note_store_route, note_store_route_n};
     match (seen.stated, seen.verdict) {
         (StatedGuestWrite::Unaddressed, _) => note_store_route("gwst_unaddressed"),
         (StatedGuestWrite::Quiet, GatherVerdict::Vouched) => note_store_route("gwst_agree_quiet"),
@@ -1284,6 +1227,196 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             .fail_once(key.content_key());
         }
     }
+}
+
+/// A gather decision planned off the drain thread: the warm branch of the
+/// witness run on a clone of the window's entry, with the readings it rests on.
+#[derive(Debug)]
+pub(crate) struct PlannedGather {
+    key: GatherKey,
+    rail: GatherRail,
+    span: u64,
+    /// The entry's `last_seen` when planned; every write of the entry moves it.
+    expect_last_seen: u64,
+    readings: WitnessReadings,
+    /// The window's write token and its generation as of the last sync, taken
+    /// right after the decision asked it.
+    token: u64,
+    lagged_gen: Option<u64>,
+    next: Entry,
+    seen: GatherObservation,
+    warm_routes: Vec<&'static str>,
+}
+
+/// Plan the witness decision for one bind of `key`'s window from state this call
+/// only reads. `None` for a window the witness does not track with this exact
+/// page set — re-arming it changes the host's write tracking, which only the
+/// drain thread may do — so the serial path observes it.
+pub(crate) fn plan_gather<M: crate::runtime::host::HostOps>(
+    state: &crate::model::DeviceState,
+    host: &M,
+    rail: GatherRail,
+    key: GatherKey,
+    window: GatherWindow<'_>,
+) -> Option<PlannedGather> {
+    let entry = state.gather_witness.entries.get(&key)?;
+    if entry.gpas != window.gpas || entry.span != window.span {
+        return None;
+    }
+    let readings = witness_readings(state, &key, window.gpas);
+    let fresh = state.next_sampled_content_generation();
+    let mut next = entry.clone();
+    let mut warm_routes = Vec::new();
+    let seen = decide_warm(
+        &mut next,
+        host,
+        key,
+        window.runs,
+        window.span,
+        readings.pages_wrote,
+        readings.pending,
+        readings.stated_gen,
+        readings.pages_epoch,
+        fresh,
+        state.gather_witness.audit,
+        &mut warm_routes,
+    );
+    let token = next.token;
+    let lagged_gen = (token != 0).then(|| host.guest_write_gen_lagged(token)).flatten();
+    Some(PlannedGather {
+        key,
+        rail,
+        span: window.span,
+        expect_last_seen: entry.last_seen,
+        readings,
+        token,
+        lagged_gen,
+        next,
+        seen,
+        warm_routes,
+    })
+}
+
+/// Apply a planned witness decision at the point the serial path would observe,
+/// if everything it rests on still holds: the entry unwritten since (same
+/// `last_seen`), the same readings, and no sync that moved the token's write
+/// generation. `None` drops the plan; the caller then runs [`note_gather`].
+pub(crate) fn commit_gather<M: crate::runtime::host::HostOps>(
+    state: &mut crate::model::DeviceState,
+    host: &M,
+    plan: &PlannedGather,
+    gpas: &[u64],
+) -> Option<GatherOutcome> {
+    let entry = state.gather_witness.entries.get(&plan.key)?;
+    if entry.last_seen != plan.expect_last_seen || entry.gpas != gpas {
+        return None;
+    }
+    if witness_readings(state, &plan.key, gpas) != plan.readings {
+        return None;
+    }
+    if plan.token != 0 && host.guest_write_gen_lagged(plan.token) != plan.lagged_gen {
+        return None;
+    }
+    use crate::runtime::drain::{note_store_route, note_store_route_n};
+    let (rail_count, rail_kb) = plan.rail.names();
+    note_store_route(rail_count);
+    note_store_route_n(rail_kb, plan.span / 1024);
+    note_store_route(plan.readings.pending.route());
+    if let Some(verdict) = plan.readings.pages_wrote {
+        note_store_route(verdict.route());
+    }
+    let witness = &mut state.gather_witness;
+    witness.binds = witness.binds.wrapping_add(1);
+    let mut next = plan.next.clone();
+    next.last_seen = witness.binds;
+    witness.entries.insert(plan.key, next);
+    for route in &plan.warm_routes {
+        note_store_route(route);
+    }
+    note_observation(&plan.seen, plan.key, plan.span);
+    Some(GatherOutcome {
+        identity: GatheredIdentity {
+            key: plan.key.content_key(),
+            generation: plan.seen.generation,
+        },
+        vouch: plan.seen.vouch,
+    })
+}
+
+/// Record one zero-copy sampled gather against the guest-write witness, and
+/// report it to the census.
+///
+/// Called from the producers with the window already resolved, so it adds a
+/// page-set compare and one content fold and changes no behaviour.
+///
+/// # Why this does not return an `Option`
+///
+/// It used to, and the `Option` was `Some` on every path: the identity was read
+/// back with `vouched_identity`, which answered "is this window tracked", and
+/// [`observe`] leaves an entry for every key it is given — the re-point branch
+/// inserts one and returns, the overflow evictor never evicts the key it was
+/// asked about, and the surviving branch holds a `&mut` to one. The engine spent
+/// a boot counting `identity.is_some()` as the witness's verdict and read the
+/// resulting zero as "the witness never refused a gather". It cannot refuse
+/// through this return value at all; [`GatherVouch`] is where the verdict lives.
+#[must_use = "the identity is what lets the engine skip the gather; dropping it \
+              silently keeps the copy"]
+pub fn note_gather<M: crate::runtime::host::HostOps>(
+    state: &mut crate::model::DeviceState,
+    host: &mut M,
+    rail: GatherRail,
+    key: GatherKey,
+    window: GatherWindow<'_>,
+) -> GatherOutcome {
+    use crate::runtime::drain::{note_store_route, note_store_route_n};
+
+    let span = window.span;
+    let (rail_count, rail_kb) = rail.names();
+    note_store_route(rail_count);
+    note_store_route_n(rail_kb, span / 1024);
+
+    // Both writers' accounts, taken before the witness is touched: the
+    // page-exact question needs the epoch recorded at the *previous* bind, which
+    // is inside the witness, and the ring that answers it is read through the
+    // same device state.
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_ng_counts_us"); // TEMP (lab)
+    let counts = witness_readings(state, &key, window.gpas);
+    drop(lab_span);
+    // Every bind, vouched or not, so the route is a denominator rather than a
+    // tally of refusals — the reading wanted is what fraction of binds this
+    // device has a copy in flight over, and a count with no denominator cannot
+    // say whether a repair moved it.
+    note_store_route(counts.pending.route());
+    // Report the host-write half's grounds, not just its answer. Three of its
+    // four non-quiet values are this device declining to rule a write out rather
+    // than one that landed here, and they want different repairs — name the
+    // writer's pages, widen the ring, or stop writing the window at all. Taken
+    // for every bind that had a previous one to ask about, so the split covers
+    // the vouched binds too and `gw_hw_quiet` is the denominator.
+    if let Some(verdict) = counts.pages_wrote {
+        note_store_route(verdict.route());
+    }
+    // A generation is issued from the device-global counter and never reused, so
+    // it is taken before the witness runs and spent only if the witness refuses
+    // to vouch for the previous one. An unspent generation is not a leak: the
+    // counter's whole contract is that a value is issued once and never again.
+    let fresh = state.next_sampled_content_generation();
+    // The guest's own statement about this resource, read before the witness is
+    // touched for the same reason the host-write epoch is: it has to describe the
+    // moment the inferred half is asked about, not a moment after it.
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_ng_observe_us"); // TEMP (lab)
+    let seen = observe(&mut state.gather_witness, host, key, window, counts, fresh);
+    drop(lab_span);
+
+    // Score the guest's stated account against the hypervisor's inferred one,
+    // and both against the content audit. Nothing branches on the stated channel
+    // yet; this cross is what says whether anything may.
+    //
+    // The reading wanted is one cell: `gwst_would_save`, the binds the inferred
+    // half refused and the guest says were quiet. That is the gather work the
+    // stated channel would recover. `gwst_stated_stricter` is the opposite cell
+    // and costs nothing but a gather that would have happened anyway.
+    note_observation(&seen, key, span);
     GatherOutcome {
         identity: GatheredIdentity {
             key: key.content_key(),
@@ -2634,5 +2767,85 @@ mod tests {
             key_at(1),
             "the lower name outranked the older bind ordinal"
         );
+    }
+
+    fn fresh_state() -> crate::model::DeviceState {
+        crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86)
+    }
+
+    const PLAN_KEY: GatherKey = GatherKey::Mapping { mid: 5, base_off: 0 };
+
+    /// A planned witness decision applied at commit leaves the witness where
+    /// the serial observation would have, and answers the same.
+    #[test]
+    fn a_planned_gather_commits_to_the_serial_outcome() {
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let (mut planned, mut serial) = (fresh_state(), fresh_state());
+        let (mut host_p, mut host_s) = (
+            crate::runtime::host::FakeHost::new(),
+            crate::runtime::host::FakeHost::new(),
+        );
+        let rail = GatherRail::MapperRefTexture;
+        // Arm both (the cold branch is serial-only).
+        let _ = note_gather(&mut planned, &mut host_p, rail, PLAN_KEY, one_page(&GPAS, &runs));
+        let _ = note_gather(&mut serial, &mut host_s, rail, PLAN_KEY, one_page(&GPAS, &runs));
+        for _ in 0..3 {
+            let plan = plan_gather(&planned, &host_p, rail, PLAN_KEY, one_page(&GPAS, &runs))
+                .expect("a tracked window with the same pages plans");
+            let a = commit_gather(&mut planned, &host_p, &plan, &GPAS).expect("nothing moved");
+            let b = note_gather(&mut serial, &mut host_s, rail, PLAN_KEY, one_page(&GPAS, &runs));
+            assert_eq!(a, b);
+        }
+        // And the two witnesses keep agreeing on the next serial bind.
+        let a = note_gather(&mut planned, &mut host_p, rail, PLAN_KEY, one_page(&GPAS, &runs));
+        let b = note_gather(&mut serial, &mut host_s, rail, PLAN_KEY, one_page(&GPAS, &runs));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn an_untracked_window_is_not_planned() {
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let state = fresh_state();
+        let host = crate::runtime::host::FakeHost::new();
+        assert!(plan_gather(
+            &state,
+            &host,
+            GatherRail::MapperRefTexture,
+            PLAN_KEY,
+            one_page(&GPAS, &runs)
+        )
+        .is_none());
+    }
+
+    /// Any observation of the window between plan and commit rewrites the entry,
+    /// and the plan it was made against no longer applies.
+    #[test]
+    fn a_bind_observed_between_plan_and_commit_drops_the_plan() {
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let mut state = fresh_state();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let rail = GatherRail::MapperRefTexture;
+        let _ = note_gather(&mut state, &mut host, rail, PLAN_KEY, one_page(&GPAS, &runs));
+        let plan = plan_gather(&state, &host, rail, PLAN_KEY, one_page(&GPAS, &runs)).unwrap();
+        let _ = note_gather(&mut state, &mut host, rail, PLAN_KEY, one_page(&GPAS, &runs));
+        assert!(commit_gather(&mut state, &host, &plan, &GPAS).is_none());
+    }
+
+    /// A guest store the hypervisor saw after the plan moves the write
+    /// generation, and the plan's vouch is not taken.
+    #[test]
+    fn a_guest_store_after_the_plan_drops_it() {
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let mut state = fresh_state();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let rail = GatherRail::MapperRefTexture;
+        let _ = note_gather(&mut state, &mut host, rail, PLAN_KEY, one_page(&GPAS, &runs));
+        let plan = plan_gather(&state, &host, rail, PLAN_KEY, one_page(&GPAS, &runs)).unwrap();
+        host.guest_wrote_page(GPAS[0]);
+        assert!(commit_gather(&mut state, &host, &plan, &GPAS).is_none());
     }
 }
