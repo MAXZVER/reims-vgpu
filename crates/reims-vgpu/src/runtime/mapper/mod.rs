@@ -1777,6 +1777,41 @@ pub enum GuestWriteVerdict {
     Unreadable,
 }
 
+thread_local! {
+    /// TEMP (lab, verify): the mapping whose last verdict the lagged generation
+    /// would have answered `Clean` while the synced one said written, for the
+    /// caller that can say whether the write touched the pixels it serves.
+    static LAB_V_VERDICT_MISS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// TEMP (lab, verify): remember (and, within budget, describe) a verdict miss.
+fn lab_v_note_verdict_miss(mapping_id: u32, m: &crate::model::MappingEntry) {
+    LAB_V_VERDICT_MISS.with(|c| c.set(Some(mapping_id)));
+    if m.guest_cpu_shared {
+        crate::runtime::drain::note_store_route("lab_v_gwv_miss_cpu_shared");
+    }
+    if m.scanout_presented {
+        crate::runtime::drain::note_store_route("lab_v_gwv_miss_presented");
+    }
+    if crate::runtime::gather_witness::lab_v_detail_budget() {
+        crate::observe::fail(format!(
+            "lab_v_gwv_miss mid={mapping_id} pages={} cpu_shared={} presented={} dims={}x{} format={}",
+            m.page_entries.len(),
+            m.guest_cpu_shared,
+            m.scanout_presented,
+            m.width,
+            m.height,
+            m.format
+        ));
+    }
+}
+
+/// TEMP (lab, verify): take the mapping noted by the verdict just computed, if
+/// it was a miss.
+pub(crate) fn lab_v_take_verdict_miss(mapping_id: u32) -> bool {
+    LAB_V_VERDICT_MISS.with(|c| c.take()) == Some(mapping_id)
+}
+
 /// The verdict itself, with no counters attached.
 ///
 /// Split from the mapper-ref-texture LOAD gate's `mapper_ref_texture_guest_wrote_since_store` so
@@ -1788,6 +1823,7 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     host: &M,
     mapping_id: u32,
 ) -> GuestWriteVerdict {
+    LAB_V_VERDICT_MISS.with(|c| c.set(None)); // TEMP (lab, verify)
     let Some(m) = state.mappings.get(&mapping_id) else {
         return GuestWriteVerdict::NoMapping;
     };
@@ -1837,11 +1873,24 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     // since the observation the stamp came from, so take the hypervisor's
     // generation as of its last sync rather than waiting for this epoch's; a
     // write the guest did not state is then seen one read late.
-    let gen_ = if crate::runtime::gather_witness::lab_stated_vouch()
-        && m.guest_stated_gen == m.guest_stated_at_stamp
-    {
+    let lab_unstated = m.guest_stated_gen == m.guest_stated_at_stamp;
+    let gen_ = if crate::runtime::gather_witness::lab_stated_vouch() && lab_unstated {
         crate::runtime::drain::note_store_route("lab_gwv_lagged");
         host.guest_write_gen_lagged(m.guest_write_token)
+    } else if crate::runtime::gather_witness::lab_stated_verify() && lab_unstated {
+        // TEMP (lab, verify): the verdict follows the synced generation, as with
+        // the switch off; the lagged one is read first and compared with it.
+        let lag = host.guest_write_gen_lagged(m.guest_write_token);
+        let synced = host.guest_write_gen(m.guest_write_token);
+        crate::runtime::drain::note_store_route("lab_v_gwv_cand");
+        let at_store = Some(m.guest_write_gen_at_store);
+        if lag == at_store && synced != at_store {
+            crate::runtime::drain::note_store_route("lab_v_gwv_miss");
+            lab_v_note_verdict_miss(mapping_id, m);
+        } else if lag != at_store {
+            crate::runtime::drain::note_store_route("lab_v_gwv_seen");
+        }
+        synced
     } else {
         host.guest_write_gen(m.guest_write_token)
     };

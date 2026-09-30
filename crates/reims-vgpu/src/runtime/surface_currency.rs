@@ -213,10 +213,23 @@ pub fn surface_currency<M: HostOps>(
     height: u32,
 ) -> SurfaceCurrency {
     let verdict = mapper::mapping_guest_write_verdict(state, host, mapping_id);
+    let lab_miss = mapper::lab_v_take_verdict_miss(mapping_id); // TEMP (lab, verify)
     if !matches!(verdict, GuestWriteVerdict::Wrote) {
         return SurfaceCurrency::Unwritten(verdict);
     }
-    narrow_to_window(state, host, mapping_id, width, height)
+    let currency = narrow_to_window(state, host, mapping_id, width, height);
+    if lab_miss {
+        // TEMP (lab, verify): the lagged generation would have served this window's
+        // host-side copy. Whether that was a stale serve depends on where the
+        // unstated write landed.
+        crate::runtime::drain::note_store_route(match currency {
+            SurfaceCurrency::WrotePixels(_) => "lab_v_cur_miss_pixels",
+            SurfaceCurrency::WroteUnknown => "lab_v_cur_miss_unknown",
+            SurfaceCurrency::WroteElsewhere => "lab_v_cur_miss_elsewhere",
+            SurfaceCurrency::Unwritten(_) => "lab_v_cur_miss_unwritten",
+        });
+    }
+    currency
 }
 
 /// The second stage: where the writes landed relative to the pixel window.
