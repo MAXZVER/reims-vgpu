@@ -2300,6 +2300,12 @@ fn admit_and_park<H: HostMemory + HostOps>(
     };
     let mut transaction = admission.admitted.transaction;
     let ingress = transaction.identity.ingress;
+    lab_dag_admit(
+        &transaction,
+        &admission.admitted.hazard_waits,
+        admission.admitted.ready,
+        packet.opcode,
+    );
     // The resolved records move out of the transaction the model just handed
     // back. `admit` keeps a transaction's accesses in its dependency graph and
     // returns everything else, and nothing downstream of this line reads the
@@ -2414,6 +2420,98 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
             ));
         }
     }
+}
+
+/// TEMP (lab, S0): `REIMS_VGPU_LAB_DAG=PATH` — while PATH exists, one `lab_dag` line
+/// per admitted packet (ingress, channel, opcode, readiness, the hazard edges the
+/// model found, the accesses it declared) and one `lab_dag_run` line per executed
+/// child packet (µs), with the frame counter the present packets advance. Input
+/// to `scratchpad/dagwidth.py`; nothing here changes what runs.
+fn lab_dag_on() -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static OPEN: AtomicBool = AtomicBool::new(false);
+    let Some(path) = PATH.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DAG").ok()) else {
+        return false;
+    };
+    let now = crate::observe::elapsed_us() / 1000 + 1;
+    let last = LAST.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 200 {
+        return OPEN.load(Ordering::Relaxed);
+    }
+    LAST.store(now, Ordering::Relaxed);
+    let open = std::path::Path::new(path).exists();
+    OPEN.store(open, Ordering::Relaxed);
+    open
+}
+
+static LAB_DAG_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn lab_dag_admit(
+    transaction: &reims_vgpu_core::transaction::DeviceTransaction,
+    hazards: &[reims_vgpu_core::identity::IngressOrdinal],
+    ready: bool,
+    opcode: u16,
+) {
+    use reims_vgpu_core::access::{AccessKey, AccessMode};
+    if !lab_dag_on() {
+        return;
+    }
+    let mut acc = String::new();
+    let (mut unknown, mut rung3) = (0u32, 0u32);
+    for a in transaction.accesses() {
+        let mode = match a.mode {
+            AccessMode::Read => 'r',
+            AccessMode::Write => 'w',
+            AccessMode::ReadWrite => 'x',
+            AccessMode::Unknown => {
+                unknown += 1;
+                'u'
+            }
+        };
+        let key = match a.key {
+            AccessKey::Range(k, r) => format!("R{}:{}+{}", k.backing.0, r.offset, r.length),
+            AccessKey::Subresource(k, s) => format!("S{}:{}.{}", k.backing.0, s.base_level, s.plane),
+            AccessKey::Whole(k) => format!("W{}", k.backing.0),
+            AccessKey::Heap(h) => format!("H{h:?}"),
+            AccessKey::DomainOnly => {
+                rung3 += 1;
+                "D".to_string()
+            }
+        };
+        if !acc.is_empty() {
+            acc.push(';');
+        }
+        acc.push(mode);
+        acc.push_str(&key);
+    }
+    let hz: Vec<String> = hazards.iter().map(|h| h.0.to_string()).collect();
+    crate::observe::fail(format!(
+        "lab_dag g={} in={} ch={} op={:#x} rd={} hz={} unk={unknown} r3={rung3} acc={acc}",
+        LAB_DAG_FRAME.load(std::sync::atomic::Ordering::Relaxed),
+        transaction.identity.ingress.0,
+        transaction.identity.domain.0,
+        opcode,
+        u8::from(ready),
+        hz.join(","),
+    ));
+}
+
+fn lab_dag_run(ingress: u64, domain: u32, opcode: u16, us: u64) {
+    if matches!(
+        opcode,
+        CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3
+    ) {
+        LAB_DAG_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::runtime::lab_repeat::frame();
+    }
+    if !lab_dag_on() {
+        return;
+    }
+    crate::observe::fail(format!(
+        "lab_dag_run in={ingress} ch={domain} op={opcode:#x} us={us}"
+    ));
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_HOLD_PRESENT_STAMP=1` holds the completion words
@@ -2715,6 +2813,7 @@ fn run_parked_packet<H: HostMemory + HostOps>(
         let started = std::time::Instant::now();
         let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
         census::note_drain_proc(work.packet().opcode, started.elapsed().as_nanos() as u64);
+        lab_dag_run(ingress.0, domain, work.packet().opcode, started.elapsed().as_micros() as u64);
         if lab_hold_present_stamp() {
             if state.lab_hold_since.is_some() {
                 state.lab_hold_packets += 1;

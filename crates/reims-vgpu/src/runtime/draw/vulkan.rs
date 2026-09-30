@@ -1374,6 +1374,82 @@ fn lab_cover_tex(
     ));
 }
 
+/// TEMP (lab, S0): feed one draw to [`crate::runtime::lab_repeat`]. Buffers up to
+/// 4 KiB are hashed whole; larger ones by their first and last 2 KiB and length,
+/// and the draw is counted `partial`. A `GuestRuns` buffer over 64 KiB is keyed by
+/// length alone (copying it out to hash would cost more than the draw).
+fn lab_repeat_draw(
+    req: &DrawEncodeRequest,
+    vtx: &[(u32, crate::backend::vulkan::engine::BufferContent)],
+    frag: &[(u32, crate::backend::vulkan::engine::BufferContent)],
+    vertex_entry: Option<&str>,
+    fragment_entry: Option<&str>,
+) {
+    use crate::backend::vulkan::engine::BufferContent;
+    use std::hash::{Hash, Hasher};
+    if !crate::runtime::lab_repeat::on() {
+        return;
+    }
+    let mut partial = false;
+    let mut bytes = std::collections::hash_map::DefaultHasher::new();
+    for (i, c) in vtx.iter().chain(frag.iter()) {
+        i.hash(&mut bytes);
+        match c {
+            BufferContent::Bytes(_) => {
+                let b = c.cpu_bytes();
+                b.len().hash(&mut bytes);
+                if b.len() <= 4096 {
+                    b.hash(&mut bytes);
+                } else {
+                    partial = true;
+                    b[..2048].hash(&mut bytes);
+                    b[b.len() - 2048..].hash(&mut bytes);
+                }
+            }
+            other => {
+                let len = other.len();
+                len.hash(&mut bytes);
+                if len <= 4096 {
+                    other.cpu_bytes().hash(&mut bytes);
+                } else {
+                    partial = true;
+                    if len <= 65536 {
+                        let b = other.cpu_bytes();
+                        b[..2048].hash(&mut bytes);
+                        b[b.len() - 2048..].hash(&mut bytes);
+                    }
+                }
+            }
+        }
+    }
+    let mut st = std::collections::hash_map::DefaultHasher::new();
+    req.task_id.hash(&mut st);
+    req.pipeline_ref.hash(&mut st);
+    vertex_entry.hash(&mut st);
+    fragment_entry.hash(&mut st);
+    (req.vertex_count, req.instance_count, req.primitive_type, req.first_vertex).hash(&mut st);
+    for c in &req.colors {
+        (c.slot, c.texture_ref, c.mapping_id, c.target_gva, c.width, c.height, c.format, c.load_action, c.store_action).hash(&mut st);
+    }
+    for t in req.vertex_textures.iter().chain(req.fragment_textures.iter()) {
+        (t.index, t.texture_ref).hash(&mut st);
+        t.resource.as_ref().map(|r| std::sync::Arc::as_ptr(r) as usize).hash(&mut st);
+    }
+    for s in req.vertex_samplers.iter().chain(req.fragment_samplers.iter()) {
+        (s.index, s.sampler_ref).hash(&mut st);
+    }
+    for v in &req.viewports {
+        for x in v {
+            x.to_bits().hash(&mut st);
+        }
+    }
+    for s in &req.scissors {
+        (s.x, s.y, s.width, s.height).hash(&mut st);
+    }
+    req.indexed.as_ref().map(|i| (i.index_type, i.index_count, i.index_buffer_ref, i.base_vertex)).hash(&mut st);
+    crate::runtime::lab_repeat::draw(st.finish(), bytes.finish(), partial, !req.continues_render_pass);
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_UBO=pipe[,pipe]` logs the fragment buffers
 /// (reflected access, length, first 64 words) and fragment textures of draws
 /// with those pipelines, once per distinct (textures, bytes) digest and at most
@@ -9034,6 +9110,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         drop(fragment_span);
         lab_spv_all(req, f_shader.reflection.entry_point.as_deref(), &f_shader.spirv);
         lab_cover_draw(req, f_shader.reflection.entry_point.as_deref());
+        lab_repeat_draw(req, &vtx_storage, &frag_storage, v_shader.reflection.entry_point.as_deref(), f_shader.reflection.entry_point.as_deref());
         lab_ubo_draw(req, &frag_storage, f_shader.reflection.entry_point.as_deref(), &f_shader.spirv, |i| {
             format!(
                 "{:?}",
