@@ -443,7 +443,7 @@ fn apply_delete_object<H: HostMemory + HostOps>(
             } else if let Some(name) =
                 crate::runtime::objects::name_resource(state, host, task_id, object_ref)
             {
-                let ended = state.retire_pipeline(name);
+                let ended = state.retire_pipeline(task_id, name);
                 note_store_route_n("pipeline_retire_released", ended.stranded.len() as u64);
                 // Whether the table had an entry to retire, which is not the
                 // same question as whether the guest sent a delete. A driven
@@ -2239,9 +2239,13 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // step is the guest's fact and the walk's own list; taking it earlier
     // states the same thing at the first moment it is known.
     let claiming_task = arrived.submission.as_ref().map(|s| s.task_id());
+    // An exec packet always has a submission (`device_packet` refuses one
+    // without), so a packet with leases has a task; the `0` is for the packets
+    // with none, which have no leases to name.
+    let lease_task = claiming_task.unwrap_or(0);
     for &lease in leases {
         lab_note_pipeline_claim(lease, claiming_task);
-        note_store_route(if state.declare_pipeline(lease) {
+        note_store_route(if state.declare_pipeline(lease_task, lease) {
             "pipeline_declared"
         } else {
             "pipeline_declared_already"
@@ -2262,9 +2266,9 @@ fn admit_and_park<H: HostMemory + HostOps>(
     };
     for &lease in leases {
         if translating.contains(&lease.slot.0) {
-            withdraw_lease(state, lease);
+            withdraw_lease(state, lease_task, lease);
         } else if translating.is_empty() {
-            ready_lease(state, lease, "pipeline_lease_ready_admission");
+            ready_lease(state, lease_task, lease, "pipeline_lease_ready_admission");
         }
     }
 
@@ -2319,7 +2323,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
                                 id.slot.0,
                                 id.generation.0,
                                 claiming_task,
-                                state.pipeline_state(id).unwrap_or("unleased"),
+                                state.pipeline_state(claiming_task.unwrap_or(0), id).unwrap_or("unleased"),
                                 state.pipeline_usage_published(claiming_task.unwrap_or(0), id),
                                 state.pipeline_usage_wanted(claiming_task.unwrap_or(0), id),
                             ));
@@ -2427,7 +2431,7 @@ fn lab_capture_walk_state(state: &DeviceState, built: &reims_vgpu_core::session:
         .exec()
         .and_then(|work| work.usage_census.first_unanswered_pipeline)
     {
-        let st = state.pipeline_state(id).unwrap_or("unleased");
+        let st = work_pipeline_state(state, built, id);
         LAB_NP.with(|n| *n.borrow_mut() = Some(st));
     }
 }
@@ -2514,10 +2518,26 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
                  the draw binds ordered against every other access to the same resource)",
                 id.slot.0,
                 id.generation.0,
-                state.pipeline_state(id).unwrap_or("unleased"),
+                work_pipeline_state(state, built, id),
             ));
         }
     }
+}
+
+/// The model's state for a pipeline a packet's walk named, under the scope the
+/// packet states. `"unleased"` for one the table does not hold.
+fn work_pipeline_state(
+    state: &DeviceState,
+    built: &reims_vgpu_core::session::Packet,
+    id: reims_vgpu_core::identity::ResourceId,
+) -> &'static str {
+    let scope = built
+        .payload
+        .exec()
+        .map_or_else(Default::default, |work| work.pipelines);
+    state
+        .pipeline_state_of(scope.id(id))
+        .unwrap_or("unleased")
 }
 
 thread_local! {
@@ -2552,7 +2572,7 @@ pub(crate) fn lab_note_memo_skip(state: &DeviceState, task_id: u32, pipeline_ref
             "lab_memo_skip_unpublished slot={} gen={} model_pipeline={}",
             name.slot.0,
             name.generation.0,
-            state.pipeline_state(name).unwrap_or("unleased"),
+            state.pipeline_state(task_id, name).unwrap_or("unleased"),
         ));
     }
 }
@@ -2692,7 +2712,9 @@ fn lab_dag_admit(
                 id.slot.0,
                 id.generation.0,
                 at_walk.unwrap_or("?"),
-                state.pipeline_state(id).unwrap_or("unleased"),
+                state
+                    .pipeline_state(task.unwrap_or(0), id)
+                    .unwrap_or("unleased"),
                 u8::from(task.is_some_and(|task| state.pipeline_usage_published(task, id))),
                 c.draws_with_no_stage_published + c.dispatches_with_no_stage_published,
             ))
@@ -2909,6 +2931,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             continue;
         };
         let leases = resolved.pipeline_leases.as_slice();
+        let task = submission.task_id();
         // A position whose every lease is already `Ready` has had the rail's
         // promise made for it, and this pass cannot make it again: `ready_lease`
         // would find every step illegal and `preflight_submission` would re-walk
@@ -2920,7 +2943,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
         // `parked_translations_finished = 282 172` against 137 pipelines
         // declared and readied, which is the same handful of plans re-walked
         // thousands of times.
-        if leases.iter().all(|&lease| state.pipeline_is_ready(lease)) {
+        if leases.iter().all(|&lease| state.pipeline_is_ready(task, lease)) {
             note_store_route("parked_translations_already_ready");
             continue;
         }
@@ -2940,7 +2963,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             // building is also where the second stops being usable.
             for &lease in leases {
                 if pending.contains(&lease.slot.0) {
-                    withdraw_lease(state, lease);
+                    withdraw_lease(state, task, lease);
                 }
             }
             continue;
@@ -2948,7 +2971,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
         let leases = leases.to_vec();
         note_store_route("parked_translations_finished");
         for lease in leases {
-            ready_lease(state, lease, "pipeline_lease_ready_pump");
+            ready_lease(state, task, lease, "pipeline_lease_ready_pump");
             // A lease the table would not ready names a pipeline that ended —
             // the guest deleted it (or this device retired its name) while the
             // packet was parked. Nothing will ever ready it, so without this
@@ -2958,7 +2981,8 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             // behind it: WindowServer stopped presenting and the display froze
             // on the boot logo. The packet runs instead; a draw whose pipeline
             // is really gone refuses on its own, and the packet completes.
-            if !state.pipeline_is_ready(lease) && state.release_past_ended_pipeline(ingress, lease)
+            if !state.pipeline_is_ready(task, lease)
+                && state.release_past_ended_pipeline(ingress, task, lease)
             {
                 note_store_route("parked_released_past_ended_pipeline");
                 if crate::observe::first_sight(
@@ -2971,7 +2995,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
                          rather than park forever)",
                         lease.slot.0,
                         lease.generation.0,
-                        state.pipeline_state(lease).unwrap_or("absent")
+                        state.pipeline_state(task, lease).unwrap_or("absent")
                     ));
                 }
             }
@@ -3099,8 +3123,12 @@ fn run_parked_packet<H: HostMemory + HostOps>(
 /// is worth a line is the *withdrawal* — a lease that was `Ready` and is not
 /// any more — and `PipelineTable::advance` is what distinguishes them, so the
 /// counter is read off the table's own census rather than guessed here.
-fn withdraw_lease(state: &DeviceState, lease: reims_vgpu_core::identity::ResourceId) {
-    if state.withdraw_pipeline(lease) {
+fn withdraw_lease(
+    state: &DeviceState,
+    task: u32,
+    lease: reims_vgpu_core::identity::ResourceId,
+) {
+    if state.withdraw_pipeline(task, lease) {
         note_store_route("pipeline_lease_withdrawn");
         if crate::observe::first_sight("pipeline_lease_withdrawn", u64::from(lease.slot.0)) {
             crate::observe::fail(format!(
@@ -3122,13 +3150,14 @@ fn withdraw_lease(state: &DeviceState, lease: reims_vgpu_core::identity::Resourc
 /// what a lease wait needs to know.
 fn ready_lease(
     state: &DeviceState,
+    task: u32,
     lease: reims_vgpu_core::identity::ResourceId,
     site: &'static str,
 ) {
     use reims_vgpu_core::pipeline::PipelineState;
-    state.advance_pipeline(lease, PipelineState::Translating);
-    state.advance_pipeline(lease, PipelineState::Compiling);
-    if state.ready_pipeline(lease) {
+    state.advance_pipeline(task, lease, PipelineState::Translating);
+    state.advance_pipeline(task, lease, PipelineState::Compiling);
+    if state.ready_pipeline(task, lease) {
         note_store_route("pipeline_ready");
         // Which of the three answers put this lease at `Ready`, once per slot
         // per site.

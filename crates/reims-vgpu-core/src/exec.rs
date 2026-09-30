@@ -303,6 +303,16 @@ pub struct ExecWork {
     /// supplied.
     pub accesses: Vec<AccessIntent>,
     pub pipeline_leases: Vec<ResourceId>,
+    /// How [`Self::pipeline_leases`] are named in the pipeline table.
+    ///
+    /// The leases are bare resource ids — ids in *one task's* object list — and
+    /// the walk that collected them does not name the task. The device that built
+    /// the transaction does, here, once: [`crate::pipeline::PipelineScope::Task`]
+    /// makes them that task's pipelines, and the default
+    /// [`crate::pipeline::PipelineScope::Shared`] is the naming the table has
+    /// always used, under which two tasks' pipelines with one id are one. See
+    /// [`crate::pipeline::PipelineId`] for what that costs.
+    pub pipelines: crate::pipeline::PipelineScope,
     pub prerequisites: Vec<Prerequisite>,
     pub arenas: ExecArenas,
     /// Why this transaction's bound slots stayed `Unknown`. See
@@ -983,6 +993,7 @@ impl<'u> ExecBuilder<'u> {
             streams: core::mem::take(&mut self.streams),
             accesses: core::mem::take(&mut self.accesses),
             pipeline_leases: core::mem::take(&mut self.pipeline_leases),
+            pipelines: crate::pipeline::PipelineScope::default(),
             prerequisites: core::mem::take(&mut self.prerequisites),
             arenas: core::mem::take(&mut self.arenas),
             usage_census: self.usage_census,
@@ -1425,14 +1436,26 @@ mod tests {
 
         let pipeline = res(9);
         let mut table = PipelineTable::new();
-        assert!(table.declare(pipeline, crate::identity::SessionGeneration::FIRST));
-        assert!(table.advance(pipeline, PipelineState::Translating));
-        assert!(table.advance(pipeline, PipelineState::Compiling));
-        assert!(table.advance(pipeline, PipelineState::Ready));
+        assert!(table.declare(
+            crate::pipeline::PipelineId::shared(pipeline),
+            crate::identity::SessionGeneration::FIRST
+        ));
+        assert!(table.advance(
+            crate::pipeline::PipelineId::shared(pipeline),
+            PipelineState::Translating
+        ));
+        assert!(table.advance(
+            crate::pipeline::PipelineId::shared(pipeline),
+            PipelineState::Compiling
+        ));
+        assert!(table.advance(
+            crate::pipeline::PipelineId::shared(pipeline),
+            PipelineState::Ready
+        ));
         // Vertex reflected, fragment not. Both are real positions for an
         // executor and the two answers differ.
         assert!(table.publish_usage(
-            pipeline,
+            crate::pipeline::PipelineId::shared(pipeline),
             PublishedUsage::render(
                 Some(BindingUsage::new(
                     vec![Some(AccessMode::Read), Some(AccessMode::Write), None],
@@ -1526,16 +1549,19 @@ mod tests {
 
         let pipeline = res(9);
         let mut table = PipelineTable::new();
-        assert!(table.declare(pipeline, crate::identity::SessionGeneration::FIRST));
+        assert!(table.declare(
+            crate::pipeline::PipelineId::shared(pipeline),
+            crate::identity::SessionGeneration::FIRST
+        ));
         for step in [
             PipelineState::Translating,
             PipelineState::Compiling,
             PipelineState::Ready,
         ] {
-            assert!(table.advance(pipeline, step));
+            assert!(table.advance(crate::pipeline::PipelineId::shared(pipeline), step));
         }
         assert!(table.publish_usage(
-            pipeline,
+            crate::pipeline::PipelineId::shared(pipeline),
             PublishedUsage::render(
                 Some(BindingUsage::new(
                     vec![Some(AccessMode::Read), Some(AccessMode::Write)],
@@ -1608,11 +1634,23 @@ mod tests {
         };
         let ready = || {
             let mut t = PipelineTable::new();
-            assert!(t.declare(id, crate::identity::SessionGeneration::FIRST));
-            assert!(t.advance(id, PipelineState::Translating));
-            assert!(t.advance(id, PipelineState::Compiling));
-            assert!(t.advance(id, PipelineState::Ready));
-            assert!(t.publish_usage(id, usage()));
+            assert!(t.declare(
+                crate::pipeline::PipelineId::shared(id),
+                crate::identity::SessionGeneration::FIRST
+            ));
+            assert!(t.advance(
+                crate::pipeline::PipelineId::shared(id),
+                PipelineState::Translating
+            ));
+            assert!(t.advance(
+                crate::pipeline::PipelineId::shared(id),
+                PipelineState::Compiling
+            ));
+            assert!(t.advance(
+                crate::pipeline::PipelineId::shared(id),
+                PipelineState::Ready
+            ));
+            assert!(t.publish_usage(crate::pipeline::PipelineId::shared(id), usage()));
             t
         };
         let published = |t: &PipelineTable| {
@@ -1621,14 +1659,14 @@ mod tests {
 
         let mut t = ready();
         assert!(published(&t), "the fixture publishes");
-        assert!(t.withdraw(id));
+        assert!(t.withdraw(crate::pipeline::PipelineId::shared(id)));
         assert!(
             !published(&t),
             "the executor said it no longer holds the translation this described"
         );
 
         let mut t = ready();
-        assert!(t.retire(id));
+        assert!(t.retire(crate::pipeline::PipelineId::shared(id)));
         assert!(!published(&t), "the guest deleted the name");
 
         let mut t = ready();
@@ -1637,15 +1675,17 @@ mod tests {
 
         let mut t = ready();
         let closed = t.generation_closed(crate::identity::SessionGeneration::FIRST);
-        assert!(closed.removed.contains(&id));
+        assert!(closed
+            .removed
+            .contains(&crate::pipeline::PipelineId::shared(id)));
         assert!(!published(&t), "the generation that named it closed");
 
         // And a reflection landing after the name is gone does not resurrect
         // it.
         let mut t = ready();
-        assert!(t.retire(id));
+        assert!(t.retire(crate::pipeline::PipelineId::shared(id)));
         assert!(
-            !t.publish_usage(id, usage()),
+            !t.publish_usage(crate::pipeline::PipelineId::shared(id), usage()),
             "a compile finishing after the delete describes a build nothing may bind"
         );
         assert!(!published(&t));

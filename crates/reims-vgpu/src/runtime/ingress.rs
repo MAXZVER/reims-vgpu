@@ -684,7 +684,7 @@ pub fn device_packet<M: crate::runtime::host::HostMemory>(
     // the `lifecycle` owner's and not this one's.
     let usages = state.pipeline_usage(task.0);
     let no_streams: [Vec<u8>; 0] = [];
-    packet(
+    let mut built = packet(
         fifo,
         session,
         completion_slot,
@@ -699,7 +699,16 @@ pub fn device_packet<M: crate::runtime::host::HostMemory>(
             },
             repointed,
         },
-    )
+    )?;
+    // The records' pipeline references are ids in this task's object list; say
+    // so, once, so that the model's admission names the pipelines the walk above
+    // was answered for under the same scope (`PipelineUsage` asks under
+    // `DeviceState::pipeline_scope` too). The packet cannot state it itself — it
+    // is the submission's header that names the task.
+    if let Payload::Exec(work) = &mut built.payload {
+        work.pipelines = state.pipeline_scope(task.0);
+    }
+    Ok(built)
 }
 
 /// What a present asks to show, and the one access that orders it.

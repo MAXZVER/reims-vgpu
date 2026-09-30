@@ -3424,6 +3424,41 @@ pub(crate) fn with_access_exact<R>(on: bool, f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// Whether the ordering model names a pipeline by its task and its id in that
+/// task's list, rather than by the id alone. See
+/// [`crate::config::PIPELINE_PER_TASK`]; read once.
+///
+/// On with [`crate::config::ACCESS_EXACT`] too: a reflection that is answered to
+/// the task whose shader it describes is the half of exact accesses this is.
+pub(crate) fn pipeline_per_task() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PIPELINE_PER_TASK.with(std::cell::Cell::get) {
+        return on || access_exact();
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::PIPELINE_PER_TASK).0,
+            crate::config::Switch::On
+        )
+    }) || access_exact()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's answer to [`pipeline_per_task`], for the thread that asked.
+    static TEST_PIPELINE_PER_TASK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with [`pipeline_per_task`] answering `on` on this thread.
+#[cfg(test)]
+pub(crate) fn with_pipeline_per_task<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = TEST_PIPELINE_PER_TASK.with(|c| c.replace(Some(on)));
+    let out = f();
+    TEST_PIPELINE_PER_TASK.with(|c| c.set(before));
+    out
+}
+
 /// How deep a declaration may nest: naming a view names its base, which may be
 /// a view, which names its base. The guest writes the list, so the chain is
 /// the guest's length and this is the stack's.

@@ -222,7 +222,7 @@ impl RefusalReason {
 /// One pipeline object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pipeline {
-    pub id: ResourceId,
+    pub id: PipelineId,
     /// The semantic lifetime it was declared in. A pipeline outliving its
     /// generation is not usable by work from a later one, however healthy the
     /// host object is.
@@ -286,11 +286,11 @@ impl AbsentBecause {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeaseRefusal {
     Refused {
-        pipeline: ResourceId,
+        pipeline: PipelineId,
         reason: RefusalReason,
     },
     Absent {
-        pipeline: ResourceId,
+        pipeline: PipelineId,
         because: AbsentBecause,
     },
 }
@@ -447,10 +447,99 @@ impl PublishTo {
     }
 }
 
+/// A pipeline as the ordering plane names it.
+///
+/// # A [`ResourceId`] is not enough, and this is the type that says so
+///
+/// A resource id is an object-list slot and the generation of that slot, and
+/// the object list is **per task**: every task numbers its own list from the
+/// same small integers, so pipeline 30 of task 1 and pipeline 30 of task 3 have
+/// the same `ResourceId` and are two different objects with two different
+/// shaders, two different builds and two different lifetimes. A table keyed by
+/// the resource id alone holds one entry for both. One task's deletion then
+/// retires the other's pipeline, one task's refused build refuses the other's
+/// packets, one task's translation going stale withdraws the other's lease, and
+/// a reflection published for the first is answered to the second. A driven
+/// Tahoe desktop shares a hundred and fifty ids between its tasks.
+///
+/// So the ordering plane names a pipeline by the task that owns it and its id in
+/// that task's list, and nothing in this crate can ask the table about a bare
+/// resource id. [`Self::shared`] is the one way to name a pipeline without a
+/// task, and it is the old behaviour on purpose — every task that reuses a
+/// resource id is the same pipeline — kept reachable so the device can run both
+/// ways on one binary until the per-task naming has been measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PipelineId {
+    task: Option<TaskId>,
+    resource: ResourceId,
+}
+
+impl PipelineId {
+    /// The pipeline `resource` names in `task`'s object list.
+    #[must_use]
+    pub const fn of(task: TaskId, resource: ResourceId) -> Self {
+        Self {
+            task: Some(task),
+            resource,
+        }
+    }
+
+    /// The pipeline `resource` names in *whichever* task's list — every task
+    /// that uses the id shares it. See the type's documentation for what that
+    /// costs.
+    #[must_use]
+    pub const fn shared(resource: ResourceId) -> Self {
+        Self {
+            task: None,
+            resource,
+        }
+    }
+
+    /// The object-list id, in the owning task's list.
+    #[must_use]
+    pub const fn resource(self) -> ResourceId {
+        self.resource
+    }
+
+    /// The owning task, or `None` for a [`Self::shared`] pipeline.
+    #[must_use]
+    pub const fn task(self) -> Option<TaskId> {
+        self.task
+    }
+}
+
+/// How a transaction's pipeline references are named in the pipeline table.
+///
+/// A packet's records carry bare resource ids, because they are the ids of one
+/// task's list; the transaction is what knows which task that is. It says so
+/// once, here, and every door that turns a reference into a [`PipelineId`] goes
+/// through [`Self::id`], so a reference cannot be named under the wrong scope by
+/// one caller and the right one by another.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PipelineScope {
+    /// Every task's pipelines with one id are one pipeline. What the device has
+    /// always done, and the default.
+    #[default]
+    Shared,
+    /// The references are this task's.
+    Task(TaskId),
+}
+
+impl PipelineScope {
+    /// The pipeline a reference names under this scope.
+    #[must_use]
+    pub const fn id(self, resource: ResourceId) -> PipelineId {
+        match self {
+            Self::Shared => PipelineId::shared(resource),
+            Self::Task(task) => PipelineId::of(task, resource),
+        }
+    }
+}
+
 /// The pipeline objects of one session.
 #[derive(Debug, Default)]
 pub struct PipelineTable {
-    pipelines: HashMap<ResourceId, Pipeline>,
+    pipelines: HashMap<PipelineId, Pipeline>,
     /// What an executor has published about each pipeline's shaders.
     ///
     /// Beside [`Self::pipelines`] rather than a field of [`Pipeline`], which is
@@ -460,29 +549,10 @@ pub struct PipelineTable {
     /// build and a pipeline that has to be built again has not published
     /// anything about the build that will replace it.
     ///
-    /// Keyed by the pipeline **and the task whose shader it describes**, because
-    /// the pipeline's own key is not enough: an id is an object-list slot and
-    /// that slot's generation, and every task numbers its own list from the same
-    /// small integers, so two tasks' pipelines at slot 30, generation 1, are one
-    /// id. A driven Tahoe desktop has a hundred and fifty such ids shared between
-    /// its tasks. Keyed by the id alone, the first task to publish answered for
-    /// all of them — the narrower footprint derived from *another task's shader*
-    /// that the rule above exists to prevent. `None` is a caller that names no
-    /// task, which is how every caller that predates this spoke, and all of them
-    /// share the one key.
-    usage: HashMap<(Option<TaskId>, ResourceId), PublishedUsage>,
+    /// Keyed by [`PipelineId`], so what one task published is answered to that
+    /// task only.
+    usage: HashMap<PipelineId, PublishedUsage>,
     census: Census,
-}
-
-/// Forget every reflection published for `id`, whichever task published it.
-///
-/// What every event that ends or rebuilds a pipeline has to do: those events
-/// are about the pipeline's id and not about one task's claim on it.
-fn drop_usage_of(
-    usage: &mut HashMap<(Option<TaskId>, ResourceId), PublishedUsage>,
-    id: &ResourceId,
-) {
-    usage.retain(|(_, published), _| published != id);
 }
 
 impl UsageSource for PipelineTable {
@@ -491,23 +561,19 @@ impl UsageSource for PipelineTable {
         pipeline: ResourceId,
         stage: Option<ShaderStage>,
     ) -> Option<&BindingUsage> {
-        self.binding_usage_of(None, pipeline, stage)
+        self.binding_usage_of(PipelineId::shared(pipeline), stage)
     }
 }
 
 impl PipelineTable {
-    /// One stage of the reflection published for `owner`'s use of `pipeline`.
-    ///
-    /// `owner` is the task whose shader the reflection describes, or `None` for
-    /// the caller that names none. See [`Self::usage`]'s field documentation.
+    /// One stage of the reflection published for `pipeline`.
     #[must_use]
     pub fn binding_usage_of(
         &self,
-        owner: Option<TaskId>,
-        pipeline: ResourceId,
+        pipeline: PipelineId,
         stage: Option<ShaderStage>,
     ) -> Option<&BindingUsage> {
-        self.usage.get(&(owner, pipeline))?.stage(stage)
+        self.usage.get(&pipeline)?.stage(stage)
     }
 }
 
@@ -577,11 +643,11 @@ pub struct Closed {
     /// Removed pipelines a host object exists for, in id order. Destroyed
     /// rather than abandoned: a closed generation leaves the handles usable
     /// and merely unnameable.
-    pub destroy: Vec<ResourceId>,
+    pub destroy: Vec<PipelineId>,
     /// Every removed pipeline, in id order — including the ones no host object
     /// was ever built for. These are the names nothing may reach again, which
     /// is what a parked transaction was waiting on.
-    pub removed: Vec<ResourceId>,
+    pub removed: Vec<PipelineId>,
 }
 
 impl PipelineTable {
@@ -639,7 +705,7 @@ impl PipelineTable {
     /// namespace produces a new generation for a reused slot, so two live
     /// declarations of one [`ResourceId`] would mean the namespace failed to do
     /// that, and silently replacing the first would hide it.
-    pub fn declare(&mut self, id: ResourceId, generation: SessionGeneration) -> bool {
+    pub fn declare(&mut self, id: PipelineId, generation: SessionGeneration) -> bool {
         if self.pipelines.contains_key(&id) {
             return false;
         }
@@ -657,7 +723,7 @@ impl PipelineTable {
     }
 
     #[must_use]
-    pub fn get(&self, id: ResourceId) -> Option<&Pipeline> {
+    pub fn get(&self, id: PipelineId) -> Option<&Pipeline> {
         self.pipelines.get(&id)
     }
 
@@ -676,14 +742,8 @@ impl PipelineTable {
     /// pipeline is declared is refused by [`Self::publish_usage`], and the next
     /// pass is what lands it.
     #[must_use]
-    pub fn usage_published(&self, id: ResourceId) -> bool {
-        self.usage_published_by(None, id)
-    }
-
-    /// [`Self::usage_published`] for `owner`'s reflection of the pipeline.
-    #[must_use]
-    pub fn usage_published_by(&self, owner: Option<TaskId>, id: ResourceId) -> bool {
-        self.usage.contains_key(&(owner, id))
+    pub fn usage_published(&self, id: PipelineId) -> bool {
+        self.usage.contains_key(&id)
     }
 
     /// Whether publishing this pipeline's usage now would land: the table
@@ -696,21 +756,14 @@ impl PipelineTable {
     /// retried on that answer alone would pay for the build of a table on every
     /// packet that names a retired pipeline and land nothing.
     #[must_use]
-    pub fn usage_wanted(&self, id: ResourceId) -> bool {
+    pub fn usage_wanted(&self, id: PipelineId) -> bool {
         self.usage_wanted_by(id, PublishTo::Live)
     }
 
     /// [`Self::usage_wanted`] for a caller publishing to `to`.
     #[must_use]
-    pub fn usage_wanted_by(&self, id: ResourceId, to: PublishTo) -> bool {
-        self.usage_wanted_for(None, id, to)
-    }
-
-    /// [`Self::usage_wanted_by`] for a reflection `owner` would publish.
-    #[must_use]
-    pub fn usage_wanted_for(&self, owner: Option<TaskId>, id: ResourceId, to: PublishTo) -> bool {
-        self.pipelines.get(&id).is_some_and(|p| to.takes(p.state))
-            && !self.usage.contains_key(&(owner, id))
+    pub fn usage_wanted_by(&self, id: PipelineId, to: PublishTo) -> bool {
+        self.pipelines.get(&id).is_some_and(|p| to.takes(p.state)) && !self.usage.contains_key(&id)
     }
 
     /// Advance a pipeline. Returns whether the step was legal and taken.
@@ -731,7 +784,7 @@ impl PipelineTable {
     /// read zero refusals meanwhile.
     ///
     /// So the door that can supply a reason is the only door: [`Self::refuse`].
-    pub fn advance(&mut self, id: ResourceId, next: PipelineState) -> bool {
+    pub fn advance(&mut self, id: PipelineId, next: PipelineState) -> bool {
         if next == PipelineState::Refused {
             return false;
         }
@@ -766,7 +819,7 @@ impl PipelineTable {
                 // behind it would be answered for a later pipeline that
                 // reused the id, which is a narrower footprint derived from
                 // another object's shader.
-                drop_usage_of(&mut self.usage, &id);
+                self.usage.remove(&id);
             }
             _ => {}
         }
@@ -786,7 +839,7 @@ impl PipelineTable {
     /// waiting, terminal, or absent — all of which are ordinary: the caller
     /// asks for every ref its pre-scan found pending, and almost all of those
     /// are a cold pipeline that has simply not finished yet.
-    pub fn withdraw(&mut self, id: ResourceId) -> bool {
+    pub fn withdraw(&mut self, id: PipelineId) -> bool {
         let Some(p) = self.pipelines.get_mut(&id) else {
             return false;
         };
@@ -796,7 +849,7 @@ impl PipelineTable {
             // one it held, and a reflection published for a deleted pipeline
             // (see [`PublishTo`]) described that one. The next publication is
             // the new build's.
-            drop_usage_of(&mut self.usage, &id);
+            self.usage.remove(&id);
             return false;
         }
         if p.state != PipelineState::Ready {
@@ -805,13 +858,13 @@ impl PipelineTable {
         p.state = PipelineState::Translating;
         // The build this described is the one the executor just said it no
         // longer holds. What the rebuild publishes is the rebuild's.
-        drop_usage_of(&mut self.usage, &id);
+        self.usage.remove(&id);
         self.census.withdrawn += 1;
         true
     }
 
     /// Refuse a pipeline, with the reason.
-    pub fn refuse(&mut self, id: ResourceId, reason: RefusalReason) -> bool {
+    pub fn refuse(&mut self, id: PipelineId, reason: RefusalReason) -> bool {
         let Some(p) = self.pipelines.get_mut(&id) else {
             return false;
         };
@@ -823,7 +876,7 @@ impl PipelineTable {
         self.census.refused += 1;
         // A build that will not happen publishes nothing, and anything already
         // published described a build this refusal supersedes.
-        drop_usage_of(&mut self.usage, &id);
+        self.usage.remove(&id);
         true
     }
 
@@ -833,7 +886,7 @@ impl PipelineTable {
     /// because the question is whether *this* work may use it: a pipeline
     /// declared in a closed generation is absent to work from a later one even
     /// though the object is intact.
-    pub fn lease(&mut self, id: ResourceId, generation: SessionGeneration) -> Lease {
+    pub fn lease(&mut self, id: PipelineId, generation: SessionGeneration) -> Lease {
         let lease = self.peek(id, generation);
         self.charge(lease);
         lease
@@ -847,7 +900,7 @@ impl PipelineTable {
     /// returning `Ok` — otherwise a list whose third pipeline is refused
     /// charges two leases for a transaction that never ran, and the number that
     /// says whether compilation starts early enough grows with refusals.
-    fn peek(&self, id: ResourceId, generation: SessionGeneration) -> Lease {
+    fn peek(&self, id: PipelineId, generation: SessionGeneration) -> Lease {
         let Some(p) = self.pipelines.get(&id) else {
             return Lease::Absent(AbsentBecause::Undeclared);
         };
@@ -908,9 +961,9 @@ impl PipelineTable {
     /// `an_unusable_pipeline_stops_the_walk_and_nothing_is_counted` asserts.
     pub fn waits_for(
         &mut self,
-        leases: &[ResourceId],
+        leases: &[PipelineId],
         generation: SessionGeneration,
-    ) -> Result<Vec<ResourceId>, LeaseRefusal> {
+    ) -> Result<Vec<PipelineId>, LeaseRefusal> {
         let mut taken = Vec::new();
         let mut waits = Vec::new();
         for &pipeline in leases {
@@ -986,7 +1039,7 @@ impl PipelineTable {
     /// [`Self::device_lost`] has already had its usage dropped, so what lands
     /// after a rebuild is the rebuild's own answer and never the previous
     /// build's.
-    pub fn publish_usage(&mut self, id: ResourceId, usage: PublishedUsage) -> bool {
+    pub fn publish_usage(&mut self, id: PipelineId, usage: PublishedUsage) -> bool {
         self.publish_usage_to(id, usage, PublishTo::Live)
     }
 
@@ -994,19 +1047,7 @@ impl PipelineTable {
     /// publish for. See [`PublishTo`].
     pub fn publish_usage_to(
         &mut self,
-        id: ResourceId,
-        usage: PublishedUsage,
-        to: PublishTo,
-    ) -> bool {
-        self.publish_usage_as(None, id, usage, to)
-    }
-
-    /// [`Self::publish_usage_to`] for the reflection of `owner`'s pipeline: what
-    /// lands is answered to that task's walks and to no other's.
-    pub fn publish_usage_as(
-        &mut self,
-        owner: Option<TaskId>,
-        id: ResourceId,
+        id: PipelineId,
         usage: PublishedUsage,
         to: PublishTo,
     ) -> bool {
@@ -1016,12 +1057,12 @@ impl PipelineTable {
         if !to.takes(p.state) {
             return false;
         }
-        self.usage.insert((owner, id), usage);
+        self.usage.insert(id, usage);
         true
     }
 
     /// Retire a pipeline the guest deleted.
-    pub fn retire(&mut self, id: ResourceId) -> bool {
+    pub fn retire(&mut self, id: PipelineId) -> bool {
         self.advance(id, PipelineState::Retired)
     }
 
@@ -1077,7 +1118,7 @@ impl PipelineTable {
             false
         });
         for id in &out.removed {
-            drop_usage_of(&mut self.usage, id);
+            self.usage.remove(id);
         }
         out.destroy.sort_unstable();
         out.removed.sort_unstable();
@@ -1110,7 +1151,7 @@ impl PipelineTable {
     /// could not describe is not one the next incarnation describes either,
     /// and an object the guest deleted is not resurrected by a new device.
     #[must_use = "a build nobody restarts is a transaction that waits forever"]
-    pub fn device_lost(&mut self) -> Vec<ResourceId> {
+    pub fn device_lost(&mut self) -> Vec<PipelineId> {
         let mut rebuilding = Vec::new();
         for (id, p) in &mut self.pipelines {
             if p.state.is_terminal() {
@@ -1132,7 +1173,7 @@ impl PipelineTable {
             // incarnation that just ended. The shader is the guest's and does
             // not change, but the pipeline these were published against is
             // gone, and a rebuild republishes.
-            drop_usage_of(&mut self.usage, id);
+            self.usage.remove(id);
             rebuilding.push(*id);
         }
         rebuilding.sort_unstable();
@@ -1151,8 +1192,7 @@ impl PipelineTable {
         // Belt and braces against a retired entry that reached this table by
         // some door other than `advance`: an entry here with no pipeline beside
         // it would be answered for whatever next takes the id.
-        self.usage
-            .retain(|(_, id), _| self.pipelines.contains_key(id));
+        self.usage.retain(|id, _| self.pipelines.contains_key(id));
     }
 
     #[must_use]
@@ -1170,11 +1210,11 @@ impl PipelineTable {
 mod resting_tests {
     use super::*;
 
-    fn name(slot: u32) -> ResourceId {
-        ResourceId {
+    fn name(slot: u32) -> PipelineId {
+        PipelineId::shared(ResourceId {
             slot: crate::identity::ObjectListRef(slot),
             generation: crate::identity::SlotGeneration(1),
-        }
+        })
     }
 
     /// Occupancy and the census answer different questions, and the difference
@@ -1249,11 +1289,11 @@ mod tests {
     use super::*;
     use crate::identity::{ObjectListRef, SlotGeneration};
 
-    fn id(slot: u32) -> ResourceId {
-        ResourceId {
+    fn id(slot: u32) -> PipelineId {
+        PipelineId::shared(ResourceId {
             slot: ObjectListRef(slot),
             generation: SlotGeneration::default(),
-        }
+        })
     }
     const GEN: SessionGeneration = SessionGeneration::FIRST;
 
@@ -1335,8 +1375,12 @@ mod tests {
             )
         };
         let answered = |t: &PipelineTable| {
-            crate::pipeline::UsageSource::binding_usage(t, id(1), Some(ShaderStage::Vertex))
-                .is_some()
+            crate::pipeline::UsageSource::binding_usage(
+                t,
+                id(1).resource(),
+                Some(ShaderStage::Vertex),
+            )
+            .is_some()
         };
         let mut t = PipelineTable::new();
         assert!(t.declare(id(1), GEN));
@@ -1402,61 +1446,118 @@ mod tests {
         );
     }
 
-    /// Two tasks whose pipelines have the same id each get the reflection of
-    /// their own shader, and a third task is answered neither.
+    /// The same object-list id in two tasks is two pipelines: each has its own
+    /// lifetime, its own waits and its own reflection, and nothing one does is
+    /// done to the other.
     ///
-    /// The id is a slot and a generation and every task numbers its own object
-    /// list from the same integers, so this is not a corner: it is the ordinary
-    /// shape of a desktop with several clients. Keyed by the id alone the first
-    /// publication answered for all of them.
+    /// The id is a slot and a generation and every task numbers its own list from
+    /// the same integers, so this is not a corner: it is the ordinary shape of a
+    /// desktop with several clients. Named by the id alone, one table entry stood
+    /// for all of them: one task's delete retired the others', one task's refused
+    /// build refused the others' packets, one task's stale translation withdrew
+    /// the others' lease and one task's reflection was answered to all.
     #[test]
-    fn two_tasks_sharing_a_pipeline_id_are_answered_their_own_reflections() {
+    fn two_tasks_with_one_resource_id_are_two_pipelines() {
         use reims_vgpu_protocol::render::ShaderStage;
+        let resource = id(30).resource();
+        let (a, b) = (
+            PipelineId::of(TaskId(1), resource),
+            PipelineId::of(TaskId(3), resource),
+        );
+        assert_ne!(a, b);
         let usage = |mode| {
             PublishedUsage::render(Some(BindingUsage::new(vec![Some(mode)], Vec::new())), None)
         };
-        let (a, b, c) = (Some(TaskId(1)), Some(TaskId(3)), Some(TaskId(9)));
-        let slot0 = |t: &PipelineTable, owner| {
-            t.binding_usage_of(owner, id(1), Some(ShaderStage::Vertex))
+        let slot0 = |t: &PipelineTable, who: PipelineId| {
+            t.binding_usage_of(who, Some(ShaderStage::Vertex))
                 .and_then(|u| u.buffer(0))
         };
         let mut t = PipelineTable::new();
-        assert!(t.declare(id(1), GEN));
-        assert!(t.publish_usage_as(a, id(1), usage(AccessMode::Read), PublishTo::Live));
-        assert!(
-            t.usage_wanted_for(b, id(1), PublishTo::Live),
-            "a's publication does not cover b"
-        );
-        assert!(t.publish_usage_as(b, id(1), usage(AccessMode::Write), PublishTo::Live));
 
+        // Declared separately: the second is new, not "already".
+        assert!(t.declare(a, GEN));
+        assert!(t.declare(b, GEN), "a's declaration is not b's");
+        assert_eq!(t.census().declared, 2);
+
+        // Their own reflections.
+        assert!(t.publish_usage(a, usage(AccessMode::Read)));
+        assert!(t.usage_wanted(b), "a's publication does not cover b");
+        assert!(t.publish_usage(b, usage(AccessMode::Write)));
         assert_eq!(slot0(&t, a), Some(AccessMode::Read));
         assert_eq!(slot0(&t, b), Some(AccessMode::Write));
+
+        // Their own build state: a ready, b still building.
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            assert!(t.advance(a, step));
+        }
+        assert_eq!(t.lease(a, GEN), Lease::Ready);
+        assert_eq!(t.lease(b, GEN), Lease::Pending, "b's build is b's");
+        assert_eq!(t.waits_for(&[a, b], GEN), Ok(vec![b]));
+
+        // a's translation goes stale: a waits again, b is untouched.
+        assert!(t.withdraw(a));
+        assert_eq!(t.lease(a, GEN), Lease::Pending);
+        assert_eq!(slot0(&t, a), None, "and a's reflection went with its build");
+        assert_eq!(slot0(&t, b), Some(AccessMode::Write));
+
+        // a is deleted: a is a tombstone, b is still a live pipeline.
+        assert!(t.retire(a));
+        assert_eq!(t.lease(a, GEN), Lease::Absent(AbsentBecause::Retired));
+        assert_eq!(t.lease(b, GEN), Lease::Pending);
+        assert_eq!(slot0(&t, b), Some(AccessMode::Write));
+
+        // b's build is refused: b's packets are refused, and a third task's
+        // pipeline with the same id is not.
+        let c = PipelineId::of(TaskId(9), resource);
+        assert!(t.declare(c, GEN));
+        assert!(t.refuse(b, RefusalReason::TranslationFailed("test")));
+        assert!(matches!(
+            t.waits_for(&[b], GEN),
+            Err(LeaseRefusal::Refused { pipeline, .. }) if pipeline == b
+        ));
         assert_eq!(
-            slot0(&t, c),
-            None,
-            "a task that published nothing is answered nothing"
+            t.lease(c, GEN),
+            Lease::Pending,
+            "c is not refused for b's build"
         );
-        assert_eq!(
-            slot0(&t, None),
-            None,
-            "and neither is a caller naming no task"
-        );
-        assert!(t.usage_published_by(a, id(1)) && t.usage_published_by(b, id(1)));
-        assert!(!t.usage_published_by(c, id(1)));
-        assert!(t.usage_wanted_for(c, id(1), PublishTo::Live));
     }
 
-    /// Everything that ends or rebuilds a pipeline ends every task's reflection
-    /// of it: those events are about the id, not about one task's claim.
+    /// The shared name is the old behaviour: two tasks with one id are one
+    /// pipeline, and what one does is done to both. It stays reachable so the
+    /// device can run both ways on one binary.
     #[test]
-    fn ending_a_pipeline_ends_every_tasks_reflection_of_it() {
+    fn the_shared_name_is_one_pipeline_for_every_task() {
+        let resource = id(30).resource();
+        let (a, b) = (
+            PipelineScope::Shared.id(resource),
+            PipelineScope::Shared.id(resource),
+        );
+        assert_eq!(a, b);
+        assert_eq!(a.task(), None);
+        assert_ne!(a, PipelineScope::Task(TaskId(1)).id(resource));
+        assert_eq!(
+            PipelineScope::Task(TaskId(1)).id(resource),
+            PipelineId::of(TaskId(1), resource)
+        );
+        assert_eq!(PipelineScope::default(), PipelineScope::Shared);
+        let mut t = PipelineTable::new();
+        assert!(t.declare(a, GEN));
+        assert!(!t.declare(b, GEN), "one entry, however many tasks ask");
+    }
+
+    /// Everything that ends or rebuilds a pipeline ends its reflection.
+    #[test]
+    fn ending_a_pipeline_ends_its_reflection() {
         let usage = || {
             PublishedUsage::render(
                 Some(BindingUsage::new(vec![Some(AccessMode::Read)], Vec::new())),
                 None,
             )
         };
-        let (a, b) = (Some(TaskId(1)), Some(TaskId(3)));
         let ready = || {
             let mut t = PipelineTable::new();
             assert!(t.declare(id(1), GEN));
@@ -1467,42 +1568,34 @@ mod tests {
             ] {
                 assert!(t.advance(id(1), step));
             }
-            assert!(t.publish_usage_as(a, id(1), usage(), PublishTo::Live));
-            assert!(t.publish_usage_as(b, id(1), usage(), PublishTo::Live));
+            assert!(t.publish_usage(id(1), usage()));
             t
-        };
-        let held = |t: &PipelineTable| {
-            (
-                t.usage_published_by(a, id(1)),
-                t.usage_published_by(b, id(1)),
-            )
         };
 
         let mut t = ready();
-        assert_eq!(held(&t), (true, true));
+        assert!(t.usage_published(id(1)));
         assert!(t.withdraw(id(1)));
-        assert_eq!(held(&t), (false, false), "withdrawn");
+        assert!(!t.usage_published(id(1)), "withdrawn");
 
         let mut t = ready();
         assert!(t.retire(id(1)));
-        assert_eq!(held(&t), (false, false), "retired");
+        assert!(!t.usage_published(id(1)), "retired");
 
         // A refusal is a step only a pipeline still building can take.
         let mut t = PipelineTable::new();
         assert!(t.declare(id(1), GEN));
-        assert!(t.publish_usage_as(a, id(1), usage(), PublishTo::Live));
-        assert!(t.publish_usage_as(b, id(1), usage(), PublishTo::Live));
-        assert_eq!(held(&t), (true, true));
+        assert!(t.publish_usage(id(1), usage()));
+        assert!(t.usage_published(id(1)));
         assert!(t.refuse(id(1), RefusalReason::TranslationFailed("test")));
-        assert_eq!(held(&t), (false, false), "refused");
+        assert!(!t.usage_published(id(1)), "refused");
 
         let mut t = ready();
         assert!(!t.device_lost().is_empty());
-        assert_eq!(held(&t), (false, false), "device lost");
+        assert!(!t.usage_published(id(1)), "device lost");
 
         let mut t = ready();
         let _ = t.generation_closed(GEN);
-        assert_eq!(held(&t), (false, false), "generation closed");
+        assert!(!t.usage_published(id(1)), "generation closed");
     }
 
     /// A pipeline is wanted exactly while the table holds it, it has not ended,
@@ -1888,10 +1981,10 @@ mod tests {
         assert!(!t.declare(id(1), GEN));
         assert_eq!(t.get(id(1)).unwrap().state, PipelineState::Translating);
         // A reused slot is a different id, and declares cleanly.
-        let reused = ResourceId {
+        let reused = PipelineId::shared(ResourceId {
             slot: ObjectListRef(1),
             generation: SlotGeneration::default().next(),
-        };
+        });
         assert!(t.declare(reused, GEN));
     }
 

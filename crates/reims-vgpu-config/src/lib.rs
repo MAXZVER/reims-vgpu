@@ -764,9 +764,10 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 ///   hit, from the memo's own resolution;
 /// - a packet whose walk found a pipeline's reflection missing is walked again
 ///   once the pre-scan has published it;
-/// - a reflection is published for, and answered to, the task whose shader it
-///   describes, because a pipeline's id is a slot and a generation and every
-///   task numbers its own list from the same integers;
+/// - a pipeline is the task's own in the ordering model — its reflection, build
+///   state, waits and tombstone — because a pipeline's id is a slot and a
+///   generation and every task numbers its own list from the same integers
+///   ([`PIPELINE_PER_TASK`], which this implies);
 /// - a name the model holds with no bytes is given the storage construction
 ///   finds under it, where it used to stay `DomainOnly` for the life of the name
 ///   (`reims_vgpu_core::lifecycle::Lifecycle::attach_storage`).
@@ -800,6 +801,36 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// stays `DomainOnly`, so the most it can do is order a packet against exactly
 /// what the packet touches instead of against everything.
 pub const ACCESS_EXACT: &str = "REIMS_VGPU_ACCESS_EXACT";
+
+/// `on` names a pipeline in the ordering model by the task that owns it and its
+/// id in that task's object list; off, by the object-list id alone.
+///
+/// # What it changes
+///
+/// A pipeline reference in a packet is an id in one task's object list, and every
+/// task numbers its own list from the same small integers, so the id alone does
+/// not say which pipeline is meant. The ordering model keyed its pipeline table
+/// by the id alone, which makes one entry stand for every task that reuses the
+/// id: one task's build state, deletion tombstone, refusal, waits and published
+/// reflection answer for all of them. With this on each task's pipeline is its
+/// own entry.
+///
+/// # Why it is a switch, and why only ever on
+///
+/// Nothing the guest can observe is computed differently: no record, no host
+/// command and no shader changes. What changes is when the model lets work go.
+/// A packet waits for the pipelines it leases, and with per-task naming it waits
+/// for *its task's* pipeline and not for a same-numbered pipeline of a task that
+/// has nothing to do with it, so a packet that used to wait on another task's
+/// compilation, or be refused for another task's failed build, no longer does.
+/// That can only remove a wait, never add one, but removing a wait changes the
+/// order this device executes in, so it gets a binary that runs both ways until
+/// the measurement of the frames it produces exists. It narrows what the device
+/// waits for; it widens nothing.
+///
+/// [`ACCESS_EXACT`] implies it: a reflection published for one task must not be
+/// answered to another, and exact accesses are what make the answer matter.
+pub const PIPELINE_PER_TASK: &str = "REIMS_VGPU_PIPELINE_PER_TASK";
 
 /// `on` issues the draw-time guest buffer gather as one compute dispatch per
 /// gathered window instead of one transfer region per guest run.
