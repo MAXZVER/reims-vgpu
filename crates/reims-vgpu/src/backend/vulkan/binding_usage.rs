@@ -440,7 +440,10 @@ mod tests {
             assert_eq!(got, want, "{a:?} then {b:?}");
             if matches!(a, Some(WriteOnly | ReadWrite)) || matches!(b, Some(WriteOnly | ReadWrite))
             {
-                assert!(got.is_some_and(AccessMode::writes), "{a:?} {b:?}: a write survives");
+                assert!(
+                    got.is_some_and(AccessMode::writes),
+                    "{a:?} {b:?}: a write survives"
+                );
             }
         }
     }
