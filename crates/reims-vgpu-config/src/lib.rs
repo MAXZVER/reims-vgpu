@@ -746,25 +746,47 @@ pub const GATHER_AUDIT_ALL: &str = "REIMS_VGPU_GATHER_AUDIT_ALL";
 pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 
 /// **Default off.** `on` makes the ordering model state its accesses exactly
-/// where the guest has told it enough to: a texture view, a buffer texture and a
-/// surface-backed texture stop being [`AccessKey::DomainOnly`] and are ordered
-/// against the memory they are a window onto.
+/// where the guest has told it enough to, instead of ordering a packet against
+/// everything in its domain.
 ///
-/// # What it changes, and why that is not the default
+/// # What it changes
 ///
-/// It changes what the model *knows*, and only that. No packet's records, no
-/// host command and no byte the guest can read is computed differently. But the
-/// model's knowledge is also what releases work: a transaction is ready when the
-/// hazard edges it was admitted with are discharged, and exact accesses draw
-/// fewer edges. So with this on, a packet can be ready while an earlier packet
-/// of its own channel is still parked — on a translation, on a stamp, on host
-/// paint — and then it runs first. That is precisely what the model's schedule
-/// equivalence permits and what exact accesses are *for*; it is also a change
-/// to the order this device executes in, made on the strength of a claim about
-/// a guest (that the accesses are exact) rather than of a measurement of the
-/// frames it produces. A claim of that shape gets a binary that runs both ways
-/// until the measurement exists, and the default stays on the side that changes
-/// nothing.
+/// Five things, all of them about what the model *knows*:
+///
+/// - a texture view, a buffer texture and a surface-backed ref texture stop
+///   being `DomainOnly` and are ordered against the memory they are a window
+///   onto (`reims_vgpu_core::lifecycle::Aliasing`);
+/// - a pipeline the guest deleted and still binds takes a reflection, where it
+///   used to be refused one and dropped the one it had, so every draw through it
+///   was `Unknown` for as long as it was bound
+///   (`reims_vgpu_core::pipeline::PublishTo`);
+/// - the pre-scan publishes a reflection the model wants past a translation-memo
+///   hit, from the memo's own resolution;
+/// - a packet whose walk found a pipeline's reflection missing is walked again
+///   once the pre-scan has published it;
+/// - a reflection is published for, and answered to, the task whose shader it
+///   describes, because a pipeline's id is a slot and a generation and every
+///   task numbers its own list from the same integers.
+///
+/// # Why it is not the default
+///
+/// No packet's records, no host command and no byte the guest can read is
+/// computed differently. But the model's knowledge is also what releases work: a
+/// transaction is ready when the hazard edges it was admitted with are
+/// discharged, and exact accesses draw fewer edges. So with this on, a packet can
+/// be ready while an earlier packet of its own channel is still parked — on a
+/// translation, on a stamp, on host paint — and then it runs first. Measured on a
+/// driven macos-26 desktop that is one packet in a thousand to ten thousand. It
+/// is what the model's schedule equivalence permits and what exact accesses are
+/// for, and it is also a change to the order this device executes in, made on the
+/// strength of a claim about a guest (that the accesses are exact) rather than of
+/// a measurement of the frames it produces. A claim of that shape gets a binary
+/// that runs both ways until the measurement exists, and the default stays on the
+/// side that changes nothing.
+///
+/// Exactness is also only as complete as the model's knowledge of what a packet
+/// touches: memory reached through argument buffers or an indirect command buffer
+/// is not in any access, and `DomainOnly` used to over-order it by accident.
 ///
 /// # Why it is not the widening this module forbids
 ///
@@ -773,8 +795,6 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// whole window, a surface is the whole surface — and a name it cannot resolve
 /// stays `DomainOnly`, so the most it can do is order a packet against exactly
 /// what the packet touches instead of against everything.
-///
-/// [`AccessKey::DomainOnly`]: https://docs.rs/reims-vgpu-core
 pub const ACCESS_EXACT: &str = "REIMS_VGPU_ACCESS_EXACT";
 
 /// `on` issues the draw-time guest buffer gather as one compute dispatch per
