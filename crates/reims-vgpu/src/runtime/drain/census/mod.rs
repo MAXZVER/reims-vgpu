@@ -485,6 +485,22 @@ pub(crate) fn note_display_enable_mask(mask: u32) {
     if prev == mask {
         return;
     }
+    // Edge history for the first transitions, then one summary per thousand.
+    // WindowServer on macOS 26 arms VBL for a frame and disarms it after, so a
+    // busy desktop flips this ~100 times a second: tens of thousands of lines
+    // an hour that say the same two things.
+    static TRANSITIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    const EDGE_LINES: u64 = 256;
+    const SUMMARY_EVERY: u64 = 1024;
+    let n = TRANSITIONS.fetch_add(1, Relaxed) + 1;
+    if n > EDGE_LINES {
+        if n % SUMMARY_EVERY == 0 {
+            crate::observe::off(format!(
+                "display_enable_mask transitions={n} last=0x{prev:x}->0x{mask:x} (per-edge lines stop after {EDGE_LINES})"
+            ));
+        }
+        return;
+    }
     // Name every bit the guest's dispatch can claim, and say plainly when it has
     // armed one this device never signals. A reader looking at `0xe` should not
     // have to go and find out what bit 3 is; that question cost a session.
