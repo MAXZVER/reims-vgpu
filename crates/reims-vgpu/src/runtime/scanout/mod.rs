@@ -1456,6 +1456,61 @@ impl SampledFieldWindow {
     }
 }
 
+/// Read `ok.len()` consecutive texels of `bpp` bytes starting at surface byte
+/// `off` into `row`, marking in `ok` which texels were read.
+///
+/// The span is read in at most one piece per page it touches. When a piece
+/// fails, its texels are retried one at a time so a texel whose own bytes are
+/// readable is never lost to a neighbour's page.
+fn read_field_row<M: HostMemory>(
+    host: &M,
+    gpa_at: &impl Fn(u64) -> Option<u64>,
+    off: u64,
+    bpp: u32,
+    page: u64,
+    row: &mut [u8],
+    ok: &mut [bool],
+) {
+    let bpp = u64::from(bpp);
+    let len = ok.len() as u64 * bpp;
+    let mut done = 0u64;
+    while done < len {
+        let at = off + done;
+        let piece = (page - at % page).min(len - done);
+        let span = &mut row[done as usize..(done + piece) as usize];
+        let whole = gpa_at(at).is_some_and(|gpa| host.read_gpa(gpa, span).is_ok());
+        // Texels that start inside this piece. One that starts here and ends
+        // on the next page is settled by the per-texel read below.
+        let first = done.div_ceil(bpp);
+        let last = (done + piece).div_ceil(bpp).min(ok.len() as u64);
+        for t in first..last {
+            let t_off = t * bpp;
+            ok[t as usize] = if whole && t_off + bpp <= done + piece {
+                true
+            } else {
+                let texel = &mut row[t_off as usize..(t_off + bpp) as usize];
+                texel_read(host, gpa_at, off + t_off, page, texel)
+            };
+        }
+        done += piece;
+    }
+}
+
+/// One texel's bytes, split at a page boundary if they cross one.
+fn texel_read<M: HostMemory>(
+    host: &M,
+    gpa_at: &impl Fn(u64) -> Option<u64>,
+    off: u64,
+    page: u64,
+    texel: &mut [u8],
+) -> bool {
+    let head = ((page - off % page) as usize).min(texel.len());
+    let (a, b) = texel.split_at_mut(head);
+    gpa_at(off).is_some_and(|gpa| host.read_gpa(gpa, a).is_ok())
+        && (b.is_empty()
+            || gpa_at(off + head as u64).is_some_and(|gpa| host.read_gpa(gpa, b).is_ok()))
+}
+
 /// [`note_sampled_surface_field`] over an explicitly named window, for a bind
 /// whose texels are not the mapping's own geometry.
 pub fn note_sampled_surface_field_window<M: HostMemory>(
@@ -1478,19 +1533,35 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
         return;
     }
     let page_shift = state.page_shift;
-    let Some(gpas) = state.mappings.get(&mapping_id).map(|m| {
-        m.page_entries
-            .iter()
-            .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, page_shift))
-            .collect::<Vec<u64>>()
-    }) else {
+    let Some(entries) = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| m.page_entries.as_slice())
+    else {
         return;
     };
-    if gpas.is_empty() {
+    let page = state.page_size();
+    // Page `off` falls in, resolved on demand: the patches touch a few dozen
+    // pages of a surface that can own ten thousand, and this runs per bind.
+    let gpa_at = |off: u64| {
+        entries
+            .get((off / page) as usize)
+            .and_then(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, page_shift))
+            .map(|gpa| gpa + off % page)
+    };
+    if !entries
+        .iter()
+        .any(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, page_shift).is_some())
+    {
         return;
     }
-    let page = state.page_size();
     let read = bpp.min(4) as usize;
+    // One patch row is contiguous in the surface, so it is read whole, split
+    // only where it crosses a page. A texel whose bytes cannot be read is
+    // skipped, exactly as a per-texel read skipped it.
+    let row_bytes_max = (FIELD_PATCH_SIDE * bpp) as usize;
+    let mut row = vec![0u8; row_bytes_max];
+    let mut row_ok = vec![false; FIELD_PATCH_SIDE as usize];
     let mut report = String::new();
     let mut first_texel = String::new();
     let mut verdicts: Vec<u8> = Vec::with_capacity(FIELD_PATCHES.len());
@@ -1502,22 +1573,28 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
         let mut samples = [0f32; (FIELD_PATCH_SIDE * FIELD_PATCH_SIDE) as usize];
         let mut n = 0usize;
         for dy in 0..FIELD_PATCH_SIDE {
-            for dx in 0..FIELD_PATCH_SIDE {
-                let (x, y) = (x0 + dx, y0 + dy);
-                if x >= width || y >= height {
+            let y = y0 + dy;
+            if y >= height {
+                continue;
+            }
+            let cols = FIELD_PATCH_SIDE.min(width - x0);
+            let row_off = base_off + u64::from(y) * u64::from(bpr) + u64::from(x0) * u64::from(bpp);
+            read_field_row(
+                host,
+                &gpa_at,
+                row_off,
+                bpp,
+                page,
+                &mut row,
+                &mut row_ok[..cols as usize],
+            );
+            for dx in 0..cols {
+                if !row_ok[dx as usize] {
                     continue;
                 }
-                let off = base_off + u64::from(y) * u64::from(bpr) + u64::from(x) * u64::from(bpp);
-                let Some(&gpa) = gpas.get((off / page) as usize) else {
-                    continue;
-                };
+                let at = (dx * bpp) as usize;
                 let mut texel = [0u8; 4];
-                if host
-                    .read_gpa(gpa + (off % page), &mut texel[..read])
-                    .is_err()
-                {
-                    continue;
-                }
+                texel[..read].copy_from_slice(&row[at..at + read]);
                 if first_texel.is_empty() {
                     first_texel = texel[..read].iter().map(|b| format!("{b:02x}")).collect();
                 }

@@ -1443,3 +1443,46 @@ fn the_efi_console_paint_refuses_a_span_whose_hole_is_not_at_either_end() {
          read, not vouched for by its two endpoints"
     );
 }
+
+/// A patch row is read in one piece per page it touches, and the bytes it
+/// yields are the bytes a per-texel read would have: across a page boundary
+/// the row follows the page list, not guest-physical adjacency, and a texel on
+/// an unreadable page is skipped without losing its readable neighbours.
+#[test]
+fn a_field_row_follows_the_page_list_and_skips_only_unreadable_texels() {
+    use crate::runtime::host::HostMemory;
+    let page = 0x1000u64;
+    let mut host = FakeHost::new();
+    // Surface page 0 is GPA 0x5000, page 1 is GPA 0x9000: not adjacent.
+    let map = [0x5000u64, 0x9000, 0xd000];
+    for (i, &gpa) in map.iter().enumerate() {
+        let bytes: Vec<u8> = (0..page)
+            .map(|b| (i as u8) << 6 | (b as u8 & 0x3f))
+            .collect();
+        host.write_gpa(gpa, &bytes).unwrap();
+    }
+    let gpa_at = |off: u64| map.get((off / page) as usize).map(|&g| g + off % page);
+    // Eight 4-byte texels starting 12 bytes before the end of page 0.
+    let off = page - 12;
+    let mut row = vec![0u8; 32];
+    let mut ok = vec![false; 8];
+    read_field_row(&host, &gpa_at, off, 4, page, &mut row, &mut ok);
+    assert!(ok.iter().all(|&v| v));
+    let mut want = vec![0u8; 32];
+    host.read_gpa(0x5000 + page - 12, &mut want[..12]).unwrap();
+    host.read_gpa(0x9000, &mut want[12..]).unwrap();
+    assert_eq!(row, want);
+
+    // Page 1 unreadable: the three texels on page 0 survive, the rest do not.
+    host.mark_non_ram(0x9000, page);
+    let mut ok = vec![false; 8];
+    read_field_row(&host, &gpa_at, off, 4, page, &mut row, &mut ok);
+    assert_eq!(ok, [true, true, true, false, false, false, false, false]);
+    assert_eq!(row[..12], want[..12]);
+
+    // A texel straddling the boundary needs both pages; its neighbour wholly
+    // on page 0 does not.
+    let mut ok = vec![false; 2];
+    read_field_row(&host, &gpa_at, page - 6, 4, page, &mut row, &mut ok);
+    assert_eq!(ok, [true, false]);
+}
