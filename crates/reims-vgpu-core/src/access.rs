@@ -461,6 +461,31 @@ impl AccessMode {
             Self::Unknown => "unknown",
         }
     }
+
+    /// The one mode that does everything either of these does.
+    ///
+    /// For two statements about one piece of memory made by one operation — a
+    /// shader that reads a buffer through one binding and writes it through
+    /// another — the operation's access is both of them together, and this is
+    /// that. It is a join and so it only ever moves *up*: a write joined with
+    /// anything still writes, a read joined with a write is `ReadWrite` and is
+    /// neither alone, and ignorance absorbs, because a direction nobody
+    /// established might be any of them. It is the answer that does not let the
+    /// order two bindings are listed in decide a hazard.
+    ///
+    /// Commutative, associative and idempotent, which is what makes folding a
+    /// list of them independent of the list's order; a test holds it to all
+    /// three.
+    #[must_use]
+    pub const fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::ReadWrite, _) | (_, Self::ReadWrite) => Self::ReadWrite,
+            (Self::Read, Self::Write) | (Self::Write, Self::Read) => Self::ReadWrite,
+            (Self::Read, Self::Read) => Self::Read,
+            (Self::Write, Self::Write) => Self::Write,
+        }
+    }
 }
 
 /// A resource's content version.
@@ -1036,6 +1061,61 @@ mod tests {
             assert!(other.may_alias(AccessKey::DomainOnly));
         }
         assert_eq!(AccessKey::DomainOnly.rung(), 3);
+    }
+
+    /// A join never weakens: whatever either side orders against, the joined
+    /// mode orders against, and it is neither a read nor a write alone when the
+    /// two disagree.
+    #[test]
+    fn joining_two_modes_never_loses_what_either_one_does() {
+        const ALL: [AccessMode; 4] = [
+            AccessMode::Read,
+            AccessMode::Write,
+            AccessMode::ReadWrite,
+            AccessMode::Unknown,
+        ];
+        for a in ALL {
+            assert_eq!(a.join(a), a, "idempotent");
+            for b in ALL {
+                let j = a.join(b);
+                assert_eq!(j, b.join(a), "commutative: {a:?} {b:?}");
+                assert_eq!(
+                    j.writes(),
+                    a.writes() || b.writes(),
+                    "a join writes exactly when either side does: {a:?} {b:?}"
+                );
+                // Against every mode, in both orders: if either side needs an
+                // edge the join does too.
+                for c in ALL {
+                    let k = key(1);
+                    let (ia, ib, ij, ic) = (
+                        intent(AccessKey::Whole(k), a),
+                        intent(AccessKey::Whole(k), b),
+                        intent(AccessKey::Whole(k), j),
+                        intent(AccessKey::Whole(k), c),
+                    );
+                    for side in [&ia, &ib] {
+                        assert!(
+                            !requires_edge(&ic, side) || requires_edge(&ic, &ij),
+                            "{a:?} {b:?} {c:?}: later"
+                        );
+                        assert!(
+                            !requires_edge(side, &ic) || requires_edge(&ij, &ic),
+                            "{a:?} {b:?} {c:?}: earlier"
+                        );
+                    }
+                    assert_eq!(j.join(c), a.join(b.join(c)), "associative");
+                }
+            }
+        }
+        assert_eq!(
+            AccessMode::Read.join(AccessMode::Write),
+            AccessMode::ReadWrite
+        );
+        assert_eq!(
+            AccessMode::Read.join(AccessMode::Unknown),
+            AccessMode::Unknown
+        );
     }
 
     #[test]

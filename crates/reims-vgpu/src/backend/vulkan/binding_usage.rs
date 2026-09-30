@@ -147,12 +147,14 @@ fn stage_tables(reflection: &ShaderReflection) -> Result<Tables, UnpublishableSt
         if table.len() <= slot {
             table.resize(slot + 1, None);
         }
-        // Two variables on one slot: keep the wider answer rather than the
-        // later one, so the order the reflection lists them in cannot decide a
-        // hazard.
+        // Two variables on one slot: the slot does what both do, so the order
+        // the reflection lists them in cannot decide a hazard. A read and a
+        // write on one slot is a read-write — not `Unknown`, which says nobody
+        // established the direction, and here somebody did — and ignorance on
+        // either side still absorbs.
         table[slot] = Some(match table[slot] {
-            Some(existing) if existing != mode => AccessMode::Unknown,
-            _ => mode,
+            Some(existing) => existing.join(mode),
+            None => mode,
         });
         Ok(())
     };
@@ -398,6 +400,49 @@ mod tests {
         );
         assert_eq!(usage.texture(0), Some(AccessMode::Read));
         assert_eq!(usage.texture(1), Some(AccessMode::ReadWrite));
+    }
+
+    /// Two variables on one slot are what both of them do, and a stated write
+    /// is never lost to the order they were listed in.
+    ///
+    /// The merge used to answer `Unknown` whenever the two disagreed. That
+    /// ordered identically and threw away a fact the reflection had stated: a
+    /// read and a write on one slot is a read-write. What must never happen is
+    /// the other direction — a reflected write reading back as a read, because
+    /// the read was listed second.
+    #[test]
+    fn a_reflected_write_is_never_downgraded_by_a_second_variable_on_its_slot() {
+        use ResourceAccess::{ReadOnly, ReadWrite, Unused, WriteOnly};
+        let slot_after = |first: Option<ResourceAccess>, second: Option<ResourceAccess>| {
+            let r = reflection(vec![
+                binding(ResourceKind::Buffer, 0, first),
+                binding(ResourceKind::Buffer, 0, second),
+            ]);
+            stage_usage(&r).expect("two buffers").buffer(0)
+        };
+        // Every order of every pair keeps the write.
+        for (a, b, want) in [
+            (Some(WriteOnly), Some(ReadOnly), Some(AccessMode::ReadWrite)),
+            (Some(ReadOnly), Some(WriteOnly), Some(AccessMode::ReadWrite)),
+            (Some(WriteOnly), Some(Unused), Some(AccessMode::Write)),
+            (Some(Unused), Some(WriteOnly), Some(AccessMode::Write)),
+            (Some(WriteOnly), Some(WriteOnly), Some(AccessMode::Write)),
+            (Some(ReadWrite), Some(ReadOnly), Some(AccessMode::ReadWrite)),
+            (Some(ReadOnly), Some(ReadWrite), Some(AccessMode::ReadWrite)),
+            (Some(ReadOnly), Some(ReadOnly), Some(AccessMode::Read)),
+            (Some(Unused), Some(Unused), None),
+            // Ignorance absorbs, in either order, and never narrows a write.
+            (Some(WriteOnly), None, Some(AccessMode::Unknown)),
+            (None, Some(WriteOnly), Some(AccessMode::Unknown)),
+            (Some(ReadOnly), None, Some(AccessMode::Unknown)),
+        ] {
+            let got = slot_after(a, b);
+            assert_eq!(got, want, "{a:?} then {b:?}");
+            if matches!(a, Some(WriteOnly | ReadWrite)) || matches!(b, Some(WriteOnly | ReadWrite))
+            {
+                assert!(got.is_some_and(AccessMode::writes), "{a:?} {b:?}: a write survives");
+            }
+        }
     }
 
     /// A synthetic index refuses the stage rather than being placed.
