@@ -2176,6 +2176,11 @@ pub(crate) struct ResidentTargetSlot {
     pub height: u32,
     pub sample_count: u32,
     pub generation: u64,
+    /// The image holds rendered contents. **Written only by
+    /// [`Self::set_content`]**, which publishes it to [`readiness`] in the same
+    /// breath; the source-scan test
+    /// `the_registry_writes_a_residents_content_state_in_exactly_one_place` holds
+    /// the door shut.
     pub content_ready: bool,
     /// The mapping-level `surface_content_epoch` this image's pixels were last
     /// stamped with, or `None` when nothing has vouched for them.
@@ -2187,7 +2192,14 @@ pub(crate) struct ResidentTargetSlot {
     /// falls back to its CPU seed. An `Option` rather than a sentinel because
     /// epoch 0 ("nothing published since attach") is a legal *mapping* value
     /// and a bare `0 == 0` would match an image that was never stamped at all.
+    ///
+    /// Written only by [`Self::set_content`], with [`Self::content_ready`].
     pub content_epoch: Option<u32>,
+    /// This slot's entry on the lock-free readiness table: how it publishes
+    /// `content_ready`, `content_epoch` and whether the memory is a guest
+    /// import, and what takes the entry off the table when the slot is dropped.
+    /// See [`readiness`] for what readers get and why the version moves.
+    pub readiness: readiness::ReadinessHandle,
     /// What last touched this image, and where that left it. See
     /// [`ResidentAccess`] for why these are one field and not two.
     pub access: ResidentAccess,
@@ -2337,6 +2349,21 @@ pub(crate) struct ResidentTargetSlot {
 }
 
 impl ResidentTargetSlot {
+    /// Set what this slot says about its content, and publish it.
+    ///
+    /// The one writer of [`Self::content_ready`] and [`Self::content_epoch`]: a
+    /// store, a depth store and an epoch stamp all come through here, so the
+    /// lock-free [`readiness`] table readers consult instead of the engine lock
+    /// cannot disagree with the registry about a live resident. The publish
+    /// moves the table's version whether or not a field changed, because each of
+    /// those events means the pixels did.
+    pub(crate) fn set_content(&mut self, ready: bool, epoch: Option<u32>) {
+        self.content_ready = ready;
+        self.content_epoch = epoch;
+        self.readiness
+            .publish(ready, self.memory.is_guest_imported(), epoch);
+    }
+
     /// Whether this image's texels are already in the byte order the guest
     /// scanout and the host window blit both read.
     ///
@@ -3592,6 +3619,9 @@ impl Drop for SlowStagingWrite {
 
 pub mod buffer_gather_working_set;
 mod images_and_registry;
+/// What the resident registry says about an identity's content, readable
+/// without the engine lock.
+pub(crate) mod readiness;
 pub mod sampled_working_set;
 mod submission_and_buffers;
 /// The lease's own extent travels with its pointer; see [`ReadbackLease`].
@@ -4352,6 +4382,7 @@ mod resident_reuse_tests {
             generation,
             content_ready: false,
             content_epoch: None,
+            readiness: super::readiness::ReadinessHandle::detached(),
             access: ResidentAccess::Untouched,
             format: translate::pixel::ResidentFormat::of(format),
             pin_count: 0,

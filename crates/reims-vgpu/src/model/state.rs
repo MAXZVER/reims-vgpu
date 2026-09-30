@@ -9,7 +9,7 @@ use reims_vgpu_core::identity::{ObjectListRef, ResourceId};
 use reims_vgpu_core::namespace::Teardown;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Opaque device instance id (QEMU handle).
@@ -3398,7 +3398,14 @@ pub struct DeviceState {
     /// that restarted at 1 whenever the entry was re-created, and
     /// `evict_gva` re-creates it on every deferred GVA render Store arm. One
     /// boot's audit caught `(0xa4c000, 1)` naming two different 64x64 icons.
-    pub sampled_content_gen: u64,
+    ///
+    /// An atomic so that issuing one needs `&self`: the parallel pool's jobs
+    /// hold the device state shared and a plan that builds a fresh host copy
+    /// needs a generation for it. The uniqueness claim above is exactly what an
+    /// atomic increment gives, from any number of threads; the *order* values are
+    /// issued in across threads is unspecified, and nothing may depend on it —
+    /// generations are compared for equality and never for "newer".
+    pub sampled_content_gen: AtomicU64,
     /// Which guest pages this device has written, and when.
     ///
     /// The hypervisor dirty bitmap witnesses guest CPU stores and nothing else,
@@ -3598,7 +3605,27 @@ pub struct DeviceState {
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
+    /// The parallel worker pool of the device this state belongs to, when its
+    /// shim can register worker threads for RCU; see [`crate::runtime::par`].
+    ///
+    /// Owned by the bound device, which stops it on destroy; this is the door the
+    /// draw rails reach it through, because they hold a `DeviceState` and
+    /// nothing else of the device. Carried across [`Self::reset`] — the threads
+    /// are the device's, not the guest lifetime's — and `None` for every device
+    /// made without host ops and every shim that offers no registration.
+    par: Option<Arc<crate::runtime::par::Pool>>,
 }
+
+// The parallel pool's jobs hold `&DeviceState` from several threads at once, so
+// the state being `Sync` is a claim the design rests on, not a convenience. It
+// held structurally when it was first asserted (no `Cell`/`RefCell` in the
+// model, the two locks are `Mutex`, the rail slot is `Send + Sync` by its
+// trait); this keeps it true: a field that breaks it fails here, at the
+// definition, rather than at some distant scope call.
+const _: () = {
+    const fn assert_sync<T: Sync>() {}
+    assert_sync::<DeviceState>();
+};
 
 /// Domain tag for ch-event segment events (matches event_sync::Domain::Event).
 pub const FENCE_DOMAIN_EVENT: u8 = 1;
@@ -3734,7 +3761,7 @@ impl DeviceState {
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
             bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
             buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens::default(),
-            sampled_content_gen: 0,
+            sampled_content_gen: AtomicU64::new(0),
             host_writes: crate::runtime::host_writes::HostWrites::new(page_shift),
             guest_linear_scratch: Vec::new(),
             ref_texture_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -3742,6 +3769,7 @@ impl DeviceState {
             mapper_ref_texture_memo_scratch: Vec::new(),
             gva_host_views: Vec::new(),
             view_stale_reads: 0,
+            par: None,
         }
     }
 
@@ -4091,6 +4119,9 @@ impl DeviceState {
         let intr_fault = Arc::clone(&self.gfx.interrupt_fault);
         let fifo_read = Arc::clone(&self.gfx.fifo_read);
         let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
+        // The pool's threads belong to the device, and a reset is a guest
+        // lifetime boundary, not the device's.
+        let par = self.par.take();
         intr_disp.store(0, Ordering::Release);
         intr_gpu.store(0, Ordering::Release);
         intr_fault.store(0, Ordering::Release);
@@ -4099,6 +4130,7 @@ impl DeviceState {
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
         *self = Self::new(id, page_shift);
+        self.par = par;
         self.gfx.interrupt_status_disp = intr_disp;
         self.gfx.interrupt_status_gpu = intr_gpu;
         self.gfx.interrupt_fault = intr_fault;
@@ -5865,12 +5897,29 @@ impl DeviceState {
     /// before" is the whole of the contract — see
     /// [`Self::sampled_content_gen`]. Never returns 0, which readers use for
     /// "no host content yet".
-    pub fn next_sampled_content_generation(&mut self) -> u64 {
-        self.sampled_content_gen = self.sampled_content_gen.wrapping_add(1);
-        if self.sampled_content_gen == 0 {
-            self.sampled_content_gen = 1;
+    pub fn next_sampled_content_generation(&self) -> u64 {
+        loop {
+            let issued = self
+                .sampled_content_gen
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            // Zero is skipped, not returned: the counter wrapped, and the next
+            // increment is the first value past the reserved one.
+            if issued != 0 {
+                return issued;
+            }
         }
-        self.sampled_content_gen
+    }
+
+    /// The parallel worker pool of this device, when it has one.
+    pub fn par(&self) -> Option<&crate::runtime::par::Pool> {
+        self.par.as_deref()
+    }
+
+    /// Give this state the pool its bound device created. Called once, at
+    /// device creation, before any guest work exists.
+    pub fn install_par_pool(&mut self, pool: Arc<crate::runtime::par::Pool>) {
+        self.par = Some(pool);
     }
 
     /// Issue the next recency stamp for [`HostSurface::last_touch`].
@@ -7238,5 +7287,93 @@ impl reims_vgpu_core::pipeline::UsageSource for PipelineUsage<'_> {
         stage: Option<reims_vgpu_protocol::render::ShaderStage>,
     ) -> Option<&reims_vgpu_core::pipeline::BindingUsage> {
         self.0.pipelines_ref().binding_usage(pipeline, stage)
+    }
+}
+
+#[cfg(test)]
+mod sampled_generation_tests {
+    use super::*;
+    use crate::model::PAGE_SHIFT_X86;
+
+    /// The contract the engine's sampled cache binds on: a generation is issued
+    /// once and never again, from any number of threads, and is never 0.
+    #[test]
+    fn a_generation_is_issued_once_across_threads_and_never_zero() {
+        const THREADS: usize = 8;
+        const EACH: usize = 20_000;
+        let state = Arc::new(DeviceState::new(DeviceId(1), PAGE_SHIFT_X86));
+        let mut all: Vec<u64> = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let state = Arc::clone(&state);
+                    s.spawn(move || {
+                        (0..EACH)
+                            .map(|_| state.next_sampled_content_generation())
+                            .collect::<Vec<u64>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().expect("issuer does not panic"))
+                .collect()
+        });
+        assert_eq!(all.len(), THREADS * EACH);
+        assert!(all.iter().all(|&g| g != 0), "0 means no host content yet");
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), THREADS * EACH, "a generation was issued twice");
+    }
+
+    /// Serially it is the sequence it always was: 1, 2, 3, ...
+    #[test]
+    fn serially_the_generations_count_up_from_one() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(state.next_sampled_content_generation(), 1);
+        assert_eq!(state.next_sampled_content_generation(), 2);
+        assert_eq!(state.next_sampled_content_generation(), 3);
+    }
+
+    /// The counter wrapping skips the reserved value rather than returning it,
+    /// exactly as the `&mut self` form it replaced did.
+    #[test]
+    fn a_wrapped_counter_skips_zero() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state
+            .sampled_content_gen
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(state.next_sampled_content_generation(), u64::MAX);
+        assert_eq!(state.next_sampled_content_generation(), 1, "0 is skipped");
+        assert_eq!(state.next_sampled_content_generation(), 2);
+    }
+
+    /// A reset is a guest-lifetime boundary: the counter restarts (as it did)
+    /// and the device's worker pool, which is not the guest's, survives it.
+    #[test]
+    fn reset_restarts_generations_and_keeps_the_pool() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut table = crate::qemu::host_ops::ReimsVgpuHostOps::null();
+        unsafe extern "C" fn nothing(_ctx: *mut std::os::raw::c_void) {}
+        table.thread_attach = Some(nothing);
+        table.thread_detach = Some(nothing);
+        let pool = Arc::new(
+            crate::runtime::par::Pool::new(
+                &table,
+                &crate::runtime::par::Settings {
+                    workers: 0,
+                    worker_spin: std::time::Duration::ZERO,
+                    join_spin: std::time::Duration::ZERO,
+                },
+            )
+            .expect("the table offers the registration pair"),
+        );
+        state.install_par_pool(Arc::clone(&pool));
+        assert_eq!(state.next_sampled_content_generation(), 1);
+        state.reset();
+        assert_eq!(state.next_sampled_content_generation(), 1, "restarted");
+        assert!(
+            std::ptr::eq(state.par().expect("the pool survived the reset"), &*pool),
+            "the same pool, not a rebuilt one"
+        );
     }
 }

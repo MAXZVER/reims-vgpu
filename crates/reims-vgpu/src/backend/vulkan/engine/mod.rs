@@ -40,6 +40,9 @@ pub(crate) mod stamp_completion;
 /// reason: `pools` is private, and the number this reports is what a content
 /// cache on that rail would have to be sized from.
 pub use pools::buffer_gather_working_set::census as buffer_gather_working_set_census;
+/// One resident's published readiness, for the readers of
+/// [`resident_readiness`]; `pools` is private.
+pub use pools::readiness::ResidentReadiness;
 /// The requested sampled working set, re-exported for the same reason and to
 /// the same place: `pools` is private, and this line is only interpretable
 /// beside the eviction routes the census already emits.
@@ -2513,13 +2516,27 @@ fn classify_resident_content(content_ready: bool, guest_imported: bool) -> Resid
     }
 }
 
+/// What kind of content, if any, a resident registered under `identity` holds.
+///
+/// Answered from the lock-free [`pools::readiness`] table the registry publishes
+/// to, **not** from the registry: this is asked before every sampled bind, the
+/// engine lock is the drain's for most of every draw, and the parallel
+/// preparation workers must not queue behind it for three words. The table is
+/// written in the same critical section as every change to the fields this
+/// reads, so the answer is exactly the one the registry would give a moment
+/// ago — which is all a lock-held read ever was, the lock being released before
+/// the caller acts on it.
 pub fn resident_content_backing(identity: &TargetIdentity) -> ResidentContentBacking {
-    let guard = lock_engine();
-    guard
-        .pools
-        .registry_get(identity)
-        .map(|slot| classify_resident_content(slot.content_ready, slot.memory.is_guest_imported()))
+    pools::readiness::lookup(identity)
+        .map(|r| classify_resident_content(r.ready, r.guest_imported))
         .unwrap_or(ResidentContentBacking::NotReady)
+}
+
+/// The published readiness of a resident, with the version a reader records to
+/// learn later that it is still current, or `None` when no resident is
+/// registered under `identity`. No engine lock; see [`pools::readiness`].
+pub fn resident_readiness(identity: &TargetIdentity) -> Option<ResidentReadiness> {
+    pools::readiness::lookup(identity)
 }
 
 pub fn resident_content_ready(identity: &TargetIdentity) -> bool {

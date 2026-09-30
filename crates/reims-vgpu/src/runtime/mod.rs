@@ -109,6 +109,9 @@ pub mod mtlb;
 pub mod node_guard;
 /// Object-list lookup and mapper-ref-texture registration.
 pub mod objects;
+/// Parallel preparation: a fixed pool of worker threads and a fork-join, for
+/// work whose result the drain validates before it uses it.
+pub mod par;
 /// The bytes an admitted packet is executed from, held while the model decides
 /// when it runs.
 pub mod parked;
