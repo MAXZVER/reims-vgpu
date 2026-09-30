@@ -1160,6 +1160,12 @@ fn lab_alias_other_level(
     other
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_FIX_STATIC_SAMPLER=1` — see the push loop.
+fn lab_fix_static_sampler() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_FIX_STATIC_SAMPLER").is_ok_and(|v| v == "1"))
+}
+
 /// TEMP (lab): whether `REIMS_VGPU_LAB_SMP_LINEAR` names this fragment entry.
 fn lab_smp_linear(entry: Option<&str>) -> bool {
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -9631,6 +9637,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             });
         }
         {
+            // TEMP (lab): `REIMS_VGPU_LAB_FIX_STATIC_SAMPLER=1` — a constexpr
+            // sampler owns the binding metal2vulkan gave it. The guest's encoder
+            // keeps whatever it last bound at a sampler index, and a shader with
+            // no argument sampler at that index never reads it; provisioning it
+            // anyway took the constexpr sampler's binding first-writer-wins, so
+            // macOS 26's glass shaders sampled their blur through a stale
+            // nearest, non-mipmapped sampler (M1: blocky menu backdrop).
+            let static_sampler_binds: std::collections::BTreeSet<u32> =
+                if lab_fix_static_sampler() {
+                    v_variant
+                        .samplers
+                        .iter()
+                        .chain(f_variant.samplers.iter())
+                        .filter(|r| r.static_state.is_some())
+                        .map(|r| r.binding)
+                        .collect()
+                } else {
+                    Default::default()
+                };
             let mut push_smp = |index: u32,
                                 sampler_ref: u32,
                                 lod_clamp: Option<(u32, u32)>,
@@ -9642,6 +9667,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     0
                 };
                 let smp_bind = SAMPLER_BINDING_BASE + index + base_off;
+                if static_sampler_binds.contains(&smp_bind) {
+                    crate::runtime::drain::note_store_route("sampler_guest_yields_to_constexpr");
+                    return Ok(());
+                }
                 if sampler_binds.insert(smp_bind) {
                     let mut sampler = if sampler_ref != 0 {
                         sampler_origin.insert(smp_bind, b'g');
