@@ -1411,7 +1411,51 @@ fn lab_repeat_draw(
         }
     }
     // B: everything but the render-target identity. A adds it back; C also drops the
-    // bound-texture identity.
+    // bound-texture identity. V0..V5 are B with one field group removed, to find which
+    // field keeps a draw from repeating: first_vertex, index buffer ref, viewport and
+    // scissor, sampler refs, pipeline identity, vertex/instance counts.
+    let field = |skip: usize| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        req.task_id.hash(&mut h);
+        if skip != 4 {
+            req.pipeline_ref.hash(&mut h);
+            vertex_entry.hash(&mut h);
+            fragment_entry.hash(&mut h);
+        }
+        if skip != 5 {
+            (req.vertex_count, req.instance_count).hash(&mut h);
+        }
+        (req.primitive_type, if skip == 0 { 0 } else { req.first_vertex }).hash(&mut h);
+        for c in &req.colors {
+            (c.slot, c.width, c.height, c.format, c.load_action, c.store_action).hash(&mut h);
+        }
+        if skip != 3 {
+            for s in req.vertex_samplers.iter().chain(req.fragment_samplers.iter()) {
+                (s.index, s.sampler_ref).hash(&mut h);
+            }
+        }
+        if skip != 2 {
+            for v in &req.viewports {
+                for x in v {
+                    x.to_bits().hash(&mut h);
+                }
+            }
+            for s in &req.scissors {
+                (s.x, s.y, s.width, s.height).hash(&mut h);
+            }
+        }
+        if skip != 1 {
+            req.indexed.as_ref().map(|i| (i.index_type, i.index_count, i.index_buffer_ref, i.base_vertex)).hash(&mut h);
+        } else {
+            req.indexed.as_ref().map(|i| (i.index_type, i.index_count)).hash(&mut h);
+        }
+        for t in req.vertex_textures.iter().chain(req.fragment_textures.iter()) {
+            (t.index, t.texture_ref).hash(&mut h);
+            t.resource.as_ref().map(|r| std::sync::Arc::as_ptr(r) as usize).hash(&mut h);
+        }
+        h.finish()
+    };
+    let variants = [field(0), field(1), field(2), field(3), field(4), field(5)];
     let mut shape = std::collections::hash_map::DefaultHasher::new();
     req.task_id.hash(&mut shape);
     req.pipeline_ref.hash(&mut shape);
@@ -1445,7 +1489,7 @@ fn lab_repeat_draw(
     for c in &req.colors {
         (c.texture_ref, c.mapping_id, c.target_gva).hash(&mut a_h);
     }
-    crate::runtime::lab_repeat::draw(a_h.finish(), b_key, c_key, bytes.finish(), partial, !req.continues_render_pass);
+    crate::runtime::lab_repeat::draw(a_h.finish(), b_key, c_key, bytes.finish(), partial, !req.continues_render_pass, variants);
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_UBO=pipe[,pipe]` logs the fragment buffers

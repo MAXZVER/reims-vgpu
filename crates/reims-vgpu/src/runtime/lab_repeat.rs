@@ -37,6 +37,8 @@ struct Frames {
     b_struct_cur: HashSet<u64>,
     streams: [HashSet<u64>; 4],
     streams_cur: HashSet<u64>,
+    v_prev: [HashSet<Key>; 6],
+    v_cur: [HashSet<Key>; 6],
     stream_hash: u64,
     stream_draws: u32,
 }
@@ -82,10 +84,13 @@ pub fn frame() {
     f.streams[0] = std::mem::take(&mut f.streams_cur);
     f.c_prev = std::mem::take(&mut f.c_cur);
     f.b_struct_prev = std::mem::take(&mut f.b_struct_cur);
+    for i in 0..6 {
+        f.v_prev[i] = std::mem::take(&mut f.v_cur[i]);
+    }
 }
 
 /// One draw: `new_stream` when it does not continue the previous draw's pass.
-pub fn draw(a: u64, b: u64, c: u64, bytes: u64, partial: bool, new_stream: bool) {
+pub fn draw(a: u64, b: u64, c: u64, bytes: u64, partial: bool, new_stream: bool, variants: [u64; 6]) {
     let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let f = guard.get_or_insert_with(Frames::default);
     if new_stream {
@@ -115,6 +120,21 @@ pub fn draw(a: u64, b: u64, c: u64, bytes: u64, partial: bool, new_stream: bool)
     }
     if f.b.iter().any(|s| s.contains(&kb)) {
         note("rep_b_full_w4");
+    }
+    const NAMES: [&str; 6] = [
+        "rep_v_no_first_vertex",
+        "rep_v_no_index_ref",
+        "rep_v_no_viewport_scissor",
+        "rep_v_no_sampler",
+        "rep_v_no_pipeline",
+        "rep_v_no_counts",
+    ];
+    for (i, v) in variants.iter().enumerate() {
+        let k = (*v, bytes);
+        if f.v_prev[i].contains(&k) {
+            note(NAMES[i]);
+        }
+        f.v_cur[i].insert(k);
     }
     f.a_cur.insert(ka);
     f.b_cur.insert(kb);
