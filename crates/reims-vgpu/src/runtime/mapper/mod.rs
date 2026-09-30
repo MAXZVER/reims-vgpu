@@ -1055,6 +1055,8 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     host: &H,
     mapping_id: u32,
 ) -> Option<&'static str> {
+    let _lab_rmr = crate::runtime::chain_phase::CostSpan::new("lab_rmr_us"); // TEMP (lab)
+    crate::runtime::drain::note_store_route("lab_rmr_calls"); // TEMP (lab)
     let Some(m) = state.mappings.get(&mapping_id) else {
         return Some("revalidate_gone");
     };
@@ -1068,13 +1070,28 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     // the two facts that separate the empty-page-list outcomes from each other.
     let mut resolve_ran = false;
     let mut resolve_ok = false;
+    if !has_internal {
+        crate::runtime::drain::note_store_route("lab_rmr_nointernal"); // TEMP (lab)
+    }
     if has_internal {
         let generation_before = m.map_generation;
+        let lab_before = lab_rmb_fp().then(|| lab_resolve_fingerprint(m)); // TEMP (lab)
         let started = std::time::Instant::now();
         let resolved = resolve_mapping_backing(state, host, mapping_id);
         resolve_ran = true;
         resolve_ok = resolved;
         let elapsed_us = started.elapsed().as_micros() as u64;
+        // TEMP (lab): what the re-resolve costs and whether it ever changes anything.
+        crate::runtime::drain::note_store_route("lab_rmb_calls");
+        crate::runtime::drain::note_store_route_n("lab_rmb_us", elapsed_us);
+        if !resolved {
+            crate::runtime::drain::note_store_route("lab_rmb_unresolved");
+        }
+        if let Some(before) = lab_before {
+            if state.mappings.get(&mapping_id).map(lab_resolve_fingerprint) != Some(before) {
+                crate::runtime::drain::note_store_route("lab_rmb_changed");
+            }
+        }
         let (pages_after, generation_after) = state
             .mappings
             .get(&mapping_id)
@@ -1473,6 +1490,35 @@ const REVALIDATE_SLOW_US: u64 = 1_000;
 #[inline]
 fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
     elapsed_us >= REVALIDATE_SLOW_US
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_RMB_FP=1` folds the mapping before and after every
+/// re-resolve (extra cost, measurement only) and counts `lab_rmb_changed`.
+fn lab_rmb_fp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RMB_FP").is_ok_and(|v| v == "1"))
+}
+
+/// TEMP (lab): every field of a mapping that [`resolve_mapping_backing`] can rewrite,
+/// folded, so a before/after pair says whether a re-resolve changed anything.
+fn lab_resolve_fingerprint(m: &crate::model::MappingEntry) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (
+        m.map_generation,
+        m.mapped,
+        m.mapping_internal,
+        m.page_table_kva,
+        m.has_geom,
+        m.width,
+        m.height,
+        m.format,
+        m.condemned_entries.is_some(),
+    )
+        .hash(&mut h);
+    m.page_entries.hash(&mut h);
+    m.device_desc.hash(&mut h);
+    h.finish()
 }
 
 /// Release contiguous views whose page tables changed.
