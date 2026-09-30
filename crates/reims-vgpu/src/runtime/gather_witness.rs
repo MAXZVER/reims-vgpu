@@ -663,6 +663,10 @@ pub(crate) unsafe fn fold_runs(runs: &[crate::runtime::guest_ram::GuestRun], spa
     let mut a: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut b: u64 = 0xc2b2_ae3d_27d4_eb4f;
     let mut remaining = span;
+    let stride = fold_block_stride(span);
+    // Offset of the current run's first byte within the window, so the sampled
+    // blocks are the same window positions however the pages split into runs.
+    let mut at: u64 = 0;
     for run in runs {
         if remaining == 0 {
             break;
@@ -671,7 +675,33 @@ pub(crate) unsafe fn fold_runs(runs: &[crate::runtime::guest_ram::GuestRun], spa
         remaining -= n as u64;
         // SAFETY: caller's precondition — `host_ptr` is a stable RAMBlock alias
         // valid for at least `run.len` bytes, and `n <= run.len`.
-        let bytes = unsafe { std::slice::from_raw_parts(run.host_ptr() as *const u8, n) };
+        let run_bytes = unsafe { std::slice::from_raw_parts(run.host_ptr() as *const u8, n) };
+        let run_at = at;
+        at += n as u64;
+        if stride > 1 {
+            // A large window folds every `stride`-th block of `FOLD_BLOCK` bytes,
+            // at fixed window offsets, rather than every byte.
+            let mut off = 0usize;
+            while off < n {
+                let block = (run_at + off as u64) / FOLD_BLOCK;
+                let block_end = ((block + 1) * FOLD_BLOCK - run_at) as usize;
+                let end = block_end.min(n);
+                if block % stride == 0 {
+                    for chunk in run_bytes[off..end].chunks(8) {
+                        let mut w = [0u8; 8];
+                        w[..chunk.len()].copy_from_slice(chunk);
+                        let w = u64::from_le_bytes(w);
+                        a = (a ^ w).rotate_left(29).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                        b = b.rotate_left(7).wrapping_add(w ^ a);
+                    }
+                    b = b.wrapping_mul(0xff51_afd7_ed55_8ccd) ^ block;
+                }
+                off = end;
+            }
+            b = b.wrapping_mul(0xff51_afd7_ed55_8ccd) ^ (n as u64);
+            continue;
+        }
+        let bytes = run_bytes;
         let (words, tail) = bytes.split_at(n & !7);
         for chunk in words.chunks_exact(8) {
             let w = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
@@ -686,6 +716,44 @@ pub(crate) unsafe fn fold_runs(runs: &[crate::runtime::guest_ram::GuestRun], spa
         b = b.wrapping_mul(0xff51_afd7_ed55_8ccd) ^ (n as u64);
     }
     ((a as u128) << 64) | b as u128
+}
+
+/// Block granularity of a sampled fold: one guest page on x86.
+const FOLD_BLOCK: u64 = 4096;
+
+/// Windows up to this size fold every byte.
+///
+/// Above it the fold reads every `stride`-th block so that it touches about
+/// [`FOLD_SAMPLED_BYTES`]. A 4K video plane is 16.6 MB, and folding it whole on
+/// the drain thread took milliseconds a bind — 361 MB of reads in one census
+/// window on a driven macos-26 desktop, most of what the audit cost. The alarm
+/// this fold serves catches systematic staleness (a frame or a scroll moves most
+/// of a window's pages), which a fixed, evenly spread sample still sees; the
+/// sample is taken at fixed window offsets, so a baseline and its comparison
+/// read the same bytes.
+const FOLD_FULL_MAX: u64 = 2 << 20;
+
+/// Bytes a sampled fold aims to read.
+const FOLD_SAMPLED_BYTES: u64 = 1 << 20;
+
+/// Every how many blocks a fold of `span` bytes reads one (1 = every block).
+fn fold_block_stride(span: u64) -> u64 {
+    if span <= FOLD_FULL_MAX {
+        return 1;
+    }
+    let blocks = span.div_ceil(FOLD_BLOCK);
+    let want = (FOLD_SAMPLED_BYTES / FOLD_BLOCK).max(1);
+    blocks.div_ceil(want).max(1)
+}
+
+/// Bytes a fold of `span` bytes actually reads, for the cost census.
+pub(crate) fn fold_read_bytes(span: u64) -> u64 {
+    let stride = fold_block_stride(span);
+    if stride == 1 {
+        span
+    } else {
+        span.div_ceil(FOLD_BLOCK).div_ceil(stride) * FOLD_BLOCK
+    }
 }
 
 /// Every account of one bind's writers that is read out of device state, taken
@@ -1177,7 +1245,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     // `gw_audit_kb` is every byte the fold still reads, so the cost of keeping
     // the alarm is reported in the same units as the gathers it saves.
     if !matches!(seen.audit, ContentAudit::Skipped) {
-        note_store_route_n("gw_audit_kb", span / 1024);
+        note_store_route_n("gw_audit_kb", fold_read_bytes(span) / 1024);
     }
     match seen.audit {
         ContentAudit::Skipped => {}
@@ -1624,6 +1692,46 @@ mod tests {
     fn run_over(buf: &[u8]) -> GuestRun {
         GuestRun::whole(buf.as_ptr() as usize, buf.len() as u64)
             .expect("a fixture run covers its own span")
+    }
+
+    #[test]
+    fn a_large_window_folds_a_fixed_sample_of_about_a_megabyte() {
+        // A 4K video plane: 3840x2160 at two bytes a texel.
+        let plane = 3840 * 2160 * 2;
+        let read = fold_read_bytes(plane);
+        assert!(
+            read <= FOLD_SAMPLED_BYTES + FOLD_BLOCK && read >= FOLD_SAMPLED_BYTES / 2,
+            "a 16.6 MB plane read {read} bytes"
+        );
+        // At or below the full-fold bound nothing changes.
+        assert_eq!(fold_read_bytes(FOLD_FULL_MAX), FOLD_FULL_MAX);
+        assert_eq!(fold_block_stride(FOLD_FULL_MAX), 1);
+    }
+
+    #[test]
+    fn a_sampled_fold_sees_a_change_in_a_sampled_block_and_repeats_itself() {
+        let span = 8u64 << 20;
+        let stride = fold_block_stride(span);
+        assert!(stride > 1, "an 8 MB window is sampled");
+        let mut buf = vec![3u8; span as usize];
+        let base = unsafe { fold_runs(&[run_over(&buf)], span) };
+        // The same bytes fold the same: a baseline and its comparison agree.
+        assert_eq!(base, unsafe { fold_runs(&[run_over(&buf)], span) });
+        // Block 0 and the last sampled block are read.
+        let last_sampled = ((span / FOLD_BLOCK - 1) / stride) * stride;
+        for block in [0, stride, last_sampled] {
+            let at = (block * FOLD_BLOCK + 17) as usize;
+            buf[at] ^= 0x20;
+            let moved = unsafe { fold_runs(&[run_over(&buf)], span) };
+            assert_ne!(
+                base, moved,
+                "a change in sampled block {block} folded the same"
+            );
+            buf[at] ^= 0x20;
+        }
+        // Whole-frame change (a new video frame, a scroll) always moves it.
+        buf.iter_mut().for_each(|b| *b = 9);
+        assert_ne!(base, unsafe { fold_runs(&[run_over(&buf)], span) });
     }
 
     #[test]
