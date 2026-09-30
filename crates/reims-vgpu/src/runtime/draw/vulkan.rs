@@ -1392,6 +1392,7 @@ fn lab_repeat_draw(
     }
     let mut partial = false;
     let mut bytes = std::collections::hash_map::DefaultHasher::new();
+    let mut pre: [std::collections::hash_map::DefaultHasher; 3] = Default::default();
     for (i, c) in vtx.iter().chain(frag.iter()) {
         i.hash(&mut bytes);
         let len = c.len();
@@ -1401,15 +1402,23 @@ fn lab_repeat_draw(
         }
         // The bound window starts at the draw's own offset, so its prefix is the
         // draw's data; what lies past 4 KiB may be other draws' and is not keyed.
+        let mut feed = |b: &[u8]| {
+            b[..b.len().min(4096)].hash(&mut bytes);
+            for (k, n) in [64usize, 256, 1024].into_iter().enumerate() {
+                i.hash(&mut pre[k]);
+                b[..b.len().min(n)].hash(&mut pre[k]);
+            }
+        };
         match c {
-            BufferContent::Bytes(b) => b[..len.min(4096)].hash(&mut bytes),
+            BufferContent::Bytes(b) => feed(&b[..len.min(4096)]),
             other if len <= 65536 => {
                 let b = other.cpu_bytes();
-                b[..b.len().min(4096)].hash(&mut bytes);
+                feed(&b);
             }
             _ => {}
         }
     }
+    let prefix = [pre[0].finish(), pre[1].finish(), pre[2].finish()];
     // B: everything but the render-target identity. A adds it back; C also drops the
     // bound-texture identity. V0..V5 are B with one field group removed, to find which
     // field keeps a draw from repeating: first_vertex, index buffer ref, viewport and
@@ -1489,7 +1498,7 @@ fn lab_repeat_draw(
     for c in &req.colors {
         (c.texture_ref, c.mapping_id, c.target_gva).hash(&mut a_h);
     }
-    crate::runtime::lab_repeat::draw(a_h.finish(), b_key, c_key, bytes.finish(), partial, !req.continues_render_pass, variants);
+    crate::runtime::lab_repeat::draw(a_h.finish(), b_key, c_key, bytes.finish(), partial, !req.continues_render_pass, variants, prefix);
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_UBO=pipe[,pipe]` logs the fragment buffers

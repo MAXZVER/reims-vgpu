@@ -39,6 +39,8 @@ struct Frames {
     streams_cur: HashSet<u64>,
     v_prev: [HashSet<Key>; 6],
     v_cur: [HashSet<Key>; 6],
+    p: [[HashSet<Key>; 4]; 3],
+    p_cur: [HashSet<Key>; 3],
     stream_hash: u64,
     stream_draws: u32,
 }
@@ -87,10 +89,25 @@ pub fn frame() {
     for i in 0..6 {
         f.v_prev[i] = std::mem::take(&mut f.v_cur[i]);
     }
+    for k in 0..3 {
+        for i in (1..4).rev() {
+            f.p[k][i] = std::mem::take(&mut f.p[k][i - 1]);
+        }
+        f.p[k][0] = std::mem::take(&mut f.p_cur[k]);
+    }
 }
 
 /// One draw: `new_stream` when it does not continue the previous draw's pass.
-pub fn draw(a: u64, b: u64, c: u64, bytes: u64, partial: bool, new_stream: bool, variants: [u64; 6]) {
+pub fn draw(
+    a: u64,
+    b: u64,
+    c: u64,
+    bytes: u64,
+    partial: bool,
+    new_stream: bool,
+    variants: [u64; 6],
+    prefix: [u64; 3],
+) {
     let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let f = guard.get_or_insert_with(Frames::default);
     if new_stream {
@@ -135,6 +152,24 @@ pub fn draw(a: u64, b: u64, c: u64, bytes: u64, partial: bool, new_stream: bool,
             note(NAMES[i]);
         }
         f.v_cur[i].insert(k);
+    }
+    // The index-buffer-normalised shape with only the first 64 / 256 / 1024 bytes of
+    // every buffer keyed: the window a draw is handed runs on into its neighbours'
+    // data, so a long prefix repeats only when the whole neighbourhood does.
+    const PN: [(&str, &str); 3] = [
+        ("rep_p64", "rep_p64_w4"),
+        ("rep_p256", "rep_p256_w4"),
+        ("rep_p1024", "rep_p1024_w4"),
+    ];
+    for k in 0..3 {
+        let key = (variants[1], prefix[k]);
+        if f.p[k][0].contains(&key) {
+            note(PN[k].0);
+        }
+        if f.p[k].iter().any(|s| s.contains(&key)) {
+            note(PN[k].1);
+        }
+        f.p_cur[k].insert(key);
     }
     f.a_cur.insert(ka);
     f.b_cur.insert(kb);
