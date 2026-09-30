@@ -6088,6 +6088,30 @@ impl reims_vgpu_core::access::AccessSource for DeviceAccess<'_> {
         match answer {
             Ok(intent) => {
                 note_access_widened(self.state, self.task, participation, &intent);
+                if matches!(intent.key, reims_vgpu_core::access::AccessKey::DomainOnly)
+                    && crate::runtime::drain::lab_dag_window()
+                {
+                    use reims_vgpu_core::access::{AccessMode, ParticipationExtent};
+                    let object_type = self
+                        .state
+                        .constructed_object(self.task.0, participation.resource.slot.0)
+                        .map_or(255, |r| r.entry.object_type);
+                    crate::runtime::drain::lab_note_domain_only(
+                        object_type,
+                        participation.resource.slot.0,
+                        match participation.mode {
+                            AccessMode::Read => 'r',
+                            AccessMode::Write => 'w',
+                            AccessMode::ReadWrite => 'x',
+                            AccessMode::Unknown => 'u',
+                        },
+                        match participation.extent {
+                            ParticipationExtent::Range(_) => 'R',
+                            ParticipationExtent::Subresource(_) => 'S',
+                            ParticipationExtent::Whole => 'W',
+                        },
+                    );
+                }
                 Ok(intent)
             }
             Err(refusal) => {

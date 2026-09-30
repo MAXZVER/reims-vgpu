@@ -2301,6 +2301,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
     let mut transaction = admission.admitted.transaction;
     let ingress = transaction.identity.ingress;
     lab_dag_admit(
+        state,
         &transaction,
         &admission.admitted.hazard_waits,
         admission.admitted.ready,
@@ -2373,6 +2374,12 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
         return;
     };
     let census = &work.usage_census;
+    if lab_dag_on() {
+        if let Some(id) = census.first_unanswered_pipeline {
+            let st = state.pipeline_state(id).unwrap_or("unleased");
+            LAB_NP.with(|n| *n.borrow_mut() = Some(st));
+        }
+    }
     for (route, n) in [
         ("draw_usage_no_pipeline", census.draws_without_a_pipeline),
         ("draw_usage_no_stage", census.draws_with_no_stage_published),
@@ -2422,6 +2429,27 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
     }
 }
 
+thread_local! {
+    /// TEMP (lab, access precision): DomainOnly participations the current
+    /// walk answered, drained by `lab_dag_admit` of the same packet.
+    static LAB_D: std::cell::RefCell<Vec<(u8, u32, char, char)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// TEMP (lab, access precision): the model's state for the first pipeline a
+    /// draw found unanswered, as it was when the walk finished.
+    static LAB_NP: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// TEMP (lab, access precision): whether the DAG census window is open.
+pub(crate) fn lab_dag_window() -> bool {
+    lab_dag_on()
+}
+
+/// TEMP (lab, access precision): record one DomainOnly participation.
+pub(crate) fn lab_note_domain_only(object_type: u8, slot: u32, mode: char, extent: char) {
+    LAB_D.with(|d| d.borrow_mut().push((object_type, slot, mode, extent)));
+}
+
 /// TEMP (lab, S0): `REIMS_VGPU_LAB_DAG=PATH` — while PATH exists, one `lab_dag` line
 /// per admitted packet (ingress, channel, opcode, readiness, the hazard edges the
 /// model found, the accesses it declared) and one `lab_dag_run` line per executed
@@ -2449,6 +2477,7 @@ fn lab_dag_on() -> bool {
 static LAB_DAG_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn lab_dag_admit(
+    state: &DeviceState,
     transaction: &reims_vgpu_core::transaction::DeviceTransaction,
     hazards: &[reims_vgpu_core::identity::IngressOrdinal],
     ready: bool,
@@ -2487,8 +2516,39 @@ fn lab_dag_admit(
         acc.push_str(&key);
     }
     let hz: Vec<String> = hazards.iter().map(|h| h.0.to_string()).collect();
+    // TEMP (lab, access precision): what made the packet's accesses imprecise.
+    // `dt` is every DomainOnly participation the walk answered (object type of
+    // the named slot, slot, mode, extent); `np` is the first pipeline a draw
+    // found unanswered, with the model's state for it when the walk asked and
+    // now, whether usage is published now (after this packet's own preflight),
+    // and how many draws/dispatches found nothing.
+    let dt = LAB_D.with(|d| {
+        d.borrow_mut()
+            .drain(..)
+            .map(|(t, slot, m, e)| format!("{t}:{slot}:{m}{e}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    let at_walk = LAB_NP.with(|n| n.borrow_mut().take());
+    let np = transaction
+        .payload
+        .exec()
+        .and_then(|work| {
+            let c = &work.usage_census;
+            let id = c.first_unanswered_pipeline?;
+            Some(format!(
+                "{}/{}:{}:{}:{}:{}",
+                id.slot.0,
+                id.generation.0,
+                at_walk.unwrap_or("?"),
+                state.pipeline_state(id).unwrap_or("unleased"),
+                u8::from(state.pipeline_usage_published(id)),
+                c.draws_with_no_stage_published + c.dispatches_with_no_stage_published,
+            ))
+        })
+        .unwrap_or_default();
     crate::observe::fail(format!(
-        "lab_dag g={} in={} ch={} op={:#x} rd={} hz={} unk={unknown} r3={rung3} acc={acc}",
+        "lab_dag g={} in={} ch={} op={:#x} rd={} hz={} unk={unknown} r3={rung3} acc={acc} dt={dt} np={np}",
         LAB_DAG_FRAME.load(std::sync::atomic::Ordering::Relaxed),
         transaction.identity.ingress.0,
         transaction.identity.domain.0,
