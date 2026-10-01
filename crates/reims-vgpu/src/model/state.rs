@@ -3127,6 +3127,10 @@ pub struct DeviceState {
     /// keep "which state changes, from where" a list a reader can enumerate,
     /// instead of a public field any call site can reach into.
     session: Mutex<reims_vgpu_core::session::SessionModel>,
+    /// TEMP (lab, pipeline ids): the pipeline table as it would be named per
+    /// task, stepped beside the real one. See
+    /// [`crate::model::lab_pipeline_shadow`].
+    lab_shadow: super::lab_pipeline_shadow::LabShadow,
     /// The bytes every admitted position is executed from, keyed by the
     /// ordinal [`Self::admit_packet`] issued.
     ///
@@ -3697,6 +3701,7 @@ impl DeviceState {
             session: Mutex::new(reims_vgpu_core::session::SessionModel::new(
                 reims_vgpu_core::identity::SessionId(id.0 as u32),
             )),
+            lab_shadow: Default::default(),
             parked: crate::runtime::parked::ParkedStore::new(),
             translation_deferred_mask: 0,
             translation_order_hold_mask: 0,
@@ -4475,10 +4480,50 @@ impl DeviceState {
     /// rail-neutral half of filling it: *that* a pipeline exists is the guest's
     /// fact, while translating and building it are the running rail's and reach
     /// the model from there.
-    pub fn declare_pipeline(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
-        let mut session = self.session.lock().expect("session");
-        let generation = session.generation();
-        session.pipelines().declare(pipeline, generation)
+    pub fn declare_pipeline(
+        &self,
+        task_id: u32,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> bool {
+        let id = self.pipeline_id(task_id, pipeline);
+        let (declared, generation) = {
+            let mut session = self.session.lock().expect("session");
+            let generation = session.generation();
+            (session.pipelines().declare(id, generation), generation)
+        };
+        self.lab_shadow.declare(task_id, pipeline, generation);
+        declared
+    }
+
+    /// How a transaction of `task_id` names its pipelines in the ordering plane.
+    ///
+    /// A pipeline reference is an id in *one task's* object list, and every task
+    /// numbers its own list from the same small integers, so the reference alone
+    /// does not say which pipeline is meant: a driven Tahoe desktop shares 140 to
+    /// 170 ids between its tasks. The pipeline is the task's, which is
+    /// [`crate::runtime::objects::pipeline_per_task`]'s default; with it off it
+    /// is the shared one every task that reuses the id is, which is what the table
+    /// did until it learned about tasks.
+    #[must_use]
+    pub fn pipeline_scope(&self, task_id: u32) -> reims_vgpu_core::pipeline::PipelineScope {
+        if crate::runtime::objects::pipeline_per_task() {
+            reims_vgpu_core::pipeline::PipelineScope::Task(reims_vgpu_core::identity::TaskId(
+                task_id,
+            ))
+        } else {
+            reims_vgpu_core::pipeline::PipelineScope::Shared
+        }
+    }
+
+    /// The pipeline `name` is, in `task_id`'s object list, as the ordering plane
+    /// names it. See [`Self::pipeline_scope`].
+    #[must_use]
+    pub fn pipeline_id(
+        &self,
+        task_id: u32,
+        name: reims_vgpu_core::identity::ResourceId,
+    ) -> reims_vgpu_core::pipeline::PipelineId {
+        self.pipeline_scope(task_id).id(name)
     }
 
     /// Tell the ordering plane the guest has ended a pipeline's life.
@@ -4498,12 +4543,13 @@ impl DeviceState {
     /// 54 that named a slot it has no entry for.
     pub fn retire_pipeline(
         &self,
+        task_id: u32,
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> reims_vgpu_core::session::Ended {
-        self.session
-            .lock()
-            .expect("session")
-            .pipeline_retired(pipeline)
+        let id = self.pipeline_id(task_id, pipeline);
+        let ended = self.session.lock().expect("session").pipeline_retired(id);
+        self.lab_shadow.retire(task_id, pipeline, &ended);
+        ended
     }
 
     /// Step a declared pipeline along its build, from the rail that is
@@ -4523,14 +4569,19 @@ impl DeviceState {
     /// what a compile finishing after the guest's delete answers.
     pub fn advance_pipeline(
         &self,
+        task_id: u32,
         pipeline: reims_vgpu_core::identity::ResourceId,
         next: reims_vgpu_core::pipeline::PipelineState,
     ) -> bool {
-        self.session
+        let id = self.pipeline_id(task_id, pipeline);
+        let took = self
+            .session
             .lock()
             .expect("session")
             .pipelines()
-            .advance(pipeline, next)
+            .advance(id, next);
+        self.lab_shadow.advance(task_id, pipeline, next);
+        took
     }
 
     /// This rail no longer holds a translation for a pipeline the model called
@@ -4538,12 +4589,20 @@ impl DeviceState {
     ///
     /// See [`reims_vgpu_core::pipeline::PipelineTable::withdraw`] for why this
     /// is not an [`Self::advance_pipeline`] step.
-    pub fn withdraw_pipeline(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
-        self.session
+    pub fn withdraw_pipeline(
+        &self,
+        task_id: u32,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> bool {
+        let id = self.pipeline_id(task_id, pipeline);
+        let took = self
+            .session
             .lock()
             .expect("session")
             .pipelines()
-            .withdraw(pipeline)
+            .withdraw(id);
+        self.lab_shadow.withdraw(task_id, pipeline, took);
+        took
     }
 
     /// What an executor found its shaders do with each bound slot.
@@ -4560,14 +4619,29 @@ impl DeviceState {
     /// [`reims_vgpu_core::pipeline::PipelineTable::publish_usage`].
     pub fn publish_pipeline_usage(
         &self,
+        task_id: u32,
         pipeline: reims_vgpu_core::identity::ResourceId,
         usage: reims_vgpu_core::pipeline::PublishedUsage,
     ) -> bool {
+        let id = self.pipeline_id(task_id, pipeline);
+        if super::lab_pipeline_shadow::enabled() {
+            // TEMP (lab): the shadow table takes every task's reflection; the
+            // real one keeps the first published, which is what it holds when
+            // the rail is not asked again.
+            self.lab_shadow.publish(task_id, pipeline, &usage);
+            let mut session = self.session.lock().expect("session");
+            if session.pipelines().usage_published(id) {
+                return false;
+            }
+            return session
+                .pipelines()
+                .publish_usage_to(id, usage, self.usage_scope());
+        }
         self.session
             .lock()
             .expect("session")
             .pipelines()
-            .publish_usage(pipeline, usage)
+            .publish_usage_to(id, usage, self.usage_scope())
     }
 
     /// Whether an executor has already published this pipeline's reflection.
@@ -4579,13 +4653,51 @@ impl DeviceState {
     /// the memo is the model's and not the rail's.
     pub fn pipeline_usage_published(
         &self,
+        task_id: u32,
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> bool {
-        self.session
+        let id = self.pipeline_id(task_id, pipeline);
+        let real = self
+            .session
             .lock()
             .expect("session")
             .pipelines()
-            .usage_published(pipeline)
+            .usage_published(id);
+        // TEMP (lab): asked for the task, so a reflection is built for each
+        // task that binds the pipeline; skipped only when both tables hold one.
+        real && (!super::lab_pipeline_shadow::enabled()
+            || self.lab_shadow.usage_published(task_id, pipeline))
+    }
+
+    /// Whether publishing this pipeline's usage now would land. See
+    /// [`reims_vgpu_core::pipeline::PipelineTable::usage_wanted`].
+    pub fn pipeline_usage_wanted(
+        &self,
+        task_id: u32,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> bool {
+        let id = self.pipeline_id(task_id, pipeline);
+        let real = self
+            .session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .usage_wanted_by(id, self.usage_scope());
+        real || (super::lab_pipeline_shadow::enabled()
+            && self.lab_shadow.usage_wanted(task_id, pipeline))
+    }
+
+    /// Which pipelines a reflection is published for on this device.
+    ///
+    /// A deleted pipeline the guest still binds takes one only with
+    /// `REIMS_VGPU_ACCESS_EXACT` on: it changes what the walk is answered, and
+    /// through that which packets the model may release ahead of which.
+    fn usage_scope(&self) -> reims_vgpu_core::pipeline::PublishTo {
+        if crate::runtime::objects::access_exact() {
+            reims_vgpu_core::pipeline::PublishTo::LiveAndDeleted
+        } else {
+            reims_vgpu_core::pipeline::PublishTo::Live
+        }
     }
 
     /// The published reflections, for the length of one packet's walk.
@@ -4598,8 +4710,13 @@ impl DeviceState {
     /// [`Self::task_access`] and the name resolvers are the `lifecycle` owner's,
     /// which is a different lock.
     #[must_use]
-    pub fn pipeline_usage(&self) -> PipelineUsage<'_> {
-        PipelineUsage(self.session.lock().expect("session"))
+    pub fn pipeline_usage(&self, task_id: u32) -> PipelineUsage<'_> {
+        PipelineUsage(
+            self.session.lock().expect("session"),
+            self.pipeline_scope(task_id),
+            task_id,
+            &self.lab_shadow,
+        )
     }
 
     /// A pipeline finished building and is usable.
@@ -4608,11 +4725,65 @@ impl DeviceState {
     /// the event that releases the transactions parked on it — and a rail that
     /// recorded the state without releasing the work would leave every exec
     /// that leased this pipeline holding its channel's publication head.
-    pub fn ready_pipeline(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
-        self.session
-            .lock()
-            .expect("session")
-            .pipeline_ready(pipeline)
+    pub fn ready_pipeline(
+        &self,
+        task_id: u32,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> bool {
+        let id = self.pipeline_id(task_id, pipeline);
+        let waiters = if super::lab_pipeline_shadow::enabled() {
+            self.session
+                .lock()
+                .expect("session")
+                .pipeline_waiters(id)
+        } else {
+            Vec::new()
+        };
+        let took = self.session.lock().expect("session").pipeline_ready(id);
+        self.lab_shadow.ready(task_id, pipeline, &waiters, took);
+        took
+    }
+
+    /// TEMP (lab, pipeline ids): what the real table and the per-task shadow
+    /// each say about a packet about to be admitted with `leases`.
+    pub fn lab_pipeline_admission(
+        &self,
+        task_id: u32,
+        leases: &[reims_vgpu_core::identity::ResourceId],
+    ) {
+        if !super::lab_pipeline_shadow::enabled() || leases.is_empty() {
+            return;
+        }
+        let (generation, real) = {
+            let session = self.session.lock().expect("session");
+            let generation = session.generation();
+            let real: Vec<reims_vgpu_core::pipeline::Lease> = leases
+                .iter()
+                .map(|&lease| {
+                    session
+                        .pipelines_ref()
+                        .peek(reims_vgpu_core::pipeline::PipelineId::shared(lease), generation)
+                })
+                .collect();
+            (generation, real)
+        };
+        self.lab_shadow
+            .admission(task_id, leases, generation, &real);
+    }
+
+    /// TEMP (lab, pipeline ids): a packet that leases pipelines was admitted.
+    pub fn lab_pipeline_admitted(
+        &self,
+        ingress: reims_vgpu_core::identity::IngressOrdinal,
+        task_id: u32,
+        leases: &[reims_vgpu_core::identity::ResourceId],
+    ) {
+        self.lab_shadow.note_admitted(ingress, task_id, leases);
+    }
+
+    /// TEMP (lab, pipeline ids): a packet that leased pipelines ran.
+    pub fn lab_pipeline_ran(&self, ingress: reims_vgpu_core::identity::IngressOrdinal) {
+        self.lab_shadow.forget(ingress);
     }
 
     /// Whether a declared pipeline has already reached `Ready`.
@@ -4632,13 +4803,23 @@ impl DeviceState {
     #[must_use]
     pub fn pipeline_state(
         &self,
+        task_id: u32,
         pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> Option<&'static str> {
+        self.pipeline_state_of(self.pipeline_id(task_id, pipeline))
+    }
+
+    /// [`Self::pipeline_state`] for a pipeline already named as the ordering
+    /// plane names it, which is what a transaction's own scope produces.
+    pub fn pipeline_state_of(
+        &self,
+        id: reims_vgpu_core::pipeline::PipelineId,
     ) -> Option<&'static str> {
         self.session
             .lock()
             .expect("session")
             .pipelines()
-            .get(pipeline)
+            .get(id)
             .map(|entry| entry.state.name())
     }
 
@@ -4649,21 +4830,28 @@ impl DeviceState {
     pub fn release_past_ended_pipeline(
         &self,
         ingress: reims_vgpu_core::identity::IngressOrdinal,
+        task_id: u32,
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> bool {
+        let id = self.pipeline_id(task_id, pipeline);
         self.session
             .lock()
             .expect("session")
-            .release_past_ended_pipeline(ingress, pipeline)
+            .release_past_ended_pipeline(ingress, id)
     }
 
     #[must_use]
-    pub fn pipeline_is_ready(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
+    pub fn pipeline_is_ready(
+        &self,
+        task_id: u32,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> bool {
+        let id = self.pipeline_id(task_id, pipeline);
         self.session
             .lock()
             .expect("session")
             .pipelines()
-            .get(pipeline)
+            .get(id)
             .is_some_and(|entry| entry.state.is_ready())
     }
 
@@ -4676,13 +4864,18 @@ impl DeviceState {
     /// `Ended::took` is whether the refusal was a legal step at all.
     pub fn refuse_pipeline(
         &self,
+        task_id: u32,
         pipeline: reims_vgpu_core::identity::ResourceId,
         reason: reims_vgpu_core::pipeline::RefusalReason,
     ) -> reims_vgpu_core::session::Ended {
-        self.session
+        let id = self.pipeline_id(task_id, pipeline);
+        let ended = self
+            .session
             .lock()
             .expect("session")
-            .pipeline_refused(pipeline, reason)
+            .pipeline_refused(id, reason);
+        self.lab_shadow.refuse(task_id, pipeline, reason, &ended);
+        ended
     }
 
     /// Give one packet an ordering position in the model.
@@ -4709,6 +4902,24 @@ impl DeviceState {
     ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
         let mut session = self.session.lock().expect("session");
         let admitted = session.admit(packet)?;
+        Ok(Admission {
+            epoch: session.epoch(),
+            admitted,
+        })
+    }
+
+    /// [`Self::admit_packet`] for a packet the caller is done with. See
+    /// [`reims_vgpu_core::session::SessionModel::admit_owned`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit_packet`].
+    pub fn admit_packet_owned(
+        &self,
+        packet: reims_vgpu_core::session::Packet,
+    ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
+        let mut session = self.session.lock().expect("session");
+        let admitted = session.admit_owned(packet)?;
         Ok(Admission {
             epoch: session.epoch(),
             admitted,
@@ -4869,6 +5080,51 @@ impl DeviceState {
             resting.refused,
             resting.retired,
             resting.total(),
+        ))
+    }
+
+    /// The dependency graph's own census, once a second, or `None` between
+    /// windows.
+    ///
+    /// **The numbers the graph has always kept and nothing exported.**
+    /// [`reims_vgpu_core::depend::Census`] counts every access admitted by the
+    /// rung of the precision ladder it arrived on, every hazard edge drawn, and
+    /// — separately — the edges and the comparisons that exist only because an
+    /// access was `DomainOnly` or its direction was `Unknown`. Those last two
+    /// are the price of imprecision stated in the graph's own units, and the
+    /// route counters beside it (`access_mode_*`) count *accesses*, which is a
+    /// different population: one `Unknown` slot on a hot buffer is one access
+    /// and thousands of edges.
+    ///
+    /// Cumulative since the model was built, like every other census here, so a
+    /// reader takes differences across the window it cares about. Quiet until
+    /// something has been admitted.
+    pub fn dependency_graph_census(&self) -> Option<String> {
+        const WINDOW_MS: u64 = 1000;
+        static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = crate::observe::elapsed_ms() as u64;
+        let last = LAST_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < WINDOW_MS {
+            return None;
+        }
+        let (census, live, slots) = {
+            let session = self.session.lock().expect("session");
+            let graph = session.graph();
+            (graph.census(), graph.live_accesses(), graph.entries())
+        };
+        if census.accesses == 0 {
+            return None;
+        }
+        LAST_MS.store(now, Ordering::Relaxed);
+        Some(format!(
+            "dependency_graph accesses={} edges={} rung1={} rung2={} rung3={}              domain_only_comparisons={} edges_from_unknown_mode={} live={live} slots={slots}",
+            census.accesses,
+            census.edges,
+            census.by_rung[0],
+            census.by_rung[1],
+            census.by_rung[2],
+            census.domain_only_comparisons,
+            census.edges_from_unknown_mode,
         ))
     }
 
@@ -5034,6 +5290,73 @@ impl DeviceState {
         })
     }
 
+    /// Tell the ordering model what a byte-less name is a window onto.
+    ///
+    /// The runtime half of [`reims_vgpu_core::lifecycle::Aliasing`]: only this
+    /// layer reads the descriptor that says what a view or a surface texture is
+    /// over, and only the owner may record it. Returns whether it was recorded;
+    /// `false` is a name that owns bytes, which an alias must not shadow.
+    ///
+    /// # Errors
+    ///
+    /// The owner's refusal: a task it does not hold, or a name that is not its
+    /// slot's live occupant.
+    pub fn declare_alias(
+        &self,
+        task_id: u32,
+        name: reims_vgpu_core::identity::ResourceId,
+        alias: reims_vgpu_core::lifecycle::Aliasing,
+    ) -> Result<bool, reims_vgpu_core::lifecycle::Refusal> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .declare_alias(reims_vgpu_core::identity::TaskId(task_id), name, alias)
+    }
+
+    /// Tell the ordering model that a name it holds with no bytes owns some.
+    ///
+    /// The runtime half of [`reims_vgpu_core::lifecycle::Lifecycle::attach_storage`]:
+    /// only this layer reads the descriptor that says what a slot holds *now*.
+    /// Returns whether the model took it.
+    ///
+    /// # Errors
+    ///
+    /// The owner's refusal: a task it does not hold.
+    pub fn attach_storage(
+        &self,
+        task_id: u32,
+        name: reims_vgpu_core::identity::ResourceId,
+        storage: reims_vgpu_core::lifecycle::Storage,
+    ) -> Result<bool, reims_vgpu_core::lifecycle::Refusal> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attach_storage(reims_vgpu_core::identity::TaskId(task_id), name, storage)
+    }
+
+    /// TEMP (lab, access precision): whether the model holds this name over
+    /// bytes of its own.
+    pub fn name_owns_bytes(&self, task_id: u32, name: reims_vgpu_core::identity::ResourceId) -> bool {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolve(reims_vgpu_core::identity::TaskId(task_id), name)
+            .is_ok_and(|extent| extent.length > 0)
+    }
+
+    /// The alias a name was declared with, for a test.
+    #[cfg(test)]
+    pub(crate) fn alias_of(
+        &self,
+        task_id: u32,
+        name: reims_vgpu_core::identity::ResourceId,
+    ) -> Option<reims_vgpu_core::lifecycle::Aliasing> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alias_of(reims_vgpu_core::identity::TaskId(task_id), name)
+    }
+
     /// Retire a name: stop it resolving, and leave accepted work alone.
     ///
     /// `None` when the slot held nothing this device had named — the guest
@@ -5088,6 +5411,36 @@ impl DeviceState {
             crate::runtime::drain::note_store_route_n(
                 "task_namespace_teardowns",
                 acted.teardowns.len() as u64,
+            );
+            self.end_task_pipelines(task_id);
+        }
+    }
+
+    /// A task's address space ended — deleted, or redefined under the same id —
+    /// and the pipelines it named end with it.
+    ///
+    /// Only where a pipeline is the task's own
+    /// ([`crate::runtime::objects::pipeline_per_task`]): named by the id alone the
+    /// table cannot say which entries are a task's. Needed because the next
+    /// incarnation numbers its object list from the start again, so an entry left
+    /// behind would answer for a pipeline of the same (slot, generation) that
+    /// nobody has built. The work parked on them is named by the model and is run
+    /// past them by the drain's own pump, the same way it is for a deleted
+    /// pipeline.
+    fn end_task_pipelines(&self, task_id: u32) {
+        if !crate::runtime::objects::pipeline_per_task() {
+            return;
+        }
+        let ended = self
+            .session
+            .lock()
+            .expect("session")
+            .task_ended(reims_vgpu_core::identity::TaskId(task_id));
+        if ended.removed > 0 {
+            crate::runtime::drain::note_store_route_n("pipeline_task_ended", ended.removed as u64);
+            crate::runtime::drain::note_store_route_n(
+                "pipeline_task_ended_stranded",
+                ended.stranded.len() as u64,
             );
         }
     }
@@ -5184,7 +5537,12 @@ impl DeviceState {
             "task_namespace_teardowns",
             acted.teardowns.len() as u64,
         );
-        acted.redefined.pop()
+        let redefined = acted.redefined.pop();
+        if redefined.is_some() {
+            // The previous address space ended under the same id.
+            self.end_task_pipelines(task_id);
+        }
+        redefined
     }
 
     pub fn delete_object(&mut self, task_id: u32, ref_: u32) -> bool {
@@ -6136,11 +6494,39 @@ impl reims_vgpu_core::access::AccessSource for DeviceAccess<'_> {
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .access(self.task, self.domain, participation)
+                // The device is the mapper, so a name declared as a window onto
+                // a surface resolves to the surface's backing *as of this
+                // access*. With no alias declared this is `access` exactly.
+                .access_through(self.task, self.domain, participation, self.state)
         };
         match answer {
             Ok(intent) => {
                 note_access_widened(self.state, self.task, participation, &intent);
+                if matches!(intent.key, reims_vgpu_core::access::AccessKey::DomainOnly)
+                    && crate::runtime::drain::lab_dag_window()
+                {
+                    use reims_vgpu_core::access::{AccessMode, ParticipationExtent};
+                    let object_type = self
+                        .state
+                        .constructed_object(self.task.0, participation.resource.slot.0)
+                        .map_or(255, |r| r.entry.object_type);
+                    crate::runtime::drain::lab_note_domain_only(
+                        object_type,
+                        participation.resource.slot.0,
+                        match participation.mode {
+                            AccessMode::Read => 'r',
+                            AccessMode::Write => 'w',
+                            AccessMode::ReadWrite => 'x',
+                            AccessMode::Unknown => 'u',
+                        },
+                        match participation.extent {
+                            ParticipationExtent::Range(_) => 'R',
+                            ParticipationExtent::Subresource(_) => 'S',
+                            ParticipationExtent::Whole => 'W',
+                            ParticipationExtent::Unbounded => 'U',
+                        },
+                    );
+                }
                 Ok(intent)
             }
             Err(refusal) => {
@@ -6415,6 +6801,316 @@ mod device_access_tests {
             .access(&participation(resource, AccessMode::Read))
             .expect("declared and resident");
         assert_eq!(intent.domain, DOMAIN);
+    }
+
+    /// What the walk is handed for a name declared as a window onto another
+    /// resource: the base's memory, the record's own mode, and the ordering
+    /// that follows — through the door the walk actually uses.
+    #[test]
+    fn a_view_declared_as_an_alias_is_ordered_against_its_base_through_the_walks_door() {
+        use reims_vgpu_core::access::{requires_edge, AccessKey, ResourceKey, SubresourceRange};
+        use reims_vgpu_core::lifecycle::Aliasing;
+
+        let (state, base) = state_with_one_resource();
+        let view = state
+            .declare_object(TASK, 8, Storage::NoBytes)
+            .expect("the task is open")
+            .id;
+        let window = SubresourceRange::one(0, 2);
+        let mut access = state.task_access(TaskId(TASK), DOMAIN);
+
+        // Before anyone says what it is, the name is what it always was.
+        let undeclared = access
+            .access(&participation(view, AccessMode::Read))
+            .expect("a live name with no bytes");
+        assert_eq!(
+            undeclared.key,
+            reims_vgpu_core::access::AccessKey::DomainOnly
+        );
+
+        assert_eq!(
+            state.declare_alias(
+                TASK,
+                view,
+                Aliasing::TextureView {
+                    base,
+                    window: Some(window)
+                }
+            ),
+            Ok(true)
+        );
+        for mode in [
+            AccessMode::Read,
+            AccessMode::Write,
+            AccessMode::ReadWrite,
+            AccessMode::Unknown,
+        ] {
+            let through = access
+                .access(&participation(view, mode))
+                .expect("the alias resolves");
+            assert_eq!(through.mode, mode, "the record's mode, exactly");
+            assert_eq!(
+                through.key,
+                AccessKey::Subresource(
+                    ResourceKey {
+                        backing: BACKING,
+                        heap: None
+                    },
+                    window
+                )
+            );
+            assert_eq!(through.output_content_version, None);
+        }
+        let write_base = access
+            .access(&participation(base, AccessMode::Write))
+            .expect("the base");
+        let read_view = access
+            .access(&participation(view, AccessMode::Read))
+            .expect("the view");
+        assert!(requires_edge(&write_base, &read_view));
+    }
+
+    /// A texture over a surface is ordered against the surface the device's
+    /// mapper holds *now*: the same identity a present of that surface reads, a
+    /// different one once the pages move, and `DomainOnly` while nothing is
+    /// mapped.
+    #[test]
+    fn a_surface_alias_meets_the_present_of_its_surface_and_follows_the_mapping() {
+        use reims_vgpu_core::access::{requires_edge, AccessIntent, AccessKey, ResourceKey};
+        use reims_vgpu_core::identity::MappingId;
+        use reims_vgpu_core::lifecycle::Aliasing;
+        use reims_vgpu_core::resolve::MappingResolver as _;
+
+        let (mut state, _) = state_with_one_resource();
+        let texture = state
+            .declare_object(TASK, 9, Storage::NoBytes)
+            .expect("the task is open")
+            .id;
+        let mid = 21u32;
+        assert_eq!(
+            state.declare_alias(TASK, texture, Aliasing::Surface(MappingId(mid))),
+            Ok(true)
+        );
+        let mut draw = |state: &DeviceState| {
+            state
+                .task_access(TaskId(TASK), DOMAIN)
+                .access(&participation(texture, AccessMode::Write))
+                .expect("a live name")
+        };
+        assert_eq!(
+            draw(&state).key,
+            AccessKey::DomainOnly,
+            "nothing is mapped, so there is no surface to name"
+        );
+
+        assert!(state.map_surface(mid));
+        let first = draw(&state);
+        let surface = state.backing(MappingId(mid)).expect("mapped");
+        let key = ResourceKey {
+            backing: surface,
+            heap: None,
+        };
+        assert_eq!(first.key, AccessKey::Whole(key));
+        // The shape a present of that surface is built with.
+        let present = AccessIntent {
+            domain: DOMAIN,
+            key: AccessKey::Whole(key),
+            mode: AccessMode::Read,
+            api_stages: 0,
+            input_content_version: None,
+            output_content_version: None,
+        };
+        assert!(
+            requires_edge(&first, &present),
+            "a draw into it, then the frame"
+        );
+
+        // The mapping's pages moved: an alias that had cached the old identity
+        // would keep naming storage the mapping no longer has.
+        let entry = state.mappings.get_mut(&mid).expect("mapped");
+        DeviceState::bump_map_generation(entry);
+        let moved = draw(&state);
+        assert_ne!(moved.key, first.key);
+        assert_eq!(
+            moved.key,
+            AccessKey::Whole(ResourceKey {
+                backing: state.backing(MappingId(mid)).expect("still mapped"),
+                heap: None
+            })
+        );
+    }
+
+    /// With per-task naming on, a pipeline is the task's and so is everything the
+    /// model holds for it; off, every task shares the one entry it always shared.
+    ///
+    /// The id is a slot and a generation and every task numbers its own list from
+    /// the same integers, so pipeline 30 of task 1 and pipeline 30 of task 3 are
+    /// one id. A reflection published for the first, answered to the second, is a
+    /// footprint derived from another task's shader; a build state, a deletion or
+    /// a refusal taken for the first and held against the second is a packet that
+    /// waits, refuses or runs for a pipeline that is not its own.
+    #[test]
+    fn a_pipeline_is_the_tasks_own_only_with_per_task_naming_on() {
+        use reims_vgpu_core::access::AccessMode;
+        use reims_vgpu_core::identity::ResourceId;
+        use reims_vgpu_core::pipeline::{
+            BindingUsage, PipelineState, PublishedUsage, RefusalReason, UsageSource as _,
+        };
+        use reims_vgpu_protocol::render::ShaderStage;
+
+        let pipeline = ResourceId {
+            slot: reims_vgpu_core::identity::ObjectListRef(30),
+            generation: reims_vgpu_core::identity::SlotGeneration::default().next(),
+        };
+        let usage = || {
+            PublishedUsage::render(
+                Some(BindingUsage::new(vec![Some(AccessMode::Read)], Vec::new())),
+                None,
+            )
+        };
+        let answered = |state: &DeviceState, task: u32| {
+            state
+                .pipeline_usage(task)
+                .binding_usage(pipeline, Some(ShaderStage::Vertex))
+                .is_some()
+        };
+
+        // On: two pipelines, each with its own reflection, state and end.
+        let state = DeviceState::new(DeviceId(1), 12);
+        crate::runtime::objects::with_pipeline_per_task(true, || {
+            assert!(state.declare_pipeline(1, pipeline));
+            assert!(
+                state.declare_pipeline(3, pipeline),
+                "task 3's pipeline 30 is not task 1's"
+            );
+            assert_eq!(state.pipeline_census().declared, 2);
+
+            assert!(state.publish_pipeline_usage(1, pipeline, usage()));
+            assert!(answered(&state, 1), "the task that published is answered");
+            assert!(!answered(&state, 3), "another task with the same id is not");
+            assert!(state.pipeline_usage_published(1, pipeline));
+            assert!(!state.pipeline_usage_published(3, pipeline));
+            assert!(state.pipeline_usage_wanted(3, pipeline));
+
+            // Task 1's build reaches ready; task 3's is still a declaration.
+            assert!(state.advance_pipeline(1, pipeline, PipelineState::Translating));
+            assert!(state.advance_pipeline(1, pipeline, PipelineState::Compiling));
+            assert!(state.ready_pipeline(1, pipeline));
+            assert!(state.pipeline_is_ready(1, pipeline));
+            assert!(!state.pipeline_is_ready(3, pipeline), "task 3 has not built");
+            assert_eq!(state.pipeline_state(3, pipeline), Some("declared"));
+
+            // Task 1 deletes its pipeline; task 3's is untouched.
+            assert!(state.retire_pipeline(1, pipeline).took);
+            assert_eq!(state.pipeline_state(1, pipeline), Some("retired"));
+            assert_eq!(state.pipeline_state(3, pipeline), Some("declared"));
+
+            // Task 3's build is refused; a third task's same-id pipeline is not.
+            assert!(state.declare_pipeline(9, pipeline));
+            assert!(
+                state
+                    .refuse_pipeline(3, pipeline, RefusalReason::TranslationFailed("test"))
+                    .took
+            );
+            assert_eq!(state.pipeline_state(9, pipeline), Some("declared"));
+        });
+
+        // Off: one entry for every task, as it always was.
+        let state = DeviceState::new(DeviceId(1), 12);
+        crate::runtime::objects::with_pipeline_per_task(false, || {
+            assert!(state.declare_pipeline(1, pipeline));
+            assert!(
+                !state.declare_pipeline(3, pipeline),
+                "one entry, however many tasks ask"
+            );
+            assert!(state.publish_pipeline_usage(1, pipeline, usage()));
+            assert!(
+                answered(&state, 3),
+                "switch off: one key for every task, as it always was"
+            );
+            assert!(state.advance_pipeline(1, pipeline, PipelineState::Translating));
+            assert_eq!(
+                state.pipeline_state(3, pipeline),
+                Some("translating"),
+                "and one build state"
+            );
+        });
+    }
+
+    /// A task's address space ending — deleted, or redefined under the same id —
+    /// takes the pipelines it named and no one else's.
+    ///
+    /// The next incarnation numbers its object list from the start again, so an
+    /// entry left behind would stand for a pipeline of the same slot and
+    /// generation that nobody has built.
+    #[test]
+    fn a_task_ending_ends_its_pipelines_with_per_task_naming_on() {
+        use reims_vgpu_core::identity::ResourceId;
+        use reims_vgpu_core::pipeline::PipelineState;
+
+        let pipeline = ResourceId {
+            slot: reims_vgpu_core::identity::ObjectListRef(30),
+            generation: reims_vgpu_core::identity::SlotGeneration::default().next(),
+        };
+        let ready = |state: &DeviceState, task: u32| {
+            state.declare_pipeline(task, pipeline);
+            assert!(state.advance_pipeline(task, pipeline, PipelineState::Translating));
+            assert!(state.advance_pipeline(task, pipeline, PipelineState::Compiling));
+            assert!(state.ready_pipeline(task, pipeline));
+        };
+        crate::runtime::objects::with_pipeline_per_task(true, || {
+            let mut state = DeviceState::new(DeviceId(1), 12);
+            state.define_task(1, 0x1000, 2);
+            state.define_task(3, 0x1000, 3);
+            ready(&state, 1);
+            ready(&state, 3);
+
+            // Redefined under the same id: its pipelines go, task 3's stay.
+            state.define_task(1, 0x1000, 4);
+            assert_eq!(state.pipeline_state(1, pipeline), None);
+            assert_eq!(state.pipeline_state(3, pipeline), Some("ready"));
+            assert!(
+                state.declare_pipeline(1, pipeline),
+                "the new incarnation's pipeline is new"
+            );
+            assert_eq!(state.pipeline_state(1, pipeline), Some("declared"));
+
+            // Deleted: the same.
+            ready(&state, 1);
+            assert!(state.delete_task(1));
+            assert_eq!(state.pipeline_state(1, pipeline), None);
+            assert_eq!(state.pipeline_state(3, pipeline), Some("ready"));
+        });
+    }
+
+    /// A pipeline is the task's own unless the operator says `off`, and
+    /// `REIMS_VGPU_ACCESS_EXACT` neither changes that nor is changed by it. Exact
+    /// accesses say a pipeline nothing is published for touches what its slots do
+    /// not name — the argument-buffer gap they would otherwise open — which the
+    /// default does not.
+    #[test]
+    fn a_pipeline_is_the_tasks_own_by_default_and_exact_accesses_are_a_separate_question() {
+        use reims_vgpu_core::pipeline::{PipelineScope, UsageSource as _};
+        let state = DeviceState::new(DeviceId(1), 12);
+        let task = |n: u32| PipelineScope::Task(reims_vgpu_core::identity::TaskId(n));
+        // No test override: the answer is the process's, and the process was not
+        // started with the switch off.
+        assert_eq!(state.pipeline_scope(4), task(4));
+        crate::runtime::objects::with_pipeline_per_task(false, || {
+            assert_eq!(state.pipeline_scope(4), PipelineScope::Shared);
+            crate::runtime::objects::with_access_exact(true, || {
+                assert_eq!(
+                    state.pipeline_scope(4),
+                    PipelineScope::Shared,
+                    "`off` restores the shared naming whatever else is on"
+                );
+                assert!(state.pipeline_usage(4).unanswered_is_unbounded());
+            });
+            assert!(!state.pipeline_usage(4).unanswered_is_unbounded());
+        });
+        crate::runtime::objects::with_access_exact(true, || {
+            assert_eq!(state.pipeline_scope(4), task(4));
+        });
     }
 
     /// A name the task never declared refuses with the owner's own slug, and
@@ -6845,6 +7541,10 @@ mod pipeline_door_tests {
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
 
+    /// The task the door tests run as. One task: the tests are about the door's
+    /// lifetime rules, and the per-task naming has its own test above.
+    const TASK: u32 = 1;
+
     fn name(slot: u32) -> ResourceId {
         ResourceId {
             slot: ObjectListRef(slot),
@@ -6866,26 +7566,26 @@ mod pipeline_door_tests {
         assert_eq!(state.pipeline_census().declared, 0);
 
         assert!(
-            state.declare_pipeline(name(9)),
+            state.declare_pipeline(TASK, name(9)),
             "the first sight of a pipeline is its declaration"
         );
         assert!(
-            !state.declare_pipeline(name(9)),
+            !state.declare_pipeline(TASK, name(9)),
             "and every re-bind after it is not, which is most of them"
         );
         assert_eq!(state.pipeline_census().declared, 1);
 
         // A different slot is a different pipeline; a different generation of
         // the same slot is too, which is the whole reason the name carries one.
-        assert!(state.declare_pipeline(name(10)));
-        assert!(state.declare_pipeline(ResourceId {
+        assert!(state.declare_pipeline(TASK, name(10)));
+        assert!(state.declare_pipeline(TASK, ResourceId {
             slot: ObjectListRef(9),
             generation: SlotGeneration(2),
         }));
         assert_eq!(state.pipeline_census().declared, 3);
 
         assert_eq!(
-            state.retire_pipeline(name(9)),
+            state.retire_pipeline(TASK, name(9)),
             reims_vgpu_core::session::Ended {
                 took: true,
                 stranded: Vec::new()
@@ -6907,7 +7607,7 @@ mod pipeline_door_tests {
         // nothing parked on it answers. A driven boot needs the difference: the
         // guest deletes render pipelines this device never drew with.
         assert_eq!(
-            state.retire_pipeline(name(4000)),
+            state.retire_pipeline(TASK, name(4000)),
             reims_vgpu_core::session::Ended::default()
         );
         assert_eq!(state.pipeline_census().retired, 1);
@@ -6928,21 +7628,21 @@ mod pipeline_door_tests {
         use reims_vgpu_core::pipeline::PipelineState;
 
         let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.declare_pipeline(name(9)));
+        assert!(state.declare_pipeline(TASK, name(9)));
 
         assert!(
-            !state.advance_pipeline(name(9), PipelineState::Compiling),
+            !state.advance_pipeline(TASK, name(9), PipelineState::Compiling),
             "the steps are a lifetime and not a set: nothing compiles that has \
              not been translated"
         );
-        assert!(state.advance_pipeline(name(9), PipelineState::Translating));
-        assert!(state.advance_pipeline(name(9), PipelineState::Compiling));
+        assert!(state.advance_pipeline(TASK, name(9), PipelineState::Translating));
+        assert!(state.advance_pipeline(TASK, name(9), PipelineState::Compiling));
         assert_eq!(
             state.pipeline_census().ready,
             0,
             "compiling is not usable, and a draw binding it is not ready"
         );
-        assert!(state.ready_pipeline(name(9)));
+        assert!(state.ready_pipeline(TASK, name(9)));
         assert_eq!(state.pipeline_census().ready, 1);
 
         // The Metal rail retains no pipeline state, so it walks these same
@@ -6955,7 +7655,7 @@ mod pipeline_door_tests {
             PipelineState::Ready,
         ] {
             assert!(
-                !state.advance_pipeline(name(9), step),
+                !state.advance_pipeline(TASK, name(9), step),
                 "{} is not a step from ready",
                 step.name()
             );
@@ -6974,13 +7674,13 @@ mod pipeline_door_tests {
         use reims_vgpu_core::pipeline::{PipelineState, RefusalReason};
 
         let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.declare_pipeline(name(9)));
-        assert!(state.advance_pipeline(name(9), PipelineState::Translating));
+        assert!(state.declare_pipeline(TASK, name(9)));
+        assert!(state.advance_pipeline(TASK, name(9), PipelineState::Translating));
 
         assert!(
             state
                 .refuse_pipeline(
-                    name(9),
+                    TASK, name(9),
                     RefusalReason::TranslationFailed("vertex_translate")
                 )
                 .took,
@@ -6991,10 +7691,10 @@ mod pipeline_door_tests {
         // The guest re-binds a pipeline this device cannot build on every
         // frame, and each of those draws re-walks the rail. One refusal is the
         // whole point of the state being terminal.
-        assert!(!state.advance_pipeline(name(9), PipelineState::Compiling));
+        assert!(!state.advance_pipeline(TASK, name(9), PipelineState::Compiling));
         assert!(
             !state
-                .refuse_pipeline(name(9), RefusalReason::CompilationFailed("again"))
+                .refuse_pipeline(TASK, name(9), RefusalReason::CompilationFailed("again"))
                 .took
         );
         assert_eq!(state.pipeline_census().refused, 1);
@@ -7004,7 +7704,7 @@ mod pipeline_door_tests {
         // absent rather than refusing a name the table has no entry for.
         assert!(
             !state
-                .refuse_pipeline(name(4000), RefusalReason::CompilationFailed("absent"))
+                .refuse_pipeline(TASK, name(4000), RefusalReason::CompilationFailed("absent"))
                 .took
         );
         assert_eq!(state.pipeline_census().refused, 1);
@@ -7276,7 +7976,12 @@ mod slot_table_reach_tests {
 ///
 /// See [`DeviceState::pipeline_usage`] for why this is a guard and not a
 /// lookup.
-pub struct PipelineUsage<'a>(std::sync::MutexGuard<'a, reims_vgpu_core::session::SessionModel>);
+pub struct PipelineUsage<'a>(
+    std::sync::MutexGuard<'a, reims_vgpu_core::session::SessionModel>,
+    reims_vgpu_core::pipeline::PipelineScope,
+    u32,
+    &'a super::lab_pipeline_shadow::LabShadow,
+);
 
 impl std::fmt::Debug for PipelineUsage<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -7290,7 +7995,25 @@ impl reims_vgpu_core::pipeline::UsageSource for PipelineUsage<'_> {
         pipeline: reims_vgpu_core::identity::ResourceId,
         stage: Option<reims_vgpu_protocol::render::ShaderStage>,
     ) -> Option<&reims_vgpu_core::pipeline::BindingUsage> {
-        self.0.pipelines_ref().binding_usage(pipeline, stage)
+        let id = self.1.id(pipeline);
+        let real = self.0.pipelines_ref().binding_usage_of(id, stage);
+        let state = if real.is_none() {
+            self.0.pipelines_ref().get(id).map(|p| p.state)
+        } else {
+            None
+        };
+        self.3.lookup(self.2, pipeline, stage, real, state);
+        real
+    }
+
+    /// With `REIMS_VGPU_ACCESS_EXACT` on, a draw through a pipeline nothing is
+    /// published for is ordered against everything in its domain. Exact accesses
+    /// are what make the slots a draw binds the whole of what it touches, and a
+    /// shader that could not be reflected is the one that can reach memory no
+    /// binding names (an argument buffer); off, the slots it binds are all the
+    /// model has ever said about it.
+    fn unanswered_is_unbounded(&self) -> bool {
+        crate::runtime::objects::access_exact()
     }
 }
 

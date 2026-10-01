@@ -45,6 +45,41 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             task_id,
             pipeline_ref,
         ) {
+            if crate::runtime::drain::lab_dag_window() {
+                crate::runtime::drain::lab_note_memo_skip(state, task_id, pipeline_ref);
+            }
+            // **A memoized translation is not a published usage.** The memo
+            // answers "will executing this wait for a translation", and skipping
+            // here was right for that question; but the model learns what a
+            // pipeline's shaders do with each slot only when somebody publishes
+            // it, and this pass is where a packet's pipelines are published
+            // before admission readies them. A pipeline that was memoized by a
+            // path that did not publish — or whose publication the model
+            // declined while it would take none for that pipeline — stays
+            // `Unknown` for every packet that binds it, for as long as this
+            // `continue` stands.
+            //
+            // So when the model *wants* the usage (see
+            // `PipelineTable::usage_wanted_by`) it is published from the memo's
+            // own resolution, which holds the reflections: no guest read and no
+            // translation, and nothing here can make the packet wait.
+            //
+            // Behind [`crate::runtime::objects::access_exact`]: publishing
+            // earlier narrows the accesses of every later packet, which changes
+            // which of them the model may release ahead of which.
+            if crate::runtime::objects::access_exact()
+                && state
+                    .object_name(task_id, pipeline_ref)
+                    .is_some_and(|name| state.pipeline_usage_wanted(task_id, name))
+                && crate::backend::vulkan::pipeline_resolve::publish_memoized_usage(
+                    state,
+                    host,
+                    task_id,
+                    pipeline_ref,
+                )
+            {
+                crate::runtime::drain::note_store_route("access_memo_hit_publishes_usage");
+            }
             continue;
         }
         let air_started = std::time::Instant::now();
@@ -139,7 +174,7 @@ fn publish_render_usage<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("pipeline_usage_unnamed");
         return;
     };
-    if state.pipeline_usage_published(name) {
+    if state.pipeline_usage_published(task_id, name) {
         crate::runtime::drain::note_store_route("render_usage_already_published");
         return;
     }
@@ -276,7 +311,7 @@ fn publish_kernel_usage<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("pipeline_usage_unnamed");
         return;
     };
-    if state.pipeline_usage_published(name) {
+    if state.pipeline_usage_published(task_id, name) {
         crate::runtime::drain::note_store_route("compute_usage_already_published");
         return;
     }

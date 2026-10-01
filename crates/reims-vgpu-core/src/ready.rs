@@ -42,9 +42,8 @@
 //! waiting on a stamp nobody will write is a hang with a cause, and this is the
 //! cause.
 
-use crate::identity::{
-    CompletionStamp, IngressOrdinal, ResourceId, StampSlot, StampValue, StampWait,
-};
+use crate::identity::{CompletionStamp, IngressOrdinal, StampSlot, StampValue, StampWait};
+use crate::pipeline::PipelineId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// One admitted transaction's unfinished business.
@@ -69,7 +68,7 @@ struct Pending {
     /// that completed long ago.
     registered_slots: Vec<StampSlot>,
     /// Pipelines that must become usable before this may begin.
-    pipeline_waits: Vec<ResourceId>,
+    pipeline_waits: Vec<PipelineId>,
     /// What this transaction publishes when it completes.
     completion: Option<CompletionStamp>,
 }
@@ -94,7 +93,7 @@ pub struct Scheduler {
     waiters_by_slot: HashMap<StampSlot, BTreeSet<IngressOrdinal>>,
     /// Transactions blocked on each pipeline, so a compilation finishing does
     /// not scan either.
-    waiters_by_pipeline: HashMap<ResourceId, BTreeSet<IngressOrdinal>>,
+    waiters_by_pipeline: HashMap<PipelineId, BTreeSet<IngressOrdinal>>,
     /// For each transaction, the transactions that must not overtake it.
     dependents: HashMap<IngressOrdinal, Vec<IngressOrdinal>>,
     ready: BTreeSet<IngressOrdinal>,
@@ -124,7 +123,7 @@ impl Scheduler {
         ordinal: IngressOrdinal,
         hazard_waits: &[IngressOrdinal],
         stamp_waits: &[StampWait],
-        pipeline_waits: &[ResourceId],
+        pipeline_waits: &[PipelineId],
         completion: Option<CompletionStamp>,
     ) -> bool {
         let live: Vec<_> = hazard_waits
@@ -293,7 +292,7 @@ impl Scheduler {
     ///
     /// Indexed rather than scanned, so a compilation finishing costs the
     /// waiters it actually had.
-    pub fn pipeline_ready(&mut self, pipeline: ResourceId) {
+    pub fn pipeline_ready(&mut self, pipeline: PipelineId) {
         let Some(waiters) = self.waiters_by_pipeline.remove(&pipeline) else {
             return;
         };
@@ -308,6 +307,23 @@ impl Scheduler {
         }
     }
 
+    /// The transactions parked on `pipeline`, without changing what they wait
+    /// for. For an observer: [`Self::pipeline_ready`] and
+    /// [`Self::pipeline_refused`] take the list.
+    #[must_use]
+    pub fn pipeline_waiters(&self, pipeline: PipelineId) -> Vec<IngressOrdinal> {
+        self.waiters_by_pipeline
+            .get(&pipeline)
+            .map(|waiters| {
+                waiters
+                    .iter()
+                    .copied()
+                    .filter(|w| self.pending.contains_key(w))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// A pipeline will never be usable: name the transactions that can
     /// therefore never be ready.
     ///
@@ -318,7 +334,7 @@ impl Scheduler {
     /// labour [`Scheduler::stalled`] follows, except that this one is certain
     /// rather than diagnosed.
     #[must_use]
-    pub fn pipeline_refused(&mut self, pipeline: ResourceId) -> Vec<IngressOrdinal> {
+    pub fn pipeline_refused(&mut self, pipeline: PipelineId) -> Vec<IngressOrdinal> {
         let Some(waiters) = self.waiters_by_pipeline.remove(&pipeline) else {
             return Vec::new();
         };
@@ -342,7 +358,7 @@ impl Scheduler {
     pub fn release_ended_pipeline_wait(
         &mut self,
         ingress: IngressOrdinal,
-        pipeline: ResourceId,
+        pipeline: PipelineId,
     ) -> bool {
         let Some(p) = self.pending.get_mut(&ingress) else {
             return false;
@@ -444,11 +460,11 @@ mod tests {
         }
     }
 
-    fn pipe(slot: u32) -> ResourceId {
-        ResourceId {
+    fn pipe(slot: u32) -> PipelineId {
+        PipelineId::shared(crate::identity::ResourceId {
             slot: crate::identity::ObjectListRef(slot),
             generation: crate::identity::SlotGeneration::default().next(),
-        }
+        })
     }
 
     /// **The waiter index holds only live waiters.**
@@ -702,6 +718,29 @@ mod tests {
         assert_eq!(s.waiting_on_pipelines(), 0);
     }
 
+    /// Two tasks' pipelines with one object-list id are two waits: one finishing
+    /// releases its own task's transactions and nobody else's.
+    #[test]
+    fn a_pipeline_finishing_releases_only_its_own_tasks_waiters() {
+        use crate::identity::TaskId;
+        let resource = pipe(4).resource();
+        let (one, three) = (
+            PipelineId::of(TaskId(1), resource),
+            PipelineId::of(TaskId(3), resource),
+        );
+        let mut s = Scheduler::new();
+        assert!(!s.admit(ord(1), &[], &[], &[one], None));
+        assert!(!s.admit(ord(2), &[], &[], &[three], None));
+        assert_eq!(s.pipeline_waiters(one), vec![ord(1)]);
+        assert_eq!(s.pipeline_waiters(three), vec![ord(2)]);
+
+        s.pipeline_ready(one);
+        assert_eq!(s.take_ready(), vec![ord(1)], "task 1's build is task 1's");
+        assert_eq!(s.pipeline_waiters(three), vec![ord(2)]);
+        assert_eq!(s.pipeline_refused(three), vec![ord(2)]);
+        assert!(s.pipeline_waiters(three).is_empty());
+    }
+
     /// A pipeline is one prerequisite among three, and discharging it alone
     /// does not make a transaction ready.
     #[test]
@@ -807,7 +846,7 @@ mod tests {
         IngressOrdinal,
         Vec<IngressOrdinal>,
         Vec<StampWait>,
-        Vec<ResourceId>,
+        Vec<PipelineId>,
     );
 
     /// Tiny pools, so slots and pipelines are shared constantly and one
@@ -862,7 +901,7 @@ mod tests {
                         let stamps: Vec<StampWait> = (0..rng.below(3))
                             .map(|_| wait(rng.below(SLOTS) as u32 + 1, rng.below(4) as u32 + 1))
                             .collect();
-                        let pipes: Vec<ResourceId> = (0..rng.below(3))
+                        let pipes: Vec<PipelineId> = (0..rng.below(3))
                             .map(|_| pipe(rng.below(PIPES) as u32 + 1))
                             .collect();
                         let got = s.admit(ordinal, &hazards, &stamps, &pipes, None);

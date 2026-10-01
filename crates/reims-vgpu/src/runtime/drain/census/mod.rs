@@ -3123,6 +3123,96 @@ thread_local! {
     static STORE_ROUTE_CACHE: std::cell::RefCell<
         std::collections::HashMap<&'static str, StoreRouteCounter>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// The same cache, keyed by the route's *address* instead of its text.
+    ///
+    /// A route is a string literal, so the pointer and length name it for the
+    /// life of the process, and hashing the text with the default hasher (15 ns a
+    /// call, about 330 calls per packet on a driven drag) bought nothing the
+    /// address does not. Two literals with equal text at different addresses are
+    /// two keys of one counter: the slow path still goes through the registry by
+    /// text, so they share it.
+    static FAST_ROUTE_CACHE: std::cell::RefCell<RouteCache> =
+        const { std::cell::RefCell::new(RouteCache::empty()) };
+}
+
+/// An open-addressed table from a route's address to its counter.
+struct RouteCache {
+    slots: Vec<RouteSlot>,
+    used: usize,
+}
+
+struct RouteSlot {
+    ptr: usize,
+    len: usize,
+    counter: Option<StoreRouteCounter>,
+}
+
+impl RouteCache {
+    const fn empty() -> Self {
+        Self {
+            slots: Vec::new(),
+            used: 0,
+        }
+    }
+
+    #[inline]
+    fn start(ptr: usize, len: usize, mask: usize) -> usize {
+        ((ptr ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) & mask
+    }
+
+    #[inline]
+    fn find(&self, route: &'static str) -> Option<&StoreRouteCounter> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let (ptr, len) = (route.as_ptr() as usize, route.len());
+        let mask = self.slots.len() - 1;
+        let mut i = Self::start(ptr, len, mask);
+        loop {
+            let slot = &self.slots[i];
+            match &slot.counter {
+                None => return None,
+                Some(counter) if slot.ptr == ptr && slot.len == len => return Some(counter),
+                Some(_) => i = (i + 1) & mask,
+            }
+        }
+    }
+
+    fn insert(&mut self, route: &'static str, counter: StoreRouteCounter) {
+        if (self.used + 1) * 2 > self.slots.len() {
+            let wanted = (self.slots.len() * 2).max(256);
+            let old = std::mem::take(&mut self.slots);
+            self.slots = (0..wanted)
+                .map(|_| RouteSlot {
+                    ptr: 0,
+                    len: 0,
+                    counter: None,
+                })
+                .collect();
+            self.used = 0;
+            for slot in old {
+                if let Some(counter) = slot.counter {
+                    self.place(slot.ptr, slot.len, counter);
+                }
+            }
+        }
+        self.place(route.as_ptr() as usize, route.len(), counter);
+    }
+
+    fn place(&mut self, ptr: usize, len: usize, counter: StoreRouteCounter) {
+        let mask = self.slots.len() - 1;
+        let mut i = Self::start(ptr, len, mask);
+        while self.slots[i].counter.is_some() {
+            i = (i + 1) & mask;
+        }
+        self.slots[i] = RouteSlot {
+            ptr,
+            len,
+            counter: Some(counter),
+        };
+        self.used += 1;
+    }
 }
 
 /// # This census cannot find the Finder icon defect, and that is now measured
@@ -3212,6 +3302,25 @@ pub fn note_store_route_n(route: &'static str, n: u64) {
     if n == 0 {
         return;
     }
+    if crate::runtime::cost_opts::on() {
+        FAST_ROUTE_CACHE.with(|cache| {
+            if let Some(counter) = cache.borrow().find(route) {
+                counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            let counter = {
+                let Ok(mut routes) = STORE_ROUTES.lock() else {
+                    return;
+                };
+                std::sync::Arc::clone(routes.entry(route).or_insert_with(|| {
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))
+                }))
+            };
+            counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            cache.borrow_mut().insert(route, counter);
+        });
+        return;
+    }
     STORE_ROUTE_CACHE.with(|cache| {
         let hit = {
             let cache = cache.borrow();
@@ -3287,6 +3396,59 @@ fn take_store_routes() -> Option<String> {
         }
     }
     any.then_some(out)
+}
+
+#[cfg(test)]
+mod route_cache_tests {
+    use super::{note_store_route, note_store_route_n, store_route_count};
+
+    fn leak(text: &str) -> &'static str {
+        Box::leak(text.to_string().into_boxed_str())
+    }
+
+    /// Both lookup paths count one route once, whichever address the text came
+    /// from: the keyed-by-address cache must not split a counter in two.
+    #[test]
+    fn equal_text_at_two_addresses_is_one_counter_on_either_path() {
+        for on in [true, false] {
+            crate::runtime::cost_opts::with(on, || {
+                let text = format!("lab_rc_equal_text_{on}");
+                let (a, b) = (leak(&text), leak(&text));
+                assert_ne!(a.as_ptr(), b.as_ptr());
+                note_store_route(a);
+                note_store_route(b);
+                note_store_route_n(a, 3);
+                note_store_route_n(b, 0);
+                assert_eq!(store_route_count(&text), 5, "on={on}");
+            });
+        }
+    }
+
+    /// A thousand distinct routes grow the table several times over and every one
+    /// of them still counts to its own total, interleaved.
+    #[test]
+    fn a_thousand_routes_each_keep_their_own_count() {
+        for on in [true, false] {
+            crate::runtime::cost_opts::with(on, || {
+                let names: Vec<&'static str> = (0..1000)
+                    .map(|i| leak(&format!("lab_rc_many_{on}_{i}")))
+                    .collect();
+                for round in 0..3u64 {
+                    for (i, name) in names.iter().enumerate() {
+                        note_store_route_n(name, 1 + (i as u64 % 4) + round);
+                    }
+                }
+                for (i, name) in names.iter().enumerate() {
+                    let each = 1 + (i as u64 % 4);
+                    assert_eq!(
+                        store_route_count(name),
+                        3 * each + 3,
+                        "{name} on={on}"
+                    );
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]

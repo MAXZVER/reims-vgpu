@@ -461,6 +461,31 @@ impl AccessMode {
             Self::Unknown => "unknown",
         }
     }
+
+    /// The one mode that does everything either of these does.
+    ///
+    /// For two statements about one piece of memory made by one operation — a
+    /// shader that reads a buffer through one binding and writes it through
+    /// another — the operation's access is both of them together, and this is
+    /// that. It is a join and so it only ever moves *up*: a write joined with
+    /// anything still writes, a read joined with a write is `ReadWrite` and is
+    /// neither alone, and ignorance absorbs, because a direction nobody
+    /// established might be any of them. It is the answer that does not let the
+    /// order two bindings are listed in decide a hazard.
+    ///
+    /// Commutative, associative and idempotent, which is what makes folding a
+    /// list of them independent of the list's order; a test holds it to all
+    /// three.
+    #[must_use]
+    pub const fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::ReadWrite, _) | (_, Self::ReadWrite) => Self::ReadWrite,
+            (Self::Read, Self::Write) | (Self::Write, Self::Read) => Self::ReadWrite,
+            (Self::Read, Self::Read) => Self::Read,
+            (Self::Write, Self::Write) => Self::Write,
+        }
+    }
 }
 
 /// A resource's content version.
@@ -540,6 +565,17 @@ pub enum ParticipationExtent {
     /// the texture's whole pyramid and whose level count the record does not
     /// carry.
     Whole,
+    /// The operation touches memory this device cannot enumerate: an indirect
+    /// command buffer's commands, the resources behind an argument buffer, a
+    /// shader nobody has reflected. The resource it names is the operation's
+    /// cause, not its footprint, and is not resolved.
+    ///
+    /// Resolves to [`AccessKey::DomainOnly`], which meets every access in its
+    /// domain — with the mode the participation states, so `Unknown` orders
+    /// against readers and writers alike. It is the one honest answer to "what
+    /// does this touch" when the answer is not in any record, and it only ever
+    /// over-orders.
+    Unbounded,
 }
 
 impl Participation {
@@ -556,12 +592,18 @@ impl Participation {
         input_content_version: Option<ContentVersion>,
         output_content_version: Option<ContentVersion>,
     ) -> AccessIntent {
+        // No key to name, and no bytes to carry a version: the answer is the
+        // one a name with no bytes gets.
+        if matches!(self.extent, ParticipationExtent::Unbounded) {
+            return self.resolve_no_bytes(domain);
+        }
         AccessIntent {
             domain,
             key: match self.extent {
                 ParticipationExtent::Range(r) => AccessKey::Range(resource, r),
                 ParticipationExtent::Subresource(s) => AccessKey::Subresource(resource, s),
                 ParticipationExtent::Whole => AccessKey::Whole(resource),
+                ParticipationExtent::Unbounded => AccessKey::DomainOnly,
             },
             mode: self.mode,
             api_stages: self.api_stages,
@@ -861,6 +903,48 @@ mod tests {
         }
     }
 
+    /// An unbounded participation resolves to `DomainOnly` with the mode it
+    /// states, whatever resource it names and whatever key it is handed, and
+    /// carries no versions.
+    #[test]
+    fn an_unbounded_participation_resolves_to_domain_only_with_its_own_mode() {
+        let participation = |mode| Participation {
+            resource: ResourceId {
+                slot: crate::identity::ObjectListRef(3),
+                generation: crate::identity::SlotGeneration::default(),
+            },
+            extent: ParticipationExtent::Unbounded,
+            mode,
+            api_stages: 0x5,
+        };
+        for mode in [AccessMode::Read, AccessMode::Unknown] {
+            let got = participation(mode).resolve(
+                ChannelId(4),
+                key(9),
+                Some(ContentVersion(1)),
+                Some(ContentVersion(2)),
+            );
+            assert_eq!(got.key, AccessKey::DomainOnly);
+            assert_eq!(got.mode, mode);
+            assert_eq!(got.domain, ChannelId(4));
+            assert_eq!(
+                (got.input_content_version, got.output_content_version),
+                (None, None)
+            );
+            assert_eq!(got.api_stages, 0x5);
+        }
+        // It meets everything in its domain, and an Unknown one meets readers.
+        let unknown = participation(AccessMode::Unknown).resolve(ChannelId(1), key(9), None, None);
+        assert!(requires_edge(
+            &unknown,
+            &intent(AccessKey::Whole(key(77)), AccessMode::Read)
+        ));
+        assert!(requires_edge(
+            &intent(AccessKey::Whole(key(77)), AccessMode::Read),
+            &unknown
+        ));
+    }
+
     #[test]
     fn a_zero_length_range_names_no_byte_and_so_conflicts_with_nothing() {
         let empty = ByteRange {
@@ -1036,6 +1120,61 @@ mod tests {
             assert!(other.may_alias(AccessKey::DomainOnly));
         }
         assert_eq!(AccessKey::DomainOnly.rung(), 3);
+    }
+
+    /// A join never weakens: whatever either side orders against, the joined
+    /// mode orders against, and it is neither a read nor a write alone when the
+    /// two disagree.
+    #[test]
+    fn joining_two_modes_never_loses_what_either_one_does() {
+        const ALL: [AccessMode; 4] = [
+            AccessMode::Read,
+            AccessMode::Write,
+            AccessMode::ReadWrite,
+            AccessMode::Unknown,
+        ];
+        for a in ALL {
+            assert_eq!(a.join(a), a, "idempotent");
+            for b in ALL {
+                let j = a.join(b);
+                assert_eq!(j, b.join(a), "commutative: {a:?} {b:?}");
+                assert_eq!(
+                    j.writes(),
+                    a.writes() || b.writes(),
+                    "a join writes exactly when either side does: {a:?} {b:?}"
+                );
+                // Against every mode, in both orders: if either side needs an
+                // edge the join does too.
+                for c in ALL {
+                    let k = key(1);
+                    let (ia, ib, ij, ic) = (
+                        intent(AccessKey::Whole(k), a),
+                        intent(AccessKey::Whole(k), b),
+                        intent(AccessKey::Whole(k), j),
+                        intent(AccessKey::Whole(k), c),
+                    );
+                    for side in [&ia, &ib] {
+                        assert!(
+                            !requires_edge(&ic, side) || requires_edge(&ic, &ij),
+                            "{a:?} {b:?} {c:?}: later"
+                        );
+                        assert!(
+                            !requires_edge(side, &ic) || requires_edge(&ij, &ic),
+                            "{a:?} {b:?} {c:?}: earlier"
+                        );
+                    }
+                    assert_eq!(j.join(c), a.join(b.join(c)), "associative");
+                }
+            }
+        }
+        assert_eq!(
+            AccessMode::Read.join(AccessMode::Write),
+            AccessMode::ReadWrite
+        );
+        assert_eq!(
+            AccessMode::Read.join(AccessMode::Unknown),
+            AccessMode::Unknown
+        );
     }
 
     #[test]

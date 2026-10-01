@@ -672,7 +672,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             let model_pipeline = state
                 .object_name(task_id, acc.pipeline_ref)
                 .map_or("unnamed", |id| {
-                    state.pipeline_state(id).unwrap_or("unleased")
+                    state.pipeline_state(task_id, id).unwrap_or("unleased")
                 });
             crate::observe::Emit::decline("compute_linux_m2v", &e)
                 .field("pipe", acc.pipeline_ref)

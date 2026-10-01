@@ -6341,10 +6341,13 @@ fn a_pipeline_destroy_whose_ref_names_another_kind_retires_no_pipeline() {
         .declare_object(TASK, REF, reims_vgpu_core::lifecycle::Storage::NoBytes)
         .expect("the task is open")
         .id;
-    assert!(state.declare_pipeline(name), "declared for the first time");
-    state.advance_pipeline(name, PipelineState::Translating);
-    state.advance_pipeline(name, PipelineState::Compiling);
-    assert!(state.ready_pipeline(name));
+    assert!(
+        state.declare_pipeline(TASK, name),
+        "declared for the first time"
+    );
+    state.advance_pipeline(TASK, name, PipelineState::Translating);
+    state.advance_pipeline(TASK, name, PipelineState::Compiling);
+    assert!(state.ready_pipeline(TASK, name));
 
     let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
     st32(&mut payload[0..], TASK);
@@ -6366,7 +6369,7 @@ fn a_pipeline_destroy_whose_ref_names_another_kind_retires_no_pipeline() {
     );
 
     assert!(
-        state.pipeline_is_ready(name),
+        state.pipeline_is_ready(TASK, name),
         "the destroy's ref is a number in another space; retiring the object \
          that merely shares it tombstones a pipeline the guest still binds"
     );

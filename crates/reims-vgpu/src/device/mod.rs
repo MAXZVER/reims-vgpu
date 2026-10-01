@@ -639,6 +639,11 @@ pub fn device_drain(id: u64) -> bool {
         if let Some(line) = device.state.pipeline_occupancy_census() {
             crate::observe::off(line);
         }
+        // And the graph those pipelines' transactions are admitted into: how much
+        // of its ordering is bought with knowledge and how much with ignorance.
+        if let Some(line) = device.state.dependency_graph_census() {
+            crate::observe::off(line);
+        }
     });
     // Beside it and on the same cadence: a page the guest released is judged
     // against the write census, which only moves when this device writes. Also

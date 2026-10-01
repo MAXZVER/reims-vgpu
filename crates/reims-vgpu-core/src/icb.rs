@@ -105,30 +105,41 @@ impl IcbOp {
 
     /// What this operation touches.
     ///
-    /// The ICB is read whole — the command range is in commands and the bytes
-    /// are not derivable from it — and the argument buffer, where there is one,
-    /// is read with no extent for the same reason its encoding is unestablished.
+    /// An execution touches **everything its commands touch, and that is not
+    /// known**: the commands are inside the buffer, the resources they bind are
+    /// the guest's to have declared through residency, and this device's
+    /// residency rows are all unresolved. An operation here that claimed to know
+    /// them would be claiming the contract that is open, and one that claimed
+    /// to read the ICB alone would be claiming that running it writes nothing —
+    /// a command that draws writes its target, and a later packet reading that
+    /// target would get no edge to this one. So an execution is
+    /// [`ParticipationExtent::Unbounded`] and `Unknown`: ordered against every
+    /// access in its domain, which is what the ICB's no-bytes name resolved to
+    /// before exact accesses made the difference visible.
     ///
-    /// **What is deliberately absent: the resources the ICB's own commands
-    /// touch.** Those are inside the buffer, they are the guest's to have
-    /// declared through residency, and this device's residency rows are all
-    /// unresolved. An operation here that claimed to know them would be
-    /// claiming the contract that is open.
+    /// The optimize hint only rewrites the device's representation of the
+    /// commands, and is the ICB read-write; the argument buffer, where there is
+    /// one, is read with no extent for the reason its encoding is unestablished.
     #[must_use]
     pub fn participations(&self) -> Participations {
-        let commands = Participation {
-            resource: self.icb(),
-            extent: ParticipationExtent::Whole,
-            mode: if self.executes() {
-                AccessMode::Read
-            } else {
+        let commands = if self.executes() {
+            Participation {
+                resource: self.icb(),
+                extent: ParticipationExtent::Unbounded,
+                mode: AccessMode::Unknown,
+                api_stages: NO_STAGES,
+            }
+        } else {
+            Participation {
+                resource: self.icb(),
+                extent: ParticipationExtent::Whole,
                 // An optimize hint may rewrite the device's representation of
                 // the commands. Nothing establishes that it does not, and a
                 // read-only claim that turned out to be a write is a missing
                 // edge rather than a redundant one.
-                AccessMode::ReadWrite
-            },
-            api_stages: NO_STAGES,
+                mode: AccessMode::ReadWrite,
+                api_stages: NO_STAGES,
+            }
         };
         Participations::pair(
             Some(commands),
@@ -245,8 +256,12 @@ mod tests {
         let parts = op.participations();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].resource, res(1));
-        assert_eq!(parts[0].extent, ParticipationExtent::Whole);
-        assert_eq!(parts[0].mode, AccessMode::Read);
+        assert_eq!(
+            parts[0].extent,
+            ParticipationExtent::Unbounded,
+            "the commands touch what nothing here can enumerate"
+        );
+        assert_eq!(parts[0].mode, AccessMode::Unknown);
     }
 
     /// The indirect form reads a second buffer, with no extent.
@@ -289,9 +304,19 @@ mod tests {
         assert!(!range.is_empty());
         assert!(CommandRange::default().is_empty());
         // The whole claim: nothing in this module turns one into a byte offset.
+        // An execution's ICB claim is unbounded and every other claim is whole.
         for op in every_op() {
-            for part in op.participations() {
-                assert_eq!(part.extent, ParticipationExtent::Whole);
+            let parts = op.participations();
+            for (i, part) in parts.into_iter().enumerate() {
+                let unbounded = i == 0 && op.executes();
+                assert_eq!(
+                    part.extent,
+                    if unbounded {
+                        ParticipationExtent::Unbounded
+                    } else {
+                        ParticipationExtent::Whole
+                    }
+                );
             }
         }
     }

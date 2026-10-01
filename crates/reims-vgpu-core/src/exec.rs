@@ -303,6 +303,16 @@ pub struct ExecWork {
     /// supplied.
     pub accesses: Vec<AccessIntent>,
     pub pipeline_leases: Vec<ResourceId>,
+    /// How [`Self::pipeline_leases`] are named in the pipeline table.
+    ///
+    /// The leases are bare resource ids — ids in *one task's* object list — and
+    /// the walk that collected them does not name the task. The device that built
+    /// the transaction does, here, once: [`crate::pipeline::PipelineScope::Task`]
+    /// makes them that task's pipelines, and the default
+    /// [`crate::pipeline::PipelineScope::Shared`] is the naming the table has
+    /// always used, under which two tasks' pipelines with one id are one. See
+    /// [`crate::pipeline::PipelineId`] for what that costs.
+    pub pipelines: crate::pipeline::PipelineScope,
     pub prerequisites: Vec<Prerequisite>,
     pub arenas: ExecArenas,
     /// Why this transaction's bound slots stayed `Unknown`. See
@@ -564,6 +574,27 @@ pub struct ExecBuilder<'u> {
     usage_census: UsageCensus,
 }
 
+/// What a draw or dispatch through an unanswered pipeline touches beyond the
+/// slots it binds, when the usage source says that cannot be enumerated: the
+/// whole of its domain. See [`crate::pipeline::UsageSource::unanswered_is_unbounded`].
+fn unbounded_footprint(
+    usages: &dyn crate::pipeline::UsageSource,
+    pipeline: ResourceId,
+    out: &mut Vec<Participation>,
+    census: &mut UsageCensus,
+) {
+    if !usages.unanswered_is_unbounded() {
+        return;
+    }
+    out.push(Participation {
+        resource: pipeline,
+        extent: crate::access::ParticipationExtent::Unbounded,
+        mode: crate::access::AccessMode::Unknown,
+        api_stages: 0,
+    });
+    census.footprints_unbounded = census.footprints_unbounded.saturating_add(1);
+}
+
 /// The binding state of whichever encoder is open.
 ///
 /// **What makes a draw's footprint the draw's, and not just its index
@@ -642,6 +673,11 @@ impl EncoderBindings {
                 let had_a_table = vertex.is_some() || fragment.is_some();
                 state.footprint_into(vertex, fragment, out);
                 census.note_unknowns(&out[before..], had_a_table);
+                if let Some(pipeline) = bound {
+                    if vertex.is_none() || fragment.is_none() {
+                        unbounded_footprint(usages, pipeline, out, census);
+                    }
+                }
             }
             (Self::Compute(state), ResolvedOperation::Compute(ComputeOp::Dispatch(_))) => {
                 let bound = state.pipeline;
@@ -651,6 +687,11 @@ impl EncoderBindings {
                 let had_a_table = kernel.is_some();
                 state.footprint_into(kernel, out);
                 census.note_unknowns(&out[before..], had_a_table);
+                if let Some(pipeline) = bound {
+                    if kernel.is_none() {
+                        unbounded_footprint(usages, pipeline, out, census);
+                    }
+                }
             }
             _ => {}
         }
@@ -983,6 +1024,7 @@ impl<'u> ExecBuilder<'u> {
             streams: core::mem::take(&mut self.streams),
             accesses: core::mem::take(&mut self.accesses),
             pipeline_leases: core::mem::take(&mut self.pipeline_leases),
+            pipelines: crate::pipeline::PipelineScope::default(),
             prerequisites: core::mem::take(&mut self.prerequisites),
             arenas: core::mem::take(&mut self.arenas),
             usage_census: self.usage_census,
@@ -1033,6 +1075,10 @@ pub struct UsageCensus {
     pub unknown_participations_from_a_table: u32,
     /// `Unknown` participations emitted because there was no table to ask.
     pub unknown_participations_with_no_table: u32,
+    /// Draws and dispatches that carried an unbounded participation: a pipeline
+    /// with a stage nothing was published for, under a [`crate::pipeline::UsageSource`]
+    /// that says such a footprint cannot be enumerated.
+    pub footprints_unbounded: u32,
     /// The first pipeline a draw or dispatch found unanswered.
     ///
     /// A count says how much was lost and never which pipeline lost it, and the
@@ -1400,6 +1446,117 @@ mod tests {
             .all(|a| a.mode == AccessMode::Unknown));
     }
 
+    /// A usage source that answers nothing and says so: what a draw through an
+    /// unanswered pipeline touches beyond its slots cannot be enumerated.
+    #[derive(Debug)]
+    struct Unenumerable<'a>(&'a crate::pipeline::PipelineTable);
+
+    impl crate::pipeline::UsageSource for Unenumerable<'_> {
+        fn binding_usage(
+            &self,
+            pipeline: ResourceId,
+            stage: Option<reims_vgpu_protocol::render::ShaderStage>,
+        ) -> Option<&crate::pipeline::BindingUsage> {
+            crate::pipeline::UsageSource::binding_usage(self.0, pipeline, stage)
+        }
+
+        fn unanswered_is_unbounded(&self) -> bool {
+            true
+        }
+    }
+
+    /// A draw through a pipeline whose stage nothing was published for touches
+    /// what its slots do not name, and says so; one the reflection answered in
+    /// full does not.
+    ///
+    /// The argument-buffer gap. A shader that reads through an argument buffer
+    /// reaches resources no binding names, and its stage is the one a rail
+    /// refuses to publish; `Unknown` on the slots it binds does not order
+    /// against those resources. So under a source that says an unanswered
+    /// footprint is unbounded, the draw carries an `Unbounded` participation —
+    /// `DomainOnly`, `Unknown`, ordered against everything in its domain — and
+    /// under the default answer it carries none.
+    #[test]
+    fn a_draw_through_an_unanswered_pipeline_is_unbounded_only_when_the_source_says_so() {
+        use crate::pipeline::{
+            BindingUsage, PipelineId, PipelineState, PipelineTable, PublishedUsage,
+        };
+        use reims_vgpu_protocol::render::ShaderStage;
+
+        let (answered, one_stage, unanswered) = (res(9), res(10), res(11));
+        let mut table = PipelineTable::new();
+        for p in [answered, one_stage, unanswered] {
+            let id = PipelineId::shared(p);
+            assert!(table.declare(id, crate::identity::SessionGeneration::FIRST));
+            for step in [
+                PipelineState::Translating,
+                PipelineState::Compiling,
+                PipelineState::Ready,
+            ] {
+                assert!(table.advance(id, step));
+            }
+        }
+        let stage = || Some(BindingUsage::new(vec![Some(AccessMode::Read)], Vec::new()));
+        assert!(table.publish_usage(
+            PipelineId::shared(answered),
+            PublishedUsage::render(stage(), stage())
+        ));
+        assert!(table.publish_usage(
+            PipelineId::shared(one_stage),
+            PublishedUsage::render(stage(), None)
+        ));
+
+        let unbounded_in = |usages: &dyn crate::pipeline::UsageSource, pipeline: ResourceId| {
+            let mut b = ExecBuilder::with_usage(usages);
+            b.begin_segment(
+                SegmentKind::Render.wire_type(),
+                SegmentLifetime::SELF_CONTAINED,
+            )
+            .expect("open");
+            let entries = bind_arena(&mut b, &[res(7)]);
+            b.record(
+                ResolvedOperation::Render(RenderOp::BindBuffers {
+                    stage: ShaderStage::Vertex,
+                    first: 0,
+                    entries,
+                }),
+                &mut StubRegistry(ChannelId(1)),
+            )
+            .expect("bind");
+            b.record(
+                ResolvedOperation::Render(RenderOp::SetPipeline { pipeline }),
+                &mut StubRegistry(ChannelId(1)),
+            )
+            .expect("set pipeline");
+            b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+                .expect("draw");
+            let unbounded: Vec<_> = b
+                .accesses
+                .iter()
+                .filter(|a| a.key == AccessKey::DomainOnly)
+                .collect();
+            assert_eq!(
+                b.usage_census.footprints_unbounded as usize,
+                unbounded.len(),
+                "the census counts what the walk declared"
+            );
+            for a in &unbounded {
+                assert_eq!(a.mode, AccessMode::Unknown);
+            }
+            unbounded.len()
+        };
+
+        // The default answer is the one the model has always given.
+        assert_eq!(unbounded_in(&table, unanswered), 0);
+        assert_eq!(unbounded_in(&table, one_stage), 0);
+        // Under the stricter one, an unanswered stage is unbounded — one refused
+        // stage is enough — and a pipeline answered in full is not.
+        let strict = Unenumerable(&table);
+        assert_eq!(unbounded_in(&strict, unanswered), 1);
+        assert_eq!(unbounded_in(&strict, one_stage), 1);
+        assert_eq!(unbounded_in(&strict, answered), 0);
+    }
+
     /// A published reflection narrows the draw's footprint, and an unpublished
     /// stage stays `Unknown`.
     ///
@@ -1425,14 +1582,26 @@ mod tests {
 
         let pipeline = res(9);
         let mut table = PipelineTable::new();
-        assert!(table.declare(pipeline, crate::identity::SessionGeneration::FIRST));
-        assert!(table.advance(pipeline, PipelineState::Translating));
-        assert!(table.advance(pipeline, PipelineState::Compiling));
-        assert!(table.advance(pipeline, PipelineState::Ready));
+        assert!(table.declare(
+            crate::pipeline::PipelineId::shared(pipeline),
+            crate::identity::SessionGeneration::FIRST
+        ));
+        assert!(table.advance(
+            crate::pipeline::PipelineId::shared(pipeline),
+            PipelineState::Translating
+        ));
+        assert!(table.advance(
+            crate::pipeline::PipelineId::shared(pipeline),
+            PipelineState::Compiling
+        ));
+        assert!(table.advance(
+            crate::pipeline::PipelineId::shared(pipeline),
+            PipelineState::Ready
+        ));
         // Vertex reflected, fragment not. Both are real positions for an
         // executor and the two answers differ.
         assert!(table.publish_usage(
-            pipeline,
+            crate::pipeline::PipelineId::shared(pipeline),
             PublishedUsage::render(
                 Some(BindingUsage::new(
                     vec![Some(AccessMode::Read), Some(AccessMode::Write), None],
@@ -1505,6 +1674,92 @@ mod tests {
         );
     }
 
+    /// What exact accesses are for, at the graph: two packets that read one
+    /// buffer and write two different ones are independent once their pipeline's
+    /// reflection is published, and ordered before it is.
+    ///
+    /// Written at the dependency graph and not at the walk because the walk's
+    /// answer is only interesting for what it lets the graph do. Without a
+    /// publication every bound slot is `Unknown`, which conflicts with everything
+    /// naming the same memory — including the shared read, which two readers
+    /// would otherwise never conflict on — so the second packet waits for the
+    /// first. With one, the shared slot is a read, each packet's write is its
+    /// own, and there is nothing to wait for. The pair is the smallest shape of
+    /// what a drag of overlapping windows does a hundred times a frame.
+    #[test]
+    fn a_published_reflection_is_what_makes_two_draws_independent_in_the_graph() {
+        use crate::depend::DependencyGraph;
+        use crate::identity::IngressOrdinal;
+        use crate::pipeline::{BindingUsage, PipelineState, PipelineTable, PublishedUsage};
+        use reims_vgpu_protocol::render::ShaderStage;
+
+        let pipeline = res(9);
+        let mut table = PipelineTable::new();
+        assert!(table.declare(
+            crate::pipeline::PipelineId::shared(pipeline),
+            crate::identity::SessionGeneration::FIRST
+        ));
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            assert!(table.advance(crate::pipeline::PipelineId::shared(pipeline), step));
+        }
+        assert!(table.publish_usage(
+            crate::pipeline::PipelineId::shared(pipeline),
+            PublishedUsage::render(
+                Some(BindingUsage::new(
+                    vec![Some(AccessMode::Read), Some(AccessMode::Write)],
+                    Vec::new(),
+                )),
+                Some(BindingUsage::new(Vec::new(), Vec::new())),
+            )
+        ));
+
+        let packet = |usages: &dyn crate::pipeline::UsageSource, written: u32| {
+            let mut b = ExecBuilder::with_usage(usages);
+            b.begin_segment(
+                SegmentKind::Render.wire_type(),
+                SegmentLifetime::SELF_CONTAINED,
+            )
+            .expect("open");
+            // Slot 0 is the shared read, slot 1 this packet's own target.
+            let entries = bind_arena(&mut b, &[res(7), res(written)]);
+            for op in [
+                ResolvedOperation::Render(RenderOp::BindBuffers {
+                    stage: ShaderStage::Vertex,
+                    first: 0,
+                    entries,
+                }),
+                ResolvedOperation::Render(RenderOp::SetPipeline { pipeline }),
+                a_draw(),
+            ] {
+                b.record(op, &mut StubRegistry(ChannelId(1)))
+                    .expect("record");
+            }
+            b.accesses.clone()
+        };
+        let waits = |usages: &dyn crate::pipeline::UsageSource| {
+            let mut graph = DependencyGraph::new();
+            assert!(graph
+                .admit(IngressOrdinal(1), &packet(usages, 8))
+                .is_empty());
+            graph.admit(IngressOrdinal(2), &packet(usages, 18))
+        };
+
+        assert_eq!(
+            waits(&crate::pipeline::NoUsage),
+            vec![IngressOrdinal(1)],
+            "nothing published: every slot might be written, so the second packet waits"
+        );
+        assert_eq!(
+            waits(&table),
+            Vec::<IngressOrdinal>::new(),
+            "published: a shared read and two separate writes have nothing to order"
+        );
+    }
+
     /// A pipeline's reflection does not outlive the build it described.
     ///
     /// Every door that un-builds or unnames a pipeline drops it, and the reason
@@ -1525,11 +1780,23 @@ mod tests {
         };
         let ready = || {
             let mut t = PipelineTable::new();
-            assert!(t.declare(id, crate::identity::SessionGeneration::FIRST));
-            assert!(t.advance(id, PipelineState::Translating));
-            assert!(t.advance(id, PipelineState::Compiling));
-            assert!(t.advance(id, PipelineState::Ready));
-            assert!(t.publish_usage(id, usage()));
+            assert!(t.declare(
+                crate::pipeline::PipelineId::shared(id),
+                crate::identity::SessionGeneration::FIRST
+            ));
+            assert!(t.advance(
+                crate::pipeline::PipelineId::shared(id),
+                PipelineState::Translating
+            ));
+            assert!(t.advance(
+                crate::pipeline::PipelineId::shared(id),
+                PipelineState::Compiling
+            ));
+            assert!(t.advance(
+                crate::pipeline::PipelineId::shared(id),
+                PipelineState::Ready
+            ));
+            assert!(t.publish_usage(crate::pipeline::PipelineId::shared(id), usage()));
             t
         };
         let published = |t: &PipelineTable| {
@@ -1538,14 +1805,14 @@ mod tests {
 
         let mut t = ready();
         assert!(published(&t), "the fixture publishes");
-        assert!(t.withdraw(id));
+        assert!(t.withdraw(crate::pipeline::PipelineId::shared(id)));
         assert!(
             !published(&t),
             "the executor said it no longer holds the translation this described"
         );
 
         let mut t = ready();
-        assert!(t.retire(id));
+        assert!(t.retire(crate::pipeline::PipelineId::shared(id)));
         assert!(!published(&t), "the guest deleted the name");
 
         let mut t = ready();
@@ -1554,15 +1821,17 @@ mod tests {
 
         let mut t = ready();
         let closed = t.generation_closed(crate::identity::SessionGeneration::FIRST);
-        assert!(closed.removed.contains(&id));
+        assert!(closed
+            .removed
+            .contains(&crate::pipeline::PipelineId::shared(id)));
         assert!(!published(&t), "the generation that named it closed");
 
         // And a reflection landing after the name is gone does not resurrect
         // it.
         let mut t = ready();
-        assert!(t.retire(id));
+        assert!(t.retire(crate::pipeline::PipelineId::shared(id)));
         assert!(
-            !t.publish_usage(id, usage()),
+            !t.publish_usage(crate::pipeline::PipelineId::shared(id), usage()),
             "a compile finishing after the delete describes a build nothing may bind"
         );
         assert!(!published(&t));

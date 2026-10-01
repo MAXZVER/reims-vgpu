@@ -25,9 +25,10 @@
 use crate::control::{ChannelTransition, ControlOp};
 use crate::depend::DependencyGraph;
 use crate::identity::{
-    ChannelId, ChannelSequence, CompletionStamp, DeviceEpoch, IngressOrdinal, ResourceId,
-    SessionGeneration, SessionId, StampWait, TransactionIdentity,
+    ChannelId, ChannelSequence, CompletionStamp, DeviceEpoch, IngressOrdinal, SessionGeneration,
+    SessionId, StampWait, TransactionIdentity,
 };
+use crate::pipeline::PipelineId;
 use crate::publish::{Publisher, Release, RetireRefusal};
 use crate::ready::Scheduler;
 use crate::retire::Lifetime;
@@ -275,6 +276,19 @@ pub struct DeviceLoss {
     pub released: Vec<Release>,
 }
 
+/// What a task's end took with it. See [`SessionModel::task_ended`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[must_use = "the ended task's pipelines are host objects nothing else will destroy, and its stranded work is a channel head nothing else will release"]
+pub struct TaskEnded {
+    /// How many pipelines the task owned, in any state.
+    pub removed: usize,
+    /// The ones a host object exists for, in id order.
+    pub destroy: Vec<PipelineId>,
+    /// Transactions that were waiting for one of them, in ingress order and each
+    /// named once.
+    pub stranded: Vec<IngressOrdinal>,
+}
+
 /// What a guest reset closed.
 ///
 /// The generation and the pipelines are one value because they are one event.
@@ -291,7 +305,7 @@ pub struct Reset {
     /// order. Destroyed rather than abandoned: the handles are live and merely
     /// unnameable — see
     /// [`crate::pipeline::PipelineTable::generation_closed`].
-    pub destroy: Vec<ResourceId>,
+    pub destroy: Vec<PipelineId>,
     /// Transactions that were waiting for a pipeline the closed generation
     /// took away, in ingress order and each named once.
     ///
@@ -306,6 +320,13 @@ pub struct Reset {
     /// and the caller withdraws each one with a typed reason on its failure
     /// channel — see [`SessionModel::withdraw`].
     pub stranded: Vec<IngressOrdinal>,
+}
+
+/// What judging a packet decided, before the transaction is built from it.
+struct Judged {
+    identity: TransactionIdentity,
+    hazard_waits: Vec<IngressOrdinal>,
+    ready: bool,
 }
 
 /// What admitting a packet produced.
@@ -340,7 +361,7 @@ pub struct SessionModel {
     /// which builds it lost and the caller knows how to start one, and between
     /// the loss and [`SessionModel::recreate_device`] there is no device to
     /// start them against.
-    rebuilding: Vec<ResourceId>,
+    rebuilding: Vec<PipelineId>,
     /// The pipeline objects this session's work binds.
     ///
     /// Held here rather than beside this plane, because the waits a transaction
@@ -453,6 +474,31 @@ impl SessionModel {
         }
     }
 
+    /// A task's address space ended, by deletion or by redefinition under the
+    /// same id: take its pipelines out, and name the transactions that were
+    /// parked on them.
+    ///
+    /// The per-task half of [`Self::reset`], with the same two answers for the
+    /// same two callers. The waiters come back rather than being dropped or made
+    /// ready: a pipeline that no longer exists answers `release_past_ended_pipeline`
+    /// as an ended one, which is how a position parked on it runs rather than
+    /// holds its channel's head forever.
+    pub fn task_ended(&mut self, task: crate::identity::TaskId) -> TaskEnded {
+        let taken = self.pipelines.task_ended(task);
+        let mut stranded: Vec<IngressOrdinal> = taken
+            .removed
+            .iter()
+            .flat_map(|id| self.scheduler.pipeline_refused(*id))
+            .collect();
+        stranded.sort_unstable();
+        stranded.dedup();
+        TaskEnded {
+            removed: taken.removed.len(),
+            destroy: taken.destroy,
+            stranded,
+        }
+    }
+
     /// Whether this session has a host device at all.
     #[must_use]
     pub const fn device_state(&self) -> DeviceState {
@@ -537,7 +583,7 @@ impl SessionModel {
     /// stops shrinking is builds nobody started, which is a transaction
     /// waiting forever and is exactly what the list exists to make visible.
     #[must_use]
-    pub fn rebuilding(&mut self) -> Vec<ResourceId> {
+    pub fn rebuilding(&mut self) -> Vec<PipelineId> {
         let table = &self.pipelines;
         self.rebuilding.retain(|id| {
             table
@@ -578,6 +624,55 @@ impl SessionModel {
     /// no ordinal is consumed and no sequence advances — so a refused packet
     /// leaves no gap in either order for a reader to explain.
     pub fn admit(&mut self, packet: &Packet) -> Result<Admitted, Refusal> {
+        let judged = self.judge(packet)?;
+        Ok(Admitted {
+            transaction: DeviceTransaction {
+                identity: judged.identity,
+                stamp_waits: packet.stamp_waits.clone(),
+                completion: packet.completion,
+                payload: packet.payload.clone(),
+            },
+            hazard_waits: judged.hazard_waits,
+            ready: judged.ready,
+        })
+    }
+
+    /// [`Self::admit`] for a caller that is done with the packet: the payload moves
+    /// into the transaction instead of being copied out of the packet and dropped.
+    ///
+    /// The same judgement, the same ordinals, the same waits and the same
+    /// refusals — `admit` is this plus a clone of the two fields that own memory.
+    /// An exec payload is every stream's resolved records, the arenas they index
+    /// and the accesses derived from them, so on the hottest path the device has
+    /// the clone was an allocation per record and the drop after it the same
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit`]. A refused packet is consumed all the same; what refused
+    /// it is the answer.
+    pub fn admit_owned(&mut self, packet: Packet) -> Result<Admitted, Refusal> {
+        let judged = self.judge(&packet)?;
+        let Packet {
+            stamp_waits,
+            completion,
+            payload,
+            ..
+        } = packet;
+        Ok(Admitted {
+            transaction: DeviceTransaction {
+                identity: judged.identity,
+                stamp_waits,
+                completion,
+                payload,
+            },
+            hazard_waits: judged.hazard_waits,
+            ready: judged.ready,
+        })
+    }
+
+    /// Everything [`Self::admit`] decides, which is everything but the copy.
+    fn judge(&mut self, packet: &Packet) -> Result<Judged, Refusal> {
         if self.device == DeviceState::Lost {
             self.refusals += 1;
             return Err(Refusal::DeviceLost { epoch: self.epoch });
@@ -645,7 +740,16 @@ impl SessionModel {
         // work binds a pipeline.
         let generation = self.generation;
         let pipeline_waits = match packet.payload.exec() {
-            Some(work) => self.pipelines.waits_for(&work.pipeline_leases, generation),
+            Some(work) => {
+                // Named under the scope the transaction states, so two tasks'
+                // pipelines with one object-list id are two pipelines here.
+                let leases: Vec<PipelineId> = work
+                    .pipeline_leases
+                    .iter()
+                    .map(|&lease| work.pipelines.id(lease))
+                    .collect();
+                self.pipelines.waits_for(&leases, generation)
+            }
             None => Ok(Vec::new()),
         };
         let pipeline_waits = match pipeline_waits {
@@ -676,17 +780,12 @@ impl SessionModel {
             &pipeline_waits,
             packet.completion,
         );
-        Ok(Admitted {
-            transaction: DeviceTransaction {
-                identity: TransactionIdentity {
-                    session: self.generation,
-                    domain: packet.domain,
-                    domain_sequence: sequence,
-                    ingress,
-                },
-                stamp_waits: packet.stamp_waits.clone(),
-                completion: packet.completion,
-                payload: packet.payload.clone(),
+        Ok(Judged {
+            identity: TransactionIdentity {
+                session: self.generation,
+                domain: packet.domain,
+                domain_sequence: sequence,
+                ingress,
             },
             hazard_waits,
             ready,
@@ -934,6 +1033,23 @@ impl SessionModel {
         &mut self.pipelines
     }
 
+    /// The pipeline table, read-only.
+    ///
+    /// The read half of [`Self::pipelines`], so a caller that only asks — the
+    /// walk's usage source — does not need `&mut SessionModel` and cannot step
+    /// a pipeline's state by accident.
+    #[must_use]
+    pub fn pipelines_ref(&self) -> &crate::pipeline::PipelineTable {
+        &self.pipelines
+    }
+
+    /// The transactions parked on `pipeline`. See
+    /// [`crate::ready::Scheduler::pipeline_waiters`].
+    #[must_use]
+    pub fn pipeline_waiters(&self, pipeline: PipelineId) -> Vec<IngressOrdinal> {
+        self.scheduler.pipeline_waiters(pipeline)
+    }
+
     /// A pipeline finished building: record it, and release what was held for
     /// it.
     ///
@@ -948,17 +1064,7 @@ impl SessionModel {
     /// compile that finishes after the guest deleted the pipeline, which must
     /// not resurrect it — and must not release work either, since that work
     /// cannot be admitted against a retired pipeline in the first place.
-    /// The pipeline table, read-only.
-    ///
-    /// The read half of [`Self::pipelines`], so a caller that only asks — the
-    /// walk's usage source — does not need `&mut SessionModel` and cannot step
-    /// a pipeline's state by accident.
-    #[must_use]
-    pub fn pipelines_ref(&self) -> &crate::pipeline::PipelineTable {
-        &self.pipelines
-    }
-
-    pub fn pipeline_ready(&mut self, pipeline: ResourceId) -> bool {
+    pub fn pipeline_ready(&mut self, pipeline: PipelineId) -> bool {
         if !self
             .pipelines
             .advance(pipeline, crate::pipeline::PipelineState::Ready)
@@ -982,7 +1088,7 @@ impl SessionModel {
     /// must not read as a legal one that happened to strand nothing.
     pub fn pipeline_refused(
         &mut self,
-        pipeline: ResourceId,
+        pipeline: PipelineId,
         reason: crate::pipeline::RefusalReason,
     ) -> Ended {
         if !self.pipelines.refuse(pipeline, reason) {
@@ -1017,7 +1123,7 @@ impl SessionModel {
     /// [`Ended::took`] says whether the retirement was a legal step — and a
     /// guest deleting a render pipeline this device never drew with makes that
     /// `false` on a real boot, which is ordinary and is why it is named.
-    pub fn pipeline_retired(&mut self, pipeline: ResourceId) -> Ended {
+    pub fn pipeline_retired(&mut self, pipeline: PipelineId) -> Ended {
         if !self.pipelines.retire(pipeline) {
             return Ended::default();
         }
@@ -1038,7 +1144,7 @@ impl SessionModel {
     pub fn release_past_ended_pipeline(
         &mut self,
         ingress: IngressOrdinal,
-        pipeline: ResourceId,
+        pipeline: PipelineId,
     ) -> bool {
         let ended = self
             .pipelines
@@ -1117,7 +1223,7 @@ impl SessionModel {
 mod tests {
     use super::*;
     use crate::access::{AccessIntent, AccessKey, AccessMode, BackingId, ResourceKey};
-    use crate::identity::{ObjectListRef, SlotGeneration, StampSlot, StampValue};
+    use crate::identity::{ObjectListRef, ResourceId, SlotGeneration, StampSlot, StampValue};
     use crate::retire::Validity;
 
     /// Complete under the incarnation that is current, which is what a caller
@@ -1149,6 +1255,12 @@ mod tests {
             slot: ObjectListRef(slot),
             generation: SlotGeneration(1),
         }
+    }
+
+    /// How these tests name a pipeline: by the id alone, the way the table always
+    /// did. What naming by task does is `pipeline::tests`' business.
+    fn pid(resource: ResourceId) -> PipelineId {
+        PipelineId::shared(resource)
     }
 
     fn packet(opcode: u16) -> Packet {
@@ -1252,7 +1364,7 @@ mod tests {
             slot: ObjectListRef(9),
             generation: SlotGeneration(1),
         };
-        s.pipelines().declare(pipe, SessionGeneration::FIRST);
+        s.pipelines().declare(pid(pipe), SessionGeneration::FIRST);
         let before = s.pipelines().census();
 
         // A domain no definition opened.
@@ -1504,7 +1616,7 @@ mod tests {
             generation: SlotGeneration(1),
         };
         let gen = s.generation();
-        s.pipelines().declare(pipeline, gen);
+        s.pipelines().declare(pid(pipeline), gen);
 
         // Binding nothing waits for nothing, whatever the table holds.
         assert!(s.admit(&packet(0x37)).expect("accepted").ready);
@@ -1539,7 +1651,7 @@ mod tests {
             generation: SlotGeneration(1),
         };
         let gen = s.generation();
-        s.pipelines().declare(pipeline, gen);
+        s.pipelines().declare(pid(pipeline), gen);
         let mut leased = packet(0x37);
         let Payload::Exec(work) = &mut leased.payload else {
             panic!("an EXEC");
@@ -1554,21 +1666,214 @@ mod tests {
             crate::pipeline::PipelineState::Translating,
             crate::pipeline::PipelineState::Compiling,
         ] {
-            s.pipelines().advance(pipeline, step);
+            s.pipelines().advance(pid(pipeline), step);
         }
         assert!(
             s.take_ready().is_empty(),
             "a pipeline is not ready until it is"
         );
 
-        assert!(s.pipeline_ready(pipeline));
+        assert!(s.pipeline_ready(pid(pipeline)));
         assert_eq!(s.take_ready(), vec![admitted.transaction.identity.ingress]);
         assert_eq!(s.scheduler().waiting_on_pipelines(), 0);
 
         // A second arrival of the same news is not a legal step and releases
         // nothing, which is what stops a late compile callback resurrecting a
         // pipeline the guest deleted.
-        assert!(!s.pipeline_ready(pipeline));
+        assert!(!s.pipeline_ready(pid(pipeline)));
+    }
+
+    /// Two tasks whose pipelines have one object-list id are two pipelines to the
+    /// model: what happens to one is not done to the other's work.
+    ///
+    /// Named by the id alone, one table entry stood for both, and the four things
+    /// a pipeline can do to work waiting on it crossed between tasks: a build
+    /// finishing released the other task's waiters, a refusal refused the other
+    /// task's packets, a deletion retired the other task's pipeline, and a
+    /// declaration by one told the other its pipeline existed. A packet states the
+    /// task whose list its references index, once, and the model names them under
+    /// it.
+    #[test]
+    fn two_tasks_with_one_pipeline_id_do_not_release_refuse_or_retire_each_other() {
+        use crate::identity::TaskId;
+        use crate::pipeline::{LeaseRefusal, PipelineScope, PipelineState, RefusalReason};
+
+        let resource = res(9);
+        let (one, three) = (
+            PipelineScope::Task(TaskId(1)).id(resource),
+            PipelineScope::Task(TaskId(3)).id(resource),
+        );
+        let gen = |s: &SessionModel| s.generation();
+        let leased = |task: u32| {
+            let mut p = packet(0x37);
+            let Payload::Exec(work) = &mut p.payload else {
+                panic!("an EXEC");
+            };
+            work.pipeline_leases.push(resource);
+            work.pipelines = PipelineScope::Task(TaskId(task));
+            p
+        };
+
+        // Both declared, both building; one packet parked on each.
+        let mut s = session();
+        let g = gen(&s);
+        assert!(s.pipelines().declare(one, g));
+        assert!(s.pipelines().declare(three, g), "task 1's is not task 3's");
+        for p in [one, three] {
+            for step in [PipelineState::Translating, PipelineState::Compiling] {
+                assert!(s.pipelines().advance(p, step));
+            }
+        }
+        let a = s.admit(&leased(1)).expect("accepted");
+        let b = s.admit(&leased(3)).expect("accepted");
+        assert!(!a.ready && !b.ready);
+        assert_eq!(s.scheduler().waiting_on_pipelines(), 2);
+
+        // Task 1's build finishes: task 1's packet runs, task 3's still waits.
+        assert!(s.pipeline_ready(one));
+        assert_eq!(s.take_ready(), vec![a.transaction.identity.ingress]);
+        assert_eq!(s.scheduler().waiting_on_pipelines(), 1);
+
+        // Task 3's build is refused: task 3's later packets are refused, and task
+        // 1's — the same object-list id, a pipeline that built — are not.
+        let reason = RefusalReason::CompilationFailed("out of registers");
+        assert!(s.pipeline_refused(three, reason).took);
+        assert!(matches!(
+            s.admit(&leased(3)),
+            Err(Refusal::PipelineUnusable(LeaseRefusal::Refused { pipeline, .. })) if pipeline == three
+        ));
+        assert!(
+            s.admit(&leased(1)).expect("task 1's pipeline built").ready,
+            "task 3's refusal is not task 1's"
+        );
+
+        // Task 1 deletes its pipeline: it is a tombstone for task 1 and nothing
+        // happened to task 3's, which is still refused for its own reason.
+        assert!(s.pipeline_retired(one).took);
+        assert!(
+            s.admit(&leased(1)).is_ok(),
+            "a deleted pipeline is tolerated"
+        );
+        assert!(matches!(
+            s.admit(&leased(3)),
+            Err(Refusal::PipelineUnusable(LeaseRefusal::Refused { .. }))
+        ));
+
+        // A packet naming no task is the shared pipeline — a third entry, which
+        // nothing declared.
+        assert!(matches!(
+            s.admit(&packet_leasing_shared(resource)),
+            Err(Refusal::PipelineUnusable(LeaseRefusal::Absent { .. }))
+        ));
+    }
+
+    /// A task's end takes its pipelines and strands only the work parked on them;
+    /// a task of the same object-list id keeps its own.
+    #[test]
+    fn a_task_ending_strands_its_own_waiters_and_leaves_another_tasks_alone() {
+        use crate::identity::TaskId;
+        use crate::pipeline::{PipelineScope, PipelineState};
+
+        let resource = res(9);
+        let (one, three) = (
+            PipelineScope::Task(TaskId(1)).id(resource),
+            PipelineScope::Task(TaskId(3)).id(resource),
+        );
+        let leased = |task: u32| {
+            let mut p = packet(0x37);
+            let Payload::Exec(work) = &mut p.payload else {
+                panic!("an EXEC");
+            };
+            work.pipeline_leases.push(resource);
+            work.pipelines = PipelineScope::Task(TaskId(task));
+            p
+        };
+        let mut s = session();
+        let g = s.generation();
+        for p in [one, three] {
+            assert!(s.pipelines().declare(p, g));
+            for step in [PipelineState::Translating, PipelineState::Compiling] {
+                assert!(s.pipelines().advance(p, step));
+            }
+        }
+        let a = s.admit(&leased(1)).expect("accepted");
+        let b = s.admit(&leased(3)).expect("accepted");
+        assert_eq!(s.scheduler().waiting_on_pipelines(), 2);
+
+        let ended = s.task_ended(TaskId(1));
+        assert_eq!(ended.removed, 1);
+        assert_eq!(ended.destroy, vec![one], "it was compiling: a host object");
+        assert_eq!(ended.stranded, vec![a.transaction.identity.ingress]);
+        // The stranded packet is still parked until the caller runs it past the
+        // pipeline that no longer exists, which the table answers as an ended one.
+        assert_eq!(s.scheduler().waiting_on_pipelines(), 2);
+        assert!(s.release_past_ended_pipeline(a.transaction.identity.ingress, one));
+        assert_eq!(s.take_ready(), vec![a.transaction.identity.ingress]);
+        assert_eq!(
+            s.scheduler().waiting_on_pipelines(),
+            1,
+            "task 3's wait stands"
+        );
+
+        // Task 3 still builds and releases its own packet.
+        assert!(s.pipeline_ready(three));
+        assert_eq!(s.take_ready(), vec![b.transaction.identity.ingress]);
+
+        // The id is task 1's again: a fresh incarnation declares it anew.
+        assert!(s.pipelines().declare(one, g));
+        assert_eq!(s.task_ended(TaskId(99)), TaskEnded::default());
+    }
+
+    /// Admitting a packet by value is admitting it by reference without the copy:
+    /// the same transactions, the same waits, the same readiness, the same ordinals
+    /// and the same refusals, packet for packet.
+    #[test]
+    fn admitting_a_packet_by_value_decides_what_admitting_it_by_reference_decides() {
+        let batch = || {
+            let mut packets = Vec::new();
+            for (i, opcode) in [0x37u16; 6].into_iter().enumerate() {
+                let mut p = packet(opcode);
+                if i % 3 == 1 {
+                    p.domain = ChannelId(3);
+                }
+                if i == 3 {
+                    // Waits for a stamp nothing has published.
+                    p.stamp_waits.push(StampWait {
+                        slot: StampSlot(9),
+                        value: StampValue(4),
+                    });
+                    p.completion = Some(CompletionStamp {
+                        slot: StampSlot(2),
+                        value: StampValue(1),
+                    });
+                }
+                packets.push(p);
+            }
+            // One the model refuses: a domain no channel definition opened.
+            let mut closed = packet(0x37);
+            closed.domain = ChannelId(40);
+            packets.push(closed);
+            packets
+        };
+        let (mut by_ref, mut by_value) = (session(), session());
+        for p in batch() {
+            let a = by_ref.admit(&p);
+            let b = by_value.admit_owned(p);
+            assert_eq!(a, b);
+        }
+        // And the state each leaves behind answers alike.
+        assert_eq!(by_ref.take_ready(), by_value.take_ready());
+        assert_eq!(by_ref.refusals(), by_value.refusals());
+    }
+
+    /// A packet leasing `resource` under the shared naming.
+    fn packet_leasing_shared(resource: ResourceId) -> Packet {
+        let mut p = packet(0x37);
+        let Payload::Exec(work) = &mut p.payload else {
+            panic!("an EXEC");
+        };
+        work.pipeline_leases.push(resource);
+        p
     }
 
     /// The guest deleting a pipeline is the other door that ends its name, and
@@ -1585,9 +1890,9 @@ mod tests {
             generation: SlotGeneration(1),
         };
         let gen = s.generation();
-        s.pipelines().declare(pipeline, gen);
+        s.pipelines().declare(pid(pipeline), gen);
         s.pipelines()
-            .advance(pipeline, crate::pipeline::PipelineState::Translating);
+            .advance(pid(pipeline), crate::pipeline::PipelineState::Translating);
         let mut leased = packet(0x37);
         let Payload::Exec(work) = &mut leased.payload else {
             panic!("an EXEC");
@@ -1597,14 +1902,14 @@ mod tests {
         assert!(!admitted.ready);
 
         assert_eq!(
-            s.pipeline_retired(pipeline),
+            s.pipeline_retired(pid(pipeline)),
             Ended {
                 took: true,
                 stranded: vec![admitted.transaction.identity.ingress]
             }
         );
         assert!(
-            !s.pipeline_ready(pipeline),
+            !s.pipeline_ready(pid(pipeline)),
             "the compile landing afterwards resurrects nothing"
         );
         assert!(s.take_ready().is_empty(), "and releases nobody");
@@ -1612,7 +1917,7 @@ mod tests {
         // A second delete is not a legal step and names nobody twice — and
         // says which of the two it is, rather than answering an empty list for
         // both.
-        assert_eq!(s.pipeline_retired(pipeline), Ended::default());
+        assert_eq!(s.pipeline_retired(pid(pipeline)), Ended::default());
     }
 
     /// A reset ends the pipeline's *name*, and a transaction waiting for one
@@ -1639,10 +1944,10 @@ mod tests {
             generation: SlotGeneration(1),
         };
         let gen = s.generation();
-        s.pipelines().declare(building, gen);
-        s.pipelines().declare(declared, gen);
+        s.pipelines().declare(pid(building), gen);
+        s.pipelines().declare(pid(declared), gen);
         s.pipelines()
-            .advance(building, crate::pipeline::PipelineState::Translating);
+            .advance(pid(building), crate::pipeline::PipelineState::Translating);
 
         let mut waiters = Vec::new();
         for pipeline in [building, declared] {
@@ -1660,7 +1965,7 @@ mod tests {
         let reset = s.reset();
         assert_eq!(
             reset.destroy,
-            vec![building],
+            vec![pid(building)],
             "only the one a host object exists for is destroyed"
         );
         assert_eq!(
@@ -1671,7 +1976,7 @@ mod tests {
         // The half that makes it a hang: the news the compiling layer is about
         // to deliver reaches nobody.
         assert!(
-            !s.pipeline_ready(building),
+            !s.pipeline_ready(pid(building)),
             "a compile landing after the reset resurrects nothing"
         );
         assert!(s.take_ready().is_empty(), "and releases nobody");
@@ -1696,7 +2001,7 @@ mod tests {
                 slot: ObjectListRef(slot),
                 generation: SlotGeneration(1),
             };
-            s.pipelines().declare(id, gen);
+            s.pipelines().declare(pid(id), gen);
             leases.push(id);
         }
         let mut leased = packet(0x37);
@@ -1726,7 +2031,7 @@ mod tests {
             generation: SlotGeneration(1),
         };
         let gen = s.generation();
-        s.pipelines().declare(pipeline, gen);
+        s.pipelines().declare(pid(pipeline), gen);
         let mut leased = packet(0x37);
         let Payload::Exec(work) = &mut leased.payload else {
             panic!("an EXEC");
@@ -1736,7 +2041,7 @@ mod tests {
 
         let reason = crate::pipeline::RefusalReason::CompilationFailed("out of registers");
         assert_eq!(
-            s.pipeline_refused(pipeline, reason),
+            s.pipeline_refused(pid(pipeline), reason),
             Ended {
                 took: true,
                 stranded: vec![admitted.transaction.identity.ingress]
@@ -1747,7 +2052,10 @@ mod tests {
         let err = s.admit(&leased).expect_err("it can never run");
         assert_eq!(
             err,
-            Refusal::PipelineUnusable(crate::pipeline::LeaseRefusal::Refused { pipeline, reason })
+            Refusal::PipelineUnusable(crate::pipeline::LeaseRefusal::Refused {
+                pipeline: pid(pipeline),
+                reason
+            })
         );
         assert_eq!(err.slug(), "pipeline_compilation_failed");
     }
@@ -1770,20 +2078,20 @@ mod tests {
         assert_eq!(
             err,
             Refusal::PipelineUnusable(crate::pipeline::LeaseRefusal::Absent {
-                pipeline,
+                pipeline: pid(pipeline),
                 because: crate::pipeline::AbsentBecause::Undeclared,
             })
         );
         assert_eq!(err.slug(), "pipeline_absent_undeclared");
         // The refusal consumed no ordinal, like every other one here.
         let gen = s.generation();
-        s.pipelines().declare(pipeline, gen);
+        s.pipelines().declare(pid(pipeline), gen);
         for step in [
             crate::pipeline::PipelineState::Translating,
             crate::pipeline::PipelineState::Compiling,
             crate::pipeline::PipelineState::Ready,
         ] {
-            s.pipelines().advance(pipeline, step);
+            s.pipelines().advance(pid(pipeline), step);
         }
         let ok = s.admit(&leased).expect("declared and built");
         assert_eq!(ok.transaction.identity.ingress, IngressOrdinal(1));
@@ -1813,21 +2121,21 @@ mod tests {
         let refused = res(81);
         let deleted = res(82);
         for p in [built, refused, deleted] {
-            s.pipelines().declare(p, gen);
+            s.pipelines().declare(pid(p), gen);
         }
         for step in [
             PipelineState::Translating,
             PipelineState::Compiling,
             PipelineState::Ready,
         ] {
-            s.pipelines().advance(built, step);
+            s.pipelines().advance(pid(built), step);
         }
         s.pipelines().refuse(
-            refused,
+            pid(refused),
             crate::pipeline::RefusalReason::CompilationFailed("x"),
         );
-        s.pipelines().retire(deleted);
-        assert_eq!(s.pipelines().lease(built, gen), Lease::Ready);
+        s.pipelines().retire(pid(deleted));
+        assert_eq!(s.pipelines().lease(pid(built), gen), Lease::Ready);
 
         let died = s.device_lost();
         let epoch = s.recreate_device().expect("lost, so replaceable");
@@ -1839,24 +2147,24 @@ mod tests {
         );
 
         assert_eq!(
-            s.pipelines().lease(built, gen),
+            s.pipelines().lease(pid(built), gen),
             Lease::Pending,
             "the host build died with the incarnation that made it"
         );
         assert_eq!(
             s.rebuilding(),
-            vec![built],
+            vec![pid(built)],
             "and the caller is told which builds to start, because nothing \
              else can enumerate them"
         );
         assert_eq!(
-            s.pipelines().lease(refused, gen),
+            s.pipelines().lease(pid(refused), gen),
             Lease::Refused(crate::pipeline::RefusalReason::CompilationFailed("x")),
             "a pipeline this device cannot describe is not describable by the \
              next one either; refused stays terminal"
         );
         assert_eq!(
-            s.pipelines().lease(deleted, gen),
+            s.pipelines().lease(pid(deleted), gen),
             Lease::Absent(crate::pipeline::AbsentBecause::Retired),
             "and a deleted object is not resurrected by a new device"
         );
@@ -1868,9 +2176,9 @@ mod tests {
             PipelineState::Compiling,
             PipelineState::Ready,
         ] {
-            s.pipelines().advance(built, step);
+            s.pipelines().advance(pid(built), step);
         }
-        assert_eq!(s.pipelines().lease(built, gen), Lease::Ready);
+        assert_eq!(s.pipelines().lease(pid(built), gen), Lease::Ready);
         assert!(s.rebuilding().is_empty());
     }
 
@@ -2733,26 +3041,28 @@ mod tests {
         let gen = s.generation();
         let (declared, translating, ready, refused) = (res(90), res(91), res(92), res(93));
         for p in [declared, translating, ready, refused] {
-            s.pipelines().declare(p, gen);
+            s.pipelines().declare(pid(p), gen);
         }
         s.pipelines()
-            .advance(translating, PipelineState::Translating);
+            .advance(pid(translating), PipelineState::Translating);
         for step in [
             PipelineState::Translating,
             PipelineState::Compiling,
             PipelineState::Ready,
         ] {
-            s.pipelines().advance(ready, step);
+            s.pipelines().advance(pid(ready), step);
         }
-        s.pipelines()
-            .refuse(refused, crate::pipeline::RefusalReason::Undescribable("x"));
+        s.pipelines().refuse(
+            pid(refused),
+            crate::pipeline::RefusalReason::Undescribable("x"),
+        );
         assert_eq!(s.pipelines().len(), 4);
 
         let reset = s.reset();
         assert!(reset.generation > gen);
         assert_eq!(
             reset.destroy,
-            vec![translating, ready],
+            vec![pid(translating), pid(ready)],
             "only the ones the host has something for; a declaration never \
              reached it and a refusal is a build that did not happen"
         );
@@ -2763,11 +3073,11 @@ mod tests {
         );
         for p in [declared, translating, ready, refused] {
             assert_eq!(
-                s.pipelines().lease(p, gen),
+                s.pipelines().lease(pid(p), gen),
                 Lease::Absent(crate::pipeline::AbsentBecause::Undeclared)
             );
             assert_eq!(
-                s.pipelines().lease(p, reset.generation),
+                s.pipelines().lease(pid(p), reset.generation),
                 Lease::Absent(crate::pipeline::AbsentBecause::Undeclared)
             );
         }
@@ -2775,15 +3085,15 @@ mod tests {
         // The next generation declares its own, and a second reset takes only
         // those.
         let next = reset.generation;
-        s.pipelines().declare(declared, next);
+        s.pipelines().declare(pid(declared), next);
         for step in [
             PipelineState::Translating,
             PipelineState::Compiling,
             PipelineState::Ready,
         ] {
-            s.pipelines().advance(declared, step);
+            s.pipelines().advance(pid(declared), step);
         }
-        assert_eq!(s.reset().destroy, vec![declared]);
+        assert_eq!(s.reset().destroy, vec![pid(declared)]);
     }
 
     /// A reset closes names; a device loss takes handles. The two doors hand
@@ -2792,13 +3102,13 @@ mod tests {
     fn a_reset_destroys_pipelines_and_a_device_loss_rebuilds_them() {
         use crate::pipeline::PipelineState;
         let build = |s: &mut SessionModel, id, gen| {
-            s.pipelines().declare(id, gen);
+            s.pipelines().declare(pid(id), gen);
             for step in [
                 PipelineState::Translating,
                 PipelineState::Compiling,
                 PipelineState::Ready,
             ] {
-                s.pipelines().advance(id, step);
+                s.pipelines().advance(pid(id), step);
             }
         };
 
@@ -2810,7 +3120,7 @@ mod tests {
         s.recreate_device().expect("lost");
         assert_eq!(
             s.rebuilding(),
-            vec![p],
+            vec![pid(p)],
             "the object survives a loss and its build starts again"
         );
         assert_eq!(s.pipelines().len(), 1);
@@ -2820,7 +3130,7 @@ mod tests {
         build(&mut s, p, gen);
         assert_eq!(
             s.reset().destroy,
-            vec![p],
+            vec![pid(p)],
             "the object does not survive a reset, and its handle is live"
         );
         assert_eq!(s.pipelines().len(), 0);

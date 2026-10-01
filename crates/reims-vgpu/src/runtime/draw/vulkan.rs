@@ -802,7 +802,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         let model_pipeline = state
             .object_name(req.task_id, req.pipeline_ref)
             .map_or("unnamed", |id| {
-                state.pipeline_state(id).unwrap_or("unleased")
+                state
+                    .pipeline_state(req.task_id, id)
+                    .unwrap_or("unleased")
             });
         crate::observe::fail(format!(
             "linux_clear_store draws_skipped reason=draws_skipped_after_engine_refusal \

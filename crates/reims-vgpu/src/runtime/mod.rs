@@ -21,6 +21,7 @@ pub mod census;
 /// Where a draw chain's wall clock goes on the runtime side of the engine
 /// boundary, which is 82% of it.
 pub mod chain_phase;
+pub(crate) mod cost_opts;
 /// The byte runs in which a newly rendered row differs from the guest's.
 pub mod changed_runs;
 /// Product-path compute bind/dispatch (pipeline + buffers + direct dispatch).

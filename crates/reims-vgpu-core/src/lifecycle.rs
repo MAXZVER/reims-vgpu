@@ -53,12 +53,13 @@
 
 use crate::access::{
     AccessIntent, AccessMode, AccessRefusal, AccessSource, BackingId, ByteRange, GuestSpan,
-    Participation, ParticipationExtent, ResourceKey,
+    Participation, ParticipationExtent, ResourceKey, SubresourceRange,
 };
 use crate::content::{ContentLedger, Replica, Transfer};
 use crate::heap::{self, HeapPlacement, Heaps, Retirement};
-use crate::identity::{ChannelId, DirectoryFrame, ObjectListRef, ResourceId, TaskId};
+use crate::identity::{ChannelId, DirectoryFrame, MappingId, ObjectListRef, ResourceId, TaskId};
 use crate::namespace::{self, Namespace, Teardown};
+use crate::resolve::MappingResolver;
 use crate::transaction::{classify, PayloadClass};
 use reims_vgpu_protocol::fifo;
 use reims_vgpu_protocol::packets::Channel;
@@ -1444,6 +1445,88 @@ impl AccessSource for TaskAccess<'_> {
     }
 }
 
+/// What a name that owns no bytes is nonetheless a window onto.
+///
+/// # Why [`Storage::NoBytes`] is not the end of the question
+///
+/// A view, a texture over a surface the mapper holds, and a texture over a
+/// buffer's bytes each own nothing and each *touch* someone's memory. Declared
+/// `NoBytes` they resolve to [`crate::access::AccessKey::DomainOnly`], which
+/// meets every access in its domain: the honest answer when nothing is known
+/// and a needless one when the object states exactly what it is over. A driven
+/// Tahoe desktop put that answer on every EXEC packet of a lightly animated
+/// scene and on six in ten of a window drag.
+///
+/// So the guest's own statement — *this name is a window onto that one* — is
+/// recorded beside the residency table, in the guest's own terms, and resolved
+/// against the **current** state at each access rather than once at
+/// declaration. That last clause is the load-bearing one. A surface's backing is
+/// an incarnation that advances when its pages move, and a view's base may be
+/// deleted or replaced after the view was declared; an alias that cached the
+/// answer would name the old storage, which is false *distinctness* and the
+/// direction [`BackingId`] says loses a hazard edge.
+///
+/// # What resolving one may and may not do
+///
+/// It names memory and declares nothing about its content. An aliased access
+/// carries no content versions on either side — the same as the
+/// [`crate::access::AccessKey::DomainOnly`] it replaces — so the content
+/// authority is exactly what it was. The mode is the record's own and is never
+/// changed: a write through a view stays a write.
+///
+/// It only ever names a *superset* of what the access touches. A view's window
+/// is the view's whole range and not the record's sub-range; a surface is the
+/// whole surface; a placed base is its whole placement. Anything it cannot
+/// resolve — a base that is gone, a mapping that names no surface, a chain
+/// longer than [`ALIAS_DEPTH`] — falls back to `DomainOnly`, which is where it
+/// started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aliasing {
+    /// A texture over a surface the mapper tracks by id. The backing is the
+    /// mapper's answer *now*.
+    Surface(MappingId),
+    /// A view over another name's texture.
+    ///
+    /// `window` is the levels and slices the view covers, in the base's
+    /// coordinates, and `None` is the whole of the base — which is what a view
+    /// that carries no range means, and what [`Lifecycle::declare_alias`] makes
+    /// of a window naming no level or no slice (an empty window overlaps
+    /// nothing, and a view that overlapped nothing would be false distinctness
+    /// the guest can write).
+    TextureView {
+        base: ResourceId,
+        window: Option<SubresourceRange>,
+    },
+    /// A texture laid over a buffer's bytes: the buffer's memory, whole.
+    BufferBytes { buffer: ResourceId },
+}
+
+/// How many names one alias may be followed through before the chain is
+/// declared unresolvable.
+///
+/// A guest writes the object list, so a view of a view of itself is a value it
+/// can spell, and a resolution that followed it would not return. The bound is
+/// well above anything a driver builds; past it the access is `DomainOnly`.
+const ALIAS_DEPTH: u8 = 4;
+
+/// The memory an alias resolved to, in the vocabulary an access is built on.
+#[derive(Clone, Copy, Debug)]
+struct AliasTarget {
+    key: ResourceKey,
+    extent: ParticipationExtent,
+}
+
+/// The mapper with nothing mapped: the answer [`Lifecycle::access`] gives when
+/// its caller brought none, so a surface alias stays unresolved (`DomainOnly`)
+/// rather than being resolved against an invented namespace.
+struct NoMappings;
+
+impl MappingResolver for NoMappings {
+    fn backing(&self, _mapping: MappingId) -> Option<BackingId> {
+        None
+    }
+}
+
 /// Where a live resource's bytes are, derived once at creation.
 #[derive(Clone, Copy, Debug)]
 enum Resident {
@@ -1513,6 +1596,10 @@ struct Task {
     namespace: Namespace,
     heaps: Heaps,
     resident: HashMap<ResourceId, Resident>,
+    /// What each byte-less name is a window onto, where the guest said. An
+    /// entry exists only for a name with no [`Self::resident`] row; the two
+    /// tables never both hold one name.
+    aliases: HashMap<ResourceId, Aliasing>,
 }
 
 /// Where a task's object list is and how big the guest said it is.
@@ -1538,7 +1625,69 @@ impl Task {
             namespace: Namespace::new(),
             heaps: Heaps::default(),
             resident: HashMap::new(),
+            aliases: HashMap::new(),
         }
+    }
+
+    /// The memory `alias` is a window onto, resolved against this task's
+    /// current names.
+    ///
+    /// `None` is "cannot say", and the caller's answer to that is `DomainOnly`.
+    fn alias_target(
+        &self,
+        alias: Aliasing,
+        mappings: &dyn MappingResolver,
+        depth: u8,
+    ) -> Option<AliasTarget> {
+        match alias {
+            Aliasing::Surface(mapping) => Some(AliasTarget {
+                key: ResourceKey {
+                    backing: mappings.backing(mapping)?,
+                    heap: None,
+                },
+                extent: ParticipationExtent::Whole,
+            }),
+            Aliasing::TextureView { base, window } => self.through(base, window, mappings, depth),
+            Aliasing::BufferBytes { buffer } => self.through(buffer, None, mappings, depth),
+        }
+    }
+
+    /// The memory a *live* name stands for, narrowed to `window` when the name
+    /// owns image storage of its own.
+    fn through(
+        &self,
+        name: ResourceId,
+        window: Option<SubresourceRange>,
+        mappings: &dyn MappingResolver,
+        depth: u8,
+    ) -> Option<AliasTarget> {
+        if depth >= ALIAS_DEPTH || !self.namespace.is_live(name) {
+            return None;
+        }
+        if let Some(&resident) = self.resident.get(&name) {
+            let heap = match resident {
+                Resident::Placed(p) => Some(self.heaps.membership(p.heap).ok()?),
+                Resident::Dedicated { .. } => None,
+            };
+            let extent = match (resident, window) {
+                (Resident::Dedicated { .. }, Some(w)) => ParticipationExtent::Subresource(w),
+                (Resident::Dedicated { .. }, None) => ParticipationExtent::Whole,
+                // A placed resource is a window of a heap a neighbour also sits
+                // in, so its whole is an exact range and never the backing.
+                (Resident::Placed(p), _) => ParticipationExtent::Range(p.region),
+            };
+            return Some(AliasTarget {
+                key: ResourceKey {
+                    backing: resident.backing(),
+                    heap,
+                },
+                extent,
+            });
+        }
+        // A name that is itself only a window. Its own target is a superset of
+        // ours whichever sub-window we asked for, so it is taken whole.
+        let inner = *self.aliases.get(&name)?;
+        self.alias_target(inner, mappings, depth + 1)
     }
 }
 
@@ -1680,6 +1829,118 @@ impl Lifecycle {
         }
     }
 
+    /// Record what a byte-less name is a window onto.
+    ///
+    /// Returns whether it was recorded. `false` for a name that owns bytes: an
+    /// alias beside a residency would be a second answer to "what memory is
+    /// this", and the residency is the one the content authority already
+    /// stands on — so the declaration is refused rather than allowed to shadow
+    /// it, and the caller is told.
+    ///
+    /// Declaring again replaces, because the guest may rewrite a view in place
+    /// and the newest statement is the one that is true.
+    ///
+    /// # Errors
+    ///
+    /// If the task does not exist or the name is not its slot's live occupant.
+    pub fn declare_alias(
+        &mut self,
+        task: TaskId,
+        resource: ResourceId,
+        alias: Aliasing,
+    ) -> Result<bool, Refusal> {
+        let t = self
+            .tasks
+            .get_mut(&task)
+            .ok_or(Refusal::NoSuchTask { task })?;
+        t.namespace
+            .resolve(resource)
+            .map_err(|refusal| Refusal::Namespace { task, refusal })?;
+        if t.resident.contains_key(&resource) {
+            return Ok(false);
+        }
+        let alias = match alias {
+            // A window naming no level or no slice overlaps nothing, so an
+            // alias carrying one would order against nothing at all.
+            Aliasing::TextureView {
+                base,
+                window: Some(w),
+            } if w.level_count == 0 || w.slice_count == 0 => {
+                Aliasing::TextureView { base, window: None }
+            }
+            other => other,
+        };
+        t.aliases.insert(resource, alias);
+        Ok(true)
+    }
+
+    /// Give a live name that was declared with no bytes the bytes its object
+    /// turns out to own.
+    ///
+    /// # When a name is declared before its object can say what it is
+    ///
+    /// A name is issued the first time anything asks what a slot holds, and the
+    /// question is often a lifetime packet or a pipeline lookup that reads the
+    /// slot's list entry before the guest has finished writing the descriptor
+    /// behind it — or reads a slot the guest has since reused for a different
+    /// kind of object without sending a delete. The name is then declared
+    /// [`Storage::NoBytes`], and it stays so: construction takes the existing
+    /// name rather than issue a second one, because a second one would retire an
+    /// object the guest never deleted. Every access by that name is then
+    /// [`crate::access::AccessKey::DomainOnly`] for as long as the name lives,
+    /// whatever the object in the slot is.
+    ///
+    /// This is the half that was missing: the same declaration
+    /// [`LifecycleOp::CreateResource`] makes — residency, namespace backing,
+    /// content authority over the guest's own pages — applied to a name that
+    /// already exists, without the generation advance and the displacement
+    /// that a redeclaration is. Only a [`Storage::Dedicated`] arrives here:
+    /// nothing in the model stopped a placed resource being described the same
+    /// way, and nothing produces one.
+    ///
+    /// Returns whether the storage was attached. `false` for a name that is not
+    /// live, that already owns bytes, or that is a declared window onto another
+    /// name's memory ([`Aliasing`]) — an alias is itself the statement that the
+    /// name has none — and for any storage other than `Dedicated`.
+    ///
+    /// # Errors
+    ///
+    /// If the task does not exist.
+    pub fn attach_storage(
+        &mut self,
+        task: TaskId,
+        name: ResourceId,
+        storage: Storage,
+    ) -> Result<bool, Refusal> {
+        let Storage::Dedicated { backing, extent } = storage else {
+            return Ok(false);
+        };
+        let t = self
+            .tasks
+            .get_mut(&task)
+            .ok_or(Refusal::NoSuchTask { task })?;
+        if t.resident.contains_key(&name) || t.aliases.contains_key(&name) {
+            return Ok(false);
+        }
+        if !t.namespace.attach_backing(name, backing) {
+            return Ok(false);
+        }
+        // Its own pages: the guest supplied them and holds all of the content,
+        // so this is a declaration and not a write, exactly as in
+        // `create_resource`.
+        self.content.declare(backing, extent, Replica::GuestPages);
+        let t = self.tasks.get_mut(&task).expect("checked above");
+        t.resident
+            .insert(name, Resident::Dedicated { backing, extent });
+        Ok(true)
+    }
+
+    /// The alias a name was declared with, for a test or a census.
+    #[must_use]
+    pub fn alias_of(&self, task: TaskId, resource: ResourceId) -> Option<Aliasing> {
+        self.tasks.get(&task)?.aliases.get(&resource).copied()
+    }
+
     /// Place one participation: which backing it names, where in that
     /// backing's coordinates, and which content versions it consumes and
     /// produces.
@@ -1728,6 +1989,36 @@ impl Lifecycle {
         domain: ChannelId,
         participation: &Participation,
     ) -> Result<AccessIntent, Refusal> {
+        self.access_through(task, domain, participation, &NoMappings)
+    }
+
+    /// [`Self::access`], for a caller that can say what a mapping's surface
+    /// currently is, so a name declared as a window onto one resolves to it.
+    ///
+    /// Everything [`Self::access`] says holds here. The one difference is for a
+    /// name with no bytes: when it was declared an [`Aliasing`], and the alias
+    /// resolves, the access is keyed on the memory it is a window onto instead
+    /// of on the domain alone. When it does not resolve the answer is the same
+    /// `DomainOnly` as before, which is what keeps this an improvement and not
+    /// a change of meaning.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::access`].
+    pub fn access_through(
+        &mut self,
+        task: TaskId,
+        domain: ChannelId,
+        participation: &Participation,
+        mappings: &dyn MappingResolver,
+    ) -> Result<AccessIntent, Refusal> {
+        // An unbounded participation names no memory, so there is no name to
+        // resolve: what it is a participation *of* is the operation, not a
+        // resource, and a name that has since been deleted must not refuse the
+        // packet that binds it.
+        if matches!(participation.extent, ParticipationExtent::Unbounded) {
+            return Ok(participation.resolve_no_bytes(domain));
+        }
         let t = self
             .tasks
             .get_mut(&task)
@@ -1748,7 +2039,21 @@ impl Lifecycle {
         // over-orders and never under-orders, and it is the same vocabulary an
         // unresolvable present target already uses.
         let Some(&resident) = t.resident.get(&participation.resource) else {
-            return Ok(participation.resolve_no_bytes(domain));
+            // No bytes of its own. If the guest said what it is a window onto,
+            // the access is that memory's, with the record's own mode and no
+            // content versions — see [`Aliasing`].
+            let aliased = t
+                .aliases
+                .get(&participation.resource)
+                .and_then(|&alias| t.alias_target(alias, mappings, 0));
+            return Ok(match aliased {
+                Some(target) => Participation {
+                    extent: target.extent,
+                    ..*participation
+                }
+                .resolve(domain, target.key, None, None),
+                None => participation.resolve_no_bytes(domain),
+            });
         };
         let key = ResourceKey {
             backing: resident.backing(),
@@ -1805,13 +2110,18 @@ impl Lifecycle {
                 .window(range.offset, range.length)
                 .map_or(whole, ParticipationExtent::Range),
             ParticipationExtent::Subresource(range) => ParticipationExtent::Subresource(range),
-            ParticipationExtent::Whole => whole,
+            // Answered before the name was looked up; the arm exists so the
+            // match is exhaustive, and it is the whole of the resource because
+            // that is the widest thing this function can name.
+            ParticipationExtent::Whole | ParticipationExtent::Unbounded => whole,
         };
         let bytes = match extent {
             ParticipationExtent::Range(range) => Some(range),
             // The whole of a dedicated resource is the extent it was declared
             // with, which the content authority already knows.
-            ParticipationExtent::Whole => self.content.extent(key.backing),
+            ParticipationExtent::Whole | ParticipationExtent::Unbounded => {
+                self.content.extent(key.backing)
+            }
             ParticipationExtent::Subresource(_) => None,
         };
         let input = bytes.map_or_else(
@@ -2210,6 +2520,7 @@ impl Lifecycle {
             .get_mut(&task)
             .expect("the caller holds the task");
         let resident = t.resident.remove(&resource);
+        t.aliases.remove(&resource);
         let mut effects = Effects {
             teardowns: vec![teardown],
             ..Effects::default()
@@ -5833,6 +6144,32 @@ mod tests {
         assert_eq!(intent.output_content_version, None);
     }
 
+    /// An unbounded participation needs no name: it is a participation of the
+    /// operation, and a name the guest has deleted since, or never declared, does
+    /// not refuse the packet that carries it.
+    #[test]
+    fn an_unbounded_participation_resolves_with_no_name_at_all() {
+        let (mut l, dedicated_name) = with_one_resource(0x1000);
+        let unbounded = |resource| Participation {
+            resource,
+            extent: ParticipationExtent::Unbounded,
+            mode: AccessMode::Unknown,
+            api_stages: 0,
+        };
+        // A live dedicated name: still not keyed by its backing.
+        let live = l
+            .access(TASK, ChannelId(2), &unbounded(dedicated_name))
+            .expect("unbounded");
+        assert_eq!(live.key, crate::access::AccessKey::DomainOnly);
+        assert_eq!(live.mode, AccessMode::Unknown);
+        assert_eq!(live.output_content_version, None, "nothing is reserved");
+        // A name nothing declared, in a task nothing defined.
+        let nowhere = l
+            .access(TaskId(99), ChannelId(2), &unbounded(name(40)))
+            .expect("it names no memory, so it resolves nothing");
+        assert_eq!(nowhere.key, crate::access::AccessKey::DomainOnly);
+    }
+
     /// It over-orders rather than under-orders: the key meets every other
     /// access, so nothing the record might really have touched slips past it.
     #[test]
@@ -5952,5 +6289,622 @@ mod tests {
             )
             .expect_err("slot 9 was never declared");
         assert!(matches!(refusal, Refusal::Namespace { .. }));
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    use crate::access::{requires_edge, AccessKey};
+    use crate::identity::SlotGeneration;
+
+    const TASK: TaskId = TaskId(1);
+
+    fn name(slot: u32) -> ResourceId {
+        ResourceId {
+            slot: ObjectListRef(slot),
+            generation: SlotGeneration::default().next(),
+        }
+    }
+
+    fn range(offset: u64, length: u64) -> ByteRange {
+        ByteRange { offset, length }
+    }
+
+    /// A task with a dedicated texture in slot 0 (backing 10), a dedicated
+    /// buffer in slot 1 (backing 11) and byte-less names in slots 2..=5.
+    fn world() -> Lifecycle {
+        let mut l = Lifecycle::new();
+        let _ = l
+            .apply(&LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+                directory: DirectoryFrame(0x1000),
+            })
+            .expect("task");
+        for (slot, storage) in [
+            (
+                0,
+                Storage::Dedicated {
+                    backing: BackingId(10),
+                    extent: range(0, 0x4000),
+                },
+            ),
+            (
+                1,
+                Storage::Dedicated {
+                    backing: BackingId(11),
+                    extent: range(0, 0x1000),
+                },
+            ),
+            (2, Storage::NoBytes),
+            (3, Storage::NoBytes),
+            (4, Storage::NoBytes),
+            (5, Storage::NoBytes),
+        ] {
+            let _ = l
+                .apply(&LifecycleOp::CreateResource {
+                    task: TASK,
+                    slot: ObjectListRef(slot),
+                    storage,
+                })
+                .expect("declared");
+        }
+        l
+    }
+
+    fn touch(l: &mut Lifecycle, resource: ResourceId, mode: AccessMode) -> AccessIntent {
+        l.access(
+            TASK,
+            ChannelId(1),
+            &Participation {
+                resource,
+                extent: ParticipationExtent::Whole,
+                mode,
+                api_stages: 0,
+            },
+        )
+        .expect("a live name")
+    }
+
+    struct Mapper(Vec<(u32, u64)>);
+
+    impl MappingResolver for Mapper {
+        fn backing(&self, mapping: MappingId) -> Option<BackingId> {
+            self.0
+                .iter()
+                .find(|(m, _)| *m == mapping.0)
+                .map(|(_, b)| BackingId(*b))
+        }
+    }
+
+    fn through(
+        l: &mut Lifecycle,
+        resource: ResourceId,
+        mode: AccessMode,
+        mappings: &dyn MappingResolver,
+    ) -> AccessIntent {
+        l.access_through(
+            TASK,
+            ChannelId(1),
+            &Participation {
+                resource,
+                extent: ParticipationExtent::Whole,
+                mode,
+                api_stages: 0,
+            },
+            mappings,
+        )
+        .expect("a live name")
+    }
+
+    const ALL_MODES: [AccessMode; 4] = [
+        AccessMode::Read,
+        AccessMode::Write,
+        AccessMode::ReadWrite,
+        AccessMode::Unknown,
+    ];
+
+    /// The point of the whole module: a view is ordered against the texture it
+    /// is a view of, and against nothing else.
+    #[test]
+    fn a_view_is_ordered_against_its_base_and_only_its_base() {
+        let mut l = world();
+        let window = SubresourceRange {
+            base_level: 1,
+            level_count: 2,
+            base_slice: 0,
+            slice_count: 1,
+            plane: 0,
+        };
+        assert_eq!(
+            l.declare_alias(
+                TASK,
+                name(2),
+                Aliasing::TextureView {
+                    base: name(0),
+                    window: Some(window)
+                }
+            ),
+            Ok(true)
+        );
+        let view = touch(&mut l, name(2), AccessMode::Read);
+        assert_eq!(
+            view.key,
+            AccessKey::Subresource(
+                ResourceKey {
+                    backing: BackingId(10),
+                    heap: None
+                },
+                window
+            )
+        );
+        let base_write = touch(&mut l, name(0), AccessMode::Write);
+        let other_write = touch(&mut l, name(1), AccessMode::Write);
+        assert!(
+            requires_edge(&base_write, &view),
+            "a write of the base, then a read through its view"
+        );
+        assert!(!requires_edge(&other_write, &view), "a different resource");
+        // And the flip side of the same fact: two readers of one base are
+        // still free of each other, view or not.
+        let base_read = touch(&mut l, name(0), AccessMode::Read);
+        assert!(!requires_edge(&base_read, &view));
+    }
+
+    /// A reflected write is never downgraded on the way through an alias, and
+    /// nothing is promoted either: the mode is the record's, exactly.
+    #[test]
+    fn an_alias_never_changes_the_mode_it_was_asked_for() {
+        let mut l = world();
+        l.declare_alias(
+            TASK,
+            name(2),
+            Aliasing::TextureView {
+                base: name(0),
+                window: None,
+            },
+        )
+        .expect("view");
+        l.declare_alias(TASK, name(3), Aliasing::Surface(MappingId(7)))
+            .expect("surface");
+        l.declare_alias(TASK, name(4), Aliasing::BufferBytes { buffer: name(1) })
+            .expect("buffer texture");
+        let mapper = Mapper(vec![(7, 99)]);
+        for mode in ALL_MODES {
+            for alias in [name(2), name(3), name(4)] {
+                let got = through(&mut l, alias, mode, &mapper);
+                assert_eq!(got.mode, mode, "{alias:?}");
+                assert_ne!(got.key, AccessKey::DomainOnly, "{alias:?} resolved");
+                assert_eq!(got.input_content_version, None);
+                assert_eq!(
+                    got.output_content_version, None,
+                    "a write through an alias reserves no version, as the DomainOnly it replaces reserved none"
+                );
+            }
+        }
+    }
+
+    /// An alias is a superset of what the record touches, never a subset: a
+    /// view with no window is the whole base, and a buffer texture is the
+    /// whole buffer.
+    #[test]
+    fn a_view_without_a_window_and_a_buffer_texture_are_the_whole_of_what_they_cover() {
+        let mut l = world();
+        l.declare_alias(
+            TASK,
+            name(2),
+            Aliasing::TextureView {
+                base: name(0),
+                window: None,
+            },
+        )
+        .expect("view");
+        l.declare_alias(TASK, name(4), Aliasing::BufferBytes { buffer: name(1) })
+            .expect("buffer texture");
+        let key = |b| ResourceKey {
+            backing: BackingId(b),
+            heap: None,
+        };
+        assert_eq!(
+            touch(&mut l, name(2), AccessMode::Write).key,
+            AccessKey::Whole(key(10))
+        );
+        assert_eq!(
+            touch(&mut l, name(4), AccessMode::Write).key,
+            AccessKey::Whole(key(11))
+        );
+    }
+
+    /// A window naming no level, or no slice, would overlap nothing and so
+    /// order against nothing. It is recorded as the whole base instead.
+    #[test]
+    fn an_empty_window_is_the_whole_base_and_never_nothing() {
+        let mut l = world();
+        for empty in [
+            SubresourceRange {
+                base_level: 0,
+                level_count: 0,
+                base_slice: 0,
+                slice_count: 1,
+                plane: 0,
+            },
+            SubresourceRange {
+                base_level: 0,
+                level_count: 1,
+                base_slice: 0,
+                slice_count: 0,
+                plane: 0,
+            },
+        ] {
+            l.declare_alias(
+                TASK,
+                name(2),
+                Aliasing::TextureView {
+                    base: name(0),
+                    window: Some(empty),
+                },
+            )
+            .expect("view");
+            let view = touch(&mut l, name(2), AccessMode::Write);
+            let base = touch(&mut l, name(0), AccessMode::Read);
+            assert!(requires_edge(&view, &base), "{empty:?}");
+            assert_eq!(
+                view.key,
+                AccessKey::Whole(ResourceKey {
+                    backing: BackingId(10),
+                    heap: None
+                })
+            );
+        }
+    }
+
+    /// A surface is whatever the mapper says it is *now*: with no mapper, or a
+    /// mapper that does not know it, the answer is the `DomainOnly` it always
+    /// was, and when the mapper moves the surface the access moves with it.
+    #[test]
+    fn a_surface_follows_the_mapper_and_falls_back_to_domain_only_without_one() {
+        let mut l = world();
+        l.declare_alias(TASK, name(3), Aliasing::Surface(MappingId(7)))
+            .expect("surface");
+        assert_eq!(
+            touch(&mut l, name(3), AccessMode::Read).key,
+            AccessKey::DomainOnly
+        );
+        assert_eq!(
+            through(&mut l, name(3), AccessMode::Read, &Mapper(vec![])).key,
+            AccessKey::DomainOnly
+        );
+        let first = through(&mut l, name(3), AccessMode::Read, &Mapper(vec![(7, 99)]));
+        assert_eq!(
+            first.key,
+            AccessKey::Whole(ResourceKey {
+                backing: BackingId(99),
+                heap: None
+            })
+        );
+        // The mapping's pages moved: a new incarnation, and the alias is not
+        // holding the old one.
+        let moved = through(&mut l, name(3), AccessMode::Read, &Mapper(vec![(7, 100)]));
+        assert_eq!(
+            moved.key,
+            AccessKey::Whole(ResourceKey {
+                backing: BackingId(100),
+                heap: None
+            })
+        );
+        assert!(!first.key.may_alias(moved.key));
+    }
+
+    /// A view of a base the guest has since deleted names nothing, so it falls
+    /// back rather than naming storage the base no longer has.
+    #[test]
+    fn a_view_of_a_deleted_base_falls_back_to_domain_only() {
+        let mut l = world();
+        l.declare_alias(
+            TASK,
+            name(2),
+            Aliasing::TextureView {
+                base: name(0),
+                window: None,
+            },
+        )
+        .expect("view");
+        assert_ne!(
+            touch(&mut l, name(2), AccessMode::Read).key,
+            AccessKey::DomainOnly
+        );
+        let _ = l
+            .apply(&LifecycleOp::DeleteResource {
+                task: TASK,
+                object_ref: 0,
+                resource: Some(name(0)),
+            })
+            .expect("delete");
+        assert_eq!(
+            touch(&mut l, name(2), AccessMode::Read).key,
+            AccessKey::DomainOnly
+        );
+    }
+
+    /// A guest can spell a view of a view of itself. The resolution stops, and
+    /// the answer is the conservative one; a chain that is merely long but
+    /// finite resolves up to the bound.
+    #[test]
+    fn a_cycle_of_views_resolves_to_domain_only_and_a_short_chain_resolves() {
+        let mut l = world();
+        l.declare_alias(
+            TASK,
+            name(2),
+            Aliasing::TextureView {
+                base: name(3),
+                window: None,
+            },
+        )
+        .expect("a over b");
+        l.declare_alias(
+            TASK,
+            name(3),
+            Aliasing::TextureView {
+                base: name(2),
+                window: None,
+            },
+        )
+        .expect("b over a");
+        assert_eq!(
+            touch(&mut l, name(2), AccessMode::Write).key,
+            AccessKey::DomainOnly
+        );
+        assert_eq!(
+            touch(&mut l, name(3), AccessMode::Write).key,
+            AccessKey::DomainOnly
+        );
+
+        // 2 over 3 over 4 over 0: a chain of three names above a real base.
+        l.declare_alias(
+            TASK,
+            name(2),
+            Aliasing::TextureView {
+                base: name(3),
+                window: None,
+            },
+        )
+        .expect("2 over 3");
+        l.declare_alias(
+            TASK,
+            name(3),
+            Aliasing::TextureView {
+                base: name(4),
+                window: None,
+            },
+        )
+        .expect("3 over 4");
+        l.declare_alias(
+            TASK,
+            name(4),
+            Aliasing::TextureView {
+                base: name(0),
+                window: None,
+            },
+        )
+        .expect("4 over 0");
+        assert_eq!(
+            touch(&mut l, name(2), AccessMode::Write).key,
+            AccessKey::Whole(ResourceKey {
+                backing: BackingId(10),
+                heap: None
+            })
+        );
+    }
+
+    /// An alias beside a residency would be a second answer to what the memory
+    /// is. It is refused, and said so.
+    #[test]
+    fn a_name_that_owns_bytes_takes_no_alias() {
+        let mut l = world();
+        assert_eq!(
+            l.declare_alias(TASK, name(0), Aliasing::Surface(MappingId(1))),
+            Ok(false)
+        );
+        assert_eq!(l.alias_of(TASK, name(0)), None);
+        assert_eq!(
+            touch(&mut l, name(0), AccessMode::Read).key,
+            AccessKey::Whole(ResourceKey {
+                backing: BackingId(10),
+                heap: None
+            }),
+            "and the residency still answers"
+        );
+    }
+
+    /// The alias dies with its name, and a slot the guest overwrites does not
+    /// hand the previous occupant's alias to the next.
+    #[test]
+    fn an_alias_does_not_outlive_its_name() {
+        let mut l = world();
+        l.declare_alias(TASK, name(2), Aliasing::Surface(MappingId(7)))
+            .expect("surface");
+        assert!(l.alias_of(TASK, name(2)).is_some());
+        let _ = l
+            .apply(&LifecycleOp::DeleteResource {
+                task: TASK,
+                object_ref: 2,
+                resource: Some(name(2)),
+            })
+            .expect("delete");
+        assert_eq!(l.alias_of(TASK, name(2)), None);
+
+        // Overwritten in place: the slot is redeclared with no packet.
+        l.declare_alias(TASK, name(3), Aliasing::Surface(MappingId(7)))
+            .expect("surface");
+        let _ = l
+            .apply(&LifecycleOp::CreateResource {
+                task: TASK,
+                slot: ObjectListRef(3),
+                storage: Storage::NoBytes,
+            })
+            .expect("redeclared");
+        let fresh = ResourceId {
+            slot: ObjectListRef(3),
+            generation: SlotGeneration::default().next().next(),
+        };
+        assert_eq!(l.alias_of(TASK, fresh), None);
+        assert_eq!(
+            through(&mut l, fresh, AccessMode::Read, &Mapper(vec![(7, 99)])).key,
+            AccessKey::DomainOnly
+        );
+    }
+
+    /// A view over a resource placed in a heap names the placement and the
+    /// heap, because the heap is where its neighbours are.
+    #[test]
+    fn a_view_over_a_placed_base_is_its_placement_in_its_heap() {
+        let mut l = world();
+        l.declare_heap(TASK, 3, BackingId(50), 0x10000)
+            .expect("heap");
+        let _ = l
+            .apply(&LifecycleOp::CreateResource {
+                task: TASK,
+                slot: ObjectListRef(6),
+                storage: Storage::Placed {
+                    heap: 3,
+                    offset: 0x2000,
+                    length: 0x1000,
+                },
+            })
+            .expect("placed");
+        l.declare_alias(
+            TASK,
+            name(2),
+            Aliasing::TextureView {
+                base: name(6),
+                window: Some(SubresourceRange::one(0, 0)),
+            },
+        )
+        .expect("view");
+        let view = touch(&mut l, name(2), AccessMode::Write);
+        let AccessKey::Range(key, r) = view.key else {
+            panic!("a placed base is a range of its heap, got {:?}", view.key);
+        };
+        assert_eq!(key.backing, BackingId(50));
+        assert_eq!(r, range(0x2000, 0x1000));
+        assert!(key.heap.is_some());
+        // The neighbour in the same heap, elsewhere in it, is not its conflict.
+        let _ = l
+            .apply(&LifecycleOp::CreateResource {
+                task: TASK,
+                slot: ObjectListRef(7),
+                storage: Storage::Placed {
+                    heap: 3,
+                    offset: 0x8000,
+                    length: 0x1000,
+                },
+            })
+            .expect("neighbour");
+        let neighbour = touch(&mut l, name(7), AccessMode::Write);
+        assert!(!requires_edge(&neighbour, &view));
+    }
+
+    /// A name declared with no bytes that turns out to own some is ordered
+    /// against those bytes from then on, under the name it already had.
+    ///
+    /// Not a redeclaration: the name, its generation and every id handed out for
+    /// it are the same before and after, and accepted work keeps the name it was
+    /// admitted under.
+    #[test]
+    fn a_name_that_turns_out_to_own_bytes_keeps_its_name_and_takes_them() {
+        let mut l = world();
+        let before = touch(&mut l, name(5), AccessMode::Write);
+        assert_eq!(before.key, AccessKey::DomainOnly);
+
+        let storage = Storage::Dedicated {
+            backing: BackingId(77),
+            extent: range(0, 0x2000),
+        };
+        assert_eq!(l.attach_storage(TASK, name(5), storage), Ok(true));
+
+        let after = touch(&mut l, name(5), AccessMode::Write);
+        assert_eq!(
+            after.key,
+            AccessKey::Whole(ResourceKey {
+                backing: BackingId(77),
+                heap: None
+            })
+        );
+        assert!(
+            after.output_content_version.is_some(),
+            "it owns bytes now, so a write is authority over them like any other"
+        );
+        // The same name still resolves, and another resource over other
+        // storage is still independent of it.
+        let other = touch(&mut l, name(1), AccessMode::Write);
+        assert!(!requires_edge(&other, &after));
+        assert!(l.content().knows(BackingId(77)));
+        // And the name's departure owes what a name over bytes owes.
+        let effects = l
+            .apply(&LifecycleOp::DeleteResource {
+                task: TASK,
+                object_ref: 5,
+                resource: Some(name(5)),
+            })
+            .expect("delete");
+        assert!(
+            matches!(effects.teardowns.as_slice(), [namespace::Teardown::Now { backing }] if *backing == BackingId(77)),
+            "{effects:?}"
+        );
+    }
+
+    /// Storage is settled once, and only for a name that is live and has none.
+    #[test]
+    fn attaching_storage_is_refused_for_everything_but_a_live_name_with_none() {
+        let mut l = world();
+        let dedicated = |b| Storage::Dedicated {
+            backing: BackingId(b),
+            extent: range(0, 0x1000),
+        };
+        // Already owns bytes.
+        assert_eq!(l.attach_storage(TASK, name(0), dedicated(88)), Ok(false));
+        assert_eq!(
+            touch(&mut l, name(0), AccessMode::Read).key,
+            AccessKey::Whole(ResourceKey {
+                backing: BackingId(10),
+                heap: None
+            }),
+            "and keeps the storage it had"
+        );
+        // A declared window onto another name's memory.
+        l.declare_alias(TASK, name(2), Aliasing::Surface(MappingId(7)))
+            .expect("surface");
+        assert_eq!(l.attach_storage(TASK, name(2), dedicated(88)), Ok(false));
+        // Not a live name.
+        assert_eq!(l.attach_storage(TASK, name(99), dedicated(88)), Ok(false));
+        let _ = l
+            .apply(&LifecycleOp::DeleteResource {
+                task: TASK,
+                object_ref: 4,
+                resource: Some(name(4)),
+            })
+            .expect("delete");
+        assert_eq!(l.attach_storage(TASK, name(4), dedicated(88)), Ok(false));
+        // A storage that is not dedicated.
+        assert_eq!(l.attach_storage(TASK, name(3), Storage::NoBytes), Ok(false));
+        // No such task.
+        assert_eq!(
+            l.attach_storage(TaskId(9), name(3), dedicated(88)),
+            Err(Refusal::NoSuchTask { task: TaskId(9) })
+        );
+        // The one that qualifies, once.
+        assert_eq!(l.attach_storage(TASK, name(3), dedicated(88)), Ok(true));
+        assert_eq!(l.attach_storage(TASK, name(3), dedicated(89)), Ok(false));
+    }
+
+    /// The default of the whole owner is unchanged for a name nobody declared an
+    /// alias for: it is still `DomainOnly`, still at rung three.
+    #[test]
+    fn a_byte_less_name_with_no_alias_is_what_it_was() {
+        let mut l = world();
+        let got = touch(&mut l, name(5), AccessMode::Unknown);
+        assert_eq!(got.key, AccessKey::DomainOnly);
+        assert_eq!(got.mode, AccessMode::Unknown);
     }
 }

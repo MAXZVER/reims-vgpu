@@ -443,7 +443,7 @@ fn apply_delete_object<H: HostMemory + HostOps>(
             } else if let Some(name) =
                 crate::runtime::objects::name_resource(state, host, task_id, object_ref)
             {
-                let ended = state.retire_pipeline(name);
+                let ended = state.retire_pipeline(task_id, name);
                 note_store_route_n("pipeline_retire_released", ended.stranded.len() as u64);
                 // Whether the table had an entry to retire, which is not the
                 // same question as whether the guest sent a delete. A driven
@@ -2210,25 +2210,8 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // a wait nothing can satisfy loses the guest. So the wait is dropped and
     // named, here rather than in the bridge — which slot numbers exist is a
     // property of this device's page and not of the packet.
-    let page_size = state.page_size();
-    built.stamp_waits.retain(|wait| {
-        if stamp_slot_offset(wait.slot.0, page_size).is_some() {
-            return true;
-        }
-        note_store_route("packet_stamp_wait_unresolvable");
-        if crate::observe::first_sight("packet_stamp_wait_unresolvable", u64::from(wait.slot.0)) {
-            crate::observe::fail(format!(
-                "packet_stamp_wait_unresolvable reason=stamp_slot_out_of_range opcode={:#x} \
-                 index={} slots={} (no drain writes a slot outside the stamp page, so the \
-                 packet is admitted unordered against this wait rather than parking forever)",
-                packet.opcode,
-                wait.slot.0,
-                stamp_slot_count(page_size)
-            ));
-        }
-        false
-    });
-    note_access_modes(state, &built);
+    drop_unresolvable_stamp_waits(state, &packet, &mut built);
+    lab_capture_walk_state(state, &built);
     // The pipelines the records bind, told to the model before it is asked
     // whether the packet may run: `PipelineTable::waits_for` refuses a lease it
     // has no entry for, and the entry is this device's to make. The list is the
@@ -2255,8 +2238,14 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // then ready) unreachable on the packet that first builds the kernel. The
     // step is the guest's fact and the walk's own list; taking it earlier
     // states the same thing at the first moment it is known.
+    let claiming_task = arrived.submission.as_ref().map(|s| s.task_id());
+    // An exec packet always has a submission (`device_packet` refuses one
+    // without), so a packet with leases has a task; the `0` is for the packets
+    // with none, which have no leases to name.
+    let lease_task = claiming_task.unwrap_or(0);
     for &lease in leases {
-        note_store_route(if state.declare_pipeline(lease) {
+        lab_note_pipeline_claim(lease, claiming_task);
+        note_store_route(if state.declare_pipeline(lease_task, lease) {
             "pipeline_declared"
         } else {
             "pipeline_declared_already"
@@ -2277,13 +2266,91 @@ fn admit_and_park<H: HostMemory + HostOps>(
     };
     for &lease in leases {
         if translating.contains(&lease.slot.0) {
-            withdraw_lease(state, lease);
+            withdraw_lease(state, lease_task, lease);
         } else if translating.is_empty() {
-            ready_lease(state, lease, "pipeline_lease_ready_admission");
+            ready_lease(state, lease_task, lease, "pipeline_lease_ready_admission");
         }
     }
 
-    let admission = match state.admit_packet(&built) {
+    // **The walk asked a question the pre-scan has since answered.** It reads
+    // a pipeline's published usage once, before anything for this packet has
+    // been published, so the first packet to bind a pipeline — or the first
+    // after the model dropped what it knew — is walked with every slot it binds
+    // `Unknown`, and is admitted that way for the rest of its life: the
+    // dependency graph keeps the accesses it was admitted with. When the
+    // pre-scan above has published what the walk was missing, walking again is
+    // the only way the admission can be the exact one. The records and the
+    // packet are the same, so the second walk differs from the first in nothing
+    // but what the model now knows.
+    //
+    // Behind [`crate::runtime::objects::access_exact`], because it narrows
+    // accesses the model would otherwise have kept conservative.
+    if crate::runtime::objects::access_exact() {
+        let unanswered = built
+            .payload
+            .exec()
+            .and_then(|work| work.usage_census.first_unanswered_pipeline);
+        if unanswered
+            .zip(claiming_task)
+            .is_some_and(|(id, task)| state.pipeline_usage_published(task, id))
+        {
+            match crate::runtime::ingress::device_packet(
+                state,
+                host,
+                fifo,
+                session,
+                StampSlot(stamp_slot_index(completion_slot)),
+                &packet,
+                crate::runtime::ingress::PacketReads {
+                    submission: arrived.submission.as_ref(),
+                    repointed: arrived.repointed,
+                },
+            ) {
+                Ok(mut again) => {
+                    drop_unresolvable_stamp_waits(state, &packet, &mut again);
+                    note_store_route("access_rewalked");
+                    // TEMP (lab, access precision): the usage the pre-scan just
+                    // published did not answer the walk that asked for it.
+                    if let Some(id) = again
+                        .payload
+                        .exec()
+                        .and_then(|work| work.usage_census.first_unanswered_pipeline)
+                    {
+                        note_store_route("lab_rewalk_still_unanswered");
+                        if crate::observe::first_sight("lab_rewalk_still_unanswered", u64::from(id.slot.0)) {
+                            crate::observe::fail(format!(
+                                "lab_rewalk_still_unanswered slot={} gen={} task={:?} model_pipeline={}                                  published={} wanted={}",
+                                id.slot.0,
+                                id.generation.0,
+                                claiming_task,
+                                state.pipeline_state(claiming_task.unwrap_or(0), id).unwrap_or("unleased"),
+                                state.pipeline_usage_published(claiming_task.unwrap_or(0), id),
+                                state.pipeline_usage_wanted(claiming_task.unwrap_or(0), id),
+                            ));
+                        }
+                    }
+                    built = again;
+                }
+                // The first walk is still a valid admission: conservative, and
+                // the one this packet would have had without the switch.
+                Err(_) => note_store_route("access_rewalk_refused"),
+            }
+        }
+    }
+    note_access_modes(state, &built);
+    state.lab_pipeline_admission(
+        lease_task,
+        built
+            .payload
+            .exec()
+            .map_or(&[][..], |work| &work.pipeline_leases),
+    );
+    let admitted = if crate::runtime::cost_opts::on() {
+        state.admit_packet_owned(built)
+    } else {
+        state.admit_packet(&built)
+    };
+    let admission = match admitted {
         Ok(admission) => admission,
         Err(refusal) => {
             note_unadmitted(
@@ -2300,7 +2367,17 @@ fn admit_and_park<H: HostMemory + HostOps>(
     };
     let mut transaction = admission.admitted.transaction;
     let ingress = transaction.identity.ingress;
+    state.lab_pipeline_admitted(
+        ingress,
+        lease_task,
+        transaction
+            .payload
+            .exec()
+            .map_or(&[][..], |work| &work.pipeline_leases),
+    );
     lab_dag_admit(
+        state,
+        claiming_task,
         &transaction,
         &admission.admitted.hazard_waits,
         admission.admitted.ready,
@@ -2332,6 +2409,51 @@ fn admit_and_park<H: HostMemory + HostOps>(
         _ => crate::runtime::parked::ParkedWork::new(fifo.domain().0, admission.epoch, packet),
     };
     state.parked.park(ingress, work);
+}
+
+/// Drop the stamp waits a packet names that no drain could ever satisfy.
+///
+/// Factored out of [`admit_and_park`] because a packet may be walked twice and
+/// the rule is about the walk's result, not about which walk it was.
+fn drop_unresolvable_stamp_waits(
+    state: &DeviceState,
+    packet: &Packet,
+    built: &mut reims_vgpu_core::session::Packet,
+) {
+    let page_size = state.page_size();
+    built.stamp_waits.retain(|wait| {
+        if stamp_slot_offset(wait.slot.0, page_size).is_some() {
+            return true;
+        }
+        note_store_route("packet_stamp_wait_unresolvable");
+        if crate::observe::first_sight("packet_stamp_wait_unresolvable", u64::from(wait.slot.0)) {
+            crate::observe::fail(format!(
+                "packet_stamp_wait_unresolvable reason=stamp_slot_out_of_range opcode={:#x} \
+                 index={} slots={} (no drain writes a slot outside the stamp page, so the \
+                 packet is admitted unordered against this wait rather than parking forever)",
+                packet.opcode,
+                wait.slot.0,
+                stamp_slot_count(page_size)
+            ));
+        }
+        false
+    });
+}
+
+/// TEMP (lab, access precision): remember the model's state for the first
+/// pipeline the walk found unanswered, as it was when the walk finished.
+fn lab_capture_walk_state(state: &DeviceState, built: &reims_vgpu_core::session::Packet) {
+    if !lab_dag_on() {
+        return;
+    }
+    if let Some(id) = built
+        .payload
+        .exec()
+        .and_then(|work| work.usage_census.first_unanswered_pipeline)
+    {
+        let st = work_pipeline_state(state, built, id);
+        LAB_NP.with(|n| *n.borrow_mut() = Some(st));
+    }
 }
 
 /// How much of this packet's ordering is bought by knowing, and how much by not
@@ -2374,6 +2496,7 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
     };
     let census = &work.usage_census;
     for (route, n) in [
+        ("access_unbounded_footprint", census.footprints_unbounded),
         ("draw_usage_no_pipeline", census.draws_without_a_pipeline),
         ("draw_usage_no_stage", census.draws_with_no_stage_published),
         (
@@ -2416,10 +2539,106 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
                  the draw binds ordered against every other access to the same resource)",
                 id.slot.0,
                 id.generation.0,
-                state.pipeline_state(id).unwrap_or("unleased"),
+                work_pipeline_state(state, built, id),
             ));
         }
     }
+}
+
+/// The model's state for a pipeline a packet's walk named, under the scope the
+/// packet states. `"unleased"` for one the table does not hold.
+fn work_pipeline_state(
+    state: &DeviceState,
+    built: &reims_vgpu_core::session::Packet,
+    id: reims_vgpu_core::identity::ResourceId,
+) -> &'static str {
+    let scope = built
+        .payload
+        .exec()
+        .map_or_else(Default::default, |work| work.pipelines);
+    state
+        .pipeline_state_of(scope.id(id))
+        .unwrap_or("unleased")
+}
+
+thread_local! {
+    /// TEMP (lab, access precision): DomainOnly participations the current
+    /// walk answered, drained by `lab_dag_admit` of the same packet.
+    static LAB_D: std::cell::RefCell<Vec<(u8, u32, char, char)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// TEMP (lab, access precision): the model's state for the first pipeline a
+    /// draw found unanswered, as it was when the walk finished.
+    static LAB_NP: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// TEMP (lab, access precision): the pre-scan found this pipeline's translation
+/// already memoized and skipped it without publishing; say whether the model
+/// holds its usage, and in which state the pipeline is. A pipeline that is
+/// skipped here and was never published stays `Unknown` for every later walk.
+pub(crate) fn lab_note_memo_skip(state: &DeviceState, task_id: u32, pipeline_ref: u32) {
+    let Some(name) = state.object_name(task_id, pipeline_ref) else {
+        note_store_route("lab_memo_skip_unnamed");
+        return;
+    };
+    let published = state.pipeline_usage_published(task_id, name);
+    note_store_route(if published {
+        "lab_memo_skip_published"
+    } else {
+        "lab_memo_skip_unpublished"
+    });
+    if !published && crate::observe::first_sight("lab_memo_skip_unpublished", u64::from(name.slot.0))
+    {
+        crate::observe::fail(format!(
+            "lab_memo_skip_unpublished slot={} gen={} model_pipeline={}",
+            name.slot.0,
+            name.generation.0,
+            state.pipeline_state(task_id, name).unwrap_or("unleased"),
+        ));
+    }
+}
+
+/// TEMP (lab, access precision): the ordering plane keys a pipeline by its
+/// object-list slot and that slot's generation, and neither names a task. Two
+/// tasks that each have a pipeline at slot 30, generation 1, are one entry in
+/// its table — one deletion retires both, and a reflection published for one is
+/// answered for the other. Say when a second task binds an id a first one did.
+fn lab_note_pipeline_claim(lease: reims_vgpu_core::identity::ResourceId, task: Option<u32>) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    let Some(task) = task else {
+        return;
+    };
+    static CLAIMS: OnceLock<Mutex<HashMap<(u32, u32), u32>>> = OnceLock::new();
+    let mut claims = CLAIMS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let key = (lease.slot.0, lease.generation.0 as u32);
+    let first = *claims.entry(key).or_insert(task);
+    if first == task {
+        return;
+    }
+    note_store_route("lab_pipeline_id_shared_packets");
+    if crate::observe::first_sight(
+        "lab_pipeline_id_shared",
+        (u64::from(task) << 40) | (u64::from(first) << 32) | u64::from(lease.slot.0),
+    ) {
+        crate::observe::fail(format!(
+            "lab_pipeline_id_shared slot={} gen={} first_task={first} this_task={task}              (one pipeline-table entry for two tasks' pipelines)",
+            lease.slot.0, lease.generation.0
+        ));
+    }
+}
+
+/// TEMP (lab, access precision): whether the DAG census window is open.
+pub(crate) fn lab_dag_window() -> bool {
+    lab_dag_on()
+}
+
+/// TEMP (lab, access precision): record one DomainOnly participation.
+pub(crate) fn lab_note_domain_only(object_type: u8, slot: u32, mode: char, extent: char) {
+    LAB_D.with(|d| d.borrow_mut().push((object_type, slot, mode, extent)));
 }
 
 /// TEMP (lab, S0): `REIMS_VGPU_LAB_DAG=PATH` — while PATH exists, one `lab_dag` line
@@ -2449,6 +2668,8 @@ fn lab_dag_on() -> bool {
 static LAB_DAG_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn lab_dag_admit(
+    state: &DeviceState,
+    task: Option<u32>,
     transaction: &reims_vgpu_core::transaction::DeviceTransaction,
     hazards: &[reims_vgpu_core::identity::IngressOrdinal],
     ready: bool,
@@ -2487,8 +2708,41 @@ fn lab_dag_admit(
         acc.push_str(&key);
     }
     let hz: Vec<String> = hazards.iter().map(|h| h.0.to_string()).collect();
+    // TEMP (lab, access precision): what made the packet's accesses imprecise.
+    // `dt` is every DomainOnly participation the walk answered (object type of
+    // the named slot, slot, mode, extent); `np` is the first pipeline a draw
+    // found unanswered, with the model's state for it when the walk asked and
+    // now, whether usage is published now (after this packet's own preflight),
+    // and how many draws/dispatches found nothing.
+    let dt = LAB_D.with(|d| {
+        d.borrow_mut()
+            .drain(..)
+            .map(|(t, slot, m, e)| format!("{t}:{slot}:{m}{e}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    let at_walk = LAB_NP.with(|n| n.borrow_mut().take());
+    let np = transaction
+        .payload
+        .exec()
+        .and_then(|work| {
+            let c = &work.usage_census;
+            let id = c.first_unanswered_pipeline?;
+            Some(format!(
+                "{}/{}:{}:{}:{}:{}",
+                id.slot.0,
+                id.generation.0,
+                at_walk.unwrap_or("?"),
+                state
+                    .pipeline_state(task.unwrap_or(0), id)
+                    .unwrap_or("unleased"),
+                u8::from(task.is_some_and(|task| state.pipeline_usage_published(task, id))),
+                c.draws_with_no_stage_published + c.dispatches_with_no_stage_published,
+            ))
+        })
+        .unwrap_or_default();
     crate::observe::fail(format!(
-        "lab_dag g={} in={} ch={} op={:#x} rd={} hz={} unk={unknown} r3={rung3} acc={acc}",
+        "lab_dag g={} in={} ch={} op={:#x} rd={} hz={} unk={unknown} r3={rung3} acc={acc} dt={dt} np={np}",
         LAB_DAG_FRAME.load(std::sync::atomic::Ordering::Relaxed),
         transaction.identity.ingress.0,
         transaction.identity.domain.0,
@@ -2698,6 +2952,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             continue;
         };
         let leases = resolved.pipeline_leases.as_slice();
+        let task = submission.task_id();
         // A position whose every lease is already `Ready` has had the rail's
         // promise made for it, and this pass cannot make it again: `ready_lease`
         // would find every step illegal and `preflight_submission` would re-walk
@@ -2709,7 +2964,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
         // `parked_translations_finished = 282 172` against 137 pipelines
         // declared and readied, which is the same handful of plans re-walked
         // thousands of times.
-        if leases.iter().all(|&lease| state.pipeline_is_ready(lease)) {
+        if leases.iter().all(|&lease| state.pipeline_is_ready(task, lease)) {
             note_store_route("parked_translations_already_ready");
             continue;
         }
@@ -2729,7 +2984,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             // building is also where the second stops being usable.
             for &lease in leases {
                 if pending.contains(&lease.slot.0) {
-                    withdraw_lease(state, lease);
+                    withdraw_lease(state, task, lease);
                 }
             }
             continue;
@@ -2737,7 +2992,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
         let leases = leases.to_vec();
         note_store_route("parked_translations_finished");
         for lease in leases {
-            ready_lease(state, lease, "pipeline_lease_ready_pump");
+            ready_lease(state, task, lease, "pipeline_lease_ready_pump");
             // A lease the table would not ready names a pipeline that ended —
             // the guest deleted it (or this device retired its name) while the
             // packet was parked. Nothing will ever ready it, so without this
@@ -2747,7 +3002,8 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             // behind it: WindowServer stopped presenting and the display froze
             // on the boot logo. The packet runs instead; a draw whose pipeline
             // is really gone refuses on its own, and the packet completes.
-            if !state.pipeline_is_ready(lease) && state.release_past_ended_pipeline(ingress, lease)
+            if !state.pipeline_is_ready(task, lease)
+                && state.release_past_ended_pipeline(ingress, task, lease)
             {
                 note_store_route("parked_released_past_ended_pipeline");
                 if crate::observe::first_sight(
@@ -2760,7 +3016,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
                          rather than park forever)",
                         lease.slot.0,
                         lease.generation.0,
-                        state.pipeline_state(lease).unwrap_or("absent")
+                        state.pipeline_state(task, lease).unwrap_or("absent")
                     ));
                 }
             }
@@ -2796,6 +3052,7 @@ fn run_parked_packet<H: HostMemory + HostOps>(
     work: &crate::runtime::parked::ParkedWork,
     domain: u32,
 ) {
+    state.lab_pipeline_ran(ingress);
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
         process_root_packet(state, host, work.packet());
     } else {
@@ -2888,8 +3145,12 @@ fn run_parked_packet<H: HostMemory + HostOps>(
 /// is worth a line is the *withdrawal* — a lease that was `Ready` and is not
 /// any more — and `PipelineTable::advance` is what distinguishes them, so the
 /// counter is read off the table's own census rather than guessed here.
-fn withdraw_lease(state: &DeviceState, lease: reims_vgpu_core::identity::ResourceId) {
-    if state.withdraw_pipeline(lease) {
+fn withdraw_lease(
+    state: &DeviceState,
+    task: u32,
+    lease: reims_vgpu_core::identity::ResourceId,
+) {
+    if state.withdraw_pipeline(task, lease) {
         note_store_route("pipeline_lease_withdrawn");
         if crate::observe::first_sight("pipeline_lease_withdrawn", u64::from(lease.slot.0)) {
             crate::observe::fail(format!(
@@ -2911,13 +3172,14 @@ fn withdraw_lease(state: &DeviceState, lease: reims_vgpu_core::identity::Resourc
 /// what a lease wait needs to know.
 fn ready_lease(
     state: &DeviceState,
+    task: u32,
     lease: reims_vgpu_core::identity::ResourceId,
     site: &'static str,
 ) {
     use reims_vgpu_core::pipeline::PipelineState;
-    state.advance_pipeline(lease, PipelineState::Translating);
-    state.advance_pipeline(lease, PipelineState::Compiling);
-    if state.ready_pipeline(lease) {
+    state.advance_pipeline(task, lease, PipelineState::Translating);
+    state.advance_pipeline(task, lease, PipelineState::Compiling);
+    if state.ready_pipeline(task, lease) {
         note_store_route("pipeline_ready");
         // Which of the three answers put this lease at `Ready`, once per slot
         // per site.

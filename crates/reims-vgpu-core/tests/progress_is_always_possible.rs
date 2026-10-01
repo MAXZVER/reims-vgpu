@@ -52,9 +52,9 @@ use reims_vgpu_core::access::{AccessIntent, AccessKey, AccessMode, BackingId, Re
 use reims_vgpu_core::exec::ExecWork;
 use reims_vgpu_core::identity::{
     ChannelId, CompletionStamp, IngressOrdinal, ObjectListRef, ResourceId, SessionId,
-    SlotGeneration, StampSlot, StampValue, StampWait,
+    SlotGeneration, StampSlot, StampValue, StampWait, TaskId,
 };
-use reims_vgpu_core::pipeline::PipelineState;
+use reims_vgpu_core::pipeline::{PipelineId, PipelineScope, PipelineState};
 use reims_vgpu_core::session::{Packet, SessionModel};
 use reims_vgpu_core::submit::{Admission, PhysicalQueue, QueueMap, SubmitGate};
 use reims_vgpu_core::transaction::Payload;
@@ -103,11 +103,41 @@ impl Rng {
     }
 }
 
-/// The identity a generated pipeline number resolves to.
-fn pipeline_id(n: u32) -> ResourceId {
+/// The object-list identity a generated pipeline number resolves to.
+fn pipeline_resource(n: u32) -> ResourceId {
     ResourceId {
         slot: ObjectListRef(n),
         generation: SlotGeneration(1),
+    }
+}
+
+/// How a batch names its pipelines, which is the one thing the two sweeps of this
+/// file differ in.
+///
+/// `Shared`: every transaction binding number `n` binds the same pipeline, which
+/// is what the table did before it learned about tasks and what the generator's
+/// waits were written against. `PerTask`: transaction `i` belongs to task
+/// `i % 3 + 1` and binds *that task's* pipeline number `n` — so one object-list
+/// id is up to three pipelines, each compiled on its own, and a compilation
+/// finishing releases only its own task's waiters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Naming {
+    Shared,
+    PerTask,
+}
+
+impl Naming {
+    /// The scope a transaction of `task` states.
+    fn scope(self, task: u32) -> PipelineScope {
+        match self {
+            Self::Shared => PipelineScope::Shared,
+            Self::PerTask => PipelineScope::Task(TaskId(task)),
+        }
+    }
+
+    /// The pipeline number `n` of `task` as the table names it.
+    fn id(self, task: u32, n: u32) -> PipelineId {
+        self.scope(task).id(pipeline_resource(n))
     }
 }
 
@@ -138,6 +168,10 @@ struct Spec {
     /// enabled action is "finish a compilation" is a state the other three wait
     /// classes cannot produce.
     pipeline: Option<u32>,
+    /// The task whose object list `pipeline` indexes. Derived from the
+    /// transaction's position rather than drawn, so adding it moves no other
+    /// number a seed produces.
+    task: u32,
 }
 
 /// How many distinct pipelines a batch's transactions may bind.
@@ -204,6 +238,7 @@ fn batch(seed: u64, count: usize, channels: u32) -> Vec<Spec> {
             forwarded,
             completion,
             pipeline,
+            task: (i % 3) as u32 + 1,
         });
     }
     specs
@@ -245,6 +280,25 @@ fn drive(seed: u64, count: usize, channels: u32, queues: u32, policy: Policy) ->
     drive_withdrawing(seed, count, channels, queues, policy, false)
 }
 
+/// [`drive`] with the pipelines named per task.
+fn drive_per_task(
+    seed: u64,
+    count: usize,
+    channels: u32,
+    queues: u32,
+    policy: Policy,
+) -> Exercised {
+    drive_named(
+        seed,
+        count,
+        channels,
+        queues,
+        policy,
+        false,
+        Naming::PerTask,
+    )
+}
+
 /// The same drive, optionally taking one transaction out before the loop
 /// starts.
 ///
@@ -270,6 +324,27 @@ fn drive_withdrawing(
     policy: Policy,
     withdraw_one: bool,
 ) -> Exercised {
+    drive_named(
+        seed,
+        count,
+        channels,
+        queues,
+        policy,
+        withdraw_one,
+        Naming::Shared,
+    )
+}
+
+/// [`drive_withdrawing`], with the naming stated.
+fn drive_named(
+    seed: u64,
+    count: usize,
+    channels: u32,
+    queues: u32,
+    policy: Policy,
+    withdraw_one: bool,
+    naming: Naming,
+) -> Exercised {
     let specs = batch(seed, count, channels);
     // Nothing may wait on the one taken out; see the doc above. The last such
     // transaction, so it has predecessors to have taken hazard waits on.
@@ -294,10 +369,20 @@ fn drive_withdrawing(
     // layer takes it on its own. The last step is the driver's action below, so
     // a transaction binding one is admitted with a wait that only that action
     // can discharge.
-    let mut compiling: BTreeSet<u32> = specs.iter().filter_map(|s| s.pipeline).collect();
+    // A pipeline is a (task, number) pair. Under the shared naming the task is
+    // forgotten, so every task's number `n` is one entry — which is the point of
+    // the two sweeps.
+    let key = |task: u32, n: u32| match naming {
+        Naming::Shared => (0, n),
+        Naming::PerTask => (task, n),
+    };
+    let mut compiling: BTreeSet<(u32, u32)> = specs
+        .iter()
+        .filter_map(|s| s.pipeline.map(|n| key(s.task, n)))
+        .collect();
     let generation = model.generation();
-    for id in &compiling {
-        let pipeline = pipeline_id(*id);
+    for &(task, n) in &compiling {
+        let pipeline = naming.id(task, n);
         assert!(model.pipelines().declare(pipeline, generation));
         for step in [PipelineState::Translating, PipelineState::Compiling] {
             assert!(model.pipelines().advance(pipeline, step));
@@ -332,7 +417,8 @@ fn drive_withdrawing(
                     input_content_version: None,
                     output_content_version: None,
                 }],
-                pipeline_leases: spec.pipeline.map(pipeline_id).into_iter().collect(),
+                pipeline_leases: spec.pipeline.map(pipeline_resource).into_iter().collect(),
+                pipelines: naming.scope(spec.task),
                 ..ExecWork::default()
             }),
         };
@@ -414,11 +500,11 @@ fn drive_withdrawing(
         if !compiling.is_empty()
             && (submittable.is_empty() && completable.is_empty() || rng.below(3) == 0)
         {
-            let ids: Vec<u32> = compiling.iter().copied().collect();
+            let ids: Vec<(u32, u32)> = compiling.iter().copied().collect();
             let indices: Vec<usize> = (0..ids.len()).collect();
             let chosen = ids[policy.pick(&indices, &mut rng)];
             assert!(
-                model.pipeline_ready(pipeline_id(chosen)),
+                model.pipeline_ready(naming.id(chosen.0, chosen.1)),
                 "a compiling pipeline may become ready"
             );
             compiling.remove(&chosen);
@@ -502,6 +588,36 @@ fn a_batch_always_has_something_it_can_do() {
     assert!(
         total.only_compilable > 0,
         "no state had a compilation as its only enabled action, so a          `pipeline_ready` that released nothing would have passed"
+    );
+}
+
+/// The same claim with the pipelines named per task.
+///
+/// The sweep above names a pipeline by its object-list id alone, so three tasks
+/// that each bind "pipeline 1" bind one pipeline and one compilation releases
+/// them all. Named per task they are three pipelines: each compiles on its own
+/// schedule, and the compilation of one releases only the transactions of its
+/// own task. The property is the same — while work remains something is enabled
+/// — and what could break it is new: a pipeline the driver has to finish for
+/// every task that binds it, where the shared naming finished it once.
+#[test]
+fn a_batch_with_pipelines_named_per_task_always_has_something_it_can_do() {
+    let mut total = Exercised::default();
+    for policy in Policy::ALL {
+        for seed in 0..24u64 {
+            total.absorb(drive_per_task(seed, 12, 4, 2, policy));
+            total.absorb(drive_per_task(seed, 10, 3, 1, policy));
+            total.absorb(drive_per_task(seed, 8, 1, 1, policy));
+            total.absorb(drive_per_task(seed, 10, 4, 4, policy));
+        }
+    }
+    assert!(total.gate_holds > 0);
+    assert!(total.only_completable > 0);
+    assert!(total.publication_blocked > 0);
+    assert!(
+        total.only_compilable > 0,
+        "no state had a compilation as its only enabled action, so a \
+         `pipeline_ready` that released nothing would have passed"
     );
 }
 

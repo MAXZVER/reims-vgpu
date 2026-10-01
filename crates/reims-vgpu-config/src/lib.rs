@@ -745,6 +745,160 @@ pub const GATHER_AUDIT_ALL: &str = "REIMS_VGPU_GATHER_AUDIT_ALL";
 /// binary that can be run both ways against that guest.
 pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 
+/// **Default off.** `on` makes the ordering model state its accesses exactly
+/// where the guest has told it enough to, instead of ordering a packet against
+/// everything in its domain.
+///
+/// # What it changes
+///
+/// Seven things, six about what the model *knows* and one about what it will not
+/// claim to:
+///
+/// - a texture view, a buffer texture and a surface-backed ref texture stop
+///   being `DomainOnly` and are ordered against the memory they are a window
+///   onto (`reims_vgpu_core::lifecycle::Aliasing`);
+/// - a pipeline the guest deleted and still binds takes a reflection, where it
+///   used to be refused one and dropped the one it had, so every draw through it
+///   was `Unknown` for as long as it was bound
+///   (`reims_vgpu_core::pipeline::PublishTo`);
+/// - the pre-scan publishes a reflection the model wants past a translation-memo
+///   hit, from the memo's own resolution;
+/// - a packet whose walk found a pipeline's reflection missing is walked again
+///   once the pre-scan has published it;
+/// - a pipeline is the task's own in the ordering model — its reflection, build
+///   state, waits and tombstone — because a pipeline's id is a slot and a
+///   generation and every task numbers its own list from the same integers
+///   ([`PIPELINE_PER_TASK`], on by default and what exact accesses assume);
+/// - a name the model holds with no bytes is given the storage construction
+///   finds under it, where it used to stay `DomainOnly` for the life of the name
+///   (`reims_vgpu_core::lifecycle::Lifecycle::attach_storage`).
+/// - a draw or dispatch through a pipeline nothing is published for is ordered
+///   against everything in its domain, on top of the slots it binds
+///   (`reims_vgpu_core::pipeline::UsageSource::unanswered_is_unbounded`). See
+///   below for what that is for.
+///
+/// # Why it is not the default
+///
+/// No packet's records, no host command and no byte the guest can read is
+/// computed differently. But the model's knowledge is also what releases work: a
+/// transaction is ready when the hazard edges it was admitted with are
+/// discharged, and exact accesses draw fewer edges. So with this on, a packet can
+/// be ready while an earlier packet of its own channel is still parked — on a
+/// translation, on a stamp, on host paint — and then it runs first. Measured on a
+/// driven macos-26 desktop at 5120x2160 that is between one packet in three
+/// thousand and one in thirty, reaching up to 34 packets back in its channel,
+/// depending on how many translations were still cold. It is what the model's
+/// schedule equivalence permits and what exact accesses are for, and it is also a change to the order this device executes in, made on the
+/// strength of a claim about a guest (that the accesses are exact) rather than of
+/// a measurement of the frames it produces. A claim of that shape gets a binary
+/// that runs both ways until the measurement exists, and the default stays on the
+/// side that changes nothing.
+///
+/// Exactness is also only as complete as the model's knowledge of what a packet
+/// touches, and two things a packet can touch are in no access: memory reached
+/// through an argument buffer, and whatever an indirect command buffer's commands
+/// bind. `DomainOnly` used to over-order both by accident, because so many names
+/// were `DomainOnly`; exact accesses take the accident away. So two rules keep
+/// them ordered on purpose:
+///
+/// - an indirect command buffer's execution is `Unknown` over the whole domain
+///   (`reims_vgpu_core::access::ParticipationExtent::Unbounded`), whatever this
+///   switch says — the commands write their targets, and a packet reading one got
+///   no edge to it. No driven rail sends one;
+/// - with this on, a draw or dispatch whose pipeline has a stage nothing is
+///   published for is ordered against everything in its domain. The stage a rail
+///   refuses to publish is the shader that reads through an argument buffer, so
+///   this is the unanswered shader and not a guess about it. It costs nothing
+///   while few draws are unanswered (well under 1 % of a driven desktop's draws
+///   with this on) and a great deal while most are, which is why it is not the
+///   default.
+///
+/// What is still in no access: a resource the guest makes resident with
+/// `useResource`/`useHeap` and a shader reaches through an address written into an
+/// ordinary buffer. The residency rows are unresolved and a reflection cannot tell
+/// such a buffer from data.
+///
+/// # Why it is not the widening this module forbids
+///
+/// It turns on no rail and imports nothing. The accesses it states are a
+/// superset of what a record touches by construction — a view is its base's
+/// whole window, a surface is the whole surface — and a name it cannot resolve
+/// stays `DomainOnly`, so the most it can do is order a packet against exactly
+/// what the packet touches instead of against everything.
+pub const ACCESS_EXACT: &str = "REIMS_VGPU_ACCESS_EXACT";
+
+/// **Default on.** The ordering model names a pipeline by the task that owns it
+/// and its id in that task's object list; `off` names it by the object-list id
+/// alone, which is what the model did before it knew about tasks.
+///
+/// # What it changes
+///
+/// A pipeline reference in a packet is an id in one task's object list, and every
+/// task numbers its own list from the same small integers, so the id alone does
+/// not say which pipeline is meant. The ordering model keyed its pipeline table
+/// by the id alone, which makes one entry stand for every task that reuses the
+/// id: one task's build state, deletion tombstone, refusal, waits and published
+/// reflection answer for all of them. With this on each task's pipeline is its
+/// own entry, and it ends with its task's address space
+/// (`reims_vgpu_core::pipeline::PipelineTable::task_ended`).
+///
+/// # What it cost, measured
+///
+/// On a driven macos-26 desktop at 5120x2160, a second table named per task stepped
+/// beside the real one (`scratchpad/ppcensus.py`, the light animation and a window
+/// drag):
+///
+/// - **When work runs: almost nothing, and only while the desktop warms up.** In
+///   the steady windows (9 000 and 42 000 packets) no packet waited, ran or was
+///   refused differently. Over the whole boot 0.06 to 0.08 % of leases ran while
+///   their own pipeline was still building, and 1 to 6 % of build completions
+///   released a packet of another task whose own pipeline was not built.
+/// - **What the model knew: a great deal.** One task's delete tombstones the live
+///   pipelines of the tasks that reuse the id (57 to 60 such deletes a boot), a
+///   tombstone refuses a reflection and drops the one it had, and so 86 % (light)
+///   and 58 % (drag) of the walk's lookups found no reflection only because of a
+///   tombstone somebody else left. 37 to 56 % of leases bound one. No lookup was
+///   ever answered by a reflection that orders less than the task's own.
+///
+/// With it on, packets with an `Unknown`-mode access on a named backing go from
+/// 83 % to 0 (light) and 68 % to 0 (drag), `Unknown` participations fall by 98 %,
+/// and the model's edges per frame by a quarter on the drag; 0 packets ran ahead
+/// of an earlier one of their channel, the verification tour's frames differ from
+/// the shared naming's no more than two boots of the same arm differ from each
+/// other, and `driver_call_quarantined` stays 0. Frame rate did not move beyond
+/// the spread between boots.
+///
+/// # Why it is on, and why it can be turned off
+///
+/// Nothing the guest can observe is computed differently: no record, no host
+/// command and no shader. The model's knowledge is also what releases work, and
+/// this gives it far more of it, so a packet can be ready where it used to wait
+/// for an edge that only ignorance drew. That is the model being right about
+/// whose pipeline is whose, and it is on for that reason. `off` narrows the model
+/// back to the shared naming and nothing else — it is an ablation for telling a
+/// frame difference apart from the naming, and the way to reproduce what every
+/// measurement before 2026-10-01 ran.
+///
+/// [`ACCESS_EXACT`] assumes it: exact accesses are what make the reflection's
+/// answer matter, and with `off` they order against a reflection another task
+/// published.
+pub const PIPELINE_PER_TASK: &str = "REIMS_VGPU_PIPELINE_PER_TASK";
+
+/// **Default on.** The exact reductions of the drain's fixed per-packet costs: each
+/// one does the same work the earlier path did, with less around it.
+///
+/// What they are — a packet's payload moved into its transaction instead of copied
+/// and dropped, the census's route lookup keyed by the route's address instead of
+/// hashed from its text, an environment variable read once instead of per stream.
+/// None of them changes a record, a command, an ordering or a counter's value.
+///
+/// `off` restores the earlier path of each of them (the ledger's by-index row lookup
+/// is a pure function with a test against the scan, and has no earlier path to
+/// restore), and it exists for exactly one reason: an A/B of a cost needs both arms
+/// in one binary, boots alternating, because a drain's microseconds per packet move
+/// more between builds than a change of this size does.
+pub const COST_OPTS: &str = "REIMS_VGPU_COST_OPTS";
+
 /// `on` issues the draw-time guest buffer gather as one compute dispatch per
 /// gathered window instead of one transfer region per guest run.
 ///

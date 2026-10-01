@@ -5033,6 +5033,16 @@ fn stream_draw_delta(out: &ExecResult, at_entry: (u32, u32)) -> StreamDrawDelta 
     }
 }
 
+/// TEMP (lab): whether `REIMS_VGPU_LAB_CLEAR_LOG=1`. Read once; the environment
+/// is a process-wide lock and this was asked of every clear-only stream.
+fn lab_clear_log() -> bool {
+    if !crate::runtime::cost_opts::on() {
+        return std::env::var("REIMS_VGPU_LAB_CLEAR_LOG").is_ok_and(|v| v == "1");
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CLEAR_LOG").is_ok_and(|v| v == "1"))
+}
+
 fn finish_stream<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -5056,7 +5066,7 @@ fn finish_stream<M: HostMemory + HostOps>(
     if !will_draw {
         // TEMP (lab, REIMS_VGPU_LAB_CLEAR_LOG=1): every clear-only attachment,
         // whether it reaches guest pages, and whether a lazy Store is owed on it.
-        if std::env::var("REIMS_VGPU_LAB_CLEAR_LOG").is_ok_and(|v| v == "1") {
+        if lab_clear_log() {
             for att in acc.clears.iter() {
                 let owed = state.pending_writebacks.has_gva(
                     crate::runtime::writeback_debt::GvaResourceKey {

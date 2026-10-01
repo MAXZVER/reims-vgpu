@@ -3047,6 +3047,9 @@ pub fn resolve_resource<M: HostMemory>(
     // object's bytes rather than a flattening of it. See `declare_object_name`
     // for why an undescribable storage is `None` here and not `NoBytes`.
     let storage = declared_storage(state, task_id, obj_ref, &entry, &descriptor).ok();
+    if storage.is_none() {
+        lab_note_unidentified(task_id, obj_ref, &entry, &descriptor, "construct");
+    }
     // Naming is idempotent, and a name may already exist without a memo: a
     // reference is named the first time *anything* asks what it names, and a
     // lifetime packet asks without constructing. Declaring again here would give
@@ -3055,9 +3058,45 @@ pub fn resolve_resource<M: HostMemory>(
     let name = match state.object_name(task_id, obj_ref) {
         Some(existing) => {
             crate::runtime::drain::note_store_route("object_named_before_constructed");
+            // TEMP (lab, access precision): a name the model holds with no bytes
+            // that construction now finds to own some.
+            if matches!(
+                storage,
+                Some(reims_vgpu_core::lifecycle::Storage::Dedicated { .. })
+            ) && !state.name_owns_bytes(task_id, existing)
+            {
+                // Told to the model, which otherwise orders every access by this
+                // name `DomainOnly` for as long as the name lives. Behind the
+                // switch: it changes what the model releases ahead of what.
+                if access_exact() {
+                    if let Some(storage) = storage {
+                        crate::runtime::drain::note_store_route(
+                            match state.attach_storage(task_id, existing, storage) {
+                                Ok(true) => "access_name_storage_attached",
+                                Ok(false) => "access_name_storage_not_attached",
+                                Err(_) => "access_name_storage_no_task",
+                            },
+                        );
+                    }
+                }
+                crate::runtime::drain::note_store_route("lab_named_nobytes_constructed_dedicated");
+                if crate::observe::first_sight(
+                    "lab_named_nobytes_constructed_dedicated",
+                    (u64::from(task_id) << 32) | u64::from(obj_ref),
+                ) {
+                    crate::observe::fail(format!(
+                        "lab_named_nobytes_constructed_dedicated task={task_id} ref={obj_ref}                          type={} gen={} (the model holds this name with no bytes; the slot's                          object owns storage)",
+                        entry.object_type, existing.generation.0
+                    ));
+                }
+            }
             existing
         }
-        None => declare_object_name(state, task_id, obj_ref, storage)?,
+        None => {
+            let name = declare_object_name(state, task_id, obj_ref, storage)?;
+            declare_alias_for(state, host, task_id, name, &entry, &descriptor);
+            name
+        }
     };
     let resource = Arc::new(TaskResource::new(entry, descriptor));
     Ok(state.task_resources.register(task_id, name, resource))
@@ -3291,7 +3330,363 @@ pub fn name_resource<M: HostMemory>(
     let entry = lookup_list_entry(state, host, task_id, obj_ref)?;
     let descriptor: Arc<[u8]> = Arc::from(read_descriptor(state, host, task_id, &entry)?);
     let storage = declared_storage(state, task_id, obj_ref, &entry, &descriptor).ok();
-    declare_object_name(state, task_id, obj_ref, storage).ok()
+    if storage.is_none() {
+        lab_note_unidentified(task_id, obj_ref, &entry, &descriptor, "name");
+    }
+    lab_note_named_without_bytes(task_id, obj_ref, &entry, storage.as_ref());
+    let name = declare_object_name(state, task_id, obj_ref, storage).ok()?;
+    declare_alias_for(state, host, task_id, name, &entry, &descriptor);
+    Some(name)
+}
+
+/// TEMP (lab, stale names): what kind of object a name is when it is first
+/// declared with no bytes, by the list entry's object type. The residual
+/// `DomainOnly` participations are on names the rails never construct; this says
+/// what those are.
+fn lab_note_named_without_bytes(
+    task_id: u32,
+    obj_ref: u32,
+    entry: &ListObjectEntry,
+    storage: Option<&reims_vgpu_core::lifecycle::Storage>,
+) {
+    if matches!(
+        storage,
+        Some(reims_vgpu_core::lifecycle::Storage::Dedicated { .. })
+    ) {
+        return;
+    }
+    let route = match entry.object_type {
+        1 => "lab_nb_type_1",
+        2 => "lab_nb_type_2",
+        3 => "lab_nb_type_3",
+        4 => "lab_nb_type_4",
+        5 => "lab_nb_type_5",
+        6 => "lab_nb_type_6",
+        7 => "lab_nb_type_7",
+        8 => "lab_nb_type_8",
+        9 => "lab_nb_type_9",
+        10 => "lab_nb_type_10",
+        11 => "lab_nb_type_11",
+        12 => "lab_nb_type_12",
+        _ => "lab_nb_type_other",
+    };
+    crate::runtime::drain::note_store_route(route);
+    if crate::observe::first_sight(
+        "lab_named_without_bytes",
+        (u64::from(task_id) << 32) | u64::from(obj_ref),
+    ) {
+        crate::observe::fail(format!(
+            "lab_named_without_bytes task={task_id} ref={obj_ref} type={} desc_len={} storage_answer={}",
+            entry.object_type,
+            entry.descriptor_length,
+            if storage.is_some() { "no_bytes" } else { "undescribable" },
+        ));
+    }
+}
+
+/// TEMP (lab, access precision): a buffer or texture whose storage this device
+/// could not identify when it was named, once per (task, ref). Such a name is
+/// declared `NoBytes` and stays so for the life of the name, whatever the
+/// descriptor says later; the model orders it `DomainOnly`.
+fn lab_note_unidentified(
+    task_id: u32,
+    obj_ref: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+    site: &'static str,
+) {
+    if !matches!(
+        entry.object_type,
+        OBJECT_TYPE_BUFFER | OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
+    ) || !crate::observe::first_sight(
+        "lab_unidentified",
+        (u64::from(task_id) << 32) | u64::from(obj_ref),
+    ) {
+        return;
+    }
+    let shape = crate::runtime::decode::resource::decode_texture_descriptor(descriptor)
+        .ok()
+        .filter(|_| entry.object_type != OBJECT_TYPE_BUFFER)
+        .map(|t| {
+            format!(
+                "handle={:#x} alloc={} levels={} dims={}x{}x{} fmt={:#x} samples={:?} used={} stride={}",
+                t.handle,
+                t.allocation_size,
+                t.mipmap_level_count,
+                t.width,
+                t.height,
+                t.depth,
+                t.pixel_format,
+                t.sample_count,
+                t.used_size,
+                t.row_stride,
+            )
+        })
+        .unwrap_or_default();
+    let head: String = descriptor
+        .iter()
+        .take(48)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    crate::observe::fail(format!(
+        "lab_unidentified site={site} task={task_id} ref={obj_ref} type={} desc_len={} {shape} \
+         heap_placement={} head={head}",
+        entry.object_type,
+        entry.descriptor_length,
+        crate::runtime::decode::resource::descriptor_is_heap_placement(descriptor),
+    ));
+}
+
+/// Whether the ordering model is to state byte-less names exactly. See
+/// [`crate::config::ACCESS_EXACT`]; read once.
+pub(crate) fn access_exact() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ACCESS_EXACT.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::ACCESS_EXACT).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's answer to [`access_exact`], for the thread that asked. The real
+    /// answer is read from the process environment once, so a test cannot state
+    /// both arms of the switch through it.
+    static TEST_ACCESS_EXACT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with [`access_exact`] answering `on` on this thread.
+#[cfg(test)]
+pub(crate) fn with_access_exact<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = TEST_ACCESS_EXACT.with(|c| c.replace(Some(on)));
+    let out = f();
+    TEST_ACCESS_EXACT.with(|c| c.set(before));
+    out
+}
+
+/// Whether the ordering model names a pipeline by its task and its id in that
+/// task's list, rather than by the id alone. See
+/// [`crate::config::PIPELINE_PER_TASK`]; read once.
+///
+/// **On unless the operator says `off`.** `off` is the ablation: the shared
+/// naming every task's same-numbered pipeline is one entry under.
+pub(crate) fn pipeline_per_task() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PIPELINE_PER_TASK.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            crate::config::read(crate::config::PIPELINE_PER_TASK).0,
+            crate::config::Switch::Off
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's answer to [`pipeline_per_task`], for the thread that asked.
+    static TEST_PIPELINE_PER_TASK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with [`pipeline_per_task`] answering `on` on this thread.
+#[cfg(test)]
+pub(crate) fn with_pipeline_per_task<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = TEST_PIPELINE_PER_TASK.with(|c| c.replace(Some(on)));
+    let out = f();
+    TEST_PIPELINE_PER_TASK.with(|c| c.set(before));
+    out
+}
+
+/// How deep a declaration may nest: naming a view names its base, which may be
+/// a view, which names its base. The guest writes the list, so the chain is
+/// the guest's length and this is the stack's.
+const ALIAS_DECLARE_DEPTH: u8 = 4;
+
+thread_local! {
+    static ALIAS_DECLARING: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Say what a name that owns no bytes is a window onto, to the model that
+/// orders work.
+///
+/// # What is declared, and from what
+///
+/// Two kinds of object are byte-less and still touch memory, and the model
+/// was answering both `DomainOnly`:
+///
+/// - **A ref texture (type 5)**: the descriptor's header names the surface the
+///   texture is over, and on this interface a surface id *is* its mapping id —
+///   `AppleParavirtResource::allocateBackingHandle` adds the backing object at
+///   the object-list index `IOSurface::getSurfaceID()`. So the alias is the
+///   mapping, and the model asks the mapper for the backing each time it is
+///   used. A present of that surface reads `Whole` of the same backing, so the
+///   two meet.
+/// - **A texture view (type 8)**: a view over another texture, with the level
+///   and slice range its record carries, or a texture laid over a buffer's
+///   bytes (the opcode-9 form). The base is named — a slot the guest has not
+///   been asked about yet is named by reading its list entry, exactly as any
+///   other first mention would — and the alias holds the base's *name*, which
+///   carries a generation, so a base the guest deletes or replaces stops
+///   resolving and the view falls back to `DomainOnly`.
+///
+/// Anything it cannot establish is left undeclared and counted under its own
+/// route; an undeclared name is the `DomainOnly` it always was. Nothing is
+/// refused: this states what a name is over and is never a reason to lose a
+/// packet.
+///
+/// Gated by [`access_exact`], because it changes which packets the model
+/// releases ahead of which.
+fn declare_alias_for<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    name: reims_vgpu_core::identity::ResourceId,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) {
+    if access_exact() {
+        declare_alias_ungated(state, host, task_id, name, entry, descriptor);
+    }
+}
+
+/// [`declare_alias_for`] with the switch already answered, so a test states
+/// the behaviour the switch selects without a process-wide environment read.
+fn declare_alias_ungated<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    name: reims_vgpu_core::identity::ResourceId,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) {
+    use crate::runtime::drain::note_store_route as note;
+
+    if !matches!(
+        entry.object_type,
+        OBJECT_TYPE_REF_TEXTURE | OBJECT_TYPE_TEXTURE_VIEW
+    ) {
+        return;
+    }
+    let depth = ALIAS_DECLARING.with(|d| d.get());
+    if depth >= ALIAS_DECLARE_DEPTH {
+        note("alias_declare_too_deep");
+        return;
+    }
+    ALIAS_DECLARING.with(|d| d.set(depth + 1));
+    let alias = alias_of_descriptor(state, host, task_id, entry, descriptor);
+    ALIAS_DECLARING.with(|d| d.set(depth));
+    let Some((alias, route)) = alias else {
+        return;
+    };
+    note(match state.declare_alias(task_id, name, alias) {
+        Ok(true) => route,
+        Ok(false) => "alias_refused_name_owns_bytes",
+        Err(_) => "alias_refused_name_not_live",
+    });
+}
+
+/// The alias a byte-less object's descriptor states, and the route that counts
+/// it, or `None` (counted) when the descriptor does not say enough.
+fn alias_of_descriptor<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) -> Option<(reims_vgpu_core::lifecycle::Aliasing, &'static str)> {
+    use crate::runtime::decode::resource::{
+        decode_buffer_texture_descriptor, decode_texture_view_descriptor, texture_view_opcode,
+        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
+    };
+    use crate::runtime::drain::note_store_route as note;
+    use reims_vgpu_core::access::SubresourceRange;
+    use reims_vgpu_core::identity::MappingId;
+    use reims_vgpu_core::lifecycle::Aliasing;
+
+    if entry.object_type == OBJECT_TYPE_REF_TEXTURE {
+        let Ok(header) = reims_vgpu_wire::device_desc::ref_texture_header(descriptor) else {
+            note("alias_ref_texture_short");
+            return None;
+        };
+        let surface = header.surface_id.get();
+        if !crate::model::is_mapping_id(surface) {
+            note("alias_ref_texture_no_surface");
+            return None;
+        }
+        return Some((
+            Aliasing::Surface(MappingId(surface)),
+            "alias_declared_surface",
+        ));
+    }
+    if matches!(
+        texture_view_opcode(descriptor),
+        Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE | TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE)
+    ) {
+        let Ok(laid) = decode_buffer_texture_descriptor(descriptor) else {
+            note("alias_buffer_texture_undecodable");
+            return None;
+        };
+        if laid.buffer_ref == 0 {
+            note("alias_buffer_texture_no_buffer");
+            return None;
+        }
+        let Some(buffer) = name_resource(state, host, task_id, laid.buffer_ref) else {
+            note("alias_buffer_texture_buffer_unnamed");
+            return None;
+        };
+        return Some((
+            Aliasing::BufferBytes { buffer },
+            "alias_declared_buffer_bytes",
+        ));
+    }
+    let Ok(view) = decode_texture_view_descriptor(descriptor) else {
+        note("alias_view_undecodable");
+        return None;
+    };
+    if view.base_texture_ref == 0 {
+        note("alias_view_no_base");
+        return None;
+    }
+    let Some(base) = name_resource(state, host, task_id, view.base_texture_ref) else {
+        note("alias_view_base_unnamed");
+        return None;
+    };
+    // The simple form carries no range, and a range that does not fit the
+    // words the model keys on is left as the whole base rather than truncated:
+    // a truncated window would name fewer levels than the view covers.
+    let window = if view.carries_range() {
+        match (
+            u32::try_from(view.level_base),
+            u32::try_from(view.level_count),
+            u32::try_from(view.slice_base),
+            u32::try_from(view.slice_count),
+        ) {
+            (Ok(base_level), Ok(level_count), Ok(base_slice), Ok(slice_count)) => {
+                Some(SubresourceRange {
+                    base_level,
+                    level_count,
+                    base_slice,
+                    slice_count,
+                    plane: 0,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    Some((
+        Aliasing::TextureView { base, window },
+        "alias_declared_view",
+    ))
 }
 
 /// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,

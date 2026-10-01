@@ -927,7 +927,7 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
     // ever bind, and declaring one would put a name in the table that nothing
     // will ever advance or retire.
     if let Some(name) = objects::name_resource(state, host, task_id, pipeline_ref) {
-        crate::runtime::drain::note_store_route(if state.declare_pipeline(name) {
+        crate::runtime::drain::note_store_route(if state.declare_pipeline(task_id, name) {
             "pipeline_declared"
         } else {
             "pipeline_declared_already"
@@ -988,14 +988,16 @@ pub(crate) fn publish_pipeline_usage<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("pipeline_usage_unnamed");
         return;
     };
-    crate::runtime::drain::note_store_route(if state.publish_pipeline_usage(name, usage) {
-        "pipeline_usage_published"
-    } else {
-        // The same population `pipeline_advance_declined` describes: a build
-        // finishing after the guest's delete, or a rail with no retained
-        // pipeline state re-walking one the table has already retired.
-        "pipeline_usage_declined"
-    });
+    crate::runtime::drain::note_store_route(
+        if state.publish_pipeline_usage(task_id, name, usage) {
+            "pipeline_usage_published"
+        } else {
+            // The same population `pipeline_advance_declined` describes: a build
+            // finishing after the guest's delete, or a rail with no retained
+            // pipeline state re-walking one the table has already retired.
+            "pipeline_usage_declined"
+        },
+    );
 }
 
 /// Step the pipeline `pipeline_ref` names along its build.
@@ -1030,7 +1032,7 @@ pub(crate) fn advance_pipeline<M: HostMemory + HostOps>(
         return;
     };
     let taken = if next == PipelineState::Ready {
-        let taken = state.ready_pipeline(name);
+        let taken = state.ready_pipeline(task_id, name);
         // The rail's own answer, beside the drain's two. See `ready_lease`.
         if taken && crate::observe::first_sight("pipeline_lease_ready_rail", u64::from(name.slot.0))
         {
@@ -1041,7 +1043,7 @@ pub(crate) fn advance_pipeline<M: HostMemory + HostOps>(
         }
         taken
     } else {
-        state.advance_pipeline(name, next)
+        state.advance_pipeline(task_id, name, next)
     };
     crate::runtime::drain::note_store_route(if taken {
         match next {
@@ -1076,7 +1078,7 @@ pub(crate) fn refuse_pipeline<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("pipeline_refuse_unnamed");
         return;
     };
-    let ended = state.refuse_pipeline(name, reason);
+    let ended = state.refuse_pipeline(task_id, name, reason);
     // The two facts apart. A refusal the table did not take is one that had
     // already ended — refused before, or retired by the guest mid-build — and
     // it is not the same event as a refusal that took and had nobody parked on
