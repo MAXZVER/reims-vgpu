@@ -269,8 +269,11 @@ impl Handoff {
         }
         g.shutdown = false;
         let priority = current_thread_priority();
+        // A generous stack: `execute_draw_inner` is one very large frame and
+        // this thread inherits no size from the drain's.
         let spawned = std::thread::Builder::new()
             .name(self.name.to_string())
+            .stack_size(8 << 20)
             .spawn(move || self.worker_loop(priority));
         match spawned {
             Ok(handle) => {
