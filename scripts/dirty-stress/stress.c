@@ -29,6 +29,8 @@
 #include "system/memory.h"
 #include "system/ramlist.h"
 #include "reims-vgpu-dirty.h"
+#include "system/whpx-wp.h"
+#include "system/cpus.h"
 
 #define NPAGES 16384
 #define PAGE 4096ULL
@@ -60,6 +62,118 @@ static uint32_t rnd(uint32_t *st)
 {
     *st = *st * 1664525u + 1013904223u;
     return *st >> 8;
+}
+
+/*
+ * Lab DIRTY_WP: the fake hypervisor's read-only pages. A remap drops the dirty bits its range had
+ * collected (the worst case WHPX may do), so only a protect taken with every writer paused right after a
+ * query is exact. Writers are the "vCPUs": a store into a read-only page first goes to the fault hook,
+ * which must make it writable; pause_all_vcpus waits for every store in flight and holds new ones.
+ * STRESS_WP_NOPAUSE=1 is the control: pausing does nothing, so protects race the writers.
+ */
+bool (*whpx_wp_fault_hook)(uint64_t gpa);
+void (*whpx_wp_invalidate_hook)(void);
+static uint8_t hv_ro[NPAGES];
+static uint64_t n_wp_faults, n_wp_remaps;
+static int cfg_wp_nopause;
+static QemuMutex vg_lock;
+static QemuCond vg_cond;
+static int vg_paused, vg_active;
+
+int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
+{
+    uint64_t pg;
+
+    for (pg = gpa / PAGE; pg < (gpa + size) / PAGE && pg < NPAGES; pg++) {
+        qatomic_set(&hv_dirty[pg], 0);
+        qatomic_set(&hv_ro[pg], !writable);
+    }
+    qatomic_inc(&n_wp_remaps);
+    if (g_hv_delay_us) {
+        spin_us(g_hv_delay_us / 2);
+    }
+    return 0;
+}
+
+void pause_all_vcpus(void)
+{
+    if (cfg_wp_nopause) {
+        return;
+    }
+    qemu_mutex_lock(&vg_lock);
+    vg_paused++;
+    while (vg_active) {
+        qemu_cond_wait(&vg_cond, &vg_lock);
+    }
+    qemu_mutex_unlock(&vg_lock);
+}
+
+void resume_all_vcpus(void)
+{
+    if (cfg_wp_nopause) {
+        return;
+    }
+    qemu_mutex_lock(&vg_lock);
+    vg_paused--;
+    qemu_cond_broadcast(&vg_cond);
+    qemu_mutex_unlock(&vg_lock);
+}
+
+static void vcpu_enter(void)
+{
+    qemu_mutex_lock(&vg_lock);
+    while (vg_paused) {
+        qemu_cond_wait(&vg_cond, &vg_lock);
+    }
+    vg_active++;
+    qemu_mutex_unlock(&vg_lock);
+}
+
+static void vcpu_leave(void)
+{
+    qemu_mutex_lock(&vg_lock);
+    if (--vg_active == 0) {
+        qemu_cond_broadcast(&vg_cond);
+    }
+    qemu_mutex_unlock(&vg_lock);
+}
+
+struct QEMUBH {
+    QEMUBHFunc *cb;
+    void *opaque;
+    int sched;
+};
+QEMUBH *reims_stress_bh_new(QEMUBHFunc *cb, void *opaque);
+void reims_stress_bh_schedule(QEMUBH *bh);
+static QEMUBH *stress_bh;
+
+QEMUBH *reims_stress_bh_new(QEMUBHFunc *cb, void *opaque)
+{
+    QEMUBH *b = g_new0(QEMUBH, 1);
+
+    b->cb = cb;
+    b->opaque = opaque;
+    stress_bh = b;
+    return b;
+}
+
+void reims_stress_bh_schedule(QEMUBH *bh)
+{
+    qatomic_set(&bh->sched, 1);
+}
+
+static void *mainloop_thread(void *arg)
+{
+    (void)arg;
+    rcu_register_thread();
+    while (!stop_flag) {
+        if (stress_bh && qatomic_xchg(&stress_bh->sched, 0)) {
+            stress_bh->cb(stress_bh->opaque);
+        }
+        g_usleep(100);
+    }
+    rcu_unregister_thread();
+    return NULL;
 }
 
 ram_addr_t memory_region_get_ram_addr(const MemoryRegion *mr) { (void)mr; return 0; }
@@ -219,6 +333,13 @@ static void do_write(uint32_t *st, int hot)
 {
     uint64_t pg = hot && (rnd(st) & 1) ? hot_pages[rnd(st) % NHOT] : rnd(st) % UNIVERSE;
 
+    while (qatomic_read(&hv_ro[pg])) {   /* lab DIRTY_WP: the store exits first */
+        if (!whpx_wp_fault_hook || !whpx_wp_fault_hook(pg * PAGE)) {
+            fprintf(stderr, "wp: a store into a read-only page was not taken\n");
+            abort();
+        }
+        qatomic_inc(&n_wp_faults);
+    }
     wseq[pg] = ++gseq;
     qatomic_set(&hv_dirty[pg], 1);
 }
@@ -252,12 +373,14 @@ static void *guest_thread(void *arg)
         Packet *p = g_new0(Packet, 1);
         int nw = 1 + rnd(&st) % 12, i;
 
+        vcpu_enter();
         qemu_mutex_lock(&glock);
         for (i = 0; i < nw; i++) {
             do_write(&st, 1);
         }
         p->snap = g_memdup2(wseq, sizeof(wseq));
         qemu_mutex_unlock(&glock);
+        vcpu_leave();
         /* -1..4: some doorbells name no channel (unless STRESS_NAMED_ONLY: then 1..4, like Tahoe) */
         p->channel = cfg_named_only ? 1 + (int)(rnd(&st) % 4) : (int)(rnd(&st) % 6) - 1;
         p->sets_mask = 0;
@@ -366,9 +489,11 @@ static void *racer_thread(void *arg)
 
     rcu_register_thread();
     while (!stop_flag) {
+        vcpu_enter();
         qemu_mutex_lock(&glock);
         do_write(&st, 1);
         qemu_mutex_unlock(&glock);
+        vcpu_leave();
         spin_us(rnd(&st) % 40);
     }
     rcu_unregister_thread();
@@ -576,7 +701,7 @@ int main(int argc, char **argv)
 {
     int seconds = argc > 1 ? atoi(argv[1]) : 10;
     uint32_t st = 1;
-    QemuThread th_guest, th_racer, th_harvest, th_drain, th_churn, th_nondb, th_readers[8];
+    QemuThread th_guest, th_racer, th_harvest, th_drain, th_churn, th_nondb, th_readers[8], th_main;
     int i;
     const char *e;
 
@@ -609,6 +734,9 @@ int main(int argc, char **argv)
     cfg_reader_pure = (e = getenv("STRESS_READER_PURE")) ? atoi(e) : 0;
     cfg_hole_us = (e = getenv("STRESS_HOLE_US")) ? atoi(e) : 40;
     nsets = (e = getenv("STRESS_SETS")) ? MIN(atoi(e), MAXSETS) : 16;
+    cfg_wp_nopause = (e = getenv("STRESS_WP_NOPAUSE")) ? atoi(e) : 0;
+    qemu_mutex_init(&vg_lock);
+    qemu_cond_init(&vg_cond);
 
     for (i = 0; i < NHOT; i++) {
         hot_pages[i] = rnd(&st) % UNIVERSE;
@@ -623,6 +751,7 @@ int main(int argc, char **argv)
         fixed_tokens[i] = sets[i].token;
     }
     qemu_thread_create(&th_harvest, "harvest", harvest_thread, NULL, QEMU_THREAD_JOINABLE);
+    qemu_thread_create(&th_main, "mainloop", mainloop_thread, NULL, QEMU_THREAD_JOINABLE);
     qemu_thread_create(&th_drain, "drain", drain_thread, NULL, QEMU_THREAD_JOINABLE);
     qemu_thread_create(&th_guest, "guest", guest_thread, NULL, QEMU_THREAD_JOINABLE);
     qemu_thread_create(&th_racer, "racer", racer_thread, NULL, QEMU_THREAD_JOINABLE);
@@ -662,9 +791,10 @@ int main(int argc, char **argv)
     }
     qemu_thread_join(&th_drain);
     qemu_thread_join(&th_harvest);
+    qemu_thread_join(&th_main);
     printf("RESULT packets=%" PRIu64 " reads=%" PRIu64 " regathers=%" PRIu64 " violations=%" PRIu64
-           " reader_calls=%" PRIu64 "\n",
-           n_packets, n_reads, n_regathers, n_violations, n_reader_calls);
+           " reader_calls=%" PRIu64 " wp_faults=%" PRIu64 " wp_remaps=%" PRIu64 "\n",
+           n_packets, n_reads, n_regathers, n_violations, n_reader_calls, n_wp_faults, n_wp_remaps);
     fflush(stdout);
     return n_violations ? 1 : 0;
 }

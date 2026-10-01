@@ -24,6 +24,7 @@ for e in json.load(open('compile_commands.json')):
                 continue
             else:
                 out.append(x)
+        out.append('-DREIMS_DIRTY_STRESS')
         print(' '.join(shlex.quote(x) for x in out))
         break
 PY

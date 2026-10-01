@@ -14,6 +14,7 @@ G = 'REIMS_VGPU_LAB_'
 NAMED = {'STRESS_NAMED_ONLY': '1', 'STRESS_NONDB_HZ': '250'}
 HOLE = {'STRESS_HOLE': '25', 'STRESS_HOLE_US': '40'}
 RING = {'STRESS_RING': '1', 'STRESS_RING_SKIP': '30', 'STRESS_HOLE_US': '40'}
+WP = {G + 'DIRTY_WP': 'on', G + 'DIRTY_WP_MIN': '8', G + 'DIRTY_WP_STREAK': '2'}
 EXACT3 = {G + 'DIRTY_STEAL': 'on', G + 'GEN_MEMO': 'on', G + 'GEN_LOCKFREE': 'on'}
 cfgs = [
     ('off', {}, '0'),
@@ -52,6 +53,12 @@ cfgs = [
     ('CONTROL: drain reads lagged', {'STRESS_DRAIN_LAGGED': '1'}, '>0'),
     ('DEFAULTS (no gate env): named model', dict(NAMED), '0'),
     ('DEFAULTS (no gate env): real ring protocol', dict(NAMED, **RING), '0'),
+    ('wp (sets >= 8 pages, 2 clean syncs)', dict(WP), '0'),
+    ('wp + exact3, named model', dict(NAMED, **WP, **EXACT3), '0'),
+    ('wp + frontier + named, ring + hole=tail', dict(NAMED, **RING, **EXACT3, **WP, **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_FRONTIER': 'on', G + 'EPOCH_NAMED': 'on'}), '0'),
+    ('CONTROL: wp protects without pausing the writers', dict(WP, STRESS_WP_NOPAUSE='1'), '>0'),
+    ('DEFAULTS + wp: named model', dict(NAMED, **WP), '0'),
+    ('DEFAULTS + wp: real ring protocol', dict(NAMED, **RING, **WP), '0'),
 ]
 ORIGINAL = {G + 'DIRTY_STEAL': 'off', G + 'GEN_LOCKFREE': 'off', G + 'EPOCH_NAMED': 'off', G + 'DIRTY_HOLE': 'off'}
 KEYS = ('steals', 'steal_same', 'steal_late', 'memo_hit', 'memo_fresh', 'memo_diff', 'memo_bad', 'unnamed_skipped',
