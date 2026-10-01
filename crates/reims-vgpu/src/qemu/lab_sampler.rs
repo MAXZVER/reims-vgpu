@@ -50,6 +50,7 @@ extern "system" {
     fn GetModuleFileNameW(module: Handle, name: *mut u16, size: u32) -> u32;
     fn K32GetModuleInformation(process: Handle, module: Handle, info: *mut ModuleInfo, size: u32) -> i32;
     fn GetCurrentProcess() -> Handle;
+    fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize);
     fn RtlLookupFunctionEntry(
         pc: u64,
         base: *mut u64,
@@ -144,17 +145,24 @@ pub(crate) fn start_once() {
         if target.is_null() {
             return;
         }
+        // The drain thread's stack: a walk that leaves it (a frame without
+        // unwind data that is not a leaf, e.g. driver JIT code) stops instead
+        // of reading through a garbage stack pointer.
+        let (mut lo, mut hi) = (0usize, 0usize);
+        // SAFETY: both out-pointers are ours; the call describes this thread.
+        unsafe { GetCurrentThreadStackLimits(&mut lo, &mut hi) };
+        let stack = (lo as u64, hi as u64);
         let target = SendHandle(target);
         let _ = std::thread::Builder::new()
             .name("lab-sampler".into())
             .spawn(move || {
                 let target = target;
-                run(target.0, &out, gate.as_deref(), hz)
+                run(target.0, &out, gate.as_deref(), hz, stack)
             });
     });
 }
 
-fn run(target: Handle, out: &str, gate: Option<&str>, hz: u64) {
+fn run(target: Handle, out: &str, gate: Option<&str>, hz: u64, stack: (u64, u64)) {
     // SAFETY: a null name asks for the executable's own module.
     let base = unsafe { GetModuleHandleW(core::ptr::null()) } as u64;
     let Ok(file) = std::fs::OpenOptions::new()
@@ -217,7 +225,7 @@ fn run(target: Handle, out: &str, gate: Option<&str>, hz: u64) {
                 while n < MAX_FRAMES {
                     let rip = rd(&ctx, OFF_RIP);
                     let rsp = rd(&ctx, OFF_RSP);
-                    if rip == 0 || (n > 0 && rsp <= last_rsp) {
+                    if rip == 0 || (n > 0 && rsp <= last_rsp) || rsp < stack.0 || rsp + 8 > stack.1 {
                         break;
                     }
                     last_rsp = rsp;
