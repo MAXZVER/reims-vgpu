@@ -1516,6 +1516,12 @@ pub fn prewake_recorder() {
     }
 }
 
+/// TEMP (lab, S5a): how many deferred draws may be out at once
+/// (`REIMS_VGPU_LAB_RECORDER_DEPTH`).
+pub fn recorder_depth() -> u32 {
+    recorder::depth()
+}
+
 /// TEMP (lab, S5a): whether the drain owes the recorder a join — a draw is out,
 /// or its result has not been taken — which is true after the gate is turned off
 /// as well as while it is on.

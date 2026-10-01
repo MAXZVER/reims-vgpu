@@ -173,6 +173,22 @@ pub(crate) fn settle_deferred_draws_at_stream_end() -> bool {
     if !crate::backend::vulkan::engine::deferred_draws_pending() {
         return false;
     }
+    // TEMP (lab, `REIMS_VGPU_LAB_RECORDER_STREAM_JOIN=off`, with a queue deeper
+    // than one): the stream's end takes a failure already found and does not
+    // wait for the draws still recording. The wait is only for attribution (a
+    // failure found later is reported, with its own pipeline and task, at a
+    // later join); every door into engine state still waits for the recorder,
+    // and the batch flush and the tranche end still settle. With depth 4 this
+    // wait was ~6 400 joins/s, ~49 ms/s on the 5K drag (fq*).
+    if !lab_recorder_stream_join() && crate::backend::vulkan::engine::recorder_depth() > 1 {
+        return match crate::backend::vulkan::engine::take_deferred_failure() {
+            Some(failure) => {
+                crate::backend::vulkan::engine::report_deferred_failure(&failure);
+                true
+            }
+            None => false,
+        };
+    }
     match crate::backend::vulkan::engine::settle_deferred_draws() {
         Some(failure) => {
             crate::backend::vulkan::engine::report_deferred_failure(&failure);
@@ -1319,6 +1335,18 @@ fn lab_recorder_gva_store() -> bool {
     *ON.get_or_init(|| {
         let on = std::env::var("REIMS_VGPU_LAB_RECORDER_GVA_STORE").map_or(true, |v| v != "off");
         crate::observe::off(format!("recorder_gva_store on={on}"));
+        on
+    })
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_RECORDER_STREAM_JOIN=off` skips the wait for the
+/// recorder at the end of a stream (see `settle_deferred_draws_at_stream_end`).
+/// On (waiting) by default until measured. Latched.
+fn lab_recorder_stream_join() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_RECORDER_STREAM_JOIN").map_or(true, |v| v != "off");
+        crate::observe::off(format!("recorder_stream_join on={on}"));
         on
     })
 }
