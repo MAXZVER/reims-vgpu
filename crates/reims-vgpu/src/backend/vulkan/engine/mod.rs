@@ -31,6 +31,7 @@ mod linear_target_import;
 mod page_diff;
 mod pools;
 mod queue_owner;
+pub(crate) mod recorder;
 /// This rail's half of a serialized resource's rail state: the resident-target
 /// leases the guest's own delete releases.
 pub mod resource_lease;
@@ -268,7 +269,11 @@ impl DeviceObjectCaches {
     /// under this lock leaves the caches consistent — every entry is an owned
     /// handle in a map — and a device that refused every later draw because one
     /// earlier draw panicked would turn a recoverable refusal into a dead boot.
+    #[track_caller]
     fn with<R>(&self, f: impl FnOnce(&mut ObjectCaches) -> R) -> R {
+        // TEMP (lab, S5a): the drain waits for a deferred draw before it takes
+        // the caches the job holds; see `recorder`'s module doc for the order.
+        recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Caches);
         let mut caches = self.0.lock();
         f(&mut caches)
     }
@@ -286,6 +291,17 @@ impl DeviceObjectCaches {
     /// these handles is already gone — so the entries are dropped logically,
     /// which is exactly what `flush_device_derived` does in the same situation.
     pub(crate) fn end_device(&self) {
+        // TEMP (lab, S5a): the recorder ends with the device it recorded for. A
+        // failure it still held belongs to this device: reported here, so the
+        // next device's first draw does not find it.
+        match recorder::DRAW.stop() {
+            Some(recorder::JobResult::Failed(failure)) => {
+                recorder::DRAW.note_deferred_error();
+                report_deferred_failure(&failure);
+            }
+            Some(recorder::JobResult::Panicked(payload)) => std::panic::resume_unwind(payload),
+            Some(recorder::JobResult::Done) | None => {}
+        }
         let mut taken = {
             let mut caches = self.0.lock();
             std::mem::replace(&mut *caches, ObjectCaches::new())
@@ -865,6 +881,10 @@ pub(crate) enum EngineLockSite {
     Device,
     /// The host window's event loop: present, attach, resize, detach.
     Window,
+    /// TEMP (lab, S5a): the draw recorder thread, which takes the lock for the
+    /// engine half of a draw the drain handed it. Apart from `Device` because its
+    /// waits are not a guest stalled in an MMIO store.
+    Recorder,
 }
 
 impl EngineLockSite {
@@ -873,6 +893,7 @@ impl EngineLockSite {
             Self::Worker => 0,
             Self::Device => 1,
             Self::Window => 2,
+            Self::Recorder => 3,
         }
     }
 
@@ -881,10 +902,11 @@ impl EngineLockSite {
             Self::Worker => "worker",
             Self::Device => "device",
             Self::Window => "window",
+            Self::Recorder => "recorder",
         }
     }
 
-    const ALL: [Self; 3] = [Self::Worker, Self::Device, Self::Window];
+    const ALL: [Self; 4] = [Self::Worker, Self::Device, Self::Window, Self::Recorder];
 }
 
 thread_local! {
@@ -904,10 +926,18 @@ pub(crate) fn mark_drain_thread() {
     IS_DRAIN_THREAD.with(|c| c.set(true));
 }
 
+/// Whether the calling thread is the drain worker (see [`IS_DRAIN_THREAD`]).
+#[inline]
+pub(crate) fn is_drain_thread() -> bool {
+    IS_DRAIN_THREAD.with(std::cell::Cell::get)
+}
+
 /// Which site a `lock_engine()` acquire belongs to, from the calling thread.
 fn calling_site() -> EngineLockSite {
     if IS_DRAIN_THREAD.with(std::cell::Cell::get) {
         EngineLockSite::Worker
+    } else if recorder::is_recorder_thread() {
+        EngineLockSite::Recorder
     } else {
         EngineLockSite::Device
     }
@@ -1005,6 +1035,11 @@ pub(crate) fn take_engine_lock_census(win_ms: u64) -> Option<String> {
     ENGINE_LOCK.take(win_ms)
 }
 
+/// TEMP (lab, S5a): the recorder's window, beside `engine_lock`.
+pub(crate) fn take_recorder_census(win_ms: u64) -> Option<String> {
+    recorder::DRAW.take_window(win_ms)
+}
+
 /// A held engine lock that reports how long it was held.
 ///
 /// Derefs to [`EngineState`], so a call site reads exactly as it did against
@@ -1072,8 +1107,13 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
 /// vCPU's MMIO store, so no fixed site could name both correctly. See
 /// [`EngineLockSite`] for why telling them apart is the whole point.
 #[inline]
+#[track_caller]
 fn lock_engine() -> EngineGuard {
-    lock_engine_at(calling_site())
+    let site = calling_site();
+    // TEMP (lab, S5a): the drain's every entry into engine state first waits for
+    // a deferred draw; any other thread, the recorder included, does not.
+    recorder::settle_if_drain(site == EngineLockSite::Worker, recorder::JoinSite::Lock);
+    lock_engine_at(site)
 }
 
 /// Device-reset proxy: guest-derived Vulkan objects evicted at the lifetime boundary.
@@ -1461,6 +1501,125 @@ pub fn execute_draw_request(
     device_caches.with(|caches| execute_draw_request_with(caches, req))
 }
 
+/// TEMP (lab, S5a): whether a draw on this thread may be handed to the
+/// recorder. Only the drain defers, and only with the gate on.
+pub fn deferred_draws_enabled() -> bool {
+    recorder::enabled() && is_drain_thread()
+}
+
+/// TEMP (lab, S5a): a stream with more than one record is about to start, on the
+/// drain: bring the recorder's thread awake now, in parallel with the first
+/// record's preparation, rather than at its first job.
+pub fn prewake_recorder() {
+    if deferred_draws_enabled() {
+        recorder::DRAW.prewake();
+    }
+}
+
+/// TEMP (lab, S5a): whether the drain owes the recorder a join — a draw is out,
+/// or its result has not been taken — which is true after the gate is turned off
+/// as well as while it is on.
+pub fn deferred_draws_pending() -> bool {
+    is_drain_thread() && recorder::DRAW.pending()
+}
+
+/// What a caller says about the draw it defers, for the report of a failure
+/// nobody is waiting for.
+pub use recorder::DeferredMeta;
+
+/// What a deferred draw's failure is, once it is taken.
+pub use recorder::DeferredFailure;
+
+/// TEMP (lab, S5a): hand one draw to the recorder and return immediately.
+///
+/// The caller owns the contract: this draw's result is never read (no armed
+/// visibility, no readback), and it has already taken any earlier deferred
+/// draw's failure with [`take_deferred_failure`] -- at most one is in flight.
+/// The draw is recorded either way: on the recorder, or, when its thread will
+/// not start or the caches are unreachable, right here before this returns, its
+/// failure waiting for the caller's next take like any other.
+///
+/// Called on the drain thread, with neither the engine nor the caches held.
+pub fn submit_deferred_draw(
+    state: &crate::model::DeviceState,
+    req: DrawRequest,
+    meta: DeferredMeta,
+) {
+    let Some(caches) = device_caches(state) else {
+        // No caches to record against: the synchronous path's own refusal.
+        let error = DrawError::Facade(facade_decline::EngineFacadeDecline::DeviceCachesUnreachable);
+        recorder::DRAW.submit(Box::new(move || {
+            recorder::JobResult::Failed(Box::new(recorder::DeferredFailure { error, meta }))
+        }));
+        return;
+    };
+    let caches = recorder::AssertSend(caches as *const DeviceObjectCaches);
+    let req = recorder::AssertSend(req);
+    // The job owns the request; the only borrow it carries is the caches'
+    // address, valid until the drain settles it (see `recorder`'s module doc).
+    let job: Box<dyn FnOnce() -> recorder::JobResult + Send> = Box::new(move || {
+        let caches = caches.into_inner();
+        let req = req.into_inner();
+        // SAFETY: `recorder`'s module doc -- the drain holds the device the
+        // caches belong to for the whole tranche and settles this job before it
+        // ends.
+        let caches = unsafe { &*caches };
+        match caches.with(|caches| execute_draw_request_with(caches, &req)) {
+            Ok(_) => recorder::JobResult::Done,
+            Err(error) => {
+                recorder::JobResult::Failed(Box::new(recorder::DeferredFailure { error, meta }))
+            }
+        }
+    });
+    recorder::DRAW.submit(job);
+}
+
+/// TEMP (lab, S5a): wait for the in-flight deferred draw, if any, and take its
+/// failure. A panic in the job is re-raised here, where the synchronous path
+/// would have raised it.
+pub fn take_deferred_failure() -> Option<DeferredFailure> {
+    match recorder::DRAW.take(recorder::JoinSite::Explicit) {
+        None | Some(recorder::JobResult::Done) => None,
+        Some(recorder::JobResult::Failed(failure)) => {
+            recorder::DRAW.note_deferred_error();
+            Some(*failure)
+        }
+        Some(recorder::JobResult::Panicked(payload)) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// TEMP (lab, S5a): the drain is about to write guest memory with the CPU; see
+/// [`crate::backend::settle_deferred_draws_for_guest_write`].
+#[inline]
+#[track_caller]
+pub(crate) fn settle_for_guest_write() {
+    if recorder::DRAW.in_flight() {
+        recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
+    }
+}
+
+/// TEMP (lab, S5a): leave nothing in flight. The failure, if the job had one,
+/// is returned for the caller to report.
+pub fn settle_deferred_draws() -> Option<DeferredFailure> {
+    take_deferred_failure()
+}
+
+/// A deferred draw's failure, named on the always-on channel and latched per
+/// (reason, pipeline) like the synchronous path's own report of the same decline
+/// at the draw itself.
+pub fn report_deferred_failure(failure: &DeferredFailure) {
+    crate::observe::Emit::decline("linux_m2v_draw", &failure.error)
+        .field("pipe", failure.meta.pipeline_ref)
+        .field("task", failure.meta.task_id)
+        .field(
+            "geom",
+            format!("{}x{}", failure.meta.width, failure.meta.height),
+        )
+        .field("vtx", failure.meta.vertex_count)
+        .field("deferred", 1)
+        .fail_once(u64::from(failure.meta.pipeline_ref));
+}
+
 fn execute_draw_request_with(
     caches: &mut ObjectCaches,
     req: &DrawRequest,
@@ -1512,6 +1671,12 @@ fn execute_draw_request_with(
 /// prefetch, next non-joinable draw) already flushes via begin_entry, so this
 /// only bounds the idle-tail latency. No-op without a context or open batch.
 pub fn flush_batched_draws(state: &crate::model::DeviceState) {
+    // TEMP (lab, S5a): a deferred draw does not outlive the tranche that
+    // submitted it (the pointer it holds into `state` would), and it may not be
+    // in the batch this tail flush is about to look for yet.
+    if let Some(failure) = settle_deferred_draws() {
+        report_deferred_failure(&failure);
+    }
     if !end_of_tranche_requires_engine(
         BATCH_OPEN.load(std::sync::atomic::Ordering::Acquire),
         device_lost::device_lost_seen(),
@@ -1800,6 +1965,7 @@ fn clear_guest_write_pages() {
 /// `pages` need not be sorted; it is the reader's window and is usually a
 /// handful of entries against a whole frame's worth here.
 pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
+    recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
     let Ok(f) = GUEST_WRITE_PAGES.lock() else {
         return GuestWriteReach::Unnamed;
     };
@@ -1856,6 +2022,9 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
 /// mapping bytes.
 pub fn quiesce_guest_writes() {
     use std::sync::atomic::Ordering;
+    // TEMP (lab, S5a): the flag below is lock-free; a deferred draw may still
+    // owe it.
+    recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
     if !GUEST_WRITE_DEBT.load(Ordering::Acquire) {
         return;
     }
@@ -1908,11 +2077,13 @@ pub fn quiesce_guest_writes() {
 /// The same flag [`quiesce_guest_writes`] short-circuits on. Host-side readers
 /// use this to avoid taking the engine lock when no GPU write can race them.
 pub fn guest_writes_outstanding() -> bool {
+    recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
     GUEST_WRITE_DEBT.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Whether a completion stamp must be queued behind guest-memory access.
 pub fn guest_access_outstanding() -> bool {
+    recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
     GUEST_READ_DEBT.load(std::sync::atomic::Ordering::Acquire) || guest_writes_outstanding()
 }
 
@@ -2527,6 +2698,8 @@ fn classify_resident_content(content_ready: bool, guest_imported: bool) -> Resid
 /// ago — which is all a lock-held read ever was, the lock being released before
 /// the caller acts on it.
 pub fn resident_content_backing(identity: &TargetIdentity) -> ResidentContentBacking {
+    // TEMP (lab, S5a): a lock-free read of what a deferred draw publishes.
+    recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
     // TEMP (lab): `REIMS_VGPU_LAB_READINESS_LOCKED=1` answers from the registry
     // under the engine lock, as this function did before the table existed. An
     // A/B switch for the one behaviour change the table made on the serial path
@@ -2552,6 +2725,7 @@ pub fn resident_content_backing(identity: &TargetIdentity) -> ResidentContentBac
 /// learn later that it is still current, or `None` when no resident is
 /// registered under `identity`. No engine lock; see [`pools::readiness`].
 pub fn resident_readiness(identity: &TargetIdentity) -> Option<ResidentReadiness> {
+    recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
     pools::readiness::lookup(identity)
 }
 
@@ -7136,6 +7310,13 @@ fn test_reset_engine_with(caches: &mut ObjectCaches) {
 /// Test hook: next execute reports device lost (named path).
 pub fn test_force_device_lost_once() {
     lock_engine().owner.force_device_lost = true;
+}
+
+/// Test hook: make the calling thread the drain worker, so the engine's own
+/// doors (`lock_engine`, the caches, the lock-free readers) wait for a deferred
+/// draw the way they do in a boot. Thread-local, so one test's thread only.
+pub fn test_mark_drain_thread() {
+    mark_drain_thread();
 }
 
 /// Test hook: flush any open batch and retire every in-flight ring slot so

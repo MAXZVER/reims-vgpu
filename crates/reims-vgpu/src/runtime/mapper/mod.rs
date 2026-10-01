@@ -2589,6 +2589,7 @@ impl RectStride {
 /// # Safety
 /// `src` and `dst` must be valid for `n` bytes and not overlap.
 unsafe fn write_guest_bytes(src: *const u8, dst: *mut u8, n: usize) {
+    crate::backend::settle_deferred_draws_for_guest_write();
     // TEMP lab A/B: REIMS_LAB_STREAM_WRITE=off takes the plain copy.
     static STREAM: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
         std::env::var("REIMS_LAB_STREAM_WRITE").map_or(true, |v| v != "off")
@@ -3084,6 +3085,11 @@ fn par_land_write_in<H: HostMemory + HostOps>(
         return None;
     }
     let pool = state.par().filter(|pool| pool.workers() > 0)?;
+    // TEMP (lab, S5a): the pool's workers write guest pages, and
+    // `write_guest_bytes`'s own settle only joins on the drain thread. A draw
+    // the recorder still holds may read these pages, so the drain settles it
+    // here, before it forks.
+    crate::backend::settle_deferred_draws_for_guest_write();
     let need_end = off.saturating_add(buf.len() as u64);
     let selected: u64 = selected_within(only, off, need_end)
         .map(|(lo, hi)| hi - lo)

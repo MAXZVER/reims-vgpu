@@ -117,6 +117,76 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     host: &mut M,
     req: &mut DrawEncodeRequest,
     writeback_guest: bool,
+    force_full_store: bool,
+) -> (EncodeStatus, Option<Vec<u8>>) {
+    let mut out = encode_draw_chain_inner(state, host, req, writeback_guest, force_full_store);
+    // TEMP (lab, S5a, REIMS_VGPU_LAB_RECORDER): a deferred draw may stay in
+    // flight past this call only when this very call handed one to the recorder
+    // (it then reports the resident chain). Every other exit settles it first,
+    // so nothing the caller runs after a record that did not defer — a Store, an
+    // abandoned chain's landing, the next stream — runs beside a recording.
+    //
+    // Asked of `pending`, not of the gate: the gate may have been turned off with
+    // a draw still out, and that draw is still owed its join.
+    if !req.chain_resident_established && crate::backend::vulkan::engine::deferred_draws_pending() {
+        if let Some(failure) = crate::backend::vulkan::engine::settle_deferred_draws() {
+            crate::backend::vulkan::engine::report_deferred_failure(&failure);
+            // Found here because this record left before it reached the engine
+            // (a preparation refusal, or a record that draws nothing): the
+            // sequential path would never have run it, so it is refused, and the
+            // exec loop is told whose failure it is counting.
+            if !req.deferred_failure_of_previous {
+                req.deferred_failure_of_previous = true;
+                out = refuse_after_deferred_failure(out);
+            }
+        }
+    }
+    out
+}
+
+/// TEMP (lab, S5a): a record that reached its exit with an earlier deferred
+/// draw's failure in hand. A refusal already stands; an `Ok` is turned into the
+/// refusal the sequential path would have given the chain at this point — it
+/// would never have run this record — so the exec loop abandons the chain.
+pub(super) fn refuse_after_deferred_failure(
+    out: (EncodeStatus, Option<Vec<u8>>),
+) -> (EncodeStatus, Option<Vec<u8>>) {
+    match out.0 {
+        EncodeStatus::Ok => (EncodeStatus::NoMetal("deferred_draw_failed"), None),
+        _ => out,
+    }
+}
+
+/// TEMP (lab, S5a): a stream with more than one record is about to prepare its
+/// first, so the recorder (if it is on and asleep) wakes in parallel with it.
+pub(crate) fn prewake_recorder_for_stream(records: usize) {
+    if records > 1 {
+        crate::backend::vulkan::engine::prewake_recorder();
+    }
+}
+
+/// TEMP (lab, S5a): the end of a stream's record loop. A deferred draw does not
+/// outlive the stream that handed it over: the next stream may be another task's,
+/// and its first draw must not find this one's failure. Returns whether a failure
+/// was found, which the loop then counts (the draw was reported drawn).
+pub(crate) fn settle_deferred_draws_at_stream_end() -> bool {
+    if !crate::backend::vulkan::engine::deferred_draws_pending() {
+        return false;
+    }
+    match crate::backend::vulkan::engine::settle_deferred_draws() {
+        Some(failure) => {
+            crate::backend::vulkan::engine::report_deferred_failure(&failure);
+            true
+        }
+        None => false,
+    }
+}
+
+fn encode_draw_chain_inner<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    req: &mut DrawEncodeRequest,
+    writeback_guest: bool,
     // Inert on this arm, and by construction rather than by omission: the Metal
     // arm consults it in `store_seed_policy` to suppress a scissor-local store,
     // and this rail has no scissor-local store to suppress — `req.scissor` only
@@ -12248,6 +12318,57 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the boundary below names the engine's specific check as the primary
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
+        // TEMP (lab, S5a, REIMS_VGPU_LAB_RECORDER): the engine half of a chain
+        // intermediate runs on the recorder while the drain prepares the next
+        // record.
+        //
+        // What makes a draw deferrable is that the code below this call would
+        // do nothing with the engine's answer: a resident render-pass chain
+        // intermediate has `skip_readback` (so no pixels), reads `out` only for
+        // the occlusion samples (so none may be armed), and returns
+        // `ResidentChain` from flags decided above. Anything else — the last
+        // record's Store, a readback, an armed visibility query — runs
+        // synchronously exactly as before, and the engine doors the drain
+        // enters first wait for the recorder (`engine::recorder`).
+        //
+        // The previous deferred draw's failure is taken here, before this draw
+        // runs or is handed over: the sequential path would never have reached
+        // this record, so it refuses it with the failure's own error and the
+        // exec loop abandons the chain exactly as it does for a synchronous
+        // refusal. (The one difference: the failed draw was reported `Ok` to
+        // the loop when it was submitted, so the loop counts it as drawn and
+        // counts this record as the failed one; and this record's preparation
+        // has already run, whose effects are observations, caches and debt
+        // payment, correct on their own.)
+        let recorder_on = crate::backend::vulkan::engine::deferred_draws_enabled();
+        if recorder_on || crate::backend::vulkan::engine::deferred_draws_pending() {
+            if let Some(failure) = crate::backend::vulkan::engine::take_deferred_failure() {
+                crate::backend::vulkan::engine::report_deferred_failure(&failure);
+                req.deferred_failure_of_previous = true;
+                return Err(failure.error);
+            }
+        }
+        if recorder_on
+            && resident_render_chain
+            && req.visibility.is_none()
+            && resources.occlusion_query.is_none()
+            && resources.skip_readback
+        {
+            crate::backend::vulkan::engine::submit_deferred_draw(
+                state,
+                resources,
+                crate::backend::vulkan::engine::DeferredMeta {
+                    pipeline_ref: req.pipeline_ref,
+                    task_id: req.task_id,
+                    width: w,
+                    height: h,
+                    vertex_count,
+                },
+            );
+            // What `out.occlusion_samples` would have been with no query armed.
+            req.visibility_samples = None;
+            return Ok(M2vDrawSpan::ResidentChain);
+        }
         let out = crate::backend::vulkan::engine::execute_draw_request(state, &resources)?;
         // Carried back on the request so `runtime::exec` can sum the chain's
         // draws into the guest's buffer. The engine reports per draw because a

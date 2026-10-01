@@ -307,6 +307,97 @@ fn batched_draws_compose_and_flush_on_read() {
     }
 }
 
+/// A chain handed to the recorder thread lands the same pixels as the
+/// synchronous one in `batched_draws_compose_and_flush_on_read`, and the
+/// engine's own door does the waiting: this thread plays the drain, so
+/// `read_target` — which takes the engine lock — settles the job first, with no
+/// explicit join between the second submit and the read.
+#[test]
+fn a_deferred_chain_composes_like_the_synchronous_one() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_131,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    engine::test_mark_drain_thread();
+    let meta = engine::DeferredMeta {
+        pipeline_ref: 7,
+        task_id: 1,
+        width: W,
+        height: H,
+        vertex_count: 3,
+    };
+    let before = engine::counter_snapshot();
+    let opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    engine::submit_deferred_draw(engine_device(), opener, meta);
+    // The previous deferred draw's failure is taken before the next goes out.
+    if let Some(failure) = engine::take_deferred_failure() {
+        let msg = failure.error.to_string();
+        if skip_if_no_gpu(&msg) {
+            eprintln!("skipping: {msg}");
+            return;
+        }
+        panic!("opener draw: {msg}");
+    }
+    let joiner = batch_req(&vert, &frag, &identity, true, half_scissor(false));
+    engine::submit_deferred_draw(engine_device(), joiner, meta);
+    let px = engine::read_target(&identity)
+        .expect("read_target waits for the recorder, then flushes the batch")
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
+    assert!(
+        engine::take_deferred_failure().is_none(),
+        "the joiner draw failed on the recorder"
+    );
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(delta.batch_opens, 1, "the first draw opened the batch");
+    assert_eq!(delta.batch_joins, 1, "the second joined it, in order");
+    assert_eq!(delta.batch_flush_draws, 2, "the one submit carried both");
+    assert_eq!(px.len(), (W * H * 4) as usize);
+    for y in [0u32, H / 2, H - 1] {
+        for x in [0u32, W / 4, W / 2, 3 * W / 4, W - 1] {
+            let i = ((y * W + x) * 4) as usize;
+            assert!(
+                is_frag_color(&px[i..i + 4]),
+                "deferred composite at ({x},{y}) = {:?}",
+                &px[i..i + 4]
+            );
+        }
+    }
+}
+
+/// A draw the engine refuses on the recorder is not lost: the next take returns
+/// its own error and the request's name, once, and the recorder goes on to run
+/// the next job.
+#[test]
+fn a_refused_deferred_draw_is_reported_once_and_the_recorder_goes_on() {
+    let _guard = engine_test_lock().lock().unwrap();
+    engine::test_mark_drain_thread();
+    // No shaders and no geometry: refused before any GPU work, on any host.
+    let meta = engine::DeferredMeta {
+        pipeline_ref: 4242,
+        task_id: 9,
+        width: 0,
+        height: 0,
+        vertex_count: 0,
+    };
+    engine::submit_deferred_draw(engine_device(), DrawRequest::default(), meta);
+    let failure = engine::take_deferred_failure().expect("the refusal reaches the taker");
+    assert_eq!(failure.meta.pipeline_ref, 4242);
+    assert_eq!(failure.meta.task_id, 9);
+    assert!(
+        engine::take_deferred_failure().is_none(),
+        "a failure is taken once"
+    );
+    // The recorder survived: a second refusal is reported the same way.
+    engine::submit_deferred_draw(engine_device(), DrawRequest::default(), meta);
+    assert!(engine::settle_deferred_draws().is_some());
+}
+
 /// The first and second draws from one decoded Metal render encoder retain one
 /// Vulkan pass instance even though the serialized continuation forces the
 /// second record's load action to LOAD. Load/store actions describe how a pass

@@ -652,6 +652,14 @@ pub struct DrawEncodeRequest {
     /// target (no CPU pixels, no guest Store). The exec chain loop arms
     /// `chain_from_resident` for the next record when set.
     pub chain_resident_established: bool,
+    /// Out-flag (TEMP lab, `REIMS_VGPU_LAB_RECORDER`): the record *before* this
+    /// one was handed to the recorder thread and reported drawn, and its engine
+    /// half has failed since. This record is the one that refused, with the failed
+    /// draw's own error, and the exec chain loop uses the flag to put the
+    /// bookkeeping where the sequential path would have had it: the earlier
+    /// record counts as the failure it is, and the chain's resident state is the
+    /// one from before it.
+    pub deferred_failure_of_previous: bool,
     /// Lifetime identity of the color0 GVA render resource.
     ///
     /// Resolved once per draw, before any GPU work, by
