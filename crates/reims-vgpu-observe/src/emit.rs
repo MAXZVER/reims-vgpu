@@ -119,15 +119,68 @@ const REFUSAL_CENSUS_WINDOW: std::time::Duration = std::time::Duration::from_sec
 /// always-on `refusal_census` line. One boot then names every refusal class
 /// with its magnitude, which is what makes a single evidence run enough.
 fn count_refusal(event: &'static str, reason: &'static str) {
-    let now = std::time::Instant::now();
-    let line = REFUSAL_CENSUS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(|| RefusalCensus::new(now))
-        .note(event, reason, now);
-    if let Some(line) = line {
-        super::off(line);
+    // Counted per thread and merged into the census every
+    // `REFUSAL_LOCAL_BATCH` calls: the 5K drag makes ~55 000 sightings a
+    // second on the drain, and a global lock, a map insert and a clock read
+    // each was ~3 % of the thread. A batch lands in the window open when it is
+    // merged, which moves a few counts across a five-second boundary at most.
+    #[cfg(not(test))]
+    {
+        let batch = REFUSAL_LOCAL.with(|l| {
+            let mut l = l.borrow_mut();
+            *l.0.entry((event, reason)).or_insert(0) += 1;
+            l.1 += 1;
+            (l.1 >= REFUSAL_LOCAL_BATCH).then(|| {
+                l.1 = 0;
+                std::mem::take(&mut l.0)
+            })
+        });
+        let Some(batch) = batch else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let mut line = None;
+        {
+            let mut g = REFUSAL_CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+            let census = g.get_or_insert_with(|| RefusalCensus::new(now));
+            for ((event, reason), n) in batch {
+                if let Some(l) = census.note_n(event, reason, n, now) {
+                    line = Some(l);
+                }
+            }
+        }
+        if let Some(line) = line {
+            super::off(line);
+        }
+        return;
     }
+    #[allow(unreachable_code)]
+    {
+        let now = std::time::Instant::now();
+        let line = REFUSAL_CENSUS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| RefusalCensus::new(now))
+            .note(event, reason, now);
+        if let Some(line) = line {
+            super::off(line);
+        }
+    }
+}
+
+/// Calls a thread counts before merging them into [`REFUSAL_CENSUS`].
+#[cfg(not(test))]
+const REFUSAL_LOCAL_BATCH: u32 = 512;
+
+#[cfg(not(test))]
+thread_local! {
+    /// This thread's unmerged sighting counts, and how many calls they hold.
+    static REFUSAL_LOCAL: std::cell::RefCell<(HashMap<(&'static str, &'static str), u64, LatchBuild>, u32)> =
+        std::cell::RefCell::new((HashMap::default(), 0));
+    /// Pairs this thread has already seen [`first_sight`] answer for: the
+    /// process-wide latch is set for them, so the answer is `false` without it.
+    static SEEN_LOCAL: std::cell::RefCell<HashSet<(&'static str, u64), LatchBuild>> =
+        std::cell::RefCell::new(HashSet::default());
 }
 
 /// The process's one [`RefusalCensus`], opened by the first refusal counted.
@@ -165,7 +218,18 @@ impl RefusalCensus {
         reason: &'static str,
         now: std::time::Instant,
     ) -> Option<String> {
-        *self.counts.entry((event, reason)).or_insert(0) += 1;
+        self.note_n(event, reason, 1, now)
+    }
+
+    /// [`Self::note`] for `n` sightings at once (a thread's merged batch).
+    fn note_n(
+        &mut self,
+        event: &'static str,
+        reason: &'static str,
+        n: u64,
+        now: std::time::Instant,
+    ) -> Option<String> {
+        *self.counts.entry((event, reason)).or_insert(0) += n;
         let elapsed = now.saturating_duration_since(self.since);
         if elapsed < REFUSAL_CENSUS_WINDOW {
             return None;
@@ -305,10 +369,25 @@ pub fn first_sight(reason: &'static str, discriminant: u64) -> bool {
     // Every sighting, not only the first, so a latched class still reports
     // its magnitude in `refusal_census` (as `seen:<reason>`).
     count_refusal("seen", reason);
-    SEEN.get_or_init(|| Mutex::new(HashSet::default()))
+    // A pair this thread already saw is latched process-wide: no global lock.
+    #[cfg(not(test))]
+    if SEEN_LOCAL.with(|l| l.borrow().contains(&(reason, discriminant))) {
+        return false;
+    }
+    let first = SEEN
+        .get_or_init(|| Mutex::new(HashSet::default()))
         .lock()
         .map(|mut s| s.insert((reason, discriminant)))
-        .unwrap_or(true)
+        .unwrap_or(true);
+    #[cfg(not(test))]
+    SEEN_LOCAL.with(|l| {
+        let mut l = l.borrow_mut();
+        // Bounded like the latch's key space; a thread past it asks globally.
+        if l.len() < 1 << 16 {
+            l.insert((reason, discriminant));
+        }
+    });
+    first
 }
 
 /// Every `(reason, discriminant)` [`first_sight`] has been asked about.

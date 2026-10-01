@@ -1029,7 +1029,10 @@ pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
 /// would cost more than the rail saves and would be measuring the instrument.
 /// A census wants a rate and not a total, and a rate converges on a 1-in-64
 /// sample of a population this size: ~26 walks a second against ~1 700 calls.
-const REACH_SAMPLE: u64 = 64;
+// TEMP (lab): 4096 (was 64). At 5K drag the site runs ~15 000 times a second,
+// so 1 in 64 was ~240 walks a second, each a page-table walk of the read plus a
+// set of every owed GVA page (~3 % of the drain thread for a census).
+const REACH_SAMPLE: u64 = 4096;
 
 /// Calls to [`note_unnamed_reach`], for the sample.
 static REACH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
