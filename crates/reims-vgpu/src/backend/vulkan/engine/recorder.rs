@@ -641,6 +641,42 @@ mod tests {
         assert_eq!(n.load(Ordering::SeqCst), 3);
     }
 
+    /// What the handoff costs the drain, measured (run with `--ignored
+    /// --nocapture`): a job of `job_us` is submitted, the drain spends `prep_us`
+    /// of its own, then settles. Prints the mean submit cost and the mean wait at
+    /// the settle; with the job shorter than the prep the wait should be ~0.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn handoff_cost_against_a_prep_of_the_drain() {
+        fn spin_us(us: u64) {
+            let end = Instant::now() + Duration::from_micros(us);
+            while Instant::now() < end {
+                std::hint::spin_loop();
+            }
+        }
+        let h = handoff("rec-test-cost");
+        for (job_us, prep_us) in [(7, 30), (17, 35), (7, 5), (40, 35)] {
+            let n = 5_000u32;
+            let (mut submit_ns, mut wait_ns) = (0u128, 0u128);
+            for _ in 0..n {
+                let t = Instant::now();
+                h.submit(ok_job(move || spin_us(job_us)));
+                submit_ns += t.elapsed().as_nanos();
+                spin_us(prep_us);
+                let t = Instant::now();
+                h.settle(JoinSite::Explicit);
+                wait_ns += t.elapsed().as_nanos();
+                let _ = h.take(JoinSite::Explicit);
+            }
+            eprintln!(
+                "job {job_us} us, prep {prep_us} us: submit {} ns, settle wait {} ns (mean of {n})",
+                submit_ns / u128::from(n),
+                wait_ns / u128::from(n)
+            );
+        }
+        h.stop();
+    }
+
     /// A thread that is not the drain never waits: the recorder's own
     /// `lock_engine` and `with` must not settle the job they belong to.
     #[test]
