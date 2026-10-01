@@ -1309,13 +1309,15 @@ fn sampled_mip_chain(
 /// (constexpr-sampler precedence, level-aware alias, sampled mip chain) for a
 /// same-conditions performance A/B; a comma list of `sampler`, `alias`,
 /// `pyramid` narrows only those.
-/// TEMP (lab): `REIMS_VGPU_LAB_RECORDER_GVA_STORE=on` hands a stream's last
-/// record to the recorder too when its Store stays on the GVA resident (see the
-/// deferral in `try_metal2vulkan_draw`). Latched.
+/// TEMP (lab): a stream's last record goes to the recorder too when its Store
+/// stays on the GVA resident (see the deferral in `try_metal2vulkan_draw`). On
+/// by default (5K drag, fgs*: busy 817/811 -> 775/785 ms/s, 17.6 -> 16.0 us a
+/// draw, 101.4/100.5 -> 102.1/102.5 Hz); `REIMS_VGPU_LAB_RECORDER_GVA_STORE=off`
+/// keeps it synchronous. Latched.
 fn lab_recorder_gva_store() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("REIMS_VGPU_LAB_RECORDER_GVA_STORE").is_ok_and(|v| v == "on");
+        let on = std::env::var("REIMS_VGPU_LAB_RECORDER_GVA_STORE").map_or(true, |v| v != "off");
         crate::observe::off(format!("recorder_gva_store on={on}"));
         on
     })
