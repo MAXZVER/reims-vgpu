@@ -18,6 +18,62 @@ extern "system" {
         flags: u32,
     ) -> i32;
     fn GetCurrentProcessorNumber() -> u32;
+    fn GetCurrentThread() -> *mut core::ffi::c_void;
+    fn SetThreadSelectedCpuSets(thread: *mut core::ffi::c_void, ids: *const u32, n: u32) -> i32;
+}
+
+/// Lab `REIMS_VGPU_LAB_PCORES=on`: the calling thread prefers the performance
+/// cores (a CPU-set selection, which the scheduler keeps as a preference). For
+/// the draw recorder; QEMU does the same for the vCPU and drain threads.
+pub(crate) fn pin_to_performance_cores(who: &str) {
+    if !std::env::var("REIMS_VGPU_LAB_PCORES").is_ok_and(|v| v == "on") {
+        return;
+    }
+    let ids = performance_cpu_set_ids();
+    if ids.is_empty() {
+        return;
+    }
+    // SAFETY: the pseudo handle of this thread and a slice of `ids.len()` ids.
+    if unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), ids.as_ptr(), ids.len() as u32) } != 0 {
+        crate::observe::off(format!("lab_pcores {who} sets={}", ids.len()));
+    }
+}
+
+/// CPU-set ids of the most performant efficiency class (group 0).
+fn performance_cpu_set_ids() -> Vec<u32> {
+    let recs = cpu_set_records();
+    let max_class = recs.iter().map(|r| r.2).max().unwrap_or(0);
+    recs.iter().filter(|r| r.2 == max_class).map(|r| r.0).collect()
+}
+
+/// (cpu-set id, logical processor, efficiency class) per group-0 CPU set.
+fn cpu_set_records() -> Vec<(u32, usize, u8)> {
+    let mut need = 0u32;
+    // SAFETY: a size query (null buffer, zero length).
+    unsafe { GetSystemCpuSetInformation(core::ptr::null_mut(), 0, &mut need, core::ptr::null_mut(), 0) };
+    if need == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; need as usize];
+    // SAFETY: the buffer is `need` bytes, as asked.
+    if unsafe { GetSystemCpuSetInformation(buf.as_mut_ptr(), need, &mut need, core::ptr::null_mut(), 0) } == 0 {
+        return Vec::new();
+    }
+    let mut recs = Vec::new();
+    let mut off = 0usize;
+    while off + 19 <= buf.len() {
+        let size = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+        if size == 0 {
+            break;
+        }
+        let id = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
+        let group = u16::from_le_bytes(buf[off + 12..off + 14].try_into().unwrap());
+        if group == 0 {
+            recs.push((id, buf[off + 14] as usize, buf[off + 18]));
+        }
+        off += size;
+    }
+    recs
 }
 
 /// Per logical processor (group 0): true for an efficiency core.

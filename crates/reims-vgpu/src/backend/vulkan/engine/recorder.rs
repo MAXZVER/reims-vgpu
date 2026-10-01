@@ -352,6 +352,8 @@ impl Handoff {
 
     fn worker_loop(&'static self, priority: Option<i32>) {
         apply_thread_priority(priority);
+        #[cfg(windows)]
+        crate::lab_cores::pin_to_performance_cores(self.name);
         if std::ptr::eq(self, &DRAW) {
             mark_recorder_thread();
         }
