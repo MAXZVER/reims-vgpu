@@ -358,6 +358,13 @@ impl ParkedStore {
         self.ready.iter().copied().collect()
     }
 
+    /// [`Self::ready_in_order`] appended to a buffer the caller keeps, for a
+    /// caller that has to hold the list across work that changes this store and
+    /// would otherwise allocate one on every pass.
+    pub fn ready_in_order_into(&self, out: &mut Vec<IngressOrdinal>) {
+        out.extend(self.ready.iter().copied());
+    }
+
     /// How many positions may run but have not.
     #[must_use]
     pub fn ready_len(&self) -> usize {
@@ -387,10 +394,16 @@ impl ParkedStore {
     /// plane what it holds — stays the caller's.
     #[must_use]
     pub fn awaited_slots(&self, ingress: IngressOrdinal) -> Vec<u32> {
+        self.awaited_slot_indices(ingress).collect()
+    }
+
+    /// [`Self::awaited_slots`] without the list: the same indices in the same
+    /// order, for a caller that reads them once and keeps nothing.
+    pub fn awaited_slot_indices(&self, ingress: IngressOrdinal) -> impl Iterator<Item = u32> + '_ {
         self.work
             .get(&ingress)
-            .map(|w| w.packet.stamp_waits.iter().map(|wait| wait.index).collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|w| w.packet.stamp_waits.iter().map(|wait| wait.index))
     }
 
     /// The ordering domain of a parked position, for a caller that has the
@@ -413,11 +426,19 @@ impl ParkedStore {
     /// this device itself has to finish, and nothing but a later pass will.
     #[must_use]
     pub fn waiting_in_order(&self) -> Vec<IngressOrdinal> {
+        self.waiting().collect()
+    }
+
+    /// [`Self::waiting_in_order`] without the list: the same positions in the
+    /// same order, borrowing the store for as long as the caller walks it. For a
+    /// walker that does nothing to this store between steps — the drain's passes
+    /// over what is still parked ask this on every packet, and almost always to
+    /// find that nothing is waiting or that nothing needs doing.
+    pub fn waiting(&self) -> impl Iterator<Item = IngressOrdinal> + '_ {
         self.work
             .keys()
             .filter(|o| !self.ready.contains(o))
             .copied()
-            .collect()
     }
 
     /// Whether this ordinal is holding bytes. For a caller deciding whether a
@@ -512,6 +533,54 @@ mod tests {
 
     /// A withdrawal is not a run: the store empties and hands nothing back, so
     /// a caller that ignored its own reason cannot execute the packet anyway.
+    /// The listings that walk the store in place answer exactly what the lists
+    /// that collect it do — same positions, same order, same slot indices — and
+    /// the one that fills a caller's buffer appends to it.
+    #[test]
+    fn the_in_place_listings_answer_what_the_collected_lists_do() {
+        use crate::runtime::drain::StampWait;
+
+        let mut store = ParkedStore::new();
+        for n in [9u64, 3, 7, 5, 1] {
+            let mut p = packet(4);
+            p.stamp_waits = (0..(n as u32 % 3))
+                .map(|i| StampWait {
+                    index: n as u32 * 10 + i,
+                    value: 1,
+                })
+                .collect();
+            store.park(ordinal(n), ParkedWork::new(1, EPOCH, p));
+        }
+        for ready in [3u64, 5] {
+            assert!(store.mark_ready(ordinal(ready)));
+        }
+
+        assert_eq!(
+            store.waiting().collect::<Vec<_>>(),
+            store.waiting_in_order()
+        );
+        assert_eq!(
+            store.waiting_in_order(),
+            vec![ordinal(1), ordinal(7), ordinal(9)],
+            "the positions the model has not released, ascending"
+        );
+        for n in [1u64, 3, 5, 7, 9, 100] {
+            assert_eq!(
+                store.awaited_slot_indices(ordinal(n)).collect::<Vec<_>>(),
+                store.awaited_slots(ordinal(n)),
+                "position {n}"
+            );
+        }
+        assert_eq!(store.awaited_slots(ordinal(7)), vec![70]);
+        assert!(store.awaited_slots(ordinal(100)).is_empty());
+
+        let mut buffer = vec![ordinal(42)];
+        store.ready_in_order_into(&mut buffer);
+        assert_eq!(buffer[0], ordinal(42), "appended, not cleared");
+        assert_eq!(buffer[1..], store.ready_in_order()[..]);
+        assert_eq!(store.ready_in_order(), vec![ordinal(3), ordinal(5)]);
+    }
+
     #[test]
     fn a_withdrawal_hands_nothing_back() {
         let mut store = ParkedStore::new();
