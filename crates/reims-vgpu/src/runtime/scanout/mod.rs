@@ -1649,12 +1649,27 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
     // One patch row is contiguous in the surface, so it is read whole, split
     // only where it crosses a page. A texel whose bytes cannot be read is
     // skipped, exactly as a per-texel read skipped it.
+    //
+    // This runs on every full-screen bind and reports only a change, so the
+    // record is kept as numbers and formatted only when it is printed: the
+    // strings it used to build per bind were thrown away on nearly every one.
+    // A row of up to 16-byte texels lives on the stack.
     let row_bytes_max = (FIELD_PATCH_SIDE * bpp) as usize;
-    let mut row = vec![0u8; row_bytes_max];
-    let mut row_ok = vec![false; FIELD_PATCH_SIDE as usize];
-    let mut report = String::new();
-    let mut first_texel = String::new();
-    let mut verdicts: Vec<u8> = Vec::with_capacity(FIELD_PATCHES.len());
+    let mut row_stack = [0u8; (FIELD_PATCH_SIDE * 16) as usize];
+    let mut row_heap = Vec::new();
+    let row: &mut [u8] = if row_bytes_max <= row_stack.len() {
+        &mut row_stack[..row_bytes_max]
+    } else {
+        row_heap.resize(row_bytes_max, 0u8);
+        &mut row_heap[..]
+    };
+    let mut row_ok = [false; FIELD_PATCH_SIDE as usize];
+    // `(patch index, verdict, mean, sd)` per patch that read anything.
+    let mut patches: [(usize, &'static str, f32, f32); FIELD_PATCHES.len()] =
+        [(0, "", 0.0, 0.0); FIELD_PATCHES.len()];
+    let mut first_texel: Option<([u8; 4], usize)> = None;
+    let mut verdicts: [u8; FIELD_PATCHES.len()] = [0; FIELD_PATCHES.len()];
+    let mut verdict_count = 0usize;
     for (i, (fx, fy)) in FIELD_PATCHES.iter().enumerate() {
         let cx = (width as f32 * fx) as u32;
         let cy = (height as f32 * fy) as u32;
@@ -1669,7 +1684,7 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
             }
             let cols = FIELD_PATCH_SIDE.min(width - x0);
             let row_off = base_off + u64::from(y) * u64::from(bpr) + u64::from(x0) * u64::from(bpp);
-            read_field_row(host, &gpa_at, row_off, bpp, page, &mut row, &mut row_ok[..cols as usize]);
+            read_field_row(host, &gpa_at, row_off, bpp, page, row, &mut row_ok[..cols as usize]);
             for dx in 0..cols {
                 if !row_ok[dx as usize] {
                     continue;
@@ -1677,8 +1692,8 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
                 let at = (dx * bpp) as usize;
                 let mut texel = [0u8; 4];
                 texel[..read].copy_from_slice(&row[at..at + read]);
-                if first_texel.is_empty() {
-                    first_texel = texel[..read].iter().map(|b| format!("{b:02x}")).collect();
+                if first_texel.is_none() {
+                    first_texel = Some((texel, read));
                 }
                 samples[n] = texel[..read].iter().map(|b| f32::from(*b)).sum::<f32>() / read as f32;
                 n += 1;
@@ -1690,16 +1705,14 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
         let mean = samples[..n].iter().sum::<f32>() / n as f32;
         let sd = (samples[..n].iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n as f32).sqrt();
         let verdict = field_patch_verdict(mean, sd);
-        verdicts.push(verdict.as_bytes()[0]);
-        if i != 0 {
-            report.push(',');
-        }
-        report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
+        verdicts[verdict_count] = verdict.as_bytes()[0];
+        patches[verdict_count] = (i, verdict, mean, sd);
+        verdict_count += 1;
     }
-    if verdicts.is_empty() {
+    if verdict_count == 0 {
         return;
     }
-    let pattern = verdicts
+    let pattern = verdicts[..verdict_count]
         .iter()
         .fold(0u64, |acc, v| (acc << 8) | u64::from(*v));
     let changed = {
@@ -1711,6 +1724,16 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
     if !changed {
         return;
     }
+    let mut report = String::new();
+    for &(i, verdict, mean, sd) in &patches[..verdict_count] {
+        if i != 0 {
+            report.push(',');
+        }
+        report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
+    }
+    let first_texel: String = first_texel
+        .map(|(texel, read)| texel[..read].iter().map(|b| format!("{b:02x}")).collect())
+        .unwrap_or_default();
     // The draws that went into this surface since the last change of its field,
     // for [`note_present_field_witness`]'s reason and drained the same way: a
     // full-screen layer that turns uniform is either a pass that produced a
