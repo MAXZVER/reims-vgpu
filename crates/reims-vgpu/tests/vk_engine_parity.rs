@@ -4511,3 +4511,169 @@ fn a_page_diff_lands_exactly_the_changed_and_forced_pages() {
     let (p, _, _) = read(&s1, m1, k1, &[]);
     assert!(p.is_empty(), "and the shadow followed the repaint");
 }
+
+/// Seed a `w`x`h` resident surface with `bgra` (guest scanout order: the bytes a
+/// payment lands), left in the registry for a later read — a seeded pass whose
+/// one draw covers nothing, so any word pattern can be laid down.
+fn seed_resident(identity: &TargetIdentity, w: u32, h: u32, bgra: &[u8]) -> bool {
+    let (vert, frag) = degenerate_triangle_spirv();
+    let mut req = engine_req(&vert, &frag, w, h);
+    req.target_identity = Some(identity.clone());
+    req.skip_readback = true;
+    req.color_attachment = Some(color_attachment(
+        reims_vgpu::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        [0.0; 4],
+    ));
+    req.target_rgba8 = Some(std::sync::Arc::new(bgra.to_vec()));
+    req.target_seed_order = engine::SeedOrder::Bgra8;
+    match engine::execute_draw_request(engine_device(), &req) {
+        Ok(_) => true,
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP pay hash: {e}");
+            false
+        }
+        Err(e) => panic!("pay hash seed draw: {e}"),
+    }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH`): the hash compare lands exactly the
+/// pages the `prev` compare lands, with the frame's own bytes. One resident is
+/// paid under three mappings — `off`, `on`, `verify` — after every seed, so each
+/// compare sees the same frames: a first frame (every page), a forced page of an
+/// unchanged frame, a one-word change beside a many-word one, a swap of two words
+/// and a rotation of rows inside a page, two halves of equal words exchanged (the
+/// page's multiset of words unchanged), and a page changed and changed back.
+/// `verify` must count no page the `prev` compare lands and the hash one misses,
+/// nor the reverse. A fourth mapping switches modes between payments: a record
+/// the last payment did not refresh must take every page, not compare.
+#[test]
+fn a_hash_payment_lands_exactly_the_pages_the_prev_compare_lands() {
+    use engine::PayHash;
+    let _g = engine_test_session();
+    // Sixteen pages of sixteen 64-texel rows each.
+    let (w, h) = (64u32, 256u32);
+    let frame_bytes = (w * h * 4) as usize;
+    let pages = (frame_bytes / 4096) as u32;
+    const WPP: usize = 1024;
+    let id = TargetIdentity::Surface {
+        id: 7201,
+        width: w,
+        height: h,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let arms = [
+        (PayHash::Off, 7201u32),
+        (PayHash::On, 7202),
+        (PayHash::Verify, 7203),
+    ];
+    let key = |m: u32| (1u32, w, h, u64::from(m));
+    let bytes_of = |f: &[u32]| f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+    let pay = |mode: PayHash, m: u32, frame: &[u8], force: &[u32], label: &str| {
+        let got = engine::with_pay_hash(mode, || {
+            engine::read_target_changed_pages(&id, m, key(m), force)
+        })
+        .expect("page diff read")
+        .expect("a BGRA8 resident takes the page diff");
+        assert_eq!(got.frame_bytes as usize, frame_bytes);
+        // SAFETY: the engine's mapped `out` buffer, at least `frame_bytes`
+        // long, valid until the next page-diff call.
+        let out = unsafe { std::slice::from_raw_parts(got.frame_ptr, frame_bytes) };
+        for &p in &got.pages {
+            let r = p as usize * 4096..(p as usize + 1) * 4096;
+            assert!(
+                out[r.clone()] == frame[r],
+                "{label}: {mode:?} landed page {p} with the frame's bytes"
+            );
+        }
+        engine::page_diff_set_key(m, key(m));
+        (got.pages, got.full)
+    };
+    let step = |frame: &[u32], force: &[u32], want: &[u32], full: bool, label: &str| {
+        let bytes = bytes_of(frame);
+        assert!(seed_resident(&id, w, h, &bytes), "{label}: seed");
+        for &(mode, m) in &arms {
+            let (got, got_full) = pay(mode, m, &bytes, force, label);
+            assert_eq!(got, want, "{label}: {mode:?} lands these pages");
+            assert_eq!(got_full, full, "{label}: {mode:?} full");
+        }
+    };
+
+    // Every word distinct, so a swap or a rotation really moves values.
+    let mut frame: Vec<u32> = (0..w * h)
+        .map(|i| i.wrapping_mul(0x9E37_79B9) ^ 0x5A5A_A5A5)
+        .collect();
+    if !seed_resident(&id, w, h, &bytes_of(&frame)) {
+        return; // no GPU
+    }
+    let (compared0, missed0, extra0) = engine::pay_hash_verify_totals();
+    let all: Vec<u32> = (0..pages).collect();
+    step(&frame, &[], &all, true, "first frame");
+    step(
+        &frame,
+        &[3],
+        &[3],
+        false,
+        "a forced page of an unchanged frame",
+    );
+
+    frame[WPP + 5] ^= 1;
+    for v in &mut frame[5 * WPP..5 * WPP + 100] {
+        *v = 0;
+    }
+    step(&frame, &[], &[1, 5], false, "one word, and a hundred");
+
+    frame.swap(7 * WPP + 10, 7 * WPP + 900);
+    frame[9 * WPP..10 * WPP].rotate_left(64);
+    step(
+        &frame,
+        &[0],
+        &[0, 7, 9],
+        false,
+        "a swap and a row rotation, page 0 forced",
+    );
+    step(&frame, &[], &[], false, "unchanged");
+
+    let (a, b) = (0x1122_3344u32, 0xAABB_CCDDu32);
+    frame[11 * WPP..11 * WPP + 512].fill(a);
+    frame[11 * WPP + 512..12 * WPP].fill(b);
+    step(&frame, &[], &[11], false, "two halves of equal words");
+    frame[11 * WPP..12 * WPP].rotate_left(512);
+    step(&frame, &[], &[11], false, "the halves exchanged");
+
+    let kept = frame[2 * WPP + 300];
+    frame[2 * WPP + 300] = !kept;
+    step(&frame, &[], &[2], false, "a page changed");
+    frame[2 * WPP + 300] = kept;
+    step(&frame, &[], &[2], false, "and changed back");
+
+    // One mapping across modes: each payment refreshes only the records it ran.
+    let m = 7204u32;
+    let bytes = bytes_of(&frame);
+    let mixed = |mode: PayHash, full: bool, label: &str| {
+        let (p, got_full) = pay(mode, m, &bytes, &[], label);
+        assert_eq!(got_full, full, "{label}");
+        assert_eq!(p, if full { all.clone() } else { Vec::new() }, "{label}");
+    };
+    mixed(PayHash::On, true, "a new shadow, by hash");
+    mixed(PayHash::On, false, "the hash record stands");
+    mixed(PayHash::Off, true, "prev was never recorded");
+    mixed(PayHash::On, true, "the prev payment left the hashes behind");
+    mixed(PayHash::Verify, true, "the hash payment left prev behind");
+    mixed(PayHash::Verify, false, "both records stand");
+    mixed(PayHash::On, false, "the hashes stand after verify");
+    mixed(PayHash::Off, true, "prev fell behind the hash payment");
+
+    let (compared, missed, extra) = engine::pay_hash_verify_totals();
+    assert!(compared > compared0, "verify compared pages");
+    assert_eq!(
+        missed - missed0,
+        0,
+        "no page the prev compare lands is missed"
+    );
+    assert_eq!(
+        extra - extra0,
+        0,
+        "no page the prev compare skips is landed"
+    );
+}
