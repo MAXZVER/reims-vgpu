@@ -21,6 +21,10 @@
 //! seeds `prev` from it.
 //!
 //! Default on; `REIMS_VGPU_PAY_DIFF=off` pays whole frames instead.
+//!
+//! TEMP (lab): `REIMS_VGPU_LAB_PAY_HASH=on` keeps a 64-bit hash per page in
+//! place of `prev` and compares that, reading half the bytes (see [`PayHash`]);
+//! `=verify` runs both compares and counts where they disagree.
 
 use ash::vk;
 use std::collections::HashMap;
@@ -257,6 +261,158 @@ pub(crate) const PAGE_DIFF_IMAGE_SPIRV: [u32; 703] = [
     0x00000062, 0x000200f9, 0x00000037, 0x000200f8, 0x00000037, 0x000100fd, 0x00010038,
 ];
 
+/// `shaders/page_diff_hash.spvasm` (assembled the same way): the image kernel
+/// comparing a 64-bit hash per page instead of the full-frame `prev`, and
+/// writing a changed page to `out` straight from the image. TEMP (lab,
+/// [`pay_hash_mode`]).
+pub(crate) const PAGE_DIFF_HASH_SPIRV: [u32; 1155] = [
+    0x07230203, 0x00010000, 0x00070000, 0x000000cc, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0007000f, 0x00000005, 0x00000002, 0x6e69616d, 0x00000000, 0x00000003, 0x00000004, 0x00060010,
+    0x00000002, 0x00000011, 0x00000100, 0x00000001, 0x00000001, 0x00040047, 0x00000003, 0x0000000b,
+    0x0000001a, 0x00040047, 0x00000004, 0x0000000b, 0x0000001b, 0x00040047, 0x00000005, 0x00000006,
+    0x00000004, 0x00050048, 0x00000006, 0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x00000006,
+    0x00000003, 0x00040047, 0x00000007, 0x00000022, 0x00000000, 0x00040047, 0x00000007, 0x00000021,
+    0x00000000, 0x00040047, 0x00000008, 0x00000022, 0x00000000, 0x00040047, 0x00000008, 0x00000021,
+    0x00000001, 0x00040047, 0x00000009, 0x00000022, 0x00000000, 0x00040047, 0x00000009, 0x00000021,
+    0x00000002, 0x00040047, 0x0000000a, 0x00000022, 0x00000000, 0x00040047, 0x0000000a, 0x00000021,
+    0x00000003, 0x00030047, 0x0000000a, 0x00000019, 0x00050048, 0x0000000b, 0x00000000, 0x00000023,
+    0x00000000, 0x00050048, 0x0000000b, 0x00000001, 0x00000023, 0x00000004, 0x00050048, 0x0000000b,
+    0x00000002, 0x00000023, 0x00000008, 0x00050048, 0x0000000b, 0x00000003, 0x00000023, 0x0000000c,
+    0x00030047, 0x0000000b, 0x00000002, 0x00020013, 0x0000000c, 0x00030021, 0x0000000d, 0x0000000c,
+    0x00040015, 0x0000000e, 0x00000020, 0x00000000, 0x00040015, 0x0000000f, 0x00000020, 0x00000001,
+    0x00030016, 0x00000010, 0x00000020, 0x00020014, 0x00000011, 0x00040017, 0x00000012, 0x0000000e,
+    0x00000003, 0x00040017, 0x00000013, 0x0000000f, 0x00000002, 0x00040017, 0x00000014, 0x00000010,
+    0x00000004, 0x00040020, 0x00000015, 0x00000001, 0x00000012, 0x0004003b, 0x00000015, 0x00000003,
+    0x00000001, 0x0004003b, 0x00000015, 0x00000004, 0x00000001, 0x00090019, 0x00000016, 0x00000010,
+    0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00040020, 0x00000017,
+    0x00000000, 0x00000016, 0x0004003b, 0x00000017, 0x00000007, 0x00000000, 0x0003001d, 0x00000005,
+    0x0000000e, 0x0003001e, 0x00000006, 0x00000005, 0x00040020, 0x00000018, 0x00000002, 0x00000006,
+    0x0004003b, 0x00000018, 0x00000008, 0x00000002, 0x0004003b, 0x00000018, 0x00000009, 0x00000002,
+    0x0004003b, 0x00000018, 0x0000000a, 0x00000002, 0x0006001e, 0x0000000b, 0x0000000e, 0x0000000e,
+    0x0000000e, 0x0000000e, 0x00040020, 0x00000019, 0x00000009, 0x0000000b, 0x0004003b, 0x00000019,
+    0x0000001a, 0x00000009, 0x00040020, 0x0000001b, 0x00000009, 0x0000000e, 0x00040020, 0x0000001c,
+    0x00000002, 0x0000000e, 0x00040020, 0x0000001d, 0x00000004, 0x0000000e, 0x0004002b, 0x0000000e,
+    0x0000001e, 0x00000100, 0x0004001c, 0x0000001f, 0x0000000e, 0x0000001e, 0x00040020, 0x00000020,
+    0x00000004, 0x0000001f, 0x0004003b, 0x00000020, 0x00000021, 0x00000004, 0x0004003b, 0x00000020,
+    0x00000022, 0x00000004, 0x0004003b, 0x0000001d, 0x00000023, 0x00000004, 0x0004002b, 0x0000000f,
+    0x00000024, 0x00000000, 0x0004002b, 0x0000000f, 0x00000025, 0x00000001, 0x0004002b, 0x0000000f,
+    0x00000026, 0x00000002, 0x0004002b, 0x0000000f, 0x00000027, 0x00000003, 0x0004002b, 0x0000000e,
+    0x00000028, 0x00000000, 0x0004002b, 0x0000000e, 0x00000029, 0x00000001, 0x0004002b, 0x0000000e,
+    0x0000002a, 0x00000002, 0x0004002b, 0x0000000e, 0x0000002b, 0x0000000d, 0x0004002b, 0x0000000e,
+    0x0000002c, 0x0000000f, 0x0004002b, 0x0000000e, 0x0000002d, 0x00000010, 0x0004002b, 0x0000000e,
+    0x0000002e, 0x00000108, 0x0004002b, 0x0000000e, 0x0000002f, 0x9e3779b9, 0x0004002b, 0x0000000e,
+    0x00000030, 0x85ebca6b, 0x0004002b, 0x0000000e, 0x00000031, 0xc2b2ae35, 0x0004002b, 0x0000000e,
+    0x00000032, 0x632be5ab, 0x0004002b, 0x0000000e, 0x00000033, 0x1b873593, 0x0004002b, 0x0000000e,
+    0x00000034, 0x7feb352d, 0x0004002b, 0x0000000e, 0x00000035, 0x846ca68b, 0x00050036, 0x0000000c,
+    0x00000002, 0x00000000, 0x0000000d, 0x000200f8, 0x00000036, 0x0004003d, 0x00000012, 0x00000037,
+    0x00000003, 0x00050051, 0x0000000e, 0x00000038, 0x00000037, 0x00000000, 0x0004003d, 0x00000012,
+    0x00000039, 0x00000004, 0x00050051, 0x0000000e, 0x0000003a, 0x00000039, 0x00000000, 0x00050041,
+    0x0000001b, 0x0000003b, 0x0000001a, 0x00000024, 0x0004003d, 0x0000000e, 0x0000003c, 0x0000003b,
+    0x00050041, 0x0000001b, 0x0000003d, 0x0000001a, 0x00000025, 0x0004003d, 0x0000000e, 0x0000003e,
+    0x0000003d, 0x00050041, 0x0000001b, 0x0000003f, 0x0000001a, 0x00000026, 0x0004003d, 0x0000000e,
+    0x00000040, 0x0000003f, 0x00050041, 0x0000001b, 0x00000041, 0x0000001a, 0x00000027, 0x0004003d,
+    0x0000000e, 0x00000042, 0x00000041, 0x000500ae, 0x00000011, 0x00000043, 0x00000038, 0x0000003c,
+    0x000300f7, 0x00000044, 0x00000000, 0x000400fa, 0x00000043, 0x00000044, 0x00000045, 0x000200f8,
+    0x00000045, 0x00050084, 0x0000000e, 0x00000046, 0x00000038, 0x0000003e, 0x000500aa, 0x00000011,
+    0x00000047, 0x0000003a, 0x00000028, 0x000200f9, 0x00000048, 0x000200f8, 0x00000048, 0x000700f5,
+    0x0000000e, 0x00000049, 0x0000003a, 0x00000045, 0x0000004a, 0x0000004b, 0x000700f5, 0x0000000e,
+    0x0000004c, 0x00000028, 0x00000045, 0x0000004d, 0x0000004b, 0x000700f5, 0x0000000e, 0x0000004e,
+    0x00000028, 0x00000045, 0x0000004f, 0x0000004b, 0x000400f6, 0x00000050, 0x0000004b, 0x00000000,
+    0x000200f9, 0x00000051, 0x000200f8, 0x00000051, 0x000500b0, 0x00000011, 0x00000052, 0x00000049,
+    0x0000003e, 0x000400fa, 0x00000052, 0x00000053, 0x00000050, 0x000200f8, 0x00000053, 0x00050080,
+    0x0000000e, 0x00000054, 0x00000046, 0x00000049, 0x000500b0, 0x00000011, 0x00000055, 0x00000054,
+    0x00000042, 0x000300f7, 0x00000056, 0x00000000, 0x000400fa, 0x00000055, 0x00000057, 0x00000056,
+    0x000200f8, 0x00000057, 0x00050089, 0x0000000e, 0x00000058, 0x00000054, 0x00000040, 0x00050086,
+    0x0000000e, 0x00000059, 0x00000054, 0x00000040, 0x0004007c, 0x0000000f, 0x0000005a, 0x00000058,
+    0x0004007c, 0x0000000f, 0x0000005b, 0x00000059, 0x00050050, 0x00000013, 0x0000005c, 0x0000005a,
+    0x0000005b, 0x0004003d, 0x00000016, 0x0000005d, 0x00000007, 0x0007005f, 0x00000014, 0x0000005e,
+    0x0000005d, 0x0000005c, 0x00000002, 0x00000024, 0x0009004f, 0x00000014, 0x0000005f, 0x0000005e,
+    0x0000005e, 0x00000002, 0x00000001, 0x00000000, 0x00000003, 0x0006000c, 0x0000000e, 0x00000060,
+    0x00000001, 0x00000037, 0x0000005f, 0x00050084, 0x0000000e, 0x00000061, 0x00000049, 0x0000002f,
+    0x000500c6, 0x0000000e, 0x00000062, 0x00000060, 0x00000061, 0x000500c2, 0x0000000e, 0x00000063,
+    0x00000062, 0x0000002d, 0x000500c6, 0x0000000e, 0x00000064, 0x00000062, 0x00000063, 0x00050084,
+    0x0000000e, 0x00000065, 0x00000064, 0x00000030, 0x000500c2, 0x0000000e, 0x00000066, 0x00000065,
+    0x0000002b, 0x000500c6, 0x0000000e, 0x00000067, 0x00000065, 0x00000066, 0x00050084, 0x0000000e,
+    0x00000068, 0x00000067, 0x00000031, 0x000500c2, 0x0000000e, 0x00000069, 0x00000068, 0x0000002d,
+    0x000500c6, 0x0000000e, 0x0000006a, 0x00000068, 0x00000069, 0x00050080, 0x0000000e, 0x0000006b,
+    0x0000004c, 0x0000006a, 0x00050084, 0x0000000e, 0x0000006c, 0x00000049, 0x00000032, 0x00050080,
+    0x0000000e, 0x0000006d, 0x0000006c, 0x00000033, 0x00050080, 0x0000000e, 0x0000006e, 0x00000060,
+    0x0000006d, 0x000500c2, 0x0000000e, 0x0000006f, 0x0000006e, 0x0000002d, 0x000500c6, 0x0000000e,
+    0x00000070, 0x0000006e, 0x0000006f, 0x00050084, 0x0000000e, 0x00000071, 0x00000070, 0x00000034,
+    0x000500c2, 0x0000000e, 0x00000072, 0x00000071, 0x0000002c, 0x000500c6, 0x0000000e, 0x00000073,
+    0x00000071, 0x00000072, 0x00050084, 0x0000000e, 0x00000074, 0x00000073, 0x00000035, 0x000500c2,
+    0x0000000e, 0x00000075, 0x00000074, 0x0000002d, 0x000500c6, 0x0000000e, 0x00000076, 0x00000074,
+    0x00000075, 0x000500c6, 0x0000000e, 0x00000077, 0x0000004e, 0x00000076, 0x000200f9, 0x00000056,
+    0x000200f8, 0x00000056, 0x000700f5, 0x0000000e, 0x0000004d, 0x0000004c, 0x00000053, 0x0000006b,
+    0x00000057, 0x000700f5, 0x0000000e, 0x0000004f, 0x0000004e, 0x00000053, 0x00000077, 0x00000057,
+    0x000200f9, 0x0000004b, 0x000200f8, 0x0000004b, 0x00050080, 0x0000000e, 0x0000004a, 0x00000049,
+    0x0000001e, 0x000200f9, 0x00000048, 0x000200f8, 0x00000050, 0x00050041, 0x0000001d, 0x00000078,
+    0x00000021, 0x0000003a, 0x0003003e, 0x00000078, 0x0000004c, 0x00050041, 0x0000001d, 0x00000079,
+    0x00000022, 0x0000003a, 0x0003003e, 0x00000079, 0x0000004e, 0x000400e0, 0x0000002a, 0x0000002a,
+    0x0000002e, 0x000500b0, 0x00000011, 0x0000007a, 0x0000003a, 0x0000002d, 0x000300f7, 0x0000007b,
+    0x00000000, 0x000400fa, 0x0000007a, 0x0000007c, 0x0000007b, 0x000200f8, 0x0000007c, 0x000200f9,
+    0x0000007d, 0x000200f8, 0x0000007d, 0x000700f5, 0x0000000e, 0x0000007e, 0x0000003a, 0x0000007c,
+    0x0000007f, 0x00000080, 0x000700f5, 0x0000000e, 0x00000081, 0x00000028, 0x0000007c, 0x00000082,
+    0x00000080, 0x000700f5, 0x0000000e, 0x00000083, 0x00000028, 0x0000007c, 0x00000084, 0x00000080,
+    0x000400f6, 0x00000085, 0x00000080, 0x00000000, 0x000200f9, 0x00000086, 0x000200f8, 0x00000086,
+    0x000500b0, 0x00000011, 0x00000087, 0x0000007e, 0x0000001e, 0x000400fa, 0x00000087, 0x00000088,
+    0x00000085, 0x000200f8, 0x00000088, 0x00050041, 0x0000001d, 0x00000089, 0x00000021, 0x0000007e,
+    0x0004003d, 0x0000000e, 0x0000008a, 0x00000089, 0x00050080, 0x0000000e, 0x00000082, 0x00000081,
+    0x0000008a, 0x00050041, 0x0000001d, 0x0000008b, 0x00000022, 0x0000007e, 0x0004003d, 0x0000000e,
+    0x0000008c, 0x0000008b, 0x000500c6, 0x0000000e, 0x00000084, 0x00000083, 0x0000008c, 0x000200f9,
+    0x00000080, 0x000200f8, 0x00000080, 0x00050080, 0x0000000e, 0x0000007f, 0x0000007e, 0x0000002d,
+    0x000200f9, 0x0000007d, 0x000200f8, 0x00000085, 0x0003003e, 0x00000078, 0x00000081, 0x0003003e,
+    0x00000079, 0x00000083, 0x000200f9, 0x0000007b, 0x000200f8, 0x0000007b, 0x000400e0, 0x0000002a,
+    0x0000002a, 0x0000002e, 0x000300f7, 0x0000008d, 0x00000000, 0x000400fa, 0x00000047, 0x0000008e,
+    0x0000008d, 0x000200f8, 0x0000008e, 0x000200f9, 0x0000008f, 0x000200f8, 0x0000008f, 0x000700f5,
+    0x0000000e, 0x00000090, 0x00000028, 0x0000008e, 0x00000091, 0x00000092, 0x000700f5, 0x0000000e,
+    0x00000093, 0x00000028, 0x0000008e, 0x00000094, 0x00000092, 0x000700f5, 0x0000000e, 0x00000095,
+    0x00000028, 0x0000008e, 0x00000096, 0x00000092, 0x000400f6, 0x00000097, 0x00000092, 0x00000000,
+    0x000200f9, 0x00000098, 0x000200f8, 0x00000098, 0x000500b0, 0x00000011, 0x00000099, 0x00000090,
+    0x0000002d, 0x000400fa, 0x00000099, 0x0000009a, 0x00000097, 0x000200f8, 0x0000009a, 0x00050041,
+    0x0000001d, 0x0000009b, 0x00000021, 0x00000090, 0x0004003d, 0x0000000e, 0x0000009c, 0x0000009b,
+    0x00050080, 0x0000000e, 0x00000094, 0x00000093, 0x0000009c, 0x00050041, 0x0000001d, 0x0000009d,
+    0x00000022, 0x00000090, 0x0004003d, 0x0000000e, 0x0000009e, 0x0000009d, 0x000500c6, 0x0000000e,
+    0x00000096, 0x00000095, 0x0000009e, 0x000200f9, 0x00000092, 0x000200f8, 0x00000092, 0x00050080,
+    0x0000000e, 0x00000091, 0x00000090, 0x00000029, 0x000200f9, 0x0000008f, 0x000200f8, 0x00000097,
+    0x00060041, 0x0000001c, 0x0000009f, 0x00000009, 0x00000024, 0x00000038, 0x0004003d, 0x0000000e,
+    0x000000a0, 0x0000009f, 0x000500ab, 0x00000011, 0x000000a1, 0x000000a0, 0x00000028, 0x00050084,
+    0x0000000e, 0x000000a2, 0x00000038, 0x0000002a, 0x00050080, 0x0000000e, 0x000000a3, 0x000000a2,
+    0x00000029, 0x00060041, 0x0000001c, 0x000000a4, 0x00000008, 0x00000024, 0x000000a2, 0x00060041,
+    0x0000001c, 0x000000a5, 0x00000008, 0x00000024, 0x000000a3, 0x0004003d, 0x0000000e, 0x000000a6,
+    0x000000a4, 0x0004003d, 0x0000000e, 0x000000a7, 0x000000a5, 0x000500ab, 0x00000011, 0x000000a8,
+    0x000000a6, 0x00000093, 0x000500ab, 0x00000011, 0x000000a9, 0x000000a7, 0x00000095, 0x000500a6,
+    0x00000011, 0x000000aa, 0x000000a8, 0x000000a9, 0x000500a6, 0x00000011, 0x000000ab, 0x000000a1,
+    0x000000aa, 0x000300f7, 0x000000ac, 0x00000000, 0x000400fa, 0x000000ab, 0x000000ad, 0x000000ac,
+    0x000200f8, 0x000000ad, 0x0003003e, 0x000000a4, 0x00000093, 0x0003003e, 0x000000a5, 0x00000095,
+    0x000200f9, 0x000000ac, 0x000200f8, 0x000000ac, 0x000600a9, 0x0000000e, 0x000000ae, 0x000000ab,
+    0x00000029, 0x00000028, 0x0003003e, 0x00000023, 0x000000ae, 0x000200f9, 0x0000008d, 0x000200f8,
+    0x0000008d, 0x000400e0, 0x0000002a, 0x0000002a, 0x0000002e, 0x0004003d, 0x0000000e, 0x000000af,
+    0x00000023, 0x000500ab, 0x00000011, 0x000000b0, 0x000000af, 0x00000028, 0x000300f7, 0x000000b1,
+    0x00000000, 0x000400fa, 0x000000b0, 0x000000b2, 0x000000b1, 0x000200f8, 0x000000b2, 0x000200f9,
+    0x000000b3, 0x000200f8, 0x000000b3, 0x000700f5, 0x0000000e, 0x000000b4, 0x0000003a, 0x000000b2,
+    0x000000b5, 0x000000b6, 0x000400f6, 0x000000b7, 0x000000b6, 0x00000000, 0x000200f9, 0x000000b8,
+    0x000200f8, 0x000000b8, 0x000500b0, 0x00000011, 0x000000b9, 0x000000b4, 0x0000003e, 0x000400fa,
+    0x000000b9, 0x000000ba, 0x000000b7, 0x000200f8, 0x000000ba, 0x00050080, 0x0000000e, 0x000000bb,
+    0x00000046, 0x000000b4, 0x000500b0, 0x00000011, 0x000000bc, 0x000000bb, 0x00000042, 0x000300f7,
+    0x000000bd, 0x00000000, 0x000400fa, 0x000000bc, 0x000000be, 0x000000bd, 0x000200f8, 0x000000be,
+    0x00050089, 0x0000000e, 0x000000bf, 0x000000bb, 0x00000040, 0x00050086, 0x0000000e, 0x000000c0,
+    0x000000bb, 0x00000040, 0x0004007c, 0x0000000f, 0x000000c1, 0x000000bf, 0x0004007c, 0x0000000f,
+    0x000000c2, 0x000000c0, 0x00050050, 0x00000013, 0x000000c3, 0x000000c1, 0x000000c2, 0x0004003d,
+    0x00000016, 0x000000c4, 0x00000007, 0x0007005f, 0x00000014, 0x000000c5, 0x000000c4, 0x000000c3,
+    0x00000002, 0x00000024, 0x0009004f, 0x00000014, 0x000000c6, 0x000000c5, 0x000000c5, 0x00000002,
+    0x00000001, 0x00000000, 0x00000003, 0x0006000c, 0x0000000e, 0x000000c7, 0x00000001, 0x00000037,
+    0x000000c6, 0x00060041, 0x0000001c, 0x000000c8, 0x0000000a, 0x00000024, 0x000000bb, 0x0003003e,
+    0x000000c8, 0x000000c7, 0x000200f9, 0x000000bd, 0x000200f8, 0x000000bd, 0x000200f9, 0x000000b6,
+    0x000200f8, 0x000000b6, 0x00050080, 0x0000000e, 0x000000b5, 0x000000b4, 0x0000001e, 0x000200f9,
+    0x000000b3, 0x000200f8, 0x000000b7, 0x000300f7, 0x000000c9, 0x00000000, 0x000400fa, 0x00000047,
+    0x000000ca, 0x000000c9, 0x000200f8, 0x000000ca, 0x00060041, 0x0000001c, 0x000000cb, 0x00000009,
+    0x00000024, 0x00000038, 0x0003003e, 0x000000cb, 0x00000029, 0x000200f9, 0x000000c9, 0x000200f8,
+    0x000000c9, 0x000200f9, 0x000000b1, 0x000200f8, 0x000000b1, 0x000200f9, 0x00000044, 0x000200f8,
+    0x00000044, 0x000100fd, 0x00010038,
+];
+
 /// TEMP (lab): `REIMS_VGPU_LAB_PAY_IMAGE=off` takes the frame copy again (the
 /// two-trip or one-trip compare over a buffer). On by default. Latched.
 pub(crate) fn image_enabled() -> bool {
@@ -378,6 +534,266 @@ pub(crate) fn pay_band_mode() -> super::pay_band::PayBandMode {
         crate::observe::off(format!("pay_band mode={mode:?}"));
         mode
     })
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_HASH` — which compare a payment of a packed
+/// BGRA8 UNORM resident runs.
+///
+/// The image kernel reads the frame and the full-frame `prev` shadow (~88 MB a
+/// 5K payment) and is bandwidth-bound; the hash kernel
+/// (`shaders/page_diff_hash.spvasm`) reads the frame and a 64-bit hash per page
+/// (~44 MB + 115 KB) and writes a changed page to `out` from the image, so it
+/// needs no `prev`. Its exactness bound (a missed page needs a 64-bit
+/// collision, ~2^-64 per changed page; a one-word change is always seen) is
+/// argued in the shader's header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayHash {
+    /// Unset or `off`: the `prev` compare, exactly as without this switch.
+    Off,
+    /// `on`: the hash compare in place of the `prev` one.
+    On,
+    /// `verify`: both, landing the union of what they flag and counting the
+    /// pages one flags and the other does not (`pay_hash_verify_missed`: the
+    /// `prev` compare's page the hash one missed, must stay 0;
+    /// `pay_hash_verify_extra`: the reverse).
+    Verify,
+}
+
+/// The mode a `REIMS_VGPU_LAB_PAY_HASH` value asks for: only `on` and `verify`
+/// turn anything on, so a typo leaves the established compare in place.
+fn parse_pay_hash(raw: Option<&str>) -> PayHash {
+    match raw.map(str::trim) {
+        Some("on") => PayHash::On,
+        Some("verify") => PayHash::Verify,
+        _ => PayHash::Off,
+    }
+}
+
+thread_local! {
+    /// [`with_pay_hash`]'s answer on this thread, ahead of the environment.
+    static PAY_HASH_OVERRIDE: std::cell::Cell<Option<PayHash>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// TEMP (lab): the [`PayHash`] mode, latched from the environment for the
+/// process unless [`with_pay_hash`] is answering on this thread.
+pub(crate) fn pay_hash_mode() -> PayHash {
+    if let Some(mode) = PAY_HASH_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<PayHash> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = parse_pay_hash(std::env::var("REIMS_VGPU_LAB_PAY_HASH").ok().as_deref());
+        crate::observe::off(format!("pay_hash mode={mode:?}"));
+        mode
+    })
+}
+
+/// TEMP (lab, tests): run `f` with `pay_hash_mode` answering `mode` on this
+/// thread — a payment runs on its caller's thread, so a suite can pay one
+/// resident through each compare in one process.
+pub fn with_pay_hash<R>(mode: PayHash, f: impl FnOnce() -> R) -> R {
+    let before = PAY_HASH_OVERRIDE.with(|c| c.replace(Some(mode)));
+    let out = f();
+    PAY_HASH_OVERRIDE.with(|c| c.set(before));
+    out
+}
+
+/// The running totals behind [`pay_hash_verify_totals`]. The census carries
+/// the same counts per second; this total is for a suite to read back.
+static VERIFY_TOTALS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// TEMP (lab): what `verify` payments found since the process started —
+/// `(compared, missed, extra)` pages.
+pub fn pay_hash_verify_totals() -> (u64, u64, u64) {
+    let get = |i: usize| VERIFY_TOTALS[i].load(std::sync::atomic::Ordering::Relaxed);
+    (get(0), get(1), get(2))
+}
+
+/// The marks a one-trip kernel starts from: every page when its record stands
+/// for nothing (the kernel then lands and records all of them), otherwise the
+/// pages the caller must land whatever the compare says.
+pub(crate) fn prefill_marks(marks: &mut [u32], force: &[u32], every_page: bool) {
+    if every_page {
+        marks.fill(1);
+        return;
+    }
+    marks.fill(0);
+    for &p in force {
+        if let Some(slot) = marks.get_mut(p as usize) {
+            *slot = 1;
+        }
+    }
+}
+
+/// The pages a compare answered, ascending: those its kernel flagged, those the
+/// second compare of a `verify` payment flagged, and the forced ones (which a
+/// two-trip kernel does not flag itself). Landing a page that did not change
+/// writes the bytes the guest already holds, so the union is always lawful.
+pub(crate) fn landed_pages(flags: &[u32], second: Option<&[u32]>, force: &[u32]) -> Vec<u32> {
+    (0..flags.len() as u32)
+        .filter(|&p| {
+            flags[p as usize] != 0
+                || second.is_some_and(|s| s.get(p as usize).is_some_and(|&f| f != 0))
+                || force.binary_search(&p).is_ok()
+        })
+        .collect()
+}
+
+/// A `verify` payment's disagreement, each side taken as the set it would land
+/// alone: `prev` (its flags plus the forced pages) against `hash` (its flags,
+/// which carry the forced marks). `(missed, extra)`: pages only the `prev`
+/// compare lands, and pages only the hash compare lands.
+pub(crate) fn verify_disagreement(prev: &[u32], hash: &[u32], force: &[u32]) -> (u64, u64) {
+    let (mut missed, mut extra) = (0u64, 0u64);
+    for (p, (&pf, &hf)) in prev.iter().zip(hash).enumerate() {
+        let by_prev = pf != 0 || force.binary_search(&(p as u32)).is_ok();
+        let by_hash = hf != 0;
+        missed += u64::from(by_prev && !by_hash);
+        extra += u64::from(by_hash && !by_prev);
+    }
+    (missed, extra)
+}
+
+/// Count a `verify` payment's comparison into the census and [`VERIFY_TOTALS`].
+pub(crate) fn note_verify(pages: u64, missed: u64, extra: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    VERIFY_TOTALS[0].fetch_add(pages, Relaxed);
+    VERIFY_TOTALS[1].fetch_add(missed, Relaxed);
+    VERIFY_TOTALS[2].fetch_add(extra, Relaxed);
+    crate::runtime::drain::note_store_route_n("pay_hash_verify_pages", pages);
+    crate::runtime::drain::note_store_route_n("pay_hash_verify_missed", missed);
+    crate::runtime::drain::note_store_route_n("pay_hash_verify_extra", extra);
+}
+
+#[cfg(test)]
+mod pay_hash_tests {
+    use super::*;
+
+    #[test]
+    fn only_on_and_verify_turn_the_hash_compare_on() {
+        assert_eq!(parse_pay_hash(None), PayHash::Off);
+        assert_eq!(parse_pay_hash(Some("off")), PayHash::Off);
+        assert_eq!(parse_pay_hash(Some("1")), PayHash::Off);
+        assert_eq!(parse_pay_hash(Some(" on ")), PayHash::On);
+        assert_eq!(parse_pay_hash(Some("verify")), PayHash::Verify);
+    }
+
+    #[test]
+    fn the_override_answers_on_its_own_thread_and_unwinds() {
+        let outer = pay_hash_mode();
+        with_pay_hash(PayHash::Verify, || {
+            assert_eq!(pay_hash_mode(), PayHash::Verify);
+            with_pay_hash(PayHash::On, || assert_eq!(pay_hash_mode(), PayHash::On));
+            assert_eq!(pay_hash_mode(), PayHash::Verify);
+            let other = std::thread::spawn(pay_hash_mode).join().unwrap();
+            assert_eq!(other, outer, "another thread reads the latched mode");
+        });
+        assert_eq!(pay_hash_mode(), outer);
+    }
+
+    #[test]
+    fn marks_start_from_every_page_or_exactly_the_forced_ones() {
+        let mut m = [7u32; 6];
+        prefill_marks(&mut m, &[1, 4, 99], false);
+        assert_eq!(m, [0, 1, 0, 0, 1, 0], "an out-of-range force is ignored");
+        prefill_marks(&mut m, &[2], true);
+        assert_eq!(m, [1; 6]);
+    }
+
+    #[test]
+    fn the_landed_set_is_the_union_of_both_compares_and_the_forced_pages() {
+        let flags = [0, 1, 0, 0, 1, 0];
+        assert_eq!(landed_pages(&flags, None, &[]), vec![1, 4]);
+        assert_eq!(landed_pages(&flags, None, &[0, 4]), vec![0, 1, 4]);
+        let second = [0, 0, 0, 1, 1, 0];
+        assert_eq!(landed_pages(&flags, Some(&second), &[5]), vec![1, 3, 4, 5]);
+    }
+
+    #[test]
+    fn verify_counts_each_side_with_its_forced_pages() {
+        // Page 0 forced: a two-trip prev compare leaves it unflagged, the hash
+        // kernel flags it — both land it, so no disagreement. Page 2 only the
+        // prev compare lands (missed), page 4 only the hash one (extra).
+        let prev = [0, 1, 1, 0, 0];
+        let hash = [1, 1, 0, 0, 1];
+        assert_eq!(verify_disagreement(&prev, &hash, &[0]), (1, 1));
+        assert_eq!(verify_disagreement(&prev, &prev, &[]), (0, 0));
+    }
+
+    /// The shader's page hash, word for word: the oracle these properties are
+    /// stated against (the GPU parity suite checks the kernel lands what the
+    /// `prev` compare lands).
+    fn page_hash(words: &[u32]) -> (u32, u32) {
+        let (mut a, mut b) = (0u32, 0u32);
+        for (i, &c) in words.iter().enumerate() {
+            let i = i as u32;
+            let mut x = c ^ i.wrapping_mul(0x9E37_79B9);
+            x ^= x >> 16;
+            x = x.wrapping_mul(0x85EB_CA6B);
+            x ^= x >> 13;
+            x = x.wrapping_mul(0xC2B2_AE35);
+            x ^= x >> 16;
+            a = a.wrapping_add(x);
+            let mut y = c.wrapping_add(i.wrapping_mul(0x632B_E5AB).wrapping_add(0x1B87_3593));
+            y ^= y >> 16;
+            y = y.wrapping_mul(0x7FEB_352D);
+            y ^= y >> 15;
+            y = y.wrapping_mul(0x846C_A68B);
+            y ^= y >> 16;
+            b ^= y;
+        }
+        (a, b)
+    }
+
+    fn page(seed: u32) -> Vec<u32> {
+        let mut s = seed;
+        (0..WORDS_PER_PAGE)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                s
+            })
+            .collect()
+    }
+
+    #[test]
+    fn any_one_word_change_moves_both_lanes() {
+        let base = page(1);
+        let h = page_hash(&base);
+        for (i, delta) in [
+            (0usize, 1u32),
+            (511, 0x8000_0000),
+            (1023, 0xFFFF_FFFF),
+            (77, 0x0100),
+        ] {
+            let mut p = base.clone();
+            p[i] ^= delta;
+            let g = page_hash(&p);
+            assert!(g.0 != h.0 && g.1 != h.1, "word {i} ^ {delta:#x}");
+        }
+    }
+
+    #[test]
+    fn a_permutation_of_words_changes_the_hash() {
+        let base = page(2);
+        let h = page_hash(&base);
+        let mut swapped = base.clone();
+        swapped.swap(3, 900);
+        assert_ne!(page_hash(&swapped), h, "two words swapped");
+        let mut rows = base.clone();
+        rows[..512].rotate_left(64);
+        assert_ne!(page_hash(&rows), h, "rows rotated inside the page");
+        // Two halves of equal words exchanged: the multiset is unchanged.
+        let mut halves = vec![0x1122_3344u32; 512];
+        halves.extend(vec![0xAABB_CCDDu32; 512]);
+        let mut flipped = halves.clone();
+        flipped.rotate_left(512);
+        assert_ne!(page_hash(&flipped), page_hash(&halves));
+    }
 }
 
 /// A buffer this module owns outright: its own `vkAllocateMemory`, alive across
@@ -514,6 +930,20 @@ impl OwnedBuffer {
     }
 }
 
+/// Which compare kernel a [`DiffPipeline`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kernel {
+    /// `page_diff.spvasm`: flags only; a second trip copies the pages.
+    TwoTrip,
+    /// `page_diff_one_trip.spvasm`: flags and copies, over a buffer copy.
+    OneTrip,
+    /// `page_diff_image.spvasm`: the one-trip compare reading the image.
+    Image,
+    /// `page_diff_hash.spvasm` (TEMP lab): the image compare against a hash
+    /// per page; same bindings and push block as [`Kernel::Image`].
+    Hash,
+}
+
 /// The compare kernel, its layout and the one descriptor set it is dispatched
 /// with: payments run one at a time under the engine lock and wait for their
 /// fence, so a single set is never in use twice.
@@ -534,19 +964,18 @@ impl DiffPipeline {
     /// unchanged).
     unsafe fn create(
         ctx: &DeviceContext,
-        one_trip: bool,
-        image: bool,
+        kernel: Kernel,
         dispatch_base: bool,
     ) -> Result<Self, DrawError> {
         let device = &ctx.device;
-        let code: &[u32] = if image {
-            &PAGE_DIFF_IMAGE_SPIRV
-        } else if one_trip {
-            &PAGE_DIFF_ONE_TRIP_SPIRV
-        } else {
-            &PAGE_DIFF_SPIRV
+        let code: &[u32] = match kernel {
+            Kernel::TwoTrip => &PAGE_DIFF_SPIRV,
+            Kernel::OneTrip => &PAGE_DIFF_ONE_TRIP_SPIRV,
+            Kernel::Image => &PAGE_DIFF_IMAGE_SPIRV,
+            Kernel::Hash => &PAGE_DIFF_HASH_SPIRV,
         };
-        let one_trip = one_trip || image;
+        let image = matches!(kernel, Kernel::Image | Kernel::Hash);
+        let one_trip = kernel != Kernel::TwoTrip;
         let module = unsafe {
             device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None)
         }
@@ -637,12 +1066,15 @@ impl DiffPipeline {
     }
 
     /// Point the image kernel's set at this payment's resident view (sampled in
-    /// `GENERAL`) and buffers.
+    /// `GENERAL`) and buffers. `record` is what the kernel compares against —
+    /// the `prev` frame, or the hash kernel's `hash` words — `record_bytes` long.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn write_set_image(
         &self,
         device: &ash::Device,
         view: vk::ImageView,
-        prev: &OwnedBuffer,
+        record: &OwnedBuffer,
+        record_bytes: u64,
         flags: &OwnedBuffer,
         out: &OwnedBuffer,
         frame: u64,
@@ -653,9 +1085,9 @@ impl DiffPipeline {
             .image_layout(vk::ImageLayout::GENERAL)];
         let bufs = [
             vk::DescriptorBufferInfo::default()
-                .buffer(prev.buffer)
+                .buffer(record.buffer)
                 .offset(0)
-                .range(frame),
+                .range(record_bytes),
             vk::DescriptorBufferInfo::default()
                 .buffer(flags.buffer)
                 .offset(0)
@@ -737,6 +1169,25 @@ pub(crate) struct Shadow {
     /// shadow is born unpaid, so a band can only be read against a shadow it
     /// was kept for.
     pub pay_epoch: u64,
+    /// TEMP (lab, [`PayHash`]): two hash words per page, device-local, made on
+    /// the first hash payment of this shadow.
+    pub hashes: Option<OwnedBuffer>,
+    /// Which records stand for the frame the guest pages were last written
+    /// from. A new shadow (its key moved, or `page_diff_forget`) starts with
+    /// neither.
+    pub basis: Basis,
+}
+
+/// Which of a [`Shadow`]'s compare records — `prev`, `hashes` — equal the frame
+/// its guest pages were last written from. A payment through one compare does
+/// not move the other, which then stands for an older frame: compared against,
+/// it would miss a page that changed and changed back. So a payment refreshes
+/// exactly the records it ran, and a compare whose record is not current takes
+/// every page (and rebuilds the record from this frame) instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Basis {
+    pub prev: bool,
+    pub hash: bool,
 }
 
 #[derive(Default)]
@@ -749,6 +1200,12 @@ pub(crate) struct PageDiffState {
     /// The image kernel, created on first use beside the buffer one.
     pub image_pipeline: Option<DiffPipeline>,
     pub image_refused: bool,
+    /// TEMP (lab, [`PayHash`]): the hash kernel, created on first use.
+    pub hash_pipeline: Option<DiffPipeline>,
+    pub hash_refused: bool,
+    /// TEMP (lab, [`PayHash::Verify`]): the hash kernel's own flags, so the
+    /// two compares' answers can be told apart.
+    pub hash_flags: Option<OwnedBuffer>,
     pub shadows: HashMap<u32, Shadow>,
     pub cur: Option<OwnedBuffer>,
     pub flags: Option<OwnedBuffer>,
@@ -764,7 +1221,14 @@ impl PageDiffState {
     /// The compare kernel, created on first use; `None` after a refusal.
     pub(crate) unsafe fn ensure_pipeline(&mut self, ctx: &DeviceContext) -> bool {
         if self.pipeline.is_none() && !self.refused {
-            match unsafe { DiffPipeline::create(ctx, one_trip_enabled(), false, false) } {
+            let kernel = if one_trip_enabled() {
+                Kernel::OneTrip
+            } else {
+                Kernel::TwoTrip
+            };
+            // The buffer kernels compare a copy of the whole frame, so the band
+            // never starts them anywhere but at page zero.
+            match unsafe { DiffPipeline::create(ctx, kernel, false) } {
                 Ok(p) => self.pipeline = Some(p),
                 Err(e) => {
                     self.refused = true;
@@ -781,7 +1245,7 @@ impl PageDiffState {
         if self.image_pipeline.is_none() && !self.image_refused {
             // Based only when the band is asked to narrow the dispatch.
             let based = pay_band_mode() == super::pay_band::PayBandMode::On;
-            match unsafe { DiffPipeline::create(ctx, true, true, based) } {
+            match unsafe { DiffPipeline::create(ctx, Kernel::Image, based) } {
                 Ok(p) => self.image_pipeline = Some(p),
                 Err(e) => {
                     self.image_refused = true;
@@ -790,6 +1254,49 @@ impl PageDiffState {
             }
         }
         self.image_pipeline.is_some()
+    }
+
+    /// TEMP (lab, [`PayHash`]): the hash kernel, created on first use; `None`
+    /// after a refusal (the payment then takes the `prev` compare).
+    pub(crate) unsafe fn ensure_hash_pipeline(&mut self, ctx: &DeviceContext) -> bool {
+        if self.hash_pipeline.is_none() && !self.hash_refused {
+            match unsafe { DiffPipeline::create(ctx, Kernel::Hash, false) } {
+                Ok(p) => self.hash_pipeline = Some(p),
+                Err(e) => {
+                    self.hash_refused = true;
+                    crate::observe::Emit::decline("page_diff_hash_pipeline", &e).fail();
+                }
+            }
+        }
+        self.hash_pipeline.is_some()
+    }
+
+    /// TEMP (lab, [`PayHash`]): `mapping_id`'s hash record, at least
+    /// `pages * 8` bytes. A record made here holds nothing, so the shadow's
+    /// [`Basis::hash`] is cleared with it.
+    pub(crate) unsafe fn ensure_hashes(
+        &mut self,
+        ctx: &DeviceContext,
+        mapping_id: u32,
+        pages: u64,
+    ) -> Result<(), DrawError> {
+        let Some(shadow) = self.shadows.get_mut(&mapping_id) else {
+            return Ok(());
+        };
+        let size = pages * 8;
+        if shadow.hashes.as_ref().is_some_and(|b| b.size >= size) {
+            return Ok(());
+        }
+        shadow.basis.hash = false;
+        unsafe {
+            Self::ensure(
+                ctx,
+                &mut shadow.hashes,
+                size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryClass::DeviceLocal,
+            )
+        }
     }
 
     /// A buffer in `slot` of at least `size` bytes, replacing a smaller one.
@@ -825,7 +1332,12 @@ impl PageDiffState {
             }
         }
         if let Some(old) = self.shadows.remove(&mapping_id) {
-            unsafe { old.prev.destroy(&ctx.device) };
+            unsafe {
+                old.prev.destroy(&ctx.device);
+                if let Some(hashes) = old.hashes {
+                    hashes.destroy(&ctx.device);
+                }
+            }
         }
         let prev = unsafe {
             OwnedBuffer::create(
@@ -843,6 +1355,8 @@ impl PageDiffState {
                 key,
                 prev,
                 pay_epoch: 0,
+                hashes: None,
+                basis: Basis::default(),
             },
         );
         Ok(true)

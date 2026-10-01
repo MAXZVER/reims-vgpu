@@ -12348,11 +12348,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 return Err(failure.error);
             }
         }
+        // `!record_guest_store`: a deferred draw never publishes a write into
+        // guest memory, which is what lets `engine::guest_writes_outstanding`
+        // answer without waiting for the recorder.
         if recorder_on
             && resident_render_chain
             && req.visibility.is_none()
             && resources.occlusion_query.is_none()
             && resources.skip_readback
+            && !resources.record_guest_store
         {
             crate::backend::vulkan::engine::submit_deferred_draw(
                 state,
