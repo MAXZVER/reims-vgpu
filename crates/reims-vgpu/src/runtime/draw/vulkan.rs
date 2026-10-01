@@ -128,7 +128,23 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     //
     // Asked of `pending`, not of the gate: the gate may have been turned off with
     // a draw still out, and that draw is still owed its join.
-    if !req.chain_resident_established && crate::backend::vulkan::engine::deferred_draws_pending() {
+    // TEMP (lab, `REIMS_VGPU_LAB_RECORDER_STORE_JOIN=off`): a record whose own
+    // draw is the deferred GVA-resident Store has already done its Store routing
+    // (the debt arm) inside the encode; what runs after it reaches engine state
+    // only through doors that wait for the recorder. Leave it recording and take
+    // only a failure already found (~6 400 waits/s on the 5K drag otherwise).
+    let leave_store_job = req.lab_left_store_job
+        && !lab_recorder_store_join()
+        && crate::backend::vulkan::engine::recorder_depth() > 1;
+    if leave_store_job && crate::backend::vulkan::engine::deferred_draws_pending() {
+        if let Some(failure) = crate::backend::vulkan::engine::take_deferred_failure() {
+            crate::backend::vulkan::engine::report_deferred_failure(&failure);
+            if !req.deferred_failure_of_previous {
+                req.deferred_failure_of_previous = true;
+                out = refuse_after_deferred_failure(out);
+            }
+        }
+    } else if !req.chain_resident_established && crate::backend::vulkan::engine::deferred_draws_pending() {
         if let Some(failure) = crate::backend::vulkan::engine::settle_deferred_draws() {
             crate::backend::vulkan::engine::report_deferred_failure(&failure);
             // Found here because this record left before it reached the engine
@@ -1335,6 +1351,18 @@ fn lab_recorder_gva_store() -> bool {
     *ON.get_or_init(|| {
         let on = std::env::var("REIMS_VGPU_LAB_RECORDER_GVA_STORE").map_or(true, |v| v != "off");
         crate::observe::off(format!("recorder_gva_store on={on}"));
+        on
+    })
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_RECORDER_STORE_JOIN=off` leaves a deferred
+/// GVA-resident Store recording past its encode (see `encode_draw_chain`).
+/// On (waiting) by default until measured. Latched.
+fn lab_recorder_store_join() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_RECORDER_STORE_JOIN").map_or(true, |v| v != "off");
+        crate::observe::off(format!("recorder_store_join on={on}"));
         on
     })
 }
@@ -12444,6 +12472,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     },
                 );
                 req.visibility_samples = None;
+                req.lab_left_store_job = true;
                 crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
                 crate::runtime::drain::note_store_route("lab_recorder_gva_store_deferred");
                 return Ok(M2vDrawSpan::ResidentGvaStore { identity });

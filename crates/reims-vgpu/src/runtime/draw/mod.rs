@@ -660,6 +660,9 @@ pub struct DrawEncodeRequest {
     /// record counts as the failure it is, and the chain's resident state is the
     /// one from before it.
     pub deferred_failure_of_previous: bool,
+    /// Out-flag (TEMP lab, `REIMS_VGPU_LAB_RECORDER_GVA_STORE`): this record's
+    /// own draw is a GVA-resident Store left recording on the recorder thread.
+    pub lab_left_store_job: bool,
     /// Lifetime identity of the color0 GVA render resource.
     ///
     /// Resolved once per draw, before any GPU work, by
