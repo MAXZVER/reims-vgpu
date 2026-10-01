@@ -119,19 +119,61 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     writeback_guest: bool,
     force_full_store: bool,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
-    let out = encode_draw_chain_inner(state, host, req, writeback_guest, force_full_store);
+    let mut out = encode_draw_chain_inner(state, host, req, writeback_guest, force_full_store);
     // TEMP (lab, S5a, REIMS_VGPU_LAB_RECORDER): a deferred draw may stay in
     // flight past this call only when this very call handed one to the recorder
     // (it then reports the resident chain). Every other exit settles it first,
     // so nothing the caller runs after a record that did not defer — a Store, an
     // abandoned chain's landing, the next stream — runs beside a recording.
-    if !req.chain_resident_established && crate::backend::vulkan::engine::deferred_draws_enabled()
+    //
+    // Asked of `pending`, not of the gate: the gate may have been turned off with
+    // a draw still out, and that draw is still owed its join.
+    if !req.chain_resident_established
+        && crate::backend::vulkan::engine::deferred_draws_pending()
     {
         if let Some(failure) = crate::backend::vulkan::engine::settle_deferred_draws() {
             crate::backend::vulkan::engine::report_deferred_failure(&failure);
+            // Found here because this record left before it reached the engine
+            // (a preparation refusal, or a record that draws nothing): the
+            // sequential path would never have run it, so it is refused, and the
+            // exec loop is told whose failure it is counting.
+            if !req.deferred_failure_of_previous {
+                req.deferred_failure_of_previous = true;
+                out = refuse_after_deferred_failure(out);
+            }
         }
     }
     out
+}
+
+/// TEMP (lab, S5a): a record that reached its exit with an earlier deferred
+/// draw's failure in hand. A refusal already stands; an `Ok` is turned into the
+/// refusal the sequential path would have given the chain at this point — it
+/// would never have run this record — so the exec loop abandons the chain.
+pub(super) fn refuse_after_deferred_failure(
+    out: (EncodeStatus, Option<Vec<u8>>),
+) -> (EncodeStatus, Option<Vec<u8>>) {
+    match out.0 {
+        EncodeStatus::Ok => (EncodeStatus::NoMetal("deferred_draw_failed"), None),
+        _ => out,
+    }
+}
+
+/// TEMP (lab, S5a): the end of a stream's record loop. A deferred draw does not
+/// outlive the stream that handed it over: the next stream may be another task's,
+/// and its first draw must not find this one's failure. Returns whether a failure
+/// was found, which the loop then counts (the draw was reported drawn).
+pub(crate) fn settle_deferred_draws_at_stream_end() -> bool {
+    if !crate::backend::vulkan::engine::deferred_draws_pending() {
+        return false;
+    }
+    match crate::backend::vulkan::engine::settle_deferred_draws() {
+        Some(failure) => {
+            crate::backend::vulkan::engine::report_deferred_failure(&failure);
+            true
+        }
+        None => false,
+    }
 }
 
 fn encode_draw_chain_inner<M: HostMemory + HostOps>(
@@ -12293,9 +12335,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // has already run, whose effects are observations, caches and debt
         // payment, correct on their own.)
         let recorder_on = crate::backend::vulkan::engine::deferred_draws_enabled();
-        if recorder_on {
+        if recorder_on || crate::backend::vulkan::engine::deferred_draws_pending() {
             if let Some(failure) = crate::backend::vulkan::engine::take_deferred_failure() {
                 crate::backend::vulkan::engine::report_deferred_failure(&failure);
+                req.deferred_failure_of_previous = true;
                 return Err(failure.error);
             }
         }

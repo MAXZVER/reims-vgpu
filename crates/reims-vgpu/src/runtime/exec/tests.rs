@@ -8309,3 +8309,49 @@ fn an_exec_resource_record_clearing_guest_valid_pays_the_owed_frame() {
         "a record that does not clear guest-valid pays nothing"
     );
 }
+
+
+/// A deferred first record that failed leaves the stream with no drawn record, so
+/// the pass-clear fallback (which keys on `ok == 0`) runs as it does sequentially,
+/// and the abandon lands the resident the chain really had: none.
+#[test]
+fn a_deferred_first_record_that_failed_leaves_the_stream_with_nothing_drawn() {
+    let mut out = ExecResult::default();
+    let at_entry = (out.metal_draws_ok, out.metal_draws_fail);
+    // Record 0 was handed to the recorder: counted drawn, chain resident.
+    out.metal_draws_ok += 1;
+    let mut resident_chain = true;
+    // Record 1 refused with record 0's error; its own arm counts one failure.
+    take_back_deferred_record(&mut out, &mut resident_chain, false);
+    out.metal_draws_fail += 1;
+    let delta = stream_draw_delta(&out, at_entry);
+    assert_eq!((delta.ok, delta.fail), (0, 1), "one failure, nothing drawn");
+    assert!(!resident_chain, "nothing was ever resident");
+}
+
+/// A later failed record leaves the earlier ones drawn and the chain resident, as
+/// it was before the failed record.
+#[test]
+fn a_deferred_later_record_that_failed_keeps_the_chain_it_extended() {
+    let mut out = ExecResult::default();
+    out.metal_draws_ok = 3; // records 0..=2 handed over
+    let mut resident_chain = true;
+    take_back_deferred_record(&mut out, &mut resident_chain, true);
+    out.metal_draws_fail += 1;
+    assert_eq!((out.metal_draws_ok, out.metal_draws_fail), (2, 1));
+    assert!(resident_chain, "the records before it still hold the resident");
+    // Never below zero, whatever the caller's bookkeeping did.
+    let mut empty = ExecResult::default();
+    take_back_deferred_record(&mut empty, &mut resident_chain, false);
+    assert_eq!(empty.metal_draws_ok, 0);
+}
+
+/// A failure found after the last record is counted where nobody refused in its
+/// name.
+#[test]
+fn a_deferred_failure_found_after_the_loop_is_counted_as_a_failure() {
+    let mut out = ExecResult::default();
+    out.metal_draws_ok = 2;
+    count_deferred_failure_after_the_loop(&mut out);
+    assert_eq!((out.metal_draws_ok, out.metal_draws_fail), (1, 1));
+}

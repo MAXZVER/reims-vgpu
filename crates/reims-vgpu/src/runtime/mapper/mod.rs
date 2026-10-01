@@ -3085,6 +3085,11 @@ fn par_land_write_in<H: HostMemory + HostOps>(
         return None;
     }
     let pool = state.par().filter(|pool| pool.workers() > 0)?;
+    // TEMP (lab, S5a): the pool's workers write guest pages, and
+    // `write_guest_bytes`'s own settle only joins on the drain thread. A draw
+    // the recorder still holds may read these pages, so the drain settles it
+    // here, before it forks.
+    crate::backend::settle_deferred_draws_for_guest_write();
     let need_end = off.saturating_add(buf.len() as u64);
     let selected: u64 = selected_within(only, off, need_end)
         .map(|(lo, hi)| hi - lo)

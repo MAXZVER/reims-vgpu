@@ -118,14 +118,14 @@ pub(crate) enum JobResult {
 /// What an explicit join needs to name a deferred draw's failure after the
 /// request that made it is gone.
 #[derive(Debug)]
-pub(crate) struct DeferredFailure {
+pub struct DeferredFailure {
     pub error: DrawError,
     pub meta: DeferredMeta,
 }
 
 /// The few request fields a failure report names.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct DeferredMeta {
+pub struct DeferredMeta {
     pub pipeline_ref: u32,
     pub task_id: u32,
     pub width: u32,
@@ -138,7 +138,7 @@ type Job = Box<dyn FnOnce() -> JobResult + Send + 'static>;
 /// Keep a finished job's result for the taker. An earlier failure nobody has
 /// taken yet outranks a later result: the first loss is the one that must be
 /// reported.
-fn stash_result(inner: &mut Inner, result: JobResult) {
+fn stash_result(inner: &mut Inner, flag: &AtomicBool, result: JobResult) {
     let keep_older = matches!(
         inner.stash,
         Some(JobResult::Failed(_)) | Some(JobResult::Panicked(_))
@@ -146,6 +146,7 @@ fn stash_result(inner: &mut Inner, result: JobResult) {
     if !keep_older {
         inner.stash = Some(result);
     }
+    flag.store(inner.stash.is_some(), Ordering::Release);
 }
 
 /// Asserts that a value may cross to the recorder thread. See the module doc for
@@ -171,17 +172,32 @@ struct Inner {
     /// taken yet.
     stash: Option<JobResult>,
     worker_parked: bool,
-    submitter_waiting: bool,
+    /// Threads inside `settle_slow` waiting for a result. At most one at a time
+    /// (`settle_lock`), but counted and woken with `notify_all` anyway so the
+    /// protocol does not rest on that.
+    waiters: u32,
     shutdown: bool,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// One-slot handoff to one worker thread.
+///
+/// Three locks, taken in this order and never the other way: `lifecycle`
+/// (submit and stop exclude each other, so a submit never posts a job to a
+/// worker that stop is retiring, and a restart cannot race stop's bookkeeping),
+/// then `settle_lock` (one settler at a time: the drain and a teardown thread
+/// can both ask, and the second finds nothing in flight once the first is
+/// done), then `inner` (the slot, taken for a few instructions at a time and
+/// by the worker alone otherwise).
 pub(crate) struct Handoff {
     name: &'static str,
+    lifecycle: Mutex<()>,
+    settle_lock: Mutex<()>,
     inner: Mutex<Inner>,
     work_cv: Condvar,
     done_cv: Condvar,
+    /// A finished job's result is in the stash and nobody has taken it.
+    stash_pending: AtomicBool,
     /// A job is posted and the worker has not taken it yet (spin target).
     pending: AtomicBool,
     /// The worker posted a result (spin target).
@@ -203,6 +219,9 @@ struct Stats {
     join_max_ns: [AtomicU64; 4],
     deferred_err: AtomicU64,
     submit_declined: AtomicU64,
+    /// Where a blocked join came from: the call site of the engine door, and
+    /// what it waited. Touched only when a job is in flight.
+    by_caller: Mutex<Vec<((&'static str, u32), (u64, u64))>>,
 }
 
 #[allow(clippy::declare_interior_mutable_const)]
@@ -220,6 +239,7 @@ impl Stats {
             join_max_ns: [Z; 4],
             deferred_err: Z,
             submit_declined: Z,
+            by_caller: Mutex::new(Vec::new()),
         }
     }
 }
@@ -227,24 +247,40 @@ impl Stats {
 /// Spin before parking, on either side. Draws arrive 30-80 us apart inside a
 /// stream and a park/wake round trip costs about as much as one, so the
 /// recorder stays hot across a stream and sleeps between streams.
-const WORKER_SPIN: Duration = Duration::from_micros(200);
 const JOIN_SPIN: Duration = Duration::from_micros(30);
+
+/// How long the worker spins for the next job before it parks.
+/// `REIMS_VGPU_LAB_RECORDER_SPIN_US` overrides (default 200); read once.
+fn worker_spin() -> Duration {
+    static SPIN: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *SPIN.get_or_init(|| {
+        Duration::from_micros(
+            std::env::var("REIMS_VGPU_LAB_RECORDER_SPIN_US")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200),
+        )
+    })
+}
 
 impl Handoff {
     pub(crate) const fn new(name: &'static str) -> Self {
         Self {
             name,
+            lifecycle: Mutex::new(()),
+            settle_lock: Mutex::new(()),
             inner: Mutex::new(Inner {
                 job: None,
                 result: None,
                 stash: None,
                 worker_parked: false,
-                submitter_waiting: false,
+                waiters: 0,
                 shutdown: false,
                 thread: None,
             }),
             work_cv: Condvar::new(),
             done_cv: Condvar::new(),
+            stash_pending: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             done: AtomicBool::new(false),
             in_flight: AtomicBool::new(false),
@@ -259,14 +295,20 @@ impl Handoff {
         self.in_flight.load(Ordering::Acquire)
     }
 
+    /// Whether a job is in flight or its result has not been taken: the state
+    /// in which the drain still owes the recorder a join, whatever the gate says
+    /// now (it may have been turned off while a draw was out).
+    #[inline]
+    pub(crate) fn pending(&self) -> bool {
+        self.in_flight.load(Ordering::Acquire) || self.stash_pending.load(Ordering::Acquire)
+    }
+
+    /// Called with `lifecycle` held, so no stop is retiring the worker.
     fn ensure_worker(&'static self) -> bool {
         if self.alive.load(Ordering::Acquire) {
             return true;
         }
         let mut g = self.inner.lock();
-        if self.alive.load(Ordering::Acquire) {
-            return true;
-        }
         g.shutdown = false;
         let priority = current_thread_priority();
         // A generous stack: `execute_draw_inner` is one very large frame and
@@ -287,8 +329,11 @@ impl Handoff {
 
     fn worker_loop(&'static self, priority: Option<i32>) {
         apply_thread_priority(priority);
+        if std::ptr::eq(self, &DRAW) {
+            mark_recorder_thread();
+        }
         loop {
-            let spin_until = Instant::now() + WORKER_SPIN;
+            let spin_until = Instant::now() + worker_spin();
             let mut i = 0u32;
             while !self.pending.load(Ordering::Acquire) {
                 std::hint::spin_loop();
@@ -303,8 +348,9 @@ impl Handoff {
                 self.work_cv.wait(&mut g);
             }
             g.worker_parked = false;
+            // Retiring: `stop` clears `alive` after it has joined this thread,
+            // under `lifecycle`, so there is nothing for the exit to publish.
             let Some(job) = g.job.take() else {
-                self.alive.store(false, Ordering::Release);
                 return;
             };
             self.pending.store(false, Ordering::Release);
@@ -320,8 +366,8 @@ impl Handoff {
             let mut g = self.inner.lock();
             g.result = Some(result);
             self.done.store(true, Ordering::Release);
-            if g.submitter_waiting {
-                self.done_cv.notify_one();
+            if g.waiters != 0 {
+                self.done_cv.notify_all();
             }
         }
     }
@@ -331,6 +377,7 @@ impl Handoff {
     /// before this returns: the draw is recorded either way and the result waits
     /// in the stash like any other.
     pub(crate) fn submit(&'static self, job: Job) {
+        let _lifecycle = self.lifecycle.lock();
         debug_assert!(!self.in_flight(), "one job in flight");
         if self.in_flight() {
             // Defensive: wait for it rather than overwrite it.
@@ -342,7 +389,7 @@ impl Handoff {
                 Ok(result) => result,
                 Err(payload) => JobResult::Panicked(payload),
             };
-            stash_result(&mut self.inner.lock(), result);
+            stash_result(&mut self.inner.lock(), &self.stash_pending, result);
             return;
         }
         let mut g = self.inner.lock();
@@ -360,6 +407,7 @@ impl Handoff {
     /// Wait for the in-flight job, if any, and keep its result for
     /// [`Self::take`]. A no-op (one atomic load) when nothing is in flight.
     #[inline]
+    #[track_caller]
     pub(crate) fn settle(&self, site: JoinSite) {
         if !self.in_flight.load(Ordering::Acquire) {
             return;
@@ -368,8 +416,17 @@ impl Handoff {
     }
 
     #[cold]
+    #[track_caller]
     fn settle_slow(&self, site: JoinSite) {
+        let caller = std::panic::Location::caller();
         let started = Instant::now();
+        // One settler at a time. A second (a teardown thread asking while the
+        // drain waits) queues here and, once the first has the result stashed,
+        // finds nothing in flight and returns.
+        let _settler = self.settle_lock.lock();
+        if !self.in_flight.load(Ordering::Acquire) {
+            return;
+        }
         let spin_until = started + JOIN_SPIN;
         let mut i = 0u32;
         let mut blocked = false;
@@ -382,19 +439,13 @@ impl Handoff {
         }
         let mut g = self.inner.lock();
         while g.result.is_none() {
-            // Another thread settled it while this one waited (teardown racing
-            // the drain): nothing is left to wait for.
-            if !self.in_flight.load(Ordering::Acquire) {
-                g.submitter_waiting = false;
-                return;
-            }
             blocked = true;
-            g.submitter_waiting = true;
+            g.waiters += 1;
             self.done_cv.wait(&mut g);
+            g.waiters -= 1;
         }
-        g.submitter_waiting = false;
         if let Some(result) = g.result.take() {
-            stash_result(&mut g, result);
+            stash_result(&mut g, &self.stash_pending, result);
         }
         self.done.store(false, Ordering::Release);
         self.in_flight.store(false, Ordering::Release);
@@ -407,22 +458,40 @@ impl Handoff {
         }
         self.stats.join_ns[s].fetch_add(ns, Ordering::Relaxed);
         self.stats.join_max_ns[s].fetch_max(ns, Ordering::Relaxed);
+        let key = (caller.file(), caller.line());
+        let mut by = self.stats.by_caller.lock();
+        match by.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, (n, total))) => {
+                *n += 1;
+                *total += ns;
+            }
+            None => by.push((key, (1, ns))),
+        }
     }
 
     /// The finished job's result, waiting for it if it is still running, or
     /// `None` when no job has finished since the last take.
+    #[track_caller]
     pub(crate) fn take(&self, site: JoinSite) -> Option<JobResult> {
         self.settle(site);
-        self.inner.lock().stash.take()
+        let mut g = self.inner.lock();
+        let taken = g.stash.take();
+        self.stash_pending.store(false, Ordering::Release);
+        taken
     }
 
     pub(crate) fn note_deferred_error(&self) {
         self.stats.deferred_err.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Settle, then stop the worker and wait for it to exit. A later `submit`
-    /// starts a new one.
-    pub(crate) fn stop(&'static self) {
+    /// Settle, then stop the worker and wait for it to exit, and hand back the
+    /// result nobody had taken (the caller reports a failure: it belongs to the
+    /// device that is ending, and must not be found by the next one). A later
+    /// `submit` starts a new worker.
+    pub(crate) fn stop(&'static self) -> Option<JobResult> {
+        // Excludes `submit`: no job can be posted to the worker being retired,
+        // and the restart cannot interleave with the bookkeeping below.
+        let _lifecycle = self.lifecycle.lock();
         self.settle(JoinSite::Explicit);
         let handle = {
             let mut g = self.inner.lock();
@@ -434,6 +503,11 @@ impl Handoff {
             let _ = handle.join();
         }
         self.alive.store(false, Ordering::Release);
+        let mut g = self.inner.lock();
+        g.shutdown = false;
+        let taken = g.stash.take();
+        self.stash_pending.store(false, Ordering::Release);
+        taken
     }
 
     /// Drain the window into one line, or `None` when nothing happened in it.
@@ -461,11 +535,26 @@ impl Handoff {
                 max / 1000
             ));
         }
+        let mut by = std::mem::take(&mut *s.by_caller.lock());
+        by.sort_by_key(|(_, (_, ns))| std::cmp::Reverse(*ns));
+        let top: Vec<String> = by
+            .iter()
+            .take(6)
+            .map(|((file, line), (n, ns))| {
+                let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
+                format!("{name}:{line}={n}/{}us", ns / 1000)
+            })
+            .collect();
         any.then(|| {
             format!(
                 "recorder win_ms={win_ms} deferred={submitted} busy_us={} wakes={wakes} \
-                 deferred_err={err} submit_declined={declined}{body}",
-                busy / 1000
+                 deferred_err={err} submit_declined={declined}{body} top={}",
+                busy / 1000,
+                if top.is_empty() {
+                    "-".to_string()
+                } else {
+                    top.join(",")
+                }
             )
         })
     }
@@ -508,6 +597,21 @@ fn apply_thread_priority(_priority: Option<i32>) {}
 /// The process's recorder: draws only.
 pub(crate) static DRAW: Handoff = Handoff::new("reims-vgpu-recorder");
 
+thread_local! {
+    static IS_RECORDER_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn mark_recorder_thread() {
+    IS_RECORDER_THREAD.with(|c| c.set(true));
+}
+
+/// Whether the calling thread is the draw recorder, for the engine-lock census
+/// (its acquires are neither the drain's nor a device entry point's).
+#[inline]
+pub(crate) fn is_recorder_thread() -> bool {
+    IS_RECORDER_THREAD.with(std::cell::Cell::get)
+}
+
 /// `REIMS_VGPU_LAB_RECORDER=on`. Read once.
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -518,6 +622,7 @@ pub(crate) fn enabled() -> bool {
 /// is the drain; any other thread (the recorder itself, the window, a vCPU)
 /// must not wait for a job it may be part of or has no ordering claim on.
 #[inline]
+#[track_caller]
 pub(crate) fn settle_if_drain(is_drain: bool, site: JoinSite) {
     if is_drain {
         DRAW.settle(site);
@@ -571,7 +676,7 @@ mod tests {
             }
         }
         assert_eq!(*log.lock(), (0..200).collect::<Vec<_>>());
-        h.stop();
+        let _ = h.stop();
     }
 
     /// A failure travels to the join that takes it, intact, and a panic is
@@ -619,7 +724,7 @@ mod tests {
         h.submit(ok_job(move || flag.store(true, Ordering::SeqCst)));
         h.settle(JoinSite::Explicit);
         assert!(ran.load(Ordering::SeqCst));
-        h.stop();
+        let _ = h.stop();
     }
 
     /// `stop` waits for the job, ends the thread, and a later submit starts a
@@ -634,11 +739,182 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
                 c.fetch_add(1, Ordering::SeqCst);
             }));
-            h.stop();
+            let _ = h.stop();
             assert!(!h.alive.load(Ordering::SeqCst));
             assert!(!h.in_flight());
         }
         assert_eq!(n.load(Ordering::SeqCst), 3);
+    }
+
+    fn failing_job(pipeline_ref: u32) -> Job {
+        Box::new(move || {
+            JobResult::Failed(Box::new(DeferredFailure {
+                error: DrawError::FenceTimeout,
+                meta: DeferredMeta {
+                    pipeline_ref,
+                    ..Default::default()
+                },
+            }))
+        })
+    }
+
+    /// Run `f` on its own thread and fail rather than hang if it does not finish.
+    fn within(secs: u64, name: &str, f: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(secs)).is_ok(),
+            "{name} hung"
+        );
+    }
+
+    /// The drain and a teardown thread can both settle: neither waits forever,
+    /// and the one result is kept for whoever takes it.
+    #[test]
+    fn two_settlers_both_return_and_the_result_is_kept_once() {
+        within(20, "two settlers", || {
+            let h = handoff("rec-test-two-settlers");
+            for round in 0..40u32 {
+                let ran = Arc::new(AtomicUsize::new(0));
+                let job_ran = Arc::clone(&ran);
+                h.submit(ok_job(move || {
+                    std::thread::sleep(Duration::from_millis(2));
+                    job_ran.fetch_add(1, Ordering::SeqCst);
+                }));
+                let other = std::thread::spawn(move || h.settle(JoinSite::Explicit));
+                h.settle(JoinSite::Explicit);
+                other.join().unwrap();
+                assert!(!h.in_flight(), "round {round}");
+                assert_eq!(ran.load(Ordering::SeqCst), 1);
+                assert!(matches!(h.take(JoinSite::Explicit), Some(JobResult::Done)));
+                assert!(h.take(JoinSite::Explicit).is_none());
+            }
+            let _ = h.stop();
+        });
+    }
+
+    /// A stop that races a submit neither strands a job (posted to a worker that
+    /// is retiring) nor lets a restart's bookkeeping be overwritten: every job
+    /// submitted runs exactly once and every settle returns.
+    #[test]
+    fn stop_racing_submit_never_strands_a_job() {
+        within(30, "stop racing submit", || {
+            let h = handoff("rec-test-stop-race");
+            let ran = Arc::new(AtomicUsize::new(0));
+            let stopper = std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let _ = h.stop();
+                    std::thread::yield_now();
+                }
+            });
+            for _ in 0..400 {
+                let job_ran = Arc::clone(&ran);
+                h.submit(ok_job(move || {
+                    job_ran.fetch_add(1, Ordering::SeqCst);
+                }));
+                h.settle(JoinSite::Explicit);
+            }
+            stopper.join().unwrap();
+            let _ = h.stop();
+            assert_eq!(ran.load(Ordering::SeqCst), 400);
+        });
+    }
+
+    /// What `stop` hands back is the failure nobody had taken, and a restart does
+    /// not find it again: the next device's first draw must not see the last one's.
+    #[test]
+    fn stop_hands_back_the_untaken_failure_once() {
+        let h = handoff("rec-test-stop-failure");
+        h.submit(failing_job(77));
+        match h.stop() {
+            Some(JobResult::Failed(f)) => assert_eq!(f.meta.pipeline_ref, 77),
+            _ => panic!("the failure was not handed back"),
+        }
+        assert!(!h.pending(), "nothing is owed after a stop");
+        h.submit(ok_job(|| {}));
+        assert!(matches!(h.take(JoinSite::Explicit), Some(JobResult::Done)));
+        let _ = h.stop();
+    }
+
+    /// An earlier failure outranks a later result, so the first loss is the one
+    /// reported, and `pending` stays true until it is taken.
+    #[test]
+    fn an_older_failure_outranks_a_newer_result_and_stays_pending() {
+        let h = handoff("rec-test-older");
+        h.submit(failing_job(5));
+        h.settle(JoinSite::Explicit);
+        assert!(!h.in_flight());
+        assert!(h.pending(), "the failure is not yet taken");
+        h.submit(ok_job(|| {}));
+        h.settle(JoinSite::Explicit);
+        match h.take(JoinSite::Explicit) {
+            Some(JobResult::Failed(f)) => assert_eq!(f.meta.pipeline_ref, 5),
+            _ => panic!("the older failure was overwritten"),
+        }
+        assert!(!h.pending());
+        let _ = h.stop();
+    }
+
+    /// The recorder's own lock acquires are counted under their own site, not as
+    /// a device entry point or the drain, and the drain's CPU write into guest
+    /// pages waits for the job where the engine lock does.
+    #[test]
+    fn the_recorder_has_its_own_lock_site_and_a_guest_write_waits_for_the_job() {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        let _serial = SERIAL.lock();
+        let site = Arc::new(AtomicUsize::new(usize::MAX));
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let effect = Arc::new(AtomicBool::new(false));
+        let (site_in, started_in, release_in, effect_in) = (
+            Arc::clone(&site),
+            Arc::clone(&started),
+            Arc::clone(&release),
+            Arc::clone(&effect),
+        );
+        super::super::mark_drain_thread();
+        assert_eq!(
+            super::super::calling_site(),
+            super::super::EngineLockSite::Worker
+        );
+        DRAW.submit(ok_job(move || {
+            site_in.store(
+                super::super::calling_site().index(),
+                Ordering::SeqCst,
+            );
+            started_in.store(true, Ordering::SeqCst);
+            while !release_in.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+            effect_in.store(true, Ordering::SeqCst);
+        }));
+        while !started.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+        assert_eq!(
+            site.load(Ordering::SeqCst),
+            super::super::EngineLockSite::Recorder.index(),
+            "the worker is neither the drain nor a device entry point"
+        );
+        let releaser = std::thread::spawn({
+            let release = Arc::clone(&release);
+            move || {
+                std::thread::sleep(Duration::from_millis(5));
+                release.store(true, Ordering::SeqCst);
+            }
+        });
+        // The drain is about to write guest pages with the CPU.
+        super::super::settle_for_guest_write();
+        assert!(
+            effect.load(Ordering::SeqCst),
+            "the drain wrote guest pages while the recorder still held a draw"
+        );
+        releaser.join().unwrap();
+        let _ = DRAW.take(JoinSite::Explicit);
+        let _ = DRAW.stop();
     }
 
     /// What the handoff costs the drain, measured (run with `--ignored
@@ -674,7 +950,7 @@ mod tests {
                 wait_ns / u128::from(n)
             );
         }
-        h.stop();
+        let _ = h.stop();
     }
 
     /// A thread that is not the drain never waits: the recorder's own
@@ -746,6 +1022,6 @@ mod tests {
         releaser.join().unwrap();
         assert!(!DRAW.in_flight());
         assert!(matches!(DRAW.take(JoinSite::Explicit), Some(JobResult::Done)));
-        DRAW.stop();
+        let _ = DRAW.stop();
     }
 }

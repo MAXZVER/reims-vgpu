@@ -5026,6 +5026,30 @@ struct StreamDrawDelta {
     fail: u32,
 }
 
+/// TEMP (lab, S5a, `REIMS_VGPU_LAB_RECORDER`): the record before the one that just
+/// refused was handed to the recorder thread and counted drawn, and its engine half
+/// failed. Take the count back and the chain to the state from before it, so a
+/// stream whose first record failed has `ok == 0` again (which is what decides the
+/// pass-clear fallback) and the abandon lands the resident the chain really had.
+/// The refusing record counts its own failure in its own arm, which is the one
+/// failure the sequential path would have recorded for the failed draw.
+fn take_back_deferred_record(
+    out: &mut ExecResult,
+    resident_chain: &mut bool,
+    resident_chain_before_the_failed_record: bool,
+) {
+    out.metal_draws_ok = out.metal_draws_ok.saturating_sub(1);
+    *resident_chain = resident_chain_before_the_failed_record;
+}
+
+/// TEMP (lab, S5a): a deferred draw's failure found after the last record, where
+/// no later record refused in its name: the draw was counted drawn and is a
+/// failure.
+fn count_deferred_failure_after_the_loop(out: &mut ExecResult) {
+    out.metal_draws_ok = out.metal_draws_ok.saturating_sub(1);
+    out.metal_draws_fail = out.metal_draws_fail.saturating_add(1);
+}
+
 fn stream_draw_delta(out: &ExecResult, at_entry: (u32, u32)) -> StreamDrawDelta {
     StreamDrawDelta {
         ok: out.metal_draws_ok.saturating_sub(at_entry.0),
@@ -5331,6 +5355,11 @@ fn finish_stream<M: HostMemory + HostOps>(
         // on the engine target (no CPU chain buffer); records 2+ LoadFromTarget.
         let mut resident_chain = false;
         let mut saw_nometal = false;
+        // TEMP (lab, S5a): the resident-chain state from before the last record
+        // and before this one, for a record that turns out to have been a
+        // deferred failure.
+        let mut resident_chain_before_last_record = false;
+        let mut resident_chain_before_this_record = false;
         let first_draw = draw_list.first().copied();
         let mut first_req = first_draw.and_then(|pd| {
             out.render_attachment_resolves = out.render_attachment_resolves.saturating_add(1);
@@ -5362,6 +5391,8 @@ fn finish_stream<M: HostMemory + HostOps>(
         }
         for (di, pd) in draw_list.iter().enumerate() {
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
+            resident_chain_before_last_record = resident_chain_before_this_record;
+            resident_chain_before_this_record = resident_chain;
             let mut req = if di == 0 {
                 let Some(req) = first_req.take() else {
                     break;
@@ -5437,6 +5468,14 @@ fn finish_stream<M: HostMemory + HostOps>(
                     force_full_store,
                 );
                 fin.enter(crate::runtime::drain::FinishPhase::Result);
+                // TEMP (lab, S5a): the record before this one was handed to the
+                // recorder thread and counted drawn; its engine half failed and
+                // this record is the one that refused. Count it as the failure
+                // it is and take the chain back to the state from before it, as
+                // the sequential path (which never got here) would have had it.
+                if req.deferred_failure_of_previous {
+                    take_back_deferred_record(out, &mut resident_chain, resident_chain_before_last_record);
+                }
                 // Read before the status is matched: a draw whose Store failed
                 // still ran its query, and the count is the guest's answer
                 // either way.
@@ -5574,6 +5613,13 @@ fn finish_stream<M: HostMemory + HostOps>(
                     }
                 }
             }
+        }
+        // TEMP (lab, S5a): nothing deferred outlives this stream.
+        #[cfg(feature = "backend-vulkan")]
+        if crate::backend::selected().rail() == crate::backend::Rail::Vulkan
+            && crate::runtime::draw::vulkan::settle_deferred_draws_at_stream_end()
+        {
+            count_deferred_failure_after_the_loop(out);
         }
         fin.enter(crate::runtime::drain::FinishPhase::Tail);
         write_visibility_results(state, host, task_id, acc, &visibility_counts);

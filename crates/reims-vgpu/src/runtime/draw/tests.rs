@@ -8582,3 +8582,18 @@ fn a_guest_write_between_observation_and_copy_is_not_vouched_for() {
     commit_guest_write_stamp(&mut state, 7, stale);
     assert_eq!(state.mappings[&7].guest_write_gen_at_store, 0);
 }
+
+
+/// A record that leaves with an earlier deferred draw's failure in hand is
+/// refused, and one that already refused keeps its own refusal.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_record_leaving_with_a_deferred_failure_is_refused_not_ok() {
+    use super::vulkan::refuse_after_deferred_failure;
+    assert_eq!(
+        refuse_after_deferred_failure((EncodeStatus::Ok, None)).0,
+        EncodeStatus::NoMetal("deferred_draw_failed")
+    );
+    let kept = refuse_after_deferred_failure((EncodeStatus::BadArgs("x"), None));
+    assert_eq!(kept.0, EncodeStatus::BadArgs("x"));
+}
