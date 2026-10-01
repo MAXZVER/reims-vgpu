@@ -346,13 +346,13 @@ pub const BACKING_A008: &str = "REIMS_VGPU_BACKING_A008";
 /// Both arms leave the same bytes in guest RAM.
 pub const PAY_DIFF: &str = "REIMS_VGPU_PAY_DIFF";
 
-/// `on` makes a bare integer name a mapping only in the task the guest speaks
-/// mapping ids in: the one whose page table walked that mapping's backing (a
-/// mapping with no backing walk has no owner to compare and is named as before).
-/// Unset, every task's reference N also names the mapping numbered N, as it always
-/// has, in `DeviceState::mappings_named_by` -- which the validity quads
-/// (`clear_host_valid`) and the render-frame ledger's payment by reference both
-/// resolve through.
+/// **Default on.** `off` restores the old reading, in which every task's reference
+/// N also names the mapping numbered N, in `DeviceState::mappings_named_by` --
+/// which the validity quads (`clear_host_valid`) and the render-frame ledger's
+/// payment by reference both resolve through. On, a bare integer names a mapping
+/// only in the task the guest speaks mapping ids in: the one whose page table walked
+/// that mapping's backing (a mapping with no backing walk has no owner to compare
+/// and is named as before).
 ///
 /// Mapping ids are device-wide and references are per-task, and both are small
 /// integers, so the bare spelling collides constantly. Two of the collisions are
@@ -369,6 +369,14 @@ pub const PAY_DIFF: &str = "REIMS_VGPU_PAY_DIFF";
 /// used to accept, so it makes strictly fewer payments and fewer guest-write claims.
 /// A reference that does name the mapping -- the owning task's, or any task's
 /// `texture_to_mapping` registration -- is named exactly as before.
+///
+/// Measured, driven macos-26 1080p, the layer's second frame forced to be preceded
+/// by an early payment of its first (a payment 3 s after the first arm, the order
+/// that happens by chance in one boot in six): without it 3 of 6 boots that kept the
+/// layer through the re-point showed the black rectangle (8 of 11 with the earlier
+/// runs), with it 0 of 7, the spurious `clear_host_valid` claims on the layer going
+/// from one a boot to none and 140-160 per-task references a boot no longer paying
+/// whole framebuffers they merely shared a number with.
 pub const NAME_NARROW: &str = "REIMS_VGPU_NAME_NARROW";
 
 /// `on` pays the frame a mapping is owed before the guest's ReplacePhysical for it

@@ -4369,7 +4369,7 @@ impl DeviceState {
             .is_some_and(|m| m.backing_walk.is_none_or(|walk| walk.task_id == task_id))
     }
 
-    /// Whether `object_id`, spelled bare (`REIMS_VGPU_NAME_NARROW`, opt-in for now),
+    /// Whether `object_id`, spelled bare (`REIMS_VGPU_NAME_NARROW`, default on),
     /// by `task_id`, is the id of the mapping of that number.
     ///
     /// Mapping ids are device-wide, task references are per-task, and both are
@@ -4383,14 +4383,17 @@ impl DeviceState {
     /// mapping. Everything else is named through `texture_to_mapping`, which the
     /// per-task registration fills.
     ///
-    /// Off, every bare integer names the mapping of that number, as before.
+    /// `REIMS_VGPU_NAME_NARROW=off`: every bare integer names the mapping of that
+    /// number, as before.
     fn bare_reference_is_mapping_id(&self, task_id: u32, object_id: u32) -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
+        // Only an explicit `off` restores the old reading; unset, `on` and an
+        // unrecognized value are the narrowed one.
         if !*ON.get_or_init(|| {
-            matches!(
+            !matches!(
                 crate::config::read(crate::config::NAME_NARROW).0,
-                crate::config::Switch::On
+                crate::config::Switch::Off
             )
         }) {
             return true;
