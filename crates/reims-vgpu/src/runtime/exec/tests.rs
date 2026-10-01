@@ -8626,3 +8626,25 @@ fn a_plural_scissor_replaces_the_state_in_place_and_an_empty_rect_keeps_it() {
         });
     }
 }
+
+/// A stream asks the guest's object lists whether a reference is a surface once,
+/// whatever the answer; the next stream asks again.
+#[test]
+fn a_stream_probes_the_backing_of_a_reference_once() {
+    // Ref 7 is a buffer in task 1's list; no task lists a surface there.
+    for on in [true, false] {
+        walk_memo::with(on, || {
+            let (host, mut state) = device_with_one_buffer();
+            let mut memo = walk_memo::StreamMemo::default();
+            assert!(!resolve_backing_memo(&mut state, &host, &mut memo, 7));
+            assert_eq!(
+                memo.backing(7),
+                on.then_some(false),
+                "memo {on}: the answer is kept exactly when the memo is on"
+            );
+            assert!(!resolve_backing_memo(&mut state, &host, &mut memo, 7));
+            let fresh = walk_memo::StreamMemo::default();
+            assert_eq!(fresh.backing(7), None, "a new stream has asked nothing");
+        });
+    }
+}

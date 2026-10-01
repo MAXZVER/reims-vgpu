@@ -20,10 +20,21 @@
 //! born and dropped with the stream and cannot outlive a delete between two
 //! streams.
 //!
-//! **Only successes are kept.** A failed construction is retried on the next
-//! bind, as the registry's own contract says ("a descriptor that is still being
-//! published can succeed on retry"), so a failure takes the original path every
-//! time and counts what it always counted.
+//! **Only successes are kept for a resource.** A failed construction is retried
+//! on the next bind, as the registry's own contract says ("a descriptor that is
+//! still being published can succeed on retry"), so a failure takes the original
+//! path every time and counts what it always counted.
+//!
+//! **The backing probe's answer is kept either way**, and the reason is its
+//! cost, not its contract. For a texture that is not a mapper-ref texture the
+//! probe walks every live task's object list through the guest's page tables to
+//! learn that no task lists a surface at that slot, and it learns it again at
+//! every bind of the texture. The answer is a statement about the guest's object
+//! lists at the moment of the probe; a stream's records are walked within
+//! microseconds of each other and the guest cannot order a write of its own
+//! between two of them, so what the first bind saw is what a second would. A
+//! publish that lands in that window reaches the next stream's probe instead,
+//! exactly as one landing a microsecond after any single probe always did.
 //!
 //! **The counters stay the same.** A registry hit counts
 //! `task_resource_reexamine_deferred` (its interval had not elapsed); the memo
@@ -38,15 +49,52 @@
 use crate::model::TaskResource;
 use std::sync::Arc;
 
-/// Whether the memo is on. Read once.
+/// How the memo is switched: `off`, on (the default), or `alt` — on for the
+/// even four-second blocks of the device clock and off for the odd ones, decided
+/// once per packet, so one boot measures both arms against the same host load.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Off,
+    On,
+    Alt,
+}
+
+fn mode() -> Mode {
+    static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("REIMS_VGPU_LAB_WALK_MEMO").as_deref() {
+        Ok("off") => Mode::Off,
+        Ok("alt") => Mode::Alt,
+        _ => Mode::On,
+    })
+}
+
+thread_local! {
+    /// `alt`'s answer for the packet being executed.
+    static ALT_NOW: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Called once at the start of a packet's execution: in `alt` mode, latch which
+/// arm this packet takes.
+#[inline]
+pub(super) fn begin_packet() {
+    if mode() == Mode::Alt {
+        let block = crate::observe::elapsed_ms() / 4000;
+        ALT_NOW.with(|now| now.set(block % 2 == 0));
+    }
+}
+
+/// Whether the memo is on.
 #[inline]
 pub(crate) fn on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST.with(std::cell::Cell::get) {
         return on;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_WALK_MEMO").map_or(true, |v| v != "off"))
+    match mode() {
+        Mode::Off => false,
+        Mode::On => true,
+        Mode::Alt => ALT_NOW.with(std::cell::Cell::get),
+    }
 }
 
 #[cfg(test)]
@@ -72,8 +120,8 @@ const MAX_REFS: usize = 48;
 #[derive(Clone, Debug, Default)]
 pub(super) struct StreamMemo {
     resources: Vec<(u32, Arc<TaskResource>)>,
-    /// References whose backing probe succeeded in this stream.
-    backed: Vec<u32>,
+    /// What this stream's backing probe answered for a reference, either way.
+    backing: Vec<(u32, bool)>,
     /// Resolutions this memo answered, not yet counted.
     replayed: u64,
 }
@@ -100,17 +148,20 @@ impl StreamMemo {
         }
     }
 
-    /// Whether this stream's backing probe for `obj_ref` already succeeded.
+    /// What this stream's backing probe already answered for `obj_ref`.
     #[inline]
-    pub(super) fn is_backed(&self, obj_ref: u32) -> bool {
-        self.backed.contains(&obj_ref)
+    pub(super) fn backing(&self, obj_ref: u32) -> Option<bool> {
+        self.backing
+            .iter()
+            .find(|(r, _)| *r == obj_ref)
+            .map(|(_, backed)| *backed)
     }
 
-    /// Keep a backing probe that succeeded.
+    /// Keep what a backing probe answered.
     #[inline]
-    pub(super) fn remember_backed(&mut self, obj_ref: u32) {
-        if self.backed.len() < MAX_REFS && !self.backed.contains(&obj_ref) {
-            self.backed.push(obj_ref);
+    pub(super) fn remember_backing(&mut self, obj_ref: u32, backed: bool) {
+        if self.backing.len() < MAX_REFS && self.backing(obj_ref).is_none() {
+            self.backing.push((obj_ref, backed));
         }
     }
 

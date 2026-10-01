@@ -1115,6 +1115,7 @@ pub fn execute_planned<M: HostMemory + HostOps>(
 ) -> ExecResult {
     let started = std::time::Instant::now();
     let mut measured_ns = 0u64;
+    walk_memo::begin_packet();
     // Read, plan, execute. The plan step is separate because it is the only one
     // of the three that a caller may run at a moment of its own choosing: it is
     // pure CPU work over bytes the submission already holds, where the read
@@ -5095,7 +5096,7 @@ fn bind_resource<M: HostMemory>(
 }
 
 /// [`objects::resolve_backing`] for a texture bind, skipping the probe for a
-/// reference this stream already found backed. See [`walk_memo`].
+/// reference this stream already asked about. See [`walk_memo`].
 fn resolve_backing_memo<M: HostMemory>(
     state: &mut DeviceState,
     host: &M,
@@ -5105,13 +5106,11 @@ fn resolve_backing_memo<M: HostMemory>(
     if !walk_memo::on() {
         return objects::resolve_backing(state, host, obj_ref);
     }
-    if memo.is_backed(obj_ref) {
-        return true;
+    if let Some(backed) = memo.backing(obj_ref) {
+        return backed;
     }
     let backed = objects::resolve_backing(state, host, obj_ref);
-    if backed {
-        memo.remember_backed(obj_ref);
-    }
+    memo.remember_backing(obj_ref, backed);
     backed
 }
 
