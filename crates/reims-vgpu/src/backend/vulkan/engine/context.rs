@@ -1791,6 +1791,23 @@ impl DeviceContext {
         }
     }
 
+    /// TEMP (lab, `REIMS_VGPU_LAB_PAY_ASYNC`): [`Self::submit_queue_work`] with
+    /// no semaphores, handed to the queue owner without waiting for its reply.
+    /// The caller must wait `fence` before reading anything the work produced;
+    /// a failed submit reaches it through the owner's failure latch, as an
+    /// asynchronous batch flush's does. Without an owner it is the synchronous
+    /// submit.
+    pub(crate) unsafe fn submit_queue_work_async(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        match self.queue_owner.as_ref() {
+            Some(owner) => owner.submit_async(command_buffers, fence, None),
+            None => unsafe { self.submit_queue_work(command_buffers, &[], &[], &[], fence) },
+        }
+    }
+
     pub(crate) unsafe fn submit_queue_work(
         &self,
         command_buffers: &[vk::CommandBuffer],

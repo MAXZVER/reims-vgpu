@@ -279,6 +279,91 @@ pub(crate) fn one_trip_enabled() -> bool {
     })
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_ASYNC=off` waits for the queue owner's reply
+/// that `vkQueueSubmit` returned before waiting the payment's own fence, as the
+/// sync readback submit does. On by default: the fence is the completion either
+/// way, and the reply only puts a second thread wake-up on the drain's path.
+/// Latched.
+pub(crate) fn lab_async_submit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_PAY_ASYNC").map_or(true, |v| v != "off");
+        crate::observe::off(format!("pay_diff_async_submit on={on}"));
+        on
+    })
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_SPIN=<us>` polls the payment's fence for up
+/// to that long before blocking in `vkWaitForFences`; `=off` (or `0`) blocks at
+/// once, as before. Default 1500 us: the drain thread has nothing else to do
+/// until the answer lands, and a blocked wait adds the OS wake-up to every
+/// payment. The answer is the same fence either way. Latched.
+pub(crate) fn lab_spin_budget_us() -> u64 {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *US.get_or_init(|| {
+        let us = parse_spin_budget(std::env::var("REIMS_VGPU_LAB_PAY_SPIN").ok().as_deref());
+        crate::observe::off(format!("pay_diff_spin budget_us={us}"));
+        us
+    })
+}
+
+/// The spin budget a `REIMS_VGPU_LAB_PAY_SPIN` value asks for: unset is the
+/// default, `off` or anything unparsable-as-a-count is no spin, and a count is
+/// clamped to 10 ms so a typo cannot pin the drain thread for seconds.
+fn parse_spin_budget(raw: Option<&str>) -> u64 {
+    const DEFAULT_US: u64 = 1500;
+    const CEILING_US: u64 = 10_000;
+    match raw.map(str::trim) {
+        None => DEFAULT_US,
+        Some(v) => v.parse::<u64>().map_or(0, |n| n.min(CEILING_US)),
+    }
+}
+
+#[cfg(test)]
+mod lab_spin_budget_tests {
+    use super::parse_spin_budget;
+
+    #[test]
+    fn unset_spins_the_default_off_never_and_a_count_is_clamped() {
+        assert_eq!(parse_spin_budget(None), 1500);
+        assert_eq!(parse_spin_budget(Some("off")), 0);
+        assert_eq!(parse_spin_budget(Some("0")), 0);
+        assert_eq!(parse_spin_budget(Some(" 700 ")), 700);
+        assert_eq!(parse_spin_budget(Some("999999")), 10_000);
+        assert_eq!(parse_spin_budget(Some("garbage")), 0);
+    }
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_FLAGS_DEV=off` binds the image kernel to the
+/// host-memory `flags` buffer directly, as before. On by default: every
+/// workgroup's first act is to read its page's flag and wait for it at a
+/// barrier before any texel is fetched, and in host memory that read crosses
+/// PCIe once per page (14 400 at 5K). The kernel now reads and writes a
+/// device-local copy instead, filled from `flags` by one copy before it and
+/// copied back by one after; the host writes and reads `flags` exactly as
+/// before, so the values each side sees are the same. Latched.
+pub(crate) fn lab_flags_dev_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_PAY_FLAGS_DEV").map_or(true, |v| v != "off");
+        crate::observe::off(format!("pay_diff_flags_dev on={on}"));
+        on
+    })
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_REAP_AFTER=off` claims the payment's own slot
+/// through `begin_entry`, which first retires every already-signalled slot (fence
+/// reset, span reads, cleanup) in front of the submit. On by default: the same
+/// retires run, in the same order, right after the submit instead. Latched.
+pub(crate) fn lab_reap_after_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_PAY_REAP_AFTER").map_or(true, |v| v != "off");
+        crate::observe::off(format!("pay_diff_reap_after on={on}"));
+        on
+    })
+}
+
 /// A buffer this module owns outright: its own `vkAllocateMemory`, alive across
 /// payments. The pools recycle their slots at each fence, and a shadow has to
 /// hold a frame from one swap to the next.
@@ -631,6 +716,9 @@ pub(crate) struct PageDiffState {
     pub cur: Option<OwnedBuffer>,
     pub flags: Option<OwnedBuffer>,
     pub out: Option<OwnedBuffer>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_PAY_FLAGS_DEV`): the image kernel's flags in
+    /// device memory, filled from and copied back to `flags` around it.
+    pub flags_dev: Option<OwnedBuffer>,
 }
 
 pub(crate) static STATE: std::sync::Mutex<Option<PageDiffState>> = std::sync::Mutex::new(None);

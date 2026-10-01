@@ -3781,18 +3781,41 @@ pub fn page_diff_forget(mapping_id: u32) {
     }
 }
 
+/// TEMP (lab): whether a draw batch is recording and not yet handed to the GPU.
+pub fn lab_batch_open() -> bool {
+    BATCH_OPEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Record one command buffer on the engine's own entry machinery, submit it and
 /// wait for it, exactly as the host-delivered readback does.
+///
+/// `between` runs after the submission and before the wait (TEMP lab,
+/// `REIMS_VGPU_LAB_PAY_SPLIT`): CPU work of the caller that needs neither the
+/// answer nor the engine, done while the GPU computes it. It runs with the
+/// engine lock held, so it must not take it.
 unsafe fn page_diff_submit(
     ctx: &context::DeviceContext,
     pools: &mut pools::ResourcePools,
     counters: &EngineCounters,
+    between: impl FnOnce(),
     record: impl FnOnce(ash::vk::CommandBuffer),
 ) -> Result<(), DrawError> {
     let ops = target_readback_ops();
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_submit_us"); // TEMP (lab)
     let appended = pools.batch_open_recording();
+    // TEMP (lab): whether this payment rode the frame's still-recording draw
+    // batch (its draws start on the GPU only now) or had its own command buffer.
+    crate::runtime::drain::note_store_route(if appended.is_some() {
+        "lab_pd_appended_to_batch"
+    } else {
+        "lab_pd_own_cb"
+    });
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_REAP_AFTER`): the reap of signalled slots
+    // waits until this payment's command buffer is on its way.
+    let reap_after = appended.is_none() && page_diff::lab_reap_after_enabled();
     let (cb, fence) = match appended {
         Some(pair) => pair,
+        None if reap_after => pools.begin_entry_reap_later(ctx, counters)?,
         None => pools.begin_entry(ctx, counters)?,
     };
     if appended.is_none() {
@@ -3816,13 +3839,60 @@ unsafe fn page_diff_submit(
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
         let cbs = [cb];
-        ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
-            .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
+        // TEMP (lab, `REIMS_VGPU_LAB_PAY_ASYNC`): hand the command buffer to the
+        // queue owner and go straight to the fence instead of first waiting for
+        // the owner's reply that `vkQueueSubmit` returned. The fence wait below
+        // is the completion either way; the batch flush already submits so.
+        let submitted = if page_diff::lab_async_submit_enabled() {
+            ctx.submit_queue_work_async(&cbs, fence)
+        } else {
+            ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
+        };
+        submitted.map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(&ctx.device, sealed);
     }
+    drop(lab_span);
+    if reap_after {
+        let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_reap_us"); // TEMP (lab)
+        pools.reap_signaled_slots_before_current(ctx, counters)?;
+    }
+    {
+        let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_between_us"); // TEMP (lab)
+        between();
+    }
+    let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_wait_us"); // TEMP (lab)
+    lab_spin_on_fence(ctx, fence);
     pools.wait_entry_fence(ctx, counters, fence)?;
     Ok(())
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_SPIN`): poll `fence` for up to the spin budget
+/// before the caller's blocking wait, which then returns at once on a signalled
+/// fence. Decides nothing: any error, a queue failure or the budget running out
+/// leaves the blocking wait to report or to wait the rest.
+fn lab_spin_on_fence(ctx: &context::DeviceContext, fence: ash::vk::Fence) {
+    let budget = page_diff::lab_spin_budget_us();
+    if budget == 0 {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_micros(budget);
+    loop {
+        match unsafe { ctx.device.get_fence_status(fence) } {
+            Ok(true) => {
+                crate::runtime::drain::note_store_route("lab_pd_spin_signalled");
+                return;
+            }
+            Ok(false) => {}
+            Err(_) => return,
+        }
+        if started.elapsed() >= budget || ctx.queue_failure().is_some() {
+            crate::runtime::drain::note_store_route("lab_pd_spin_ran_out");
+            return;
+        }
+        std::hint::spin_loop();
+    }
 }
 
 /// Read back only the pages of `identity`'s frame that changed since the frame
@@ -3839,9 +3909,27 @@ pub fn read_target_changed_pages(
     key: (u32, u32, u32, u64),
     force: &[u32],
 ) -> Result<Option<ChangedPages>, DrawError> {
+    read_target_changed_pages_with(identity, mapping_id, key, force, || {})
+}
+
+/// [`read_target_changed_pages`], running `between` once the compare is
+/// submitted and before its fence is waited (see [`page_diff_submit`]). It does
+/// not run when the call answers before submitting anything — a routing `None`
+/// or an error before the submit — so a caller that needs its effect must look
+/// for it rather than assume it.
+pub fn read_target_changed_pages_with(
+    identity: &TargetIdentity,
+    mapping_id: u32,
+    key: (u32, u32, u32, u64),
+    force: &[u32],
+    between: impl FnOnce(),
+) -> Result<Option<ChangedPages>, DrawError> {
     use ash::vk;
     use reims_vgpu_vulkan::memory::MemoryClass;
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_lock_us"); // TEMP (lab)
     let mut guard = lock_engine();
+    drop(lab_span);
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_prep_us"); // TEMP (lab)
     let EngineState {
         ref mut owner,
         ref mut pools,
@@ -3890,9 +3978,22 @@ pub fn read_target_changed_pages(
             ctx,
             &mut st.flags,
             pages * 4,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::TRANSFER_SRC,
             MemoryClass::Readback,
         )?;
+        if page_diff::lab_flags_dev_enabled() {
+            page_diff::PageDiffState::ensure(
+                ctx,
+                &mut st.flags_dev,
+                pages * 4,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::TRANSFER_SRC,
+                MemoryClass::DeviceLocal,
+            )?;
+        }
         page_diff::PageDiffState::ensure(
             ctx,
             &mut st.out,
@@ -3921,6 +4022,12 @@ pub fn read_target_changed_pages(
         st.flags.as_ref().expect("ensured"),
         st.out.as_ref().expect("ensured"),
     );
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_FLAGS_DEV`): the image kernel's own flags.
+    let flags_dev = if image_view.is_some() && page_diff::lab_flags_dev_enabled() {
+        st.flags_dev.as_ref()
+    } else {
+        None
+    };
     let prev = &st.shadows.get(&mapping_id).expect("ensured").prev;
     let pipe = if image_view.is_some() {
         st.image_pipeline.as_ref().expect("ensured")
@@ -3931,7 +4038,15 @@ pub fn read_target_changed_pages(
     if !fresh {
         match image_view {
             Some(view) => unsafe {
-                pipe.write_set_image(&ctx.device, view, prev, flags, out, padded, pages)
+                pipe.write_set_image(
+                    &ctx.device,
+                    view,
+                    prev,
+                    flags_dev.unwrap_or(flags),
+                    out,
+                    padded,
+                    pages,
+                )
             },
             None => unsafe { pipe.write_set(&ctx.device, cur, prev, flags, out, padded, pages) },
         }
@@ -3951,14 +4066,57 @@ pub fn read_target_changed_pages(
         }
     }
     let (cur_b, prev_b, flags_b, out_b) = (cur.buffer, prev.buffer, flags.buffer, out.buffer);
+    let flags_dev_b = flags_dev.map(|b| b.buffer);
+    if flags_dev_b.is_some() {
+        crate::runtime::drain::note_store_route("lab_pd_flags_dev");
+    }
     let (pl_layout, pl, set) = (pipe.layout, pipe.pipeline, pipe.set);
     if image_view.is_some() {
         crate::runtime::drain::note_store_route("pay_diff_image");
     }
+    drop(lab_span);
     unsafe {
-        page_diff_submit(ctx, pools, counters, |cb| {
+        page_diff_submit(ctx, pools, counters, between, |cb| {
             let d = &ctx.device;
             if image_view.is_some() {
+                // TEMP (lab, `REIMS_VGPU_LAB_PAY_FLAGS_DEV`): the host's marks
+                // into the kernel's device-local flags. The barrier orders the
+                // copy after every earlier use of that buffer (submission order
+                // spans the previous payment's kernel and copy-back).
+                let flags_bytes = [vk::BufferCopy::default().size(pages * 4)];
+                if let Some(fd) = flags_dev_b {
+                    let before_fill = [vk::MemoryBarrier::default()
+                        .src_access_mask(
+                            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                        )
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)];
+                    d.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &before_fill,
+                        &[],
+                        &[],
+                    );
+                    d.cmd_copy_buffer(cb, flags_b, fd, &flags_bytes);
+                    // Its own barrier rather than a term of the image barrier
+                    // below, which may carry a feedback-loop dependency flag.
+                    let flags_filled = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )];
+                    d.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &flags_filled,
+                        &[],
+                        &[],
+                    );
+                }
                 // Sampled in GENERAL (valid for any usage), then put back in the
                 // transfer-read layout the registry records below, so the next
                 // barrier over this resident names the access it actually has.
@@ -4003,21 +4161,45 @@ pub fn read_target_changed_pages(
                     .new_layout(read_access.layout())
                     .image(snap.image)
                     .subresource_range(color_subresource_range())];
+                // TEMP (lab, `REIMS_VGPU_LAB_PAY_FLAGS_DEV`): the kernel's flag
+                // writes made visible to the copy back below.
+                let flags_done = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+                let flags_done: &[vk::MemoryBarrier<'_>] = if flags_dev_b.is_some() {
+                    &flags_done
+                } else {
+                    &[]
+                };
                 d.cmd_pipeline_barrier(
                     cb,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
-                    &[],
+                    flags_done,
                     &[],
                     &back,
                 );
+                let (host_src_stage, host_src_access) = match flags_dev_b {
+                    Some(fd) => {
+                        d.cmd_copy_buffer(cb, fd, flags_b, &flags_bytes);
+                        (
+                            vk::PipelineStageFlags::COMPUTE_SHADER
+                                | vk::PipelineStageFlags::TRANSFER,
+                            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                        )
+                    }
+                    None => (
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::AccessFlags::SHADER_WRITE,
+                    ),
+                };
                 let to_host = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .src_access_mask(host_src_access)
                     .dst_access_mask(vk::AccessFlags::HOST_READ)];
                 d.cmd_pipeline_barrier(
                     cb,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    host_src_stage,
                     vk::PipelineStageFlags::HOST,
                     vk::DependencyFlags::empty(),
                     &to_host,
@@ -4112,6 +4294,7 @@ pub fn read_target_changed_pages(
             );
         })?;
     }
+    let _lab_post = crate::runtime::chain_phase::CostSpan::new("lab_pd_post_us"); // TEMP (lab)
     pools.registry_note_access(identity, read_access);
 
     let changed: Vec<u32> = if fresh {
@@ -4151,22 +4334,28 @@ pub fn read_target_changed_pages(
             i += 1;
         }
         unsafe {
-            page_diff_submit(ctx, pools, counters, |cb| {
-                let d = &ctx.device;
-                d.cmd_copy_buffer(cb, cur_b, out_b, &regions);
-                let to_host = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::HOST_READ)];
-                d.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::HOST,
-                    vk::DependencyFlags::empty(),
-                    &to_host,
-                    &[],
-                    &[],
-                );
-            })?;
+            page_diff_submit(
+                ctx,
+                pools,
+                counters,
+                || {},
+                |cb| {
+                    let d = &ctx.device;
+                    d.cmd_copy_buffer(cb, cur_b, out_b, &regions);
+                    let to_host = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                    d.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &to_host,
+                        &[],
+                        &[],
+                    );
+                },
+            )?;
         }
     }
     unsafe { out.invalidate(&ctx.device)? };

@@ -4349,3 +4349,165 @@ fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
         "a draw since the stamp clears it — the slot is still there"
     );
 }
+
+/// A vertex and a fragment module that rasterize nothing: every vertex lands
+/// on one point, so the triangle has no area. Hand-assembled words rather than
+/// an AIR fixture, so the case needs no `llvm-dis` on the host.
+#[rustfmt::skip]
+fn degenerate_triangle_spirv() -> (Vec<u32>, Vec<u32>) {
+    // OpTypeVoid %3, OpTypeFunction %4, float %5, vec4 %6, Output ptr %7,
+    // OpVariable %2, 0.0 %8, 1.0 %9, vec4(0, 0, 0, 1) %10, then main (%1).
+    let body = |interface_decoration: [u32; 4]| {
+        let mut w = vec![
+            interface_decoration[0],
+            interface_decoration[1],
+            interface_decoration[2],
+            interface_decoration[3],
+        ];
+        w.extend_from_slice(&[
+            0x0002_0013, 3, // OpTypeVoid
+            0x0003_0021, 4, 3, // OpTypeFunction
+            0x0003_0016, 5, 32, // OpTypeFloat 32
+            0x0004_0017, 6, 5, 4, // OpTypeVector
+            0x0004_0020, 7, 3, 6, // OpTypePointer Output
+            0x0004_003b, 7, 2, 3, // OpVariable Output
+            0x0004_002b, 5, 8, 0, // OpConstant 0.0
+            0x0004_002b, 5, 9, 0x3f80_0000, // OpConstant 1.0
+            0x0007_002c, 6, 10, 8, 8, 8, 9, // OpConstantComposite
+            0x0005_0036, 3, 1, 0, 4, // OpFunction
+            0x0002_00f8, 11, // OpLabel
+            0x0003_003e, 2, 10, // OpStore
+            0x0001_00fd, // OpReturn
+            0x0001_0038, // OpFunctionEnd
+        ]);
+        w
+    };
+    let header = [0x0723_0203, 0x0001_0000, 0, 12, 0, 0x0002_0011, 1, 0x0003_000e, 0, 1];
+    let main = 0x6e69_616d;
+    let mut vert = header.to_vec();
+    vert.extend_from_slice(&[0x0006_000f, 0, 1, main, 0, 2]); // OpEntryPoint Vertex
+    vert.extend(body([0x0004_0047, 2, 11, 0])); // BuiltIn Position
+    let mut frag = header.to_vec();
+    frag.extend_from_slice(&[0x0006_000f, 4, 1, main, 0, 2]); // OpEntryPoint Fragment
+    frag.extend_from_slice(&[0x0003_0010, 1, 7]); // OriginUpperLeft
+    frag.extend(body([0x0004_0047, 2, 30, 0])); // Location 0
+    (vert, frag)
+}
+
+/// Fill a `w`x`h` resident surface with one colour (`rgba`, semantic order,
+/// each channel a multiple of 1/255 so the clear lands exactly), left in the
+/// registry for a later read: a cleared pass whose one draw covers nothing.
+fn draw_uniform_into_resident(identity: &TargetIdentity, w: u32, h: u32, rgba: [u8; 4]) -> bool {
+    let (vert, frag) = degenerate_triangle_spirv();
+    let mut req = engine_req(&vert, &frag, w, h);
+    req.target_identity = Some(identity.clone());
+    req.skip_readback = true;
+    req.color_attachment = Some(color_attachment(
+        reims_vgpu::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        rgba.map(|c| f64::from(c) / 255.0),
+    ));
+    match engine::execute_draw_request(engine_device(), &req) {
+        Ok(_) => true,
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP page diff: {e}");
+            false
+        }
+        Err(e) => panic!("page diff draw: {e}"),
+    }
+}
+
+/// The page-diff payment end to end on a real device: a fresh shadow lands the
+/// whole frame, an unchanged frame lands nothing, a forced page is copied from
+/// the shadow even though it did not change, and a repaint lands every page —
+/// each with the frame's own bytes. Two surfaces share the engine's one host
+/// `out` buffer, so the forced page can only hold the right colour if the
+/// compare really saw its force mark (and did not just leave the other
+/// surface's bytes there). The `between` hook runs exactly once per answered
+/// read. Covers whatever TEMP lab arms are on by default (image compare,
+/// device-local flags, async submit, fence spin, deferred reap).
+#[test]
+fn a_page_diff_lands_exactly_the_changed_and_forced_pages() {
+    let _g = engine_test_session();
+    let (w, h) = (64u32, 64u32);
+    let frame_bytes = (w * h * 4) as usize;
+    let pages = frame_bytes / 4096;
+    let surface = |id: u32| TargetIdentity::Surface {
+        id,
+        width: w,
+        height: h,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let (s1, s2) = (surface(7101), surface(7102));
+    let (m1, m2) = (7101u32, 7102u32);
+    let (k1, k2) = ((1u32, w, h, 1u64), (1u32, w, h, 2u64));
+    let x = [51u8, 102, 153, 255];
+    let y = [204u8, 0, 85, 255];
+    if !draw_uniform_into_resident(&s1, w, h, x) {
+        return; // no GPU
+    }
+    assert!(draw_uniform_into_resident(&s2, w, h, y));
+    let bgra = |c: [u8; 4]| [c[2], c[1], c[0], c[3]];
+    let read = |id: &TargetIdentity, mid: u32, key, force: &[u32]| {
+        let mut ran = 0u32;
+        let got = engine::read_target_changed_pages_with(id, mid, key, force, || ran += 1)
+            .expect("page diff read")
+            .expect("a BGRA8 resident takes the page diff");
+        assert_eq!(ran, 1, "the between hook runs once per answered read");
+        assert_eq!(got.frame_bytes as usize, frame_bytes);
+        // SAFETY: the engine's mapped `out` buffer, at least `frame_bytes`
+        // long, valid until the next page-diff call.
+        let out = unsafe { std::slice::from_raw_parts(got.frame_ptr, frame_bytes) }.to_vec();
+        (got.pages, got.full, out)
+    };
+    let page_is = |out: &[u8], p: usize, c: [u8; 4]| {
+        let want = bgra(c);
+        out[p * 4096..(p + 1) * 4096]
+            .chunks_exact(4)
+            .all(|t| t == want)
+    };
+
+    let (p, full, out) = read(&s1, m1, k1, &[]);
+    assert!(full, "a new shadow lands the whole frame");
+    assert_eq!(p, (0..pages as u32).collect::<Vec<_>>());
+    assert!(
+        (0..pages).all(|q| page_is(&out, q, x)),
+        "s1's first landing is s1's frame"
+    );
+    engine::page_diff_set_key(m1, k1);
+
+    let (_, full, out) = read(&s2, m2, k2, &[]);
+    assert!(full);
+    assert!(
+        (0..pages).all(|q| page_is(&out, q, y)),
+        "the shared out now holds s2's frame"
+    );
+    engine::page_diff_set_key(m2, k2);
+
+    let (p, full, out) = read(&s1, m1, k1, &[2]);
+    assert!(!full, "the shadow stands: this is a compare");
+    assert_eq!(p, vec![2], "only the forced page, nothing changed");
+    assert!(
+        page_is(&out, 2, x),
+        "the forced page was copied from s1's shadow"
+    );
+
+    let (p, _, _) = read(&s1, m1, k1, &[]);
+    assert!(p.is_empty(), "an unchanged frame lands nothing");
+
+    assert!(draw_uniform_into_resident(&s1, w, h, y));
+    let (p, full, out) = read(&s1, m1, k1, &[]);
+    assert!(!full);
+    assert_eq!(
+        p,
+        (0..pages as u32).collect::<Vec<_>>(),
+        "a repaint changes every page"
+    );
+    assert!(
+        (0..pages).all(|q| page_is(&out, q, y)),
+        "with the repaint's bytes"
+    );
+
+    let (p, _, _) = read(&s1, m1, k1, &[]);
+    assert!(p.is_empty(), "and the shadow followed the repaint");
+}
