@@ -1402,7 +1402,102 @@ pub fn note_sampled_surface_field<M: HostMemory>(
     let Some(window) = SampledFieldWindow::of_mapping(state, mapping_id) else {
         return;
     };
+    lab_gpx(state, host, mapping_id, texture_ref, route, window);
     note_sampled_surface_field_window(state, host, mapping_id, texture_ref, route, window);
+}
+
+/// TEMP (lab): every `(mid, x, y)` named by `REIMS_VGPU_LAB_GPX`.
+pub fn lab_gpx_all() -> &'static [(u32, u32, u32)] {
+    static POINTS: std::sync::OnceLock<Vec<(u32, u32, u32)>> = std::sync::OnceLock::new();
+    POINTS.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_GPX")
+            .unwrap_or_default()
+            .split(';')
+            .filter_map(|p| {
+                let (mid, xy) = p.split_once(':')?;
+                let (x, y) = xy.split_once(',')?;
+                Some((mid.trim().parse().ok()?, x.trim().parse().ok()?, y.trim().parse().ok()?))
+            })
+            .collect()
+    })
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_GPX=<mid>:<x>,<y>[;<mid>:<x>,<y>...]` reads those
+/// texels out of the named mapping's **guest pages** at every sampled bind of it
+/// and reports each change with the bind that saw it, the route and the count of
+/// binds so far. With the footprint watch armed on the mapping's pages (done here,
+/// the first time the mapping is seen), a `lab_gpx` change that has no
+/// `lab_wallwrite` before it is a write this device did not make.
+fn lab_gpx<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    texture_ref: u32,
+    route: &str,
+    window: SampledFieldWindow,
+) {
+    static LAST: std::sync::Mutex<Vec<((u32, u32, u32), [u8; 4])>> =
+        std::sync::Mutex::new(Vec::new());
+    static BINDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static ARMED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    let points = lab_gpx_all();
+    if points.is_empty() || !points.iter().any(|(m, _, _)| *m == mapping_id) {
+        return;
+    }
+    let Some(entries) = state.mappings.get(&mapping_id).map(|m| m.page_entries.as_slice()) else {
+        return;
+    };
+    let page = state.page_size();
+    let page_shift = state.page_shift;
+    let gpa_of = |e: u32| crate::protocol::iosurface_pages::entry_gpa_shift(e, page_shift);
+    let binds = BINDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut armed = ARMED.lock().unwrap_or_else(|p| p.into_inner());
+        // Re-armed whenever the page list changes size or the mapping is new: the
+        // watch is additive, so arming twice costs nothing.
+        let key = mapping_id ^ ((entries.len() as u32) << 8);
+        if !armed.contains(&key) {
+            armed.push(key);
+            let gpas: Vec<u64> = entries.iter().filter_map(|&e| gpa_of(e)).collect();
+            crate::observe::footprint::lab_watch_pages(&gpas, page);
+            crate::observe::fail(format!(
+                "lab_gpx_armed mid={mapping_id} pages={} first_gpa={:#x}",
+                gpas.len(),
+                gpas.first().copied().unwrap_or(0)
+            ));
+        }
+    }
+    for &(mid, x, y) in points.iter().filter(|(m, _, _)| *m == mapping_id) {
+        if x >= window.width || y >= window.height {
+            continue;
+        }
+        let off = window.base_off + u64::from(y) * u64::from(window.bpr) + u64::from(x) * 4;
+        let mut px = [0u8; 4];
+        let ok = entries
+            .get((off / page) as usize)
+            .and_then(|&e| gpa_of(e))
+            .is_some_and(|gpa| host.read_gpa(gpa + off % page, &mut px).is_ok());
+        if !ok {
+            continue;
+        }
+        let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = last.iter().position(|(k, _)| *k == (mid, x, y));
+        if slot.is_some_and(|i| last[i].1 == px) {
+            continue;
+        }
+        match slot {
+            Some(i) => last[i].1 = px,
+            None => last.push(((mid, x, y), px)),
+        }
+        crate::observe::fail(format!(
+            "lab_gpx mid={mid} ({x},{y})={px:?} ref={texture_ref} route={route} bind={binds} \
+             pages={} owed={} map_gen={:?} watch_hits={}",
+            entries.len(),
+            state.pending_writebacks.get(mid).is_some(),
+            state.mappings.get(&mid).map(|m| m.map_generation),
+            crate::observe::footprint::lab_watch_hits()
+        ));
+    }
 }
 
 /// The texels a sampled bind reads out of one mapping, and where they sit in it.

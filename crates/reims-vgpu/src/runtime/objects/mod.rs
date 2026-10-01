@@ -4369,6 +4369,13 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     // so taking it here changes no outcome — it changes whether the loss has a
     // name. `drop_windows` reports each one against this packet instead of
     // letting it disappear into a generation mismatch nothing attributes.
+    if crate::runtime::scanout::lab_gpx_all().iter().any(|(m, _, _)| *m == target) {
+        crate::observe::fail(format!(
+            "lab_debt replace_physical task={task_id} object={object_id} mid={target} owed={} map_gen={:?}",
+            state.pending_writebacks.get(target).is_some(),
+            state.mappings.get(&target).map(|m| m.map_generation)
+        ));
+    }
     let had = state.invalidate_mapping_pages(target);
     crate::runtime::drain::note_store_route(if had {
         "replace_physical_dropped"

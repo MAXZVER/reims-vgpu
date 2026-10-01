@@ -742,6 +742,46 @@ pub fn mapping_store_format(m: &MappingEntry) -> u16 {
     }
 }
 
+/// TEMP (lab): with `REIMS_VGPU_LAB_GPX` naming this mapping, say what frame a
+/// writeback is about to land: the named texels as the source holds them, and how
+/// many texels of the whole frame have alpha 0 / 255. A writeback whose source is
+/// already opaque black says the resident was; one whose source is transparent says
+/// the landing or something after it made the pages black.
+fn lab_pay_px(mapping_id: u32, src: &[u8], src_stride: u32, width: u32, height: u32) {
+    let pts: Vec<(u32, u32)> = crate::runtime::scanout::lab_gpx_all()
+        .iter()
+        .filter(|(m, _, _)| *m == mapping_id)
+        .map(|&(_, x, y)| (x, y))
+        .collect();
+    if pts.is_empty() {
+        return;
+    }
+    let (mut a0, mut a255, mut other) = (0u64, 0u64, 0u64);
+    for y in 0..height as usize {
+        let row = y * src_stride as usize;
+        let Some(row) = src.get(row..row + width as usize * 4) else {
+            break;
+        };
+        for px in row.chunks_exact(4) {
+            match px[3] {
+                0 => a0 += 1,
+                255 => a255 += 1,
+                _ => other += 1,
+            }
+        }
+    }
+    let mut seen = String::new();
+    for (x, y) in pts {
+        let off = y as usize * src_stride as usize + x as usize * 4;
+        if let Some(p) = src.get(off..off + 4) {
+            seen.push_str(&format!(" ({x},{y})={p:?}"));
+        }
+    }
+    crate::observe::fail(format!(
+        "lab_pay_px mid={mapping_id} {width}x{height} stride={src_stride}{seen} alpha0={a0} alpha255={a255} alpha_other={other}"
+    ));
+}
+
 /// What a writeback leaves in the host surface cache when it is done.
 enum CacheOutcome<'a> {
     /// Publish this frame as the mapping's entry, sharing the caller's
@@ -777,6 +817,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             SurfaceWriteRefusal::SourceStride { src_stride, width },
         );
     }
+    lab_pay_px(mapping_id, src, src_stride, width, height); // TEMP (lab)
     // Before the landing: the stamps below vouch for pages this write puts in
     // place, and a generation read after it could fold in a guest write that
     // landed meanwhile (see `GuestWriteObservation`).

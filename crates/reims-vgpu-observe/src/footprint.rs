@@ -312,6 +312,89 @@ pub fn note_written_range(gpa: u64, len: u64) {
     let first = gpa >> FRAME_SHIFT;
     let last = gpa.saturating_add(len - 1) >> FRAME_SHIFT;
     FOOTPRINT.mark_range(first, last);
+    lab_watch_hit(gpa, len);
+}
+
+/// TEMP (lab): frames a probe asked to be told about, as `(first, last)` frame
+/// numbers, and how many hits were reported so far.
+static LAB_WATCH: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+static LAB_WATCH_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAB_WATCH_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// TEMP (lab): add the frames of these guest pages to the watch. Every later
+/// [`note_written_range`] that touches one is reported as a `lab_wallwrite` fail
+/// line with its range and, for the first few, a backtrace, so "did this device
+/// write into that surface, when, and from where" is answerable without a
+/// debugger. Registering the same pages again adds nothing.
+pub fn lab_watch_pages(gpas: &[u64], page_size: u64) {
+    let mut w = LAB_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    for &g in gpas {
+        let first = g >> FRAME_SHIFT;
+        let last = (g + page_size.max(1) - 1) >> FRAME_SHIFT;
+        w.push((first, last));
+    }
+    w.sort_unstable();
+    w.dedup();
+    LAB_WATCH_ON.store(!w.is_empty(), Ordering::Release);
+}
+
+fn lab_watch_hit(gpa: u64, len: u64) {
+    if !LAB_WATCH_ON.load(Ordering::Acquire) {
+        return;
+    }
+    let first = gpa >> FRAME_SHIFT;
+    let last = gpa.saturating_add(len - 1) >> FRAME_SHIFT;
+    let w = LAB_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    let at = w.partition_point(|&(_, l)| l < first);
+    let Some(&(wf, wl)) = w.get(at) else {
+        return;
+    };
+    if wf > last {
+        return;
+    }
+    drop(w);
+    let n = LAB_WATCH_HITS.fetch_add(1, Ordering::Relaxed);
+    // Hits come in bursts (one writeback of a whole surface is thousands of page
+    // writes), so only the first hit after a quiet 20 ms is reported, with how
+    // many hits the burst before it had.
+    static BURST: std::sync::Mutex<(Option<std::time::Instant>, u64, u64)> =
+        std::sync::Mutex::new((None, 0, 0));
+    let now = std::time::Instant::now();
+    let (prev_hits, bursts) = {
+        let mut b = BURST.lock().unwrap_or_else(|e| e.into_inner());
+        let quiet = b.0.is_none_or(|t| now.duration_since(t) > std::time::Duration::from_millis(20));
+        b.0 = Some(now);
+        if !quiet {
+            b.1 += 1;
+            return;
+        }
+        let out = (b.1, b.2);
+        b.1 = 1;
+        b.2 += 1;
+        out
+    };
+    if bursts >= 400 {
+        return;
+    }
+    let bt = format!(
+        " bt={}",
+        std::backtrace::Backtrace::force_capture()
+            .to_string()
+            .lines()
+            .filter(|l| l.contains("reims_vgpu"))
+            .take(12)
+            .map(|l| l.trim().replace(' ', "_"))
+            .collect::<Vec<_>>()
+            .join(">")
+    );
+    crate::fail(format!(
+        "lab_wallwrite burst={bursts} prev_burst_hits={prev_hits} n={n} gpa={gpa:#x} len={len}          watched_frame={wf:#x}-{wl:#x}{bt}"
+    ));
+}
+
+/// TEMP (lab): how many device writes into watched pages were seen so far.
+pub fn lab_watch_hits() -> u64 {
+    LAB_WATCH_HITS.load(Ordering::Relaxed)
 }
 
 /// Whether this device has written the frame containing `gpa` at any point in

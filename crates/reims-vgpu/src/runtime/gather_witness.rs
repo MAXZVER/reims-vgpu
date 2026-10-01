@@ -1347,6 +1347,17 @@ pub struct GatheredIdentity {
     pub generation: u64,
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_WATCHKEY=<content_key>` names one gather window
+/// whose pages the footprint watches for this device's writes.
+fn lab_watch_key() -> Option<u64> {
+    static KEY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *KEY.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_WATCHKEY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    })
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_STATED_VOUCH=on` lets the guest's stated channel
 /// stand in for this epoch's hypervisor sync (see `observe` and
 /// `mapper::mapping_guest_write_verdict`).
@@ -1407,6 +1418,18 @@ fn observe<M: crate::runtime::host::HostOps>(
             if old.token != 0 {
                 host.untrack_guest_writes(old.token);
             }
+        }
+        // TEMP (lab, REIMS_VGPU_LAB_WATCHKEY=<content_key>): tell the footprint
+        // which pages this window is made of, so every write this device makes
+        // into them is reported with the time and the caller.
+        if lab_watch_key().is_some_and(|k| k == key.content_key()) {
+            crate::observe::footprint::lab_watch_pages(gpas, page_size as u64);
+            crate::observe::fail(format!(
+                "lab_wallwatch armed key={} pages={} first_gpa={:#x} span={span}",
+                key.content_key(),
+                gpas.len(),
+                gpas.first().copied().unwrap_or(0)
+            ));
         }
         let token = host.track_guest_writes(gpas, page_size).unwrap_or(0);
         let gen = if token == 0 {

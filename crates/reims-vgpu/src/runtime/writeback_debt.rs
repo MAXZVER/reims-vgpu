@@ -333,6 +333,35 @@ pub struct PendingWritebacks {
     next_gva_generation: u64,
 }
 
+/// TEMP (lab): with `REIMS_VGPU_LAB_GPX` naming `mapping_id`, record each arm and
+/// each take of its surface debt with a short call chain, so "who paid, dropped or
+/// superseded the frame this mapping was owed, and when" reads off the log.
+pub fn lab_debt_event(what: &str, mapping_id: u32, seq: u64) {
+    if !crate::runtime::scanout::lab_gpx_all()
+        .iter()
+        .any(|(m, _, _)| *m == mapping_id)
+    {
+        return;
+    }
+    let bt = std::backtrace::Backtrace::force_capture()
+        .to_string()
+        .lines()
+        .filter(|l| l.contains("reims_vgpu::"))
+        .skip(1)
+        .take(6)
+        .map(|l| {
+            l.trim()
+                .split("::<")
+                .next()
+                .unwrap_or("")
+                .replace("_reims_vgpu::", "")
+                .replace(' ', "_")
+        })
+        .collect::<Vec<_>>()
+        .join(">");
+    crate::observe::fail(format!("lab_debt {what} mid={mapping_id} seq={seq} bt={bt}"));
+}
+
 impl PendingWritebacks {
     /// Mappings currently owed a frame.
     pub fn len(&self) -> usize {
@@ -352,7 +381,11 @@ impl PendingWritebacks {
 
     /// Take `mapping_id`'s debt, leaving it owed nothing.
     pub fn take(&mut self, mapping_id: u32) -> Option<WritebackDebt> {
-        self.debts.remove(&mapping_id)
+        let taken = self.debts.remove(&mapping_id);
+        if taken.is_some() {
+            lab_debt_event("take", mapping_id, taken.as_ref().map_or(0, |d| d.seq));
+        }
+        taken
     }
 
     /// Every mapping owed a frame, oldest arm first.
@@ -397,6 +430,7 @@ impl PendingWritebacks {
         };
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
+        lab_debt_event("arm", mapping_id, seq);
         let previous = self.debts.insert(
             mapping_id,
             WritebackDebt {
