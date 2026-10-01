@@ -1,8 +1,8 @@
 //! TEMP (lab, S5a): a recorder thread that records the engine half of a chained
 //! draw while the drain prepares the next one.
 //!
-//! `REIMS_VGPU_LAB_RECORDER=on` turns it on (default off; `off` is the old path,
-//! byte for byte: nothing here is reached when it is off).
+//! On by default since the 5K in-boot A/B (busy -17.7 +- 3.6 ms/s, +0.9 fps at 240 Hz);
+//! `REIMS_VGPU_LAB_RECORDER=off` is the old path, byte for byte: nothing here is reached then.
 //!
 //! # What it moves, and what it must not
 //!
@@ -658,12 +658,12 @@ enum Mode {
 fn mode() -> &'static Mode {
     static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
     MODE.get_or_init(|| match std::env::var("REIMS_VGPU_LAB_RECORDER") {
-        Ok(v) if v == "on" => Mode::On,
+        Ok(v) if v == "off" => Mode::Off,
         Ok(v) => match v.strip_prefix("toggle:") {
             Some(path) if !path.is_empty() => Mode::Toggle(path.to_string()),
-            _ => Mode::Off,
+            _ => Mode::On,
         },
-        Err(_) => Mode::Off,
+        Err(_) => Mode::On,
     })
 }
 
