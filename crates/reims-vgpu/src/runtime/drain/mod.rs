@@ -4554,6 +4554,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
         base_gpa: base,
         capacity: ring_size,
     };
+    let mut lab_consumed = false;
     loop {
         // Loaded once per turn and used for the whole of it. Every read below
         // used to load it again, which was the same value each time — nothing
@@ -4565,12 +4566,21 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
             .load(std::sync::atomic::Ordering::Acquire);
         host.note_work_scope(crate::runtime::host::WorkScope::All);
         match arrival(&ring, host, head, state.gfx.fifo_written) {
-            Arrival::Nothing => break,
+            Arrival::Nothing => {
+                host.note_work_scope(if lab_consumed {
+                    crate::runtime::host::WorkScope::RingDrained(0)
+                } else {
+                    crate::runtime::host::WorkScope::RingEmpty(0)
+                });
+                break;
+            }
             Arrival::Fault(fault) => {
                 state.record_fail(FailEvent::MalformedRootPacket { fault, head });
                 break;
             }
             Arrival::Packet(packet) => {
+                lab_consumed = true;
+                host.note_work_scope(crate::runtime::host::WorkScope::PacketRead(0));
                 // The census, asked for the reading and not for a verdict. The
                 // wait this timeline holds most often is a `DELETE_TASK`
                 // ordered behind a child FIFO's stamp, and running it early
@@ -7432,6 +7442,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     state.draining_channel = channel_id;
     state.draining_mask |= bit;
 
+    let mut lab_consumed = false;
     loop {
         let regs_started = std::time::Instant::now();
         let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
@@ -7457,7 +7468,14 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
             page_shift: state.page_shift,
         };
         match arrival(&ring, host, head, tail) {
-            Arrival::Nothing => break,
+            Arrival::Nothing => {
+                host.note_work_scope(if lab_consumed {
+                    crate::runtime::host::WorkScope::RingDrained(channel_id)
+                } else {
+                    crate::runtime::host::WorkScope::RingEmpty(channel_id)
+                });
+                break;
+            }
             Arrival::Fault(fault) => {
                 state.record_fail(FailEvent::MalformedChildPacket {
                     channel: channel_id,
@@ -7467,6 +7485,8 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 break;
             }
             Arrival::Packet(packet) => {
+                lab_consumed = true;
+                host.note_work_scope(crate::runtime::host::WorkScope::PacketRead(channel_id));
                 // The census the model's own stamp plane now acts on. Asked for
                 // the reading and not for a verdict: a wait that is not yet met
                 // is an ordering position in `admit`, not a ring head this loop

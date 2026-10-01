@@ -832,6 +832,10 @@ impl HostOps for QemuHost<'_> {
             let raw = match scope {
                 crate::runtime::host::WorkScope::All => crate::qemu::abi::REIMS_VGPU_WORK_SCOPE_ALL,
                 crate::runtime::host::WorkScope::Channel(ch) => ch,
+                // TEMP lab: census notifications, told apart by their high bits.
+                crate::runtime::host::WorkScope::PacketRead(ch) => 0x8000_0000 | ch,
+                crate::runtime::host::WorkScope::RingDrained(ch) => 0x4000_0000 | ch,
+                crate::runtime::host::WorkScope::RingEmpty(ch) => 0x2000_0000 | ch,
             };
             // SAFETY: QEMU owns the live ctx; the callback takes a leaf lock.
             unsafe { callback(self.ops.ctx, raw) }
@@ -1532,6 +1536,39 @@ mod tests {
     unsafe extern "C" fn token_plus_one(_ctx: *mut c_void, token: u64) -> u64 {
         // The lagged form arrives with bit 63 set; the answer is the same.
         (token & !(1 << 63)) + 1
+    }
+
+    static LAST_WORK_SCOPE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    unsafe extern "C" fn remember_work_scope(_ctx: *mut c_void, scope: u32) {
+        LAST_WORK_SCOPE.store(scope, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// TEMP lab (`REIMS_VGPU_LAB_DIRTY_HOLE=census`): the drain tells the shim, besides the
+    /// scope its reads are owed, when it read a packet and how it left a ring. The shim
+    /// tells the three apart from a scope by the high bits, and a scope below 64 is a channel.
+    #[test]
+    fn the_work_scope_codes_the_shim_receives_are_told_apart() {
+        use crate::runtime::host::{HostOps as _, WorkScope};
+        let mut table = ReimsVgpuHostOps::null();
+        table.note_work_scope = Some(remember_work_scope);
+        let mut actions = VecDeque::new();
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let drain = QemuHost::new(&table, &mut actions, &prompt);
+        for (scope, raw) in [
+            (WorkScope::All, 0xffff_ffff),
+            (WorkScope::Channel(3), 3),
+            (WorkScope::PacketRead(3), 0x8000_0003),
+            (WorkScope::RingDrained(3), 0x4000_0003),
+            (WorkScope::RingEmpty(0), 0x2000_0000),
+        ] {
+            drain.note_work_scope(scope);
+            assert_eq!(
+                LAST_WORK_SCOPE.load(std::sync::atomic::Ordering::SeqCst),
+                raw,
+                "{scope:?}"
+            );
+        }
     }
 
     /// A pool worker's host reads through the shim's table exactly as the drain's

@@ -439,6 +439,17 @@ pub enum WorkScope {
     All,
     /// Only the stores ordered before this channel's own doorbells (0 = root).
     Channel(u32),
+    /// TEMP lab (`REIMS_VGPU_LAB_DIRTY_HOLE`): a packet was just read from this
+    /// channel's ring (0 = root). Not a scope. A shim that counts doorbells may
+    /// see here that the packet's own has not been noted yet, and open an epoch
+    /// after this read for the reads that follow to need.
+    PacketRead(u32),
+    /// TEMP lab: this channel's ring was found empty after the drain consumed
+    /// packets from it.
+    RingDrained(u32),
+    /// TEMP lab: this channel's ring was found empty when the drain came to it,
+    /// before it had consumed a packet.
+    RingEmpty(u32),
 }
 
 /// Services the device cannot provide itself (time, wake, action enqueue,
