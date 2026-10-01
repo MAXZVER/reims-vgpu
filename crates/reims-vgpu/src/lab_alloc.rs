@@ -16,23 +16,38 @@
 //! so the allocator never allocates through itself; a thread's cache is left
 //! behind when the thread exits (the device's threads live as long as QEMU).
 //!
-//! `REIMS_VGPU_LAB_TCACHE=off` passes everything to the system heap. Read once,
+//! `REIMS_VGPU_LAB_TCACHE=big` caches blocks up to 64 KiB (the system heap
+//! serves blocks past its low-fragmentation sizes under its lock), each class
+//! holding at most 1 MiB. `REIMS_VGPU_LAB_TCACHE=off` passes everything to the system heap. Read once,
 //! at the first allocation, before any block exists, so no block can be freed
 //! by a path other than the one that allocated it.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
-const CLASS_SIZES: [usize; 16] = [
-    16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
+const CLASS_SIZES: [usize; 24] = [
+    16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192,
+    12288, 16384, 24576, 32768, 49152, 65536,
 ];
 const MAX_SMALL: usize = 4096;
+const MAX_BIG: usize = 65536;
 const MAX_PER_CLASS: u32 = 256;
+/// Bytes one class list may hold (caps the counts of the big classes).
+const MAX_CLASS_BYTES: usize = 1 << 20;
+/// The largest cached size, decided with the mode: 4 KiB (`on`) or 64 KiB (`big`).
+static LIMIT: AtomicUsize = AtomicUsize::new(0);
 const ALIGN: usize = 16;
 
-/// Class index for a size of at most [`MAX_SMALL`] bytes (a size of 0 is class 0).
+/// Class index for a size of at most [`MAX_BIG`] bytes (a size of 0 is class 0).
 #[inline]
 fn class_of(size: usize) -> usize {
+    if size > MAX_SMALL {
+        let mut c = 16;
+        while CLASS_SIZES[c] < size {
+            c += 1;
+        }
+        return c;
+    }
     // A lookup by 16-byte granule: 256 entries cover 4 KiB.
     static TABLE: [u8; 257] = {
         let mut t = [0u8; 257];
@@ -90,6 +105,8 @@ fn decide() -> bool {
     // SAFETY: both buffers are ours and sized as passed.
     let n = unsafe { GetEnvironmentVariableW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
     let off = n == 3 && buf[0] == u16::from(b'o') && buf[1] == u16::from(b'f') && buf[2] == u16::from(b'f');
+    let big = n == 3 && buf[0] == u16::from(b'b') && buf[1] == u16::from(b'i') && buf[2] == u16::from(b'g');
+    LIMIT.store(if big { MAX_BIG } else { MAX_SMALL }, Ordering::Relaxed);
     let mut on = !off;
     if on {
         // SAFETY: plain Win32 call.
@@ -146,9 +163,15 @@ fn class_layout(c: usize) -> Layout {
     unsafe { Layout::from_size_align_unchecked(CLASS_SIZES[c], ALIGN) }
 }
 
+/// Whether the block is cached; asked only once `enabled()` has decided the mode.
 #[inline]
 fn small(layout: &Layout) -> bool {
-    layout.size() <= MAX_SMALL && layout.align() <= ALIGN
+    layout.size() <= LIMIT.load(Ordering::Relaxed) && layout.align() <= ALIGN
+}
+
+#[inline]
+fn class_cap(c: usize) -> u32 {
+    MAX_PER_CLASS.min((MAX_CLASS_BYTES / CLASS_SIZES[c]) as u32)
 }
 
 unsafe impl GlobalAlloc for ThreadCache {
@@ -158,7 +181,7 @@ unsafe impl GlobalAlloc for ThreadCache {
         // live block of at least the class size and 16-byte alignment, and the
         // cache pointer is this thread's own.
         unsafe {
-            if !small(&layout) || !enabled() {
+            if !enabled() || !small(&layout) {
                 return System.alloc(layout);
             }
             let c = class_of(layout.size());
@@ -179,7 +202,7 @@ unsafe impl GlobalAlloc for ThreadCache {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // SAFETY: as `alloc`; the block is at least `layout.size()` bytes.
         unsafe {
-            if !small(&layout) || !enabled() {
+            if !enabled() || !small(&layout) {
                 return System.alloc_zeroed(layout);
             }
             let p = self.alloc(layout);
@@ -195,12 +218,12 @@ unsafe impl GlobalAlloc for ThreadCache {
         // SAFETY: `ptr` was allocated by this allocator with `layout`, so a small
         // one is a class block (at least 16 bytes: room for the list link).
         unsafe {
-            if !small(&layout) || !enabled() {
+            if !enabled() || !small(&layout) {
                 return System.dealloc(ptr, layout);
             }
             let c = class_of(layout.size());
             let cache = cache();
-            if !cache.is_null() && (*cache).counts[c] < MAX_PER_CLASS {
+            if !cache.is_null() && (*cache).counts[c] < class_cap(c) {
                 *(ptr as *mut *mut u8) = (*cache).heads[c];
                 (*cache).heads[c] = ptr;
                 (*cache).counts[c] += 1;
@@ -242,7 +265,7 @@ mod tests {
 
     #[test]
     fn every_size_fits_its_class() {
-        for size in 0..=MAX_SMALL {
+        for size in 0..=MAX_BIG {
             let c = class_of(size);
             assert!(CLASS_SIZES[c] >= size, "size {size} class {c}");
             assert!(c == 0 || CLASS_SIZES[c - 1] < size, "size {size} class {c} not the smallest");
