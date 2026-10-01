@@ -16,7 +16,8 @@
 //! The engine has to see exactly the sequence it saw before, so the rule is
 //! one-sided and lives in the engine's own doors, not at each call site:
 //!
-//! * **At most one job is in flight**, and only the drain submits one.
+//! * **At most one job is in flight** (lab `REIMS_VGPU_LAB_RECORDER_DEPTH=N`:
+//!   up to N, run in order), and only the drain submits one.
 //! * **Every drain-side entry into engine state first waits for the job.**
 //!   [`lock_engine`](super::lock_engine) on the drain thread, the drain's
 //!   [`DeviceObjectCaches::with`](super::DeviceObjectCaches), and the few
@@ -166,8 +167,10 @@ impl<T> AssertSend<T> {
 }
 
 struct Inner {
-    job: Option<Job>,
-    result: Option<JobResult>,
+    /// Posted and not yet taken by the worker, oldest first.
+    jobs: std::collections::VecDeque<Job>,
+    /// Posted and not yet finished (queued or running).
+    outstanding: u32,
     /// A result the drain already waited for (an implicit join) and nobody has
     /// taken yet.
     stash: Option<JobResult>,
@@ -203,10 +206,9 @@ pub(crate) struct Handoff {
     stash_pending: AtomicBool,
     /// A job is posted and the worker has not taken it yet (spin target).
     pending: AtomicBool,
-    /// The worker posted a result (spin target).
-    done: AtomicBool,
-    /// A job was submitted and its result is not yet in the stash. Written only
-    /// by the submitting side.
+    /// Some posted job has not finished (spin target of a settle). Set by the
+    /// submitter and cleared by the worker when the last one finishes, both
+    /// under `inner`; the worker's job writes happen before its clear.
     in_flight: AtomicBool,
     alive: AtomicBool,
     stats: Stats,
@@ -268,6 +270,22 @@ fn worker_spin() -> Duration {
     })
 }
 
+/// Lab `REIMS_VGPU_LAB_RECORDER_DEPTH=N` (1..=16, default 1): how many deferred
+/// draws may be out at once. Above 1 the drain's explicit join before the next
+/// draw takes only a failure already found and does not wait; a failure is then
+/// reported up to N-1 draws later, which those draws' preparation has run past
+/// (observations, caches and debt payment, correct on their own). Read once.
+pub(crate) fn depth() -> u32 {
+    static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_RECORDER_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1u32)
+            .clamp(1, 16)
+    })
+}
+
 impl Handoff {
     pub(crate) const fn new(name: &'static str) -> Self {
         Self {
@@ -275,8 +293,8 @@ impl Handoff {
             lifecycle: Mutex::new(()),
             settle_lock: Mutex::new(()),
             inner: Mutex::new(Inner {
-                job: None,
-                result: None,
+                jobs: std::collections::VecDeque::new(),
+                outstanding: 0,
                 stash: None,
                 worker_parked: false,
                 kick: false,
@@ -288,7 +306,6 @@ impl Handoff {
             done_cv: Condvar::new(),
             stash_pending: AtomicBool::new(false),
             pending: AtomicBool::new(false),
-            done: AtomicBool::new(false),
             in_flight: AtomicBool::new(false),
             alive: AtomicBool::new(false),
             stats: Stats::new(),
@@ -349,7 +366,7 @@ impl Handoff {
                 }
             }
             let mut g = self.inner.lock();
-            while g.job.is_none() && !g.shutdown && !g.kick {
+            while g.jobs.is_empty() && !g.shutdown && !g.kick {
                 g.worker_parked = true;
                 self.work_cv.wait(&mut g);
             }
@@ -358,16 +375,17 @@ impl Handoff {
                 // Woken ahead of a job (a stream is starting): spin for it
                 // instead of sleeping on it.
                 g.kick = false;
-                if g.job.is_none() && !g.shutdown {
+                if g.jobs.is_empty() && !g.shutdown {
                     continue;
                 }
             }
             // Retiring: `stop` clears `alive` after it has joined this thread,
             // under `lifecycle`, so there is nothing for the exit to publish.
-            let Some(job) = g.job.take() else {
+            // It settled first, so nothing is queued.
+            let Some(job) = g.jobs.pop_front() else {
                 return;
             };
-            self.pending.store(false, Ordering::Release);
+            self.pending.store(!g.jobs.is_empty(), Ordering::Release);
             drop(g);
             let started = Instant::now();
             let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
@@ -378,8 +396,11 @@ impl Handoff {
                 .busy_ns
                 .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let mut g = self.inner.lock();
-            g.result = Some(result);
-            self.done.store(true, Ordering::Release);
+            stash_result(&mut g, &self.stash_pending, result);
+            g.outstanding -= 1;
+            if g.outstanding == 0 {
+                self.in_flight.store(false, Ordering::Release);
+            }
             if g.waiters != 0 {
                 self.done_cv.notify_all();
             }
@@ -392,10 +413,12 @@ impl Handoff {
     /// in the stash like any other.
     pub(crate) fn submit(&'static self, job: Job) {
         let _lifecycle = self.lifecycle.lock();
-        debug_assert!(!self.in_flight(), "one job in flight");
-        if self.in_flight() {
+        let depth = depth();
+        if depth <= 1 && self.in_flight() {
             // Defensive: wait for it rather than overwrite it.
             self.settle(JoinSite::Explicit);
+        } else if depth > 1 && self.inner.lock().outstanding >= depth {
+            self.wait_below(depth);
         }
         if !self.ensure_worker() {
             self.stats.submit_declined.fetch_add(1, Ordering::Relaxed);
@@ -407,7 +430,8 @@ impl Handoff {
             return;
         }
         let mut g = self.inner.lock();
-        g.job = Some(job);
+        g.jobs.push_back(job);
+        g.outstanding += 1;
         self.in_flight.store(true, Ordering::Release);
         self.pending.store(true, Ordering::Release);
         if g.worker_parked {
@@ -462,7 +486,7 @@ impl Handoff {
         let spin_until = started + JOIN_SPIN;
         let mut i = 0u32;
         let mut blocked = false;
-        while !self.done.load(Ordering::Acquire) {
+        while self.in_flight.load(Ordering::Acquire) {
             std::hint::spin_loop();
             i = i.wrapping_add(1);
             if i & 31 == 0 && Instant::now() >= spin_until {
@@ -470,17 +494,12 @@ impl Handoff {
             }
         }
         let mut g = self.inner.lock();
-        while g.result.is_none() {
+        while g.outstanding != 0 {
             blocked = true;
             g.waiters += 1;
             self.done_cv.wait(&mut g);
             g.waiters -= 1;
         }
-        if let Some(result) = g.result.take() {
-            stash_result(&mut g, &self.stash_pending, result);
-        }
-        self.done.store(false, Ordering::Release);
-        self.in_flight.store(false, Ordering::Release);
         drop(g);
         let ns = started.elapsed().as_nanos() as u64;
         let s = site.index();
@@ -510,6 +529,39 @@ impl Handoff {
         let taken = g.stash.take();
         self.stash_pending.store(false, Ordering::Release);
         taken
+    }
+
+    /// Lab `RECORDER_DEPTH` > 1: what finished jobs have stashed, without
+    /// waiting for the ones still out. A failure among them is the first one.
+    pub(crate) fn take_nowait(&self) -> Option<JobResult> {
+        if !self.stash_pending.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut g = self.inner.lock();
+        let taken = g.stash.take();
+        self.stash_pending.store(false, Ordering::Release);
+        taken
+    }
+
+    /// Wait until fewer than `depth` jobs are out (a full queue at submit),
+    /// counted as an explicit join.
+    #[cold]
+    #[track_caller]
+    fn wait_below(&self, depth: u32) {
+        let started = Instant::now();
+        let mut g = self.inner.lock();
+        while g.outstanding >= depth {
+            g.waiters += 1;
+            self.done_cv.wait(&mut g);
+            g.waiters -= 1;
+        }
+        drop(g);
+        let ns = started.elapsed().as_nanos() as u64;
+        let s = JoinSite::Explicit.index();
+        self.stats.join_n[s].fetch_add(1, Ordering::Relaxed);
+        self.stats.join_blocked[s].fetch_add(1, Ordering::Relaxed);
+        self.stats.join_ns[s].fetch_add(ns, Ordering::Relaxed);
+        self.stats.join_max_ns[s].fetch_max(ns, Ordering::Relaxed);
     }
 
     pub(crate) fn note_deferred_error(&self) {
