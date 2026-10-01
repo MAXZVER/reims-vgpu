@@ -333,6 +333,35 @@ pub struct PendingWritebacks {
     next_gva_generation: u64,
 }
 
+/// TEMP (lab): with `REIMS_VGPU_LAB_GPX` naming `mapping_id`, record each arm and
+/// each take of its surface debt with a short call chain, so "who paid, dropped or
+/// superseded the frame this mapping was owed, and when" reads off the log.
+pub fn lab_debt_event(what: &str, mapping_id: u32, seq: u64) {
+    if !crate::runtime::scanout::lab_gpx_all()
+        .iter()
+        .any(|(m, _, _)| *m == mapping_id)
+    {
+        return;
+    }
+    let bt = std::backtrace::Backtrace::force_capture()
+        .to_string()
+        .lines()
+        .filter(|l| l.contains("reims_vgpu::"))
+        .skip(1)
+        .take(6)
+        .map(|l| {
+            l.trim()
+                .split("::<")
+                .next()
+                .unwrap_or("")
+                .replace("_reims_vgpu::", "")
+                .replace(' ', "_")
+        })
+        .collect::<Vec<_>>()
+        .join(">");
+    crate::observe::fail(format!("lab_debt {what} mid={mapping_id} seq={seq} bt={bt}"));
+}
+
 impl PendingWritebacks {
     /// Mappings currently owed a frame.
     pub fn len(&self) -> usize {
@@ -352,7 +381,11 @@ impl PendingWritebacks {
 
     /// Take `mapping_id`'s debt, leaving it owed nothing.
     pub fn take(&mut self, mapping_id: u32) -> Option<WritebackDebt> {
-        self.debts.remove(&mapping_id)
+        let taken = self.debts.remove(&mapping_id);
+        if taken.is_some() {
+            lab_debt_event("take", mapping_id, taken.as_ref().map_or(0, |d| d.seq));
+        }
+        taken
     }
 
     /// Every mapping owed a frame, oldest arm first.
@@ -397,6 +430,7 @@ impl PendingWritebacks {
         };
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
+        lab_debt_event("arm", mapping_id, seq);
         let previous = self.debts.insert(
             mapping_id,
             WritebackDebt {
@@ -1105,6 +1139,102 @@ fn note_gva_payment_skipped_by_name(state: &DeviceState, task_id: u32, texture_r
     }
 }
 
+/// TEMP (lab): which exit `pay` took for a `REIMS_VGPU_LAB_GPX` mapping.
+fn lab_pay_exit(mapping_id: u32, debt: &WritebackDebt, exit: &str) {
+    if crate::runtime::scanout::lab_gpx_all()
+        .iter()
+        .any(|(m, _, _)| *m == mapping_id)
+    {
+        crate::observe::fail(format!(
+            "lab_pay_exit mid={mapping_id} seq={} exit={exit}",
+            debt.seq
+        ));
+    }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_BLOCK=<mid>`): a reference that names this mapping
+/// does not pay it. Only to make an A/B deterministic: with the payment after the
+/// first arm forced, nothing else may land the later frame.
+fn lab_pay_block(mapping_id: u32) -> bool {
+    use std::sync::OnceLock;
+    static MID: OnceLock<Option<u32>> = OnceLock::new();
+    *MID.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PAY_BLOCK")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    }) == Some(mapping_id)
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_AFTER_ARM=<mid>[:<delay_ms>]`): the first debt
+/// armed for this mapping is paid `delay_ms` later (default at once), if it is still
+/// the debt of that first frame, so the guest's pages hold the first frame the
+/// mapping rendered -- the order a payment between two passes produces by chance.
+/// Polled from every arm of every mapping, which is often enough for a delay of
+/// seconds. A debt already replaced by the second frame is left alone and logged as
+/// missed, so such a boot is not counted as a trial of the early payment.
+pub fn lab_pay_after_first_arm<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    use std::sync::{Mutex, OnceLock};
+    #[derive(Clone, Copy)]
+    enum Phase {
+        Waiting,
+        Armed { at: std::time::Instant, seq: u64 },
+        Done,
+    }
+    static CFG: OnceLock<Option<(u32, u64)>> = OnceLock::new();
+    static PHASE: Mutex<Phase> = Mutex::new(Phase::Waiting);
+    let Some((want, delay_ms)) = *CFG.get_or_init(|| {
+        let v = std::env::var("REIMS_VGPU_LAB_PAY_AFTER_ARM").ok()?;
+        let (mid, delay) = v.split_once(':').unwrap_or((v.as_str(), "0"));
+        Some((mid.trim().parse().ok()?, delay.trim().parse().ok()?))
+    }) else {
+        return;
+    };
+    let mut phase = PHASE.lock().unwrap_or_else(|e| e.into_inner());
+    match *phase {
+        Phase::Done => {}
+        Phase::Waiting => {
+            if mapping_id == want {
+                let seq = state.pending_writebacks.get(want).map_or(0, |d| d.seq);
+                if delay_ms == 0 {
+                    *phase = Phase::Done;
+                    drop(phase);
+                    crate::observe::fail(format!(
+                        "lab_pay_after_first_arm mid={want} seq={seq} delay_ms=0 (forced early payment of the first frame)"
+                    ));
+                    pay_for_mapping(state, host, want);
+                } else {
+                    *phase = Phase::Armed {
+                        at: std::time::Instant::now(),
+                        seq,
+                    };
+                }
+            }
+        }
+        Phase::Armed { at, seq } => {
+            if at.elapsed() >= std::time::Duration::from_millis(delay_ms) {
+                *phase = Phase::Done;
+                drop(phase);
+                match state.pending_writebacks.get(want) {
+                    Some(d) if d.seq == seq => {
+                        crate::observe::fail(format!(
+                            "lab_pay_after_first_arm mid={want} seq={seq} delay_ms={delay_ms} (forced early payment of the first frame)"
+                        ));
+                        pay_for_mapping(state, host, want);
+                    }
+                    other => crate::observe::fail(format!(
+                        "lab_pay_after_first_arm_missed mid={want} seq={seq} now={:?} (the first frame is no longer the one owed)",
+                        other.map(|d| d.seq)
+                    )),
+                }
+            }
+        }
+    }
+}
+
 /// Pay whatever a *texture* reference names, for a reader that reaches guest
 /// bytes through a task GVA but knows which resource it is reading.
 ///
@@ -1172,6 +1302,9 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
     let targets = state.mappings_named_by(task_id, texture_ref);
     for mapping_id in targets.iter() {
         if state.pending_writebacks.get(mapping_id).is_some() {
+            if lab_pay_block(mapping_id) {
+                continue;
+            }
             named = true;
             pay_for_mapping(state, host, mapping_id);
         }
@@ -1920,11 +2053,13 @@ fn pay<M: HostMemory + HostOps>(
 ) {
     let Some(entry) = state.mappings.get(&mapping_id) else {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
+        lab_pay_exit(mapping_id, &debt, "no_mapping");
         return;
     };
     let (map_generation, validity) = (entry.map_generation, entry.validity);
     if map_generation != debt.map_generation {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
+        lab_pay_exit(mapping_id, &debt, "generation_moved");
         return;
     }
     // The resident the draw registered, not the one a fresh derivation would
@@ -1934,9 +2069,11 @@ fn pay<M: HostMemory + HostOps>(
         == crate::runtime::resource_validity::WritebackLicence::Superseded
     {
         crate::runtime::drain::note_store_route("wbdebt_abandoned_guest_wrote");
+        lab_pay_exit(mapping_id, &debt, "abandoned_guest_wrote");
         rail.abandon_resident(&debt.target);
         return;
     }
+    lab_pay_exit(mapping_id, &debt, "paying");
     crate::runtime::drain::note_store_route(route);
     // Before the landing (see `GuestWriteObservation`).
     let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);

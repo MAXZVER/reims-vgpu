@@ -752,6 +752,46 @@ fn replace_physical_retires_only_the_named_resource() {
     );
 }
 
+/// The bare integer names a mapping only in the task the guest speaks mapping ids
+/// in -- the one whose page table walked the mapping's backing. Another task's
+/// reference 9 is a task-local texture that merely shares the number: it must not
+/// be paid mapping 9's frame or declare mapping 9 guest-written
+/// (`REIMS_VGPU_LAB_NAME_NARROW`, black-box journal 2026-09-30).
+#[test]
+fn a_bare_reference_names_the_mapping_only_in_the_task_that_walked_its_backing() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.map_surface(9);
+    {
+        let m = state.mappings.get_mut(&9).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0x11];
+        m.backing_walk = Some(crate::model::BackingWalk {
+            task_id: 0,
+            backing_pfn: 0x20,
+            map_generation: m.map_generation,
+        });
+    }
+    assert!(
+        state.bare_reference_names_mapping(0, 9),
+        "the owning task speaks mapping ids"
+    );
+    assert!(
+        !state.bare_reference_names_mapping(3, 9),
+        "task 3's texture 9 only shares the integer"
+    );
+    assert!(
+        !state.bare_reference_names_mapping(0, 10),
+        "no mapping 10 exists to be named"
+    );
+    // A mapping nobody walked the backing of has no owner to compare against, so
+    // the old reading stands for it.
+    state.map_surface(11);
+    assert!(state.bare_reference_names_mapping(3, 11));
+    // A registration names it for the task that made one, whatever the integer.
+    state.texture_to_mapping.insert((3, 40), 9);
+    assert!(state.mappings_named_by(3, 40).iter().any(|id| id == 9));
+}
+
 /// A same-number mapping owned by another task must not capture a task-local
 /// resource re-point. The association names mapping 99; mapping 7 merely shares
 /// its integer and has independent backing provenance.

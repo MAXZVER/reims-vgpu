@@ -1032,7 +1032,29 @@ fn lab_pick_draw(
             .unwrap_or_default()
     });
     let (w, h) = (identity.width(), identity.height());
-    let picks: &Vec<(u32, u32)> = if w == 1920 && !picks1.is_empty() {
+    // `REIMS_VGPU_LAB_PICK_MID=<mapping id>` reads the `REIMS_VGPU_LAB_GPX` points of
+    // that one surface after every draw into it, whatever the gate says: the
+    // surface's own history, from the boot's first draw, at the cost of a readback
+    // of that one target per draw.
+    static PICK_MID: OnceLock<Option<u32>> = OnceLock::new();
+    static FORCED_POINTS: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
+    static FORCED_N: AtomicU32 = AtomicU32::new(0);
+    let pick_mid = *PICK_MID.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PICK_MID")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    });
+    let forced = matches!(identity, TargetIdentity::Surface { id, .. } if Some(*id) == pick_mid)
+        && FORCED_N.fetch_add(1, Ordering::Relaxed) < 300;
+    let picks: &Vec<(u32, u32)> = if forced {
+        FORCED_POINTS.get_or_init(|| {
+            crate::runtime::scanout::lab_gpx_all()
+                .iter()
+                .filter(|(m, _, _)| Some(*m) == pick_mid)
+                .map(|&(_, x, y)| (x, y))
+                .collect()
+        })
+    } else if w == 1920 && !picks1.is_empty() {
         picks1
     } else if let Some((_, pts)) = picks2.iter().find(|(wh, _)| *wh == (w, h)) {
         pts
@@ -1045,23 +1067,24 @@ fn lab_pick_draw(
             .and_then(|v| v.parse().ok())
             .unwrap_or(400)
     });
-    if !lab_gate_open() {
+    if !forced && !lab_gate_open() {
         return;
     }
     // `REIMS_VGPU_LAB_PICK_WINDOW=from-to` (ms since start) bounds the probe in time.
     static PWIN: OnceLock<Option<(u64, u64)>> = OnceLock::new();
-    if let Some((from, to)) = *PWIN.get_or_init(|| {
+    let pwin = *PWIN.get_or_init(|| {
         let v = std::env::var("REIMS_VGPU_LAB_PICK_WINDOW").ok()?;
         let (a, b) = v.split_once('-')?;
         Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-    }) {
+    });
+    if let Some((from, to)) = pwin.filter(|_| !forced) {
         let now = crate::observe::elapsed_us() / 1000;
         if now < from || now > to {
             return;
         }
     }
     let n = N.fetch_add(1, Ordering::Relaxed);
-    if n >= max {
+    if n >= max && !forced {
         return;
     }
     let Ok(rb) = crate::backend::vulkan::engine::read_target(identity) else {
@@ -1379,6 +1402,120 @@ fn lab_cover_tex(
         img.height,
         img.format,
         img.identity.as_ref().map(|i| (i.key, i.generation))
+    ));
+    lab_wallpx(req, texture_ref, img);
+}
+
+/// TEMP (lab): with `REIMS_VGPU_LAB_COVER` on, read the `REIMS_VGPU_LAB_WALLPX`
+/// points straight out of guest RAM for every 1920x1080 BGRA guest-runs bind,
+/// and say what the guest's own bytes hold there. "Is the black rectangle in the
+/// guest's surface, or only in the copy this device bound?" is the question: a
+/// `lab_wallpx` line with a black pixel beside a bind that came out black means
+/// the guest (or whatever wrote it) put those bytes there; a non-black one beside
+/// a black bind means the bound copy is stale.
+fn lab_wallpx(
+    req: &DrawEncodeRequest,
+    texture_ref: u32,
+    img: &crate::backend::vulkan::engine::SampledImageResource,
+) {
+    use crate::backend::vulkan::engine::SampledSource;
+    let SampledSource::GuestRuns(src, vouch) = &img.source else {
+        return;
+    };
+    if (img.width, img.height) != (1920, 1080) {
+        return;
+    }
+    // `REIMS_VGPU_LAB_WALLPX=x,y;x,y` names the points; unset reads the black box's
+    // centre and corners plus two control points, so the probe needs no PICK (whose
+    // readbacks change the timing under study).
+    let points: Vec<(u32, u32)> = std::env::var("REIMS_VGPU_LAB_WALLPX")
+        .unwrap_or_else(|_| "1100,450;1040,410;1175,515;700,300;1300,450".to_string())
+        .split(';')
+        .filter_map(|p| {
+            let (x, y) = p.split_once(',')?;
+            Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+        })
+        .collect();
+    let stride = if src.row_length_texels > 0 {
+        u64::from(src.row_length_texels) * 4
+    } else {
+        u64::from(img.width) * 4
+    };
+    let mut seen = Vec::new();
+    for (x, y) in points {
+        let off = u64::from(y) * stride + u64::from(x) * 4;
+        let pos = src.source_offset + off;
+        let mut base = 0u64;
+        let mut px = None;
+        for run in src.runs.iter() {
+            let rl = run.len();
+            if pos >= base + rl {
+                base += rl;
+                continue;
+            }
+            let in_run = pos - base;
+            if rl - in_run >= 4 {
+                // SAFETY: lab probe; the run is a live guest-RAM mapping, the
+                // same one the gather reads, and four bytes lie inside it.
+                let p = (run.host_ptr() + in_run as usize) as *const u8;
+                px = Some(unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] });
+            }
+            break;
+        }
+        seen.push(format!("({x},{y})={px:?}"));
+    }
+    // What the layer holds at all: the pixels whose alpha is not zero, as a count
+    // and a bounding box, read straight from the guest's rows.
+    let (mut count, mut x0, mut y0, mut x1, mut y1) = (0u64, u32::MAX, u32::MAX, 0u32, 0u32);
+    let (mut opaque_black_in_box, mut solid_black) = (0u64, 0u64);
+    let mut row_bytes: Vec<u8> = Vec::with_capacity(img.width as usize * 4);
+    for y in 0..img.height {
+        row_bytes.clear();
+        let mut pos = src.source_offset + u64::from(y) * stride;
+        let mut base = 0u64;
+        let mut need = img.width as usize * 4;
+        for run in src.runs.iter() {
+            let rl = run.len();
+            if pos >= base + rl {
+                base += rl;
+                continue;
+            }
+            let in_run = (pos - base) as usize;
+            let take = need.min(rl as usize - in_run);
+            // SAFETY: lab probe over the live guest-RAM mapping the gather reads.
+            let chunk = unsafe {
+                std::slice::from_raw_parts((run.host_ptr() + in_run) as *const u8, take)
+            };
+            row_bytes.extend_from_slice(chunk);
+            need -= take;
+            pos += take as u64;
+            base += rl;
+            if need == 0 {
+                break;
+            }
+        }
+        for (x, px) in row_bytes.chunks_exact(4).enumerate() {
+            if px[3] != 0 {
+                count += 1;
+                let x = x as u32;
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+                if px[0] == 0 && px[1] == 0 && px[2] == 0 && px[3] == 255 {
+                    solid_black += 1;
+                    if (1028..1185).contains(&x) && (403..521).contains(&y) {
+                        opaque_black_in_box += 1;
+                    }
+                }
+            }
+        }
+    }
+    crate::observe::fail(format!(
+        "lab_wallpx task={} ref={texture_ref} ident={:?} vouch={vouch:?} bgra {} nonzero_alpha={count} bbox=({x0},{y0})-({x1},{y1}) opaque_black={solid_black} opaque_black_in_box={opaque_black_in_box}",
+        req.task_id,
+        img.identity.as_ref().map(|i| (i.key, i.generation)),
+        seen.join(" ")
     ));
 }
 
@@ -13740,6 +13877,7 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
             return false;
         }
     }
+    crate::runtime::writeback_debt::lab_pay_after_first_arm(state, host, mapping_id); // TEMP (lab)
     true
 }
 

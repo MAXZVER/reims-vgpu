@@ -346,6 +346,54 @@ pub const BACKING_A008: &str = "REIMS_VGPU_BACKING_A008";
 /// Both arms leave the same bytes in guest RAM.
 pub const PAY_DIFF: &str = "REIMS_VGPU_PAY_DIFF";
 
+/// **Default on.** `off` restores the old reading, in which every task's reference
+/// N also names the mapping numbered N, in `DeviceState::mappings_named_by` --
+/// which the validity quads (`clear_host_valid`) and the render-frame ledger's
+/// payment by reference both resolve through. On, a bare integer names a mapping
+/// only in the task the guest speaks mapping ids in: the one whose page table walked
+/// that mapping's backing (a mapping with no backing walk has no owner to compare
+/// and is named as before).
+///
+/// Mapping ids are device-wide and references are per-task, and both are small
+/// integers, so the bare spelling collides constantly. Two of the collisions are
+/// not harmless, and together they are the black rectangle under the Finder window
+/// (journal `2026-09-30-black-strip.md`): a compute dispatch in task 3 reading its
+/// own texture 9 pays the desktop-icon layer, mapping 9, a frame early -- landing
+/// the layer's first, opaque-black frame in the guest's pages between its two
+/// passes -- and the validity quads tasks 2 and 3 send for their own texture 9 tell
+/// mapping 9 the guest has written its pages, which makes the owed second frame
+/// `Superseded` and abandons it. Every boot sees the second kind; about one in six
+/// sees the first.
+///
+/// It narrows in the sense this module requires: it removes a name this device
+/// used to accept, so it makes strictly fewer payments and fewer guest-write claims.
+/// A reference that does name the mapping -- the owning task's, or any task's
+/// `texture_to_mapping` registration -- is named exactly as before.
+///
+/// Measured, driven macos-26 1080p, the layer's second frame forced to be preceded
+/// by an early payment of its first (a payment 3 s after the first arm, the order
+/// that happens by chance in one boot in six): without it 3 of 6 boots that kept the
+/// layer through the re-point showed the black rectangle (8 of 11 with the earlier
+/// runs), with it 0 of 7, the spurious `clear_host_valid` claims on the layer going
+/// from one a boot to none and 140-160 per-task references a boot no longer paying
+/// whole framebuffers they merely shared a number with.
+pub const NAME_NARROW: &str = "REIMS_VGPU_NAME_NARROW";
+
+/// `on` pays the frame a mapping is owed before the guest's ReplacePhysical for it
+/// is applied, when the guest re-pointed the backing to the pages it already had
+/// (every page of the cached list re-walked through the owning task's table and
+/// agreeing). Unset, the re-point bumps the mapping's generation first and the
+/// owed frame is dropped as an orphan (`wbdebt_generation_moved`), so the last
+/// frame the GPU rendered never reaches pages the sampled rail is about to switch
+/// to reading.
+///
+/// Pages that did move are not touched (the old rule stands: the frame names
+/// memory that is no longer the surface's), and neither is a mapping with nothing
+/// to witness. Paying a debt is what any reader of the pages would have done at
+/// any other time, and `writeback_debt::pay` still abandons a frame the guest
+/// superseded.
+pub const REPOINT_PAY: &str = "REIMS_VGPU_REPOINT_PAY";
+
 /// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when
 /// the device advertises `VK_KHR_push_descriptor` and the layout fits its
 /// reported limit.
