@@ -10197,7 +10197,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         let _s = crate::runtime::sampled_phase::Span::open(
                             crate::runtime::sampled_phase::Part::ResolveSource,
                         );
-                        let lab_resolve_t0 = std::time::Instant::now();
+                        let lab_resolve_t0 = crate::lab_clock::LabInstant::now();
                         // TEMP (lab, REIMS_VGPU_LAB_PAR_PREFETCH): a stream plan
                         // validated here serves the bind (on) or is compared with
                         // the serial ladder (shadow); otherwise the ladder runs.

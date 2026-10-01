@@ -126,7 +126,7 @@
 //! that the path is free.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use crate::lab_clock::LabInstant as Instant;
 
 /// The steps of planning and recording one draw's gather dispatches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -263,7 +263,7 @@
 //! is the signal — one 950 ms draw and two hundred of them are different bugs.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use crate::lab_clock::LabInstant as Instant;
 
 use crate::observe::phase_clock::{charge_ns, to_us};
 

@@ -927,7 +927,7 @@ fn read_submission<M: HostMemory + HostOps>(
 
     // This call's measured spans, summed, so `Header` can be the leftover. The
     // census's own totals cover the whole window and cannot answer for one call.
-    let load_started = std::time::Instant::now();
+    let load_started = crate::lab_clock::LabInstant::now();
     let streams = load_command_streams(state, host, task_id, payload, cbufs_off, cmdbuf_count);
     out.streams_loaded += u32::try_from(streams.len()).unwrap_or(u32::MAX);
     note_command_stream_count(streams.len());
@@ -973,7 +973,7 @@ pub fn preflight_submission<M: HostMemory + HostOps>(
     resolved: &reims_vgpu_core::exec::ExecWork,
     measured_ns: &mut u64,
 ) -> Vec<u32> {
-    let preflight_started = std::time::Instant::now();
+    let preflight_started = crate::lab_clock::LabInstant::now();
     // The render half of the packet's leases, and the guest's own ref, which is
     // the slot half of the name: the generation is the model's business and no
     // MTLB is keyed by it. Compute leases are held back because the compute
@@ -1060,7 +1060,7 @@ fn execute_submission<M: HostMemory + HostOps>(
 
     for stream in streams {
         let mut acc = StreamAccum::default();
-        let walk_started = std::time::Instant::now();
+        let walk_started = crate::lab_clock::LabInstant::now();
         walk_stream(
             state,
             host,
@@ -1074,7 +1074,7 @@ fn execute_submission<M: HostMemory + HostOps>(
         let walk_ns = walk_started.elapsed().as_nanos() as u64;
         *measured_ns += walk_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
-        let finish_started = std::time::Instant::now();
+        let finish_started = crate::lab_clock::LabInstant::now();
         finish_stream(state, host, task_id, out, &acc);
         let finish_ns = finish_started.elapsed().as_nanos() as u64;
         *measured_ns += finish_ns;
@@ -1113,7 +1113,7 @@ pub fn execute_planned<M: HostMemory + HostOps>(
     inputs: RetainedInputs<'_>,
     mut out: ExecResult,
 ) -> ExecResult {
-    let started = std::time::Instant::now();
+    let started = crate::lab_clock::LabInstant::now();
     let mut measured_ns = 0u64;
     walk_memo::begin_packet();
     // Read, plan, execute. The plan step is separate because it is the only one
@@ -1152,7 +1152,7 @@ pub fn read_exec_submission<M: HostMemory + HostOps>(
     host: &M,
     payload: &[u8],
 ) -> (Option<ExecSubmission>, ExecResult) {
-    let started = std::time::Instant::now();
+    let started = crate::lab_clock::LabInstant::now();
     let mut out = ExecResult::default();
     let mut measured_ns = 0u64;
     let submission = read_submission(state, host, payload, &mut out, &mut measured_ns);
@@ -1175,7 +1175,7 @@ pub fn read_exec_submission<M: HostMemory + HostOps>(
 /// subtracting it from one call's clock would be subtracting the whole second.
 /// The subtraction is saturating anyway, because an underflow would print as a
 /// colossal `header_us` rather than as the zero it means.
-fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
+fn note_exec_header(exec_started: crate::lab_clock::LabInstant, measured_ns: u64) {
     let total = exec_started.elapsed().as_nanos() as u64;
     crate::runtime::drain::note_exec_phase(
         crate::runtime::drain::ExecPhase::Header,
@@ -1320,7 +1320,7 @@ impl crate::observe::Decline for ResourceTableDecline {
     }
 }
 
-fn elapsed_us(started: std::time::Instant) -> u64 {
+fn elapsed_us(started: crate::lab_clock::LabInstant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
@@ -1530,7 +1530,7 @@ fn walk_segment_records(
     // handful of segments and tens of thousands of records, so this splits
     // `exec_phase walk_us` by family for a cost that does not show up, where
     // per-record timing would cost more than the handlers it measured.
-    let started = std::time::Instant::now();
+    let started = crate::lab_clock::LabInstant::now();
     let mut ops = reims_vgpu_wire::op::OpStream::new(commands);
     let mut refusal = None;
     for next in ops.by_ref() {
@@ -2504,7 +2504,7 @@ fn handle_blit_record<M: HostMemory + HostOps>(
     //
     // Timed at the closure `walk_segment_records` calls, so decode is inside the
     // span and no arm can leave without being charged.
-    let record_started = std::time::Instant::now();
+    let record_started = crate::lab_clock::LabInstant::now();
     // **Which class of record this is, is the closure ledger's answer.** The
     // blit *rail* carries five: transfers, fences, indirect-command mutations,
     // content-representation directives, and the mipmap generation that sits
@@ -2765,7 +2765,7 @@ fn handle_blit_transfer_record<M: HostMemory + HostOps>(
     opcode: u32,
     framed: &reims_vgpu_wire::op::Op<'_>,
     cmd_len: usize,
-    record_started: std::time::Instant,
+    record_started: crate::lab_clock::LabInstant,
 ) {
     let record = match reims_vgpu_protocol::decode::blit::decode(framed) {
         Ok(record) => record,

@@ -122,7 +122,7 @@
 //! `chain_phase` states: an exit is not a phase.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use crate::lab_clock::LabInstant as Instant;
 
 use crate::observe::phase_clock::{charge_ns, to_us};
 
@@ -312,9 +312,16 @@ mod tests {
     #[test]
     fn twenty_thousand_sub_microsecond_spans_are_not_free() {
         let _ = take_window();
-        for _ in 0..20_000 {
+        for i in 0..20_000u64 {
             note_sampled();
             let _s = Span::open(Part::Lookup);
+            // ~tens of ns of work: the lab TSC clock makes an empty span nearly
+            // free, and the question is truncation, not the clock's own cost.
+            let mut x = i;
+            for _ in 0..64 {
+                x = std::hint::black_box(x.wrapping_mul(6364136223846793005).wrapping_add(1));
+            }
+            std::hint::black_box(x);
         }
         let w = take_window().expect("sampled phases were noted");
         assert!(w.lookup_us > 100, "{w:?}");

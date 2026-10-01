@@ -100,6 +100,7 @@ pub use reims_vgpu_config as config;
 /// See `reims_vgpu_protocol` for what the crate boundary makes true that a
 /// module boundary only asserted.
 pub use reims_vgpu_protocol as protocol;
+pub(crate) mod lab_clock;
 pub mod model;
 /// Crate-wide observability: the always-on fail sink and the decline
 /// vocabulary. Above `runtime/` because every subsystem owes the reader a
