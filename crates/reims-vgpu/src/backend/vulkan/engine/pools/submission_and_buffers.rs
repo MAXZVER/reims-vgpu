@@ -606,7 +606,7 @@ impl ResourcePools {
         if !self.plan_idle_maintenance(now_ms) {
             return;
         }
-        self.retire_released_residents(ctx, counters, IDLE_RECYCLE_TRIM_PER_PASS);
+        self.retire_released_residents(ctx, counters, super::released_retire_per_pass());
         let trim_buffers = self.note_maintenance_settled();
         self.trim_recycle_pools(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS, trim_buffers);
         self.trim_dead_guest_sampled(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS);

@@ -2978,6 +2978,25 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
 /// a disposal storm and let the pools refill gradually when activity resumes.
 const IDLE_RECYCLE_TRIM_PER_PASS: usize = 8;
 
+/// Residents whose resource the guest released, retired per maintenance pass.
+///
+/// TEMP (lab): 64 (was the recycle trim's 8). These are dead: the guest ended the
+/// resource and no pin is left. At 8 a pass and at most ten passes a second, the
+/// 5K drag released ~170 a second and retirement kept up with under half: the
+/// registry grew without bound, the image slab took a new 8 MiB block every ~2 s,
+/// and each new block lined up with a ~35 ms frame (fk*, 2026-10-02).
+/// `REIMS_VGPU_LAB_RELEASED_RETIRE` overrides.
+pub(crate) fn released_retire_per_pass() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_RELEASED_RETIRE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64)
+            .max(1)
+    })
+}
+
 /// Consecutive maintenance passes without upload activity required before the HOST_VISIBLE
 /// buffer pools (`staging_free`/`readback_free`) are trimmed. Unlike the image
 /// pools (cheap slab suballocation refill), a trimmed staging buffer costs a
