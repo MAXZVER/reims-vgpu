@@ -418,6 +418,32 @@ pub struct QemuHost<'a> {
     ops: &'a ReimsVgpuHostOps,
     actions: &'a mut VecDeque<HostAction>,
     prompt: &'a parking_lot::Mutex<VecDeque<HostAction>>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_IRQ_BATCH`): when (device clock, us) the held
+    /// gfx pulse of the current batch was first asked for, if one is held.
+    deferred_gfx: Option<u64>,
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_IRQ_BATCH=<us>` (0 / unset = off). The drain
+/// raises a gfx pulse per completed packet (~7 000/s on the 5K drag, ~60 per
+/// frame), and the guest's interrupt handler answers each with three register
+/// reads, one of them an emulated exit. With a budget, a pulse is held and the
+/// ones after it fold into it until the budget has run since the first, and
+/// whatever is held is raised when the tranche ends (and on drop): an interrupt
+/// raised later is still raised, and the status bits it reports accumulate.
+fn lab_irq_batch_us() -> u64 {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *US.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_IRQ_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+impl Drop for QemuHost<'_> {
+    fn drop(&mut self) {
+        self.flush_deferred_irqs();
+    }
 }
 
 impl<'a> QemuHost<'a> {
@@ -430,7 +456,64 @@ impl<'a> QemuHost<'a> {
             ops,
             actions,
             prompt,
+            deferred_gfx: None,
         }
+    }
+
+    /// TEMP (lab, `REIMS_VGPU_LAB_IRQ_BATCH`): raise the held gfx pulse, if any.
+    /// The drain calls this at the end of every tranche; drop does too.
+    pub fn flush_deferred_irqs(&mut self) {
+        if self.deferred_gfx.take().is_some() {
+            crate::runtime::drain::note_store_route("lab_irq_batch_flushed");
+            self.raise_pulse(HostAction::irq_gfx());
+        }
+    }
+
+    /// An IRQ pulse: raised in place when the shim can, else queued for the BH.
+    fn raise_pulse(&mut self, action: HostAction) {
+        let prompt = self.prompt;
+        // Raised in place when the shim can: the queue's only purpose
+        // for a pulse is to reach a thread holding the BQL, and on a
+        // host whose interrupt injection needs none that hop is pure
+        // latency — measured at ~0.2-0.5 ms mean and 5-11 ms tails,
+        // long enough for a VBL pulse to coalesce into the next one.
+        if let Some(pulse) = self.ops.irq_pulse {
+            // SAFETY: QEMU owns the live ctx; the shim documents this
+            // as callable from any thread holding the device lock.
+            if unsafe { pulse(self.ops.ctx, action.kind as u32) } != 0 {
+                crate::runtime::drain::note_store_route("irq_pulse_direct");
+                return;
+            }
+        }
+        let mut q = prompt.lock();
+        // Coalesce: an undelivered pulse of the same kind already
+        // covers this one (status bits accumulate in the r2c regs).
+        //
+        // That reasoning holds for a *status* the guest reads back. It
+        // does not hold for an event the guest **timestamps**: a VBL
+        // pulse that coalesces into an undelivered one is a vblank the
+        // guest never sees, so the interval it measures between vblanks
+        // is two grid periods rather than one. This counter says how
+        // often it happens; `note_irq_coalesced`'s doc says why that
+        // number decides a boot's frame rate.
+        let coalesced = q.iter().any(|a| a.kind == action.kind);
+        if !coalesced {
+            // Arm the delivery clock while the queue lock is held, so
+            // the stamp cannot be taken after the BH has already popped
+            // this action on another thread. See `irq_wait_us`: the
+            // guest cannot doorbell the drain worker until this pulse
+            // reaches it, so this hop is the one candidate for
+            // `gap_idle_us` that is ours.
+            if q.is_empty() {
+                crate::runtime::drain::note_irq_armed();
+            }
+            q.push_back(action);
+        }
+        drop(q);
+        if coalesced {
+            crate::runtime::drain::note_irq_coalesced(action.kind);
+        }
+        self.notify_actions();
     }
 
     fn notify_actions(&self) {
@@ -614,49 +697,24 @@ impl HostOps for QemuHost<'_> {
         // queue (poppable without the device lock) and wake the delivery BH.
         let prompt = self.prompt;
         match action.kind {
+            HostActionKind::IrqGfxPulse if lab_irq_batch_us() > 0 => {
+                let now = crate::observe::elapsed_us();
+                match self.deferred_gfx {
+                    None => {
+                        self.deferred_gfx = Some(now);
+                        crate::runtime::drain::note_store_route("lab_irq_batch_held");
+                    }
+                    Some(first) if now.saturating_sub(first) >= lab_irq_batch_us() => {
+                        self.deferred_gfx = None;
+                        crate::runtime::drain::note_store_route("lab_irq_batch_budget");
+                        self.raise_pulse(action);
+                    }
+                    Some(_) => crate::runtime::drain::note_store_route("lab_irq_batch_folded"),
+                }
+                return;
+            }
             HostActionKind::IrqGfxPulse | HostActionKind::IrqIosfcPulse => {
-                // Raised in place when the shim can: the queue's only purpose
-                // for a pulse is to reach a thread holding the BQL, and on a
-                // host whose interrupt injection needs none that hop is pure
-                // latency — measured at ~0.2-0.5 ms mean and 5-11 ms tails,
-                // long enough for a VBL pulse to coalesce into the next one.
-                if let Some(pulse) = self.ops.irq_pulse {
-                    // SAFETY: QEMU owns the live ctx; the shim documents this
-                    // as callable from any thread holding the device lock.
-                    if unsafe { pulse(self.ops.ctx, action.kind as u32) } != 0 {
-                        crate::runtime::drain::note_store_route("irq_pulse_direct");
-                        return;
-                    }
-                }
-                let mut q = prompt.lock();
-                // Coalesce: an undelivered pulse of the same kind already
-                // covers this one (status bits accumulate in the r2c regs).
-                //
-                // That reasoning holds for a *status* the guest reads back. It
-                // does not hold for an event the guest **timestamps**: a VBL
-                // pulse that coalesces into an undelivered one is a vblank the
-                // guest never sees, so the interval it measures between vblanks
-                // is two grid periods rather than one. This counter says how
-                // often it happens; `note_irq_coalesced`'s doc says why that
-                // number decides a boot's frame rate.
-                let coalesced = q.iter().any(|a| a.kind == action.kind);
-                if !coalesced {
-                    // Arm the delivery clock while the queue lock is held, so
-                    // the stamp cannot be taken after the BH has already popped
-                    // this action on another thread. See `irq_wait_us`: the
-                    // guest cannot doorbell the drain worker until this pulse
-                    // reaches it, so this hop is the one candidate for
-                    // `gap_idle_us` that is ours.
-                    if q.is_empty() {
-                        crate::runtime::drain::note_irq_armed();
-                    }
-                    q.push_back(action);
-                }
-                drop(q);
-                if coalesced {
-                    crate::runtime::drain::note_irq_coalesced(action.kind);
-                }
-                self.notify_actions();
+                self.raise_pulse(action);
                 return;
             }
             HostActionKind::CursorUpdate => {

@@ -1517,6 +1517,12 @@ pub fn prewake_recorder() {
     }
 }
 
+/// TEMP (lab, S5a): how many deferred draws may be out at once
+/// (`REIMS_VGPU_LAB_RECORDER_DEPTH`).
+pub fn recorder_depth() -> u32 {
+    recorder::depth()
+}
+
 /// TEMP (lab, S5a): whether the drain owes the recorder a join — a draw is out,
 /// or its result has not been taken — which is true after the gate is turned off
 /// as well as while it is on.
@@ -1579,7 +1585,17 @@ pub fn submit_deferred_draw(
 /// failure. A panic in the job is re-raised here, where the synchronous path
 /// would have raised it.
 pub fn take_deferred_failure() -> Option<DeferredFailure> {
-    match recorder::DRAW.take(recorder::JoinSite::Explicit) {
+    // Lab RECORDER_DEPTH > 1: the join before the next draw does not wait.
+    let taken = if recorder::depth() > 1 {
+        recorder::DRAW.take_nowait()
+    } else {
+        recorder::DRAW.take(recorder::JoinSite::Explicit)
+    };
+    deferred_failure_of(taken)
+}
+
+fn deferred_failure_of(taken: Option<recorder::JobResult>) -> Option<DeferredFailure> {
+    match taken {
         None | Some(recorder::JobResult::Done) => None,
         Some(recorder::JobResult::Failed(failure)) => {
             recorder::DRAW.note_deferred_error();
@@ -1602,7 +1618,7 @@ pub(crate) fn settle_for_guest_write() {
 /// TEMP (lab, S5a): leave nothing in flight. The failure, if the job had one,
 /// is returned for the caller to report.
 pub fn settle_deferred_draws() -> Option<DeferredFailure> {
-    take_deferred_failure()
+    deferred_failure_of(recorder::DRAW.take(recorder::JoinSite::Explicit))
 }
 
 /// A deferred draw's failure, named on the always-on channel and latched per

@@ -1798,6 +1798,10 @@ pub(crate) struct DrainDutyCensus {
     /// 38 ms tranche from three 20 ms ones; this is that count.
     slow_tranches: std::sync::atomic::AtomicU64,
     last_report_ms: std::sync::atomic::AtomicU64,
+    /// TEMP (lab): drain time of tranches that ended on an efficiency core
+    /// (`lab_cores`), and how many tranches did.
+    ecore_us: std::sync::atomic::AtomicU64,
+    ecore_tranches: std::sync::atomic::AtomicU64,
 }
 
 /// A tranche at or above this held the device lock for a whole guest frame.
@@ -2191,6 +2195,11 @@ impl DrainDutyCensus {
         if tranche_us >= DRAIN_TRANCHE_SLOW_US {
             self.slow_tranches.fetch_add(1, Relaxed);
         }
+        #[cfg(windows)]
+        if crate::lab_cores::on_efficiency_core() {
+            self.ecore_us.fetch_add(drain_us, Relaxed);
+            self.ecore_tranches.fetch_add(1, Relaxed);
+        }
         let last = self.last_report_ms.load(Relaxed);
         // First call arms the window; it does not report a duty against a zero
         // origin, which would divide the whole boot's idle time into one tranche.
@@ -2240,6 +2249,8 @@ impl DrainDutyCensus {
             regs_split.push_str(&format!(" {label}_us={us} {label}_n={n}"));
         }
         let slow = self.slow_tranches.swap(0, Relaxed);
+        let ecore_us = self.ecore_us.swap(0, Relaxed);
+        let ecore_tranches = self.ecore_tranches.swap(0, Relaxed);
         // The four buckets that tile `1 - duty`. Emitted beside the total they
         // divide, so `idle + lock + skip + post + busy == win_ms * 1000` is
         // checkable on the line itself — the same rule `regs_split` follows.
@@ -2276,7 +2287,8 @@ impl DrainDutyCensus {
              ring_us={ring} ring_reads={ring_reads} decode_us={decode} packets={packets} \
              proc_us={proc_us} regs_us={regs} regs_ops={regs_ops}{regs_split} \
              setup_us={setup} setup_calls={setup_calls} \
-             slow_tranches={slow}/{tranches} slow_us={DRAIN_TRANCHE_SLOW_US}"
+             slow_tranches={slow}/{tranches} slow_us={DRAIN_TRANCHE_SLOW_US} \
+             ecore_us={ecore_us} ecore_tranches={ecore_tranches}"
         ))
     }
 }
@@ -3388,10 +3400,14 @@ fn take_store_routes() -> Option<String> {
     let routes = STORE_ROUTES.lock().ok()?;
     let mut out = String::from("store_routes");
     let mut any = false;
+    // Written in place: the window holds ~1 500 routes, and a `format!` each
+    // was a burst of allocations on the drain once a second.
+    use std::fmt::Write as _;
+    out.reserve(routes.len() * 32);
     for (route, counter) in routes.iter() {
         let n = counter.swap(0, std::sync::atomic::Ordering::Relaxed);
         if n != 0 {
-            out.push_str(&format!(" {route}={n}"));
+            let _ = write!(out, " {route}={n}");
             any = true;
         }
     }

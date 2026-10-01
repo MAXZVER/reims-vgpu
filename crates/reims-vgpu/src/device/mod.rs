@@ -582,6 +582,8 @@ pub fn device_drain(id: u64) -> bool {
     // time through every call. See `census::tranche_elapsed_us`.
     crate::runtime::drain::note_tranche_started(crate::observe::elapsed_us());
     device.drain(&mut host);
+    // TEMP (lab, REIMS_VGPU_LAB_IRQ_BATCH): the gfx pulse held for this tranche.
+    host.flush_deferred_irqs();
     // TEMP (lab): REIMS_VGPU_LAB_PAR_SELFTEST. A no-op fork-join on this thread,
     // under this lock, to measure the pool; free when the switch is unset.
     crate::runtime::par::selftest::tick(&device.state);

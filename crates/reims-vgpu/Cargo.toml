@@ -42,6 +42,10 @@ backend-vulkan = [
 # feature — `ash-window` below with `backend-vulkan` — because Cargo cannot
 # express "this dependency when both features are on", and putting the Vulkan
 # half here is what would drag `ash` into a Metal-only build.
+# TEMP (lab): the per-thread small-block cache as the global allocator
+# (src/lab_alloc.rs). Only the QEMU staticlib build turns it on: test binaries
+# that install their own counting allocator would conflict with it.
+lab-tcache = []
 host-window = [
     "dep:winit",
     "dep:raw-window-handle",
