@@ -149,6 +149,9 @@ static TEST_ALLOCATOR: reims_vgpu_testkit::allocations::Counting =
 /// (`REIMS_VGPU_LAB_TCACHE=off` passes everything through). See `lab_alloc`.
 #[cfg(windows)]
 mod lab_alloc;
+/// TEMP (lab): performance or efficiency core, for the census.
+#[cfg(windows)]
+mod lab_cores;
 #[cfg(all(windows, not(test), feature = "lab-tcache"))]
 #[global_allocator]
 static LAB_ALLOCATOR: lab_alloc::ThreadCache = lab_alloc::ThreadCache;
