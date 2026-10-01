@@ -612,10 +612,47 @@ pub(crate) fn is_recorder_thread() -> bool {
     IS_RECORDER_THREAD.with(std::cell::Cell::get)
 }
 
-/// `REIMS_VGPU_LAB_RECORDER=on`. Read once.
+/// How `REIMS_VGPU_LAB_RECORDER` was set.
+enum Mode {
+    Off,
+    On,
+    /// `toggle:<flag file>`: on while the file exists, so an A/B can alternate
+    /// the two arms inside one boot, where the host's load is shared between
+    /// them, instead of across boots, where it is not.
+    Toggle(String),
+}
+
+fn mode() -> &'static Mode {
+    static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| match std::env::var("REIMS_VGPU_LAB_RECORDER") {
+        Ok(v) if v == "on" => Mode::On,
+        Ok(v) => match v.strip_prefix("toggle:") {
+            Some(path) if !path.is_empty() => Mode::Toggle(path.to_string()),
+            _ => Mode::Off,
+        },
+        Err(_) => Mode::Off,
+    })
+}
+
+/// `REIMS_VGPU_LAB_RECORDER=on` (or `toggle:<file>` with the file present).
 pub(crate) fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RECORDER").is_ok_and(|v| v == "on"))
+    match mode() {
+        Mode::Off => false,
+        Mode::On => true,
+        Mode::Toggle(path) => {
+            static LAST_MS: AtomicU64 = AtomicU64::new(0);
+            static OPEN: AtomicBool = AtomicBool::new(false);
+            let now = crate::observe::elapsed_us() / 1000 + 1;
+            let last = LAST_MS.load(Ordering::Relaxed);
+            if last != 0 && now.saturating_sub(last) < 100 {
+                return OPEN.load(Ordering::Relaxed);
+            }
+            LAST_MS.store(now, Ordering::Relaxed);
+            let open = std::path::Path::new(path).exists();
+            OPEN.store(open, Ordering::Relaxed);
+            open
+        }
+    }
 }
 
 /// The wait every drain-side engine door performs. The caller says whether it
