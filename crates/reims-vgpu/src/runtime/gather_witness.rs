@@ -688,9 +688,19 @@ pub(crate) unsafe fn fold_runs(runs: &[crate::runtime::guest_ram::GuestRun], spa
                 let block_end = ((block + 1) * FOLD_BLOCK - run_at) as usize;
                 let end = block_end.min(n);
                 if block % stride == 0 {
-                    for chunk in run_bytes[off..end].chunks(8) {
+                    // Whole words straight from the bytes, then one zero-padded
+                    // tail word: the same words `chunks(8)` gave, without a
+                    // variable-length copy (a memmove call) for every eight bytes.
+                    let blk = &run_bytes[off..end];
+                    let (words, tail) = blk.split_at(blk.len() & !7);
+                    for chunk in words.chunks_exact(8) {
+                        let w = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
+                        a = (a ^ w).rotate_left(29).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                        b = b.rotate_left(7).wrapping_add(w ^ a);
+                    }
+                    if !tail.is_empty() {
                         let mut w = [0u8; 8];
-                        w[..chunk.len()].copy_from_slice(chunk);
+                        w[..tail.len()].copy_from_slice(tail);
                         let w = u64::from_le_bytes(w);
                         a = (a ^ w).rotate_left(29).wrapping_mul(0x9e37_79b9_7f4a_7c15);
                         b = b.rotate_left(7).wrapping_add(w ^ a);
