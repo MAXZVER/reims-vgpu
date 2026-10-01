@@ -2894,6 +2894,13 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     }
     flush_retired_views(state, host);
     let runs = reims_vgpu_paging::runs::contig_page_runs(&gpas, page_size);
+    if let RunCopy::Write(src) = &copy {
+        if let Some(done) = par_land_write(
+            &*state, host, mapping_id, off, src, only, &gpas, &runs, site,
+        ) {
+            return done;
+        }
+    }
     let import_started = std::time::Instant::now();
     for run in &runs {
         let run_gpas = &gpas[run.clone()];
@@ -2967,6 +2974,213 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         ));
     }
     true
+}
+
+/// TEMP (lab): [`par_land_write`] splits a large mapping write across the
+/// device's worker pool by default; `REIMS_VGPU_LAB_PAR_LAND=off` keeps every
+/// byte on the caller, as before. Latched.
+fn lab_par_land() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PAR_LAND").map_or(true, |v| v != "off"))
+}
+
+/// Selected bytes below which a write is not worth a fork: a fork-join round
+/// trip is ~10 µs, which a single thread spends copying about 64 KiB.
+const PAR_LAND_MIN_BYTES: u64 = 256 * 1024;
+/// Bytes one job copies. Large enough that the per-job overhead is noise
+/// against the copy, small enough that a frame's ~6 MB spreads over every helper.
+const PAR_LAND_JOB_BYTES: usize = 256 * 1024;
+
+/// One selected stretch of a mapping write: `n` bytes of the caller's buffer at
+/// `src` into the mapped guest range at `dst`, whose first byte is guest-physical
+/// `gpa`.
+struct LandSpan {
+    dst: *mut u8,
+    src: usize,
+    n: usize,
+    gpa: u64,
+}
+
+// SAFETY: `dst` points into a guest-RAM run the coordinator mapped before the
+// scope and unmaps only after it has joined, on a host whose mapped views are
+// stable (`map_pages_stable`); the spans' guest ranges are pairwise disjoint
+// (checked before any copy), so no two jobs write one byte.
+unsafe impl Send for LandSpan {}
+unsafe impl Sync for LandSpan {}
+
+/// The write half of [`copy_mapping_runs`]'s run walk, with the byte copies
+/// spread over the device's worker pool.
+///
+/// The same walk, the same bounds checks and the same footprint marks as the
+/// serial loop, in three steps: map every run and collect the selected spans
+/// (caller), copy the spans (pool), mark the footprint and unmap (caller). The
+/// guest sees nothing until the caller publishes a completion after this
+/// returns, and the copy is exactly the bytes the serial loop moves, so the only
+/// thing that changes is how many threads move them. Two spans naming one guest
+/// byte would make the result depend on which job ran last, so a write whose
+/// spans are not pairwise disjoint copies serially in walk order, as before.
+///
+/// `None` hands the write back to the serial loop untouched: the switch is off,
+/// there is no pool to fork onto, the host's mapped views are not stable (so
+/// holding every run mapped at once is not free), or the selection is too small
+/// to pay for a fork.
+#[allow(clippy::too_many_arguments)]
+fn par_land_write<H: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    buf: &[u8],
+    only: Option<&[(u64, u64)]>,
+    gpas: &[u64],
+    runs: &[std::ops::Range<usize>],
+    site: &str,
+) -> Option<bool> {
+    par_land_write_in(
+        lab_par_land(),
+        state,
+        host,
+        mapping_id,
+        off,
+        buf,
+        only,
+        gpas,
+        runs,
+        site,
+    )
+}
+
+/// [`par_land_write`] with the switch given by the caller, so a test can state
+/// the arm it is testing.
+#[allow(clippy::too_many_arguments)]
+fn par_land_write_in<H: HostMemory + HostOps>(
+    enabled: bool,
+    state: &DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    buf: &[u8],
+    only: Option<&[(u64, u64)]>,
+    gpas: &[u64],
+    runs: &[std::ops::Range<usize>],
+    site: &str,
+) -> Option<bool> {
+    if !enabled || !host.map_pages_stable() {
+        return None;
+    }
+    let pool = state.par().filter(|pool| pool.workers() > 0)?;
+    let need_end = off.saturating_add(buf.len() as u64);
+    let selected: u64 = selected_within(only, off, need_end)
+        .map(|(lo, hi)| hi - lo)
+        .sum();
+    if selected < PAR_LAND_MIN_BYTES {
+        return None;
+    }
+    let page_size = state.page_size();
+    let page_sz = page_size as usize;
+    let len = buf.len();
+    let mut mapped: Vec<(usize, usize)> = Vec::new();
+    let mut spans: Vec<LandSpan> = Vec::new();
+    let unmap_all = |host: &mut H, mapped: &[(usize, usize)]| {
+        for &(ptr, total) in mapped {
+            host.unmap_pages(ptr, total);
+        }
+    };
+    for run in runs {
+        let run_gpas = &gpas[run.clone()];
+        let run_mlo = (run.start as u64).saturating_mul(page_size);
+        let run_mhi = (run.end as u64).saturating_mul(page_size);
+        let copy_lo = off.max(run_mlo);
+        let copy_hi = need_end.min(run_mhi);
+        if copy_lo >= copy_hi || selected_within(only, copy_lo, copy_hi).next().is_none() {
+            continue;
+        }
+        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
+            unmap_all(host, &mapped);
+            crate::observe::fail(format!(
+                "{site} fail reason=map_pages mid={mapping_id} run_pages={} mlo={run_mlo:#x}",
+                run_gpas.len()
+            ));
+            return Some(false);
+        };
+        let total = run_gpas.len().saturating_mul(page_sz);
+        mapped.push((ptr, total));
+        let host_off = (copy_lo - run_mlo) as usize;
+        let n = (copy_hi - copy_lo) as usize;
+        if host_off + n > total || (copy_lo - off) as usize + n > len {
+            unmap_all(host, &mapped);
+            crate::observe::fail(format!(
+                "{site} fail reason=run_bounds mid={mapping_id} host_off={host_off:#x} \
+                 buf_off={:#x} n={n:#x} total={total:#x} len={len:#x}",
+                copy_lo - off
+            ));
+            return Some(false);
+        }
+        for (sel_lo, sel_hi) in selected_within(only, copy_lo, copy_hi) {
+            let host_off = (sel_lo - run_mlo) as usize;
+            spans.push(LandSpan {
+                // SAFETY: `host_off + n <= total` for the enclosing window was
+                // checked above and the selection is inside it.
+                dst: unsafe { (ptr as *mut u8).add(host_off) },
+                src: (sel_lo - off) as usize,
+                n: (sel_hi - sel_lo) as usize,
+                gpa: run_gpas[0].saturating_add(host_off as u64),
+            });
+        }
+    }
+    let disjoint = {
+        let mut by_gpa: Vec<(u64, u64)> = spans.iter().map(|s| (s.gpa, s.n as u64)).collect();
+        by_gpa.sort_unstable();
+        by_gpa.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0)
+    };
+    // SAFETY (both arms): every span was bounds-checked against its mapped run
+    // and the caller's buffer above, and the runs stay mapped until `unmap_all`.
+    let copy_span =
+        |s: &LandSpan| unsafe { write_guest_bytes(buf.as_ptr().add(s.src), s.dst, s.n) };
+    if disjoint {
+        let mut jobs: Vec<std::ops::Range<usize>> = Vec::new();
+        let (mut start, mut bytes) = (0usize, 0usize);
+        for (i, s) in spans.iter().enumerate() {
+            bytes += s.n;
+            if bytes >= PAR_LAND_JOB_BYTES {
+                jobs.push(start..i + 1);
+                (start, bytes) = (i + 1, 0);
+            }
+        }
+        if start < spans.len() {
+            jobs.push(start..spans.len());
+        }
+        let spans_ref = &spans;
+        let done = pool.scope(&(), &jobs, |_, _, job: &std::ops::Range<usize>| {
+            for s in &spans_ref[job.clone()] {
+                copy_span(s);
+            }
+        });
+        // A job that panicked may have stopped part way; its spans are copied
+        // again here, which lands the same bytes.
+        for (job, outcome) in jobs.iter().zip(&done.results) {
+            if outcome.is_err() {
+                for s in &spans[job.clone()] {
+                    copy_span(s);
+                }
+            }
+        }
+        crate::runtime::drain::note_store_route(if done.serial {
+            "lab_par_land_serial_scope"
+        } else {
+            "lab_par_land"
+        });
+    } else {
+        for s in &spans {
+            copy_span(s);
+        }
+        crate::runtime::drain::note_store_route("lab_par_land_overlap_serial");
+    }
+    for s in &spans {
+        crate::observe::footprint::note_written_range(s.gpa, s.n as u64);
+    }
+    unmap_all(host, &mapped);
+    Some(true)
 }
 
 /// Write `buf` into mapping linear offset `off` via packed map_pages runs.

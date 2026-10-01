@@ -624,3 +624,175 @@ fn an_admitted_page_footprint_marks_its_window_without_filling_scatter_gaps() {
     );
     assert_eq!(footprint::counts(), (2, 0));
 }
+
+/// The worker-pool arm of a mapping write ([`par_land_write_in`]) lands exactly
+/// the bytes the serial run walk lands.
+mod par_land {
+    use super::*;
+    use std::sync::Arc;
+
+    const PAGES: usize = 96;
+    const BASE: u64 = 0x4000_0000;
+
+    unsafe extern "C" fn attach(_ctx: *mut std::os::raw::c_void) {}
+    unsafe extern "C" fn detach(_ctx: *mut std::os::raw::c_void) {}
+
+    fn pool(workers: usize) -> Arc<crate::runtime::par::Pool> {
+        let mut table = crate::qemu::host_ops::ReimsVgpuHostOps::null();
+        table.thread_attach = Some(attach);
+        table.thread_detach = Some(detach);
+        let settings = crate::runtime::par::Settings {
+            workers,
+            worker_spin: std::time::Duration::ZERO,
+            join_spin: std::time::Duration::from_micros(50),
+        };
+        Arc::new(
+            crate::runtime::par::Pool::new(&table, &settings).expect("the attach pair is offered"),
+        )
+    }
+
+    /// One RAM range of `PAGES` pages, and a mapping whose page list visits it
+    /// in `order`, so the walk meets single pages and packed runs alike.
+    fn fixture(order: &[usize], with_pool: bool) -> (DeviceState, FakeHost, u32) {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.stable_map_pages = true;
+        // A host whose map aliases packed runs only, as the Windows shim's does:
+        // a scattered list has no single view, so the serial arm walks the runs
+        // too instead of writing through a bounce copy of the whole list.
+        host.strict_linux_map = true;
+        let page = 1usize << PAGE_SHIFT_X86;
+        host.map_range(BASE, PAGES * page, 0x5a);
+        let mid = 11u32;
+        state.map_surface(mid);
+        let first_pfn = (BASE >> PAGE_SHIFT_X86) as u32;
+        state.mappings.get_mut(&mid).unwrap().page_entries = order
+            .iter()
+            .map(|&i| ((first_pfn + i as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+            .collect();
+        if with_pool {
+            state.install_par_pool(pool(3));
+        }
+        (state, host, mid)
+    }
+
+    /// Pairs swapped in the first half, identity in the second: singles, then
+    /// one long packed run.
+    fn scrambled() -> Vec<usize> {
+        (0..PAGES)
+            .map(|i| match (i < PAGES / 2, i % 2) {
+                (true, 0) => i + 1,
+                (true, _) => i - 1,
+                _ => i,
+            })
+            .collect()
+    }
+
+    fn ram(host: &FakeHost) -> Vec<u8> {
+        let mut out = vec![0u8; PAGES << PAGE_SHIFT_X86];
+        host.read_gpa(BASE, &mut out).expect("the fixture's range");
+        out
+    }
+
+    /// Land `only` of a patterned buffer at `off` through both arms and return
+    /// the two RAM images and what the pool arm answered.
+    fn land_both(
+        order: &[usize],
+        off: u64,
+        only: &[(u64, u64)],
+    ) -> (Vec<u8>, Vec<u8>, Option<bool>) {
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let len = (PAGES as u64 * page - off - 300) as usize;
+        let buf: Vec<u8> = (0..len).map(|i| (i * 31 + i / 4096) as u8).collect();
+        let (mut s_state, mut s_host, mid) = fixture(order, false);
+        assert!(copy_mapping_runs(
+            &mut s_state,
+            &mut s_host,
+            mid,
+            off,
+            RunCopy::Write(&buf),
+            Some(only),
+            "par_land_test"
+        ));
+        let (mut p_state, mut p_host, mid) = fixture(order, true);
+        let gpas = mapping_page_gpas(&mut p_state, &mut p_host, mid).expect("a valid list");
+        let runs = reims_vgpu_paging::runs::contig_page_runs(&gpas, page);
+        let answer = par_land_write_in(
+            true,
+            &p_state,
+            &mut p_host,
+            mid,
+            off,
+            &buf,
+            Some(only),
+            &gpas,
+            &runs,
+            "par_land_test",
+        );
+        (ram(&s_host), ram(&p_host), answer)
+    }
+
+    fn selection() -> Vec<(u64, u64)> {
+        let page = 1u64 << PAGE_SHIFT_X86;
+        vec![
+            (100, 5000),
+            (3 * page + 17, 9 * page),
+            (20 * page, 20 * page + 1),
+            (25 * page + 9, 90 * page + 7),
+        ]
+    }
+
+    #[test]
+    fn a_pooled_landing_writes_what_the_serial_walk_writes() {
+        let (serial, pooled, answer) = land_both(&scrambled(), 100, &selection());
+        assert_eq!(answer, Some(true), "the selection is large enough to fork");
+        assert!(serial == pooled, "the two arms landed different bytes");
+        // And the write did something: the untouched pattern is gone.
+        assert!(serial.iter().any(|&b| b != 0x5a));
+    }
+
+    /// A page listed twice makes the last writer matter, so the pooled arm copies
+    /// in walk order and still lands what the serial walk lands.
+    #[test]
+    fn a_page_listed_twice_lands_in_walk_order() {
+        let mut order = scrambled();
+        order[70] = 7;
+        let (serial, pooled, answer) = land_both(&order, 100, &selection());
+        assert_eq!(answer, Some(true));
+        // What walk order means, computed directly: every selected byte of
+        // position i lands in page order[i], later positions over earlier ones.
+        let page = 1usize << PAGE_SHIFT_X86;
+        let off = 100usize;
+        let len = PAGES * page - off - 300;
+        let buf: Vec<u8> = (0..len).map(|i| (i * 31 + i / 4096) as u8).collect();
+        let mut want = vec![0x5au8; PAGES * page];
+        for (i, &pg) in order.iter().enumerate() {
+            for (lo, hi) in selection() {
+                let (lo, hi) = (lo as usize, hi as usize);
+                let a = lo.max(i * page).max(off);
+                let b = hi.min((i + 1) * page).min(off + len);
+                for m in a..b {
+                    want[pg * page + (m - i * page)] = buf[m - off];
+                }
+            }
+        }
+        let bad = |img: &[u8]| -> Vec<usize> {
+            (0..PAGES)
+                .filter(|&p| img[p * page..(p + 1) * page] != want[p * page..(p + 1) * page])
+                .collect()
+        };
+        assert!(
+            bad(&serial).is_empty() && bad(&pooled).is_empty(),
+            "serial off at {:?}, pooled off at {:?}",
+            bad(&serial),
+            bad(&pooled)
+        );
+    }
+
+    #[test]
+    fn a_small_selection_stays_on_the_caller() {
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let (_, _, answer) = land_both(&scrambled(), 0, &[(page, 3 * page)]);
+        assert_eq!(answer, None);
+    }
+}
