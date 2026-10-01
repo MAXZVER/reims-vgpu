@@ -2077,8 +2077,25 @@ pub fn quiesce_guest_writes() {
 /// The same flag [`quiesce_guest_writes`] short-circuits on. Host-side readers
 /// use this to avoid taking the engine lock when no GPU write can race them.
 pub fn guest_writes_outstanding() -> bool {
-    recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
+    // TEMP (lab, S5a): a deferred draw never sets this flag — the drain defers
+    // only chain intermediates with `skip_readback` and no `record_guest_store`
+    // (`try_metal2vulkan_draw`), and nothing else raises `GUEST_WRITE_DEBT` —
+    // so the answer does not depend on the job in flight, and the wait for it
+    // here was ~2.8 % of a 5K drag's drain (sampled resolve's debt settle). A
+    // job that lands a batch may *clear* the flag meanwhile, which only makes
+    // the caller settle once more than it had to.
+    // `REIMS_VGPU_LAB_RECORDER_LAZY_READERS=off` restores the wait.
+    if !recorder_lazy_readers() {
+        recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
+    }
     GUEST_WRITE_DEBT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn recorder_lazy_readers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("REIMS_VGPU_LAB_RECORDER_LAZY_READERS").is_ok_and(|v| v == "off")
+    })
 }
 
 /// Whether a completion stamp must be queued behind guest-memory access.
