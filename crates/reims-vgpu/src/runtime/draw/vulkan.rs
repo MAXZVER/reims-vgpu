@@ -1309,6 +1309,18 @@ fn sampled_mip_chain(
 /// (constexpr-sampler precedence, level-aware alias, sampled mip chain) for a
 /// same-conditions performance A/B; a comma list of `sampler`, `alias`,
 /// `pyramid` narrows only those.
+/// TEMP (lab): `REIMS_VGPU_LAB_RECORDER_GVA_STORE=on` hands a stream's last
+/// record to the recorder too when its Store stays on the GVA resident (see the
+/// deferral in `try_metal2vulkan_draw`). Latched.
+fn lab_recorder_gva_store() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_RECORDER_GVA_STORE").is_ok_and(|v| v == "on");
+        crate::observe::off(format!("recorder_gva_store on={on}"));
+        on
+    })
+}
+
 fn lab_no_m1fix(part: &str) -> bool {
     static PARTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let parts = PARTS.get_or_init(|| {
@@ -12372,6 +12384,40 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // What `out.occlusion_samples` would have been with no query armed.
             req.visibility_samples = None;
             return Ok(M2vDrawSpan::ResidentChain);
+        }
+        // TEMP (lab, `REIMS_VGPU_LAB_RECORDER_GVA_STORE`): the last record of a
+        // stream whose Store stays on its GVA resident is the same case for the
+        // engine — skip_readback, no query, nothing published into guest memory
+        // — and the code below reads nothing of `out` for it either: it returns
+        // `ResidentGvaStore` with the identity decided above. Its Store routing
+        // (the debt arm and its write witness) then runs while the recorder
+        // records the draw, and the stream's end joins as it does for chains.
+        if recorder_on
+            && !resident_render_chain
+            && surface_resident_store.is_none()
+            && lab_recorder_gva_store()
+            && req.visibility.is_none()
+            && resources.occlusion_query.is_none()
+            && resources.skip_readback
+            && !resources.record_guest_store
+        {
+            if let Some(identity) = gva_resident_store.clone() {
+                crate::backend::vulkan::engine::submit_deferred_draw(
+                    state,
+                    resources,
+                    crate::backend::vulkan::engine::DeferredMeta {
+                        pipeline_ref: req.pipeline_ref,
+                        task_id: req.task_id,
+                        width: w,
+                        height: h,
+                        vertex_count,
+                    },
+                );
+                req.visibility_samples = None;
+                crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
+                crate::runtime::drain::note_store_route("lab_recorder_gva_store_deferred");
+                return Ok(M2vDrawSpan::ResidentGvaStore { identity });
+            }
         }
         let out = crate::backend::vulkan::engine::execute_draw_request(state, &resources)?;
         // Carried back on the request so `runtime::exec` can sum the chain's
