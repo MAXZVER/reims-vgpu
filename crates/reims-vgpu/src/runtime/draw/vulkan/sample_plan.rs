@@ -1554,6 +1554,128 @@ mod tests {
         );
     }
 
+    /// `REIMS_VGPU_LAB_FIELD_RUNS`: a full-screen field witness whose window the
+    /// zero-copy rail has resolved reads its patches from the cached runs and
+    /// prints exactly the record the `read_gpa` walk prints for the same pages.
+    #[test]
+    fn the_field_witness_reads_a_cached_window_from_its_runs() {
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        let (w, h) = (1024u32, 1024u32);
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let build = |mid: u32| {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            host.stable_map_pages = true;
+            host.strict_linux_map = true;
+            let pages = u64::from(w) * u64::from(h) * 4 / page;
+            let gpas: Vec<u64> = (0..pages).map(|i| 0x1_0000_0000 + 2 * i * page).collect();
+            for (n, &gpa) in gpas.iter().enumerate() {
+                host.map_range(gpa, page as usize, (n * 37 % 251) as u8);
+            }
+            assert!(state.map_surface(mid));
+            assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+            state.mappings.get_mut(&mid).unwrap().page_entries = gpas
+                .iter()
+                .map(|&gpa| {
+                    (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+                })
+                .collect();
+            (state, host, gpas)
+        };
+        let record = |mid: u32| {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains(&format!("sampled_surface_field mid={mid} ")))
+                .map(|l| {
+                    let at = l.find("patches=").expect("patches");
+                    let end = l.find(" (guest pages").unwrap_or(l.len());
+                    l[at..end].to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let (mid_runs, mid_walk) = (0xF1E1u32, 0xF1E2u32);
+        let (mut a, mut a_host, a_gpas) = build(mid_runs);
+        let (b, b_host, _) = build(mid_walk);
+        let (base_off, bpr, _) = crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+            a.mappings.get(&mid_runs).unwrap(),
+            w,
+            h,
+            MTL_FORMAT_BGRA8_UNORM,
+        )
+        .unwrap();
+        let span = u64::from(bpr) * u64::from(h - 1) + u64::from(w) * 4;
+        assert!(mapping_window_guest_runs(&mut a, &mut a_host, mid_runs, base_off, span).is_some());
+        crate::runtime::scanout::note_sampled_surface_field(&a, &a_host, mid_runs, 9, "guest_runs");
+        crate::runtime::scanout::note_sampled_surface_field(&b, &b_host, mid_walk, 9, "guest_runs");
+        let (ra, rb) = (record(mid_runs), record(mid_walk));
+        assert_eq!(ra.len(), 1);
+        assert_eq!(ra, rb, "the runs and the walk must print the same record");
+        assert!(
+            ra[0].contains("painted:"),
+            "fixture must exercise the stats: {}",
+            ra[0]
+        );
+        // The runs path is the one taken: with every page refusing `read_gpa`
+        // the walk reads nothing and prints nothing, while the runs still read
+        // the guest's new bytes and report the change.
+        for &gpa in &a_gpas {
+            assert!(a_host.write_gpa(gpa, &[0xffu8; 4096]).is_ok());
+            a_host.mark_non_ram(gpa, page);
+        }
+        crate::runtime::scanout::note_sampled_surface_field(&a, &a_host, mid_runs, 9, "guest_runs");
+        let ra = record(mid_runs);
+        assert_eq!(ra.len(), 2);
+        assert!(
+            ra[1].starts_with("patches=[white:255/0,white:255/0,white:255/0,white:255/0]"),
+            "{}",
+            ra[1]
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn lab_bench_resident_bind() {
+        let (mut state, mut host, texture_ref, surface_id) = fixture();
+        let res = resource(&state, &host, texture_ref);
+        let identity =
+            crate::backend::vulkan::present_identity::surface_identity(&state, surface_id, 4, 3);
+        resource_lease::seed_warm_lease_for_test(
+            &res,
+            &identity,
+            ResidentContentBacking::DeviceAllocation,
+        );
+        let n = 20_000u32;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(resolve_sampled_source(
+                &mut state,
+                &mut host,
+                1,
+                texture_ref,
+                Some(res.clone()),
+                true,
+            ));
+        }
+        eprintln!(
+            "lab_bench resident resolve: {:.3} us",
+            t.elapsed().as_secs_f64() * 1e6 / f64::from(n)
+        );
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(
+                surface_top(&state, &host, surface_id, true, |identity| {
+                    Some(resource_lease::resident_target_backing(&res, identity))
+                })
+                .ok(),
+            );
+        }
+        eprintln!(
+            "lab_bench resident surface_top: {:.3} us",
+            t.elapsed().as_secs_f64() * 1e6 / f64::from(n)
+        );
+    }
+
     #[test]
     #[ignore]
     fn lab_bench_memo_bind() {
