@@ -5241,8 +5241,14 @@ fn mapping_window_guest_runs_in<M: HostMemory + HostOps>(
     // The exact cache (`REIMS_VGPU_LAB_RUNS_FIX`): the same revalidation and
     // liveness checks, then a hit on the mapping's own key skips the whole-mapping
     // page list, the run memo and both clones.
+    // A mapping without a `mapping_internal` (every mapping on the x86 pathway) has
+    // nothing to revalidate: its key is a pure read of the state. Anything else
+    // takes the mutating revalidation as before.
     let (map_generation, control_key, mapping_pages) =
-        mapper::lab_mapping_window_key(state, host, mid)?;
+        match mapper::mapping_window_key_readonly(state, mid) {
+            Some(key) => key,
+            None => mapper::lab_mapping_window_key(state, host, mid)?,
+        };
     let key = WindowKey {
         map_generation,
         control_key,
@@ -15054,26 +15060,26 @@ mod vulkan_split_tests {
             m.page_entries = entries(pfn_a, pages);
         }
         let span = 32 * page;
-        let mut resolve = |fix, state: &mut DeviceState, base_off, span| {
-            mapping_window_guest_runs_in(fix, state, &mut host, mid, base_off, span)
+        let resolve = |fix, state: &mut DeviceState, host: &mut FakeHost, base_off, span| {
+            mapping_window_guest_runs_in(fix, state, host, mid, base_off, span)
         };
 
-        let walk = resolve(Mode::Off, &mut state, 0, span).expect("the walk resolves");
+        let walk = resolve(Mode::Off, &mut state, &mut host, 0, span).expect("the walk resolves");
         assert_eq!(walk.0.len(), 32);
         assert!(
             state.mappings.get(&mid).unwrap().window_cache.is_empty(),
             "the off arm remembers nothing"
         );
 
-        let first = resolve(Mode::On, &mut state, 0, span).expect("a miss resolves");
+        let first = resolve(Mode::On, &mut state, &mut host, 0, span).expect("a miss resolves");
         assert_eq!((*first.0).clone(), (*walk.0).clone());
         assert_eq!((*first.1).clone(), (*walk.1).clone());
-        let hit = resolve(Mode::On, &mut state, 0, span).expect("a hit resolves");
+        let hit = resolve(Mode::On, &mut state, &mut host, 0, span).expect("a hit resolves");
         assert!(
             Arc::ptr_eq(&hit.0, &first.0) && Arc::ptr_eq(&hit.1, &first.1),
             "a hit hands back the stored window, not a rebuilt one"
         );
-        let verified = resolve(Mode::Verify, &mut state, 0, span).expect("verify resolves");
+        let verified = resolve(Mode::Verify, &mut state, &mut host, 0, span).expect("verify resolves");
         assert_eq!((*verified.0).clone(), (*walk.0).clone());
         assert_eq!((*verified.1).clone(), (*walk.1).clone());
         assert!(
@@ -15083,12 +15089,12 @@ mod vulkan_split_tests {
 
         // A different window of the same mapping is its own entry and leaves the
         // first one served.
-        let other = resolve(Mode::On, &mut state, 8 * page, 16 * page).expect("second window");
+        let other = resolve(Mode::On, &mut state, &mut host, 8 * page, 16 * page).expect("second window");
         assert_eq!(other.0.len(), 16);
         assert_eq!(other.0[0], ((pfn_a as u64) + 8) << PAGE_SHIFT_X86);
         assert!(!Arc::ptr_eq(&other.0, &first.0));
         assert!(Arc::ptr_eq(
-            &resolve(Mode::On, &mut state, 0, span).unwrap().0,
+            &resolve(Mode::On, &mut state, &mut host, 0, span).unwrap().0,
             &first.0
         ));
         assert_eq!(state.mappings.get(&mid).unwrap().window_cache.len(), 2);
@@ -15097,7 +15103,7 @@ mod vulkan_split_tests {
         // window of the mapping is asked again, and the answer is the walk's.
         state.gfx.root_page = 0x7777;
         let control_moved =
-            resolve(Mode::On, &mut state, 0, span).expect("still clear of the root page");
+            resolve(Mode::On, &mut state, &mut host, 0, span).expect("still clear of the root page");
         assert!(
             !Arc::ptr_eq(&control_moved.0, &first.0),
             "a moved control layout is a miss"
@@ -15112,24 +15118,24 @@ mod vulkan_split_tests {
         // refusal is what the cache reports, not the window it remembered.
         state.gfx.root_page = pfn_a + 3;
         assert!(
-            resolve(Mode::On, &mut state, 0, span).is_none(),
+            resolve(Mode::On, &mut state, &mut host, 0, span).is_none(),
             "a cache must not serve a window the collision check now refuses"
         );
         assert!(
-            resolve(Mode::Off, &mut state, 0, span).is_none(),
+            resolve(Mode::Off, &mut state, &mut host, 0, span).is_none(),
             "and that is what the walk says"
         );
         state.gfx.root_page = 0x7777;
 
         // The guest re-points the surface: the list changes and the generation
         // bumps, as at every writer of `page_entries`.
-        let before = resolve(Mode::On, &mut state, 0, span).unwrap();
+        let before = resolve(Mode::On, &mut state, &mut host, 0, span).unwrap();
         {
             let m = state.mappings.get_mut(&mid).unwrap();
             m.page_entries = entries(pfn_b, pages);
             DeviceState::bump_map_generation(m);
         }
-        let after = resolve(Mode::On, &mut state, 0, span).expect("the new list resolves");
+        let after = resolve(Mode::On, &mut state, &mut host, 0, span).expect("the new list resolves");
         assert!(
             !Arc::ptr_eq(&after.0, &before.0),
             "a new map_generation is a miss"
@@ -15139,7 +15145,7 @@ mod vulkan_split_tests {
             (pfn_b as u64) << PAGE_SHIFT_X86,
             "the window names the new pages"
         );
-        let walk_after = resolve(Mode::Off, &mut state, 0, span).unwrap();
+        let walk_after = resolve(Mode::Off, &mut state, &mut host, 0, span).unwrap();
         assert_eq!((*after.0).clone(), (*walk_after.0).clone());
         assert_eq!((*after.1).clone(), (*walk_after.1).clone());
         assert_eq!(
@@ -15153,19 +15159,45 @@ mod vulkan_split_tests {
             let m = state.mappings.get_mut(&mid).unwrap();
             m.page_entries = entries(pfn_b, pages - 8);
         }
-        let shorter = resolve(Mode::On, &mut state, 0, span).expect("40 pages still cover 32");
+        let shorter = resolve(Mode::On, &mut state, &mut host, 0, span).expect("40 pages still cover 32");
         assert!(
             !Arc::ptr_eq(&shorter.0, &after.0),
             "the page count is part of the key"
         );
 
         // A window the list cannot cover is refused, cached or not.
-        assert!(resolve(Mode::On, &mut state, 0, 64 * page).is_none());
+        assert!(resolve(Mode::On, &mut state, &mut host, 0, 64 * page).is_none());
+
+        // The read-only twin (what a worker holding `&DeviceState` calls) agrees with
+        // the mutating revalidation for a mapping without a `mapping_internal`, serves
+        // the cached window without touching anything, and refuses what it cannot
+        // vouch for without mutating.
+        let served = resolve(Mode::On, &mut state, &mut host, 0, span).unwrap();
+        let ro = mapper::mapping_window_cached(&state, mid, 0, span).expect("a hit, read-only");
+        assert!(Arc::ptr_eq(&ro.0, &served.0) && Arc::ptr_eq(&ro.1, &served.1));
+        assert!(
+            mapper::mapping_window_cached(&state, mid, 8 * page, span).is_none(),
+            "a window nobody resolved is not served without a mutating resolve"
+        );
+        let key_ro = mapper::mapping_window_key_readonly(&state, mid).expect("keyed");
+        let key_mut = mapper::lab_mapping_window_key(&mut state, &mut host, mid).expect("keyed");
+        assert_eq!(key_ro, key_mut, "the same key as the revalidating path");
+        state.mappings.get_mut(&mid).unwrap().mapping_internal = 0x1234;
+        assert!(
+            mapper::mapping_window_key_readonly(&state, mid).is_none()
+                && mapper::mapping_window_cached(&state, mid, 0, span).is_none(),
+            "a mapping with a mapping_internal may be rewritten by its revalidation: not read-only"
+        );
+        state.mappings.get_mut(&mid).unwrap().mapping_internal = 0;
 
         // Unmapping retires the mapping's windows with its list.
         assert!(state.unmap_surface(mid));
         assert!(
-            resolve(Mode::On, &mut state, 0, span).is_none(),
+            mapper::mapping_window_key_readonly(&state, mid).is_none(),
+            "an unmapped surface has no key"
+        );
+        assert!(
+            resolve(Mode::On, &mut state, &mut host, 0, span).is_none(),
             "an unmapped surface serves nothing"
         );
     }

@@ -1055,6 +1055,8 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     host: &H,
     mapping_id: u32,
 ) -> Option<&'static str> {
+    let _lab_rmr = crate::runtime::chain_phase::CostSpan::new("lab_rmr_us"); // TEMP (lab)
+    crate::runtime::drain::note_store_route("lab_rmr_calls"); // TEMP (lab)
     let Some(m) = state.mappings.get(&mapping_id) else {
         return Some("revalidate_gone");
     };
@@ -1068,13 +1070,28 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     // the two facts that separate the empty-page-list outcomes from each other.
     let mut resolve_ran = false;
     let mut resolve_ok = false;
+    if !has_internal {
+        crate::runtime::drain::note_store_route("lab_rmr_nointernal"); // TEMP (lab)
+    }
     if has_internal {
         let generation_before = m.map_generation;
+        let lab_before = lab_rmb_fp().then(|| lab_resolve_fingerprint(m)); // TEMP (lab)
         let started = std::time::Instant::now();
         let resolved = resolve_mapping_backing(state, host, mapping_id);
         resolve_ran = true;
         resolve_ok = resolved;
         let elapsed_us = started.elapsed().as_micros() as u64;
+        // TEMP (lab): what the re-resolve costs and whether it ever changes anything.
+        crate::runtime::drain::note_store_route("lab_rmb_calls");
+        crate::runtime::drain::note_store_route_n("lab_rmb_us", elapsed_us);
+        if !resolved {
+            crate::runtime::drain::note_store_route("lab_rmb_unresolved");
+        }
+        if let Some(before) = lab_before {
+            if state.mappings.get(&mapping_id).map(lab_resolve_fingerprint) != Some(before) {
+                crate::runtime::drain::note_store_route("lab_rmb_changed");
+            }
+        }
         let (pages_after, generation_after) = state
             .mappings
             .get(&mapping_id)
@@ -1473,6 +1490,35 @@ const REVALIDATE_SLOW_US: u64 = 1_000;
 #[inline]
 fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
     elapsed_us >= REVALIDATE_SLOW_US
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_RMB_FP=1` folds the mapping before and after every
+/// re-resolve (extra cost, measurement only) and counts `lab_rmb_changed`.
+fn lab_rmb_fp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RMB_FP").is_ok_and(|v| v == "1"))
+}
+
+/// TEMP (lab): every field of a mapping that [`resolve_mapping_backing`] can rewrite,
+/// folded, so a before/after pair says whether a re-resolve changed anything.
+fn lab_resolve_fingerprint(m: &crate::model::MappingEntry) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (
+        m.map_generation,
+        m.mapped,
+        m.mapping_internal,
+        m.page_table_kva,
+        m.has_geom,
+        m.width,
+        m.height,
+        m.format,
+        m.condemned_entries.is_some(),
+    )
+        .hash(&mut h);
+    m.page_entries.hash(&mut h);
+    m.device_desc.hash(&mut h);
+    h.finish()
 }
 
 /// Release contiguous views whose page tables changed.
@@ -1987,6 +2033,66 @@ pub(crate) fn lab_mapping_window_key<H: HostMemory + HostOps>(
     }
     let pages = m.page_entries.len();
     Some((m.map_generation, control_layout_key(state, pages), pages))
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_RUNS_FIX`): the read-only twin of
+/// [`lab_mapping_window_key`], for a mapping whose revalidation cannot mutate
+/// anything: one with no `mapping_internal`.
+///
+/// [`revalidate_mapping_reason`] re-resolves only `if m.mapping_internal != 0`
+/// and otherwise reaches its final `match`, which for a mapped mapping with a
+/// page list answers `None` ("resolvable") and touches nothing. So for such a
+/// mapping the whole of [`lab_mapping_window_key`] is a function of `&DeviceState`,
+/// and this is that function. It answers `None` for a mapping it cannot vouch for
+/// without mutating - one with a `mapping_internal` (the re-resolve may rewrite
+/// the page list, geometry and descriptor), unmapped, or with no pages - and the
+/// caller then takes the mutating path, which decides those cases as it always did.
+/// On the x86 PCI pathway no mapping ever has a `mapping_internal`: the mapper
+/// capture needs `HostOps::read_xreg`, which the PCI shim answers -1.
+pub(crate) fn mapping_window_key_readonly(
+    state: &DeviceState,
+    mapping_id: u32,
+) -> Option<(u32, u64, usize)> {
+    let m = state.mappings.get(&mapping_id)?;
+    if !m.mapped || m.mapping_internal != 0 || m.page_entries.is_empty() {
+        return None;
+    }
+    let pages = m.page_entries.len();
+    Some((m.map_generation, control_layout_key(state, pages), pages))
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_RUNS_FIX`): the resolved window `[base_off,
+/// base_off + span)` of `mapping_id`, without mutating anything, when the mapping's
+/// window cache holds it under the mapping's current key - `None` for every case
+/// that needs the mutating resolve (see [`mapping_window_key_readonly`]) or has no
+/// cached window.
+///
+/// The page list and runs come back as the `Arc`s the cache holds, so a worker
+/// holding only `&DeviceState` can take them and the drain keeps the mutating
+/// path for misses.
+pub(crate) fn mapping_window_cached(
+    state: &DeviceState,
+    mapping_id: u32,
+    base_off: u64,
+    span: u64,
+) -> Option<(
+    std::sync::Arc<Vec<u64>>,
+    std::sync::Arc<Vec<crate::runtime::guest_ram::GuestRun>>,
+)> {
+    let (map_generation, control_key, mapping_pages) =
+        mapping_window_key_readonly(state, mapping_id)?;
+    lab_window_cache_lookup(
+        state,
+        mapping_id,
+        &crate::runtime::lab_runs::WindowKey {
+            map_generation,
+            control_key,
+            mapping_pages,
+            base_off,
+            span,
+            page: state.page_size(),
+        },
+    )
 }
 
 /// TEMP (lab): the cache half of a window resolve.
