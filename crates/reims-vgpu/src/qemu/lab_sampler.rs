@@ -181,7 +181,7 @@ fn run(target: Handle, out: &str, gate: Option<&str>, hz: u64, stack: (u64, u64)
     let mut last_flush = std::time::Instant::now();
     let mut ctx = Context([0u8; 1232]);
     let mut frames = [0u64; MAX_FRAMES];
-    let mut modules: Vec<(u64, u64)> = Vec::new();
+    let mut modules: Vec<(u64, u64)> = Vec::with_capacity(256);
     let exe_end = {
         let mut info = ModuleInfo { base: core::ptr::null_mut(), size: 0, entry: core::ptr::null_mut() };
         // SAFETY: a query about our own executable module.
@@ -231,6 +231,18 @@ fn run(target: Handle, out: &str, gate: Option<&str>, hz: u64, stack: (u64, u64)
                     last_rsp = rsp;
                     frames[n] = rip;
                     n += 1;
+                    // Unwind only through code of a known module: the exe, or a DLL
+                    // a previous sample named (after its resume). Anything else is
+                    // anonymous code (the driver's JIT): its unwind data, if any,
+                    // comes from a callback the driver registered, which must not
+                    // run against a thread suspended at an arbitrary point. The
+                    // frame is kept; the walk stops there, and the module it is in
+                    // (if it is one) is named after the resume for the next walks.
+                    if !(rip >= base && rip < exe_end)
+                        && !modules.iter().any(|&(b, e)| rip >= b && rip < e)
+                    {
+                        break;
+                    }
                     let mut image_base = 0u64;
                     let entry = RtlLookupFunctionEntry(rip, &mut image_base, core::ptr::null_mut());
                     if entry.is_null() {
