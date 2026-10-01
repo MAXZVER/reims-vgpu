@@ -2102,6 +2102,114 @@ fn the_backing_probe_order_visits_task_zero_first_and_every_live_task_once() {
     assert!(live.iter().all(|t| seen.contains(t)), "{order:?}");
 }
 
+/// The cursor steps through the same ids, in the same order, as the list it
+/// replaced — task 0, the hint when it names another task, then every other
+/// live task ascending — for every hint and every shape of table, including
+/// tasks that are present and inactive.
+#[test]
+fn the_backing_probe_cursor_yields_what_the_collected_order_did() {
+    // What the `Vec` form built, spelled as it was.
+    fn collected(tasks: &TaskTable, hint: u32) -> Vec<u32> {
+        std::iter::once(0)
+            .chain(Some(hint).filter(|&h| h != 0))
+            .chain(tasks.live_ids().filter(move |&tid| tid != 0 && tid != hint))
+            .collect()
+    }
+
+    for live in [
+        &[][..],
+        &[0][..],
+        &[5][..],
+        &[0, 1, 2][..],
+        &[0, 1, 7, 300, 70_000][..],
+        &[3, 4, u32::MAX][..],
+    ] {
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        for &id in live {
+            state.define_task(id, 0x1000, 2);
+        }
+        // A task the table holds and the guest has deactivated is not live.
+        state.define_task(9, 0x1000, 2);
+        state.tasks.get_mut(9).expect("just defined").active = false;
+
+        for hint in [0u32, 1, 5, 7, 9, 300, 70_000, u32::MAX] {
+            assert_eq!(
+                backing_probe_order(&state.tasks, hint),
+                collected(&state.tasks, hint),
+                "live={live:?} hint={hint}"
+            );
+        }
+    }
+}
+
+/// A resolve that finds its surface where it was last found — the present
+/// path, once per mapping per frame — does not enter the heap allocator. The
+/// order of probes, the descriptor read, the shape census and the claimant
+/// census each used to take a trip.
+///
+/// Warmed first, because the first resolve of a surface builds its mapping and
+/// reports it once; it is the second that a frame repeats.
+#[test]
+fn a_present_resolve_that_hits_does_not_allocate() {
+    // The instrument sees the heap: a control that must trip.
+    let (_, control) = reims_vgpu_testkit::allocations::measure(|| vec![0u8; 64]);
+    assert!(control >= 1, "the counting allocator is not installed");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.page_shift = PAGE_SHIFT_X86;
+    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    let page = 5u64 << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    host.map_range(page, 0x1000, 0x11);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+    st32(&mut d[..4], 5);
+    let _ = host.write_gpa(root_gpa + 4, &d[..4]);
+    // Task 0 owns the surface, which is where the search stops first.
+    state.define_task(0, 0x1000, 2);
+    assert!(state.set_object_list(0, 0, 8));
+    // A second live task that does not, so a search that walked on would have
+    // something to collect.
+    state.define_task(1, 0x1000, 2);
+    assert!(state.set_object_list(1, 0, 8));
+    let mut entry = [0u8; 12];
+    st32(&mut entry[0..], 4u32 | (0x30u32 << 8));
+    entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 3 * 12, &entry);
+    let mut desc = vec![0u8; 0x30];
+    st64(&mut desc[0..], 0x1000);
+    st32(&mut desc[8..], 1); // backing_pfn = GVA page 1
+    st32(&mut desc[0xc..], 0x50);
+    desc[0x10] = 1;
+    st32(&mut desc[0x18..], 16);
+    st32(&mut desc[0x1c..], 16);
+    st32(&mut desc[0x20..], 64);
+    let _ = host.write_gpa(data_gpa + 0x80, &desc);
+
+    assert!(resolve_backing(&mut state, &host, 3), "builds the mapping");
+    assert!(
+        resolve_backing_force(&mut state, &host, 3),
+        "and re-reads it"
+    );
+
+    let (hit, trips) = reims_vgpu_testkit::allocations::measure(|| {
+        let force = resolve_backing_force(&mut state, &host, 3);
+        let plain = resolve_backing(&mut state, &host, 3);
+        force && plain
+    });
+    assert!(hit, "both still find it");
+    assert_eq!(trips, 0, "a warm present resolve enters the heap allocator");
+}
+
 #[test]
 fn undecoded_backing_span_is_exactly_what_the_decoder_skips() {
     // One plane: the decoder consumes 0x14..0x24, so the tail starts there.

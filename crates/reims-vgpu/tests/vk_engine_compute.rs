@@ -1642,10 +1642,11 @@ fn compute_sampled_a8unorm_arrives_in_alpha() {
 //
 // These live here rather than beside the watchdog's own unit tests for one
 // reason: the allocation counter is a `#[global_allocator]`, and the library's
-// unit-test binary does not install one. A `measure` there would report zero
-// trips for every path, including a path that allocates — a gate that cannot
-// fail. This binary installs the counter above, so the zero it reports is the
-// path's, not the harness's.
+// unit-test binary did not install one when these were written (it does now,
+// `TEST_ALLOCATOR` in `lib.rs`, and its tests assert a control that must trip).
+// A `measure` without one would report zero trips for every path, including a
+// path that allocates — a gate that cannot fail. This binary installs the
+// counter above, so the zero it reports is the path's, not the harness's.
 // ---------------------------------------------------------------------------
 
 use reims_vgpu::runtime::compute_exec::stall_watchdog::arm_compute_engine_stall_watchdog;
