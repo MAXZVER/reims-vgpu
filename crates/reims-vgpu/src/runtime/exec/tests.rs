@@ -8506,7 +8506,15 @@ fn an_unchanged_bind_does_not_fork_the_table_a_draw_holds() {
                 offset
             };
             // The offset the slot already has changes nothing either.
-            handle_render_record(&mut state, &host, 1, offset_op, &rebase(0), &mut out, &mut acc);
+            handle_render_record(
+                &mut state,
+                &host,
+                1,
+                offset_op,
+                &rebase(0),
+                &mut out,
+                &mut acc,
+            );
             handle_render_record(&mut state, &host, 1, draw_op, &draw, &mut out, &mut acc);
             assert_eq!(
                 Arc::ptr_eq(&acc.draws[1].vertex_buffers, &acc.draws[2].vertex_buffers),
@@ -8516,7 +8524,15 @@ fn an_unchanged_bind_does_not_fork_the_table_a_draw_holds() {
 
             // A different offset is a different bind and the earlier draw keeps
             // the one it was recorded with.
-            handle_render_record(&mut state, &host, 1, offset_op, &rebase(0x40), &mut out, &mut acc);
+            handle_render_record(
+                &mut state,
+                &host,
+                1,
+                offset_op,
+                &rebase(0x40),
+                &mut out,
+                &mut acc,
+            );
             handle_render_record(&mut state, &host, 1, draw_op, &draw, &mut out, &mut acc);
             assert_eq!(acc.draws[1].vertex_buffers[0].offset, 0);
             assert_eq!(acc.draws[2].vertex_buffers[0].offset, 0);
@@ -8587,7 +8603,8 @@ fn a_fragment_texture_bind_shape_is_sighted_once_per_thread() {
 fn a_plural_scissor_replaces_the_state_in_place_and_an_empty_rect_keeps_it() {
     let rect = |x: u64, w: u64| [x, 0, w, 4];
     let record = |rects: &[[u64; 4]]| {
-        let total = OP_HEADER_LEN + render_pass::SCISSOR_RECTS_COUNT_LEN
+        let total = OP_HEADER_LEN
+            + render_pass::SCISSOR_RECTS_COUNT_LEN
             + rects.len() * render_pass::SCISSOR_PAYLOAD_LEN;
         let mut cmd = vec![0u8; total];
         st32(&mut cmd, wire_render::OPCODE_SET_SCISSOR_RECTS);
@@ -8596,7 +8613,10 @@ fn a_plural_scissor_replaces_the_state_in_place_and_an_empty_rect_keeps_it() {
         let e0 = OP_HEADER_LEN + render_pass::SCISSOR_RECTS_COUNT_LEN;
         for (n, r) in rects.iter().enumerate() {
             for (i, val) in r.iter().enumerate() {
-                st64(&mut cmd[e0 + n * render_pass::SCISSOR_PAYLOAD_LEN + i * 8..], *val);
+                st64(
+                    &mut cmd[e0 + n * render_pass::SCISSOR_PAYLOAD_LEN + i * 8..],
+                    *val,
+                );
             }
         }
         cmd

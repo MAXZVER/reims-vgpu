@@ -5041,7 +5041,10 @@ trait SameBind {
     fn same_bind(&self, other: &Self) -> bool;
 }
 
-fn same_resource(a: &Option<Arc<crate::model::TaskResource>>, b: &Option<Arc<crate::model::TaskResource>>) -> bool {
+fn same_resource(
+    a: &Option<Arc<crate::model::TaskResource>>,
+    b: &Option<Arc<crate::model::TaskResource>>,
+) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         (None, None) => true,

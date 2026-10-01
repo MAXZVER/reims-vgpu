@@ -61,11 +61,13 @@ enum Mode {
 
 fn mode() -> Mode {
     static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("REIMS_VGPU_LAB_WALK_MEMO").as_deref() {
-        Ok("off") => Mode::Off,
-        Ok("alt") => Mode::Alt,
-        _ => Mode::On,
-    })
+    *MODE.get_or_init(
+        || match std::env::var("REIMS_VGPU_LAB_WALK_MEMO").as_deref() {
+            Ok("off") => Mode::Off,
+            Ok("alt") => Mode::Alt,
+            _ => Mode::On,
+        },
+    )
 }
 
 thread_local! {
