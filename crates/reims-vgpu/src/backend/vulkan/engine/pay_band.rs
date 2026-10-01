@@ -220,6 +220,8 @@ pub(crate) const MAX_DISPATCH_RANGES: usize = 16;
 /// every page the caller must land whatever the compare says (`force`, which the
 /// kernel also copies out). Ascending, disjoint, at most
 /// [`MAX_DISPATCH_RANGES`]; empty when there is nothing to compare.
+// A frame's one range of pages is a list of one range, not `0..total` pages.
+#[allow(clippy::single_range_in_vec_init)]
 pub(crate) fn dispatch_ranges(
     band: RowBand,
     width: u32,
@@ -252,6 +254,52 @@ pub(crate) fn dispatch_ranges(
         merged.remove(join + 1);
     }
     merged
+}
+
+/// What one payment does with the band: the rows it narrows by, and the page
+/// ranges it dispatches over.
+///
+/// The band says which rows a write since the last payment could have reached;
+/// it speaks for a compare record (`prev`'s bytes, the hash words) only while
+/// that record stands for the frame the last payment left. A payment that
+/// rebuilds a record from this frame (`every_page`: a new shadow or `prev` copy,
+/// a new or grown hash buffer, a record the last payment did not refresh) takes
+/// every page whatever the band says, so its band is [`RowBand::Full`] and the
+/// registry is not even asked. Otherwise a page outside the band was not written
+/// since the last payment, the record of it is still right, and no compare need
+/// look at it — which is why `PAY_BAND` and `PAY_HASH` compose: the same pages
+/// are skipped whether the record is the `prev` frame or a hash.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct BandPlan {
+    /// The rows the compare may find changed (every row for a payment that takes
+    /// every page, and with the gate off).
+    pub band: RowBand,
+    /// The page ranges to dispatch, with the gate `on` and only when every
+    /// compare that runs reads the resident in place (`reads_image`); `None`
+    /// dispatches every page.
+    pub ranges: Option<Vec<Range<u32>>>,
+}
+
+impl BandPlan {
+    /// `kept` reads the resident's band against the shadow's payment epoch; it
+    /// is asked only when the band can narrow anything.
+    pub(crate) fn new(
+        mode: PayBandMode,
+        every_page: bool,
+        reads_image: bool,
+        kept: impl FnOnce() -> RowBand,
+        (width, height): (u32, u32),
+        force: &[u32],
+    ) -> Self {
+        let band = if mode.tracks() && !every_page {
+            kept()
+        } else {
+            RowBand::Full
+        };
+        let ranges = (mode == PayBandMode::On && reads_image)
+            .then(|| dispatch_ranges(band, width, height, force));
+        Self { band, ranges }
+    }
 }
 
 /// What `REIMS_VGPU_LAB_PAY_BAND` asks of a payment.
@@ -288,8 +336,9 @@ impl PayBandMode {
 /// Coverage is `pay_band_rows / pay_band_height_rows` (a frame with no band to
 /// narrow by counts as every row) and `pay_band_pages_dispatched /
 /// pay_band_pages_total` for what the compare was actually dispatched over.
-/// `pay_band_frames` is the payments that had a shadow to compare against;
-/// a first payment of a shadow copies the whole frame and is `pay_band_fresh`.
+/// `pay_band_frames` is the payments that had a record to compare against;
+/// a payment that takes every page (the first of a shadow, which copies the
+/// whole frame, or one that seeds a hash record) is `pay_band_fresh`.
 pub(crate) fn note_census(
     mode: PayBandMode,
     fresh: bool,
@@ -624,6 +673,80 @@ mod tests {
         assert_eq!(PayBandMode::parse(Some(" verify ")), PayBandMode::Verify);
         assert!(!PayBandMode::Off.tracks());
         assert!(PayBandMode::On.tracks() && PayBandMode::Verify.tracks());
+    }
+
+    /// The plan for a 1024x100 frame (one page per row) of a payment whose band
+    /// is rows 10..20, and whether the registry was asked for it.
+    fn plan(
+        mode: PayBandMode,
+        every_page: bool,
+        reads_image: bool,
+        force: &[u32],
+    ) -> (BandPlan, bool) {
+        let asked = std::cell::Cell::new(false);
+        let plan = BandPlan::new(
+            mode,
+            every_page,
+            reads_image,
+            || {
+                asked.set(true);
+                RowBand::rows(10, 20)
+            },
+            (1024, 100),
+            force,
+        );
+        (plan, asked.get())
+    }
+
+    #[test]
+    fn with_the_gate_off_the_band_is_not_asked_and_nothing_narrows() {
+        let (p, asked) = plan(PayBandMode::Off, false, true, &[3]);
+        assert!(!asked);
+        assert_eq!(p.band, RowBand::Full);
+        assert_eq!(p.ranges, None);
+    }
+
+    #[test]
+    fn verify_reads_the_band_but_dispatches_everything() {
+        let (p, asked) = plan(PayBandMode::Verify, false, true, &[]);
+        assert!(asked);
+        assert_eq!(p.band, RowBand::rows(10, 20));
+        assert_eq!(p.ranges, None, "verify compares every page");
+    }
+
+    #[test]
+    fn on_dispatches_the_band_and_the_forced_pages_of_an_image_reading_compare() {
+        // The same plan whichever record the compare keeps (`prev` or hashes):
+        // the band does not know which.
+        let (p, asked) = plan(PayBandMode::On, false, true, &[50]);
+        assert!(asked);
+        assert_eq!(p.band, RowBand::rows(10, 20));
+        assert_eq!(p.ranges, Some(vec![10..20, 50..51]));
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn a_payment_that_rebuilds_a_record_takes_every_page_and_never_asks_for_a_band() {
+        // A hash record being seeded, or a `prev` being copied: the stored band
+        // speaks for neither, and every page is compared and landed.
+        for mode in [PayBandMode::On, PayBandMode::Verify] {
+            let (p, asked) = plan(mode, true, true, &[50]);
+            assert!(!asked, "{mode:?}");
+            assert_eq!(p.band, RowBand::Full, "{mode:?}");
+            assert_eq!(
+                p.ranges,
+                (mode == PayBandMode::On).then(|| vec![0..100]),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_buffer_kernel_is_never_started_part_way() {
+        let (p, asked) = plan(PayBandMode::On, false, false, &[]);
+        assert!(asked, "the band is still kept and counted");
+        assert_eq!(p.band, RowBand::rows(10, 20));
+        assert_eq!(p.ranges, None);
     }
 
     #[test]

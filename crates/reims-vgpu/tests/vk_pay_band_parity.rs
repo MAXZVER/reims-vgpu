@@ -13,13 +13,21 @@
 //! full compare, counting what the band would have missed). A run that sets
 //! nothing takes `on`, the arm that has something to prove.
 //!
-//! The mode is latched on the first draw of the process, so this is its own test
-//! binary, and its one test takes the engine lock for its whole length.
+//! The band composes with `REIMS_VGPU_LAB_PAY_HASH`, the compare that keeps a
+//! hash per page in place of the previous frame: the band narrows whichever
+//! record the compare keeps, and the pages it leaves out keep their stored bytes
+//! or hash words. The same scenario therefore runs once per hash arm (`off`,
+//! `on`, `verify`, set for the test's own thread), with the band mode of the
+//! process, and a randomized sequence is paid through all three arms at once and
+//! must land the same pages and bytes in each.
+//!
+//! The band mode is latched on the first draw of the process, so this is its own
+//! test binary, and each test takes the engine lock for its whole length.
 
 #![cfg(feature = "backend-vulkan")]
 
 use reims_vgpu::backend::vulkan::engine::{
-    self, DrawRequest, PrimitiveTopology, ScissorResource, TargetIdentity,
+    self, DrawRequest, PayHash, PrimitiveTopology, ScissorResource, TargetIdentity,
 };
 use std::sync::{Mutex, OnceLock};
 
@@ -241,8 +249,9 @@ fn paint_rows(identity: &TargetIdentity, shaders: &(Vec<u32>, Vec<u32>), rows: &
     engine::execute_draw_request(engine_device(), &req).expect("pay band paint");
 }
 
-/// The guest's pages, as the payments have landed them.
-struct Guest(Vec<u8>);
+/// The guest's pages, as the payments have landed them, and the hash arm
+/// (`REIMS_VGPU_LAB_PAY_HASH`) its payments are made through.
+struct Guest(Vec<u8>, PayHash);
 
 impl Guest {
     /// One payment: ask the engine, land what it names, return which pages.
@@ -271,8 +280,10 @@ impl Guest {
     ) -> (Vec<u32>, bool) {
         let before = engine::lab_pay_band_pages();
         let mut ran = 0u32;
-        let got = engine::read_target_changed_pages_with(identity, mapping, key, force, || {
-            ran += 1;
+        let got = engine::with_pay_hash(self.1, || {
+            engine::read_target_changed_pages_with(identity, mapping, key, force, || {
+                ran += 1;
+            })
         })
         .expect("page diff read")
         .expect("a BGRA8 resident takes the page diff");
@@ -328,20 +339,22 @@ fn range(a: u32, b: u32) -> Vec<u32> {
     (a..b).collect()
 }
 
-#[test]
-fn a_payment_lands_exactly_the_pages_its_writes_changed_whatever_narrows_the_compare() {
+/// The scenario of one hash arm. Each arm pays its own surface under its own
+/// mapping, so its shadow is new (the page-diff state outlives the engine reset).
+fn scenario(hash: PayHash, surface: u32) {
     let _g = engine_test_session();
+    let verify_before = engine::pay_hash_verify_totals();
     let shaders = fullscreen_triangle_spirv();
     let id = TargetIdentity::Surface {
-        id: 7201,
+        id: surface,
         width: W,
         height: H,
         generation: 1,
         format: SURFACE_TEST_FORMAT,
     };
-    let mapping = 7201u32;
+    let mapping = surface;
     let key = (1u32, W, H, 1u64);
-    let mut guest = Guest(vec![0xAB; FRAME_BYTES]);
+    let mut guest = Guest(vec![0xAB; FRAME_BYTES], hash);
 
     if !clear_to(&id, [51, 102, 153, 255]) {
         return; // no GPU
@@ -428,5 +441,355 @@ fn a_payment_lands_exactly_the_pages_its_writes_changed_whatever_narrows_the_com
         engine::lab_pay_band_outside_changed(),
         0,
         "a page changed outside the rows the draws were accounted to"
+    );
+    // The hash `verify` arm's claim: no page one compare lands and the other
+    // misses.
+    let verify_after = engine::pay_hash_verify_totals();
+    assert_eq!(
+        (
+            verify_after.1 - verify_before.1,
+            verify_after.2 - verify_before.2
+        ),
+        (0, 0),
+        "the prev and hash compares disagreed ({hash:?})"
+    );
+}
+
+#[test]
+fn a_payment_lands_exactly_the_pages_its_writes_changed_whatever_narrows_the_compare() {
+    scenario(PayHash::Off, 7201);
+}
+
+#[test]
+fn a_hash_payment_lands_exactly_the_same_pages_whatever_the_band_narrows() {
+    scenario(PayHash::On, 7202);
+}
+
+#[test]
+fn a_hash_verify_payment_lands_exactly_the_same_pages_whatever_the_band_narrows() {
+    scenario(PayHash::Verify, 7203);
+}
+
+/// One resident paid through different hash arms in turn, with a write between
+/// payments: each payment refreshes only the records its compare ran, and a
+/// compare whose record the last payment did not refresh (the `prev` frame after
+/// a hash payment, the hash words after a `prev` one) must take every page and
+/// rebuild it, whatever band the writes since the last payment left. A band that
+/// narrowed such a payment would land `out` bytes nothing had just written.
+#[test]
+fn a_record_that_fell_behind_is_rebuilt_whatever_the_band_says() {
+    let _g = engine_test_session();
+    let verify_before = engine::pay_hash_verify_totals();
+    let shaders = fullscreen_triangle_spirv();
+    let id = TargetIdentity::Surface {
+        id: 7231,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let mapping = 7231u32;
+    let key = (1u32, W, H, 1u64);
+    let mut guest = Guest(vec![0xAB; FRAME_BYTES], PayHash::Off);
+    if !clear_to(&id, [51, 102, 153, 255]) {
+        return; // no GPU
+    }
+    let all = range(0, PAGES);
+    // Each step: the hash arm, the rows written before the payment, the pages the
+    // payment lands, and whether it takes every page. A repaint of rows already
+    // holding the colour changes nothing, so a record the payment before did not
+    // rebuild for those pages would show as a page landed that did not change.
+    let (off, on, verify) = (PayHash::Off, PayHash::On, PayHash::Verify);
+    let none: Vec<u32> = Vec::new();
+    let steps = [
+        (off, (0, 0), all.clone(), true, "a new shadow"),
+        (off, (30, 32), vec![30, 31], false, "prev compares the band"),
+        (on, (10, 20), all.clone(), true, "the hash record is new"),
+        (
+            on,
+            (30, 32),
+            none.clone(),
+            false,
+            "a repaint outside the seeding payment's band",
+        ),
+        (on, (40, 41), vec![40], false, "the hash record stands"),
+        (
+            off,
+            (5, 6),
+            all.clone(),
+            true,
+            "prev fell behind the hash payment",
+        ),
+        (
+            verify,
+            (50, 52),
+            all.clone(),
+            true,
+            "the hashes fell behind the prev payment",
+        ),
+        (
+            verify,
+            (5, 6),
+            none.clone(),
+            false,
+            "a repaint outside the seeding payment's band",
+        ),
+        (
+            on,
+            (25, 26),
+            vec![25],
+            false,
+            "the hashes stand after verify",
+        ),
+        (
+            verify,
+            (22, 23),
+            all.clone(),
+            true,
+            "prev fell behind the hash payment",
+        ),
+        (off, (60, 61), vec![60], false, "prev stands after verify"),
+        (
+            on,
+            (3, 4),
+            all.clone(),
+            true,
+            "the hashes fell behind the prev payment",
+        ),
+        (
+            on,
+            (60, 61),
+            none,
+            false,
+            "a repaint outside the seeding payment's band",
+        ),
+    ];
+    for (n, (hash, (y0, y1), want, want_full, what)) in steps.into_iter().enumerate() {
+        if y0 < y1 {
+            paint_rows(&id, &shaders, &[(y0, y1)]);
+        }
+        guest.1 = hash;
+        let (pages, full) = guest.pay(&id, mapping, key, &[]);
+        assert_eq!(
+            full, want_full,
+            "step {n} ({hash:?}, {what}): takes every page"
+        );
+        assert_eq!(
+            pages, want,
+            "step {n} ({hash:?}, {what}): lands these pages"
+        );
+        guest.assert_equals_resident(&id, &format!("step {n} ({hash:?}, {what})"));
+    }
+    assert_eq!(engine::lab_pay_band_outside_changed(), 0);
+    let verify_after = engine::pay_hash_verify_totals();
+    assert_eq!(
+        (
+            verify_after.1 - verify_before.1,
+            verify_after.2 - verify_before.2
+        ),
+        (0, 0),
+        "the prev and hash compares disagreed"
+    );
+}
+
+/// One arm of the randomized differential: its own resident (a surface whose
+/// generation moves when the resident is replaced), mapping and guest pages.
+struct Arm {
+    surface: u32,
+    generation: u64,
+    key: (u32, u32, u32, u64),
+    guest: Guest,
+}
+
+impl Arm {
+    fn id(&self) -> TargetIdentity {
+        TargetIdentity::Surface {
+            id: self.surface,
+            width: W,
+            height: H,
+            generation: self.generation,
+            format: SURFACE_TEST_FORMAT,
+        }
+    }
+}
+
+/// Pay every arm once and check that each landed what the first did, left the
+/// same bytes in its guest, and that the guest equals its resident.
+fn pay_all(arms: &mut [Arm], force: &[u32], step: usize, what: &str) -> (Vec<u32>, bool) {
+    let mut reference: Option<(Vec<u32>, bool)> = None;
+    for arm in arms.iter_mut() {
+        let (id, mapping, key) = (arm.id(), arm.surface, arm.key);
+        let got = arm.guest.pay(&id, mapping, key, force);
+        match &reference {
+            None => reference = Some(got),
+            Some(want) => assert_eq!(
+                &got, want,
+                "step {step} ({what}): {:?} landed other pages than the first arm",
+                arm.guest.1
+            ),
+        }
+        arm.guest
+            .assert_equals_resident(&id, &format!("step {step} ({what}) {:?}", arm.guest.1));
+    }
+    for arm in &arms[1..] {
+        assert!(
+            arm.guest.0 == arms[0].guest.0,
+            "step {step} ({what}): {:?}'s guest bytes differ from the first arm's",
+            arm.guest.1
+        );
+    }
+    reference.expect("an arm")
+}
+
+/// The three hash arms are paid the same randomized sequence of writes (scissored
+/// draws of one or two bands, clears, a resident replaced under its shadow, a
+/// shadow replaced under its resident, nothing at all) with random forced pages,
+/// and every payment must land the same pages, and leave the same bytes in the
+/// guest, in each — and the guest must equal the resident. With the band `on`
+/// this is the claim that composing the band with the hash compare (or with
+/// `verify`, which runs both) moves nothing a payment lands; run under each band
+/// mode it is the same test.
+#[test]
+fn every_hash_arm_lands_the_same_pages_and_bytes_through_a_random_sequence() {
+    let _g = engine_test_session();
+    let verify_before = engine::pay_hash_verify_totals();
+    let shaders = fullscreen_triangle_spirv();
+    let mut arms: Vec<Arm> = [
+        (PayHash::Off, 7211u32),
+        (PayHash::On, 7212),
+        (PayHash::Verify, 7213),
+    ]
+    .into_iter()
+    .map(|(hash, surface)| Arm {
+        surface,
+        generation: 1,
+        key: (1, W, H, 1),
+        guest: Guest(vec![0xAB; FRAME_BYTES], hash),
+    })
+    .collect();
+    const COLORS: [[u8; 4]; 3] = [[51, 102, 153, 255], [204, 0, 85, 255], [0, 128, 0, 255]];
+    let mut seed = 0x2545_F491u32;
+    let mut next = move |n: u32| {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) % n
+    };
+    for arm in &arms {
+        if !clear_to(&arm.id(), COLORS[0]) {
+            return; // no GPU
+        }
+    }
+
+    let (pages, full) = pay_all(&mut arms, &[], 0, "first frame");
+    assert!(full);
+    assert_eq!(pages, range(0, PAGES));
+    let census_before = engine::lab_pay_band_pages();
+
+    for step in 1..=80usize {
+        // `true` when the step leaves every arm's shadow new.
+        let (what, shadow_replaced) = match next(12) {
+            0..=5 => {
+                let y0 = next(H - 1);
+                let mut rows = vec![(y0, (y0 + 1 + next(9)).min(H))];
+                if next(4) == 0 {
+                    let z0 = next(H - 1);
+                    rows.push((z0, (z0 + 1 + next(5)).min(H)));
+                }
+                for arm in &arms {
+                    paint_rows(&arm.id(), &shaders, &rows);
+                }
+                ("painted rows", false)
+            }
+            6 | 7 => {
+                let c = COLORS[next(3) as usize];
+                for arm in &arms {
+                    assert!(clear_to(&arm.id(), c));
+                }
+                ("cleared", false)
+            }
+            8 => {
+                // The resident replaced under its shadow: a new image, so a new
+                // slot, paid against the records of the old one.
+                let c = COLORS[next(3) as usize];
+                for arm in &mut arms {
+                    arm.generation += 1;
+                    assert!(clear_to(&arm.id(), c));
+                }
+                ("replaced the resident", false)
+            }
+            9 => {
+                // The shadow replaced under its resident: the guest's pages were
+                // written behind the payment (the key moved), or the landing
+                // failed (`page_diff_forget`, which an unfinished payment's
+                // caller does).
+                if next(2) == 0 {
+                    for arm in &mut arms {
+                        arm.key.3 += 1;
+                    }
+                    ("moved the key", true)
+                } else {
+                    for arm in &arms {
+                        engine::page_diff_forget(arm.surface);
+                    }
+                    ("forgot the shadow", true)
+                }
+            }
+            _ => ("nothing", false),
+        };
+        let mut force: Vec<u32> = Vec::new();
+        if next(3) == 0 {
+            for _ in 0..1 + next(3) {
+                force.push(next(PAGES));
+            }
+            force.sort_unstable();
+            force.dedup();
+        }
+        let (pages, full) = pay_all(&mut arms, &force, step, what);
+        if shadow_replaced {
+            assert!(full, "step {step}: a shadow under another key lands whole");
+            assert_eq!(pages, range(0, PAGES));
+        }
+        for p in &force {
+            assert!(
+                pages.contains(p),
+                "step {step} ({what}): forced page {p} was not landed"
+            );
+        }
+    }
+
+    assert_eq!(
+        engine::lab_pay_band_outside_changed(),
+        0,
+        "a page changed outside the rows the draws were accounted to"
+    );
+    // What the band did to the compares of the run, in the mode this run took.
+    let census_after = engine::lab_pay_band_pages();
+    let (dispatched, total) = (
+        census_after.0 - census_before.0,
+        census_after.1 - census_before.1,
+    );
+    match mode().as_str() {
+        "on" => assert!(
+            dispatched < total,
+            "the band narrowed no compare: {dispatched} of {total} pages"
+        ),
+        "verify" => assert_eq!(dispatched, total, "verify compares every page"),
+        _ => assert_eq!(
+            (dispatched, total),
+            (0, 0),
+            "nothing is counted with the gate off"
+        ),
+    }
+    let verify_after = engine::pay_hash_verify_totals();
+    assert!(
+        verify_after.0 > verify_before.0,
+        "the verify arm compared pages"
+    );
+    assert_eq!(
+        (
+            verify_after.1 - verify_before.1,
+            verify_after.2 - verify_before.2
+        ),
+        (0, 0),
+        "the prev and hash compares disagreed"
     );
 }

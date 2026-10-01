@@ -4301,28 +4301,32 @@ pub fn read_target_changed_pages_with(
     let one_trip = pipe.one_trip;
     // TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND`): the rows a write since the last
     // payment could have changed, and with them the pages the compare is
-    // dispatched over. See `pay_band`. A fresh shadow compares nothing (the
-    // whole frame is copied), and a shadow other than the one the band was kept
-    // against is read as every row.
-    let band_mode = page_diff::pay_band_mode();
-    let band = if band_mode.tracks() && !fresh {
-        pools.registry_pay_band(identity, shadow.pay_epoch)
-    } else {
-        pay_band::RowBand::Full
-    };
-    // Only the image kernel is a page-per-workgroup kernel reading the resident
-    // itself, so only it can be started at the band's first page: the buffer
+    // dispatched over. See `pay_band`. A payment that takes every page (`full`:
+    // a `prev` copy or a hash record that was new or out of date, rebuilt from
+    // this frame) has nothing to narrow, and a shadow other than the one the band
+    // was kept against is read as every row. The pages outside a band were not
+    // written since the last payment, so the record the compare keeps for them
+    // (`prev`'s bytes, the hash words) still stands and they are simply not asked.
+    // Only the kernels that are a page-per-workgroup compare reading the resident
+    // itself (image, hash) can be started at the band's first page: the buffer
     // kernels compare a copy of the whole frame that was just made.
-    let band_ranges = if band_mode == pay_band::PayBandMode::On && image_view.is_some() {
-        Some(pay_band::dispatch_ranges(band, w, h, force))
-    } else {
-        None
-    };
+    let band_mode = page_diff::pay_band_mode();
+    let reads_image = image_view.is_some() || hash_only;
+    let band_plan = pay_band::BandPlan::new(
+        band_mode,
+        full,
+        reads_image,
+        || pools.registry_pay_band(identity, shadow.pay_epoch),
+        (w, h),
+        force,
+    );
+    let band = band_plan.band;
+    let band_ranges = band_plan.ranges;
     if band_mode.tracks() {
         pay_band::note_census(
             band_mode,
-            fresh,
-            image_view.is_some(),
+            full,
+            reads_image,
             band,
             band_ranges.as_deref(),
             (w, h),
@@ -4486,21 +4490,7 @@ pub fn read_target_changed_pages_with(
                     &[],
                 );
                 d.cmd_push_constants(cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, push_image);
-                match band_ranges.as_deref() {
-                    None => d.cmd_dispatch(cb, pages as u32, 1, 1),
-                    // TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND=on`): each range of
-                    // pages on its own. The kernel names its page by
-                    // `WorkgroupId`, which `vkCmdDispatchBase` starts at the
-                    // range's first page, so the shader is the one the full
-                    // dispatch runs. The ranges are disjoint, so no barrier
-                    // orders one against the next: they share the buffers and
-                    // touch none of the same pages.
-                    Some(ranges) => {
-                        for r in ranges {
-                            d.cmd_dispatch_base(cb, r.start, 0, 0, r.end - r.start, 1, 1);
-                        }
-                    }
-                }
+                lab_dispatch_pages(d, cb, pages as u32, band_ranges.as_deref());
                 if let Some((hl, hp, hs)) = verify_cmd {
                     // TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH=verify`): the hash
                     // compare of the same image, ordered after the `prev`
@@ -4520,7 +4510,17 @@ pub fn read_target_changed_pages_with(
                         &[],
                         &[],
                     );
-                    lab_dispatch_hash(d, cb, (hl, hp, hs), push_image, pages as u32);
+                    // The same band as the `prev` compare's: both kernels are
+                    // page-per-workgroup, so each is dispatched over the same
+                    // ranges and a page outside them is compared by neither.
+                    lab_dispatch_hash(
+                        d,
+                        cb,
+                        (hl, hp, hs),
+                        push_image,
+                        pages as u32,
+                        band_ranges.as_deref(),
+                    );
                 }
                 let back = [vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::empty())
@@ -4674,7 +4674,9 @@ pub fn read_target_changed_pages_with(
                     &[],
                     &to_shader,
                 );
-                lab_dispatch_hash(d, cb, cmd, push_image, pages as u32);
+                // Beside a frame copy, so not narrowed: the `prev` compare of
+                // this route (or the copy that seeds it) takes every page.
+                lab_dispatch_hash(d, cb, cmd, push_image, pages as u32, None);
                 let back = [vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::empty())
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -4756,8 +4758,9 @@ pub fn read_target_changed_pages_with(
     };
     // TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND=verify`): the compare ran over every
     // page, so any page it found changed outside the band is a write the band
-    // did not account for. Zero is the claim.
-    if band_mode == pay_band::PayBandMode::Verify && !fresh && band != pay_band::RowBand::Full {
+    // did not account for. Zero is the claim. A payment that took every page
+    // has no band to answer to (`band` is `Full` then).
+    if band_mode == pay_band::PayBandMode::Verify && !full && band != pay_band::RowBand::Full {
         pay_band::note_outside_changed(pay_band::changed_outside(
             &changed,
             &band.pages(w, h),
@@ -4827,9 +4830,35 @@ pub fn read_target_changed_pages_with(
     }))
 }
 
+/// Record a page-per-workgroup compare's dispatch over a frame of `pages`: all of
+/// them, or (`ranges`, TEMP lab `REIMS_VGPU_LAB_PAY_BAND=on`) each range of pages
+/// on its own. The kernels name their page by `WorkgroupId`, which
+/// `vkCmdDispatchBase` starts at the range's first page, so the shader is the one
+/// the full dispatch runs. The ranges are disjoint, so no barrier orders one
+/// against the next: they share the buffers and touch none of the same pages
+/// (the per-page `prev` bytes, hash words, flags and `out` bytes).
+unsafe fn lab_dispatch_pages(
+    d: &ash::Device,
+    cb: ash::vk::CommandBuffer,
+    pages: u32,
+    ranges: Option<&[std::ops::Range<u32>]>,
+) {
+    unsafe {
+        match ranges {
+            None => d.cmd_dispatch(cb, pages, 1, 1),
+            Some(ranges) => {
+                for r in ranges {
+                    d.cmd_dispatch_base(cb, r.start, 0, 0, r.end - r.start, 1, 1);
+                }
+            }
+        }
+    }
+}
+
 /// TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH`): record the hash kernel's dispatch —
-/// one workgroup per page, with the image kernel's push block — into a command
-/// buffer whose barriers already make the image readable in `GENERAL`.
+/// one workgroup per page (of `ranges` only, when the band narrows it), with the
+/// image kernel's push block — into a command buffer whose barriers already make
+/// the image readable in `GENERAL`.
 unsafe fn lab_dispatch_hash(
     d: &ash::Device,
     cb: ash::vk::CommandBuffer,
@@ -4840,13 +4869,14 @@ unsafe fn lab_dispatch_hash(
     ),
     push: &[u8],
     pages: u32,
+    ranges: Option<&[std::ops::Range<u32>]>,
 ) {
     use ash::vk;
     unsafe {
         d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
         d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
         d.cmd_push_constants(cb, layout, vk::ShaderStageFlags::COMPUTE, 0, push);
-        d.cmd_dispatch(cb, pages, 1, 1);
+        lab_dispatch_pages(d, cb, pages, ranges);
     }
 }
 

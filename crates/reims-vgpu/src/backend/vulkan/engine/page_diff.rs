@@ -25,6 +25,12 @@
 //! TEMP (lab): `REIMS_VGPU_LAB_PAY_HASH=on` keeps a 64-bit hash per page in
 //! place of `prev` and compares that, reading half the bytes (see [`PayHash`]);
 //! `=verify` runs both compares and counts where they disagree.
+//!
+//! TEMP (lab): `REIMS_VGPU_LAB_PAY_BAND=on|verify` (see [`super::pay_band`])
+//! narrows either compare to the pages of the rows written since the last
+//! payment, plus the forced ones; the pages outside keep the `prev` bytes or hash
+//! words they have. A payment that rebuilds a record (a new shadow, a `prev`
+//! copy, a seeded hash buffer) takes every page and its band is every row.
 
 use ash::vk;
 use std::collections::HashMap;
@@ -524,7 +530,9 @@ pub(crate) fn lab_reap_after_enabled() -> bool {
 /// presented frame that a write since the last payment could have changed
 /// (`on`), or compare everything as before and count the changed pages the band
 /// did not contain (`verify`). Unset or anything else is `off`: today's path.
-/// See [`super::pay_band`]. Latched.
+/// Composes with [`pay_hash_mode`]: the band narrows whichever compare runs (the
+/// pages outside it keep their stored `prev` bytes or hash). See
+/// [`super::pay_band`]. Latched.
 pub(crate) fn pay_band_mode() -> super::pay_band::PayBandMode {
     static MODE: std::sync::OnceLock<super::pay_band::PayBandMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
@@ -534,6 +542,13 @@ pub(crate) fn pay_band_mode() -> super::pay_band::PayBandMode {
         crate::observe::off(format!("pay_band mode={mode:?}"));
         mode
     })
+}
+
+/// Whether the compare pipelines are created for `vkCmdDispatchBase` (a start
+/// at a workgroup other than zero): only when the band is asked to narrow the
+/// dispatch, so the gate off or `verify` creates them exactly as before.
+fn dispatch_base_enabled() -> bool {
+    pay_band_mode() == super::pay_band::PayBandMode::On
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_PAY_HASH` — which compare a payment of a packed
@@ -961,7 +976,8 @@ impl DiffPipeline {
     /// `dispatch_base` creates the pipeline so that `vkCmdDispatchBase` may start
     /// it at a workgroup other than zero (`WorkgroupId` then counts from there,
     /// so a kernel that names its page by it is dispatched over a page range
-    /// unchanged).
+    /// unchanged). Both image-reading kernels ([`Kernel::Image`], [`Kernel::Hash`])
+    /// name their page by it.
     unsafe fn create(
         ctx: &DeviceContext,
         kernel: Kernel,
@@ -1163,11 +1179,13 @@ pub(crate) struct Shadow {
     /// `(map_generation, width, height, guest_bytes_seq after that write)`.
     pub key: (u32, u32, u32, u64),
     pub prev: OwnedBuffer,
-    /// TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND`): the payment that last made `prev`
-    /// equal a frame — the epoch the resident's damage band is kept against
-    /// (`ResidentTargetSlot::pay_damage`). `0` until one has finished; a new
-    /// shadow is born unpaid, so a band can only be read against a shadow it
-    /// was kept for.
+    /// TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND`): the payment that last made the
+    /// compare records (`prev`, `hashes`) equal a frame — the epoch the
+    /// resident's damage band is kept against (`ResidentTargetSlot::pay_damage`).
+    /// `0` until one has finished; a new shadow is born unpaid, so a band can
+    /// only be read against a shadow it was kept for. A band narrows a compare
+    /// only where its record also stands ([`Basis`]); a payment that rebuilds a
+    /// record takes every page whatever the band says.
     pub pay_epoch: u64,
     /// TEMP (lab, [`PayHash`]): two hash words per page, device-local, made on
     /// the first hash payment of this shadow.
@@ -1244,8 +1262,7 @@ impl PageDiffState {
     pub(crate) unsafe fn ensure_image_pipeline(&mut self, ctx: &DeviceContext) -> bool {
         if self.image_pipeline.is_none() && !self.image_refused {
             // Based only when the band is asked to narrow the dispatch.
-            let based = pay_band_mode() == super::pay_band::PayBandMode::On;
-            match unsafe { DiffPipeline::create(ctx, Kernel::Image, based) } {
+            match unsafe { DiffPipeline::create(ctx, Kernel::Image, dispatch_base_enabled()) } {
                 Ok(p) => self.image_pipeline = Some(p),
                 Err(e) => {
                     self.image_refused = true;
@@ -1260,7 +1277,9 @@ impl PageDiffState {
     /// after a refusal (the payment then takes the `prev` compare).
     pub(crate) unsafe fn ensure_hash_pipeline(&mut self, ctx: &DeviceContext) -> bool {
         if self.hash_pipeline.is_none() && !self.hash_refused {
-            match unsafe { DiffPipeline::create(ctx, Kernel::Hash, false) } {
+            // Based when the band narrows the dispatch: the hash kernel names
+            // its page by `WorkgroupId` as the image kernel does.
+            match unsafe { DiffPipeline::create(ctx, Kernel::Hash, dispatch_base_enabled()) } {
                 Ok(p) => self.hash_pipeline = Some(p),
                 Err(e) => {
                     self.hash_refused = true;
