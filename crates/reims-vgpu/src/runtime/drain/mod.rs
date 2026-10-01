@@ -5249,6 +5249,14 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     if mapping == 0 {
         return ChildPacketDisposition::Complete;
     }
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_EARLY_FLUSH`): the frame this swap presents
+    // has been recorded; hand its still-open draw batch to the GPU now, so its
+    // draws run while the rescue drains and the payment's preparation do,
+    // instead of starting only when the payment submits and waits.
+    if crate::runtime::writeback_debt::lab_pay_early_flush() {
+        let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_swap_flush_us");
+        crate::backend::selected().flush_deferred_submissions(state);
+    }
     // Archive apple_pv_gpu_display_swap:
     //   render_wait_surface(s, false, swap->mapping_id);
     //   scanout_present_boundary(...);

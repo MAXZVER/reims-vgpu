@@ -3781,16 +3781,35 @@ pub fn page_diff_forget(mapping_id: u32) {
     }
 }
 
+/// TEMP (lab): whether a draw batch is recording and not yet handed to the GPU.
+pub fn lab_batch_open() -> bool {
+    BATCH_OPEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Record one command buffer on the engine's own entry machinery, submit it and
 /// wait for it, exactly as the host-delivered readback does.
+///
+/// `between` runs after the submission and before the wait (TEMP lab,
+/// `REIMS_VGPU_LAB_PAY_SPLIT`): CPU work of the caller that needs neither the
+/// answer nor the engine, done while the GPU computes it. It runs with the
+/// engine lock held, so it must not take it.
 unsafe fn page_diff_submit(
     ctx: &context::DeviceContext,
     pools: &mut pools::ResourcePools,
     counters: &EngineCounters,
+    between: impl FnOnce(),
     record: impl FnOnce(ash::vk::CommandBuffer),
 ) -> Result<(), DrawError> {
     let ops = target_readback_ops();
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_submit_us"); // TEMP (lab)
     let appended = pools.batch_open_recording();
+    // TEMP (lab): whether this payment rode the frame's still-recording draw
+    // batch (its draws start on the GPU only now) or had its own command buffer.
+    crate::runtime::drain::note_store_route(if appended.is_some() {
+        "lab_pd_appended_to_batch"
+    } else {
+        "lab_pd_own_cb"
+    });
     let (cb, fence) = match appended {
         Some(pair) => pair,
         None => pools.begin_entry(ctx, counters)?,
@@ -3816,13 +3835,56 @@ unsafe fn page_diff_submit(
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
         let cbs = [cb];
-        ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
-            .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
+        // TEMP (lab, `REIMS_VGPU_LAB_PAY_ASYNC`): hand the command buffer to the
+        // queue owner and go straight to the fence instead of first waiting for
+        // the owner's reply that `vkQueueSubmit` returned. The fence wait below
+        // is the completion either way; the batch flush already submits so.
+        let submitted = if page_diff::lab_async_submit_enabled() {
+            ctx.submit_queue_work_async(&cbs, fence)
+        } else {
+            ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
+        };
+        submitted.map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(&ctx.device, sealed);
     }
+    drop(lab_span);
+    {
+        let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_between_us"); // TEMP (lab)
+        between();
+    }
+    let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_wait_us"); // TEMP (lab)
+    lab_spin_on_fence(ctx, fence);
     pools.wait_entry_fence(ctx, counters, fence)?;
     Ok(())
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_SPIN`): poll `fence` for up to the spin budget
+/// before the caller's blocking wait, which then returns at once on a signalled
+/// fence. Decides nothing: any error, a queue failure or the budget running out
+/// leaves the blocking wait to report or to wait the rest.
+fn lab_spin_on_fence(ctx: &context::DeviceContext, fence: ash::vk::Fence) {
+    let budget = page_diff::lab_spin_budget_us();
+    if budget == 0 {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_micros(budget);
+    loop {
+        match unsafe { ctx.device.get_fence_status(fence) } {
+            Ok(true) => {
+                crate::runtime::drain::note_store_route("lab_pd_spin_signalled");
+                return;
+            }
+            Ok(false) => {}
+            Err(_) => return,
+        }
+        if started.elapsed() >= budget || ctx.queue_failure().is_some() {
+            crate::runtime::drain::note_store_route("lab_pd_spin_ran_out");
+            return;
+        }
+        std::hint::spin_loop();
+    }
 }
 
 /// Read back only the pages of `identity`'s frame that changed since the frame
@@ -3839,9 +3901,27 @@ pub fn read_target_changed_pages(
     key: (u32, u32, u32, u64),
     force: &[u32],
 ) -> Result<Option<ChangedPages>, DrawError> {
+    read_target_changed_pages_with(identity, mapping_id, key, force, || {})
+}
+
+/// [`read_target_changed_pages`], running `between` once the compare is
+/// submitted and before its fence is waited (see [`page_diff_submit`]). It does
+/// not run when the call answers before submitting anything — a routing `None`
+/// or an error before the submit — so a caller that needs its effect must look
+/// for it rather than assume it.
+pub fn read_target_changed_pages_with(
+    identity: &TargetIdentity,
+    mapping_id: u32,
+    key: (u32, u32, u32, u64),
+    force: &[u32],
+    between: impl FnOnce(),
+) -> Result<Option<ChangedPages>, DrawError> {
     use ash::vk;
     use reims_vgpu_vulkan::memory::MemoryClass;
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_lock_us"); // TEMP (lab)
     let mut guard = lock_engine();
+    drop(lab_span);
+    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_prep_us"); // TEMP (lab)
     let EngineState {
         ref mut owner,
         ref mut pools,
@@ -3955,8 +4035,9 @@ pub fn read_target_changed_pages(
     if image_view.is_some() {
         crate::runtime::drain::note_store_route("pay_diff_image");
     }
+    drop(lab_span);
     unsafe {
-        page_diff_submit(ctx, pools, counters, |cb| {
+        page_diff_submit(ctx, pools, counters, between, |cb| {
             let d = &ctx.device;
             if image_view.is_some() {
                 // Sampled in GENERAL (valid for any usage), then put back in the
@@ -4112,6 +4193,7 @@ pub fn read_target_changed_pages(
             );
         })?;
     }
+    let _lab_post = crate::runtime::chain_phase::CostSpan::new("lab_pd_post_us"); // TEMP (lab)
     pools.registry_note_access(identity, read_access);
 
     let changed: Vec<u32> = if fresh {
@@ -4151,22 +4233,28 @@ pub fn read_target_changed_pages(
             i += 1;
         }
         unsafe {
-            page_diff_submit(ctx, pools, counters, |cb| {
-                let d = &ctx.device;
-                d.cmd_copy_buffer(cb, cur_b, out_b, &regions);
-                let to_host = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::HOST_READ)];
-                d.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::HOST,
-                    vk::DependencyFlags::empty(),
-                    &to_host,
-                    &[],
-                    &[],
-                );
-            })?;
+            page_diff_submit(
+                ctx,
+                pools,
+                counters,
+                || {},
+                |cb| {
+                    let d = &ctx.device;
+                    d.cmd_copy_buffer(cb, cur_b, out_b, &regions);
+                    let to_host = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                    d.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &to_host,
+                        &[],
+                        &[],
+                    );
+                },
+            )?;
         }
     }
     unsafe { out.invalidate(&ctx.device)? };

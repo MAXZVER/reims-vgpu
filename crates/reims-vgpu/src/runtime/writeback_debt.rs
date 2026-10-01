@@ -909,6 +909,25 @@ pub fn pay_cpu_shared_mapping<M: HostMemory + HostOps>(
     }
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_EARLY_FLUSH=off` leaves a presented frame's
+/// still-recording draw batch unsubmitted until its payment appends the compare
+/// to it and submits the two together, so every draw of that batch starts on the
+/// GPU only once the drain is already waiting for the answer. On by default: the
+/// batch is submitted when the DisplaySwap is admitted and again (if more draws
+/// opened one) before the payment's CPU-side preparation. Submitting a recorded
+/// batch early is what the end-of-tranche flush does every tranche; queue order
+/// stays record order, so nothing the payment or the guest observes changes.
+/// Latched.
+pub fn lab_pay_early_flush() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_PAY_EARLY_FLUSH").map_or(true, |v| v != "off");
+        crate::observe::off(format!("pay_early_flush on={on}"));
+        on
+    })
+}
+
 /// Whether presented framebuffers are written back page by page (see
 /// [`crate::config::PAY_DIFF`]). Latched for the process.
 pub fn pay_diff_enabled() -> bool {

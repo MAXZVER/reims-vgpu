@@ -326,6 +326,17 @@ fn store_changed_pages<M: HostMemory + HostOps>(
     let key = (m.map_generation, width, height, m.guest_bytes_seq);
     let (token, baseline) = (m.guest_write_token, m.pay_diff_gen);
     let frame_bytes = u64::from(width) * u64::from(height) * 4;
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_EARLY_FLUSH`): a draw batch still recording
+    // here (draws the swap's rescue drains added, or a payment not at a swap)
+    // goes to the GPU before the CPU-side preparation below, not with the
+    // compare after it. See `writeback_debt::lab_pay_early_flush`.
+    if crate::runtime::writeback_debt::lab_pay_early_flush()
+        && crate::backend::vulkan::engine::lab_batch_open()
+    {
+        let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_flush_us");
+        crate::runtime::drain::note_store_route("lab_pd_early_flushed_batch");
+        crate::backend::vulkan::engine::flush_batched_draws(state);
+    }
     // The generation this landing will stand for, read before it: a guest store
     // racing the landing then counts as written since, and is landed next time.
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_gen_us"); // TEMP (lab)
@@ -357,14 +368,33 @@ fn store_changed_pages<M: HostMemory + HostOps>(
     };
     drop(lab_span);
     crate::runtime::drain::note_store_route_n("pay_diff_pages_forced", force.len() as u64);
-    let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_vouch_us"); // TEMP (lab)
-    let (_, vouched) = crate::runtime::mapper::vouch_mapping_pages_verdict(state, host, mapping_id);
-    drop(lab_span);
-    let vouched = vouched?;
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_SPLIT`): the vouch gates only the landing,
+    // so with the split on it runs while the GPU computes the compare rather
+    // than before the compare is submitted. See `vouch_after_submit`.
+    let split = lab_pay_split();
+    let mut vouched: Option<Option<crate::runtime::mapper::PagesVouched>> = None;
+    if !split {
+        let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_vouch_us"); // TEMP (lab)
+        let (_, v) = crate::runtime::mapper::vouch_mapping_pages_verdict(state, host, mapping_id);
+        v.as_ref()?;
+        vouched = Some(v);
+    }
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_read_us"); // TEMP (lab)
-    let changed = match crate::backend::vulkan::engine::read_target_changed_pages(
-        identity, mapping_id, key, &force,
-    ) {
+    let read = crate::backend::vulkan::engine::read_target_changed_pages_with(
+        identity,
+        mapping_id,
+        key,
+        &force,
+        || {
+            if split {
+                let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_vouch_us");
+                vouched = Some(
+                    crate::runtime::mapper::vouch_mapping_pages_verdict(state, host, mapping_id).1,
+                );
+            }
+        },
+    );
+    let changed = match read {
         Ok(Some(c)) => c,
         Ok(None) => {
             crate::runtime::drain::note_store_route("pay_diff_declined");
@@ -378,6 +408,28 @@ fn store_changed_pages<M: HostMemory + HostOps>(
         }
     };
     drop(lab_span);
+    let vouched = match vouch_after_submit(vouched) {
+        VouchAfterSubmit::Vouched(v) => v,
+        VouchAfterSubmit::Refused => {
+            // The shadow now holds this frame and the guest's pages will not
+            // receive it from here: forget it, so the next payment lands whole.
+            crate::runtime::drain::note_store_route("lab_pd_split_vouch_refused");
+            crate::backend::vulkan::engine::page_diff_forget(mapping_id);
+            return None;
+        }
+        VouchAfterSubmit::NotRun => {
+            // The compare answered without the hook having run (cannot happen
+            // on an answered read; kept total rather than assumed).
+            crate::runtime::drain::note_store_route("lab_pd_split_vouch_late");
+            match crate::runtime::mapper::vouch_mapping_pages_verdict(state, host, mapping_id).1 {
+                Some(v) => v,
+                None => {
+                    crate::backend::vulkan::engine::page_diff_forget(mapping_id);
+                    return None;
+                }
+            }
+        }
+    };
     let page = 4096u64;
     let frame_len = changed.frame_bytes as usize;
     // SAFETY: `frame_ptr` is the engine's mapped page-diff host buffer, at least
@@ -437,6 +489,42 @@ fn store_changed_pages<M: HostMemory + HostOps>(
     drop(lab_span);
     finish(state, mapping_id, identity, frame_len, started, false);
     Some(true)
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_SPLIT=off` vouches the mapping's pages before
+/// the compare is submitted, as before. On by default: the vouch is a page-table
+/// walk that only the landing depends on, so it runs between the compare's
+/// submit and its fence wait (`engine::read_target_changed_pages_with`). The
+/// ordering that matters is unchanged — the generation and the forced pages are
+/// still read before the submit, and nothing lands without a vouch. Latched.
+fn lab_pay_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_PAY_SPLIT").map_or(true, |v| v != "off");
+        crate::observe::off(format!("pay_split on={on}"));
+        on
+    })
+}
+
+/// What a page-diff payment may do with its answered compare, given what the
+/// vouch said (`None`: it never ran).
+#[derive(Debug, PartialEq, Eq)]
+enum VouchAfterSubmit<V> {
+    /// Land, under this vouch.
+    Vouched(V),
+    /// The pages drifted: land nothing from the compare, and forget the
+    /// shadow, which already stands for a frame the guest will not hold.
+    Refused,
+    /// The vouch has still to be taken.
+    NotRun,
+}
+
+fn vouch_after_submit<V>(vouched: Option<Option<V>>) -> VouchAfterSubmit<V> {
+    match vouched {
+        Some(Some(v)) => VouchAfterSubmit::Vouched(v),
+        Some(None) => VouchAfterSubmit::Refused,
+        None => VouchAfterSubmit::NotRun,
+    }
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_PAY_VERIFY=1` — after a page-diff landing, read the
@@ -555,6 +643,24 @@ fn finish(
         "render_store mapping={mapping_id} bytes={frame_len} us={}",
         started.elapsed().as_micros()
     ));
+}
+
+#[cfg(test)]
+mod lab_vouch_after_submit_tests {
+    use super::{vouch_after_submit, VouchAfterSubmit};
+
+    #[test]
+    fn a_drifted_vouch_lands_nothing_and_an_unrun_one_is_taken_late() {
+        assert_eq!(
+            vouch_after_submit(Some(Some(7u32))),
+            VouchAfterSubmit::Vouched(7)
+        );
+        assert_eq!(
+            vouch_after_submit::<u32>(Some(None)),
+            VouchAfterSubmit::Refused
+        );
+        assert_eq!(vouch_after_submit::<u32>(None), VouchAfterSubmit::NotRun);
+    }
 }
 
 #[cfg(test)]
