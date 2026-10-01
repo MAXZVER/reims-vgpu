@@ -154,70 +154,85 @@ fn small(layout: &Layout) -> bool {
 unsafe impl GlobalAlloc for ThreadCache {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if !small(&layout) || !enabled() {
-            return System.alloc(layout);
-        }
-        let c = class_of(layout.size());
-        let cache = cache();
-        if !cache.is_null() {
-            let head = (*cache).heads[c];
-            if !head.is_null() {
-                (*cache).heads[c] = *(head as *mut *mut u8);
-                (*cache).counts[c] -= 1;
-                return head;
+        // SAFETY (whole body): `layout` is the caller's, a cached block is a
+        // live block of at least the class size and 16-byte alignment, and the
+        // cache pointer is this thread's own.
+        unsafe {
+            if !small(&layout) || !enabled() {
+                return System.alloc(layout);
             }
+            let c = class_of(layout.size());
+            let cache = cache();
+            if !cache.is_null() {
+                let head = (*cache).heads[c];
+                if !head.is_null() {
+                    (*cache).heads[c] = *(head as *mut *mut u8);
+                    (*cache).counts[c] -= 1;
+                    return head;
+                }
+            }
+            System.alloc(class_layout(c))
         }
-        System.alloc(class_layout(c))
     }
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if !small(&layout) || !enabled() {
-            return System.alloc_zeroed(layout);
+        // SAFETY: as `alloc`; the block is at least `layout.size()` bytes.
+        unsafe {
+            if !small(&layout) || !enabled() {
+                return System.alloc_zeroed(layout);
+            }
+            let p = self.alloc(layout);
+            if !p.is_null() {
+                core::ptr::write_bytes(p, 0, layout.size());
+            }
+            p
         }
-        let p = self.alloc(layout);
-        if !p.is_null() {
-            core::ptr::write_bytes(p, 0, layout.size());
-        }
-        p
     }
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if !small(&layout) || !enabled() {
-            return System.dealloc(ptr, layout);
+        // SAFETY: `ptr` was allocated by this allocator with `layout`, so a small
+        // one is a class block (at least 16 bytes: room for the list link).
+        unsafe {
+            if !small(&layout) || !enabled() {
+                return System.dealloc(ptr, layout);
+            }
+            let c = class_of(layout.size());
+            let cache = cache();
+            if !cache.is_null() && (*cache).counts[c] < MAX_PER_CLASS {
+                *(ptr as *mut *mut u8) = (*cache).heads[c];
+                (*cache).heads[c] = ptr;
+                (*cache).counts[c] += 1;
+                return;
+            }
+            System.dealloc(ptr, class_layout(c))
         }
-        let c = class_of(layout.size());
-        let cache = cache();
-        if !cache.is_null() && (*cache).counts[c] < MAX_PER_CLASS {
-            *(ptr as *mut *mut u8) = (*cache).heads[c];
-            (*cache).heads[c] = ptr;
-            (*cache).counts[c] += 1;
-            return;
-        }
-        System.dealloc(ptr, class_layout(c))
     }
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if !enabled() {
-            return System.realloc(ptr, layout, new_size);
+        // SAFETY: the caller's contract for `realloc`; blocks move only between
+        // this allocator's own paths.
+        unsafe {
+            if !enabled() {
+                return System.realloc(ptr, layout, new_size);
+            }
+            let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
+            let (old_small, new_small) = (small(&layout), small(&new_layout));
+            if !old_small && !new_small {
+                return System.realloc(ptr, layout, new_size);
+            }
+            if old_small && new_small && class_of(layout.size()) == class_of(new_size) {
+                return ptr;
+            }
+            let p = self.alloc(new_layout);
+            if !p.is_null() {
+                core::ptr::copy_nonoverlapping(ptr, p, layout.size().min(new_size));
+                self.dealloc(ptr, layout);
+            }
+            p
         }
-        // SAFETY: the caller guarantees `new_size`, rounded up to the alignment, does not overflow.
-        let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-        let (old_small, new_small) = (small(&layout), small(&new_layout));
-        if !old_small && !new_small {
-            return System.realloc(ptr, layout, new_size);
-        }
-        if old_small && new_small && class_of(layout.size()) == class_of(new_size) {
-            return ptr;
-        }
-        let p = self.alloc(new_layout);
-        if !p.is_null() {
-            core::ptr::copy_nonoverlapping(ptr, p, layout.size().min(new_size));
-            self.dealloc(ptr, layout);
-        }
-        p
     }
 }
 
