@@ -7748,7 +7748,7 @@ fn a_retained_depth_stencil_state_is_served_without_reading_guest_memory() {
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn a_buffer_read_pays_the_frame_its_reference_owes_before_reading_the_pages() {
-    use crate::runtime::writeback_debt::test_resident_identity;
+    use crate::runtime::writeback_debt::{test_mapping_walked_by, test_resident_identity};
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
@@ -7756,7 +7756,10 @@ fn a_buffer_read_pays_the_frame_its_reference_owes_before_reading_the_pages() {
     state.define_task(task_id, 0x1000, 9);
 
     // The reference is itself a mapping id, which is the dominant spelling and
-    // the one `mappings_named_by` resolves without a per-task registration.
+    // the one `mappings_named_by` resolves without a per-task registration. It
+    // names the mapping for the task that walked the mapping's backing -- here
+    // the reading task -- and only for that task.
+    test_mapping_walked_by(&mut state, buffer_ref, task_id);
     assert_eq!(
         state.pending_writebacks.arm(
             buffer_ref,
@@ -7800,13 +7803,16 @@ fn a_buffer_read_pays_the_frame_its_reference_owes_before_reading_the_pages() {
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn the_buffer_backed_texture_rail_pays_for_its_texture_reference() {
-    use crate::runtime::writeback_debt::test_resident_identity;
+    use crate::runtime::writeback_debt::{test_mapping_walked_by, test_resident_identity};
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let (task_id, texture_ref, buffer_ref) = (4u32, 31u32, 32u32);
     state.define_task(task_id, 0x1000, 9);
 
+    // The surface behind the texture reference, its backing walked by the task
+    // that samples it: the one task the bare spelling names it for.
+    test_mapping_walked_by(&mut state, texture_ref, task_id);
     assert_eq!(
         state.pending_writebacks.arm(
             texture_ref,

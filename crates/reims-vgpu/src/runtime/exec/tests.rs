@@ -8181,9 +8181,12 @@ fn validity_ops(
 
 /// Arm a frame owed by the surface `object_id` names — the reference is itself
 /// the mapping id, the spelling `mappings_named_by` resolves without a per-task
-/// registration.
-fn owe_a_frame(state: &mut DeviceState, object_id: u32) {
-    use crate::runtime::writeback_debt::test_resident_identity;
+/// registration. That spelling names the mapping only for the task whose page
+/// table walked its backing, so the mapping is one `task_id` walked: `task_id`
+/// is the task the test then reads it as.
+fn owe_a_frame(state: &mut DeviceState, task_id: u32, object_id: u32) {
+    use crate::runtime::writeback_debt::{test_mapping_walked_by, test_resident_identity};
+    test_mapping_walked_by(state, object_id, task_id);
     assert_eq!(
         state.pending_writebacks.arm(
             object_id,
@@ -8225,8 +8228,8 @@ fn a_guest_read_pays_the_frame_its_object_owes_and_nothing_else_does() {
     assert_eq!(paid(), before, "nothing is owed, so nothing is paid");
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    owe_a_frame(&mut state, object_id);
-    owe_a_frame(&mut state, bystander);
+    owe_a_frame(&mut state, task_id, object_id);
+    owe_a_frame(&mut state, task_id, bystander);
 
     // Every quad that does not carry byte +6 — pageon's own among them — says
     // nothing about the guest reading, so it pays nothing.
@@ -8276,8 +8279,8 @@ fn an_exec_resource_record_clearing_guest_valid_pays_the_owed_frame() {
     let (task_id, read, untouched) = (4u32, 21u32, 22u32);
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    owe_a_frame(&mut state, read);
-    owe_a_frame(&mut state, untouched);
+    owe_a_frame(&mut state, task_id, read);
+    owe_a_frame(&mut state, task_id, untouched);
 
     let record = |object_id, ops| ExecResourceDesc {
         object_id,

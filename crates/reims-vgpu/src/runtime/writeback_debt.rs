@@ -125,6 +125,36 @@ pub(crate) fn test_resident_identity(
     })
 }
 
+/// A mapping this device holds, with the backing walk `task_id`'s page table
+/// latched for it: the state `objects::resolve_backing_ex` leaves behind, and
+/// the only state a frame can be owed against.
+///
+/// A debt is armed by `arm_surface_writeback_debt`, which refuses a mapping the
+/// device holds no entry for, and no path removes an entry afterwards, so a
+/// ledger entry with no mapping behind it is not a state production reaches. A
+/// test that arms one directly and then reads it back by bare reference is
+/// testing the old, unnarrowed naming (`REIMS_VGPU_NAME_NARROW`): there, every
+/// task's reference N named mapping N whether or not the mapping existed. Now a
+/// bare integer names a mapping only for the task that walked its backing, so
+/// the fixture has to say which task that is -- and the reader in the test is
+/// that task.
+#[cfg(test)]
+pub(crate) fn test_mapping_walked_by(state: &mut DeviceState, mapping_id: u32, task_id: u32) {
+    assert!(
+        state.map_surface(mapping_id),
+        "mapping id {mapping_id} is not one a device can hold"
+    );
+    let m = state
+        .mappings
+        .get_mut(&mapping_id)
+        .expect("map_surface left an entry for the id it accepted");
+    m.backing_walk = Some(crate::model::BackingWalk {
+        task_id,
+        backing_pfn: 0,
+        map_generation: m.map_generation,
+    });
+}
+
 /// A frame owed to one mapper-ref-texture mapping's guest pages.
 ///
 /// Values only, and no memory. See the module doc: the rail this replaces held
@@ -359,7 +389,9 @@ pub fn lab_debt_event(what: &str, mapping_id: u32, seq: u64) {
         })
         .collect::<Vec<_>>()
         .join(">");
-    crate::observe::fail(format!("lab_debt {what} mid={mapping_id} seq={seq} bt={bt}"));
+    crate::observe::fail(format!(
+        "lab_debt {what} mid={mapping_id} seq={seq} bt={bt}"
+    ));
 }
 
 impl PendingWritebacks {
@@ -3012,6 +3044,10 @@ mod tests {
     fn asynchronous_resource_synchronization_submits_only_named_objects() {
         let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
         let mut host = crate::runtime::FakeHost::new();
+        // Both surfaces are task 1's: the bare integer names a mapping for the
+        // task that walked its backing, and task 1 is the task that publishes.
+        test_mapping_walked_by(&mut state, 7, 1);
+        test_mapping_walked_by(&mut state, 8, 1);
         assert_eq!(
             state
                 .pending_writebacks
@@ -3027,5 +3063,53 @@ mod tests {
         submit_for_resources(&mut state, &mut host, 1, &[7]);
         assert!(state.pending_writebacks.get(7).is_none());
         assert!(state.pending_writebacks.get(8).is_some());
+    }
+
+    /// A payment by bare reference is the owning task's alone
+    /// (`REIMS_VGPU_NAME_NARROW`, black-box journal 2026-09-30).
+    ///
+    /// Task 3's texture 9 is a task-local reference that shares its integer with
+    /// mapping 9, the desktop-icon layer another task's page table walked. Paying
+    /// it landed that layer's first frame in the guest's pages between its two
+    /// passes. The boundary is the payment, not the resolver
+    /// (`a_bare_reference_names_the_mapping_only_in_the_task_that_walked_its_backing`
+    /// has that): a different task's bare read leaves the frame owed, the walking
+    /// task's pays it, and a mapping nobody walked is paid for any task, because
+    /// it has no owner to compare against.
+    #[test]
+    fn a_bare_reference_pays_a_mapping_only_for_the_task_that_walked_it() {
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let mut host = crate::runtime::FakeHost::new();
+        let (owner, other) = (2u32, 3u32);
+        test_mapping_walked_by(&mut state, 9, owner);
+        state.map_surface(10); // no backing walk was latched for this one
+        for id in [9u32, 10] {
+            assert_eq!(
+                state
+                    .pending_writebacks
+                    .arm(id, ident(id, 64, 64, 1), 64, 64, 1),
+                None
+            );
+        }
+
+        pay_for_texture(&mut state, &mut host, other, 9);
+        assert!(
+            state.pending_writebacks.get(9).is_some(),
+            "task {other}'s texture 9 only shares the integer with the mapping \
+             task {owner} walked, so it owes that mapping's frame nothing"
+        );
+
+        pay_for_texture(&mut state, &mut host, owner, 9);
+        assert!(
+            state.pending_writebacks.get(9).is_none(),
+            "the task that walked the backing speaks mapping ids"
+        );
+
+        pay_for_texture(&mut state, &mut host, other, 10);
+        assert!(
+            state.pending_writebacks.get(10).is_none(),
+            "a mapping with no backing walk has no owner to compare, so it is \
+             named as before"
+        );
     }
 }
