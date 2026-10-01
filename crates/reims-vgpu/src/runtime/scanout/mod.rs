@@ -1392,7 +1392,7 @@ const SAMPLED_FIELD_MIN_TEXELS: u64 = 1 << 20;
 /// Reads guest pages and settles nothing, for [`note_present_field_witness`]'s
 /// reason: settling here would make the instrument cause the visibility it is
 /// trying to observe.
-pub fn note_sampled_surface_field<M: HostMemory>(
+pub fn note_sampled_surface_field<M: HostMemory + crate::runtime::host::HostOps>(
     state: &DeviceState,
     host: &M,
     mapping_id: u32,
@@ -1606,9 +1606,83 @@ fn texel_read<M: HostMemory>(
             || gpa_at(off + head as u64).is_some_and(|gpa| host.read_gpa(gpa, b).is_ok()))
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_FIELD_RUNS=off` reads the field witness's patches
+/// through `read_gpa` again even when the window's host runs are cached. On by
+/// default. Latched.
+fn lab_field_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_FIELD_RUNS").as_deref() != Ok("off"))
+}
+
+/// The host runs of a field window, when the zero-copy rail has already resolved
+/// exactly this window of this page list — `[base_off, base_off + span)` with
+/// `span` the strided extent of `width x height` texels of `bpp` bytes at `bpr`,
+/// which is the window [`crate::runtime::mapper::mapping_window_cached`] holds
+/// for a whole-surface or plane bind of the same geometry.
+///
+/// A cached window was built from every page of it translating to RAM and
+/// mapping through the stable host's `map_pages`, under the key that pins the
+/// page list (`map_generation`, control layout, length). Every byte a patch
+/// row reads lies inside the window, on a page `read_gpa` would therefore read
+/// in full from the same guest RAM, so copying the row from the RAMBlock alias
+/// yields the same bytes and the same all-readable verdict — without one FFI
+/// read per row piece.
+fn field_window_runs<M: crate::runtime::host::HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    window: &SampledFieldWindow,
+) -> Option<std::sync::Arc<Vec<crate::runtime::guest_ram::GuestRun>>> {
+    if !lab_field_runs() || !host.map_pages_stable() {
+        return None;
+    }
+    let tight = u64::from(window.width).checked_mul(u64::from(window.bpp))?;
+    let span = u64::from(window.bpr)
+        .checked_mul(u64::from(window.height.checked_sub(1)?))?
+        .checked_add(tight)?;
+    let (_, runs) =
+        crate::runtime::mapper::mapping_window_cached(state, mapping_id, window.base_off, span)?;
+    (runs.iter().map(|r| r.len()).sum::<u64>() == span).then_some(runs)
+}
+
+/// Copy window bytes `[at, at + out.len())` out of the window's runs, in order.
+/// `false` (nothing promised about `out`) if the runs do not cover the range.
+fn copy_from_window_runs(
+    runs: &[crate::runtime::guest_ram::GuestRun],
+    mut at: u64,
+    out: &mut [u8],
+) -> bool {
+    let mut run_lo = 0u64;
+    let mut done = 0usize;
+    for run in runs {
+        if done == out.len() {
+            break;
+        }
+        let run_hi = run_lo + run.len();
+        if at < run_hi {
+            let off = at - run_lo;
+            let n = ((run_hi - at) as usize).min(out.len() - done);
+            // SAFETY: a cached window's runs are stable-host `map_pages`
+            // aliases of guest RAM, valid for the life of the VM, and
+            // `off + n <= run.len()`; `out[done..done + n]` is in bounds.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (run.host_ptr() as *const u8).add(off as usize),
+                    out[done..].as_mut_ptr(),
+                    n,
+                );
+            }
+            done += n;
+            at += n as u64;
+        }
+        run_lo = run_hi;
+    }
+    done == out.len()
+}
+
 /// [`note_sampled_surface_field`] over an explicitly named window, for a bind
 /// whose texels are not the mapping's own geometry.
-pub fn note_sampled_surface_field_window<M: HostMemory>(
+pub fn note_sampled_surface_field_window<M: HostMemory + crate::runtime::host::HostOps>(
     state: &DeviceState,
     host: &M,
     mapping_id: u32,
@@ -1649,12 +1723,28 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
     // One patch row is contiguous in the surface, so it is read whole, split
     // only where it crosses a page. A texel whose bytes cannot be read is
     // skipped, exactly as a per-texel read skipped it.
+    //
+    // This runs on every full-screen bind and reports only a change, so the
+    // record is kept as numbers and formatted only when it is printed: the
+    // strings it used to build per bind were thrown away on nearly every one.
+    // A row of up to 16-byte texels lives on the stack.
     let row_bytes_max = (FIELD_PATCH_SIDE * bpp) as usize;
-    let mut row = vec![0u8; row_bytes_max];
-    let mut row_ok = vec![false; FIELD_PATCH_SIDE as usize];
-    let mut report = String::new();
-    let mut first_texel = String::new();
-    let mut verdicts: Vec<u8> = Vec::with_capacity(FIELD_PATCHES.len());
+    let mut row_stack = [0u8; (FIELD_PATCH_SIDE * 16) as usize];
+    let mut row_heap = Vec::new();
+    let row: &mut [u8] = if row_bytes_max <= row_stack.len() {
+        &mut row_stack[..row_bytes_max]
+    } else {
+        row_heap.resize(row_bytes_max, 0u8);
+        &mut row_heap[..]
+    };
+    let mut row_ok = [false; FIELD_PATCH_SIDE as usize];
+    // `(patch index, verdict, mean, sd)` per patch that read anything.
+    let mut patches: [(usize, &'static str, f32, f32); FIELD_PATCHES.len()] =
+        [(0, "", 0.0, 0.0); FIELD_PATCHES.len()];
+    let mut first_texel: Option<([u8; 4], usize)> = None;
+    let mut verdicts: [u8; FIELD_PATCHES.len()] = [0; FIELD_PATCHES.len()];
+    let mut verdict_count = 0usize;
+    let runs = field_window_runs(state, host, mapping_id, &window);
     for (i, (fx, fy)) in FIELD_PATCHES.iter().enumerate() {
         let cx = (width as f32 * fx) as u32;
         let cy = (height as f32 * fy) as u32;
@@ -1669,7 +1759,22 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
             }
             let cols = FIELD_PATCH_SIDE.min(width - x0);
             let row_off = base_off + u64::from(y) * u64::from(bpr) + u64::from(x0) * u64::from(bpp);
-            read_field_row(host, &gpa_at, row_off, bpp, page, &mut row, &mut row_ok[..cols as usize]);
+            let from_runs = runs.as_deref().is_some_and(|runs| {
+                copy_from_window_runs(runs, row_off - base_off, &mut row[..(cols * bpp) as usize])
+            });
+            if from_runs {
+                row_ok[..cols as usize].fill(true);
+            } else {
+                read_field_row(
+                    host,
+                    &gpa_at,
+                    row_off,
+                    bpp,
+                    page,
+                    row,
+                    &mut row_ok[..cols as usize],
+                );
+            }
             for dx in 0..cols {
                 if !row_ok[dx as usize] {
                     continue;
@@ -1677,8 +1782,8 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
                 let at = (dx * bpp) as usize;
                 let mut texel = [0u8; 4];
                 texel[..read].copy_from_slice(&row[at..at + read]);
-                if first_texel.is_empty() {
-                    first_texel = texel[..read].iter().map(|b| format!("{b:02x}")).collect();
+                if first_texel.is_none() {
+                    first_texel = Some((texel, read));
                 }
                 samples[n] = texel[..read].iter().map(|b| f32::from(*b)).sum::<f32>() / read as f32;
                 n += 1;
@@ -1690,16 +1795,14 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
         let mean = samples[..n].iter().sum::<f32>() / n as f32;
         let sd = (samples[..n].iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n as f32).sqrt();
         let verdict = field_patch_verdict(mean, sd);
-        verdicts.push(verdict.as_bytes()[0]);
-        if i != 0 {
-            report.push(',');
-        }
-        report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
+        verdicts[verdict_count] = verdict.as_bytes()[0];
+        patches[verdict_count] = (i, verdict, mean, sd);
+        verdict_count += 1;
     }
-    if verdicts.is_empty() {
+    if verdict_count == 0 {
         return;
     }
-    let pattern = verdicts
+    let pattern = verdicts[..verdict_count]
         .iter()
         .fold(0u64, |acc, v| (acc << 8) | u64::from(*v));
     let changed = {
@@ -1711,6 +1814,16 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
     if !changed {
         return;
     }
+    let mut report = String::new();
+    for &(i, verdict, mean, sd) in &patches[..verdict_count] {
+        if i != 0 {
+            report.push(',');
+        }
+        report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
+    }
+    let first_texel: String = first_texel
+        .map(|(texel, read)| texel[..read].iter().map(|b| format!("{b:02x}")).collect())
+        .unwrap_or_default();
     // The draws that went into this surface since the last change of its field,
     // for [`note_present_field_witness`]'s reason and drained the same way: a
     // full-screen layer that turns uniform is either a pass that produced a

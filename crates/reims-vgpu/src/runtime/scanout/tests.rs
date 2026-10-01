@@ -1484,3 +1484,69 @@ fn a_field_row_follows_the_page_list_and_skips_only_unreadable_texels() {
     read_field_row(&host, &gpa_at, page - 6, 4, page, &mut row, &mut ok);
     assert_eq!(ok, [true, false]);
 }
+
+/// The full-screen field witness prints exactly the record it always printed,
+/// and prints it only on a change: the patch verdicts, means and deviations in
+/// patch order and the first texel's bytes, now formatted only when the pattern
+/// moved rather than on every bind.
+#[test]
+fn the_sampled_field_witness_formats_its_record_only_on_a_change() {
+    use crate::model::PAGE_SHIFT_X86;
+    use crate::runtime::host::HostMemory;
+    use reims_vgpu_protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let (mid, w, h) = (0x5eedu32, 1024u32, 1024u32);
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let gpa0 = 0x4000_0000u64;
+    let pages = (u64::from(w) * u64::from(h) * 4).div_ceil(page) as u32;
+    host.map_range(gpa0, (u64::from(pages) * page) as usize, 0);
+    assert!(state.map_surface(mid));
+    assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+    {
+        let m = state.mappings.get_mut(&mid).unwrap();
+        m.mapped = true;
+        m.page_entries = (0..pages)
+            .map(|i| {
+                ((((gpa0 >> PAGE_SHIFT_X86) as u32) + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+            })
+            .collect();
+    }
+    let lines = || {
+        std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(&format!("sampled_surface_field mid={mid} ")))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let before = lines().len();
+    note_sampled_surface_field(&state, &host, mid, 7, "bytes");
+    let got = lines();
+    assert_eq!(got.len(), before + 1, "first sight prints");
+    let line = got.last().unwrap();
+    assert!(
+        line.contains("patches=[black:0/0,black:0/0,black:0/0,black:0/0] first=0x00000000"),
+        "{line}"
+    );
+    note_sampled_surface_field(&state, &host, mid, 7, "bytes");
+    assert_eq!(
+        lines().len(),
+        before + 1,
+        "an unchanged field prints nothing"
+    );
+    // Paint the first patch (10 %, 22 %) white: one verdict moves.
+    let (cx, cy) = ((w as f32 * 0.10) as u64, (h as f32 * 0.22) as u64);
+    for y in cy - 4..cy + 4 {
+        let off = y * u64::from(w) * 4 + (cx - 4) * 4;
+        assert!(host.write_gpa(gpa0 + off, &[0xffu8; 32]).is_ok());
+    }
+    note_sampled_surface_field(&state, &host, mid, 7, "bytes");
+    let got = lines();
+    assert_eq!(got.len(), before + 2);
+    let line = got.last().unwrap();
+    assert!(
+        line.contains("patches=[white:255/0,black:0/0,black:0/0,black:0/0] first=0xffffffff"),
+        "{line}"
+    );
+}

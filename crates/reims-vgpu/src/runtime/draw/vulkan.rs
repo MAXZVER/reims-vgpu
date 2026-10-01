@@ -17840,6 +17840,184 @@ fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
     scratch[filled..].fill(0);
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_MEMO_READ=off` reads the mapper-ref-texture memo's
+/// coherence bytes through [`crate::runtime::scanout::read_mapping_bgra8`]
+/// again. On by default. Latched.
+fn lab_memo_read() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_MEMO_READ").as_deref() != Ok("off"))
+}
+
+/// The window `paint_mapping` copies straight into a BGRA8 destination when it
+/// reads `mid` through its multi-run arm, as `(base_off, bpr, span, tight)` —
+/// `None` whenever that function would take any other arm or decline.
+///
+/// The arm is the one every small mapper-ref-texture memo bind takes on a host
+/// that cannot pack scattered pages: no contiguous view (refused, and the
+/// refusal cached on this page-list generation, so the probe answers from the
+/// cache), a BGRA8 format (the row copy, no conversion), and no
+/// `mapping_internal` (so neither `ensure_resolved_for_scanout` nor any
+/// revalidation can rewrite the page list underneath the read). Every check
+/// below is one `read_mapping_bgra8` / `paint_mapping` makes; a mapping that
+/// fails any of them goes to the original reader, which declines it by name.
+fn memo_read_window(
+    state: &DeviceState,
+    mid: u32,
+    w: u32,
+    h: u32,
+    dst_stride: u32,
+    dst_len: usize,
+) -> Option<(u64, usize, u64, usize)> {
+    if !crate::model::scanout_extent_ok(w, h) || dst_stride < w.saturating_mul(RGBA8_BPP) {
+        return None;
+    }
+    if dst_len < (h as u64).saturating_mul(dst_stride as u64) as usize {
+        return None;
+    }
+    let m = state.mappings.get(&mid)?;
+    if !m.mapped || m.page_entries.is_empty() || !m.has_geom || m.width != w || m.height != h {
+        return None;
+    }
+    if m.mapping_internal != 0
+        || m.contig_ptr != 0
+        || m.contig_refused_gen != Some(m.map_generation)
+    {
+        return None;
+    }
+    let format = if m.format != 0 {
+        m.format
+    } else {
+        MTL_FORMAT_BGRA8_UNORM
+    };
+    if format != MTL_FORMAT_BGRA8_UNORM && format != pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB {
+        return None;
+    }
+    pixel_format::bytes_per_pixel(format)?;
+    let tight = pixel_format::tight_row_bytes(w, format)? as usize;
+    if tight != (w as usize) * (RGBA8_BPP as usize) {
+        return None;
+    }
+    let (base_off, bpr, span_end) =
+        crate::runtime::mapping_write::mapper_ref_texture_sample_window(m, w, h, format)?;
+    let bpr = bpr as usize;
+    if bpr < tight || base_off >= span_end {
+        return None;
+    }
+    let span = span_end - base_off;
+    // Every row inside the window, or the original's `DirectRowOob` decides.
+    if ((h as usize - 1) * bpr + tight) as u64 > span {
+        return None;
+    }
+    Some((base_off, bpr, span, tight))
+}
+
+/// The memo's coherence read: what [`crate::runtime::scanout::read_mapping_bgra8`]
+/// returns, byte for byte, with the page list and its host runs taken from the
+/// mapping's exact window cache instead of rebuilt and re-imported on every bind.
+///
+/// # Why it is the same read
+///
+/// For the arm [`memo_read_window`] admits, `read_mapping_bgra8` does, in order:
+/// `ensure_resolved_for_scanout`; `paint_mapping`'s settle and its
+/// contiguous-view probe (refused from the cache); `read_mapping_bytes`' settle;
+/// `copy_mapping_runs`' second probe, the whole-mapping page list, the
+/// retired-view flush, and one `map_pages` per GPA run into a fresh window-sized
+/// buffer; then a row copy of that buffer into `dst`. This takes every one of
+/// those steps that has an effect — both settles, both probes (whose only effects
+/// are the retired-view flush and the refusal census), the flush — and replaces
+/// only the page list and the imports: [`mapping_window_guest_runs`] answers the
+/// same window from the cache keyed on the page list's `map_generation`, control
+/// layout and length, and its runs are the same `map_pages` aliases, which a
+/// stable host hands back as the RAMBlock pointer for the life of the VM (see
+/// [`coalesce_pages_to_runs`]). The rows are then copied from guest RAM straight
+/// into `dst`, which is where the intermediate buffer's bytes went.
+///
+/// Every refusal — a mapping off the arm, a window the cache cannot answer
+/// (which is exactly when the original's page list or imports fail too) — reads
+/// through the original instead, so declines are named where they always were.
+/// That fallback repeats the settles, which are idempotent: the debt was paid
+/// and the outstanding writeback waited for the first time.
+#[allow(clippy::too_many_arguments)]
+fn memo_read_bgra8<M: HostMemory + HostOps>(
+    fast: bool,
+    state: &mut DeviceState,
+    host: &mut M,
+    mid: u32,
+    dst: &mut [u8],
+    dst_stride: u32,
+    w: u32,
+    h: u32,
+) -> bool {
+    use crate::runtime::render_writeback::SettleSite;
+    let original = |state: &mut DeviceState, host: &mut M, dst: &mut [u8]| {
+        crate::runtime::scanout::read_mapping_bgra8(state, host, mid, dst, dst_stride, w, h)
+    };
+    if !fast
+        || !host.map_pages_stable()
+        || memo_read_window(state, mid, w, h, dst_stride, dst.len()).is_none()
+    {
+        return original(state, host, dst);
+    }
+    let _ = crate::runtime::mapper::ensure_resolved_for_scanout(state, host, mid);
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mid,
+        SettleSite::SampledMappingRead,
+    );
+    let Some((base_off, bpr, span, tight)) =
+        memo_read_window(state, mid, w, h, dst_stride, dst.len())
+    else {
+        return original(state, host, dst);
+    };
+    if crate::runtime::mapper::ensure_contig_view(state, host, mid).is_some() {
+        return original(state, host, dst);
+    }
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mid,
+        SettleSite::MappingBytesRead,
+    );
+    let _ = crate::runtime::mapper::ensure_contig_view(state, host, mid);
+    let Some((_, runs)) = mapping_window_guest_runs(state, host, mid, base_off, span) else {
+        return original(state, host, dst);
+    };
+    if runs.iter().map(|r| r.len()).sum::<u64>() != span {
+        return original(state, host, dst);
+    }
+    crate::runtime::mapper::flush_retired_views(state, host);
+    let stride = dst_stride as usize;
+    let (mut ri, mut run_lo) = (0usize, 0u64);
+    for y in 0..h as usize {
+        let row = &mut dst[y * stride..y * stride + tight];
+        let mut at = (y * bpr) as u64;
+        let mut done = 0usize;
+        while done < tight {
+            while run_lo + runs[ri].len() <= at {
+                run_lo += runs[ri].len();
+                ri += 1;
+            }
+            let run = runs[ri];
+            let off = at - run_lo;
+            let n = ((run.len() - off) as usize).min(tight - done);
+            // SAFETY: `run` is a stable host's `map_pages` alias of guest RAM,
+            // valid for the life of the VM (`map_pages_stable`), and
+            // `off + n <= run.len()`; `row[done..done + n]` is in bounds.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (run.host_ptr() as *const u8).add(off as usize),
+                    row[done..].as_mut_ptr(),
+                    n,
+                );
+            }
+            done += n;
+            at += n as u64;
+        }
+    }
+    true
+}
+
 /// Byte-exact revalidated memo for the mapper-ref-texture mapping-backed guest-page sampled
 /// path. Same contract as [`load_linear_guest_memoized`] / the ref-texture view memo:
 /// re-read the native BGRA rect every bind (a guest CPU write is always
@@ -17877,9 +18055,16 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
         span,
         (stride as usize).saturating_mul(h as usize),
     );
-    if !{
-        crate::runtime::scanout::read_mapping_bgra8(state, host, mid, &mut scratch, stride, w, h)
-    } {
+    if !memo_read_bgra8(
+        lab_memo_read(),
+        state,
+        host,
+        mid,
+        &mut scratch,
+        stride,
+        w,
+        h,
+    ) {
         state.mapper_ref_texture_memo_scratch = scratch;
         return None;
     }

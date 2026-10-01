@@ -1479,4 +1479,300 @@ mod tests {
             Err(SampleBail::ColdWindow | SampleBail::ZeroCopyDeclined)
         ));
     }
+
+    /// TEMP (lab bench): a small mapper-ref surface (60x64 BGRA8 over four
+    /// scattered pages, a packed-only stable host) with no host cache and no
+    /// resident, so every bind takes the guest-memo rung. Prints the per-bind
+    /// cost of the whole resolve and of its parts. `--ignored` to run.
+    pub(crate) fn memo_fixture() -> (DeviceState, FakeHost, u32, u32) {
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        let (mut state, mut host, texture_ref, surface_id) = fixture();
+        host.stable_map_pages = true;
+        host.strict_linux_map = true;
+        state.host_surfaces.remove(&surface_id);
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpas: Vec<u64> = (0..4u64).map(|i| 0x5000_0000 + 2 * i * page).collect();
+        for (n, &gpa) in gpas.iter().enumerate() {
+            host.map_range(gpa, page as usize, 0x40 + n as u8);
+        }
+        assert!(state.set_mapping_geom(surface_id, 60, 64, MTL_FORMAT_BGRA8_UNORM));
+        state.mappings.get_mut(&surface_id).unwrap().page_entries = gpas
+            .iter()
+            .map(|&gpa| {
+                (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+            })
+            .collect();
+        (state, host, texture_ref, surface_id)
+    }
+
+    /// `REIMS_VGPU_LAB_MEMO_READ`: the memo's coherence read through the window
+    /// cache answers exactly what `read_mapping_bgra8` answers — on first sight,
+    /// on a repeat, and after the guest writes a page — and a repeat imports
+    /// nothing, where the original re-imports every run on every bind.
+    #[test]
+    fn the_memo_read_through_the_window_cache_is_the_original_read() {
+        let (mut a, mut a_host, _, sid) = memo_fixture();
+        let (mut b, mut b_host, _, _) = memo_fixture();
+        let (w, h, stride) = (60u32, 64u32, 240u32);
+        let read = |fast: bool, state: &mut DeviceState, host: &mut FakeHost| {
+            let mut dst = vec![0xA5u8; (stride * h) as usize];
+            let ok = memo_read_bgra8(fast, state, host, sid, &mut dst, stride, w, h);
+            (ok, dst)
+        };
+        // The contiguous view is refused and cached on the first read of either arm.
+        let first_fast = read(true, &mut a, &mut a_host);
+        let first_orig = read(false, &mut b, &mut b_host);
+        assert!(first_fast.0 && first_orig.0);
+        assert_eq!(first_fast, first_orig);
+        // The second fast read fills the window cache; the third is warm.
+        assert_eq!(read(true, &mut a, &mut a_host), first_orig);
+        let calls = a_host.map_pages_calls;
+        let again_fast = read(true, &mut a, &mut a_host);
+        assert_eq!(again_fast, first_orig);
+        assert_eq!(
+            a_host.map_pages_calls, calls,
+            "a warm window imports nothing"
+        );
+        let calls = b_host.map_pages_calls;
+        assert_eq!(read(false, &mut b, &mut b_host), first_orig);
+        assert!(b_host.map_pages_calls > calls, "the original re-imports");
+        // A guest write to the third page is read by both.
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa = 0x5000_0000 + 4 * page + 0x10;
+        assert!(a_host.write_gpa(gpa, &[1, 2, 3, 4, 5, 6, 7]).is_ok());
+        assert!(b_host.write_gpa(gpa, &[1, 2, 3, 4, 5, 6, 7]).is_ok());
+        let wrote_fast = read(true, &mut a, &mut a_host);
+        let wrote_orig = read(false, &mut b, &mut b_host);
+        assert_ne!(wrote_fast.1, first_orig.1, "the write must be seen");
+        assert_eq!(wrote_fast, wrote_orig);
+        // A mapping whose page list moved goes back through the original.
+        a.mappings.get_mut(&sid).unwrap().map_generation += 1;
+        b.mappings.get_mut(&sid).unwrap().map_generation += 1;
+        assert_eq!(
+            read(true, &mut a, &mut a_host),
+            read(false, &mut b, &mut b_host)
+        );
+    }
+
+    /// `REIMS_VGPU_LAB_FIELD_RUNS`: a full-screen field witness whose window the
+    /// zero-copy rail has resolved reads its patches from the cached runs and
+    /// prints exactly the record the `read_gpa` walk prints for the same pages.
+    #[test]
+    fn the_field_witness_reads_a_cached_window_from_its_runs() {
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        let (w, h) = (1024u32, 1024u32);
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let build = |mid: u32| {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            host.stable_map_pages = true;
+            host.strict_linux_map = true;
+            let pages = u64::from(w) * u64::from(h) * 4 / page;
+            let gpas: Vec<u64> = (0..pages).map(|i| 0x1_0000_0000 + 2 * i * page).collect();
+            for (n, &gpa) in gpas.iter().enumerate() {
+                host.map_range(gpa, page as usize, (n * 37 % 251) as u8);
+            }
+            assert!(state.map_surface(mid));
+            assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+            state.mappings.get_mut(&mid).unwrap().page_entries = gpas
+                .iter()
+                .map(|&gpa| {
+                    (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+                })
+                .collect();
+            (state, host, gpas)
+        };
+        let record = |mid: u32| {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains(&format!("sampled_surface_field mid={mid} ")))
+                .map(|l| {
+                    let at = l.find("patches=").expect("patches");
+                    let end = l.find(" (guest pages").unwrap_or(l.len());
+                    l[at..end].to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let (mid_runs, mid_walk) = (0xF1E1u32, 0xF1E2u32);
+        let (mut a, mut a_host, a_gpas) = build(mid_runs);
+        let (b, b_host, _) = build(mid_walk);
+        let (base_off, bpr, _) = crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+            a.mappings.get(&mid_runs).unwrap(),
+            w,
+            h,
+            MTL_FORMAT_BGRA8_UNORM,
+        )
+        .unwrap();
+        let span = u64::from(bpr) * u64::from(h - 1) + u64::from(w) * 4;
+        assert!(mapping_window_guest_runs(&mut a, &mut a_host, mid_runs, base_off, span).is_some());
+        crate::runtime::scanout::note_sampled_surface_field(&a, &a_host, mid_runs, 9, "guest_runs");
+        crate::runtime::scanout::note_sampled_surface_field(&b, &b_host, mid_walk, 9, "guest_runs");
+        let (ra, rb) = (record(mid_runs), record(mid_walk));
+        assert_eq!(ra.len(), 1);
+        assert_eq!(ra, rb, "the runs and the walk must print the same record");
+        assert!(
+            ra[0].contains("painted:"),
+            "fixture must exercise the stats: {}",
+            ra[0]
+        );
+        // The runs path is the one taken: with every page refusing `read_gpa`
+        // the walk reads nothing and prints nothing, while the runs still read
+        // the guest's new bytes and report the change.
+        for &gpa in &a_gpas {
+            assert!(a_host.write_gpa(gpa, &[0xffu8; 4096]).is_ok());
+            a_host.mark_non_ram(gpa, page);
+        }
+        crate::runtime::scanout::note_sampled_surface_field(&a, &a_host, mid_runs, 9, "guest_runs");
+        let ra = record(mid_runs);
+        assert_eq!(ra.len(), 2);
+        assert!(
+            ra[1].starts_with("patches=[white:255/0,white:255/0,white:255/0,white:255/0]"),
+            "{}",
+            ra[1]
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn lab_bench_resident_bind() {
+        let (mut state, mut host, texture_ref, surface_id) = fixture();
+        let res = resource(&state, &host, texture_ref);
+        let identity =
+            crate::backend::vulkan::present_identity::surface_identity(&state, surface_id, 4, 3);
+        resource_lease::seed_warm_lease_for_test(
+            &res,
+            &identity,
+            ResidentContentBacking::DeviceAllocation,
+        );
+        let n = 20_000u32;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(resolve_sampled_source(
+                &mut state,
+                &mut host,
+                1,
+                texture_ref,
+                Some(res.clone()),
+                true,
+            ));
+        }
+        eprintln!(
+            "lab_bench resident resolve: {:.3} us",
+            t.elapsed().as_secs_f64() * 1e6 / f64::from(n)
+        );
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(
+                surface_top(&state, &host, surface_id, true, |identity| {
+                    Some(resource_lease::resident_target_backing(&res, identity))
+                })
+                .ok(),
+            );
+        }
+        eprintln!(
+            "lab_bench resident surface_top: {:.3} us",
+            t.elapsed().as_secs_f64() * 1e6 / f64::from(n)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn lab_bench_memo_bind() {
+        let (mut state, mut host, texture_ref, sid) = memo_fixture();
+        let res = resource(&state, &host, texture_ref);
+        let first = resolve_sampled_source(
+            &mut state,
+            &mut host,
+            1,
+            texture_ref,
+            Some(res.clone()),
+            true,
+        )
+        .expect("memo rung serves");
+        assert!(matches!(first.3, SampledSourceRequest::Bytes(..)));
+        let n = 20_000u32;
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            eprintln!(
+                "lab_bench {label}: {:.3} us",
+                t.elapsed().as_secs_f64() * 1e6 / f64::from(n)
+            );
+        };
+        time("resolve_sampled_source", &mut || {
+            std::hint::black_box(resolve_sampled_source(
+                &mut state,
+                &mut host,
+                1,
+                texture_ref,
+                Some(res.clone()),
+                true,
+            ));
+        });
+        time("surface_top", &mut || {
+            std::hint::black_box(
+                surface_top(&state, &host, sid, true, |identity| {
+                    Some(resource_lease::resident_target_backing(&res, identity))
+                })
+                .ok(),
+            );
+        });
+        time("ensure_surface", &mut || {
+            std::hint::black_box(objects::ensure_surface_for_texture_bind(
+                &mut state, &host, sid,
+            ));
+        });
+        time("zero_copy", &mut || {
+            std::hint::black_box(try_mapper_ref_texture_sample_zero_copy(
+                &mut state,
+                &mut host,
+                sid,
+                60,
+                64,
+                res.lifetime_ref(),
+            ));
+        });
+        time("memoized", &mut || {
+            std::hint::black_box(load_mapper_ref_texture_rgba_memoized(
+                &mut state, &mut host, sid,
+            ));
+        });
+        let mut dst = vec![0u8; 60 * 64 * 4];
+        time("memo_read fast", &mut || {
+            std::hint::black_box(memo_read_bgra8(
+                true, &mut state, &mut host, sid, &mut dst, 240, 60, 64,
+            ));
+        });
+        time("memo_read orig", &mut || {
+            std::hint::black_box(memo_read_bgra8(
+                false, &mut state, &mut host, sid, &mut dst, 240, 60, 64,
+            ));
+        });
+        let mut dst = vec![0u8; 60 * 64 * 4];
+        time("read_mapping_bgra8", &mut || {
+            std::hint::black_box(crate::runtime::scanout::read_mapping_bgra8(
+                &mut state, &mut host, sid, &mut dst, 240, 60, 64,
+            ));
+        });
+        let mut buf = vec![0u8; 60 * 64 * 4];
+        time("read_mapping_bytes", &mut || {
+            std::hint::black_box(crate::runtime::mapper::read_mapping_bytes(
+                &mut state, &mut host, sid, 0, &mut buf,
+            ));
+        });
+        time("ensure_contig_view", &mut || {
+            std::hint::black_box(crate::runtime::mapper::ensure_contig_view(
+                &mut state, &mut host, sid,
+            ));
+        });
+        time("flush_retired_views", &mut || {
+            crate::runtime::mapper::flush_retired_views(&mut state, &mut host);
+        });
+        time("note_ref_backing", &mut || {
+            note_sampled_ref_backing(&state, 1, texture_ref, 60, 64, sid, "bytes");
+        });
+    }
 }
