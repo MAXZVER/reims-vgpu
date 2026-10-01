@@ -4347,11 +4347,71 @@ impl DeviceState {
             // never emits one. A zero id names nothing.
             return named;
         }
-        named.push(object_id);
+        if self.bare_reference_is_mapping_id(task_id, object_id) {
+            named.push(object_id);
+        }
         if let Some(&mid) = self.texture_to_mapping.get(&(task_id, object_id)) {
             named.push(mid);
         }
         named
+    }
+
+    /// Whether `task_id` is the task the guest speaks mapping ids in for the
+    /// mapping numbered `object_id`: the one whose page table walked its backing.
+    #[must_use]
+    pub fn bare_reference_names_mapping(&self, task_id: u32, object_id: u32) -> bool {
+        self.mappings
+            .get(&object_id)
+            .and_then(|m| m.backing_walk)
+            .is_some_and(|walk| walk.task_id == task_id)
+    }
+
+    /// Whether `object_id`, spelled bare (`REIMS_VGPU_NAME_NARROW`, opt-in for now),
+    /// by `task_id`, is the id of the mapping of that number.
+    ///
+    /// Mapping ids are device-wide, task references are per-task, and both are
+    /// small integers, so the bare spelling collides constantly -- and a collision
+    /// is not harmless: a compute dispatch in task 3 reading its own texture 9
+    /// paid the compositor layer mapping 9 a frame early, and a validity quad
+    /// that task 3 sent for its texture 9 told mapping 9 the guest had written its
+    /// pages. The guest speaks in mapping ids in one place, the task that walked
+    /// the mapping's backing (`replace_physical` already resolves through exactly
+    /// that task), so that is the only task for which the bare integer names the
+    /// mapping. Everything else is named through `texture_to_mapping`, which the
+    /// per-task registration fills.
+    ///
+    /// Off, every bare integer names the mapping of that number, as before.
+    fn bare_reference_is_mapping_id(&self, task_id: u32, object_id: u32) -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            matches!(
+                crate::config::read(crate::config::NAME_NARROW).0,
+                crate::config::Switch::On
+            )
+        }) {
+            return true;
+        }
+        let names = self.bare_reference_names_mapping(task_id, object_id);
+        if !names && self.mappings.contains_key(&object_id) {
+            crate::runtime::drain::note_store_route("name_narrow_bare_dropped");
+            if crate::observe::first_sight(
+                "name_narrow_bare_dropped",
+                u64::from(task_id) << 32 | u64::from(object_id),
+            ) {
+                crate::observe::off(format!(
+                    "name_narrow_bare_dropped task={task_id} ref={object_id} \
+                     registered={:?} owner_task={:?} owed={}",
+                    self.texture_to_mapping.get(&(task_id, object_id)),
+                    self.mappings
+                        .get(&object_id)
+                        .and_then(|m| m.backing_walk)
+                        .map(|w| w.task_id),
+                    self.pending_writebacks.get(object_id).is_some()
+                ));
+            }
+        }
+        names
     }
 
     /// Whether any mapping this reference names is one this device still holds.

@@ -1139,38 +1139,17 @@ fn note_gva_payment_skipped_by_name(state: &DeviceState, task_id: u32, texture_r
     }
 }
 
-/// TEMP (lab, `REIMS_VGPU_LAB_PAY_NAME_NARROW=1`): whether `texture_ref` of `task_id`
-/// *is* `mapping_id`, rather than merely spelling the same integer.
-///
-/// [`DeviceState::mappings_named_by`] always includes the bare reference as a
-/// mapping id, on the reading that some guest paths use one namespace for both.
-/// Mapping ids are device-wide and small (the surfaces of a boot), references are
-/// per-task and small too, so the integers collide all the time: a compute dispatch
-/// in task 3 reading its own texture 9 paid the compositor layer mapping 9 -- a
-/// whole-frame writeback of a surface nobody was reading -- on 6 of 40 boots.
-///
-/// A bare reference names the mapping when the per-task registration says so, or
-/// when the mapping's own backing was translated through this task (the owning
-/// task is where the guest speaks in mapping ids; `replace_physical` makes the
-/// same distinction).
-fn reference_names_mapping(
-    state: &DeviceState,
-    task_id: u32,
-    texture_ref: u32,
-    mapping_id: u32,
-) -> bool {
-    state.texture_to_mapping.get(&(task_id, texture_ref)) == Some(&mapping_id)
-        || state
-            .mappings
-            .get(&mapping_id)
-            .and_then(|m| m.backing_walk)
-            .is_some_and(|walk| walk.task_id == task_id)
-}
-
-fn lab_pay_name_narrow() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PAY_NAME_NARROW").is_ok_and(|v| v == "1"))
+/// TEMP (lab): which exit `pay` took for a `REIMS_VGPU_LAB_GPX` mapping.
+fn lab_pay_exit(mapping_id: u32, debt: &WritebackDebt, exit: &str) {
+    if crate::runtime::scanout::lab_gpx_all()
+        .iter()
+        .any(|(m, _, _)| *m == mapping_id)
+    {
+        crate::observe::fail(format!(
+            "lab_pay_exit mid={mapping_id} seq={} exit={exit}",
+            debt.seq
+        ));
+    }
 }
 
 /// TEMP (lab, `REIMS_VGPU_LAB_PAY_BLOCK=<mid>`): a reference that names this mapping
@@ -1186,30 +1165,74 @@ fn lab_pay_block(mapping_id: u32) -> bool {
     }) == Some(mapping_id)
 }
 
-/// TEMP (lab, `REIMS_VGPU_LAB_PAY_AFTER_ARM=<mid>`): the first debt armed for this
-/// mapping is paid at once, so the guest's pages hold the first frame the mapping
-/// rendered -- the order a payment between two passes produces by chance.
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_AFTER_ARM=<mid>[:<delay_ms>]`): the first debt
+/// armed for this mapping is paid `delay_ms` later (default at once), if it is still
+/// the debt of that first frame, so the guest's pages hold the first frame the
+/// mapping rendered -- the order a payment between two passes produces by chance.
+/// Polled from every arm of every mapping, which is often enough for a delay of
+/// seconds. A debt already replaced by the second frame is left alone and logged as
+/// missed, so such a boot is not counted as a trial of the early payment.
 pub fn lab_pay_after_first_arm<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
 ) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::OnceLock;
-    static MID: OnceLock<Option<u32>> = OnceLock::new();
-    static DONE: AtomicBool = AtomicBool::new(false);
-    let want = *MID.get_or_init(|| {
-        std::env::var("REIMS_VGPU_LAB_PAY_AFTER_ARM")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-    });
-    if want != Some(mapping_id) || DONE.swap(true, Ordering::Relaxed) {
-        return;
+    use std::sync::{Mutex, OnceLock};
+    #[derive(Clone, Copy)]
+    enum Phase {
+        Waiting,
+        Armed { at: std::time::Instant, seq: u64 },
+        Done,
     }
-    crate::observe::fail(format!(
-        "lab_pay_after_first_arm mid={mapping_id} (forced early payment of the first frame)"
-    ));
-    pay_for_mapping(state, host, mapping_id);
+    static CFG: OnceLock<Option<(u32, u64)>> = OnceLock::new();
+    static PHASE: Mutex<Phase> = Mutex::new(Phase::Waiting);
+    let Some((want, delay_ms)) = *CFG.get_or_init(|| {
+        let v = std::env::var("REIMS_VGPU_LAB_PAY_AFTER_ARM").ok()?;
+        let (mid, delay) = v.split_once(':').unwrap_or((v.as_str(), "0"));
+        Some((mid.trim().parse().ok()?, delay.trim().parse().ok()?))
+    }) else {
+        return;
+    };
+    let mut phase = PHASE.lock().unwrap_or_else(|e| e.into_inner());
+    match *phase {
+        Phase::Done => {}
+        Phase::Waiting => {
+            if mapping_id == want {
+                let seq = state.pending_writebacks.get(want).map_or(0, |d| d.seq);
+                if delay_ms == 0 {
+                    *phase = Phase::Done;
+                    drop(phase);
+                    crate::observe::fail(format!(
+                        "lab_pay_after_first_arm mid={want} seq={seq} delay_ms=0 (forced early payment of the first frame)"
+                    ));
+                    pay_for_mapping(state, host, want);
+                } else {
+                    *phase = Phase::Armed {
+                        at: std::time::Instant::now(),
+                        seq,
+                    };
+                }
+            }
+        }
+        Phase::Armed { at, seq } => {
+            if at.elapsed() >= std::time::Duration::from_millis(delay_ms) {
+                *phase = Phase::Done;
+                drop(phase);
+                match state.pending_writebacks.get(want) {
+                    Some(d) if d.seq == seq => {
+                        crate::observe::fail(format!(
+                            "lab_pay_after_first_arm mid={want} seq={seq} delay_ms={delay_ms} (forced early payment of the first frame)"
+                        ));
+                        pay_for_mapping(state, host, want);
+                    }
+                    other => crate::observe::fail(format!(
+                        "lab_pay_after_first_arm_missed mid={want} seq={seq} now={:?} (the first frame is no longer the one owed)",
+                        other.map(|d| d.seq)
+                    )),
+                }
+            }
+        }
+    }
 }
 
 /// Pay whatever a *texture* reference names, for a reader that reaches guest
@@ -1280,12 +1303,6 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
     for mapping_id in targets.iter() {
         if state.pending_writebacks.get(mapping_id).is_some() {
             if lab_pay_block(mapping_id) {
-                continue;
-            }
-            if lab_pay_name_narrow()
-                && !reference_names_mapping(state, task_id, texture_ref, mapping_id)
-            {
-                crate::runtime::drain::note_store_route("wbdebt_bare_id_skipped");
                 continue;
             }
             named = true;
@@ -2036,11 +2053,13 @@ fn pay<M: HostMemory + HostOps>(
 ) {
     let Some(entry) = state.mappings.get(&mapping_id) else {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
+        lab_pay_exit(mapping_id, &debt, "no_mapping");
         return;
     };
     let (map_generation, validity) = (entry.map_generation, entry.validity);
     if map_generation != debt.map_generation {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
+        lab_pay_exit(mapping_id, &debt, "generation_moved");
         return;
     }
     // The resident the draw registered, not the one a fresh derivation would
@@ -2050,9 +2069,11 @@ fn pay<M: HostMemory + HostOps>(
         == crate::runtime::resource_validity::WritebackLicence::Superseded
     {
         crate::runtime::drain::note_store_route("wbdebt_abandoned_guest_wrote");
+        lab_pay_exit(mapping_id, &debt, "abandoned_guest_wrote");
         rail.abandon_resident(&debt.target);
         return;
     }
+    lab_pay_exit(mapping_id, &debt, "paying");
     crate::runtime::drain::note_store_route(route);
     // Before the landing (see `GuestWriteObservation`).
     let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);

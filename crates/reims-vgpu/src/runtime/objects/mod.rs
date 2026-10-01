@@ -4274,7 +4274,7 @@ impl RepointStorageRefusal {
     }
 }
 
-/// TEMP (lab, `REIMS_VGPU_LAB_REPOINT_PAY=1`): a frame this device owes a mapping
+/// `REIMS_VGPU_REPOINT_PAY` (opt-in for now): a frame this device owes a mapping
 /// is landed before a re-point that left the mapping's pages where they were.
 ///
 /// The re-point bumps `map_generation` and a debt armed under the old generation
@@ -4299,7 +4299,12 @@ fn repoint_settle_owed_frame<H: HostMemory + crate::runtime::host::HostOps>(
 ) {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_REPOINT_PAY").is_ok_and(|v| v == "1")) {
+    if !*ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::REPOINT_PAY).0,
+            crate::config::Switch::On
+        )
+    }) {
         return;
     }
     if state.pending_writebacks.get(mapping_id).is_none() {

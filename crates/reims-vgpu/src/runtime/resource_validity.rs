@@ -112,6 +112,16 @@ pub fn apply(
             // our copy is stale by the guest's own statement and the next read
             // must re-take the guest pages.
             let seq = state.next_validity_seq();
+            if crate::runtime::scanout::lab_gpx_all()
+                .iter()
+                .any(|(m, _, _)| *m == id)
+            {
+                crate::observe::fail(format!(
+                    "lab_validity clear_host mid={id} task={task_id} object={object_id} \
+                     site={site:?} seq={seq} owed={}",
+                    state.pending_writebacks.get(id).is_some()
+                ));
+            }
             if let Some(m) = state.mappings.get_mut(&id) {
                 m.content_generation = m.content_generation.saturating_add(1);
                 m.guest_stated_gen = m.guest_stated_gen.wrapping_add(1); // TEMP (lab)
