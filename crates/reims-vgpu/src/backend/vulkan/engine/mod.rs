@@ -1965,7 +1965,11 @@ fn clear_guest_write_pages() {
 /// `pages` need not be sorted; it is the reader's window and is usually a
 /// handful of entries against a whole frame's worth here.
 pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
-    recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
+    // TEMP (lab, S5a): the ledger has the same setters as `GUEST_WRITE_DEBT`
+    // (see `guest_writes_outstanding`), none of them a deferred draw.
+    if !recorder_lazy_readers() {
+        recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
+    }
     let Ok(f) = GUEST_WRITE_PAGES.lock() else {
         return GuestWriteReach::Unnamed;
     };
