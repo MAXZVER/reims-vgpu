@@ -884,19 +884,19 @@ pub const ACCESS_EXACT: &str = "REIMS_VGPU_ACCESS_EXACT";
 /// published.
 pub const PIPELINE_PER_TASK: &str = "REIMS_VGPU_PIPELINE_PER_TASK";
 
-/// **Default on.** The exact reductions of the drain's fixed per-packet costs:
-/// each one does the same work the earlier path did, with less around it.
+/// **Default on.** The exact reductions of the drain's fixed per-packet costs: each
+/// one does the same work the earlier path did, with less around it.
 ///
 /// What they are — a packet's payload moved into its transaction instead of copied
 /// and dropped, the census's route lookup keyed by the route's address instead of
-/// hashed from its text, the ledger's row found by index instead of by scan, an
-/// environment variable read once instead of per stream. None of them changes a
-/// record, a command, an ordering or a counter's value.
+/// hashed from its text, an environment variable read once instead of per stream.
+/// None of them changes a record, a command, an ordering or a counter's value.
 ///
-/// `off` restores the earlier path of every one of them, and it exists for exactly
-/// one reason: an A/B of a cost needs both arms in one binary, boots alternating,
-/// because a drain's microseconds per packet move more between builds than a
-/// change of this size does.
+/// `off` restores the earlier path of each of them (the ledger's by-index row lookup
+/// is a pure function with a test against the scan, and has no earlier path to
+/// restore), and it exists for exactly one reason: an A/B of a cost needs both arms
+/// in one binary, boots alternating, because a drain's microseconds per packet move
+/// more between builds than a change of this size does.
 pub const COST_OPTS: &str = "REIMS_VGPU_COST_OPTS";
 
 /// `on` issues the draw-time guest buffer gather as one compute dispatch per

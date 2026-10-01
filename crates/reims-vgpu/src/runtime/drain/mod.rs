@@ -2170,11 +2170,8 @@ fn admit_and_park<H: HostMemory + HostOps>(
             "lab_hold_admitted_other"
         });
     }
-    let arrival_span = crate::runtime::chain_phase::CostSpan::new("ap_arrival_us");
     let arrived = arrival_work(state, host, fifo, &packet);
-    drop(arrival_span);
     let session = state.session_generation();
-    let walk_span = crate::runtime::chain_phase::CostSpan::new("ap_walk_us");
     let built = crate::runtime::ingress::device_packet(
         state,
         host,
@@ -2187,7 +2184,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
             repointed: arrived.repointed,
         },
     );
-    drop(walk_span);
     let mut built = match built {
         Ok(built) => built,
         Err(blocked) => {
@@ -2214,10 +2210,8 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // a wait nothing can satisfy loses the guest. So the wait is dropped and
     // named, here rather than in the bridge — which slot numbers exist is a
     // property of this device's page and not of the packet.
-    let post_walk_span = crate::runtime::chain_phase::CostSpan::new("ap_post_walk_us");
     drop_unresolvable_stamp_waits(state, &packet, &mut built);
     lab_capture_walk_state(state, &built);
-    drop(post_walk_span);
     // The pipelines the records bind, told to the model before it is asked
     // whether the packet may run: `PipelineTable::waits_for` refuses a lease it
     // has no entry for, and the entry is this device's to make. The list is the
@@ -2249,7 +2243,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // without), so a packet with leases has a task; the `0` is for the packets
     // with none, which have no leases to name.
     let lease_task = claiming_task.unwrap_or(0);
-    let declare_span = crate::runtime::chain_phase::CostSpan::new("ap_declare_us");
     for &lease in leases {
         lab_note_pipeline_claim(lease, claiming_task);
         note_store_route(if state.declare_pipeline(lease_task, lease) {
@@ -2258,8 +2251,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
             "pipeline_declared_already"
         });
     }
-    drop(declare_span);
-    let prescan_span = crate::runtime::chain_phase::CostSpan::new("ap_prescan_us");
     let translating = match (arrived.submission.as_ref(), built.payload.exec()) {
         (Some(submission), Some(resolved)) => {
             let mut measured_ns = 0u64;
@@ -2273,8 +2264,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
         }
         _ => Vec::new(),
     };
-    drop(prescan_span);
-    let ready_span = crate::runtime::chain_phase::CostSpan::new("ap_ready_us");
     for &lease in leases {
         if translating.contains(&lease.slot.0) {
             withdraw_lease(state, lease_task, lease);
@@ -2282,7 +2271,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
             ready_lease(state, lease_task, lease, "pipeline_lease_ready_admission");
         }
     }
-    drop(ready_span);
 
     // **The walk asked a question the pre-scan has since answered.** It reads
     // a pipeline's published usage once, before anything for this packet has
@@ -2349,9 +2337,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
             }
         }
     }
-    let modes_span = crate::runtime::chain_phase::CostSpan::new("ap_modes_us");
     note_access_modes(state, &built);
-    drop(modes_span);
     state.lab_pipeline_admission(
         lease_task,
         built
@@ -2359,7 +2345,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
             .exec()
             .map_or(&[][..], |work| &work.pipeline_leases),
     );
-    let admit_packet_span = crate::runtime::chain_phase::CostSpan::new("ap_admit_us");
     let admitted = if crate::runtime::cost_opts::on() {
         state.admit_packet_owned(built)
     } else {
@@ -2380,8 +2365,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
             return;
         }
     };
-    drop(admit_packet_span);
-    let park_span = crate::runtime::chain_phase::CostSpan::new("ap_park_us");
     let mut transaction = admission.admitted.transaction;
     let ingress = transaction.identity.ingress;
     state.lab_pipeline_admitted(
@@ -2426,7 +2409,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
         _ => crate::runtime::parked::ParkedWork::new(fifo.domain().0, admission.epoch, packet),
     };
     state.parked.park(ingress, work);
-    drop(park_span);
 }
 
 /// Drop the stamp waits a packet names that no drain could ever satisfy.
@@ -2830,22 +2812,15 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     // this device is next entered. A guest that ordered a packet behind a fence
     // this very drain published would wait on a doorbell instead.
     loop {
-        let observe_span = crate::runtime::chain_phase::CostSpan::new("st_observe_us");
         observe_awaited_stamps(state, host);
-        drop(observe_span);
-        let pump_span = crate::runtime::chain_phase::CostSpan::new("st_pump_us");
         pump_translations(state, host);
-        drop(pump_span);
-        let take_span = crate::runtime::chain_phase::CostSpan::new("st_take_us");
         for ingress in state.take_ready() {
             // `false` is a position the model released and this device holds no
             // bytes for. `mark_ready` has already named it; there is nothing
             // here to run.
             let _ = state.parked.mark_ready(ingress);
         }
-        drop(take_span);
         let mut ran = false;
-        let scan_span = crate::runtime::chain_phase::CostSpan::new("st_scan_us");
         for ingress in state.parked.ready_in_order() {
             if declined_by_the_device(state, ingress) {
                 continue;
@@ -2856,17 +2831,13 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             else {
                 continue;
             };
-            let run_span = crate::runtime::chain_phase::CostSpan::new("st_run_us");
             run_parked(state, host, ingress, &work);
-            drop(run_span);
             ran = true;
         }
-        drop(scan_span);
         if !ran {
             break;
         }
     }
-    let tail_span = crate::runtime::chain_phase::CostSpan::new("st_tail_us");
     // A position still parked is work this device owes, and the ring it came
     // from is empty — so nothing but a re-entry will run it. Asking the store
     // rather than a mask is what keeps "which timelines are owed" one fact:
@@ -2878,7 +2849,6 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             None => {}
         }
     }
-    drop(tail_span);
 }
 
 /// Whether this device is not able to run a released position yet.
@@ -3119,7 +3089,6 @@ fn run_parked_packet<H: HostMemory + HostOps>(
         }
         state.draining_channel = prev_channel;
     }
-    let _complete_span = crate::runtime::chain_phase::CostSpan::new("rp_complete_us");
     match state.complete_transaction(work.epoch(), ingress) {
         Ok(released) => {
             for release in released {
@@ -6680,11 +6649,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
     packet: &Packet,
     retained: Option<crate::runtime::exec::RetainedInputs<'_>>,
 ) -> ChildPacketDisposition {
-    let prelude_span = crate::runtime::chain_phase::CostSpan::new("pc_prelude_us");
     note_packet_domain_definition(state, channel_id, packet.opcode);
     note_packet_class(reims_vgpu_protocol::packets::Channel::Child, packet.opcode);
     note_lifetime_task_definition(state, reims_vgpu_protocol::packets::Channel::Child, packet);
-    drop(prelude_span);
     match packet.opcode {
         CHILD_OP_DEFINE_TASK2 => {
             apply_define_task2(state, host, &packet.payload, Some(channel_id));
@@ -6953,7 +6920,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     inputs,
                     crate::runtime::exec::ExecResult::default(),
                 );
-                let _post_exec_span = crate::runtime::chain_phase::CostSpan::new("pc_post_exec_us");
                 let channel_bit = 1u32.checked_shl(channel_id).unwrap_or(0);
                 if result.deferred {
                     if channel_bit != 0 && state.translation_deferred_mask & channel_bit == 0 {
@@ -7490,10 +7456,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
             capacity: ring_length,
             page_shift: state.page_shift,
         };
-        let arrival_span = crate::runtime::chain_phase::CostSpan::new("dl_arrival_us");
-        let arrived_packet = arrival(&ring, host, head, tail);
-        drop(arrival_span);
-        match arrived_packet {
+        match arrival(&ring, host, head, tail) {
             Arrival::Nothing => break,
             Arrival::Fault(fault) => {
                 state.record_fail(FailEvent::MalformedChildPacket {
@@ -7508,9 +7471,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // the reading and not for a verdict: a wait that is not yet met
                 // is an ordering position in `admit`, not a ring head this loop
                 // refuses to move.
-                let stamp_span = crate::runtime::chain_phase::CostSpan::new("dl_stamp_waits_us");
                 note_packet_stamp_waits(state, host, Some(channel_id), &packet);
-                drop(stamp_span);
 
                 // **The head advances first, and unconditionally.** Everything
                 // this packet needs has been taken out of the ring — the
@@ -7543,12 +7504,8 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     });
                 }
 
-                let admit_span = crate::runtime::chain_phase::CostSpan::new("dl_admit_us");
                 admit_and_park(state, host, fifo, stamp_index, packet);
-                drop(admit_span);
-                let settle_span = crate::runtime::chain_phase::CostSpan::new("dl_settle_us");
                 settle_model_work(state, host);
-                drop(settle_span);
 
                 if state.pending.host_action_yield {
                     if head != tail {

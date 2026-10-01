@@ -3288,9 +3288,6 @@ impl RouteCache {
 /// rather than applied silently, is the fix; if the harness in front of you
 /// does not print `outsized=` when something is excluded, it predates this and
 /// its verdicts should be re-derived positionally before they are believed.
-/// TEMP (lab, per-packet cost): calls into [`note_store_route_n`] this window.
-static LAB_NSR_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 pub fn note_store_route(route: &'static str) {
     note_store_route_n(route, 1);
 }
@@ -3305,8 +3302,6 @@ pub fn note_store_route_n(route: &'static str, n: u64) {
     if n == 0 {
         return;
     }
-    // TEMP (lab, per-packet cost): how many times the census is called.
-    LAB_NSR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if crate::runtime::cost_opts::on() {
         FAST_ROUTE_CACHE.with(|cache| {
             if let Some(counter) = cache.borrow().find(route) {
@@ -3393,11 +3388,6 @@ fn take_store_routes() -> Option<String> {
     let routes = STORE_ROUTES.lock().ok()?;
     let mut out = String::from("store_routes");
     let mut any = false;
-    let calls = LAB_NSR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if calls != 0 {
-        out.push_str(&format!(" lab_nsr_calls={calls}"));
-        any = true;
-    }
     for (route, counter) in routes.iter() {
         let n = counter.swap(0, std::sync::atomic::Ordering::Relaxed);
         if n != 0 {
