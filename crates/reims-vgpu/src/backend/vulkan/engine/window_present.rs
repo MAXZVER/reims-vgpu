@@ -1918,8 +1918,13 @@ fn lab_present_gap_report() {
     }
     gaps.sort_unstable();
     let at = |q: f64| gaps[((gaps.len() - 1) as f64 * q).round() as usize] as f64 / 1000.0;
+    // `late` counts gaps past 1.5 refresh intervals at 120 Hz (a missed
+    // refresh), `late2` past 2.5 (two or more): the tail a rate at the cap
+    // cannot show.
+    let late = gaps.iter().filter(|&&us| us > 12_500).count();
+    let late2 = gaps.iter().filter(|&&us| us > 20_800).count();
     crate::observe::off(format!(
-        "lab_present_gaps n={} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} max_ms={:.2}",
+        "lab_present_gaps n={} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} max_ms={:.2} late={late} late2={late2}",
         gaps.len(),
         at(0.5),
         at(0.95),
