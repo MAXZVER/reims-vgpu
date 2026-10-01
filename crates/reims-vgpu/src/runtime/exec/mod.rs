@@ -227,6 +227,8 @@ struct StreamAccum {
     /// TEMP (lab, REIMS_VGPU_LAB_PASS_EXTENT): the pass's own
     /// `renderTargetWidth`/`Height`, `None` where it stated none.
     lab_target_extent: Option<(u32, u32)>,
+    /// What this stream's walk has already resolved. See [`walk_memo`].
+    memo: walk_memo::StreamMemo,
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_PASS_EXTENT=on` gives a draw with no viewport or
@@ -305,7 +307,12 @@ impl StreamAccum {
         if let Some(refused) = self.unrepresentable {
             return Err(refused);
         }
+        // Every field named, so no `..Default::default()` builds (and drops) six
+        // empty bind tables a draw is about to replace: each is an `Arc` and an
+        // allocation, once per draw.
         Ok(PendingDraw {
+            pipeline_ref: 0,
+            draw: DrawArgs::default(),
             indexed: self.indexed.clone(),
             vertex_buffers: self.vertex_buffers.clone(),
             fragment_buffers: self.fragment_buffers.clone(),
@@ -327,7 +334,6 @@ impl StreamAccum {
             depth_attach: self.depth_attach,
             stencil_attach: self.stencil_attach,
             visibility: self.visibility,
-            ..Default::default()
         })
     }
 }
@@ -1064,6 +1070,7 @@ fn execute_submission<M: HostMemory + HostOps>(
             &mut acc,
             resolved.as_mut(),
         );
+        acc.memo.flush();
         let walk_ns = walk_started.elapsed().as_nanos() as u64;
         *measured_ns += walk_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
@@ -1360,16 +1367,42 @@ struct ResolvedCursor<'a> {
     /// and therefore needs no sort.
     records: Vec<&'a reims_vgpu_core::exec::StreamRecord>,
     at: reims_vgpu_core::stream::StreamPosition,
+    /// Where the next position is expected in [`Self::records`]: the walks
+    /// advance together, so it is almost always the record after the last one
+    /// found, and one comparison says so where a search costs a probe per bit of
+    /// the packet's record count.
+    next: usize,
+    /// Whether the positions strictly ascend. Only then is a position found at
+    /// `next` the position a search would have found, so the expectation is
+    /// used only then; a list that were not (the builder never makes one) is
+    /// searched as it always was.
+    ascending: bool,
+    /// What the steps found, by [`Self::OUTCOMES`] index, counted once when the
+    /// cursor drops rather than once per record.
+    outcomes: [u64; 4],
 }
 
 impl<'a> ResolvedCursor<'a> {
+    /// The census route of each outcome a step can have.
+    const OUTCOMES: [&'static str; 4] = [
+        "resolved_walk_no_record",
+        "resolved_walk_unjudged",
+        "resolved_walk_class_differs",
+        "resolved_walk_aligned",
+    ];
+
     fn new(work: &'a reims_vgpu_core::exec::ExecWork) -> Self {
+        let records: Vec<_> = work.records().collect();
+        let ascending = records.windows(2).all(|pair| pair[0].at < pair[1].at);
         Self {
-            records: work.records().collect(),
+            records,
             at: reims_vgpu_core::stream::StreamPosition {
                 segment: 0,
                 record: 0,
             },
+            next: 0,
+            ascending,
+            outcomes: [0; 4],
         }
     }
 
@@ -1397,24 +1430,44 @@ impl<'a> ResolvedCursor<'a> {
     ) -> Option<&'a reims_vgpu_core::exec::ResolvedOperation> {
         let at = self.at;
         self.at.record += 1;
-        let Ok(index) = self.records.binary_search_by_key(&at, |record| record.at) else {
-            crate::runtime::drain::note_store_route("resolved_walk_no_record");
-            return None;
+        let expected_here = if self.ascending && walk_memo::on() {
+            self.records.get(self.next).filter(|record| record.at == at)
+        } else {
+            None
         };
+        let index = match expected_here {
+            Some(_) => self.next,
+            None => {
+                let Ok(index) = self.records.binary_search_by_key(&at, |record| record.at) else {
+                    self.outcomes[0] += 1;
+                    return None;
+                };
+                index
+            }
+        };
+        self.next = index + 1;
         let record = self.records[index];
         let Some(expected) = stream_class(kind, opcode) else {
             // The ledger has not settled this opcode as a stream record, so
             // this walk has no class to compare against and says so rather than
             // reporting the model's answer as wrong.
-            crate::runtime::drain::note_store_route("resolved_walk_unjudged");
+            self.outcomes[1] += 1;
             return None;
         };
         if record.op.class() != expected {
-            crate::runtime::drain::note_store_route("resolved_walk_class_differs");
+            self.outcomes[2] += 1;
             return None;
         }
-        crate::runtime::drain::note_store_route("resolved_walk_aligned");
+        self.outcomes[3] += 1;
         Some(&record.op)
+    }
+}
+
+impl Drop for ResolvedCursor<'_> {
+    fn drop(&mut self) {
+        for (route, n) in Self::OUTCOMES.into_iter().zip(self.outcomes) {
+            crate::runtime::drain::note_store_route_n(route, n);
+        }
     }
 }
 
@@ -3182,6 +3235,24 @@ fn handle_render_stream_state(task_id: u32, opcode: u32, cmd_bytes: &[u8], acc: 
             // with the empty slots left out, and adopting them as written would
             // make exactly those slots clip however the backend reads a zero
             // rect.
+            if walk_memo::on() {
+                // The state's own buffer is reused: the lifted rects were built
+                // in a new `Vec` for every scissor record (one a draw) to be
+                // swapped in and the old one freed.
+                let first_empty = rects
+                    .iter()
+                    .map(render_pass::scissor_from_wire)
+                    .find(|r| r.is_empty());
+                match first_empty {
+                    Some(empty) => note_empty_scissor(task_id, empty),
+                    None => {
+                        acc.scissors.clear();
+                        acc.scissors
+                            .extend(rects.iter().map(render_pass::scissor_from_wire));
+                    }
+                }
+                return;
+            }
             let lifted: Vec<ScissorRect> =
                 rects.iter().map(render_pass::scissor_from_wire).collect();
             match lifted.iter().find(|r| r.is_empty()) {
@@ -3328,7 +3399,7 @@ fn handle_render_binds<M: HostMemory + HostOps>(
                     (buffer_ref != 0).then_some(BufferBind {
                         index,
                         buffer_ref,
-                        resource: objects::resolve_resource(state, host, task_id, buffer_ref).ok(),
+                        resource: bind_resource(state, host, task_id, &mut acc.memo, buffer_ref),
                         offset: e.offset.get(),
                         // The record with no stride field cannot state one. The
                         // slot keeps whatever an earlier strided bind left.
@@ -3359,7 +3430,7 @@ fn handle_render_binds<M: HostMemory + HostOps>(
                     (buffer_ref != 0).then_some(BufferBind {
                         index,
                         buffer_ref,
-                        resource: objects::resolve_resource(state, host, task_id, buffer_ref).ok(),
+                        resource: bind_resource(state, host, task_id, &mut acc.memo, buffer_ref),
                         offset: e.offset.get(),
                         attribute_stride: Some(e.attribute_stride.get()),
                     })
@@ -3370,7 +3441,9 @@ fn handle_render_binds<M: HostMemory + HostOps>(
         RenderRecord::BindTextures(r) => {
             // TEMP (lab): every distinct fragment texture bind shape, once — does
             // the guest ever bind index 1 (macOS 26 icon draws sample tex1 unbound)?
-            if matches!(r.stage, reims_vgpu_protocol::render::ShaderStage::Fragment) {
+            if matches!(r.stage, reims_vgpu_protocol::render::ShaderStage::Fragment)
+                && !lab_frag_tex_bind_already_sighted(task_id, r.first, r.entries)
+            {
                 let refs: Vec<u32> = r.entries.iter().map(|e| e.object_ref.get()).collect();
                 let mask = refs.iter().enumerate().fold(0u64, |m, (i, v)| {
                     if *v != 0 && i < 32 {
@@ -3412,22 +3485,53 @@ fn handle_render_binds<M: HostMemory + HostOps>(
                     if !out.texture_refs.contains(&texture_ref) {
                         out.texture_refs.push(texture_ref);
                     }
-                    if let Some(m) =
-                        objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)
-                    {
+                    // The stream's second bind of a reference finds its resource
+                    // already resolved: the two registry lookups this arm makes
+                    // (one inside the mapper resolution, one for the bind's own
+                    // identity) are the ones the memo answers. See [`walk_memo`].
+                    let memoized = if walk_memo::on() {
+                        acc.memo.resource(texture_ref, 2)
+                    } else {
+                        None
+                    };
+                    let mapper = match &memoized {
+                        Some(resource) => objects::resolve_mapper_ref_texture_resource(
+                            state,
+                            task_id,
+                            texture_ref,
+                            resource,
+                        ),
+                        None => {
+                            objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)
+                        }
+                    };
+                    if let Some(m) = mapper {
                         if !out.mapper_ref_texture_mappings.contains(&m) {
                             out.mapper_ref_texture_mappings.push(m);
                         }
-                    } else if objects::resolve_backing(state, host, texture_ref) {
+                    } else if resolve_backing_memo(state, host, &mut acc.memo, texture_ref) {
                         // x86 backing: object ref is surface_id / mapping_id.
                         if !out.mapper_ref_texture_mappings.contains(&texture_ref) {
                             out.mapper_ref_texture_mappings.push(texture_ref);
                         }
                     }
+                    let resource = match memoized {
+                        Some(resource) => Some(resource),
+                        None => {
+                            let resource =
+                                objects::resolve_resource(state, host, task_id, texture_ref).ok();
+                            if let Some(resource) = &resource {
+                                if walk_memo::on() {
+                                    acc.memo.remember(texture_ref, resource);
+                                }
+                            }
+                            resource
+                        }
+                    };
                     Some(TextureBind {
                         index,
                         texture_ref,
-                        resource: objects::resolve_resource(state, host, task_id, texture_ref).ok(),
+                        resource,
                     })
                 },
             );
@@ -3510,6 +3614,22 @@ fn handle_render_binds<M: HostMemory + HostOps>(
                 acc.unrepresentable
                     .get_or_insert(StreamRefusal::BufferOffset(over));
                 return;
+            }
+            if walk_memo::on() {
+                // The offset the slot already has, and no stride to change: the
+                // record changes nothing, so the table a draw holds is not
+                // copied for it.
+                let table: &Vec<BufferBind> = match r.stage {
+                    ShaderStage::Vertex => &acc.vertex_buffers,
+                    ShaderStage::Fragment => &acc.fragment_buffers,
+                };
+                if table.iter().find(|b| b.index == r.index).is_some_and(|b| {
+                    b.offset == r.offset
+                        && r.stride
+                            .is_none_or(|stride| b.attribute_stride == Some(stride))
+                }) {
+                    return;
+                }
             }
             let list = match r.stage {
                 ShaderStage::Vertex => Arc::make_mut(&mut acc.vertex_buffers),
@@ -3812,7 +3932,7 @@ fn handle_render_pass_state<M: HostMemory + HostOps>(
                         if !out.mapper_ref_texture_mappings.contains(&m) {
                             out.mapper_ref_texture_mappings.push(m);
                         }
-                    } else if objects::resolve_backing(state, host, published_ref) {
+                    } else if resolve_backing_memo(state, host, &mut acc.memo, published_ref) {
                         // A backing attachment is its own mapping id — the arm
                         // below pushes `att.texture_ref` where the mapper-ref-texture arm
                         // pushes the id it resolved to.
@@ -4911,7 +5031,133 @@ struct BindTables<'a, B> {
 /// texture arm's mapper-ref-texture mapping list — with the caller. The clear count comes
 /// back as a return value rather than through an `&mut` counter so `make` can
 /// hold the rest of `ExecResult`.
-fn apply_binds<T, B: Clone>(
+/// Whether writing `new` into a slot holding `self` would change nothing.
+///
+/// Every field the draw reads, and the retained object by identity: two binds
+/// naming the same reference at different times can retain different objects,
+/// and that difference is the whole point of retaining.
+trait SameBind {
+    fn same_bind(&self, other: &Self) -> bool;
+}
+
+fn same_resource(a: &Option<Arc<crate::model::TaskResource>>, b: &Option<Arc<crate::model::TaskResource>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+impl SameBind for BufferBind {
+    fn same_bind(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.buffer_ref == other.buffer_ref
+            && self.offset == other.offset
+            && self.attribute_stride == other.attribute_stride
+            && same_resource(&self.resource, &other.resource)
+    }
+}
+
+impl SameBind for TextureBind {
+    fn same_bind(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.texture_ref == other.texture_ref
+            && same_resource(&self.resource, &other.resource)
+    }
+}
+
+impl SameBind for SamplerBind {
+    fn same_bind(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.sampler_ref == other.sampler_ref
+            && self.lod_clamp == other.lod_clamp
+    }
+}
+
+/// The retained resource a buffer bind keeps, from this stream's memo when the
+/// stream resolved the reference already. See [`walk_memo`].
+fn bind_resource<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    memo: &mut walk_memo::StreamMemo,
+    obj_ref: u32,
+) -> Option<Arc<crate::model::TaskResource>> {
+    if !walk_memo::on() {
+        return objects::resolve_resource(state, host, task_id, obj_ref).ok();
+    }
+    if let Some(resource) = memo.resource(obj_ref, 1) {
+        return Some(resource);
+    }
+    let resource = objects::resolve_resource(state, host, task_id, obj_ref).ok()?;
+    memo.remember(obj_ref, &resource);
+    Some(resource)
+}
+
+/// [`objects::resolve_backing`] for a texture bind, skipping the probe for a
+/// reference this stream already found backed. See [`walk_memo`].
+fn resolve_backing_memo<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    memo: &mut walk_memo::StreamMemo,
+    obj_ref: u32,
+) -> bool {
+    if !walk_memo::on() {
+        return objects::resolve_backing(state, host, obj_ref);
+    }
+    if memo.is_backed(obj_ref) {
+        return true;
+    }
+    let backed = objects::resolve_backing(state, host, obj_ref);
+    if backed {
+        memo.remember_backed(obj_ref);
+    }
+    backed
+}
+
+/// TEMP (lab): whether this thread has already seen this fragment texture bind
+/// shape, so the once-per-shape line below is not looked up again.
+///
+/// The line asks the process-wide first-sight latch, which takes two global
+/// locks and hashes a string, and it was asked of every fragment texture bind
+/// record — 12 000 a second — to say something it had said once. The key is the
+/// latch's own, computed from the entries without collecting them.
+fn lab_frag_tex_bind_already_sighted(
+    task_id: u32,
+    first: u32,
+    entries: &[wire_render::RefBind],
+) -> bool {
+    if !walk_memo::on() {
+        return false;
+    }
+    let mask = entries.iter().enumerate().fold(0u64, |m, (i, e)| {
+        if e.object_ref.get() != 0 && i < 32 {
+            m | (1 << i)
+        } else {
+            m
+        }
+    });
+    let key = (u64::from(task_id) << 48)
+        ^ (u64::from(first) << 40)
+        ^ ((entries.len() as u64) << 32)
+        ^ mask;
+    thread_local! {
+        static SIGHTED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    SIGHTED.with(|sighted| {
+        let mut sighted = sighted.borrow_mut();
+        if sighted.contains(&key) {
+            return true;
+        }
+        // Past the bound the latch is asked every time, as before.
+        if sighted.len() < 256 {
+            sighted.push(key);
+        }
+        false
+    })
+}
+
+fn apply_binds<T, B: Clone + SameBind>(
     entries: &[T],
     first: u32,
     target: BindTarget,
@@ -4999,6 +5245,26 @@ fn apply_binds<T, B: Clone>(
             break;
         }
         let bind = make(index, entry);
+        if walk_memo::on() {
+            // A slot written with what it already holds changes nothing, and
+            // `Arc::make_mut` below would still copy the whole table whenever a
+            // draw holds it — which one always does after the first draw. Left
+            // alone, the next draw shares this draw's table, as a stream that
+            // binds once and draws 400 times already does.
+            let table: &Vec<B> = match stage {
+                ShaderStage::Vertex => &**vertex,
+                ShaderStage::Fragment => &**fragment,
+            };
+            let occupant = table.iter().find(|b| slot(b) == index);
+            match (&bind, occupant) {
+                (Some(new), Some(old)) if new.same_bind(old) => continue,
+                (None, None) => {
+                    cleared = cleared.saturating_add(1);
+                    continue;
+                }
+                _ => {}
+            }
+        }
         // Two arms and no third: `ShaderStage` is the render opcode set's whole
         // vocabulary, so "the record named no stage" — which used to reach here
         // as `Stage::Unknown` and count the clear against a table it could not
@@ -6339,6 +6605,7 @@ fn apply_clear<M: HostMemory + HostOps>(
 }
 
 pub(crate) mod finish_phase;
+mod walk_memo;
 
 mod report;
 use report::{

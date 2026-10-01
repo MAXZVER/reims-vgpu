@@ -2475,13 +2475,24 @@ fn lab_capture_walk_state(state: &DeviceState, built: &reims_vgpu_core::session:
 /// See fn `an_unknown_mode_access_is_counted_apart_from_a_known_one`.
 pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::session::Packet) {
     use reims_vgpu_core::access::AccessMode;
+    // Counted once per mode and not once per access: a packet carries ~70
+    // accesses, and each was a counter lookup and an atomic of its own.
+    let mut modes = [0u64; 4];
     for access in built.payload.accesses() {
-        note_store_route(match access.mode {
-            AccessMode::Read => "access_mode_read",
-            AccessMode::Write => "access_mode_write",
-            AccessMode::ReadWrite => "access_mode_read_write",
-            AccessMode::Unknown => "access_mode_unknown",
-        });
+        modes[match access.mode {
+            AccessMode::Read => 0,
+            AccessMode::Write => 1,
+            AccessMode::ReadWrite => 2,
+            AccessMode::Unknown => 3,
+        }] += 1;
+    }
+    for (route, n) in [
+        ("access_mode_read", modes[0]),
+        ("access_mode_write", modes[1]),
+        ("access_mode_read_write", modes[2]),
+        ("access_mode_unknown", modes[3]),
+    ] {
+        note_store_route_n(route, n);
     }
     // Why the `Unknown`s above are `Unknown`, from the walk that decided it.
     //
