@@ -199,8 +199,11 @@ fn run(target: Handle, out: &str, gate: Option<&str>, hz: u64) {
             line.push_str(&format!("{:x}", pc.wrapping_sub(base)));
         }
         let _ = writeln!(w, "{line}");
-        if last_flush.elapsed() >= std::time::Duration::from_secs(2) {
+        if last_flush.elapsed() >= std::time::Duration::from_secs(1) {
             last_flush = std::time::Instant::now();
+            // The device clock the census lines carry as `t=`, so a window of the
+            // fail log can be cut out of the samples without a gate file.
+            let _ = writeln!(w, "T {}", crate::observe::elapsed_us() / 1000);
             let _ = w.flush();
         }
     }
