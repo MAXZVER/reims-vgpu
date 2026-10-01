@@ -4197,13 +4197,46 @@ pub fn read_target_changed_pages_with(
             MemoryClass::Readback,
         )?;
     }
-    let fresh = unsafe { st.ensure_shadow(ctx, mapping_id, key, padded)? };
+    unsafe { st.ensure_shadow(ctx, mapping_id, key, padded)? };
     let read_access = pools::ResidentAccess::transfer_read(false);
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH`): the hash compare reads the resident
+    // through its allocation-format view, so it takes the same packed BGRA8
+    // UNORM the image kernel does; anything else keeps the `prev` compare.
+    let mode = page_diff::pay_hash_mode();
+    let hash_view = if mode != page_diff::PayHash::Off {
+        pools
+            .registry_get(identity)
+            .filter(|slot| slot.format.allocation() == vk::Format::B8G8R8A8_UNORM)
+            .map(|slot| slot.view)
+    } else {
+        None
+    };
+    let hash_view = hash_view.filter(|_| unsafe { st.ensure_hash_pipeline(ctx) });
+    if hash_view.is_some() {
+        unsafe { st.ensure_hashes(ctx, mapping_id, pages)? };
+    }
+    // Which compares run: the `prev` one unless `on` replaces it with the hash
+    // one; `verify` runs both. A compare whose record does not stand for the
+    // frame last landed takes every page and rebuilds its record from this
+    // frame (`page_diff::Basis`); with the hash compare off that is exactly a
+    // new shadow, as before.
+    let hash_only = hash_view.is_some() && mode == page_diff::PayHash::On;
+    let verify = hash_view.is_some() && !hash_only;
+    let shadow = st.shadows.get_mut(&mapping_id).expect("ensured");
+    let fresh = !hash_only && !shadow.basis.prev;
+    let hash_seed = hash_view.is_some() && !shadow.basis.hash;
+    shadow.basis = page_diff::Basis {
+        prev: !hash_only,
+        hash: hash_view.is_some(),
+    };
+    // Every page is taken: the `prev` record was new or out of date (a frame
+    // copy lands it), or the hash one was (its kernel lands every page).
+    let full = fresh || hash_seed;
     // TEMP (lab, `REIMS_VGPU_LAB_PAY_IMAGE`): the compare fetches the frame from
     // the resident itself, through its allocation-format view, when that is the
     // packed BGRA8 UNORM the kernel packs back to bytes exactly. A first (fresh)
     // payment still copies the frame: it lands and seeds the whole of it.
-    let image_view = if !fresh && page_diff::image_enabled() {
+    let image_view = if !fresh && !hash_only && page_diff::image_enabled() {
         pools
             .registry_get(identity)
             .filter(|slot| slot.format.allocation() == vk::Format::B8G8R8A8_UNORM)
@@ -4212,31 +4245,67 @@ pub fn read_target_changed_pages_with(
         None
     };
     let image_view = image_view.filter(|_| unsafe { st.ensure_image_pipeline(ctx) });
+    if verify {
+        unsafe {
+            page_diff::PageDiffState::ensure(
+                ctx,
+                &mut st.hash_flags,
+                pages * 4,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryClass::Readback,
+            )?;
+        }
+    }
     let (cur, flags, out) = (
         st.cur.as_ref().expect("ensured"),
         st.flags.as_ref().expect("ensured"),
         st.out.as_ref().expect("ensured"),
     );
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH=verify`): the hash kernel's own flags.
+    let hash_flags = if verify { st.hash_flags.as_ref() } else { None };
+    // The kernel that reads the image in place of the frame copy: the image
+    // compare, or the hash one when it replaces it.
+    let image_route = image_view.is_some() || hash_only;
     // TEMP (lab, `REIMS_VGPU_LAB_PAY_FLAGS_DEV`): the image kernel's own flags.
-    let flags_dev = if image_view.is_some() && page_diff::lab_flags_dev_enabled() {
+    let flags_dev = if image_route && page_diff::lab_flags_dev_enabled() {
         st.flags_dev.as_ref()
     } else {
         None
     };
-    let prev = &st.shadows.get(&mapping_id).expect("ensured").prev;
-    let pipe = if image_view.is_some() {
+    let shadow = st.shadows.get(&mapping_id).expect("ensured");
+    let prev = &shadow.prev;
+    let hash_pipe = st.hash_pipeline.as_ref().filter(|_| hash_view.is_some());
+    let pipe = if hash_only {
+        hash_pipe.expect("ensured")
+    } else if image_view.is_some() {
         st.image_pipeline.as_ref().expect("ensured")
     } else {
         st.pipeline.as_ref().expect("ensured")
     };
     let one_trip = pipe.one_trip;
-    if !fresh {
+    let hash_record = |view| (view, shadow.hashes.as_ref().expect("ensured"), pages * 8);
+    if hash_only {
+        let (view, hashes, bytes) = hash_record(hash_view.expect("hash_only"));
+        unsafe {
+            pipe.write_set_image(
+                &ctx.device,
+                view,
+                hashes,
+                bytes,
+                flags_dev.unwrap_or(flags),
+                out,
+                padded,
+                pages,
+            )
+        }
+    } else if !fresh {
         match image_view {
             Some(view) => unsafe {
                 pipe.write_set_image(
                     &ctx.device,
                     view,
                     prev,
+                    padded,
                     flags_dev.unwrap_or(flags),
                     out,
                     padded,
@@ -4246,18 +4315,26 @@ pub fn read_target_changed_pages_with(
             None => unsafe { pipe.write_set(&ctx.device, cur, prev, flags, out, padded, pages) },
         }
     }
+    if let (Some(view), Some(hf), Some(hp)) = (hash_view.filter(|_| verify), hash_flags, hash_pipe)
+    {
+        let (view, hashes, bytes) = hash_record(view);
+        unsafe { hp.write_set_image(&ctx.device, view, hashes, bytes, hf, out, padded, pages) }
+    }
     if !fresh && one_trip {
         // The kernel copies every page it flags, so the pages the caller must
-        // land whatever the compare says are marked before it runs.
+        // land whatever the compare says are marked before it runs — every
+        // page when the hash kernel's record stands for nothing.
         unsafe {
             let f = std::slice::from_raw_parts_mut(flags.mapped.cast::<u32>(), pages as usize);
-            f.fill(0);
-            for &p in force {
-                if let Some(slot) = f.get_mut(p as usize) {
-                    *slot = 1;
-                }
-            }
+            page_diff::prefill_marks(f, force, hash_only && hash_seed);
             flags.flush(&ctx.device)?;
+        }
+    }
+    if let Some(hf) = hash_flags {
+        unsafe {
+            let f = std::slice::from_raw_parts_mut(hf.mapped.cast::<u32>(), pages as usize);
+            page_diff::prefill_marks(f, force, hash_seed);
+            hf.flush(&ctx.device)?;
         }
     }
     let (cur_b, prev_b, flags_b, out_b) = (cur.buffer, prev.buffer, flags.buffer, out.buffer);
@@ -4266,14 +4343,36 @@ pub fn read_target_changed_pages_with(
         crate::runtime::drain::note_store_route("lab_pd_flags_dev");
     }
     let (pl_layout, pl, set) = (pipe.layout, pipe.pipeline, pipe.set);
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH=verify`): the hash kernel dispatched
+    // beside the `prev` compare.
+    let verify_cmd = hash_pipe
+        .filter(|_| verify)
+        .map(|p| (p.layout, p.pipeline, p.set));
     if image_view.is_some() {
         crate::runtime::drain::note_store_route("pay_diff_image");
     }
+    if hash_only {
+        crate::runtime::drain::note_store_route("pay_hash");
+    }
+    if verify {
+        crate::runtime::drain::note_store_route("pay_hash_verify");
+    }
+    if hash_seed {
+        crate::runtime::drain::note_store_route("pay_hash_seed");
+    }
+    let push_image = [
+        pages as u32,
+        page_diff::WORDS_PER_PAGE,
+        w,
+        (frame_bytes / 4) as u32,
+    ];
     drop(lab_span);
     unsafe {
         page_diff_submit(ctx, pools, counters, between, |cb| {
             let d = &ctx.device;
-            if image_view.is_some() {
+            let push_image: &[u8] =
+                std::slice::from_raw_parts(push_image.as_ptr().cast::<u8>(), 16);
+            if image_route {
                 // TEMP (lab, `REIMS_VGPU_LAB_PAY_FLAGS_DEV`): the host's marks
                 // into the kernel's device-local flags. The barrier orders the
                 // copy after every earlier use of that buffer (submission order
@@ -4340,15 +4439,29 @@ pub fn read_target_changed_pages_with(
                     &[set],
                     &[],
                 );
-                let push = [
-                    pages as u32,
-                    page_diff::WORDS_PER_PAGE,
-                    w,
-                    (frame_bytes / 4) as u32,
-                ];
-                let bytes: &[u8] = std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 16);
-                d.cmd_push_constants(cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+                d.cmd_push_constants(cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, push_image);
                 d.cmd_dispatch(cb, pages as u32, 1, 1);
+                if let Some((hl, hp, hs)) = verify_cmd {
+                    // TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH=verify`): the hash
+                    // compare of the same image, ordered after the `prev`
+                    // compare's writes to `out` (the same bytes for a page both
+                    // flag).
+                    let ordered = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )];
+                    d.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &ordered,
+                        &[],
+                        &[],
+                    );
+                    lab_dispatch_hash(d, cb, (hl, hp, hs), push_image, pages as u32);
+                }
                 let back = [vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::empty())
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -4475,6 +4588,50 @@ pub fn read_target_changed_pages_with(
                 d.cmd_push_constants(cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
                 d.cmd_dispatch(cb, pages as u32, 1, 1);
             }
+            if let Some(cmd) = verify_cmd {
+                // TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH=verify`): the hash compare
+                // beside the frame copy, sampling the image in `GENERAL` after
+                // the copy read it and after every write to `out` above, then
+                // putting it back in the transfer-read layout recorded below.
+                let to_shader = [vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(read_access.layout())
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(snap.image)
+                    .subresource_range(color_subresource_range())];
+                let ordered = [vk::MemoryBarrier::default()
+                    .src_access_mask(
+                        vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                    )
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+                d.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &ordered,
+                    &[],
+                    &to_shader,
+                );
+                lab_dispatch_hash(d, cb, cmd, push_image, pages as u32);
+                let back = [vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(read_access.layout())
+                    .image(snap.image)
+                    .subresource_range(color_subresource_range())];
+                d.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &back,
+                );
+            }
             let to_host = [vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::TRANSFER_READ)];
@@ -4492,20 +4649,34 @@ pub fn read_target_changed_pages_with(
     let _lab_post = crate::runtime::chain_phase::CostSpan::new("lab_pd_post_us"); // TEMP (lab)
     pools.registry_note_access(identity, read_access);
 
-    let changed: Vec<u32> = if fresh {
+    let changed: Vec<u32> = if full {
         (0..pages as u32).collect()
     } else {
         unsafe { flags.invalidate(&ctx.device)? };
         let f = unsafe { std::slice::from_raw_parts(flags.mapped.cast::<u32>(), pages as usize) };
+        // TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH=verify`): the hash compare's own
+        // answer, counted against the `prev` one's and landed with it.
+        let hf = match hash_flags {
+            Some(hf) => unsafe {
+                hf.invalidate(&ctx.device)?;
+                Some(std::slice::from_raw_parts(
+                    hf.mapped.cast::<u32>(),
+                    pages as usize,
+                ))
+            },
+            None => None,
+        };
+        if let Some(hf) = hf {
+            let (missed, extra) = page_diff::verify_disagreement(f, hf, force);
+            page_diff::note_verify(pages, missed, extra);
+        }
         // Pages the caller must land whatever the diff says (the guest CPU
         // wrote them since the copy was taken). Unflagged, their `prev` already
         // equals the frame, so landing them from `cur` keeps the copy true.
         // The one-trip kernel has flagged and copied those itself.
-        (0..pages as u32)
-            .filter(|&p| f[p as usize] != 0 || force.binary_search(&p).is_ok())
-            .collect()
+        page_diff::landed_pages(f, hf, force)
     };
-    if !fresh && !changed.is_empty() && !one_trip {
+    if !full && !changed.is_empty() && !one_trip {
         // Second trip: only the changed pages cross to host memory, packed.
         let mut regions: Vec<vk::BufferCopy> = Vec::new();
         let mut i = 0usize;
@@ -4554,7 +4725,7 @@ pub fn read_target_changed_pages_with(
         }
     }
     unsafe { out.invalidate(&ctx.device)? };
-    let n = if fresh {
+    let n = if full {
         frame_bytes
     } else {
         changed.len() as u64 * page_diff::PAGE_BYTES
@@ -4563,10 +4734,37 @@ pub fn read_target_changed_pages_with(
     Ok(Some(ChangedPages {
         pages: changed,
         frame_ptr: out.mapped,
-        full: fresh,
+        full,
         frame_bytes,
     }))
 }
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH`): record the hash kernel's dispatch —
+/// one workgroup per page, with the image kernel's push block — into a command
+/// buffer whose barriers already make the image readable in `GENERAL`.
+unsafe fn lab_dispatch_hash(
+    d: &ash::Device,
+    cb: ash::vk::CommandBuffer,
+    (layout, pipeline, set): (
+        ash::vk::PipelineLayout,
+        ash::vk::Pipeline,
+        ash::vk::DescriptorSet,
+    ),
+    push: &[u8],
+    pages: u32,
+) {
+    use ash::vk;
+    unsafe {
+        d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
+        d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+        d.cmd_push_constants(cb, layout, vk::ShaderStageFlags::COMPUTE, 0, push);
+        d.cmd_dispatch(cb, pages, 1, 1);
+    }
+}
+
+/// TEMP (lab, tests): `REIMS_VGPU_LAB_PAY_HASH` for one thread, and what its
+/// `verify` mode counted.
+pub use page_diff::{pay_hash_verify_totals, with_pay_hash, PayHash};
 
 /// Read a resident target back and keep the bytes in the staging buffer.
 ///
