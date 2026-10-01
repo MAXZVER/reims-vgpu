@@ -768,7 +768,7 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// - a pipeline is the task's own in the ordering model — its reflection, build
 ///   state, waits and tombstone — because a pipeline's id is a slot and a
 ///   generation and every task numbers its own list from the same integers
-///   ([`PIPELINE_PER_TASK`], which this implies);
+///   ([`PIPELINE_PER_TASK`], on by default and what exact accesses assume);
 /// - a name the model holds with no bytes is given the storage construction
 ///   finds under it, where it used to stay `DomainOnly` for the life of the name
 ///   (`reims_vgpu_core::lifecycle::Lifecycle::attach_storage`).
@@ -827,9 +827,9 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// what the packet touches instead of against everything.
 pub const ACCESS_EXACT: &str = "REIMS_VGPU_ACCESS_EXACT";
 
-/// **Default off.** `on` names a pipeline in the ordering model by the task that
-/// owns it and its id in that task's object list; off, by the object-list id
-/// alone.
+/// **Default on.** The ordering model names a pipeline by the task that owns it
+/// and its id in that task's object list; `off` names it by the object-list id
+/// alone, which is what the model did before it knew about tasks.
 ///
 /// # What it changes
 ///
@@ -860,25 +860,28 @@ pub const ACCESS_EXACT: &str = "REIMS_VGPU_ACCESS_EXACT";
 ///   tombstone somebody else left. 37 to 56 % of leases bound one. No lookup was
 ///   ever answered by a reflection that orders less than the task's own.
 ///
-/// With this on, packets with an `Unknown`-mode access on a named backing go from
+/// With it on, packets with an `Unknown`-mode access on a named backing go from
 /// 83 % to 0 (light) and 68 % to 0 (drag), `Unknown` participations fall by 98 %,
 /// and the model's edges per frame by a quarter on the drag; 0 packets ran ahead
 /// of an earlier one of their channel, the verification tour's frames differ from
-/// the default's no more than two default boots differ from each other, and
-/// `driver_call_quarantined` stays 0. Frame rate did not move beyond the spread
-/// between boots.
+/// the shared naming's no more than two boots of the same arm differ from each
+/// other, and `driver_call_quarantined` stays 0. Frame rate did not move beyond
+/// the spread between boots.
 ///
-/// # Why it is a switch
+/// # Why it is on, and why it can be turned off
 ///
 /// Nothing the guest can observe is computed differently: no record, no host
-/// command and no shader. But the model's knowledge is also what releases work,
-/// and this gives it far more of it, so a packet can be ready where it used to
-/// wait for an edge that only ignorance drew. That is a change to what this device
-/// may execute ahead of what, made on the strength of a claim about a guest
-/// (that a task's reflection is what its own pipeline does), and a claim of that
-/// shape gets a binary that runs both ways until the frames are measured for a
-/// long time. [`ACCESS_EXACT`] implies it: exact accesses are what make the
-/// reflection's answer matter.
+/// command and no shader. The model's knowledge is also what releases work, and
+/// this gives it far more of it, so a packet can be ready where it used to wait
+/// for an edge that only ignorance drew. That is the model being right about
+/// whose pipeline is whose, and it is on for that reason. `off` narrows the model
+/// back to the shared naming and nothing else — it is an ablation for telling a
+/// frame difference apart from the naming, and the way to reproduce what every
+/// measurement before 2026-10-01 ran.
+///
+/// [`ACCESS_EXACT`] assumes it: exact accesses are what make the reflection's
+/// answer matter, and with `off` they order against a reflection another task
+/// published.
 pub const PIPELINE_PER_TASK: &str = "REIMS_VGPU_PIPELINE_PER_TASK";
 
 /// `on` issues the draw-time guest buffer gather as one compute dispatch per

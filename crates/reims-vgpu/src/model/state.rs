@@ -4464,9 +4464,10 @@ impl DeviceState {
     /// A pipeline reference is an id in *one task's* object list, and every task
     /// numbers its own list from the same small integers, so the reference alone
     /// does not say which pipeline is meant: a driven Tahoe desktop shares 140 to
-    /// 170 ids between its tasks. With [`crate::runtime::objects::pipeline_per_task`] on, the
-    /// pipeline is the task's; off, it is the shared one every task that reuses
-    /// the id is, which is what the table has always done.
+    /// 170 ids between its tasks. The pipeline is the task's, which is
+    /// [`crate::runtime::objects::pipeline_per_task`]'s default; with it off it
+    /// is the shared one every task that reuses the id is, which is what the table
+    /// did until it learned about tasks.
     #[must_use]
     pub fn pipeline_scope(&self, task_id: u32) -> reims_vgpu_core::pipeline::PipelineScope {
         if crate::runtime::objects::pipeline_per_task() {
@@ -7011,29 +7012,33 @@ mod device_access_tests {
         });
     }
 
-    /// `REIMS_VGPU_ACCESS_EXACT` implies per-task naming: the reflection it
-    /// answers must be the asking task's. It also says a pipeline nothing is
-    /// published for touches what its slots do not name — the argument-buffer
-    /// gap exact accesses would otherwise open — which the default does not.
+    /// A pipeline is the task's own unless the operator says `off`, and
+    /// `REIMS_VGPU_ACCESS_EXACT` neither changes that nor is changed by it. Exact
+    /// accesses say a pipeline nothing is published for touches what its slots do
+    /// not name — the argument-buffer gap they would otherwise open — which the
+    /// default does not.
     #[test]
-    fn exact_accesses_imply_per_task_naming_and_an_unbounded_unanswered_footprint() {
-        use reims_vgpu_core::pipeline::UsageSource as _;
+    fn a_pipeline_is_the_tasks_own_by_default_and_exact_accesses_are_a_separate_question() {
+        use reims_vgpu_core::pipeline::{PipelineScope, UsageSource as _};
         let state = DeviceState::new(DeviceId(1), 12);
+        let task = |n: u32| PipelineScope::Task(reims_vgpu_core::identity::TaskId(n));
+        // No test override: the answer is the process's, and the process was not
+        // started with the switch off.
+        assert_eq!(state.pipeline_scope(4), task(4));
         crate::runtime::objects::with_pipeline_per_task(false, || {
+            assert_eq!(state.pipeline_scope(4), PipelineScope::Shared);
             crate::runtime::objects::with_access_exact(true, || {
                 assert_eq!(
                     state.pipeline_scope(4),
-                    reims_vgpu_core::pipeline::PipelineScope::Task(
-                        reims_vgpu_core::identity::TaskId(4)
-                    )
+                    PipelineScope::Shared,
+                    "`off` restores the shared naming whatever else is on"
                 );
                 assert!(state.pipeline_usage(4).unanswered_is_unbounded());
             });
-            assert_eq!(
-                state.pipeline_scope(4),
-                reims_vgpu_core::pipeline::PipelineScope::Shared
-            );
             assert!(!state.pipeline_usage(4).unanswered_is_unbounded());
+        });
+        crate::runtime::objects::with_access_exact(true, || {
+            assert_eq!(state.pipeline_scope(4), task(4));
         });
     }
 

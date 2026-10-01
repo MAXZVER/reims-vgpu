@@ -3474,20 +3474,20 @@ pub(crate) fn with_access_exact<R>(on: bool, f: impl FnOnce() -> R) -> R {
 /// task's list, rather than by the id alone. See
 /// [`crate::config::PIPELINE_PER_TASK`]; read once.
 ///
-/// On with [`crate::config::ACCESS_EXACT`] too: a reflection that is answered to
-/// the task whose shader it describes is the half of exact accesses this is.
+/// **On unless the operator says `off`.** `off` is the ablation: the shared
+/// naming every task's same-numbered pipeline is one entry under.
 pub(crate) fn pipeline_per_task() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_PIPELINE_PER_TASK.with(std::cell::Cell::get) {
-        return on || access_exact();
+        return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             crate::config::read(crate::config::PIPELINE_PER_TASK).0,
-            crate::config::Switch::On
+            crate::config::Switch::Off
         )
-    }) || access_exact()
+    })
 }
 
 #[cfg(test)]
