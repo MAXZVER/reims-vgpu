@@ -1607,6 +1607,69 @@ impl ResourcePools {
         Ok((self.slots[next].cmd_buf, self.slots[next].fence))
     }
 
+    /// TEMP (lab, `REIMS_VGPU_LAB_PAY_REAP_AFTER`): [`Self::begin_entry`] without
+    /// its reap of every already-signalled slot, for a caller that records nothing
+    /// out of the pools and calls [`Self::reap_signaled_slots_before_current`]
+    /// once its own command buffer is submitted, so the reap runs while the GPU
+    /// works instead of in front of the submit. The slot claimed is still retired
+    /// first when it owes cleanup — it is the oldest in ring order, so that retire
+    /// is in order — exactly as `begin_entry` does.
+    pub(crate) unsafe fn begin_entry_reap_later(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+    ) -> Result<(vk::CommandBuffer, vk::Fence), DrawError> {
+        self.batch_flush(ctx, counters)?;
+        self.forget_pass_echo();
+        let next = (self.cur + 1) % self.slots.len();
+        if self.slots[next].pending.is_some() {
+            let still_running = !ctx
+                .device
+                .get_fence_status(self.slots[next].fence)
+                .map_err(|e| {
+                    Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
+                })?;
+            self.retire_slot(ctx, counters, next)?;
+            if still_running {
+                counters.ring_retire_blocks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.cur = next;
+        Ok((self.slots[next].cmd_buf, self.slots[next].fence))
+    }
+
+    /// TEMP (lab, `REIMS_VGPU_LAB_PAY_REAP_AFTER`): the reap `begin_entry` does,
+    /// over every slot but the current one, oldest first and stopping at the
+    /// first unsignalled fence. The current slot is excluded because its fence is
+    /// the one the caller is about to wait: retiring it resets that fence, and the
+    /// wait would then run to its timeout.
+    pub(crate) unsafe fn reap_signaled_slots_before_current(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+    ) -> Result<usize, DrawError> {
+        let mut retired = 0;
+        let n = self.slots.len();
+        for step in 1..n {
+            let index = (self.cur + step) % n;
+            if self.slots[index].pending.is_none() {
+                continue;
+            }
+            let signaled = ctx
+                .device
+                .get_fence_status(self.slots[index].fence)
+                .map_err(|e| {
+                    Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
+                })?;
+            if !signaled {
+                break;
+            }
+            unsafe { self.retire_slot(ctx, counters, index)? };
+            retired += 1;
+        }
+        Ok(retired)
+    }
+
     /// Seal the current entry's transient resources: move every live pool slot
     /// (which the just-recorded CB references) out of the shared live lists so
     /// a concurrent entry cannot recycle them, bundled with the descriptor set.

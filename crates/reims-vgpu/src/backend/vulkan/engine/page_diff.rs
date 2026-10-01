@@ -334,6 +334,36 @@ mod lab_spin_budget_tests {
     }
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_FLAGS_DEV=off` binds the image kernel to the
+/// host-memory `flags` buffer directly, as before. On by default: every
+/// workgroup's first act is to read its page's flag and wait for it at a
+/// barrier before any texel is fetched, and in host memory that read crosses
+/// PCIe once per page (14 400 at 5K). The kernel now reads and writes a
+/// device-local copy instead, filled from `flags` by one copy before it and
+/// copied back by one after; the host writes and reads `flags` exactly as
+/// before, so the values each side sees are the same. Latched.
+pub(crate) fn lab_flags_dev_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_PAY_FLAGS_DEV").map_or(true, |v| v != "off");
+        crate::observe::off(format!("pay_diff_flags_dev on={on}"));
+        on
+    })
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_REAP_AFTER=off` claims the payment's own slot
+/// through `begin_entry`, which first retires every already-signalled slot (fence
+/// reset, span reads, cleanup) in front of the submit. On by default: the same
+/// retires run, in the same order, right after the submit instead. Latched.
+pub(crate) fn lab_reap_after_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_PAY_REAP_AFTER").map_or(true, |v| v != "off");
+        crate::observe::off(format!("pay_diff_reap_after on={on}"));
+        on
+    })
+}
+
 /// A buffer this module owns outright: its own `vkAllocateMemory`, alive across
 /// payments. The pools recycle their slots at each fence, and a shadow has to
 /// hold a frame from one swap to the next.
@@ -686,6 +716,9 @@ pub(crate) struct PageDiffState {
     pub cur: Option<OwnedBuffer>,
     pub flags: Option<OwnedBuffer>,
     pub out: Option<OwnedBuffer>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_PAY_FLAGS_DEV`): the image kernel's flags in
+    /// device memory, filled from and copied back to `flags` around it.
+    pub flags_dev: Option<OwnedBuffer>,
 }
 
 pub(crate) static STATE: std::sync::Mutex<Option<PageDiffState>> = std::sync::Mutex::new(None);
