@@ -3400,10 +3400,14 @@ fn take_store_routes() -> Option<String> {
     let routes = STORE_ROUTES.lock().ok()?;
     let mut out = String::from("store_routes");
     let mut any = false;
+    // Written in place: the window holds ~1 500 routes, and a `format!` each
+    // was a burst of allocations on the drain once a second.
+    use std::fmt::Write as _;
+    out.reserve(routes.len() * 32);
     for (route, counter) in routes.iter() {
         let n = counter.swap(0, std::sync::atomic::Ordering::Relaxed);
         if n != 0 {
-            out.push_str(&format!(" {route}={n}"));
+            let _ = write!(out, " {route}={n}");
             any = true;
         }
     }
