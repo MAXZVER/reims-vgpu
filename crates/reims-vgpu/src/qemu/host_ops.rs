@@ -423,7 +423,7 @@ pub struct QemuHost<'a> {
     deferred_gfx: Option<u64>,
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_IRQ_BATCH=<us>` (0 / unset = off). The drain
+/// TEMP (lab): `REIMS_VGPU_LAB_IRQ_BATCH=<us>` (default 500; 0 = off). The drain
 /// raises a gfx pulse per completed packet (~7 000/s on the 5K drag, ~60 per
 /// frame), and the guest's interrupt handler answers each with three register
 /// reads, one of them an emulated exit. With a budget, a pulse is held and the
@@ -433,10 +433,13 @@ pub struct QemuHost<'a> {
 fn lab_irq_batch_us() -> u64 {
     static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *US.get_or_init(|| {
+        // 500 since the 5K continuous drag A/B (fb*, x2): gfx interrupts
+        // 8 170 -> 1 240/s, guest emulated MMIO exits 15 100 -> 9 400/s, drain
+        // duty 0.76/0.77 -> 0.75/0.75, late frames 1.8/1.3 -> 1.3/1.2 a second.
         std::env::var("REIMS_VGPU_LAB_IRQ_BATCH")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
+            .unwrap_or(500)
     })
 }
 
