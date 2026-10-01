@@ -57,9 +57,20 @@ impl LatchHasher {
 }
 
 impl Hasher for LatchHasher {
+    /// The running state, finalised. A multiply carries entropy **upward only**:
+    /// a bit of the product depends on the input bits at or below it, and a
+    /// table takes its bucket from the *low* bits. Keys that differ only high up
+    /// — a page-aligned address, `(task << 32) | ref` — would share every bucket,
+    /// which is how the first version of this hasher came out six times slower
+    /// than SipHash on a table holding a few thousand of them. Folding the high
+    /// half down and multiplying again gives every input bit a say in every
+    /// output bit (the MurmurHash3 finaliser).
     #[inline]
     fn finish(&self) -> u64 {
-        self.0
+        let mut h = self.0;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^ (h >> 33)
     }
 
     #[inline]
@@ -534,6 +545,34 @@ mod tests {
             "equal counts order by (event, reason), and nothing from the \
              drained window comes back"
         );
+    }
+
+    /// Keys that differ only in their high bits — page-aligned addresses, a task
+    /// id above a ref — spread over the buckets a table picks with the low bits.
+    /// The multiply-only state this hasher started as put every one of them in a
+    /// single bucket.
+    #[test]
+    fn keys_that_differ_only_high_up_do_not_share_buckets() {
+        use std::hash::{BuildHasher, Hash};
+        let build = LatchBuild::default();
+        let bucket = |key: &(&'static str, u64)| {
+            let mut h = build.build_hasher();
+            key.hash(&mut h);
+            (h.finish() & 0xfff) as usize
+        };
+        for shape in [
+            |i: u64| 0x1_2345_0000u64 + i * 0x1000,
+            |i: u64| i << 32,
+            |i: u64| (i << 48) ^ 7,
+        ] {
+            let mut seen = vec![false; 4096];
+            for i in 0..4096u64 {
+                seen[bucket(&("lin_serve_fmt", shape(i)))] = true;
+            }
+            let used = seen.iter().filter(|&&b| b).count();
+            // A uniform function fills about 63 % of 4096 buckets with 4096 keys.
+            assert!(used > 2300, "only {used} of 4096 buckets used");
+        }
     }
 
     /// The latch and census maps keep every key apart and find each again: the
