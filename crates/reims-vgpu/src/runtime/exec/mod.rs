@@ -1044,6 +1044,7 @@ fn execute_submission<M: HostMemory + HostOps>(
     // pixels the guest has since overwritten has to go now — landing it later
     // would replace the guest's own bytes with a frame the guest has declared
     // stale.
+    BackingProbes::begin();
     let restable_span = crate::runtime::chain_phase::CostSpan::new("ex_restable_us");
     consume_resource_table(state, host, task_id, resource_descs);
     drop(restable_span);
@@ -1729,6 +1730,50 @@ impl<'a, M: HostMemory + HostOps> StreamSink<'a, M> {
                     .fail_once(u64::from(self.task_id));
             }
         }
+    }
+}
+
+thread_local! {
+    /// The texture references this packet's walk has already asked
+    /// [`objects::resolve_backing`] about, so a ref bound by every draw of a stream is
+    /// searched for once and not once a bind. Cleared at the start of each submission.
+    ///
+    /// A miss is the common answer — a ref that is not a surface id is no task's
+    /// backing — and the search is a page-table walk of every live task's object
+    /// list. See [`BackingProbes`].
+    static BACKING_PROBED: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What the packet's walk remembers about the backing search.
+struct BackingProbes;
+
+impl BackingProbes {
+    /// A new submission: nothing has been asked yet.
+    fn begin() {
+        BACKING_PROBED.with(|p| p.borrow_mut().clear());
+    }
+
+    /// Whether `texture_ref` was already searched for in this submission, and note
+    /// that it now has been. Always `false` with the cost reductions off.
+    ///
+    /// The answer a repeated search would give is the one it gave: the walk is one
+    /// drain thread's pass over bytes it holds, microseconds long, and the guest
+    /// writing an object list inside that window is the same race the search has
+    /// whenever it runs.
+    fn already_searched(texture_ref: u32) -> bool {
+        if !crate::runtime::cost_opts::on() {
+            return false;
+        }
+        BACKING_PROBED.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.contains(&texture_ref) {
+                true
+            } else {
+                p.push(texture_ref);
+                false
+            }
+        })
     }
 }
 
@@ -3492,7 +3537,10 @@ fn handle_render_binds<M: HostMemory + HostOps>(
                         if !out.mapper_ref_texture_mappings.contains(&m) {
                             out.mapper_ref_texture_mappings.push(m);
                         }
+                    } else if BackingProbes::already_searched(texture_ref) {
+                        crate::runtime::drain::note_store_route("wb_tex_backing_memo");
                     } else {
+                        crate::runtime::drain::note_store_route("wb_tex_backing_calls");
                         let backing_span = crate::runtime::chain_phase::CostSpan::new("wb_tex_backing_us");
                         let resolved = objects::resolve_backing(state, host, texture_ref);
                         drop(backing_span);
@@ -5399,6 +5447,7 @@ fn finish_stream<M: HostMemory + HostOps>(
         let mut resident_chain = false;
         let mut saw_nometal = false;
         let first_draw = draw_list.first().copied();
+        let mrt_span = crate::runtime::chain_phase::CostSpan::new("fp_mrt_us");
         let mut first_req = first_draw.and_then(|pd| {
             out.render_attachment_resolves = out.render_attachment_resolves.saturating_add(1);
             draw::mrt_draw_request(
@@ -5411,6 +5460,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 pd.draw,
             )
         });
+        drop(mrt_span);
         // A serialized Metal render stream is one render pass: its attachment
         // descriptors are fixed while pipeline, binds, and draw arguments may
         // change per record. Keep a seedless template so records 2+ do not

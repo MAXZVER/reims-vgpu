@@ -8306,3 +8306,26 @@ fn an_exec_resource_record_clearing_guest_valid_pays_the_owed_frame() {
         "a record that does not clear guest-valid pays nothing"
     );
 }
+
+/// A texture ref is searched for as a backing once per submission, not once per bind,
+/// and a new submission starts over; with the cost reductions off every bind searches.
+#[test]
+fn a_texture_ref_is_searched_for_as_a_backing_once_per_submission() {
+    crate::runtime::cost_opts::with(true, || {
+        BackingProbes::begin();
+        assert!(!BackingProbes::already_searched(7), "the first bind searches");
+        assert!(BackingProbes::already_searched(7), "and the second does not");
+        assert!(!BackingProbes::already_searched(8), "another ref is another search");
+        assert!(BackingProbes::already_searched(8));
+        BackingProbes::begin();
+        assert!(
+            !BackingProbes::already_searched(7),
+            "a new submission asks again: the guest may have changed a list between"
+        );
+    });
+    crate::runtime::cost_opts::with(false, || {
+        BackingProbes::begin();
+        assert!(!BackingProbes::already_searched(7));
+        assert!(!BackingProbes::already_searched(7), "off: every bind searches");
+    });
+}

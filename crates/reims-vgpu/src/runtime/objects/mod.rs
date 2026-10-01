@@ -5666,8 +5666,10 @@ fn resolve_backing_ex<M: HostMemory>(
         .map(|m| m.owner_task_hint)
         .unwrap_or(0);
 
+    crate::runtime::drain::note_store_route("rb_calls");
     for task_id in backing_probe_order(&state.tasks, hint) {
         // Count the guest-read cost of one active-task object-list probe.
+        crate::runtime::drain::note_store_route("rb_probes");
         let Some(entry) = probe_list_entry(state, host, task_id, surface_id) else {
             continue;
         };
