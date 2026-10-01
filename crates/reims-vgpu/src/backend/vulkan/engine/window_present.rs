@@ -1003,13 +1003,27 @@ impl WindowPresenter {
         // `SwapchainKHR::null()` rather than the swapchain destroyed above: the
         // whole point of the paragraph above is that this one carries no old
         // swapchain.
+        let mut latency = vk::SwapchainLatencyCreateInfoNV::default().latency_mode_enable(true);
+        let mut create_info: vk::SwapchainCreateInfoKHR<'_> =
+            plan.create_info(self.surface, vk::SwapchainKHR::null());
+        if ctx.low_latency2.is_some() {
+            create_info = create_info.push_next(&mut latency);
+        }
         let swapchain = self
             .swapchain_loader
-            .create_swapchain(
-                &plan.create_info(self.surface, vk::SwapchainKHR::null()),
-                None,
-            )
+            .create_swapchain(&create_info, None)
             .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowCreateSwapchain, error)))?;
+        // TEMP (lab, `REIMS_VGPU_LAB_GPU_BOOST`): low-latency mode with clock
+        // boost and no frame-rate cap; the device never calls the sleep, so the
+        // mode's only effect is the boost.
+        if let Some(low_latency) = ctx.low_latency2.as_ref() {
+            let mode = vk::LatencySleepModeInfoNV::default()
+                .low_latency_mode(true)
+                .low_latency_boost(true)
+                .minimum_interval_us(0);
+            let result = low_latency.set_latency_sleep_mode(swapchain, Some(&mode));
+            crate::observe::off(format!("gpu_boost sleep_mode result={result:?}"));
+        }
         let images = self
             .swapchain_loader
             .get_swapchain_images(swapchain)

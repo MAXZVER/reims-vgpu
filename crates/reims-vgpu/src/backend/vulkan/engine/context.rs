@@ -653,6 +653,14 @@ fn storage_buffer_offset_alignment(limits: &vk::PhysicalDeviceLimits) -> u64 {
     limits.min_storage_buffer_offset_alignment
 }
 
+/// TEMP (lab): `VK_NV_low_latency2` low-latency mode with clock boost on the
+/// host window swapchain, where the device offers it. On by default;
+/// `REIMS_VGPU_LAB_GPU_BOOST=off` leaves the clocks to the driver. Latched.
+fn lab_gpu_boost() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GPU_BOOST").map_or(true, |v| v != "off"))
+}
+
 pub(crate) struct DeviceContext {
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
@@ -690,6 +698,9 @@ pub(crate) struct DeviceContext {
     /// string carries both; which of the two may actually be recorded is the
     /// feature flag, not this option.
     pub extended_dynamic_state3: Option<ash::ext::extended_dynamic_state3::Device>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_GPU_BOOST`): `VK_NV_low_latency2` entry points,
+    /// `Some` when the extension was enabled for the host window's swapchain.
+    pub low_latency2: Option<ash::nv::low_latency2::Device>,
     /// Queue family used for all engine submits (graphics draws + compute).
     pub gq: u32,
     /// True when `gq` supports both GRAPHICS and COMPUTE (required for engine compute).
@@ -1193,6 +1204,24 @@ impl DeviceContext {
         if swapchain {
             enabled_device_extensions.push(ash::khr::swapchain::NAME.as_ptr());
         }
+        // TEMP (lab, `REIMS_VGPU_LAB_GPU_BOOST`): the driver's low-latency mode
+        // with clock boost, set on the host window's swapchain. The device
+        // works in short dependent bursts (a frame's draws, then the payment's
+        // wait), which reads as ~20 % utilisation, so the GPU sat at 210 MHz of
+        // its 3105 (nvidia-smi, 5K light scene) and every burst ran slow.
+        #[cfg(feature = "host-window")]
+        let low_latency2 = swapchain
+            && lab_gpu_boost()
+            && has_device_extension(ash::nv::low_latency2::NAME);
+        #[cfg(not(feature = "host-window"))]
+        let low_latency2 = false;
+        if low_latency2 {
+            enabled_device_extensions.push(ash::nv::low_latency2::NAME.as_ptr());
+            if has_device_extension(ash::khr::present_id::NAME) {
+                enabled_device_extensions.push(ash::khr::present_id::NAME.as_ptr());
+            }
+        }
+        crate::observe::off(format!("gpu_boost low_latency2={low_latency2}"));
         let mut enabled_divisor_features =
             vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default()
                 .vertex_attribute_instance_rate_divisor(vertex_divisor.instance_rate_divisor)
@@ -1354,6 +1383,8 @@ impl DeviceContext {
         let extended_dynamic_state3 = features
             .wants_extended_dynamic_state3()
             .then(|| ash::ext::extended_dynamic_state3::Device::new(&instance, &device));
+        let low_latency2 =
+            low_latency2.then(|| ash::nv::low_latency2::Device::new(&instance, &device));
         let device_name = CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy()
             .into_owned();
@@ -1458,6 +1489,7 @@ impl DeviceContext {
             push_descriptor,
             extended_dynamic_state,
             extended_dynamic_state3,
+            low_latency2,
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,
