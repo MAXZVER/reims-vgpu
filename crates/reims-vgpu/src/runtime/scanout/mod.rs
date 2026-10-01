@@ -1680,6 +1680,17 @@ fn copy_from_window_runs(
     done == out.len()
 }
 
+/// TEMP (lab): the sampled field witness is an instrument, and a 5K drag profile
+/// (in-process sampler, 2026-10-01) put it at ~17% of `resolve_sampled_source`,
+/// so it is off unless `REIMS_VGPU_LAB_FIELD_WITNESS=on`. Tests keep it on.
+fn sampled_field_witness_enabled() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_FIELD_WITNESS").is_ok_and(|v| v == "on"))
+}
+
 /// [`note_sampled_surface_field`] over an explicitly named window, for a bind
 /// whose texels are not the mapping's own geometry.
 pub fn note_sampled_surface_field_window<M: HostMemory + crate::runtime::host::HostOps>(
@@ -1698,6 +1709,9 @@ pub fn note_sampled_surface_field_window<M: HostMemory + crate::runtime::host::H
         bpr,
         bpp,
     } = window;
+    if !sampled_field_witness_enabled() {
+        return;
+    }
     if mapping_id == 0 || u64::from(width) * u64::from(height) < SAMPLED_FIELD_MIN_TEXELS {
         return;
     }
