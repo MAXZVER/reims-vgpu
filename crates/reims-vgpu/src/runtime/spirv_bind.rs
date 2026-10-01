@@ -2741,6 +2741,17 @@ impl RenderBufferIndexBounds {
         }
     }
 
+    /// The largest `vertex_id` the vertex stage can observe on this draw, when
+    /// it is known (see [`Self::new`] and [`Self::with_indexed_vertex_max`]).
+    pub fn vertex_max(self) -> Option<u64> {
+        self.vertex_index
+    }
+
+    /// The largest `instance_id` the vertex stage can observe on this draw.
+    pub fn instance_max(self) -> Option<u64> {
+        self.instance_index
+    }
+
     /// [`Self::new`] for an indexed draw whose index buffer has been read: the
     /// largest `vertex_id` the vertex shader can observe is the largest index
     /// plus `baseVertex`, which the caller computed from the indices themselves
@@ -3012,6 +3023,71 @@ fn unused_binds_disabled() -> bool {
 /// already has.
 pub fn may_serve_neutral(access: ReflectedBufferAccess, feeds_stage_in: bool) -> bool {
     matches!(access, ReflectedBufferAccess::Unused) && !feeds_stage_in && !unused_binds_disabled()
+}
+
+/// Whether the shader declares a `[[buffer(n)]]` argument at `metal_index` (as
+/// opposed to the index being only a vertex-descriptor layout, which reflection
+/// does not describe).
+pub fn declares_buffer(reflection: &ShaderReflection, metal_index: u32) -> bool {
+    reflection
+        .bindings
+        .iter()
+        .any(|b| b.kind == ResourceKind::Buffer && b.metal_index == metal_index)
+}
+
+/// The widest vertex attribute format Metal defines, in bytes (`float4`,
+/// `int4`, `uint4`). An attribute reads at most this far past its offset, so it
+/// bounds a fetch without decoding the format.
+pub const VERTEX_FORMAT_MAX_BYTES: u64 = 16;
+
+/// TEMP (lab): `REIMS_VGPU_LAB_STAGE_IN_EXTENT=off` stages stage-in vertex
+/// buffers whole again, as before [`stage_in_buffer_extent`]. Latched.
+pub fn stage_in_extent_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("REIMS_VGPU_LAB_STAGE_IN_EXTENT").is_ok_and(|v| v == "off"))
+}
+
+/// The bytes the vertex fetch can read from vertex buffer `buffer_index` on
+/// this draw, counted from the bind's offset: over every attribute naming the
+/// buffer, its offset plus the widest format plus its stride times the largest
+/// index its step function fetches (`vertex_max` per vertex, `instance_max`
+/// per instance — not divided by the step rate, which only lowers it — and 0
+/// for a constant step). `stride` resolves an attribute's stride the way the
+/// draw's attribute walk does; an attribute that walk skips (format 0 or stride
+/// 0) reads nothing and adds nothing.
+///
+/// `None` keeps the whole window: an index the draw cannot bound (an indexed
+/// draw whose indices were not read), a step function with no vertex-rate
+/// meaning (patches), an overflow, or no attribute that reads the buffer at all.
+pub fn stage_in_buffer_extent(
+    attributes: &[crate::runtime::decode::resource::VertexAttribute],
+    stride: impl Fn(&crate::runtime::decode::resource::VertexAttribute) -> u32,
+    buffer_index: u32,
+    bounds: RenderBufferIndexBounds,
+) -> Option<u64> {
+    use reims_vgpu_protocol::vertex_step::StepFunction;
+    let mut end: Option<u64> = None;
+    for a in attributes.iter().filter(|a| a.buffer_index == buffer_index) {
+        let stride = u64::from(stride(a));
+        if a.format == 0 || stride == 0 {
+            continue;
+        }
+        let step = match a.declared_step_function {
+            None => StepFunction::DEFAULT,
+            Some(ordinal) => StepFunction::parse(ordinal)?,
+        };
+        let last = match step {
+            StepFunction::Constant => 0,
+            StepFunction::PerVertex => bounds.vertex_max()?,
+            StepFunction::PerInstance => bounds.instance_max()?,
+            StepFunction::PerPatch | StepFunction::PerPatchControlPoint => return None,
+        };
+        let reach = u64::from(a.offset)
+            .checked_add(VERTEX_FORMAT_MAX_BYTES)?
+            .checked_add(stride.checked_mul(last)?)?;
+        end = Some(end.map_or(reach, |e| e.max(reach)));
+    }
+    end
 }
 
 /// [`reflected_buffer_extent`] for a **vertex** bind, carrying the same stage-in
@@ -5796,5 +5872,120 @@ mod more_tests {
         words.extend([(4u32 << 16) | OP_DECORATE as u32, 3, DECORATION_BINDING, 66]);
         words.extend([(4u32 << 16) | OP_DECORATE as u32, 4, DECORATION_BINDING, 99]);
         assert_eq!(sampler_bindings(&words), vec![66]);
+    }
+}
+
+/// The stage-in vertex fetch's reach ([`stage_in_buffer_extent`]).
+#[cfg(test)]
+mod stage_in_extent_tests {
+    use super::*;
+    use crate::runtime::decode::resource::VertexAttribute;
+
+    fn attr(buffer_index: u32, offset: u32, stride: u32, step: Option<u32>) -> VertexAttribute {
+        VertexAttribute {
+            location: 0,
+            format: 30, // any non-zero format
+            offset,
+            buffer_index,
+            stride,
+            declared_step_function: step,
+            declared_step_rate: None,
+        }
+    }
+
+    fn own_stride(a: &VertexAttribute) -> u32 {
+        a.stride
+    }
+
+    /// A non-indexed draw of 4 vertices from vertex 2: indices 2..=5.
+    fn quad() -> RenderBufferIndexBounds {
+        RenderBufferIndexBounds::new(2, 4, 0, 1, false)
+    }
+
+    #[test]
+    fn a_per_vertex_attribute_reaches_its_last_vertex_plus_the_widest_format() {
+        let attrs = [attr(0, 8, 32, None)];
+        assert_eq!(
+            stage_in_buffer_extent(&attrs, own_stride, 0, quad()),
+            Some(8 + VERTEX_FORMAT_MAX_BYTES + 32 * 5)
+        );
+    }
+
+    #[test]
+    fn the_extent_is_the_farthest_attribute_and_ignores_other_buffers() {
+        let attrs = [
+            attr(0, 0, 32, None),
+            attr(0, 24, 32, None),
+            attr(1, 1000, 64, None),
+        ];
+        assert_eq!(
+            stage_in_buffer_extent(&attrs, own_stride, 0, quad()),
+            Some(24 + VERTEX_FORMAT_MAX_BYTES + 32 * 5)
+        );
+    }
+
+    #[test]
+    fn per_instance_and_constant_steps_use_their_own_indices() {
+        let bounds = RenderBufferIndexBounds::new(0, 4, 3, 2, false); // instances 3..=4
+        let per_instance = [attr(0, 4, 16, Some(2))];
+        assert_eq!(
+            stage_in_buffer_extent(&per_instance, own_stride, 0, bounds),
+            Some(4 + VERTEX_FORMAT_MAX_BYTES + 16 * 4)
+        );
+        let constant = [attr(0, 4, 16, Some(0))];
+        assert_eq!(
+            stage_in_buffer_extent(&constant, own_stride, 0, bounds),
+            Some(4 + VERTEX_FORMAT_MAX_BYTES)
+        );
+    }
+
+    #[test]
+    fn an_index_the_draw_cannot_bound_keeps_the_whole_window() {
+        // Indexed, with no indices read: the vertex index is unknown.
+        let bounds = RenderBufferIndexBounds::new(0, 6, 0, 1, true);
+        assert_eq!(
+            stage_in_buffer_extent(&[attr(0, 0, 32, None)], own_stride, 0, bounds),
+            None
+        );
+        // Read indices bound it again.
+        let read = bounds.with_indexed_vertex_max(Some(3));
+        assert_eq!(
+            stage_in_buffer_extent(&[attr(0, 0, 32, None)], own_stride, 0, read),
+            Some(VERTEX_FORMAT_MAX_BYTES + 32 * 3)
+        );
+    }
+
+    #[test]
+    fn patches_unknown_steps_and_unread_buffers_keep_the_whole_window() {
+        assert_eq!(
+            stage_in_buffer_extent(&[attr(0, 0, 32, Some(3))], own_stride, 0, quad()),
+            None
+        );
+        assert_eq!(
+            stage_in_buffer_extent(&[attr(0, 0, 32, Some(99))], own_stride, 0, quad()),
+            None
+        );
+        // Every attribute naming the buffer is one the walk skips.
+        let skipped = [
+            VertexAttribute {
+                format: 0,
+                ..attr(0, 0, 32, None)
+            },
+            attr(0, 0, 0, None),
+        ];
+        assert_eq!(
+            stage_in_buffer_extent(&skipped, own_stride, 0, quad()),
+            None
+        );
+    }
+
+    #[test]
+    fn the_stride_is_the_one_the_walk_resolves() {
+        // The bind's attributeStride (48) wins over the pipeline's (32).
+        let attrs = [attr(0, 0, 32, None)];
+        assert_eq!(
+            stage_in_buffer_extent(&attrs, |_| 48, 0, quad()),
+            Some(VERTEX_FORMAT_MAX_BYTES + 48 * 5)
+        );
     }
 }

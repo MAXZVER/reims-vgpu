@@ -802,9 +802,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         let model_pipeline = state
             .object_name(req.task_id, req.pipeline_ref)
             .map_or("unnamed", |id| {
-                state
-                    .pipeline_state(req.task_id, id)
-                    .unwrap_or("unleased")
+                state.pipeline_state(req.task_id, id).unwrap_or("unleased")
             });
         crate::observe::fail(format!(
             "linux_clear_store draws_skipped reason=draws_skipped_after_engine_refusal \
@@ -1095,8 +1093,15 @@ fn lab_pick_draw(
     };
     let key = match identity {
         TargetIdentity::Surface { id, generation, .. } => format!("s{id}.{generation}"),
-        TargetIdentity::Texture { ref_, generation, .. } => format!("r{ref_}.{generation}"),
-        TargetIdentity::Gva { gva, generation, format, .. } => format!("g{gva:x}.{generation}.{format:?}"),
+        TargetIdentity::Texture {
+            ref_, generation, ..
+        } => format!("r{ref_}.{generation}"),
+        TargetIdentity::Gva {
+            gva,
+            generation,
+            format,
+            ..
+        } => format!("g{gva:x}.{generation}.{format:?}"),
         TargetIdentity::Anonymous { slot } => format!("a{slot}"),
     };
     let mut map = LAST
@@ -1203,12 +1208,16 @@ fn sampled_mip_chain(
     if tex.mipmap_level_count < 2 {
         return None;
     }
-    let key = crate::runtime::writeback_debt::GvaResourceKey { task_id, texture_ref };
+    let key = crate::runtime::writeback_debt::GvaResourceKey {
+        task_id,
+        texture_ref,
+    };
     let mut levels = Vec::with_capacity(tex.mipmap_level_count as usize);
     for level in 0..tex.mipmap_level_count {
         let (gva, layout) = tex.level_gva(level, state.page_shift)?;
         let span = layout.row_stride.saturating_mul(u64::from(layout.height));
-        let generation = crate::runtime::writeback_debt::gva_plane_generation(state, key, gva, span)?;
+        let generation =
+            crate::runtime::writeback_debt::gva_plane_generation(state, key, gva, span)?;
         let identity = TargetIdentity::Gva {
             gva,
             width: layout.width,
@@ -1245,7 +1254,12 @@ fn lab_smp_linear(entry: Option<&str>) -> bool {
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(|| {
         std::env::var("REIMS_VGPU_LAB_SMP_LINEAR")
-            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .unwrap_or_default()
     });
     !names.is_empty() && entry.is_some_and(|e| names.iter().any(|n| e.contains(n.as_str())))
@@ -1323,8 +1337,9 @@ fn lab_cover_point(req: &DrawEncodeRequest) -> Option<usize> {
         .first()
         .map(|s| (s.x, s.y, s.width, s.height))
         .unwrap_or((0, 0, *w, *h));
-    pts.iter()
-        .position(|&(x, y)| x >= sx && y >= sy && x < sx.saturating_add(sw) && y < sy.saturating_add(sh))
+    pts.iter().position(|&(x, y)| {
+        x >= sx && y >= sy && x < sx.saturating_add(sw) && y < sy.saturating_add(sh)
+    })
 }
 
 fn lab_cover_budget() -> bool {
@@ -1385,13 +1400,17 @@ fn lab_cover_tex(
         return;
     }
     let src = match &img.source {
-        crate::backend::vulkan::engine::SampledSource::Bytes(b) => format!("bytes(len={})", b.len()),
+        crate::backend::vulkan::engine::SampledSource::Bytes(b) => {
+            format!("bytes(len={})", b.len())
+        }
         crate::backend::vulkan::engine::SampledSource::Target(t) => format!("target({t:?})"),
         crate::backend::vulkan::engine::SampledSource::GuestRuns(g, vouch) => format!(
             "guest_runs(runs={} len={} first_ptr={:?} vouch={vouch:?})",
             g.runs.len(),
             g.total_len,
-            g.runs.first().map(|r| format!("{:?}", r).chars().take(60).collect::<String>())
+            g.runs
+                .first()
+                .map(|r| format!("{:?}", r).chars().take(60).collect::<String>())
         ),
     };
     crate::observe::fail(format!(
@@ -1483,9 +1502,8 @@ fn lab_wallpx(
             let in_run = (pos - base) as usize;
             let take = need.min(rl as usize - in_run);
             // SAFETY: lab probe over the live guest-RAM mapping the gather reads.
-            let chunk = unsafe {
-                std::slice::from_raw_parts((run.host_ptr() + in_run) as *const u8, take)
-            };
+            let chunk =
+                unsafe { std::slice::from_raw_parts((run.host_ptr() + in_run) as *const u8, take) };
             row_bytes.extend_from_slice(chunk);
             need -= take;
             pos += take as u64;
@@ -1579,12 +1597,28 @@ fn lab_repeat_draw(
         if skip != 5 {
             (req.vertex_count, req.instance_count).hash(&mut h);
         }
-        (req.primitive_type, if skip == 0 { 0 } else { req.first_vertex }).hash(&mut h);
+        (
+            req.primitive_type,
+            if skip == 0 { 0 } else { req.first_vertex },
+        )
+            .hash(&mut h);
         for c in &req.colors {
-            (c.slot, c.width, c.height, c.format, c.load_action, c.store_action).hash(&mut h);
+            (
+                c.slot,
+                c.width,
+                c.height,
+                c.format,
+                c.load_action,
+                c.store_action,
+            )
+                .hash(&mut h);
         }
         if skip != 3 {
-            for s in req.vertex_samplers.iter().chain(req.fragment_samplers.iter()) {
+            for s in req
+                .vertex_samplers
+                .iter()
+                .chain(req.fragment_samplers.iter())
+            {
                 (s.index, s.sampler_ref).hash(&mut h);
             }
         }
@@ -1599,13 +1633,33 @@ fn lab_repeat_draw(
             }
         }
         if skip != 1 {
-            req.indexed.as_ref().map(|i| (i.index_type, i.index_count, i.index_buffer_ref, i.base_vertex)).hash(&mut h);
+            req.indexed
+                .as_ref()
+                .map(|i| {
+                    (
+                        i.index_type,
+                        i.index_count,
+                        i.index_buffer_ref,
+                        i.base_vertex,
+                    )
+                })
+                .hash(&mut h);
         } else {
-            req.indexed.as_ref().map(|i| (i.index_type, i.index_count)).hash(&mut h);
+            req.indexed
+                .as_ref()
+                .map(|i| (i.index_type, i.index_count))
+                .hash(&mut h);
         }
-        for t in req.vertex_textures.iter().chain(req.fragment_textures.iter()) {
+        for t in req
+            .vertex_textures
+            .iter()
+            .chain(req.fragment_textures.iter())
+        {
             (t.index, t.texture_ref).hash(&mut h);
-            t.resource.as_ref().map(|r| std::sync::Arc::as_ptr(r) as usize).hash(&mut h);
+            t.resource
+                .as_ref()
+                .map(|r| std::sync::Arc::as_ptr(r) as usize)
+                .hash(&mut h);
         }
         h.finish()
     };
@@ -1615,11 +1669,29 @@ fn lab_repeat_draw(
     req.pipeline_ref.hash(&mut shape);
     vertex_entry.hash(&mut shape);
     fragment_entry.hash(&mut shape);
-    (req.vertex_count, req.instance_count, req.primitive_type, req.first_vertex).hash(&mut shape);
+    (
+        req.vertex_count,
+        req.instance_count,
+        req.primitive_type,
+        req.first_vertex,
+    )
+        .hash(&mut shape);
     for c in &req.colors {
-        (c.slot, c.width, c.height, c.format, c.load_action, c.store_action).hash(&mut shape);
+        (
+            c.slot,
+            c.width,
+            c.height,
+            c.format,
+            c.load_action,
+            c.store_action,
+        )
+            .hash(&mut shape);
     }
-    for s in req.vertex_samplers.iter().chain(req.fragment_samplers.iter()) {
+    for s in req
+        .vertex_samplers
+        .iter()
+        .chain(req.fragment_samplers.iter())
+    {
         (s.index, s.sampler_ref).hash(&mut shape);
     }
     for v in &req.viewports {
@@ -1630,12 +1702,29 @@ fn lab_repeat_draw(
     for s in &req.scissors {
         (s.x, s.y, s.width, s.height).hash(&mut shape);
     }
-    req.indexed.as_ref().map(|i| (i.index_type, i.index_count, i.index_buffer_ref, i.base_vertex)).hash(&mut shape);
+    req.indexed
+        .as_ref()
+        .map(|i| {
+            (
+                i.index_type,
+                i.index_count,
+                i.index_buffer_ref,
+                i.base_vertex,
+            )
+        })
+        .hash(&mut shape);
     let c_key = shape.finish();
     let mut b_h = shape;
-    for t in req.vertex_textures.iter().chain(req.fragment_textures.iter()) {
+    for t in req
+        .vertex_textures
+        .iter()
+        .chain(req.fragment_textures.iter())
+    {
         (t.index, t.texture_ref).hash(&mut b_h);
-        t.resource.as_ref().map(|r| std::sync::Arc::as_ptr(r) as usize).hash(&mut b_h);
+        t.resource
+            .as_ref()
+            .map(|r| std::sync::Arc::as_ptr(r) as usize)
+            .hash(&mut b_h);
     }
     let b_key = b_h.finish();
     let mut a_h = std::collections::hash_map::DefaultHasher::new();
@@ -1643,7 +1732,16 @@ fn lab_repeat_draw(
     for c in &req.colors {
         (c.texture_ref, c.mapping_id, c.target_gva).hash(&mut a_h);
     }
-    crate::runtime::lab_repeat::draw(a_h.finish(), b_key, c_key, bytes.finish(), partial, !req.continues_render_pass, variants, prefix);
+    crate::runtime::lab_repeat::draw(
+        a_h.finish(),
+        b_key,
+        c_key,
+        bytes.finish(),
+        partial,
+        !req.continues_render_pass,
+        variants,
+        prefix,
+    );
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_UBO=pipe[,pipe]` logs the fragment buffers
@@ -1677,9 +1775,9 @@ fn lab_ubo_draw(
             [name, task, rest @ ..] => {
                 (*task == "*" || task.parse() == Ok(req.task_id))
                     && (*name == "*" || entry.is_some_and(|e| e.contains(name)))
-                    && rest.first().is_none_or(|h| {
-                        h.parse().ok() == req.colors.first().map(|c| c.height)
-                    })
+                    && rest
+                        .first()
+                        .is_none_or(|h| h.parse().ok() == req.colors.first().map(|c| c.height))
             }
             _ => item.parse() == Ok(req.pipeline_ref),
         }
@@ -1757,8 +1855,15 @@ fn lab_ubo_draw(
         .map(|c| {
             format!(
                 "s{}:ref{}/m{}/g{:x}:{}x{}:f{}:ld{}:st{}",
-                c.slot, c.texture_ref, c.mapping_id, c.target_gva, c.width, c.height, c.format,
-                c.load_action, c.store_action
+                c.slot,
+                c.texture_ref,
+                c.mapping_id,
+                c.target_gva,
+                c.width,
+                c.height,
+                c.format,
+                c.load_action,
+                c.store_action
             )
         })
         .collect();
@@ -1828,12 +1933,23 @@ fn lab_ubo_draw(
 /// fragment entry equals one of the names, each vertex attribute's format,
 /// offset and stride and the raw bytes of the first three vertices -- once per
 /// (task, pipeline, attribute layout, first-vertex bytes).
-fn lab_vtx_probe<A: LabVtxAttr>(req: &DrawEncodeRequest, entry: Option<&str>, attrs: &[A], vertex_count: u32, samplers: &str) {
+fn lab_vtx_probe<A: LabVtxAttr>(
+    req: &DrawEncodeRequest,
+    entry: Option<&str>,
+    attrs: &[A],
+    vertex_count: u32,
+    samplers: &str,
+) {
     use std::hash::{Hash, Hasher};
     static WANT: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let want = WANT.get_or_init(|| {
         std::env::var("REIMS_VGPU_LAB_VTX")
-            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .unwrap_or_default()
     });
     let Some(entry) = entry else { return };
@@ -1849,12 +1965,20 @@ fn lab_vtx_probe<A: LabVtxAttr>(req: &DrawEncodeRequest, entry: Option<&str>, at
         for i in 0..3u64 {
             let at = (off as u64 + i * stride as u64) as usize;
             if at + 16 <= content.len() {
-                verts.push(content[at..at + 16].iter().map(|b| format!("{b:02x}")).collect::<String>());
+                verts.push(
+                    content[at..at + 16]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                );
             }
         }
         (loc, &fmt, off, stride).hash(&mut hs);
         verts.first().hash(&mut hs);
-        desc.push_str(&format!(" L{loc}:{fmt}:off={off}:str={stride}:v=[{}]", verts.join(",")));
+        desc.push_str(&format!(
+            " L{loc}:{fmt}:off={off}:str={stride}:v=[{}]",
+            verts.join(",")
+        ));
     }
     if !crate::observe::first_sight("lab_vtx_probe", hs.finish()) {
         return;
@@ -1872,7 +1996,13 @@ trait LabVtxAttr {
 
 impl LabVtxAttr for crate::backend::vulkan::engine::VertexAttributeResource {
     fn lab_parts(&self) -> (u32, String, u32, u32, std::borrow::Cow<'_, [u8]>) {
-        (self.location, format!("{:?}", self.format), self.offset, self.stride, self.content.cpu_bytes())
+        (
+            self.location,
+            format!("{:?}", self.format),
+            self.offset,
+            self.stride,
+            self.content.cpu_bytes(),
+        )
     }
 }
 
@@ -1942,7 +2072,15 @@ fn lab_guest_runs_fmt(
         return;
     }
     let mut hs = std::collections::hash_map::DefaultHasher::new();
-    (req.task_id, texture_ref, w, h, format!("{layout:?}"), desc.map(|d| d.1.to_vec())).hash(&mut hs);
+    (
+        req.task_id,
+        texture_ref,
+        w,
+        h,
+        format!("{layout:?}"),
+        desc.map(|d| d.1.to_vec()),
+    )
+        .hash(&mut hs);
     if !crate::observe::first_sight("lab_guest_runs_fmt", hs.finish()) {
         return;
     }
@@ -1951,7 +2089,8 @@ fn lab_guest_runs_fmt(
         let skip = runs.source_offset as usize;
         let n = 32usize.min(run.len().saturating_sub(skip as u64) as usize);
         // SAFETY: same stable RAMBlock alias every CPU gather of these runs reads.
-        let bytes = unsafe { std::slice::from_raw_parts((run.host_ptr() as *const u8).add(skip), n) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts((run.host_ptr() as *const u8).add(skip), n) };
         first = bytes.iter().map(|b| format!("{b:02x}")).collect();
     }
     crate::observe::fail(format!(
@@ -1993,7 +2132,17 @@ fn lab_sampled_bind(
     // Keyed on what the ref resolved TO as well, so a ref re-pointed at another
     // resident logs again.
     let mut hs = std::collections::hash_map::DefaultHasher::new();
-    (req.task_id, req.pipeline_ref, frag, index, texture_ref, w, h, &route).hash(&mut hs);
+    (
+        req.task_id,
+        req.pipeline_ref,
+        frag,
+        index,
+        texture_ref,
+        w,
+        h,
+        &route,
+    )
+        .hash(&mut hs);
     if !crate::observe::first_sight("lab_sampled_bind", hs.finish()) {
         return;
     }
@@ -2278,16 +2427,33 @@ fn lab_resolve_census(ns: u64, loaded: Option<&(u32, u32, u32, SampledSourceRequ
     N[i].fetch_add(1, Ordering::Relaxed);
     let now = crate::observe::elapsed_us() / 1000;
     let last = LAST_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < 2000 || LAST_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+    if now.saturating_sub(last) < 2000
+        || LAST_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
         return;
     }
-    let names = ["bytes_tiny", "bytes_big", "target_tiny", "target_big", "runs_tiny", "runs_big", "none", "none_big"];
+    let names = [
+        "bytes_tiny",
+        "bytes_big",
+        "target_tiny",
+        "target_big",
+        "runs_tiny",
+        "runs_big",
+        "none",
+        "none_big",
+    ];
     let mut line = String::from("lab_resolve_census");
     for (k, name) in names.iter().enumerate() {
         let n = N[k].swap(0, Ordering::Relaxed);
         let t = NS[k].swap(0, Ordering::Relaxed);
         if n > 0 {
-            line.push_str(&format!(" {name}={}us/{n}({:.1}us)", t / 1000, t as f64 / 1000.0 / n as f64));
+            line.push_str(&format!(
+                " {name}={}us/{n}({:.1}us)",
+                t / 1000,
+                t as f64 / 1000.0 / n as f64
+            ));
         }
     }
     crate::observe::fail(line);
@@ -2310,7 +2476,13 @@ fn lab_spv_all(req: &DrawEncodeRequest, entry: Option<&str>, spirv: &[u8]) {
     let name: String = entry
         .unwrap_or("unknown")
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(80)
         .collect();
     let _ = std::fs::write(
@@ -2430,7 +2602,10 @@ fn lab_dump_write(req: &DrawEncodeRequest, n: u32, w: u32, h: u32, rgba: &[u8], 
         req.colors.first().map(|c| c.format).unwrap_or(0),
         req.colors
             .iter()
-            .map(|c| format!("s{}:ref{}:{}x{}:f{}", c.slot, c.texture_ref, c.width, c.height, c.format))
+            .map(|c| format!(
+                "s{}:ref{}:{}x{}:f{}",
+                c.slot, c.texture_ref, c.width, c.height, c.format
+            ))
             .collect::<Vec<_>>()
             .join(" "),
         req.colors.first().map(|c| c.load_action).unwrap_or(0),
@@ -9247,12 +9422,36 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // The vertex shader's own reflection bounds its own `[[buffer(n)]]`
             // binds, and a stage-in index is excluded — see that function's doc
             // for why the exclusion is not implied by the translator's output.
-            let cap = crate::runtime::spirv_bind::vertex_buffer_extent(
-                &v_shader.reflection,
-                b.index,
-                feeds_stage_in,
-                render_buffer_bounds,
-            );
+            let cap = if feeds_stage_in && !crate::runtime::spirv_bind::stage_in_extent_disabled() {
+                // The vertex fetch's own reach, and, where the shader also
+                // declares an argument at this index (Metal shares the index
+                // space), that argument's reach too: both read the bind.
+                crate::runtime::spirv_bind::stage_in_buffer_extent(
+                    &pd.vertex_attributes,
+                    |a| super::bind_attribute_stride(&req.vertex_buffers, a.buffer_index, a.stride),
+                    b.index,
+                    render_buffer_bounds,
+                )
+                .and_then(|fetch| {
+                    if crate::runtime::spirv_bind::declares_buffer(&v_shader.reflection, b.index) {
+                        crate::runtime::spirv_bind::reflected_render_buffer_extent(
+                            &v_shader.reflection,
+                            b.index,
+                            render_buffer_bounds,
+                        )
+                        .map(|argument| argument.max(fetch))
+                    } else {
+                        Some(fetch)
+                    }
+                })
+            } else {
+                crate::runtime::spirv_bind::vertex_buffer_extent(
+                    &v_shader.reflection,
+                    b.index,
+                    feeds_stage_in,
+                    render_buffer_bounds,
+                )
+            };
             let access =
                 crate::runtime::spirv_bind::reflected_buffer_access(&v_shader.reflection, b.index);
             crate::runtime::bind_phase::note_access(access);
@@ -9339,15 +9538,31 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             frag_storage.push((b.index, content));
         }
         drop(fragment_span);
-        lab_spv_all(req, f_shader.reflection.entry_point.as_deref(), &f_shader.spirv);
+        lab_spv_all(
+            req,
+            f_shader.reflection.entry_point.as_deref(),
+            &f_shader.spirv,
+        );
         lab_cover_draw(req, f_shader.reflection.entry_point.as_deref());
-        lab_repeat_draw(req, &vtx_storage, &frag_storage, v_shader.reflection.entry_point.as_deref(), f_shader.reflection.entry_point.as_deref());
-        lab_ubo_draw(req, &frag_storage, f_shader.reflection.entry_point.as_deref(), &f_shader.spirv, |i| {
-            format!(
-                "{:?}",
-                crate::runtime::spirv_bind::reflected_buffer_access(&f_shader.reflection, i)
-            )
-        });
+        lab_repeat_draw(
+            req,
+            &vtx_storage,
+            &frag_storage,
+            v_shader.reflection.entry_point.as_deref(),
+            f_shader.reflection.entry_point.as_deref(),
+        );
+        lab_ubo_draw(
+            req,
+            &frag_storage,
+            f_shader.reflection.entry_point.as_deref(),
+            &f_shader.spirv,
+            |i| {
+                format!(
+                    "{:?}",
+                    crate::runtime::spirv_bind::reflected_buffer_access(&f_shader.reflection, i)
+                )
+            },
+        );
         // Stage-in attributes from pipeline vertex block + bound buffer bytes.
         let mut attrs: Vec<crate::backend::vulkan::engine::VertexAttributeResource> = Vec::new();
         let mut stage_in_bufs: std::collections::BTreeSet<u32> = Default::default();
@@ -9749,7 +9964,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             fragment_attachment_alias_sample(
                                 req,
                                 texture_ref,
-                                sampled_base_level_gva(texture_resource.as_deref(), state.page_shift),
+                                sampled_base_level_gva(
+                                    texture_resource.as_deref(),
+                                    state.page_shift,
+                                ),
                             )
                         })
                         .flatten();
@@ -9880,12 +10098,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                     view_swizzle.is_none(),
                                 );
                                 if let prefetch::Prefetched::Shadow(planned) = other {
-                                    prefetch::shadow_compare(texture_ref, &planned, serial.as_ref());
+                                    prefetch::shadow_compare(
+                                        texture_ref,
+                                        &planned,
+                                        serial.as_ref(),
+                                    );
                                 }
                                 serial
                             }
                         };
-                        lab_resolve_census(lab_resolve_t0.elapsed().as_nanos() as u64, lab_resolved.as_ref());
+                        lab_resolve_census(
+                            lab_resolve_t0.elapsed().as_nanos() as u64,
+                            lab_resolved.as_ref(),
+                        );
                         let Some(loaded) = lab_resolved else {
                             let detail = sample_miss_detail(state, host, req.task_id, texture_ref);
                             return Err(DrawError::DrawPreparation(
@@ -10236,7 +10461,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         levels,
                     });
                 }
-                lab_sampled_bind(req, frag_stage, index, texture_ref, tw, th, images.last(), view_swizzle);
+                lab_sampled_bind(
+                    req,
+                    frag_stage,
+                    index,
+                    texture_ref,
+                    tw,
+                    th,
+                    images.last(),
+                    view_swizzle,
+                );
                 lab_sampled_strip_probe(req, texture_ref, images.last());
                 lab_sampled_grid_probe(req, index, texture_ref, images.last());
                 if let Some(img) = images.last() {
@@ -11683,30 +11917,44 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         });
 
         static LAB_VTX_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let lab_vtx_on = *LAB_VTX_ON.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_VTX").is_some());
-        let lab_smp: String = if !lab_vtx_on { String::new() } else { resources
-            .samplers
-            .iter()
-            .map(|s| {
-                // TEMP (lab): mip filter, LOD clamps and where the state came from.
-                format!(
-                    "b{}:un={}:min={:?}:mag={:?}:mip={:?}:lod={}..{}:u={:?}:v={:?}:o={}",
-                    s.binding,
-                    s.unnormalized_coordinates as u8,
-                    s.min_filter,
-                    s.mag_filter,
-                    s.mip_filter,
-                    f32::from_bits(s.lod_min),
-                    f32::from_bits(s.lod_max),
-                    s.address_mode_u,
-                    s.address_mode_v,
-                    sampler_origin.get(&s.binding).map(|b| *b as char).unwrap_or('?')
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(";") };
+        let lab_vtx_on =
+            *LAB_VTX_ON.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_VTX").is_some());
+        let lab_smp: String = if !lab_vtx_on {
+            String::new()
+        } else {
+            resources
+                .samplers
+                .iter()
+                .map(|s| {
+                    // TEMP (lab): mip filter, LOD clamps and where the state came from.
+                    format!(
+                        "b{}:un={}:min={:?}:mag={:?}:mip={:?}:lod={}..{}:u={:?}:v={:?}:o={}",
+                        s.binding,
+                        s.unnormalized_coordinates as u8,
+                        s.min_filter,
+                        s.mag_filter,
+                        s.mip_filter,
+                        f32::from_bits(s.lod_min),
+                        f32::from_bits(s.lod_max),
+                        s.address_mode_u,
+                        s.address_mode_v,
+                        sampler_origin
+                            .get(&s.binding)
+                            .map(|b| *b as char)
+                            .unwrap_or('?')
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";")
+        };
         if lab_vtx_on {
-            lab_vtx_probe(req, f_shader.reflection.entry_point.as_deref(), &resources.vertex_attributes, vertex_count, &lab_smp);
+            lab_vtx_probe(
+                req,
+                f_shader.reflection.entry_point.as_deref(),
+                &resources.vertex_attributes,
+                vertex_count,
+                &lab_smp,
+            );
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleTrail);
         // Asked of the module rather than of m2v's reflection, which is the
@@ -15219,7 +15467,8 @@ mod vulkan_split_tests {
             Arc::ptr_eq(&hit.0, &first.0) && Arc::ptr_eq(&hit.1, &first.1),
             "a hit hands back the stored window, not a rebuilt one"
         );
-        let verified = resolve(Mode::Verify, &mut state, &mut host, 0, span).expect("verify resolves");
+        let verified =
+            resolve(Mode::Verify, &mut state, &mut host, 0, span).expect("verify resolves");
         assert_eq!((*verified.0).clone(), (*walk.0).clone());
         assert_eq!((*verified.1).clone(), (*walk.1).clone());
         assert!(
@@ -15229,7 +15478,8 @@ mod vulkan_split_tests {
 
         // A different window of the same mapping is its own entry and leaves the
         // first one served.
-        let other = resolve(Mode::On, &mut state, &mut host, 8 * page, 16 * page).expect("second window");
+        let other =
+            resolve(Mode::On, &mut state, &mut host, 8 * page, 16 * page).expect("second window");
         assert_eq!(other.0.len(), 16);
         assert_eq!(other.0[0], ((pfn_a as u64) + 8) << PAGE_SHIFT_X86);
         assert!(!Arc::ptr_eq(&other.0, &first.0));
@@ -15242,8 +15492,8 @@ mod vulkan_split_tests {
         // The control layout moves (a task directory appears elsewhere): every
         // window of the mapping is asked again, and the answer is the walk's.
         state.gfx.root_page = 0x7777;
-        let control_moved =
-            resolve(Mode::On, &mut state, &mut host, 0, span).expect("still clear of the root page");
+        let control_moved = resolve(Mode::On, &mut state, &mut host, 0, span)
+            .expect("still clear of the root page");
         assert!(
             !Arc::ptr_eq(&control_moved.0, &first.0),
             "a moved control layout is a miss"
@@ -15275,7 +15525,8 @@ mod vulkan_split_tests {
             m.page_entries = entries(pfn_b, pages);
             DeviceState::bump_map_generation(m);
         }
-        let after = resolve(Mode::On, &mut state, &mut host, 0, span).expect("the new list resolves");
+        let after =
+            resolve(Mode::On, &mut state, &mut host, 0, span).expect("the new list resolves");
         assert!(
             !Arc::ptr_eq(&after.0, &before.0),
             "a new map_generation is a miss"
@@ -15299,7 +15550,8 @@ mod vulkan_split_tests {
             let m = state.mappings.get_mut(&mid).unwrap();
             m.page_entries = entries(pfn_b, pages - 8);
         }
-        let shorter = resolve(Mode::On, &mut state, &mut host, 0, span).expect("40 pages still cover 32");
+        let shorter =
+            resolve(Mode::On, &mut state, &mut host, 0, span).expect("40 pages still cover 32");
         assert!(
             !Arc::ptr_eq(&shorter.0, &after.0),
             "the page count is part of the key"
