@@ -1936,6 +1936,11 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
         acc.fragment_textures[0].resource.as_ref().unwrap(),
         &first
     ));
+    // The later setter is in a later stream: a delete is a packet of its own and
+    // cannot land between two records of one stream's walk, so what one stream
+    // resolves for a reference it keeps (see `walk_memo`), and the next stream
+    // resolves it afresh.
+    let mut later = StreamAccum::default();
     handle_render_record(
         &mut state,
         &host,
@@ -1943,10 +1948,10 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
         wire_render::OPCODE_SET_FRAGMENT_TEXTURE,
         &command,
         &mut out,
-        &mut acc,
+        &mut later,
     );
     assert!(Arc::ptr_eq(
-        acc.fragment_textures[0].resource.as_ref().unwrap(),
+        later.fragment_textures[0].resource.as_ref().unwrap(),
         &replacement
     ));
 }
@@ -6749,6 +6754,8 @@ fn each_render_state_record_writes_the_one_field_it_names_and_no_other() {
             unrepresentable,
             // TEMP (lab): the pass-extent probe's field; not a render-state field.
             lab_target_extent: _,
+            // What the walk resolved for itself; not a render-state field.
+            memo: _,
         } = acc;
         vec![
             ("pipeline_ref", format!("{pipeline_ref:?}")),
@@ -8077,6 +8084,36 @@ fn the_executing_walk_and_the_resolving_walk_reach_the_same_records() {
         vec![true, false, true, true, true, true],
         "exactly the removed record has no twin; everything after it still finds its own"
     );
+
+    // The expected-position shortcut answers what the search answers, on a whole
+    // packet and on one with a gap in it.
+    for on in [true, false] {
+        walk_memo::with(on, || {
+            for (work, expected) in [
+                (&work, vec![true; 6]),
+                (&gapped, vec![true, false, true, true, true, true]),
+            ] {
+                let mut cursor = ResolvedCursor::new(work);
+                let mut found = Vec::new();
+                for framed in reims_vgpu_protocol::segment::SegmentStream::new(&stream)
+                    .expect("the fixture frames")
+                {
+                    let framed = framed.expect("the fixture frames");
+                    let reims_vgpu_protocol::segment::SegmentBody::Encoder { kind, commands } =
+                        framed.body
+                    else {
+                        continue;
+                    };
+                    for op in reims_vgpu_wire::op::OpStream::new(commands) {
+                        let op = op.expect("the fixture frames");
+                        found.push(cursor.step(kind, op.opcode()).is_some());
+                    }
+                    cursor.end_segment();
+                }
+                assert_eq!(found, expected, "memo {on}");
+            }
+        });
+    }
 }
 
 /// A submission's bytes are framed once per stream, and the plan step frames
@@ -8308,4 +8345,326 @@ fn an_exec_resource_record_clearing_guest_valid_pays_the_owed_frame() {
         state.pending_writebacks.get(untouched).is_some(),
         "a record that does not clear guest-valid pays nothing"
     );
+}
+
+/// A device with one buffer object, `ref 7` in task 1, and the stream state a
+/// bind of it needs. For the tests of what a stream's walk resolves and keeps.
+fn device_with_one_buffer() -> (FakeHost, DeviceState) {
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER,
+    };
+    use crate::runtime::gva_mem::{define_task_pages_arm64e, write_task_gva_arm64e};
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+    let mut descriptor = [0u8; 16];
+    st64(&mut descriptor, 0x1000);
+    st32(&mut descriptor[8..], 5);
+    write_task_gva_arm64e(&mut host, &state.tasks[1], 0x180, &descriptor);
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(&mut entry, u32::from(OBJECT_TYPE_BUFFER) | (16 << 8));
+    st64(&mut entry[4..], 0x180);
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        list_object_entry_offset(7, 32).unwrap(),
+        &entry,
+    );
+    (host, state)
+}
+
+fn set_vertex_buffer_7() -> Vec<u8> {
+    let total = OP_HEADER_LEN + render_pass::BIND_ENTRIES + render_pass::BUFFER_BIND_ENTRY_SIZE;
+    let mut bind = vec![0u8; total];
+    st32(&mut bind, wire_render::OPCODE_SET_VERTEX_BUFFER);
+    st32(&mut bind[4..], total as u32);
+    st32(&mut bind[OP_HEADER_LEN + render_pass::BIND_COUNT..], 1);
+    st32(&mut bind[OP_HEADER_LEN + render_pass::BIND_ENTRIES..], 7);
+    bind
+}
+
+fn draw_indexed_wide() -> Vec<u8> {
+    let mut draw = vec![0u8; 0x20];
+    st32(&mut draw, wire_render::OPCODE_DRAW_INDEXED_WIDE);
+    st32(&mut draw[4..], 0x20);
+    st16(&mut draw[8..], 3);
+    st32(&mut draw[12..], 0x3e);
+    st32(&mut draw[16..], 6);
+    draw
+}
+
+/// A stream that binds one object again and again resolves it once, and what it
+/// binds is the same retained object whether the memo answered or the registry
+/// did.
+///
+/// The counters are the other half of the claim. A registry hit is counted
+/// either as a witness comparison or as one its interval deferred, and the memo
+/// answers by counting the deferred route for each hit it takes, so the pair's
+/// sum is what it was; and a second stream is a new memo, so a delete between
+/// two streams is seen by the second.
+#[test]
+fn a_stream_resolves_a_reference_once_and_its_binds_share_the_retained_object() {
+    use crate::runtime::drain::store_route_count;
+    let seen = || {
+        store_route_count("task_resource_reexamined")
+            + store_route_count("task_resource_reexamine_deferred")
+    };
+    let bind = set_vertex_buffer_7();
+    for on in [true, false] {
+        walk_memo::with(on, || {
+            let (host, mut state) = device_with_one_buffer();
+            let mut out = ExecResult::default();
+            let mut acc = StreamAccum {
+                pipeline_ref: 61,
+                ..Default::default()
+            };
+            let before = seen();
+            let op = wire_render::OPCODE_SET_VERTEX_BUFFER;
+            handle_render_record(&mut state, &host, 1, op, &bind, &mut out, &mut acc);
+            let first = acc.vertex_buffers[0].resource.clone().expect("retained");
+            for _ in 0..4 {
+                handle_render_record(&mut state, &host, 1, op, &bind, &mut out, &mut acc);
+                assert!(
+                    Arc::ptr_eq(&first, acc.vertex_buffers[0].resource.as_ref().unwrap()),
+                    "memo {on}: a later bind of the reference keeps the object the first one did"
+                );
+            }
+            acc.memo.flush();
+            assert_eq!(
+                seen() - before,
+                4,
+                "memo {on}: four binds after the constructing one are four registry hits, \
+                 counted whoever answered"
+            );
+
+            // A delete between streams is seen by the next stream's own memo.
+            assert!(state.delete_object(1, 7));
+            let mut next = StreamAccum {
+                pipeline_ref: 61,
+                ..Default::default()
+            };
+            handle_render_record(&mut state, &host, 1, op, &bind, &mut out, &mut next);
+            let again = next.vertex_buffers[0].resource.clone().expect("rebuilt");
+            assert!(
+                !Arc::ptr_eq(&first, &again),
+                "memo {on}: the second stream resolved the object the guest has now, not the \
+                 one the first stream kept"
+            );
+        });
+    }
+}
+
+/// Binding a slot what it already holds leaves the table the previous draw
+/// shares; binding it anything else forks.
+#[test]
+fn an_unchanged_bind_does_not_fork_the_table_a_draw_holds() {
+    let bind = set_vertex_buffer_7();
+    let draw = draw_indexed_wide();
+    let op = wire_render::OPCODE_SET_VERTEX_BUFFER;
+    let draw_op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
+    for on in [true, false] {
+        walk_memo::with(on, || {
+            let (host, mut state) = device_with_one_buffer();
+            let mut out = ExecResult::default();
+            let mut acc = StreamAccum {
+                pipeline_ref: 61,
+                ..Default::default()
+            };
+            handle_render_record(&mut state, &host, 1, op, &bind, &mut out, &mut acc);
+            handle_render_record(&mut state, &host, 1, draw_op, &draw, &mut out, &mut acc);
+            // The same bind again, after a draw has taken the table.
+            handle_render_record(&mut state, &host, 1, op, &bind, &mut out, &mut acc);
+            handle_render_record(&mut state, &host, 1, draw_op, &draw, &mut out, &mut acc);
+            assert_eq!(acc.draws.len(), 2);
+            assert_eq!(
+                Arc::ptr_eq(&acc.draws[0].vertex_buffers, &acc.draws[1].vertex_buffers),
+                on,
+                "memo {on}: the second draw shares the first's table exactly when the bind \
+                 between them changed nothing"
+            );
+            assert_eq!(
+                acc.draws[0].vertex_buffers[..].len(),
+                acc.draws[1].vertex_buffers[..].len()
+            );
+            assert_eq!(
+                acc.draws[0].vertex_buffers[0].buffer_ref,
+                acc.draws[1].vertex_buffers[0].buffer_ref
+            );
+
+            let offset_total = OP_HEADER_LEN + render_pass::BUFFER_OFFSET_PAYLOAD_LEN;
+            let offset_op = wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET;
+            let rebase = |at: u64| {
+                let mut offset = vec![0u8; offset_total];
+                st32(&mut offset, offset_op);
+                st32(&mut offset[4..], offset_total as u32);
+                st64(
+                    &mut offset[OP_HEADER_LEN + render_pass::BUFFER_OFFSET_VALUE..],
+                    at,
+                );
+                offset
+            };
+            // The offset the slot already has changes nothing either.
+            handle_render_record(
+                &mut state,
+                &host,
+                1,
+                offset_op,
+                &rebase(0),
+                &mut out,
+                &mut acc,
+            );
+            handle_render_record(&mut state, &host, 1, draw_op, &draw, &mut out, &mut acc);
+            assert_eq!(
+                Arc::ptr_eq(&acc.draws[1].vertex_buffers, &acc.draws[2].vertex_buffers),
+                on,
+                "memo {on}: an offset rebind to the offset the slot holds leaves the table shared"
+            );
+
+            // A different offset is a different bind and the earlier draw keeps
+            // the one it was recorded with.
+            handle_render_record(
+                &mut state,
+                &host,
+                1,
+                offset_op,
+                &rebase(0x40),
+                &mut out,
+                &mut acc,
+            );
+            handle_render_record(&mut state, &host, 1, draw_op, &draw, &mut out, &mut acc);
+            assert_eq!(acc.draws[1].vertex_buffers[0].offset, 0);
+            assert_eq!(acc.draws[2].vertex_buffers[0].offset, 0);
+            assert_eq!(acc.draws[3].vertex_buffers[0].offset, 0x40);
+        });
+    }
+}
+
+/// An unbind of an empty slot is the unbind it always was, and costs no fork.
+#[test]
+fn clearing_a_slot_nothing_holds_counts_the_clear_and_leaves_the_table_shared() {
+    let (host, mut state) = device_with_one_buffer();
+    let mut acc = StreamAccum::default();
+    let held = acc.vertex_buffers.clone();
+    let mut out = ExecResult::default();
+    // A zero ref unbinds. Slot 0 holds nothing.
+    let total = OP_HEADER_LEN + render_pass::BIND_ENTRIES + render_pass::BUFFER_BIND_ENTRY_SIZE;
+    let mut unbind = vec![0u8; total];
+    st32(&mut unbind, wire_render::OPCODE_SET_VERTEX_BUFFER);
+    st32(&mut unbind[4..], total as u32);
+    st32(&mut unbind[OP_HEADER_LEN + render_pass::BIND_COUNT..], 1);
+    for on in [true, false] {
+        walk_memo::with(on, || {
+            let before = out.buffer_unbinds;
+            handle_render_record(
+                &mut state,
+                &host,
+                1,
+                wire_render::OPCODE_SET_VERTEX_BUFFER,
+                &unbind,
+                &mut out,
+                &mut acc,
+            );
+            assert_eq!(
+                out.buffer_unbinds,
+                before + 1,
+                "memo {on}: the clear is counted"
+            );
+            assert!(acc.vertex_buffers.is_empty());
+            assert_eq!(Arc::ptr_eq(&held, &acc.vertex_buffers), on);
+        });
+    }
+}
+
+/// The once-per-shape fragment texture line is not asked of the latch again for
+/// a shape this thread has seen, and is asked every time with the memo off.
+#[test]
+fn a_fragment_texture_bind_shape_is_sighted_once_per_thread() {
+    let entries = [1u32, 0, 2].map(|r| wire_render::RefBind {
+        object_ref: reims_vgpu_protocol::decode::U32le::new(r),
+    });
+    walk_memo::with(true, || {
+        assert!(!lab_frag_tex_bind_already_sighted(0xBEEF, 2, &entries));
+        assert!(lab_frag_tex_bind_already_sighted(0xBEEF, 2, &entries));
+        assert!(
+            !lab_frag_tex_bind_already_sighted(0xBEEF, 3, &entries),
+            "another first slot is another shape"
+        );
+    });
+    walk_memo::with(false, || {
+        assert!(!lab_frag_tex_bind_already_sighted(0xBEEF, 2, &entries));
+    });
+}
+
+/// A scissor record reuses the state's own storage and says the same thing about
+/// an empty rect as it always did.
+#[test]
+fn a_plural_scissor_replaces_the_state_in_place_and_an_empty_rect_keeps_it() {
+    let rect = |x: u64, w: u64| [x, 0, w, 4];
+    let record = |rects: &[[u64; 4]]| {
+        let total = OP_HEADER_LEN
+            + render_pass::SCISSOR_RECTS_COUNT_LEN
+            + rects.len() * render_pass::SCISSOR_PAYLOAD_LEN;
+        let mut cmd = vec![0u8; total];
+        st32(&mut cmd, wire_render::OPCODE_SET_SCISSOR_RECTS);
+        st32(&mut cmd[4..], total as u32);
+        st64(&mut cmd[OP_HEADER_LEN..], rects.len() as u64);
+        let e0 = OP_HEADER_LEN + render_pass::SCISSOR_RECTS_COUNT_LEN;
+        for (n, r) in rects.iter().enumerate() {
+            for (i, val) in r.iter().enumerate() {
+                st64(
+                    &mut cmd[e0 + n * render_pass::SCISSOR_PAYLOAD_LEN + i * 8..],
+                    *val,
+                );
+            }
+        }
+        cmd
+    };
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    for on in [true, false] {
+        walk_memo::with(on, || {
+            let mut out = ExecResult::default();
+            let mut acc = StreamAccum::default();
+            let op = wire_render::OPCODE_SET_SCISSOR_RECTS;
+            let two = record(&[rect(1, 5), rect(9, 7)]);
+            handle_render_record(&mut state, &host, 1, op, &two, &mut out, &mut acc);
+            assert_eq!(acc.scissors.len(), 2, "memo {on}");
+            let one = record(&[rect(3, 4)]);
+            handle_render_record(&mut state, &host, 1, op, &one, &mut out, &mut acc);
+            assert_eq!(acc.scissors.len(), 1, "memo {on}");
+            assert_eq!(acc.scissors[0].x, 3);
+            let with_empty = record(&[rect(5, 5), rect(6, 0)]);
+            handle_render_record(&mut state, &host, 1, op, &with_empty, &mut out, &mut acc);
+            assert_eq!(
+                acc.scissors.len(),
+                1,
+                "memo {on}: an array with an empty rect is refused whole and the state stands"
+            );
+            assert_eq!(acc.scissors[0].x, 3);
+        });
+    }
+}
+
+/// A stream asks the guest's object lists whether a reference is a surface once,
+/// whatever the answer; the next stream asks again.
+#[test]
+fn a_stream_probes_the_backing_of_a_reference_once() {
+    // Ref 7 is a buffer in task 1's list; no task lists a surface there.
+    for on in [true, false] {
+        walk_memo::with(on, || {
+            let (host, mut state) = device_with_one_buffer();
+            let mut memo = walk_memo::StreamMemo::default();
+            assert!(!resolve_backing_memo(&mut state, &host, &mut memo, 7));
+            assert_eq!(
+                memo.backing(7),
+                on.then_some(false),
+                "memo {on}: the answer is kept exactly when the memo is on"
+            );
+            assert!(!resolve_backing_memo(&mut state, &host, &mut memo, 7));
+            let fresh = walk_memo::StreamMemo::default();
+            assert_eq!(fresh.backing(7), None, "a new stream has asked nothing");
+        });
+    }
 }
