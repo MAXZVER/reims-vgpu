@@ -322,6 +322,13 @@ pub struct Reset {
     pub stranded: Vec<IngressOrdinal>,
 }
 
+/// What judging a packet decided, before the transaction is built from it.
+struct Judged {
+    identity: TransactionIdentity,
+    hazard_waits: Vec<IngressOrdinal>,
+    ready: bool,
+}
+
 /// What admitting a packet produced.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Admitted {
@@ -617,6 +624,55 @@ impl SessionModel {
     /// no ordinal is consumed and no sequence advances — so a refused packet
     /// leaves no gap in either order for a reader to explain.
     pub fn admit(&mut self, packet: &Packet) -> Result<Admitted, Refusal> {
+        let judged = self.judge(packet)?;
+        Ok(Admitted {
+            transaction: DeviceTransaction {
+                identity: judged.identity,
+                stamp_waits: packet.stamp_waits.clone(),
+                completion: packet.completion,
+                payload: packet.payload.clone(),
+            },
+            hazard_waits: judged.hazard_waits,
+            ready: judged.ready,
+        })
+    }
+
+    /// [`Self::admit`] for a caller that is done with the packet: the payload moves
+    /// into the transaction instead of being copied out of the packet and dropped.
+    ///
+    /// The same judgement, the same ordinals, the same waits and the same
+    /// refusals — `admit` is this plus a clone of the two fields that own memory.
+    /// An exec payload is every stream's resolved records, the arenas they index
+    /// and the accesses derived from them, so on the hottest path the device has
+    /// the clone was an allocation per record and the drop after it the same
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit`]. A refused packet is consumed all the same; what refused
+    /// it is the answer.
+    pub fn admit_owned(&mut self, packet: Packet) -> Result<Admitted, Refusal> {
+        let judged = self.judge(&packet)?;
+        let Packet {
+            stamp_waits,
+            completion,
+            payload,
+            ..
+        } = packet;
+        Ok(Admitted {
+            transaction: DeviceTransaction {
+                identity: judged.identity,
+                stamp_waits,
+                completion,
+                payload,
+            },
+            hazard_waits: judged.hazard_waits,
+            ready: judged.ready,
+        })
+    }
+
+    /// Everything [`Self::admit`] decides, which is everything but the copy.
+    fn judge(&mut self, packet: &Packet) -> Result<Judged, Refusal> {
         if self.device == DeviceState::Lost {
             self.refusals += 1;
             return Err(Refusal::DeviceLost { epoch: self.epoch });
@@ -724,17 +780,12 @@ impl SessionModel {
             &pipeline_waits,
             packet.completion,
         );
-        Ok(Admitted {
-            transaction: DeviceTransaction {
-                identity: TransactionIdentity {
-                    session: self.generation,
-                    domain: packet.domain,
-                    domain_sequence: sequence,
-                    ingress,
-                },
-                stamp_waits: packet.stamp_waits.clone(),
-                completion: packet.completion,
-                payload: packet.payload.clone(),
+        Ok(Judged {
+            identity: TransactionIdentity {
+                session: self.generation,
+                domain: packet.domain,
+                domain_sequence: sequence,
+                ingress,
             },
             hazard_waits,
             ready,
@@ -1771,6 +1822,48 @@ mod tests {
         // The id is task 1's again: a fresh incarnation declares it anew.
         assert!(s.pipelines().declare(one, g));
         assert_eq!(s.task_ended(TaskId(99)), TaskEnded::default());
+    }
+
+    /// Admitting a packet by value is admitting it by reference without the copy:
+    /// the same transactions, the same waits, the same readiness, the same ordinals
+    /// and the same refusals, packet for packet.
+    #[test]
+    fn admitting_a_packet_by_value_decides_what_admitting_it_by_reference_decides() {
+        let batch = || {
+            let mut packets = Vec::new();
+            for (i, opcode) in [0x37u16; 6].into_iter().enumerate() {
+                let mut p = packet(opcode);
+                if i % 3 == 1 {
+                    p.domain = ChannelId(3);
+                }
+                if i == 3 {
+                    // Waits for a stamp nothing has published.
+                    p.stamp_waits.push(StampWait {
+                        slot: StampSlot(9),
+                        value: StampValue(4),
+                    });
+                    p.completion = Some(CompletionStamp {
+                        slot: StampSlot(2),
+                        value: StampValue(1),
+                    });
+                }
+                packets.push(p);
+            }
+            // One the model refuses: a domain no channel definition opened.
+            let mut closed = packet(0x37);
+            closed.domain = ChannelId(40);
+            packets.push(closed);
+            packets
+        };
+        let (mut by_ref, mut by_value) = (session(), session());
+        for p in batch() {
+            let a = by_ref.admit(&p);
+            let b = by_value.admit_owned(p);
+            assert_eq!(a, b);
+        }
+        // And the state each leaves behind answers alike.
+        assert_eq!(by_ref.take_ready(), by_value.take_ready());
+        assert_eq!(by_ref.refusals(), by_value.refusals());
     }
 
     /// A packet leasing `resource` under the shared naming.

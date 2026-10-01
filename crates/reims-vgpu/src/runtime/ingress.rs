@@ -648,6 +648,7 @@ pub fn device_packet<M: crate::runtime::host::HostMemory>(
         submission,
         repointed,
     } = reads;
+    let setup_span = crate::runtime::chain_phase::CostSpan::new("dp_setup_us");
     let channel = fifo.channel();
     let class = classify(channel, drained.opcode);
     // Asked before anything is built, because the answer decides whether the
@@ -684,6 +685,8 @@ pub fn device_packet<M: crate::runtime::host::HostMemory>(
     // the `lifecycle` owner's and not this one's.
     let usages = state.pipeline_usage(task.0);
     let no_streams: [Vec<u8>; 0] = [];
+    drop(setup_span);
+    let packet_span = crate::runtime::chain_phase::CostSpan::new("dp_packet_us");
     let mut built = packet(
         fifo,
         session,
@@ -700,6 +703,7 @@ pub fn device_packet<M: crate::runtime::host::HostMemory>(
             repointed,
         },
     )?;
+    drop(packet_span);
     // The records' pipeline references are ids in this task's object list; say
     // so, once, so that the model's admission names the pipelines the walk above
     // was answered for under the same scope (`PipelineUsage` asks under

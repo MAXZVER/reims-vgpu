@@ -4872,6 +4872,24 @@ impl DeviceState {
         })
     }
 
+    /// [`Self::admit_packet`] for a packet the caller is done with. See
+    /// [`reims_vgpu_core::session::SessionModel::admit_owned`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit_packet`].
+    pub fn admit_packet_owned(
+        &self,
+        packet: reims_vgpu_core::session::Packet,
+    ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
+        let mut session = self.session.lock().expect("session");
+        let admitted = session.admit_owned(packet)?;
+        Ok(Admission {
+            epoch: session.epoch(),
+            admitted,
+        })
+    }
+
     /// The semantic lifetime the model is in right now.
     ///
     /// **A reader's fact, and that is why it is asked here rather than inside

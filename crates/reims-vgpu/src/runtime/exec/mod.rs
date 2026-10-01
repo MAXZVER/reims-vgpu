@@ -1044,7 +1044,9 @@ fn execute_submission<M: HostMemory + HostOps>(
     // pixels the guest has since overwritten has to go now — landing it later
     // would replace the guest's own bytes with a frame the guest has declared
     // stale.
+    let restable_span = crate::runtime::chain_phase::CostSpan::new("ex_restable_us");
     consume_resource_table(state, host, task_id, resource_descs);
+    drop(restable_span);
 
     // One cursor for the whole packet, not one per buffer: a packet's
     // command-buffer table is one submission and the model resolved all of it
@@ -1730,6 +1732,61 @@ impl<'a, M: HostMemory + HostOps> StreamSink<'a, M> {
     }
 }
 
+thread_local! {
+    /// TEMP (lab, per-packet cost): nanoseconds and counts by record class for the
+    /// stream being walked, flushed once per stream so a record costs two clock
+    /// reads and no census call.
+    static WK: std::cell::RefCell<[(u64, u64); 8]> =
+        const { std::cell::RefCell::new([(0, 0); 8]) };
+}
+
+const WK_NAMES: [(&str, &str); 8] = [
+    ("wk_cursor_us", "wk_cursor_n"),
+    ("wk_state_us", "wk_state_n"),
+    ("wk_binds_us", "wk_binds_n"),
+    ("wk_pass_us", "wk_pass_n"),
+    ("wk_draw_us", "wk_draw_n"),
+    ("wk_other_us", "wk_other_n"),
+    ("wk_nonrender_us", "wk_nonrender_n"),
+    ("wk_spare_us", "wk_spare_n"),
+];
+
+/// Which of [`WK_NAMES`] a record belongs to.
+fn wk_group(kind: SegmentKind, opcode: u32) -> usize {
+    if !matches!(kind, SegmentKind::Render) {
+        return 6;
+    }
+    match ProtoRenderKind::of_opcode(opcode) {
+        Some(k) if is_render_stream_state(k) => 1,
+        Some(k) if is_render_bind(k) => 2,
+        Some(k) if is_render_pass_state(k) => 3,
+        Some(k) if is_render_draw(k) => 4,
+        _ => 5,
+    }
+}
+
+fn wk_note(group: usize, ns: u64) {
+    WK.with(|w| {
+        let mut w = w.borrow_mut();
+        w[group].0 += ns;
+        w[group].1 += 1;
+    });
+}
+
+fn wk_flush() {
+    WK.with(|w| {
+        let mut w = w.borrow_mut();
+        for (i, (us, n)) in WK_NAMES.iter().enumerate() {
+            let (ns, count) = w[i];
+            if count != 0 {
+                crate::runtime::drain::note_store_route_us(us, ns / 1000);
+                crate::runtime::drain::note_store_route_n(n, count);
+            }
+            w[i] = (0, 0);
+        }
+    });
+}
+
 fn walk_stream<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1820,16 +1877,24 @@ fn walk_stream<M: HostMemory + HostOps>(
             // in correspondence by advancing together, and a step taken only
             // for the classes that consume it would be a cursor that means
             // something different in every segment.
+            let cursor_started = std::time::Instant::now();
             if let Some(cursor) = resolved.as_deref_mut() {
                 let _ = cursor.step(kind, op);
             }
+            wk_note(0, cursor_started.elapsed().as_nanos() as u64);
+            let record_started = std::time::Instant::now();
             sink.record(kind, op, cmd);
+            wk_note(
+                wk_group(kind, op),
+                record_started.elapsed().as_nanos() as u64,
+            );
         });
         sink.end_segment();
         if let Some(cursor) = resolved.as_deref_mut() {
             cursor.end_segment();
         }
     }
+    wk_flush();
 }
 
 /// Every census route [`segment_chain_route`] can answer, in the order
@@ -3299,6 +3364,7 @@ fn handle_render_binds<M: HostMemory + HostOps>(
 ) {
     use reims_vgpu_protocol::decode::render::RenderRecord;
 
+    let decode_span = crate::runtime::chain_phase::CostSpan::new("wb_decode_us");
     let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
         return;
     };
@@ -3308,8 +3374,10 @@ fn handle_render_binds<M: HostMemory + HostOps>(
             return note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
         }
     };
+    drop(decode_span);
     match record {
         RenderRecord::BindBuffers(r) => {
+            let _buf_span = crate::runtime::chain_phase::CostSpan::new("wb_buf_us");
             let cleared = apply_binds(
                 r.entries,
                 r.first,
@@ -3339,6 +3407,7 @@ fn handle_render_binds<M: HostMemory + HostOps>(
             out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
         }
         RenderRecord::BindBuffersWithStride(r) => {
+            let _buf_span = crate::runtime::chain_phase::CostSpan::new("wb_buf_us");
             let cleared = apply_binds(
                 r.entries,
                 r.first,
@@ -3368,6 +3437,8 @@ fn handle_render_binds<M: HostMemory + HostOps>(
             out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
         }
         RenderRecord::BindTextures(r) => {
+            let _tex_span = crate::runtime::chain_phase::CostSpan::new("wb_tex_us");
+            let lab_span = crate::runtime::chain_phase::CostSpan::new("wb_tex_lab_us");
             // TEMP (lab): every distinct fragment texture bind shape, once — does
             // the guest ever bind index 1 (macOS 26 icon draws sample tex1 unbound)?
             if matches!(r.stage, reims_vgpu_protocol::render::ShaderStage::Fragment) {
@@ -3391,6 +3462,7 @@ fn handle_render_binds<M: HostMemory + HostOps>(
                     ));
                 }
             }
+            drop(lab_span);
             let cleared = apply_binds(
                 r.entries,
                 r.first,
@@ -3412,28 +3484,39 @@ fn handle_render_binds<M: HostMemory + HostOps>(
                     if !out.texture_refs.contains(&texture_ref) {
                         out.texture_refs.push(texture_ref);
                     }
-                    if let Some(m) =
-                        objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)
-                    {
+                    let mapper_span = crate::runtime::chain_phase::CostSpan::new("wb_tex_mapper_us");
+                    let mapper =
+                        objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref);
+                    drop(mapper_span);
+                    if let Some(m) = mapper {
                         if !out.mapper_ref_texture_mappings.contains(&m) {
                             out.mapper_ref_texture_mappings.push(m);
                         }
-                    } else if objects::resolve_backing(state, host, texture_ref) {
-                        // x86 backing: object ref is surface_id / mapping_id.
-                        if !out.mapper_ref_texture_mappings.contains(&texture_ref) {
-                            out.mapper_ref_texture_mappings.push(texture_ref);
+                    } else {
+                        let backing_span = crate::runtime::chain_phase::CostSpan::new("wb_tex_backing_us");
+                        let resolved = objects::resolve_backing(state, host, texture_ref);
+                        drop(backing_span);
+                        if resolved {
+                            // x86 backing: object ref is surface_id / mapping_id.
+                            if !out.mapper_ref_texture_mappings.contains(&texture_ref) {
+                                out.mapper_ref_texture_mappings.push(texture_ref);
+                            }
                         }
                     }
+                    let resource_span = crate::runtime::chain_phase::CostSpan::new("wb_tex_res_us");
+                    let resource = objects::resolve_resource(state, host, task_id, texture_ref).ok();
+                    drop(resource_span);
                     Some(TextureBind {
                         index,
                         texture_ref,
-                        resource: objects::resolve_resource(state, host, task_id, texture_ref).ok(),
+                        resource,
                     })
                 },
             );
             out.texture_unbinds = out.texture_unbinds.saturating_add(cleared);
         }
         RenderRecord::BindSamplers(r) => {
+            let _smp_span = crate::runtime::chain_phase::CostSpan::new("wb_smp_us");
             let cleared = apply_binds(
                 r.entries,
                 r.first,
@@ -3463,6 +3546,7 @@ fn handle_render_binds<M: HostMemory + HostOps>(
             out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
         }
         RenderRecord::BindSamplersWithLod(r) => {
+            let _smp_span = crate::runtime::chain_phase::CostSpan::new("wb_smp_us");
             let cleared = apply_binds(
                 r.entries,
                 r.first,
@@ -5033,6 +5117,16 @@ fn stream_draw_delta(out: &ExecResult, at_entry: (u32, u32)) -> StreamDrawDelta 
     }
 }
 
+/// TEMP (lab): whether `REIMS_VGPU_LAB_CLEAR_LOG=1`. Read once; the environment
+/// is a process-wide lock and this was asked of every clear-only stream.
+fn lab_clear_log() -> bool {
+    if !crate::runtime::cost_opts::on() {
+        return std::env::var("REIMS_VGPU_LAB_CLEAR_LOG").is_ok_and(|v| v == "1");
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CLEAR_LOG").is_ok_and(|v| v == "1"))
+}
+
 fn finish_stream<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -5056,7 +5150,7 @@ fn finish_stream<M: HostMemory + HostOps>(
     if !will_draw {
         // TEMP (lab, REIMS_VGPU_LAB_CLEAR_LOG=1): every clear-only attachment,
         // whether it reaches guest pages, and whether a lazy Store is owed on it.
-        if std::env::var("REIMS_VGPU_LAB_CLEAR_LOG").is_ok_and(|v| v == "1") {
+        if lab_clear_log() {
             for att in acc.clears.iter() {
                 let owed = state.pending_writebacks.has_gva(
                     crate::runtime::writeback_debt::GvaResourceKey {

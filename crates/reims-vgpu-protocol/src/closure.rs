@@ -265,10 +265,58 @@ pub fn blocking() -> impl Iterator<Item = &'static Op> {
 }
 
 /// The row for one operation, if the ledger has one.
+///
+/// By index for every opcode the ledger can hold, by scan beyond them. The device
+/// asks this for every record it admits and every record it executes — three times
+/// a render record — and the scan was 200 rows a call.
 pub fn find(rail: Rail, opcode: u32) -> Option<&'static Op> {
+    if (opcode as usize) < FIND_OPCODES {
+        let at = FIND_INDEX[rail as usize][opcode as usize];
+        return if at == NO_ROW {
+            None
+        } else {
+            Some(&LEDGER[at as usize])
+        };
+    }
+    find_by_scan(rail, opcode)
+}
+
+/// What [`find`] answers, found the slow way. The index is built to agree with
+/// this and a test holds it to that.
+fn find_by_scan(rail: Rail, opcode: u32) -> Option<&'static Op> {
     LEDGER
         .iter()
         .find(|o| o.rail == rail && o.opcode == Some(opcode))
+}
+
+/// The opcodes the index covers. The ledger's highest is `0x3f7`.
+const FIND_OPCODES: usize = 0x400;
+
+/// One slot per rail, in [`Rail`]'s declaration order.
+const FIND_RAILS: usize = 6;
+
+const NO_ROW: u16 = u16::MAX;
+
+/// Row number by rail and opcode, built at compile time from [`LEDGER`] with the
+/// first row of a pair winning, as the scan's `find` does.
+static FIND_INDEX: [[u16; FIND_OPCODES]; FIND_RAILS] = build_find_index();
+
+const fn build_find_index() -> [[u16; FIND_OPCODES]; FIND_RAILS] {
+    let mut table = [[NO_ROW; FIND_OPCODES]; FIND_RAILS];
+    let mut row = 0;
+    while row < LEDGER.len() {
+        let op = &LEDGER[row];
+        if let Some(code) = op.opcode {
+            if (code as usize) < FIND_OPCODES {
+                let rail = op.rail as usize;
+                if table[rail][code as usize] == NO_ROW {
+                    table[rail][code as usize] = row as u16;
+                }
+            }
+        }
+        row += 1;
+    }
+    table
 }
 
 /// The ledger. One row per decodable operation; see the module docs for what
@@ -2007,6 +2055,48 @@ mod tests {
             missing.is_empty(),
             "manifest selectors covered without a fixed opcode and unjudged here: {missing:?}"
         );
+    }
+
+    /// The index answers what the scan answers, row for row, for every rail and
+    /// every opcode up to well past the ledger's last and the index's edge.
+    #[test]
+    fn the_index_finds_what_the_scan_finds() {
+        let rails = [
+            Rail::Root,
+            Rail::Render,
+            Rail::Compute,
+            Rail::Blit,
+            Rail::Info,
+            Rail::Event,
+        ];
+        assert_eq!(rails.len(), FIND_RAILS);
+        for rail in rails {
+            for opcode in 0..0x600u32 {
+                // By content: `LEDGER` is a `const`, so two uses of it are two
+                // copies and their addresses say nothing.
+                let row = |op: Option<&'static Op>| op.map(|o| (o.rail, o.opcode, o.selector));
+                assert_eq!(
+                    row(find(rail, opcode)),
+                    row(find_by_scan(rail, opcode)),
+                    "{rail:?} {opcode:#x}"
+                );
+            }
+        }
+        assert!(find(Rail::Render, u32::MAX).is_none());
+        // Every row with an opcode is found as itself.
+        for op in LEDGER {
+            if let Some(code) = op.opcode {
+                let found = find(op.rail, code).expect("a ledger row is findable");
+                assert_eq!(
+                    (found.rail, found.opcode, found.selector),
+                    (op.rail, op.opcode, op.selector)
+                );
+            }
+        }
+        assert!(LEDGER
+            .iter()
+            .filter_map(|o| o.opcode)
+            .all(|c| (c as usize) < FIND_OPCODES));
     }
 
     /// Two rows for one operation is two answers to one question, and the
