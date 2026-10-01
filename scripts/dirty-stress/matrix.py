@@ -58,7 +58,7 @@ cfgs = [
     ('wp + frontier + named, ring + hole=tail', dict(NAMED, **RING, **EXACT3, **WP, **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_FRONTIER': 'on', G + 'EPOCH_NAMED': 'on'}), '0'),
     ('CONTROL: wp protects without pausing the writers', dict(WP, STRESS_WP_NOPAUSE='1'), '>0'),
     ('DEFAULTS + wp: named model', dict(NAMED, **WP), '0'),
-    ('DEFAULTS + wp: real ring protocol', dict(NAMED, **RING, **WP), '0'),
+    ('DEFAULTS + wp: real ring protocol + hole=tail', dict(NAMED, **RING, **WP, **{G + 'DIRTY_HOLE': 'tail'}), '0'),
 ]
 ORIGINAL = {G + 'DIRTY_STEAL': 'off', G + 'GEN_LOCKFREE': 'off', G + 'EPOCH_NAMED': 'off', G + 'DIRTY_HOLE': 'off'}
 KEYS = ('steals', 'steal_same', 'steal_late', 'memo_hit', 'memo_fresh', 'memo_diff', 'memo_bad', 'unnamed_skipped',
