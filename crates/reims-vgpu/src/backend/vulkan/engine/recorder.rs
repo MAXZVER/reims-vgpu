@@ -382,6 +382,12 @@ impl Handoff {
         }
         let mut g = self.inner.lock();
         while g.result.is_none() {
+            // Another thread settled it while this one waited (teardown racing
+            // the drain): nothing is left to wait for.
+            if !self.in_flight.load(Ordering::Acquire) {
+                g.submitter_waiting = false;
+                return;
+            }
             blocked = true;
             g.submitter_waiting = true;
             self.done_cv.wait(&mut g);
