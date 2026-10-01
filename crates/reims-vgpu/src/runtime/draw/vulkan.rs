@@ -5823,6 +5823,32 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     })
 }
 
+/// TEMP (lab): the bytes each vertex/fragment buffer bind hands the engine, by
+/// stage and by whether an extent bounded it (`lab_bb_*` count and `_b` bytes).
+fn lab_note_bind_bytes(
+    stage: &str,
+    capped: bool,
+    content: &crate::backend::vulkan::engine::BufferContent,
+) {
+    use crate::backend::vulkan::engine::BufferContent;
+    let (bytes, runs) = match content {
+        BufferContent::GuestRuns(src) => (src.total_len, true),
+        BufferContent::Bytes(b) => (b.len() as u64, false),
+    };
+    let (n, b) = match (stage, capped, runs) {
+        ("vtx", true, true) => ("lab_bb_vtx_capped_runs", "lab_bb_vtx_capped_runs_b"),
+        ("vtx", false, true) => ("lab_bb_vtx_whole_runs", "lab_bb_vtx_whole_runs_b"),
+        ("vtx", true, false) => ("lab_bb_vtx_capped_bytes", "lab_bb_vtx_capped_bytes_b"),
+        ("vtx", false, false) => ("lab_bb_vtx_whole_bytes", "lab_bb_vtx_whole_bytes_b"),
+        (_, true, true) => ("lab_bb_frag_capped_runs", "lab_bb_frag_capped_runs_b"),
+        (_, false, true) => ("lab_bb_frag_whole_runs", "lab_bb_frag_whole_runs_b"),
+        (_, true, false) => ("lab_bb_frag_capped_bytes", "lab_bb_frag_capped_bytes_b"),
+        (_, false, false) => ("lab_bb_frag_whole_bytes", "lab_bb_frag_whole_bytes_b"),
+    };
+    crate::runtime::drain::note_store_route(n);
+    crate::runtime::drain::note_store_route_n(b, bytes);
+}
+
 /// TEMP (lab): whole-allocation run lists for buffers that have no backend
 /// import -- see [`crate::runtime::bound_buffers::WholeRuns`]. On by default;
 /// `REIMS_VGPU_LAB_FIX_WHOLE_RUNS=0` turns it off (the control arm of an A/B).
@@ -9482,6 +9508,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 };
                 content
             };
+            lab_note_bind_bytes("vtx", cap.is_some(), &content);
             vtx_storage.push((b.index, content));
         }
         drop(vertex_span);
@@ -9535,6 +9562,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 };
                 content
             };
+            lab_note_bind_bytes("frag", cap.is_some(), &content);
             frag_storage.push((b.index, content));
         }
         drop(fragment_span);
