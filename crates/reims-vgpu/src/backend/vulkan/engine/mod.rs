@@ -3903,16 +3903,38 @@ pub fn read_target_changed_pages(
     }
     let fresh = unsafe { st.ensure_shadow(ctx, mapping_id, key, padded)? };
     let read_access = pools::ResidentAccess::transfer_read(false);
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_IMAGE`): the compare fetches the frame from
+    // the resident itself, through its allocation-format view, when that is the
+    // packed BGRA8 UNORM the kernel packs back to bytes exactly. A first (fresh)
+    // payment still copies the frame: it lands and seeds the whole of it.
+    let image_view = if !fresh && page_diff::image_enabled() {
+        pools
+            .registry_get(identity)
+            .filter(|slot| slot.format.allocation() == vk::Format::B8G8R8A8_UNORM)
+            .map(|slot| slot.view)
+    } else {
+        None
+    };
+    let image_view = image_view.filter(|_| unsafe { st.ensure_image_pipeline(ctx) });
     let (cur, flags, out) = (
         st.cur.as_ref().expect("ensured"),
         st.flags.as_ref().expect("ensured"),
         st.out.as_ref().expect("ensured"),
     );
     let prev = &st.shadows.get(&mapping_id).expect("ensured").prev;
-    let pipe = st.pipeline.as_ref().expect("ensured");
+    let pipe = if image_view.is_some() {
+        st.image_pipeline.as_ref().expect("ensured")
+    } else {
+        st.pipeline.as_ref().expect("ensured")
+    };
     let one_trip = pipe.one_trip;
     if !fresh {
-        unsafe { pipe.write_set(&ctx.device, cur, prev, flags, out, padded, pages) };
+        match image_view {
+            Some(view) => unsafe {
+                pipe.write_set_image(&ctx.device, view, prev, flags, out, padded, pages)
+            },
+            None => unsafe { pipe.write_set(&ctx.device, cur, prev, flags, out, padded, pages) },
+        }
     }
     if !fresh && one_trip {
         // The kernel copies every page it flags, so the pages the caller must
@@ -3930,9 +3952,80 @@ pub fn read_target_changed_pages(
     }
     let (cur_b, prev_b, flags_b, out_b) = (cur.buffer, prev.buffer, flags.buffer, out.buffer);
     let (pl_layout, pl, set) = (pipe.layout, pipe.pipeline, pipe.set);
+    if image_view.is_some() {
+        crate::runtime::drain::note_store_route("pay_diff_image");
+    }
     unsafe {
         page_diff_submit(ctx, pools, counters, |cb| {
             let d = &ctx.device;
+            if image_view.is_some() {
+                // Sampled in GENERAL (valid for any usage), then put back in the
+                // transfer-read layout the registry records below, so the next
+                // barrier over this resident names the access it actually has.
+                let to_shader = [vk::ImageMemoryBarrier::default()
+                    .src_access_mask(RESIDENT_READ_SRC_ACCESS)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(snap.layout)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(snap.image)
+                    .subresource_range(color_subresource_range())];
+                d.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    feedback_transition_dependency(snap.layout),
+                    &[],
+                    &[],
+                    &to_shader,
+                );
+                d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pl);
+                d.cmd_bind_descriptor_sets(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pl_layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                let push = [
+                    pages as u32,
+                    page_diff::WORDS_PER_PAGE,
+                    w,
+                    (frame_bytes / 4) as u32,
+                ];
+                let bytes: &[u8] = std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 16);
+                d.cmd_push_constants(cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+                d.cmd_dispatch(cb, pages as u32, 1, 1);
+                let back = [vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(read_access.layout())
+                    .image(snap.image)
+                    .subresource_range(color_subresource_range())];
+                d.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &back,
+                );
+                let to_host = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                d.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &to_host,
+                    &[],
+                    &[],
+                );
+                return;
+            }
             let to_src = [vk::ImageMemoryBarrier::default()
                 .src_access_mask(RESIDENT_READ_SRC_ACCESS)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)

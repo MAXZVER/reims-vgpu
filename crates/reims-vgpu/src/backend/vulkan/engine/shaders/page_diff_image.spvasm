@@ -1,0 +1,234 @@
+; page_diff_image: page_diff_one_trip reading the frame straight from the resident
+; image instead of from a buffer copy of it. The copy wrote the whole frame once
+; and the compare read it back once more (~88 MB of device traffic a 5K payment);
+; here the compare fetches the texels itself. Only for a packed 4-byte BGRA8 UNORM
+; resident: a texel is fetched as normalized floats and packed back to its stored
+; bytes (B, G, R, A), which is exact for 8-bit UNORM.
+;
+; `prev` ends equal to the frame on every page (changed words are stored, the rest
+; already matched), so a flagged page is copied to `out` from `prev`.
+;
+; GLSL equivalent (hand-assembled: no glslc on the Windows lab host):
+;
+;   #version 450
+;   layout(local_size_x = 256) in;
+;   layout(set = 0, binding = 0) uniform texture2D img;
+;   layout(std430, set = 0, binding = 1)          buffer Prev  { uint prev[];  };
+;   layout(std430, set = 0, binding = 2)          buffer Flags { uint flags[]; };
+;   layout(std430, set = 0, binding = 3) writeonly buffer Out  { uint out_[];  };
+;   layout(push_constant) uniform Push {
+;       uint page_count; uint words_per_page; uint width; uint words;
+;   } pc;
+;   shared uint any_changed;
+;   void main() {
+;       uint p = gl_WorkGroupID.x;
+;       if (p >= pc.page_count) return;
+;       uint base = p * pc.words_per_page;
+;       if (gl_LocalInvocationID.x == 0u) any_changed = (flags[p] != 0u) ? 1u : 0u;
+;       barrier();
+;       bool diff = false;
+;       for (uint i = gl_LocalInvocationID.x; i < pc.words_per_page; i += 256) {
+;           uint w = base + i;
+;           if (w < pc.words) {
+;               vec4 t = texelFetch(img, ivec2(int(w % pc.width), int(w / pc.width)), 0);
+;               uint c = packUnorm4x8(t.zyxw);
+;               uint pv = prev[w];
+;               if (c != pv) { prev[w] = c; }
+;               diff = diff || (c != pv);
+;           }
+;       }
+;       if (diff) any_changed = 1u;
+;       barrier();
+;       if (any_changed != 0u) {
+;           for (uint i = gl_LocalInvocationID.x; i < pc.words_per_page; i += 256) {
+;               uint w = base + i;
+;               if (w < pc.words) out_[w] = prev[w];
+;           }
+;           if (gl_LocalInvocationID.x == 0u) flags[p] = 1u;
+;       }
+;   }
+               OpCapability Shader
+       %glsl = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %wgid %lid
+               OpExecutionMode %main LocalSize 256 1 1
+               OpDecorate %wgid BuiltIn WorkgroupId
+               OpDecorate %lid BuiltIn LocalInvocationId
+               OpDecorate %rta ArrayStride 4
+               OpMemberDecorate %Buf 0 Offset 0
+               OpDecorate %Buf BufferBlock
+               OpDecorate %img DescriptorSet 0
+               OpDecorate %img Binding 0
+               OpDecorate %prev DescriptorSet 0
+               OpDecorate %prev Binding 1
+               OpDecorate %flags DescriptorSet 0
+               OpDecorate %flags Binding 2
+               OpDecorate %out DescriptorSet 0
+               OpDecorate %out Binding 3
+               OpDecorate %out NonReadable
+               OpMemberDecorate %Push 0 Offset 0
+               OpMemberDecorate %Push 1 Offset 4
+               OpMemberDecorate %Push 2 Offset 8
+               OpMemberDecorate %Push 3 Offset 12
+               OpDecorate %Push Block
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+       %bool = OpTypeBool
+     %v3uint = OpTypeVector %uint 3
+      %v2int = OpTypeVector %int 2
+    %v4float = OpTypeVector %float 4
+  %ptr_in_v3 = OpTypePointer Input %v3uint
+       %wgid = OpVariable %ptr_in_v3 Input
+        %lid = OpVariable %ptr_in_v3 Input
+      %imgty = OpTypeImage %float 2D 0 0 0 1 Unknown
+  %ptr_uc_im = OpTypePointer UniformConstant %imgty
+        %img = OpVariable %ptr_uc_im UniformConstant
+        %rta = OpTypeRuntimeArray %uint
+        %Buf = OpTypeStruct %rta
+  %ptr_u_Buf = OpTypePointer Uniform %Buf
+       %prev = OpVariable %ptr_u_Buf Uniform
+      %flags = OpVariable %ptr_u_Buf Uniform
+        %out = OpVariable %ptr_u_Buf Uniform
+       %Push = OpTypeStruct %uint %uint %uint %uint
+%ptr_pc_Push = OpTypePointer PushConstant %Push
+         %pc = OpVariable %ptr_pc_Push PushConstant
+%ptr_pc_uint = OpTypePointer PushConstant %uint
+ %ptr_u_uint = OpTypePointer Uniform %uint
+%ptr_wg_uint = OpTypePointer Workgroup %uint
+        %any = OpVariable %ptr_wg_uint Workgroup
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+      %int_2 = OpConstant %int 2
+      %int_3 = OpConstant %int 3
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+   %uint_256 = OpConstant %uint 256
+   %uint_264 = OpConstant %uint 264
+      %false = OpConstantFalse %bool
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %wg = OpLoad %v3uint %wgid
+          %p = OpCompositeExtract %uint %wg 0
+       %lid3 = OpLoad %v3uint %lid
+         %l0 = OpCompositeExtract %uint %lid3 0
+   %pcnt_ptr = OpAccessChain %ptr_pc_uint %pc %int_0
+       %pcnt = OpLoad %uint %pcnt_ptr
+    %wpp_ptr = OpAccessChain %ptr_pc_uint %pc %int_1
+        %wpp = OpLoad %uint %wpp_ptr
+      %w_ptr = OpAccessChain %ptr_pc_uint %pc %int_2
+      %width = OpLoad %uint %w_ptr
+     %nw_ptr = OpAccessChain %ptr_pc_uint %pc %int_3
+      %words = OpLoad %uint %nw_ptr
+        %oob = OpUGreaterThanEqual %bool %p %pcnt
+               OpSelectionMerge %done None
+               OpBranchConditional %oob %done %body
+       %body = OpLabel
+       %base = OpIMul %uint %p %wpp
+        %is0 = OpIEqual %bool %l0 %uint_0
+               OpSelectionMerge %initdone None
+               OpBranchConditional %is0 %init %initdone
+       %init = OpLabel
+      %fptr0 = OpAccessChain %ptr_u_uint %flags %int_0 %p
+         %f0 = OpLoad %uint %fptr0
+     %forced = OpINotEqual %bool %f0 %uint_0
+    %anyinit = OpSelect %uint %forced %uint_1 %uint_0
+               OpStore %any %anyinit
+               OpBranch %initdone
+   %initdone = OpLabel
+               OpControlBarrier %uint_2 %uint_2 %uint_264
+               OpBranch %head
+       %head = OpLabel
+          %i = OpPhi %uint %l0 %initdone %inext %cont
+       %diff = OpPhi %bool %false %initdone %dnext %cont
+               OpLoopMerge %exit %cont None
+               OpBranch %cond
+       %cond = OpLabel
+         %lt = OpULessThan %bool %i %wpp
+               OpBranchConditional %lt %lbody %exit
+      %lbody = OpLabel
+          %w = OpIAdd %uint %base %i
+        %inw = OpULessThan %bool %w %words
+               OpSelectionMerge %wmerge None
+               OpBranchConditional %inw %fetch %wmerge
+      %fetch = OpLabel
+         %wx = OpUMod %uint %w %width
+         %wy = OpUDiv %uint %w %width
+         %ix = OpBitcast %int %wx
+         %iy = OpBitcast %int %wy
+      %coord = OpCompositeConstruct %v2int %ix %iy
+       %imgv = OpLoad %imgty %img
+          %t = OpImageFetch %v4float %imgv %coord Lod %int_0
+       %bgra = OpVectorShuffle %v4float %t %t 2 1 0 3
+          %c = OpExtInst %uint %glsl PackUnorm4x8 %bgra
+       %pptr = OpAccessChain %ptr_u_uint %prev %int_0 %w
+         %pv = OpLoad %uint %pptr
+         %ne = OpINotEqual %bool %c %pv
+               OpSelectionMerge %smerge None
+               OpBranchConditional %ne %store %smerge
+      %store = OpLabel
+               OpStore %pptr %c
+               OpBranch %smerge
+     %smerge = OpLabel
+               OpBranch %wmerge
+     %wmerge = OpLabel
+        %dne = OpPhi %bool %false %lbody %ne %smerge
+      %dnext = OpLogicalOr %bool %diff %dne
+               OpBranch %cont
+       %cont = OpLabel
+      %inext = OpIAdd %uint %i %uint_256
+               OpBranch %head
+       %exit = OpLabel
+               OpSelectionMerge %setmerge None
+               OpBranchConditional %diff %setany %setmerge
+     %setany = OpLabel
+               OpStore %any %uint_1
+               OpBranch %setmerge
+   %setmerge = OpLabel
+               OpControlBarrier %uint_2 %uint_2 %uint_264
+       %anyv = OpLoad %uint %any
+     %docopy = OpINotEqual %bool %anyv %uint_0
+               OpSelectionMerge %copydone None
+               OpBranchConditional %docopy %copypre %copydone
+    %copypre = OpLabel
+               OpBranch %chead
+      %chead = OpLabel
+         %ci = OpPhi %uint %l0 %copypre %cinext %ccont
+               OpLoopMerge %cexit %ccont None
+               OpBranch %ccond
+      %ccond = OpLabel
+        %clt = OpULessThan %bool %ci %wpp
+               OpBranchConditional %clt %cbody %cexit
+      %cbody = OpLabel
+         %cw = OpIAdd %uint %base %ci
+       %cinw = OpULessThan %bool %cw %words
+               OpSelectionMerge %cwmerge None
+               OpBranchConditional %cinw %ccopy %cwmerge
+      %ccopy = OpLabel
+        %ppp = OpAccessChain %ptr_u_uint %prev %int_0 %cw
+         %cv = OpLoad %uint %ppp
+        %opp = OpAccessChain %ptr_u_uint %out %int_0 %cw
+               OpStore %opp %cv
+               OpBranch %cwmerge
+    %cwmerge = OpLabel
+               OpBranch %ccont
+      %ccont = OpLabel
+     %cinext = OpIAdd %uint %ci %uint_256
+               OpBranch %chead
+      %cexit = OpLabel
+               OpSelectionMerge %cfmerge None
+               OpBranchConditional %is0 %setf %cfmerge
+       %setf = OpLabel
+       %fptr = OpAccessChain %ptr_u_uint %flags %int_0 %p
+               OpStore %fptr %uint_1
+               OpBranch %cfmerge
+    %cfmerge = OpLabel
+               OpBranch %copydone
+   %copydone = OpLabel
+               OpBranch %done
+       %done = OpLabel
+               OpReturn
+               OpFunctionEnd
