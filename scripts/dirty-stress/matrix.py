@@ -38,7 +38,10 @@ cfgs = [
     ('ring (real protocol, 30% unrung): hole=tail', dict(NAMED, **RING, **{G + 'DIRTY_HOLE': 'tail'}), '0'),
     ('ring: hole=tail + epoch_named + exact3', dict(NAMED, **RING, **EXACT3, **{G + 'DIRTY_HOLE': 'tail', G + 'EPOCH_NAMED': 'on'}), '0'),
     ('CONTROL: drain reads lagged', {'STRESS_DRAIN_LAGGED': '1'}, '>0'),
+    ('DEFAULTS (no gate env): named model', dict(NAMED), '0'),
+    ('DEFAULTS (no gate env): real ring protocol', dict(NAMED, **RING), '0'),
 ]
+ORIGINAL = {G + 'DIRTY_STEAL': 'off', G + 'GEN_LOCKFREE': 'off', G + 'EPOCH_NAMED': 'off', G + 'DIRTY_HOLE': 'off'}
 KEYS = ('steals', 'steal_same', 'steal_late', 'memo_hit', 'memo_fresh', 'memo_diff', 'memo_bad', 'unnamed_skipped',
         'lf_hit', 'lf_hitdiff', 'lf_gendiff', 'lf_race', 'lfw_hit', 'lfw_miss', 'lfw_diff', 'lfw_race', 'closed')
 only = os.environ.get('ONLY')
@@ -49,6 +52,10 @@ for name, e, expect in cfgs:
     if only and only not in name:
         continue
     env = dict(env0)
+    # Every row states the original path for the gates it does not name (they
+    # default on since 2026-10-01), except the rows that test the defaults.
+    if not name.startswith('DEFAULTS'):
+        env.update(ORIGINAL)
     env.update(extra)
     env.update(e)
     r = subprocess.run([os.path.join(HERE, 'stress.exe'), secs], env=env, capture_output=True, text=True)
