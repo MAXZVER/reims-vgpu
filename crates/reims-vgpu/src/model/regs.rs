@@ -967,6 +967,22 @@ pub fn display_dimension_mm(millimetres: u16) -> (f32, u16) {
 /// 125 Hz against the 120 advertised here, and the guest paces to what is
 /// delivered.
 pub const DISPLAY_REFRESH_HZ: u32 = 120;
+
+/// The refresh this device advertises and delivers: [`DISPLAY_REFRESH_HZ`], or
+/// TEMP lab `REIMS_VGPU_LAB_REFRESH_HZ=N` (30..=1000). At 120 a light scene
+/// that could run faster saturates at the grid and its headroom is only
+/// visible as drain idle time; a higher lab refresh lets the frame rate itself
+/// show how fast the device can go.
+pub fn display_refresh_hz() -> u32 {
+    static HZ: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *HZ.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_REFRESH_HZ")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|hz| (30..=1000).contains(hz))
+            .unwrap_or(DISPLAY_REFRESH_HZ)
+    })
+}
 pub const DISPLAY_PRODUCT_NAME: &[u8] = b"QEMU display\0";
 /// How many unacked ONLINE pulses this device sends before it stops.
 ///

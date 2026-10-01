@@ -4844,7 +4844,7 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     if gpa == 0 {
         return;
     }
-    let Some(refresh) = display_refresh_hz_1616(DISPLAY_REFRESH_HZ) else {
+    let Some(refresh) = display_refresh_hz_1616(display_refresh_hz()) else {
         return;
     };
     let psz = page_size as usize;
@@ -7837,6 +7837,12 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
 pub(crate) const DISPLAY_VBL_MIN_INTERVAL_US: u64 =
     1_000_000 / crate::model::DISPLAY_REFRESH_HZ as u64;
 
+/// The VBL interval actually delivered: [`DISPLAY_VBL_MIN_INTERVAL_US`] unless
+/// the lab refresh override is set (see [`crate::model::display_refresh_hz`]).
+pub(crate) fn display_vbl_interval_us() -> u64 {
+    1_000_000 / crate::model::display_refresh_hz() as u64
+}
+
 /// Atomically claim the next display VBL for either the locked or lock-free
 /// poll path. A single shared timestamp makes the cadence independent of device
 /// lock contention and prevents both paths from signaling the same interval.
@@ -7859,13 +7865,14 @@ pub(crate) const DISPLAY_VBL_MIN_INTERVAL_US: u64 =
 pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: u64) -> bool {
     let last = last_us.load(std::sync::atomic::Ordering::Acquire);
     let gap = now_us.saturating_sub(last);
-    if gap < DISPLAY_VBL_MIN_INTERVAL_US {
+    let interval = display_vbl_interval_us();
+    if gap < interval {
         return false;
     }
-    let next = if gap >= 2 * DISPLAY_VBL_MIN_INTERVAL_US {
+    let next = if gap >= 2 * interval {
         now_us
     } else {
-        last + DISPLAY_VBL_MIN_INTERVAL_US
+        last + interval
     };
     last_us
         .compare_exchange(

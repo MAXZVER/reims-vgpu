@@ -46,6 +46,24 @@ pub fn rank_physical_device(device_type: vk::PhysicalDeviceType) -> u8 {
 pub fn select_physical_device<T: Copy>(
     candidates: &[(u32, vk::PhysicalDeviceType, T)],
 ) -> Result<(T, u32), Vec<u32>> {
+    select_physical_device_preferring(candidates, lab_preferred_type())
+}
+
+/// TEMP lab: `REIMS_VGPU_LAB_GPU=integrated|discrete` puts that device type
+/// first, so a second VM can run on the iGPU and leave the discrete GPU (and
+/// its VRAM) to the VM being measured. Unset or unknown keeps the rank policy.
+fn lab_preferred_type() -> Option<vk::PhysicalDeviceType> {
+    match std::env::var("REIMS_VGPU_LAB_GPU").ok()?.as_str() {
+        "integrated" => Some(vk::PhysicalDeviceType::INTEGRATED_GPU),
+        "discrete" => Some(vk::PhysicalDeviceType::DISCRETE_GPU),
+        _ => None,
+    }
+}
+
+fn select_physical_device_preferring<T: Copy>(
+    candidates: &[(u32, vk::PhysicalDeviceType, T)],
+    prefer: Option<vk::PhysicalDeviceType>,
+) -> Result<(T, u32), Vec<u32>> {
     let mut below_floor = Vec::new();
     let mut best: Option<(u8, T, u32)> = None;
     for (api, device_type, payload) in candidates {
@@ -53,7 +71,11 @@ pub fn select_physical_device<T: Copy>(
             below_floor.push(*api);
             continue;
         }
-        let rank = rank_physical_device(*device_type);
+        let rank = if prefer == Some(*device_type) {
+            u8::MAX
+        } else {
+            rank_physical_device(*device_type)
+        };
         if best.is_none_or(|(best_rank, _, _)| rank > best_rank) {
             best = Some((rank, *payload, *api));
         }
@@ -152,5 +174,32 @@ mod tests {
             (vk::API_VERSION_1_3, T::CPU, 'c'),
         ]);
         assert_eq!(chosen, Ok(('d', vk::API_VERSION_1_2)));
+    }
+
+    /// The lab preference puts an iGPU ahead of a discrete GPU, but never
+    /// resurrects a device below the floor.
+    #[test]
+    fn a_preferred_integrated_gpu_beats_a_discrete_one_above_the_floor() {
+        use vk::PhysicalDeviceType as T;
+        let host = [
+            (vk::API_VERSION_1_3, T::DISCRETE_GPU, 'd'),
+            (vk::API_VERSION_1_3, T::INTEGRATED_GPU, 'i'),
+        ];
+        assert_eq!(
+            select_physical_device_preferring(&host, Some(T::INTEGRATED_GPU)),
+            Ok(('i', vk::API_VERSION_1_3))
+        );
+        assert_eq!(
+            select_physical_device_preferring(&host, None),
+            Ok(('d', vk::API_VERSION_1_3))
+        );
+        let old_igpu = [
+            (vk::API_VERSION_1_3, T::DISCRETE_GPU, 'd'),
+            (vk::API_VERSION_1_1, T::INTEGRATED_GPU, 'i'),
+        ];
+        assert_eq!(
+            select_physical_device_preferring(&old_igpu, Some(T::INTEGRATED_GPU)),
+            Ok(('d', vk::API_VERSION_1_3))
+        );
     }
 }

@@ -347,7 +347,7 @@ impl VblCensus {
             self.arms[VBL_NOT_CLAIMED].load(Relaxed),
             self.arms[VBL_NOT_ONLINE].load(Relaxed),
             self.arms[VBL_NOT_ENABLED].load(Relaxed),
-            1_000_000.0 / DISPLAY_VBL_MIN_INTERVAL_US as f64,
+            1_000_000.0 / super::display_vbl_interval_us() as f64,
         ))
     }
 }
