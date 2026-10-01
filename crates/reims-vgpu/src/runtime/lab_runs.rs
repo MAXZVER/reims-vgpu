@@ -1,8 +1,10 @@
 //! TEMP (lab): exact fixes for the per-bind cost of a sampled window backed by a
 //! mapping's guest pages (the `runs_big` route of `resolve_sampled_source`).
-//! `REIMS_VGPU_LAB_RUNS_FIX=on` turns them on, `=verify` runs them beside the
-//! original computation and counts every disagreement (the answer returned is
-//! the original's), anything else keeps today's behaviour.
+//! On by default since it was verified (2026-10-01, 5K Tahoe x86: 76 k + 62 k
+//! live verify comparisons with 0 disagreements, three drag A/B pairs, two hunt
+//! tours with clean frames); `REIMS_VGPU_LAB_RUNS_FIX=off` restores the original
+//! code path, `=verify` runs the fixes beside the original computation and counts
+//! every disagreement (the answer returned is the original's).
 //!
 //! Two fixes, neither a dirty-tracking shortcut - each returns exactly what the
 //! code it short-cuts returns:
@@ -18,7 +20,9 @@
 //!   it), the control-layout key (the other side of the control-page collision
 //!   check) and the window's own arithmetic. A hit skips the whole-mapping page
 //!   `Vec`, the run memo's SipHash over the window, the run list clone and the
-//!   page-list clone.
+//!   page-list clone. For a mapping with no `mapping_internal` (every mapping on
+//!   the x86 pathway) the key is a pure read of `&DeviceState`
+//!   ([`crate::runtime::mapper::mapping_window_cached`]).
 //!
 //! Counters: `lab_rf_hw_shortcut` / `lab_rf_hw_full` (asks answered by the epoch
 //! shortcut / by the walk), `lab_rf_wc_hit` / `lab_rf_wc_miss` (window cache),
@@ -43,9 +47,9 @@ pub fn mode() -> Mode {
     static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("REIMS_VGPU_LAB_RUNS_FIX").as_deref() {
-            Ok("on") => Mode::On,
+            Ok("off") => Mode::Off,
             Ok("verify") => Mode::Verify,
-            _ => Mode::Off,
+            _ => Mode::On,
         },
     )
 }
