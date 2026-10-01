@@ -518,6 +518,13 @@ pub trait HostOps {
     /// run that waits on no other channel's stamps. Default: nothing to note.
     fn note_work_scope(&self, _scope: WorkScope) {}
 
+    /// The drain has just read child channel `channel`'s ring tail from guest
+    /// memory and will run the packets up to it. Called before
+    /// [`Self::note_work_scope`]. A host whose write witness opens epochs at
+    /// doorbells uses it to open one after a tail no doorbell covered. Default:
+    /// nothing to note.
+    fn note_ring_tail(&self, _channel: u32, _tail: u32) {}
+
     /// Current packed-alias levels and cumulative lifetime totals. `None`
     /// means this host does not construct or cannot report such aliases.
     fn page_alias_census(&self) -> Option<PageAliasCensus> {

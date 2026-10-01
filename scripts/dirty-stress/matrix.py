@@ -13,6 +13,7 @@ extra = dict(a.split('=', 1) for a in sys.argv[2:])
 G = 'REIMS_VGPU_LAB_'
 NAMED = {'STRESS_NAMED_ONLY': '1', 'STRESS_NONDB_HZ': '250'}
 HOLE = {'STRESS_HOLE': '25', 'STRESS_HOLE_US': '40'}
+RING = {'STRESS_RING': '1', 'STRESS_RING_SKIP': '30', 'STRESS_HOLE_US': '40'}
 EXACT3 = {G + 'DIRTY_STEAL': 'on', G + 'GEN_MEMO': 'on', G + 'GEN_LOCKFREE': 'on'}
 cfgs = [
     ('off', {}, '0'),
@@ -32,6 +33,10 @@ cfgs = [
     ('hole 25%: epoch_named + hole=census', dict(NAMED, **HOLE, **{G + 'EPOCH_NAMED': 'on', G + 'DIRTY_HOLE': 'census'}), '>0'),
     ('hole 25%: epoch_named + hole=close', dict(NAMED, **HOLE, **{G + 'EPOCH_NAMED': 'on', G + 'DIRTY_HOLE': 'close'}), '0'),
     ('hole 25%: epoch_named + hole=close + exact3', dict(NAMED, **HOLE, **EXACT3, **{G + 'EPOCH_NAMED': 'on', G + 'DIRTY_HOLE': 'close'}), '0'),
+    ('ring (real protocol, 30% unrung): off', dict(NAMED, **RING), '>0'),
+    ('ring (real protocol, 30% unrung): hole=close', dict(NAMED, **RING, **{G + 'DIRTY_HOLE': 'close'}), '?'),
+    ('ring (real protocol, 30% unrung): hole=tail', dict(NAMED, **RING, **{G + 'DIRTY_HOLE': 'tail'}), '0'),
+    ('ring: hole=tail + epoch_named + exact3', dict(NAMED, **RING, **EXACT3, **{G + 'DIRTY_HOLE': 'tail', G + 'EPOCH_NAMED': 'on'}), '0'),
     ('CONTROL: drain reads lagged', {'STRESS_DRAIN_LAGGED': '1'}, '>0'),
 ]
 KEYS = ('steals', 'steal_same', 'steal_late', 'memo_hit', 'memo_fresh', 'memo_diff', 'memo_bad', 'unnamed_skipped',
@@ -50,7 +55,7 @@ for name, e, expect in cfgs:
     res = re.search(r'RESULT (.*)', r.stdout)
     viol = re.search(r'violations=(\d+)', res.group(1)) if res else None
     n = int(viol.group(1)) if viol else -1
-    ok = (n == 0) if expect == '0' else (n > 0)
+    ok = True if expect == '?' else (n == 0) if expect == '0' else (n > 0)
     bad += not ok
     lab = {}
     for l in r.stderr.splitlines():

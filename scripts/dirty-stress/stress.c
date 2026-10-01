@@ -231,6 +231,16 @@ static uint64_t fixed_tokens[MAXSETS];
 static int cfg_churn = 1;
 static int cfg_named_only, cfg_nondb_hz, cfg_hole_pct, cfg_hole_us = 40;
 static int cfg_ring_gap_us = 150;
+/*
+ * STRESS_RING=1: the real child-ring protocol. The guest stores the packet and then the ring tail
+ * (publication), and rings the doorbell after that; the drain reads the tail from memory, so it can run a
+ * packet before its doorbell is noted, or one appended behind the tail a doorbell covered. The doorbell reads
+ * the tail before it opens its epoch (reims_vgpu_dirty_note_child_tail) and the drain reports every tail it
+ * reads (reims_vgpu_dirty_note_ring_tail). STRESS_RING_SKIP=pct: the guest rings for only some packets (a
+ * later doorbell covers the batch). STRESS_HOLE_US is the publish-to-doorbell delay.
+ */
+static int cfg_ring, cfg_ring_skip;
+static uint32_t ring_tail_pub[8];      /* per channel: packets published, under pk_lock */
 
 static void *guest_thread(void *arg)
 {
@@ -255,6 +265,37 @@ static void *guest_thread(void *arg)
             if (rnd(&st) % 3) {
                 p->sets_mask |= 1u << i;
             }
+        }
+        if (cfg_ring) {
+            uint32_t snap_tail;
+            int ch = p->channel < 1 ? 1 : p->channel;
+
+            p->channel = ch;
+            qemu_mutex_lock(&pk_lock);
+            if (pk_tail) {
+                pk_tail->next = p;
+            } else {
+                pk_head = p;
+            }
+            pk_tail = p;
+            ring_tail_pub[ch]++;
+            qemu_cond_signal(&pk_cond);
+            qemu_mutex_unlock(&pk_lock);
+            if (!(cfg_ring_skip && (int)(rnd(&st) % 100) < cfg_ring_skip)) {
+                spin_us(rnd(&st) % (cfg_hole_us + 1));
+                qemu_mutex_lock(&pk_lock);
+                snap_tail = ring_tail_pub[ch];
+                qemu_mutex_unlock(&pk_lock);
+                if (reims_vgpu_dirty_note_doorbell(D, ch)) {
+                    qemu_mutex_lock(&hv_lock);
+                    hv_asked++;
+                    qemu_cond_signal(&hv_cond);
+                    qemu_mutex_unlock(&hv_lock);
+                }
+                reims_vgpu_dirty_note_child_tail(D, ch, snap_tail, true);
+            }
+            spin_us(rnd(&st) % (cfg_ring_gap_us * 2 + 1));
+            continue;
         }
         /* The doorbell (epoch), then the packet; or, in a "hole" packet, the packet first (the drain reads the
          * ring tail from guest memory, so it can see the packet before the doorbell write lands). */
@@ -444,7 +485,16 @@ static void *drain_thread(void *arg)
         if (!pk_head) {
             pk_tail = NULL;
         }
-        qemu_mutex_unlock(&pk_lock);
+        {
+            /* The tail as the drain reads it from memory: at least this packet, maybe more behind it. */
+            uint32_t seen_tail = (cfg_ring && p->channel > 0 && p->channel < 8)
+                                 ? ring_tail_pub[p->channel] : 0;
+
+            qemu_mutex_unlock(&pk_lock);
+            if (cfg_ring) {
+                reims_vgpu_dirty_note_ring_tail(D, (uint32_t)p->channel, seen_tail);
+            }
+        }
 
         reims_vgpu_dirty_note_work_scope(D, 0xffffffffu);
         reims_vgpu_dirty_note_work_scope(D, 0x80000000u | (uint32_t)(p->channel < 0 ? 0 : p->channel));
@@ -553,6 +603,8 @@ int main(int argc, char **argv)
     cfg_named_only = (e = getenv("STRESS_NAMED_ONLY")) ? atoi(e) : 0;
     cfg_nondb_hz = (e = getenv("STRESS_NONDB_HZ")) ? atoi(e) : 0;
     cfg_hole_pct = (e = getenv("STRESS_HOLE")) ? atoi(e) : 0;
+    cfg_ring = (e = getenv("STRESS_RING")) ? atoi(e) : 0;
+    cfg_ring_skip = (e = getenv("STRESS_RING_SKIP")) ? atoi(e) : 0;
     cfg_reader_spin = (e = getenv("STRESS_READER_SPIN_US")) ? atoi(e) : 30;
     cfg_reader_pure = (e = getenv("STRESS_READER_PURE")) ? atoi(e) : 0;
     cfg_hole_us = (e = getenv("STRESS_HOLE_US")) ? atoi(e) : 40;

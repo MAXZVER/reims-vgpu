@@ -7385,6 +7385,9 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     };
     let setup_started = std::time::Instant::now();
     let regs_gpa = state.pfn_gpa(state.gfx.root_page) + regs_off;
+    // Where the shim's doorbell for this channel reads the tail before it opens
+    // its dirty-tracking epoch (`reims_vgpu_qemu_child_tail_gpa`).
+    crate::runtime::ring_tail::publish(state.id.0, channel_id, regs_gpa + CHILD_REG_TAIL);
 
     let mut head = match crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_HEAD) {
         Ok(v) => v,
@@ -7461,6 +7464,9 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 break;
             }
         };
+        // Before the scope: a tail no doorbell's epoch covers gets one opened
+        // after this read, and the scope below then makes the reads owe it.
+        host.note_ring_tail(channel_id, tail);
         host.note_work_scope(crate::runtime::host::WorkScope::All);
         let ring = Ring::Child {
             page_gpas: &page_gpas,

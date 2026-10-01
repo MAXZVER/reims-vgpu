@@ -126,6 +126,7 @@ pub mod released_pages;
 /// or a guest-memory reader makes the bytes observable.
 pub mod render_pass;
 pub mod render_writeback;
+pub mod ring_tail;
 /// A rail's own name for a resident render target, opaque to the layers that
 /// carry it. See the module doc for the ledger this exists for.
 pub mod resident_target;

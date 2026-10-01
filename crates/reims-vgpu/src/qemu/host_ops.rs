@@ -158,6 +158,8 @@ pub struct ReimsVgpuHostOps {
     pub thread_attach: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
     /// The other half: unregister the calling thread, as its last act.
     pub thread_detach: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
+    /// The drain read child channel `channel`'s ring tail; see the ABI header.
+    pub note_ring_tail: Option<unsafe extern "C" fn(ctx: *mut c_void, channel: u32, tail: u32)>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -275,6 +277,7 @@ impl ReimsVgpuHostOps {
             note_work_scope: None,
             thread_attach: None,
             thread_detach: None,
+            note_ring_tail: None,
         }
     }
 }
@@ -839,6 +842,13 @@ impl HostOps for QemuHost<'_> {
             };
             // SAFETY: QEMU owns the live ctx; the callback takes a leaf lock.
             unsafe { callback(self.ops.ctx, raw) }
+        }
+    }
+
+    fn note_ring_tail(&self, channel: u32, tail: u32) {
+        if let Some(callback) = self.ops.note_ring_tail {
+            // SAFETY: QEMU owns the live ctx; the callback takes a leaf lock.
+            unsafe { callback(self.ops.ctx, channel, tail) }
         }
     }
 

@@ -21,7 +21,14 @@
 extern "C" {
 #endif
 
-/* v24: ReimsVgpuHostOps.thread_attach / thread_detach — let the device's own
+/* v25: ReimsVgpuHostOps.note_ring_tail and reims_vgpu_qemu_child_tail_gpa — a
+ *      child ring's tail is read from guest memory, so the drain can run packets
+ *      whose doorbell has not been noted, or that were appended behind the tail
+ *      a doorbell covered. The shim reads the tail Rust names before a child
+ *      doorbell opens its dirty-tracking epoch; the drain reports every tail it
+ *      reads, and the tracker opens an epoch after a tail no epoch covers.
+ *      NULL note_ring_tail is a shim that closes no such window.
+ * v24: ReimsVgpuHostOps.thread_attach / thread_detach — let the device's own
  *      worker threads read guest memory. A thread that reads the FlatView
  *      (read_gpa, guest_write_gen, guest_written_pages) must be registered with
  *      QEMU's RCU, or synchronize_rcu() does not wait for it and it can see a
@@ -115,7 +122,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 24u
+#define REIMS_VGPU_QEMU_ABI_VERSION 25u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -444,6 +451,15 @@ typedef struct ReimsVgpuHostOps {
      */
     void (*thread_attach)(void *ctx);
     void (*thread_detach)(void *ctx);
+    /*
+     * The drain has just read child channel `channel`'s ring tail from guest
+     * memory and will run the packets up to it; called before note_work_scope.
+     * The shim makes the generation reads that follow owe every guest store
+     * ordered before this read when no epoch already covers this tail (see
+     * reims_vgpu_qemu_child_tail_gpa). Never blocks on guest work. NULL: the
+     * reads owe what the doorbells alone bind, as before.
+     */
+    void (*note_ring_tail)(void *ctx, uint32_t channel, uint32_t tail);
 } ReimsVgpuHostOps;
 
 /*
@@ -544,6 +560,10 @@ int reims_vgpu_qemu_gfx_write(uint64_t handle, uint64_t offset, uint64_t data,
  * no doorbell. Pure; ask it before the write. */
 int reims_vgpu_qemu_gfx_write_doorbell_channel(uint64_t offset, uint64_t data,
                                         uint32_t size);
+/* The guest-physical address of child channel `channel`'s tail register, or 0
+ * while the device has not set that ring up. Lock-free; a child doorbell reads
+ * the tail there before it opens its dirty-tracking epoch. */
+uint64_t reims_vgpu_qemu_child_tail_gpa(uint64_t handle, uint32_t channel);
 int reims_vgpu_qemu_iosfc_read(uint64_t handle, uint64_t offset, uint32_t size,
                         uint64_t *out_val);
 int reims_vgpu_qemu_iosfc_write(uint64_t handle, uint64_t offset, uint64_t data,

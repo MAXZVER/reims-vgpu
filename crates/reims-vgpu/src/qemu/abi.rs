@@ -60,6 +60,12 @@ use std::slice;
 
 /// Bump when breaking the C shim contract.
 ///
+/// v25 adds `note_ring_tail` on [`ReimsVgpuHostOps`] and
+/// [`reims_vgpu_qemu_child_tail_gpa`]: a child doorbell reads its ring's tail
+/// before it opens a dirty-tracking epoch, and the drain reports every tail it
+/// reads, so a packet the drain runs before its doorbell (or behind the tail a
+/// doorbell covered) is still owed a sync begun after it was published.
+///
 /// v24 adds `thread_attach` / `thread_detach` on [`ReimsVgpuHostOps`]: the door
 /// through which a thread this crate spawns joins QEMU's RCU, which it must
 /// before it reads the FlatView (`read_gpa`, the dirty-tracker queries). A shim
@@ -99,7 +105,7 @@ use std::slice;
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
 /// v20 gives `map_pages` a structured per-call failure output.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 24;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 25;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -452,6 +458,19 @@ pub extern "C" fn reims_vgpu_qemu_gfx_write_doorbell_channel(
             None => -1,
         },
         -1,
+    )
+}
+
+/// Where child channel `channel`'s tail register is in guest memory, or 0 while
+/// the drain has not set that ring up. Lock-free (see
+/// [`crate::runtime::ring_tail`]): a child doorbell asks it on the vCPU, before
+/// it opens its dirty-tracking epoch.
+#[no_mangle]
+pub extern "C" fn reims_vgpu_qemu_child_tail_gpa(handle: u64, channel: u32) -> u64 {
+    unwind_safe(
+        "reims_vgpu_qemu_child_tail_gpa",
+        || crate::runtime::ring_tail::lookup(handle, channel),
+        0,
     )
 }
 
@@ -978,14 +997,15 @@ mod tests {
 
     /// `ReimsVgpuHostOps` is one struct written twice, and a field added to only
     /// one of them shifts every later offset the shim's compiler lays out. The
-    /// pair v24 appended is the tail of both: same names, same order, last.
+    /// pair v24 appended and the `note_ring_tail` v25 appended after it are the
+    /// tail of both: same names, same order, last.
     ///
     /// Offsets as well as names, because the table is passed by pointer and the
     /// header is the only other copy: `thread_attach` has to sit immediately
-    /// after `note_work_scope` and `thread_detach` immediately after that, with
-    /// nothing after it.
+    /// after `note_work_scope`, `thread_detach` immediately after that and
+    /// `note_ring_tail` after it, with nothing after that.
     #[test]
-    fn the_abi_header_ends_the_host_ops_table_with_the_thread_registration_pair() {
+    fn the_abi_header_ends_the_host_ops_table_with_the_thread_pair_and_the_ring_tail() {
         use crate::qemu::host_ops::ReimsVgpuHostOps;
 
         const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
@@ -1013,11 +1033,12 @@ mod tests {
             .filter(|f| !f.is_empty())
             .collect();
         assert_eq!(
-            &fields[fields.len() - 3..],
+            &fields[fields.len() - 4..],
             [
                 "void (*note_work_scope)(void *ctx, uint32_t scope)",
                 "void (*thread_attach)(void *ctx)",
                 "void (*thread_detach)(void *ctx)",
+                "void (*note_ring_tail)(void *ctx, uint32_t channel, uint32_t tail)",
             ],
             "the header's HostOps tail must match the Rust struct's"
         );
@@ -1032,9 +1053,13 @@ mod tests {
             std::mem::offset_of!(ReimsVgpuHostOps, thread_attach) + word
         );
         assert_eq!(
+            std::mem::offset_of!(ReimsVgpuHostOps, note_ring_tail),
+            std::mem::offset_of!(ReimsVgpuHostOps, thread_detach) + word
+        );
+        assert_eq!(
             std::mem::size_of::<ReimsVgpuHostOps>(),
-            std::mem::offset_of!(ReimsVgpuHostOps, thread_detach) + word,
-            "nothing may follow the pair on either side"
+            std::mem::offset_of!(ReimsVgpuHostOps, note_ring_tail) + word,
+            "nothing may follow the ring tail on either side"
         );
     }
 
