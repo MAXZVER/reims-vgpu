@@ -4356,14 +4356,17 @@ impl DeviceState {
         named
     }
 
-    /// Whether `task_id` is the task the guest speaks mapping ids in for the
-    /// mapping numbered `object_id`: the one whose page table walked its backing.
+    /// Whether the integer `object_id`, spelled bare by `task_id`, may name the
+    /// mapping of that number: the mapping exists and either `task_id` is the task
+    /// whose page table walked its backing (the one the guest speaks mapping ids
+    /// in) or the mapping has no backing walk, so its owner is unknown and the
+    /// old reading stands. A mapping another task walked is not named by this
+    /// task's bare integer, whatever the integer.
     #[must_use]
     pub fn bare_reference_names_mapping(&self, task_id: u32, object_id: u32) -> bool {
         self.mappings
             .get(&object_id)
-            .and_then(|m| m.backing_walk)
-            .is_some_and(|walk| walk.task_id == task_id)
+            .is_some_and(|m| m.backing_walk.is_none_or(|walk| walk.task_id == task_id))
     }
 
     /// Whether `object_id`, spelled bare (`REIMS_VGPU_NAME_NARROW`, opt-in for now),

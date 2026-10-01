@@ -347,7 +347,8 @@ pub const BACKING_A008: &str = "REIMS_VGPU_BACKING_A008";
 pub const PAY_DIFF: &str = "REIMS_VGPU_PAY_DIFF";
 
 /// `on` makes a bare integer name a mapping only in the task the guest speaks
-/// mapping ids in: the one whose page table walked that mapping's backing.
+/// mapping ids in: the one whose page table walked that mapping's backing (a
+/// mapping with no backing walk has no owner to compare and is named as before).
 /// Unset, every task's reference N also names the mapping numbered N, as it always
 /// has, in `DeviceState::mappings_named_by` -- which the validity quads
 /// (`clear_host_valid`) and the render-frame ledger's payment by reference both

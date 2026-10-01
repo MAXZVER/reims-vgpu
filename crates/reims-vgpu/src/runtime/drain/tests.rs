@@ -783,6 +783,10 @@ fn a_bare_reference_names_the_mapping_only_in_the_task_that_walked_its_backing()
         !state.bare_reference_names_mapping(0, 10),
         "no mapping 10 exists to be named"
     );
+    // A mapping nobody walked the backing of has no owner to compare against, so
+    // the old reading stands for it.
+    state.map_surface(11);
+    assert!(state.bare_reference_names_mapping(3, 11));
     // A registration names it for the task that made one, whatever the integer.
     state.texture_to_mapping.insert((3, 40), 9);
     assert!(state.mappings_named_by(3, 40).iter().any(|id| id == 9));
