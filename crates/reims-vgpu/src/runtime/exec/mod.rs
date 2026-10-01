@@ -5360,6 +5360,11 @@ fn finish_stream<M: HostMemory + HostOps>(
         // deferred failure.
         let mut resident_chain_before_last_record = false;
         let mut resident_chain_before_this_record = false;
+        // TEMP (lab, S5a): wake the recorder while the first record is prepared.
+        #[cfg(feature = "backend-vulkan")]
+        if crate::backend::selected().rail() == crate::backend::Rail::Vulkan {
+            crate::runtime::draw::vulkan::prewake_recorder_for_stream(draw_list.len());
+        }
         let first_draw = draw_list.first().copied();
         let mut first_req = first_draw.and_then(|pd| {
             out.render_attachment_resolves = out.render_attachment_resolves.saturating_add(1);
@@ -5474,7 +5479,11 @@ fn finish_stream<M: HostMemory + HostOps>(
                 // it is and take the chain back to the state from before it, as
                 // the sequential path (which never got here) would have had it.
                 if req.deferred_failure_of_previous {
-                    take_back_deferred_record(out, &mut resident_chain, resident_chain_before_last_record);
+                    take_back_deferred_record(
+                        out,
+                        &mut resident_chain,
+                        resident_chain_before_last_record,
+                    );
                 }
                 // Read before the status is matched: a draw whose Store failed
                 // still ran its query, and the count is the guest's answer

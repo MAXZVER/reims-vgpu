@@ -1507,6 +1507,15 @@ pub fn deferred_draws_enabled() -> bool {
     recorder::enabled() && is_drain_thread()
 }
 
+/// TEMP (lab, S5a): a stream with more than one record is about to start, on the
+/// drain: bring the recorder's thread awake now, in parallel with the first
+/// record's preparation, rather than at its first job.
+pub fn prewake_recorder() {
+    if deferred_draws_enabled() {
+        recorder::DRAW.prewake();
+    }
+}
+
 /// TEMP (lab, S5a): whether the drain owes the recorder a join — a draw is out,
 /// or its result has not been taken — which is true after the gate is turned off
 /// as well as while it is on.

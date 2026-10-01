@@ -172,6 +172,9 @@ struct Inner {
     /// taken yet.
     stash: Option<JobResult>,
     worker_parked: bool,
+    /// Set by [`Handoff::prewake`] to bring a parked worker out of its park
+    /// without a job: it goes back to spinning for the one that is coming.
+    kick: bool,
     /// Threads inside `settle_slow` waiting for a result. At most one at a time
     /// (`settle_lock`), but counted and woken with `notify_all` anyway so the
     /// protocol does not rest on that.
@@ -213,6 +216,7 @@ struct Stats {
     submitted: AtomicU64,
     busy_ns: AtomicU64,
     parked_wakes: AtomicU64,
+    prewakes: AtomicU64,
     join_n: [AtomicU64; 4],
     join_blocked: [AtomicU64; 4],
     join_ns: [AtomicU64; 4],
@@ -233,6 +237,7 @@ impl Stats {
             submitted: Z,
             busy_ns: Z,
             parked_wakes: Z,
+            prewakes: Z,
             join_n: [Z; 4],
             join_blocked: [Z; 4],
             join_ns: [Z; 4],
@@ -274,6 +279,7 @@ impl Handoff {
                 result: None,
                 stash: None,
                 worker_parked: false,
+                kick: false,
                 waiters: 0,
                 shutdown: false,
                 thread: None,
@@ -343,11 +349,19 @@ impl Handoff {
                 }
             }
             let mut g = self.inner.lock();
-            while g.job.is_none() && !g.shutdown {
+            while g.job.is_none() && !g.shutdown && !g.kick {
                 g.worker_parked = true;
                 self.work_cv.wait(&mut g);
             }
             g.worker_parked = false;
+            if g.kick {
+                // Woken ahead of a job (a stream is starting): spin for it
+                // instead of sleeping on it.
+                g.kick = false;
+                if g.job.is_none() && !g.shutdown {
+                    continue;
+                }
+            }
             // Retiring: `stop` clears `alive` after it has joined this thread,
             // under `lifecycle`, so there is nothing for the exit to publish.
             let Some(job) = g.job.take() else {
@@ -402,6 +416,24 @@ impl Handoff {
         }
         drop(g);
         self.stats.submitted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bring a parked worker awake ahead of a job. The first draw of a stream finds
+    /// the worker asleep (streams arrive ~2 ms apart and the worker spins for
+    /// 200 us), and a wake costs 20-50 us, which the *next* record's first engine
+    /// door then waits out. A stream knows it will draw before its first record
+    /// is prepared, so the wake is paid in parallel with that preparation.
+    pub(crate) fn prewake(&'static self) {
+        let _lifecycle = self.lifecycle.lock();
+        if !self.ensure_worker() {
+            return;
+        }
+        let mut g = self.inner.lock();
+        if g.worker_parked {
+            g.kick = true;
+            self.stats.prewakes.fetch_add(1, Ordering::Relaxed);
+            self.work_cv.notify_one();
+        }
     }
 
     /// Wait for the in-flight job, if any, and keep its result for
@@ -516,6 +548,7 @@ impl Handoff {
         let submitted = s.submitted.swap(0, Ordering::Relaxed);
         let busy = s.busy_ns.swap(0, Ordering::Relaxed);
         let wakes = s.parked_wakes.swap(0, Ordering::Relaxed);
+        let prewakes = s.prewakes.swap(0, Ordering::Relaxed);
         let err = s.deferred_err.swap(0, Ordering::Relaxed);
         let declined = s.submit_declined.swap(0, Ordering::Relaxed);
         let mut body = String::new();
@@ -548,7 +581,7 @@ impl Handoff {
         any.then(|| {
             format!(
                 "recorder win_ms={win_ms} deferred={submitted} busy_us={} wakes={wakes} \
-                 deferred_err={err} submit_declined={declined}{body} top={}",
+                 prewakes={prewakes} deferred_err={err} submit_declined={declined}{body} top={}",
                 busy / 1000,
                 if top.is_empty() {
                     "-".to_string()
@@ -704,7 +737,11 @@ mod tests {
             h.submit(job);
             if i % 3 == 0 {
                 h.settle(JoinSite::Explicit);
-                assert_eq!(log.lock().last().copied(), Some(i), "settle must see the job");
+                assert_eq!(
+                    log.lock().last().copied(),
+                    Some(i),
+                    "settle must see the job"
+                );
                 assert!(!h.in_flight());
                 assert!(matches!(h.take(JoinSite::Explicit), Some(JobResult::Done)));
             } else {
@@ -918,10 +955,7 @@ mod tests {
             super::super::EngineLockSite::Worker
         );
         DRAW.submit(ok_job(move || {
-            site_in.store(
-                super::super::calling_site().index(),
-                Ordering::SeqCst,
-            );
+            site_in.store(super::super::calling_site().index(), Ordering::SeqCst);
             started_in.store(true, Ordering::SeqCst);
             while !release_in.load(Ordering::SeqCst) {
                 std::hint::spin_loop();
@@ -952,6 +986,48 @@ mod tests {
         releaser.join().unwrap();
         let _ = DRAW.take(JoinSite::Explicit);
         let _ = DRAW.stop();
+    }
+
+    /// A prewake brings a parked worker out of its park without a job, counts
+    /// itself once, runs nothing, and leaves the worker serving the next job; on a
+    /// worker that is not parked it does nothing.
+    #[test]
+    fn a_prewake_wakes_a_parked_worker_without_running_anything() {
+        let h = handoff("rec-test-prewake");
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r = Arc::clone(&ran);
+        h.submit(ok_job(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+        }));
+        h.settle(JoinSite::Explicit);
+        // Long enough for the worker's spin to expire and for it to park.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(h.inner.lock().worker_parked, "the worker should be asleep");
+        h.prewake();
+        assert_eq!(h.stats.prewakes.load(Ordering::SeqCst), 1);
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "a prewake runs no job");
+        // The kick is consumed by the wake: the worker spins and parks again, and
+        // a later prewake wakes it once more.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!h.inner.lock().kick, "the kick is cleared by the worker");
+        h.prewake();
+        assert_eq!(h.stats.prewakes.load(Ordering::SeqCst), 2);
+        std::thread::sleep(Duration::from_millis(30));
+        let r = Arc::clone(&ran);
+        h.submit(ok_job(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+        }));
+        h.settle(JoinSite::Explicit);
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            2,
+            "the worker still serves jobs"
+        );
+        // Not parked (a job just ran, the worker is spinning): nothing to do.
+        let before = h.stats.prewakes.load(Ordering::SeqCst);
+        h.prewake();
+        assert_eq!(h.stats.prewakes.load(Ordering::SeqCst), before);
+        let _ = h.stop();
     }
 
     /// What the handoff costs the drain, measured (run with `--ignored
@@ -1058,7 +1134,10 @@ mod tests {
         drop(guard);
         releaser.join().unwrap();
         assert!(!DRAW.in_flight());
-        assert!(matches!(DRAW.take(JoinSite::Explicit), Some(JobResult::Done)));
+        assert!(matches!(
+            DRAW.take(JoinSite::Explicit),
+            Some(JobResult::Done)
+        ));
         let _ = DRAW.stop();
     }
 }

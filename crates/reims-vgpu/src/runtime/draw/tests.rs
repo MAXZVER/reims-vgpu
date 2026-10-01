@@ -8583,7 +8583,6 @@ fn a_guest_write_between_observation_and_copy_is_not_vouched_for() {
     assert_eq!(state.mappings[&7].guest_write_gen_at_store, 0);
 }
 
-
 /// A record that leaves with an earlier deferred draw's failure in hand is
 /// refused, and one that already refused keeps its own refusal.
 #[cfg(feature = "backend-vulkan")]

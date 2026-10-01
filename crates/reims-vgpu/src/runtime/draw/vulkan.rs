@@ -128,9 +128,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     //
     // Asked of `pending`, not of the gate: the gate may have been turned off with
     // a draw still out, and that draw is still owed its join.
-    if !req.chain_resident_established
-        && crate::backend::vulkan::engine::deferred_draws_pending()
-    {
+    if !req.chain_resident_established && crate::backend::vulkan::engine::deferred_draws_pending() {
         if let Some(failure) = crate::backend::vulkan::engine::settle_deferred_draws() {
             crate::backend::vulkan::engine::report_deferred_failure(&failure);
             // Found here because this record left before it reached the engine
@@ -156,6 +154,14 @@ pub(super) fn refuse_after_deferred_failure(
     match out.0 {
         EncodeStatus::Ok => (EncodeStatus::NoMetal("deferred_draw_failed"), None),
         _ => out,
+    }
+}
+
+/// TEMP (lab, S5a): a stream with more than one record is about to prepare its
+/// first, so the recorder (if it is on and asleep) wakes in parallel with it.
+pub(crate) fn prewake_recorder_for_stream(records: usize) {
+    if records > 1 {
+        crate::backend::vulkan::engine::prewake_recorder();
     }
 }
 

@@ -8310,7 +8310,6 @@ fn an_exec_resource_record_clearing_guest_valid_pays_the_owed_frame() {
     );
 }
 
-
 /// A deferred first record that failed leaves the stream with no drawn record, so
 /// the pass-clear fallback (which keys on `ok == 0`) runs as it does sequentially,
 /// and the abandon lands the resident the chain really had: none.
@@ -8339,7 +8338,10 @@ fn a_deferred_later_record_that_failed_keeps_the_chain_it_extended() {
     take_back_deferred_record(&mut out, &mut resident_chain, true);
     out.metal_draws_fail += 1;
     assert_eq!((out.metal_draws_ok, out.metal_draws_fail), (2, 1));
-    assert!(resident_chain, "the records before it still hold the resident");
+    assert!(
+        resident_chain,
+        "the records before it still hold the resident"
+    );
     // Never below zero, whatever the caller's bookkeeping did.
     let mut empty = ExecResult::default();
     take_back_deferred_record(&mut empty, &mut resident_chain, false);
