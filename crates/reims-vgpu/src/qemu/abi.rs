@@ -581,6 +581,8 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {
             // guest attributable.
             crate::backend::selected().note_drain_thread();
             lab_drain_stall();
+            #[cfg(windows)]
+            crate::qemu::lab_sampler::start_once();
             if device_drain(handle) {
                 REIMS_VGPU_QEMU_OK
             } else {

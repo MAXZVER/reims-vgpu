@@ -8,3 +8,5 @@
 pub mod abi;
 pub(crate) mod cstr;
 pub mod host_ops;
+#[cfg(windows)]
+pub(crate) mod lab_sampler;
