@@ -29,6 +29,7 @@ mod host_ram;
 pub mod init_decline;
 mod linear_target_import;
 mod page_diff;
+mod pay_band;
 mod pools;
 mod queue_owner;
 pub(crate) mod recorder;
@@ -3955,6 +3956,21 @@ pub fn page_diff_forget(mapping_id: u32) {
     }
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND=verify`): the pages the full compare found
+/// changed outside the damage band of their payment, since the process began.
+/// Zero is the claim; the same count rides the census as `pay_band_outside_changed`.
+pub fn lab_pay_band_outside_changed() -> u64 {
+    pay_band::outside_changed_total()
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND`): `(pages the page-diff compare was
+/// dispatched over, pages of the frames it compared)`, summed over the payments
+/// that had a shadow to compare with, since the process began. Nothing is counted
+/// with the gate off.
+pub fn lab_pay_band_pages() -> (u64, u64) {
+    pay_band::compared_pages_total()
+}
+
 /// TEMP (lab): whether a draw batch is recording and not yet handed to the GPU.
 pub fn lab_batch_open() -> bool {
     BATCH_OPEN.load(std::sync::atomic::Ordering::Acquire)
@@ -4209,6 +4225,37 @@ pub fn read_target_changed_pages_with(
         st.pipeline.as_ref().expect("ensured")
     };
     let one_trip = pipe.one_trip;
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND`): the rows a write since the last
+    // payment could have changed, and with them the pages the compare is
+    // dispatched over. See `pay_band`. A fresh shadow compares nothing (the
+    // whole frame is copied), and a shadow other than the one the band was kept
+    // against is read as every row.
+    let band_mode = page_diff::pay_band_mode();
+    let band = if band_mode.tracks() && !fresh {
+        let epoch = st.shadows.get(&mapping_id).expect("ensured").pay_epoch;
+        pools.registry_pay_band(identity, epoch)
+    } else {
+        pay_band::RowBand::Full
+    };
+    // Only the image kernel is a page-per-workgroup kernel reading the resident
+    // itself, so only it can be started at the band's first page: the buffer
+    // kernels compare a copy of the whole frame that was just made.
+    let band_ranges = if band_mode == pay_band::PayBandMode::On && image_view.is_some() {
+        Some(pay_band::dispatch_ranges(band, w, h, force))
+    } else {
+        None
+    };
+    if band_mode.tracks() {
+        pay_band::note_census(
+            band_mode,
+            fresh,
+            image_view.is_some(),
+            band,
+            band_ranges.as_deref(),
+            (w, h),
+            pages as u32,
+        );
+    }
     if !fresh {
         match image_view {
             Some(view) => unsafe {
@@ -4249,7 +4296,7 @@ pub fn read_target_changed_pages_with(
         crate::runtime::drain::note_store_route("pay_diff_image");
     }
     drop(lab_span);
-    unsafe {
+    let submitted = unsafe {
         page_diff_submit(ctx, pools, counters, between, |cb| {
             let d = &ctx.device;
             if image_view.is_some() {
@@ -4327,7 +4374,21 @@ pub fn read_target_changed_pages_with(
                 ];
                 let bytes: &[u8] = std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 16);
                 d.cmd_push_constants(cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
-                d.cmd_dispatch(cb, pages as u32, 1, 1);
+                match band_ranges.as_deref() {
+                    None => d.cmd_dispatch(cb, pages as u32, 1, 1),
+                    // TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND=on`): each range of
+                    // pages on its own. The kernel names its page by
+                    // `WorkgroupId`, which `vkCmdDispatchBase` starts at the
+                    // range's first page, so the shader is the one the full
+                    // dispatch runs. The ranges are disjoint, so no barrier
+                    // orders one against the next: they share the buffers and
+                    // touch none of the same pages.
+                    Some(ranges) => {
+                        for r in ranges {
+                            d.cmd_dispatch_base(cb, r.start, 0, 0, r.end - r.start, 1, 1);
+                        }
+                    }
+                }
                 let back = [vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::empty())
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -4466,8 +4527,26 @@ pub fn read_target_changed_pages_with(
                 &[],
                 &[],
             );
-        })?;
+        })
+    };
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND`): the shadow now equals the resident
+    // as it was recorded when the compare ran, so no row differs from it — and
+    // from here on every write is a write since *this* payment. Before anything
+    // below can fail, and before the next draw can take the engine lock. A
+    // submission that failed may or may not have run the compare: nothing is
+    // known of either, and the next payment starts over.
+    if band_mode.tracks() {
+        let shadow = st.shadows.get_mut(&mapping_id).expect("ensured");
+        if submitted.is_ok() {
+            let epoch = pay_band::next_epoch();
+            shadow.pay_epoch = epoch;
+            pools.registry_note_paid(identity, epoch);
+        } else {
+            shadow.pay_epoch = 0;
+            pools.registry_forget_paid(identity);
+        }
     }
+    submitted?;
     let _lab_post = crate::runtime::chain_phase::CostSpan::new("lab_pd_post_us"); // TEMP (lab)
     pools.registry_note_access(identity, read_access);
 
@@ -4484,6 +4563,16 @@ pub fn read_target_changed_pages_with(
             .filter(|&p| f[p as usize] != 0 || force.binary_search(&p).is_ok())
             .collect()
     };
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND=verify`): the compare ran over every
+    // page, so any page it found changed outside the band is a write the band
+    // did not account for. Zero is the claim.
+    if band_mode == pay_band::PayBandMode::Verify && !fresh && band != pay_band::RowBand::Full {
+        pay_band::note_outside_changed(pay_band::changed_outside(
+            &changed,
+            &band.pages(w, h),
+            force,
+        ));
+    }
     if !fresh && !changed.is_empty() && !one_trip {
         // Second trip: only the changed pages cross to host memory, packed.
         let mut regions: Vec<vk::BufferCopy> = Vec::new();
@@ -5082,6 +5171,16 @@ pub fn overlay_guest_bytes_onto_resident(
         // resident's differs from what the guest wrote.
         return Ok(Ok(0));
     }
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND`): the rows the copy below lands in. Before
+    // it is recorded, so a copy that then fails to record is still accounted.
+    pools.registry_note_damage(
+        identity,
+        pay_band::rows_of_rects(
+            regions
+                .iter()
+                .map(|r| (r.image_offset.y, r.image_extent.height)),
+        ),
+    );
     unsafe {
         let staging = pools.acquire_staging(ctx, overlay.bytes.len() as u64, counters)?;
         pools.write_staging(ctx, &staging, overlay.bytes)?;
@@ -5256,6 +5355,12 @@ pub fn copy_resident_spans(
     if regions.is_empty() {
         return Ok(Ok(0));
     }
+    // TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND`): the rows the copy lands in `dst`,
+    // accounted before it is recorded. `src` is only read.
+    pools.registry_note_damage(
+        dst,
+        pay_band::rows_of_rects(regions.iter().map(|r| (r.dst_offset.y, r.extent.height))),
+    );
     unsafe {
         let appended = pools.batch_open_recording();
         let (cb, fence) = match appended {

@@ -364,6 +364,22 @@ pub(crate) fn lab_reap_after_enabled() -> bool {
     })
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_BAND=on|verify` — compare only the rows of the
+/// presented frame that a write since the last payment could have changed
+/// (`on`), or compare everything as before and count the changed pages the band
+/// did not contain (`verify`). Unset or anything else is `off`: today's path.
+/// See [`super::pay_band`]. Latched.
+pub(crate) fn pay_band_mode() -> super::pay_band::PayBandMode {
+    static MODE: std::sync::OnceLock<super::pay_band::PayBandMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = super::pay_band::PayBandMode::parse(
+            std::env::var("REIMS_VGPU_LAB_PAY_BAND").ok().as_deref(),
+        );
+        crate::observe::off(format!("pay_band mode={mode:?}"));
+        mode
+    })
+}
+
 /// A buffer this module owns outright: its own `vkAllocateMemory`, alive across
 /// payments. The pools recycle their slots at each fence, and a shadow has to
 /// hold a frame from one swap to the next.
@@ -512,7 +528,16 @@ pub(crate) struct DiffPipeline {
 }
 
 impl DiffPipeline {
-    unsafe fn create(ctx: &DeviceContext, one_trip: bool, image: bool) -> Result<Self, DrawError> {
+    /// `dispatch_base` creates the pipeline so that `vkCmdDispatchBase` may start
+    /// it at a workgroup other than zero (`WorkgroupId` then counts from there,
+    /// so a kernel that names its page by it is dispatched over a page range
+    /// unchanged).
+    unsafe fn create(
+        ctx: &DeviceContext,
+        one_trip: bool,
+        image: bool,
+        dispatch_base: bool,
+    ) -> Result<Self, DrawError> {
         let device = &ctx.device;
         let code: &[u32] = if image {
             &PAGE_DIFF_IMAGE_SPIRV
@@ -565,7 +590,13 @@ impl DiffPipeline {
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
             .name(c"main");
+        let flags = if dispatch_base {
+            vk::PipelineCreateFlags::DISPATCH_BASE
+        } else {
+            vk::PipelineCreateFlags::empty()
+        };
         let info = [vk::ComputePipelineCreateInfo::default()
+            .flags(flags)
             .stage(stage)
             .layout(layout)];
         let pipeline = unsafe { device.create_compute_pipelines(ctx.pipeline_cache, &info, None) }
@@ -700,6 +731,12 @@ pub(crate) struct Shadow {
     /// `(map_generation, width, height, guest_bytes_seq after that write)`.
     pub key: (u32, u32, u32, u64),
     pub prev: OwnedBuffer,
+    /// TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND`): the payment that last made `prev`
+    /// equal a frame — the epoch the resident's damage band is kept against
+    /// (`ResidentTargetSlot::pay_damage`). `0` until one has finished; a new
+    /// shadow is born unpaid, so a band can only be read against a shadow it
+    /// was kept for.
+    pub pay_epoch: u64,
 }
 
 #[derive(Default)]
@@ -727,7 +764,7 @@ impl PageDiffState {
     /// The compare kernel, created on first use; `None` after a refusal.
     pub(crate) unsafe fn ensure_pipeline(&mut self, ctx: &DeviceContext) -> bool {
         if self.pipeline.is_none() && !self.refused {
-            match unsafe { DiffPipeline::create(ctx, one_trip_enabled(), false) } {
+            match unsafe { DiffPipeline::create(ctx, one_trip_enabled(), false, false) } {
                 Ok(p) => self.pipeline = Some(p),
                 Err(e) => {
                     self.refused = true;
@@ -742,7 +779,9 @@ impl PageDiffState {
     /// payment then takes the frame copy).
     pub(crate) unsafe fn ensure_image_pipeline(&mut self, ctx: &DeviceContext) -> bool {
         if self.image_pipeline.is_none() && !self.image_refused {
-            match unsafe { DiffPipeline::create(ctx, true, true) } {
+            // Based only when the band is asked to narrow the dispatch.
+            let based = pay_band_mode() == super::pay_band::PayBandMode::On;
+            match unsafe { DiffPipeline::create(ctx, true, true, based) } {
                 Ok(p) => self.image_pipeline = Some(p),
                 Err(e) => {
                     self.image_refused = true;
@@ -798,7 +837,14 @@ impl PageDiffState {
                 MemoryClass::DeviceLocal,
             )?
         };
-        self.shadows.insert(mapping_id, Shadow { key, prev });
+        self.shadows.insert(
+            mapping_id,
+            Shadow {
+                key,
+                prev,
+                pay_epoch: 0,
+            },
+        );
         Ok(true)
     }
 }

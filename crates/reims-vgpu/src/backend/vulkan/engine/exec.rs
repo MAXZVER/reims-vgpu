@@ -20,8 +20,8 @@ use super::pools::{
 use super::stage_phase;
 use super::types::{
     BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, ResidentReclaim,
-    SampledSource, ScissorResource, SeedOrder, TargetIdentity, VertexStepFunction,
-    ViewportResource, VisibilityResultMode,
+    SampledSource, SeedOrder, TargetIdentity, VertexStepFunction, ViewportResource,
+    VisibilityResultMode,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -5485,12 +5485,6 @@ pub(crate) unsafe fn execute_draw_inner(
         min_depth: 0.0,
         max_depth: 1.0,
     };
-    let default_sc = ScissorResource {
-        x: 0,
-        y: 0,
-        width: req.width,
-        height: req.height,
-    };
     // One count for both, because a Vulkan pipeline declares one and the
     // dynamic arrays must match it. The pipeline was built from
     // `viewport_slot_count`, so this must be the same function of the same
@@ -5512,18 +5506,19 @@ pub(crate) unsafe fn execute_draw_inner(
             max_depth: vp.max_depth,
         }
     }));
+    // From `slot_scissor`, which is also what the draw's damage rows are read
+    // from, so the rect the GPU clips by and the rows a payment may skip are
+    // one derivation.
     sc_scratch.extend((0..slots).map(|i| {
-        let sc = req.scissors.get(i).copied().unwrap_or(default_sc);
-        let x = sc.x.min(req.width);
-        let y = sc.y.min(req.height);
+        let sc = req.slot_scissor(i);
         vk::Rect2D {
             offset: vk::Offset2D {
-                x: x as i32,
-                y: y as i32,
+                x: sc.x as i32,
+                y: sc.y as i32,
             },
             extent: vk::Extent2D {
-                width: sc.width.min(req.width - x),
-                height: sc.height.min(req.height - y),
+                width: sc.width,
+                height: sc.height,
             },
         }
     }));
@@ -5905,14 +5900,31 @@ pub(crate) unsafe fn execute_draw_inner(
         } else {
             super::counters::DrawCoverage::LoadedPartialScissor
         });
-        if target_feedback {
-            pools.registry_mark_ready_with_access(
-                identity,
-                super::pools::ResidentAccess::ColorFeedback(pass_key.color_final_layout(0)),
-            );
+        // TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND`): the rows this draw could have
+        // changed, for the payment's compare. Off, nothing reads it and the
+        // answer is the whole target. A seed copy is the one rewrite
+        // `rewrites_whole_attachment` above does not name when the pass also
+        // loaded the target, so it is asked of the copies themselves.
+        let rows = if super::page_diff::pay_band_mode().tracks() {
+            let seed_copied = !target_loads_guest_backing
+                && (seed_slot.is_some()
+                    || target_guest_texels.is_some()
+                    || seed_from_resolved.is_some());
+            super::pay_band::pass_rows(
+                load_uses_gpu_content,
+                seed_copied,
+                req.multisample_resolve,
+                || req.scissored_rows(),
+            )
         } else {
-            pools.registry_mark_ready_at(identity, pass_key.color_final_layout(0));
-        }
+            super::pay_band::RowBand::Full
+        };
+        let access = if target_feedback {
+            super::pools::ResidentAccess::ColorFeedback(pass_key.color_final_layout(0))
+        } else {
+            super::pools::ResidentAccess::ColorWrite(pass_key.color_final_layout(0))
+        };
+        pools.registry_mark_ready_with_access(identity, access, rows);
     }
     phase.enter(super::draw_phase::Phase::PostStore);
     let guest_store_footprint = match (
@@ -5941,11 +5953,14 @@ pub(crate) unsafe fn execute_draw_inner(
         for (secondary_index, (identity, _image, _old)) in mrt_secondaries.iter().enumerate() {
             let attachment_index = secondary_index + 1;
             if pass_key.color_feedback(attachment_index) {
+                // An MRT secondary is a write this accounting does not follow:
+                // every row.
                 pools.registry_mark_ready_with_access(
                     identity,
                     super::pools::ResidentAccess::ColorFeedback(
                         pass_key.color_final_layout(attachment_index),
                     ),
+                    super::pay_band::RowBand::Full,
                 );
             } else {
                 // The pass's own `finalLayout` for this slot, asked of the key

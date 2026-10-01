@@ -16,6 +16,7 @@ use super::context::{DeviceContext, DrawSpanProbe, TimestampProbe, FENCE_TIMEOUT
 use super::counters::{CreateSite, EngineCounters};
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
+use super::pay_band::PayDamage;
 use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
 use super::{buffer_slab, color_subresource_range, gpu_span, host_ram, reason, slab, types};
@@ -2343,6 +2344,16 @@ pub(crate) struct ResidentTargetSlot {
     /// Sampled and staging images are written on other paths, but they are not
     /// registry residents and hold no identity a later draw could resolve.
     pub gpu_only_content: bool,
+    /// Which rows of this image differ from the frame its page-diff shadow holds
+    /// (TEMP lab, `REIMS_VGPU_LAB_PAY_BAND`). See [`super::pay_band`].
+    ///
+    /// Born [`PayDamage::NEW`] — nothing known — so a recreated or recycled
+    /// resident can never inherit a band from the pixels it replaced. Widened by
+    /// the doors that write the image: `registry_mark_ready_with_access` (every
+    /// draw's colour write, and with it the clear and seed that precede it),
+    /// `registry_note_damage` (the overlay and resident-to-resident copies), and
+    /// narrowed only by `registry_note_paid`.
+    pub pay_damage: PayDamage,
     /// Value of `ResourcePools::idle_clock_ms` at this target's last use,
     /// retained for reuse-distance diagnostics. It is not a lifetime deadline.
     pub last_touch_ms: u64,
@@ -4389,6 +4400,7 @@ mod resident_reuse_tests {
             resource_released: false,
             resource_owner_count: 0,
             gpu_only_content: false,
+            pay_damage: super::PayDamage::NEW,
             last_touch_ms: 0,
         }
     }

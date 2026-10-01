@@ -753,6 +753,57 @@ impl DrawRequest {
             None
         }
     }
+
+    /// The scissor rect viewport slot `slot` rasterizes through, in target
+    /// texels and clamped to the target.
+    ///
+    /// A slot the guest bound no scissor for takes the whole target — the same
+    /// per-slot default [`viewport_slot_count`] explains. This is the one
+    /// derivation: the dynamic `vkCmdSetScissor` the draw records and the rows
+    /// the draw is accounted to have reached are both read from it, so the rect
+    /// the GPU clips by and the rows a payment skips cannot disagree.
+    pub(crate) fn slot_scissor(&self, slot: usize) -> ScissorResource {
+        let sc = self.scissors.get(slot).copied().unwrap_or(ScissorResource {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+        });
+        let x = sc.x.min(self.width);
+        let y = sc.y.min(self.height);
+        ScissorResource {
+            x,
+            y,
+            width: sc.width.min(self.width - x),
+            height: sc.height.min(self.height - y),
+        }
+    }
+
+    /// The rows of the primary attachment this draw can write **when its pass
+    /// loaded the target** — the union of every slot's scissor.
+    ///
+    /// The scissor test clips every fragment of every primitive, points and
+    /// lines included, and a slot with no scissor of its own takes the whole
+    /// target, so a draw that binds fewer scissors than it has slots (or none)
+    /// reaches every row. The viewport is deliberately not consulted: whether it
+    /// bounds fragments is the pipeline's affair, and a band wider than needed
+    /// costs pages while a narrower one costs pixels.
+    ///
+    /// Not an answer for a pass that did not load the target. A clear, a
+    /// seed copy or a multisample resolve rewrites the attachment whatever the
+    /// scissor says, and the caller says so by not asking.
+    pub(crate) fn scissored_rows(&self) -> super::pay_band::RowBand {
+        let rows = (0..viewport_slot_count(self))
+            .map(|slot| {
+                let sc = self.slot_scissor(slot);
+                super::pay_band::RowBand::rows(sc.y, sc.y + sc.height)
+            })
+            .fold(
+                super::pay_band::RowBand::Empty,
+                super::pay_band::RowBand::union,
+            );
+        rows.normalized(self.height)
+    }
 }
 
 /// Which attachment of a draw a sampled identity turned out to be.
@@ -2536,6 +2587,79 @@ mod tests {
             generation: 1,
             format: vk::Format::B8G8R8A8_UNORM,
         }));
+    }
+
+    /// The rows a draw is accounted to have written are its scissors' rows, and
+    /// every way the scissor does not bound it is the whole target.
+    #[test]
+    fn a_draws_rows_are_its_scissors_and_anything_unbounded_is_every_row() {
+        use super::super::pay_band::RowBand;
+        let draw = |viewports: usize, scissors: &[(u32, u32, u32, u32)]| DrawRequest {
+            width: 640,
+            height: 480,
+            viewports: vec![
+                ViewportResource {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 640.0,
+                    height: 480.0,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                viewports
+            ],
+            scissors: scissors
+                .iter()
+                .map(|&(x, y, width, height)| ScissorResource {
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+                .collect(),
+            ..DrawRequest::default()
+        };
+
+        // No scissor bound: the default takes the whole target.
+        assert_eq!(draw(0, &[]).scissored_rows(), RowBand::Full);
+        assert_eq!(draw(1, &[]).scissored_rows(), RowBand::Full);
+        // One scissor, one slot: its rows, whatever its columns.
+        assert_eq!(
+            draw(1, &[(100, 40, 8, 16)]).scissored_rows(),
+            RowBand::rows(40, 56)
+        );
+        // A scissor reaching past the target is clipped to it, and one covering
+        // the target says so as every row.
+        assert_eq!(
+            draw(1, &[(0, 470, 640, 100)]).scissored_rows(),
+            RowBand::rows(470, 480)
+        );
+        assert_eq!(draw(1, &[(0, 0, 640, 480)]).scissored_rows(), RowBand::Full);
+        assert_eq!(
+            draw(1, &[(0, 0, 640, 9999)]).scissored_rows(),
+            RowBand::Full
+        );
+        // Several slots: the hull of their rows.
+        assert_eq!(
+            draw(2, &[(0, 10, 4, 4), (0, 100, 4, 4)]).scissored_rows(),
+            RowBand::rows(10, 104)
+        );
+        // More viewports than scissors: the slot without one is the whole target.
+        assert_eq!(
+            draw(3, &[(0, 10, 4, 4), (0, 100, 4, 4)]).scissored_rows(),
+            RowBand::Full
+        );
+        // An empty scissor writes no row; a scissor starting below the target
+        // writes none either.
+        assert_eq!(draw(1, &[(0, 20, 640, 0)]).scissored_rows(), RowBand::Empty);
+        assert_eq!(
+            draw(1, &[(0, 900, 640, 10)]).scissored_rows(),
+            RowBand::Empty
+        );
+        // The rect the draw hands the GPU is the one the rows came from.
+        let req = draw(1, &[(5, 470, 9999, 9999)]);
+        let sc = req.slot_scissor(0);
+        assert_eq!((sc.x, sc.y, sc.width, sc.height), (5, 470, 635, 10));
     }
 
     #[test]

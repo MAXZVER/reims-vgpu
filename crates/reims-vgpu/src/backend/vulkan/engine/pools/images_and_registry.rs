@@ -6,6 +6,7 @@
 //! resource lifetime.
 
 use super::*;
+use crate::backend::vulkan::engine::pay_band::RowBand;
 use crate::backend::vulkan::engine::types::TargetKeyDivergence;
 
 /// Band observed intervals between sampled uses. This is a reuse-distance
@@ -1069,6 +1070,8 @@ impl ResourcePools {
                 // A recycled image arrives here too, and its stale contents are
                 // not this identity's content.
                 gpu_only_content: false,
+                // A new image has no payment to be a band against.
+                pay_damage: PayDamage::NEW,
                 last_touch_ms,
             },
         );
@@ -2033,22 +2036,36 @@ impl ResourcePools {
     /// host-accessible primary. Recording it beside the access is what keeps a
     /// later barrier from naming an optimized layout the imported image is not
     /// in.
+    ///
+    /// For a writer that does not say which rows it wrote: the write is
+    /// accounted to every row (see [`Self::registry_mark_ready_with_access`]).
     pub(crate) fn registry_mark_ready_at(
         &mut self,
         identity: &TargetIdentity,
         layout: vk::ImageLayout,
     ) {
-        self.registry_mark_ready_with_access(identity, ResidentAccess::ColorWrite(layout));
+        self.registry_mark_ready_with_access(
+            identity,
+            ResidentAccess::ColorWrite(layout),
+            RowBand::Full,
+        );
     }
 
     /// Publish newly rendered colour contents together with the exact access
     /// contract the pass left behind. Feedback-loop passes are both shader
     /// reads and colour writes, so reducing them to a plain colour write would
     /// lose half of the next barrier's source scope.
+    ///
+    /// `rows` is the band of the image this write could have changed — the
+    /// argument is required so that no colour write reaches the registry without
+    /// saying what it reached (TEMP lab, `REIMS_VGPU_LAB_PAY_BAND`; see
+    /// [`ResidentTargetSlot::pay_damage`]). [`RowBand::Full`] is the honest answer
+    /// to "not known", and to a pass that cleared or seeded the attachment.
     pub(crate) fn registry_mark_ready_with_access(
         &mut self,
         identity: &TargetIdentity,
         access: ResidentAccess,
+        rows: RowBand,
     ) {
         let guest_backed = self
             .registry
@@ -2056,9 +2073,47 @@ impl ResourcePools {
             .is_some_and(|slot| slot.memory.is_guest_imported());
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.set_content(true, None);
+            slot.pay_damage.note_write(rows.normalized(slot.height));
         }
         self.set_registry_access(identity, access);
         self.set_sole_copy(identity, !guest_backed);
+    }
+
+    /// A write into the image that is not a render pass: a copy that lands
+    /// bytes in `rows` of it. The slot's content state and access are not this
+    /// call's business — the copy's own caller restores the layout it found.
+    pub(crate) fn registry_note_damage(&mut self, identity: &TargetIdentity, rows: RowBand) {
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.pay_damage.note_write(rows.normalized(slot.height));
+        }
+    }
+
+    /// The rows of this resident that may differ from the page-diff shadow whose
+    /// payment epoch is `shadow_epoch`; every row when the resident is absent.
+    pub(crate) fn registry_pay_band(
+        &self,
+        identity: &TargetIdentity,
+        shadow_epoch: u64,
+    ) -> RowBand {
+        self.registry
+            .get(identity)
+            .map_or(RowBand::Full, |slot| slot.pay_damage.band_for(shadow_epoch))
+    }
+
+    /// Payment `epoch` has made the page-diff shadow equal to this resident as
+    /// recorded so far: no row differs from it.
+    pub(crate) fn registry_note_paid(&mut self, identity: &TargetIdentity, epoch: u64) {
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.pay_damage.paid(epoch);
+        }
+    }
+
+    /// A payment began and may not have finished: nothing is known of how this
+    /// resident differs from any shadow.
+    pub(crate) fn registry_forget_paid(&mut self, identity: &TargetIdentity) {
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.pay_damage.forget();
+        }
     }
 
     /// Mark a depth resident as holding rendered contents, after a pass that
@@ -3017,6 +3072,7 @@ pub(super) mod pin_count_tests {
             resource_released: false,
             resource_owner_count: 0,
             gpu_only_content: false,
+            pay_damage: PayDamage::NEW,
             last_touch_ms: 0,
         }
     }
@@ -3099,6 +3155,76 @@ pub(super) mod pin_count_tests {
     fn admit_ready(pools: &mut ResourcePools, identity: &TargetIdentity) {
         pools.registry.insert(identity.clone(), ready_slot());
         pools.registry_order.push_back(identity.clone());
+    }
+
+    /// The damage band a payment reads is kept on the slot, widened by every door
+    /// that writes the image and narrowed only by a payment.
+    #[test]
+    fn a_residents_damage_band_is_widened_by_its_writers_and_reset_by_a_payment() {
+        let layout = crate::backend::vulkan::engine::caches::color0_pass_exit_layout();
+        let mut pools = ResourcePools::new();
+        let id = surface(70);
+        admit_ready(&mut pools, &id);
+        // Nobody has paid it: there is nothing to be a band against.
+        assert_eq!(pools.registry_pay_band(&id, 5), RowBand::Full);
+        assert_eq!(pools.registry_pay_band(&id, 0), RowBand::Full);
+
+        pools.registry_note_paid(&id, 5);
+        assert_eq!(pools.registry_pay_band(&id, 5), RowBand::Empty);
+
+        // A draw through the colour-write door, then a copy through the other.
+        pools.registry_mark_ready_with_access(
+            &id,
+            ResidentAccess::ColorWrite(layout),
+            RowBand::rows(4, 8),
+        );
+        assert_eq!(pools.registry_pay_band(&id, 5), RowBand::rows(4, 8));
+        pools.registry_note_damage(&id, RowBand::rows(12, 14));
+        assert_eq!(pools.registry_pay_band(&id, 5), RowBand::rows(4, 14));
+
+        // A different shadow is not the one this band was kept against.
+        assert_eq!(pools.registry_pay_band(&id, 6), RowBand::Full);
+
+        // A write whose rows are not known (a clear, a seed, `registry_mark_ready_at`
+        // from a caller that does not follow rows) leaves every row in doubt, and a
+        // narrow write afterwards does not bring the band back.
+        pools.registry_mark_ready_at(&id, layout);
+        assert_eq!(pools.registry_pay_band(&id, 5), RowBand::Full);
+        pools.registry_note_damage(&id, RowBand::rows(1, 2));
+        assert_eq!(pools.registry_pay_band(&id, 5), RowBand::Full);
+
+        // The next payment starts the account again.
+        pools.registry_note_paid(&id, 6);
+        assert_eq!(pools.registry_pay_band(&id, 6), RowBand::Empty);
+        assert_eq!(pools.registry_pay_band(&id, 5), RowBand::Full);
+
+        // A payment that began and did not finish forgets it.
+        pools.registry_forget_paid(&id);
+        assert_eq!(pools.registry_pay_band(&id, 6), RowBand::Full);
+    }
+
+    /// A resident that leaves the registry and comes back under the same
+    /// identity is a new image, and inherits nothing the old one was owed.
+    #[test]
+    fn a_resident_born_again_under_one_identity_has_no_band() {
+        let mut pools = ResourcePools::new();
+        let id = surface(71);
+        admit_ready(&mut pools, &id);
+        pools.registry_note_paid(&id, 9);
+        assert_eq!(pools.registry_pay_band(&id, 9), RowBand::Empty);
+        assert!(pools
+            .unregister_resident(&id, ResidentReclaim::Recreated)
+            .is_some());
+        // Absent: every row.
+        assert_eq!(pools.registry_pay_band(&id, 9), RowBand::Full);
+        admit_ready(&mut pools, &id);
+        assert_eq!(pools.registry_pay_band(&id, 9), RowBand::Full);
+        // Writes and payments on an absent identity are no-ops, not a panic.
+        let gone = surface(72);
+        pools.registry_note_damage(&gone, RowBand::rows(0, 1));
+        pools.registry_note_paid(&gone, 3);
+        pools.registry_forget_paid(&gone);
+        assert_eq!(pools.registry_pay_band(&gone, 3), RowBand::Full);
     }
 
     /// The publish's own ladder, in the order a slot progresses through it, and
