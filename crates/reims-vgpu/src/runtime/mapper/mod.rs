@@ -2589,6 +2589,7 @@ impl RectStride {
 /// # Safety
 /// `src` and `dst` must be valid for `n` bytes and not overlap.
 unsafe fn write_guest_bytes(src: *const u8, dst: *mut u8, n: usize) {
+    crate::backend::settle_deferred_draws_for_guest_write();
     // TEMP lab A/B: REIMS_LAB_STREAM_WRITE=off takes the plain copy.
     static STREAM: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
         std::env::var("REIMS_LAB_STREAM_WRITE").map_or(true, |v| v != "off")

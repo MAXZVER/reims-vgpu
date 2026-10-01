@@ -2116,6 +2116,17 @@ pub fn resolve_rail(
     }
 }
 
+/// TEMP (lab, S5a): the drain is about to write guest memory with the CPU. A
+/// draw the recorder thread still holds may read those pages (a staging copy,
+/// a witnessed gather), and the sequential order has it done before this write,
+/// so wait for it. One atomic load when nothing is deferred, which is always on
+/// a build or run without `REIMS_VGPU_LAB_RECORDER=on`.
+#[inline]
+pub(crate) fn settle_deferred_draws_for_guest_write() {
+    #[cfg(feature = "backend-vulkan")]
+    vulkan::engine::settle_for_guest_write();
+}
+
 /// The backend this process runs on.
 ///
 /// Latched, and read through this function everywhere. The choice is a property

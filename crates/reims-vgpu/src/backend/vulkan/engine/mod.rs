@@ -1553,6 +1553,15 @@ pub(crate) fn take_deferred_failure() -> Option<DeferredFailure> {
     }
 }
 
+/// TEMP (lab, S5a): the drain is about to write guest memory with the CPU; see
+/// [`crate::backend::settle_deferred_draws_for_guest_write`].
+#[inline]
+pub(crate) fn settle_for_guest_write() {
+    if recorder::DRAW.in_flight() {
+        recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
+    }
+}
+
 /// TEMP (lab, S5a): leave nothing in flight. The failure, if the job had one,
 /// is returned for the caller to report.
 pub(crate) fn settle_deferred_draws() -> Option<DeferredFailure> {

@@ -566,6 +566,7 @@ impl HostMemory for QemuHost<'_> {
         if buf.is_empty() {
             return Ok(());
         }
+        crate::backend::settle_deferred_draws_for_guest_write();
         let Some(f) = self.ops.write_gpa else {
             return Err(Self::callback_decline(
                 MemError::QemuWriteGpaCallbackMissing,
