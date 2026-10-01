@@ -13761,6 +13761,7 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
             return false;
         }
     }
+    crate::runtime::writeback_debt::lab_pay_after_first_arm(state, host, mapping_id); // TEMP (lab)
     true
 }
 

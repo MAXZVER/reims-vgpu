@@ -4274,6 +4274,56 @@ impl RepointStorageRefusal {
     }
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_REPOINT_PAY=1`): a frame this device owes a mapping
+/// is landed before a re-point that left the mapping's pages where they were.
+///
+/// The re-point bumps `map_generation` and a debt armed under the old generation
+/// is then refused on payment (`wbdebt_generation_moved`), so the frame the GPU
+/// rendered last never reaches the guest's pages and every later reader of those
+/// pages -- the sampled rail switches from the resident to them at exactly this
+/// point -- reads whatever was last written there instead. For a compositor layer
+/// that was written early (a payment between two passes lands the first pass's
+/// frame) the pages then hold a frame the guest had already replaced.
+///
+/// Only when the page list the guest re-pointed to is *the same pages*:
+/// [`crate::runtime::mapper::backing_pages_witness`] re-walks the whole list through
+/// the owning task's table and agrees page for page. Then nothing moved under the
+/// debt and landing it is what a payment at any other time would have done. When
+/// the pages did move (`Drifted`) the owed frame names memory the guest no longer
+/// calls the surface's, and the old rule -- drop it -- is the right one; when there
+/// is nothing to witness (`Unwitnessed`) nothing is claimed and the old rule stands.
+fn repoint_settle_owed_frame<H: HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_REPOINT_PAY").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    if state.pending_writebacks.get(mapping_id).is_none() {
+        return;
+    }
+    match crate::runtime::mapper::backing_pages_witness(state, &*host, mapping_id) {
+        crate::runtime::mapper::BackingWitness::Verified => {
+            crate::runtime::drain::note_store_route("replace_physical_paid_same_plan");
+            crate::observe::off(format!(
+                "replace_physical_paid_owed_frame mid={mapping_id} (the guest re-pointed the \
+                 backing to the pages it already had; the frame this device owed them was \
+                 landed first instead of being dropped with the old generation)"
+            ));
+            crate::runtime::writeback_debt::pay_for_mapping(state, host, mapping_id);
+        }
+        crate::runtime::mapper::BackingWitness::Drifted => {
+            crate::runtime::drain::note_store_route("replace_physical_owed_pages_moved");
+        }
+        crate::runtime::mapper::BackingWitness::Unwitnessed(_) => {
+            crate::runtime::drain::note_store_route("replace_physical_owed_unwitnessed");
+        }
+    }
+}
+
 pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -4364,6 +4414,7 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
         );
         return;
     };
+    repoint_settle_owed_frame(state, host, target);
     // A deferred window still owed on this mapping is riding the page plan the
     // guest has just replaced. The generation bump below would refuse it anyway,
     // so taking it here changes no outcome — it changes whether the loss has a
