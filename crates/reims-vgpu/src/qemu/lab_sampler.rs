@@ -12,7 +12,10 @@
 //! and resumes it, a few hundred microseconds each. One line per sample,
 //! `S <rva> <rva> ...` (leaf first, return addresses for the callers), with the
 //! module base on the first line; `addr2line -i -e <exe>` turns the addresses
-//! into functions and source lines offline.
+//! into functions and source lines offline. A frame in another module (the
+//! Vulkan driver, the C runtime, ntdll) is written `@<absolute address>`, and the
+//! first such frame in a module adds a line `M <base> <size> <path>` (sampsym.py
+//! names it by the module's nearest export).
 //!
 //! Nothing is allocated or locked between `SuspendThread` and `ResumeThread`: the
 //! suspended thread may hold the heap lock.
@@ -43,6 +46,10 @@ extern "system" {
     fn ResumeThread(h: Handle) -> u32;
     fn GetThreadContext(h: Handle, ctx: *mut Context) -> i32;
     fn GetModuleHandleW(name: *const u16) -> Handle;
+    fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut Handle) -> i32;
+    fn GetModuleFileNameW(module: Handle, name: *mut u16, size: u32) -> u32;
+    fn K32GetModuleInformation(process: Handle, module: Handle, info: *mut ModuleInfo, size: u32) -> i32;
+    fn GetCurrentProcess() -> Handle;
     fn RtlLookupFunctionEntry(
         pc: u64,
         base: *mut u64,
@@ -58,6 +65,47 @@ extern "system" {
         establisher: *mut u64,
         pointers: *mut core::ffi::c_void,
     ) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+struct ModuleInfo {
+    base: *mut core::ffi::c_void,
+    size: u32,
+    entry: *mut core::ffi::c_void,
+}
+
+const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
+const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x2;
+
+/// The module holding `pc` as (base, end), printing its `M` line the first time.
+/// Called only with the drain thread running (it takes the loader lock).
+fn module_of(pc: u64, known: &mut Vec<(u64, u64)>, w: &mut impl Write) -> bool {
+    if known.iter().any(|&(b, e)| pc >= b && pc < e) {
+        return true;
+    }
+    let mut h: Handle = core::ptr::null_mut();
+    // SAFETY: plain Win32 queries about a loaded module; the buffers are ours.
+    unsafe {
+        if GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            pc as *const u16,
+            &mut h,
+        ) == 0
+        {
+            return false;
+        }
+        let mut info = ModuleInfo { base: core::ptr::null_mut(), size: 0, entry: core::ptr::null_mut() };
+        if K32GetModuleInformation(GetCurrentProcess(), h, &mut info, core::mem::size_of::<ModuleInfo>() as u32) == 0 {
+            return false;
+        }
+        let mut name = [0u16; 520];
+        let len = GetModuleFileNameW(h, name.as_mut_ptr(), name.len() as u32) as usize;
+        let path = String::from_utf16_lossy(&name[..len.min(name.len())]);
+        let b = info.base as u64;
+        known.push((b, b + info.size as u64));
+        let _ = writeln!(w, "M {b:x} {:x} {path}", info.size);
+    }
+    true
 }
 
 struct SendHandle(Handle);
@@ -125,6 +173,19 @@ fn run(target: Handle, out: &str, gate: Option<&str>, hz: u64) {
     let mut last_flush = std::time::Instant::now();
     let mut ctx = Context([0u8; 1232]);
     let mut frames = [0u64; MAX_FRAMES];
+    let mut modules: Vec<(u64, u64)> = Vec::new();
+    let exe_end = {
+        let mut info = ModuleInfo { base: core::ptr::null_mut(), size: 0, entry: core::ptr::null_mut() };
+        // SAFETY: a query about our own executable module.
+        if unsafe {
+            K32GetModuleInformation(GetCurrentProcess(), base as Handle, &mut info, core::mem::size_of::<ModuleInfo>() as u32)
+        } != 0
+        {
+            base + info.size as u64
+        } else {
+            u64::MAX
+        }
+    };
     loop {
         if let Some(g) = gate {
             if last_gate.elapsed() >= std::time::Duration::from_millis(100) {
@@ -196,7 +257,12 @@ fn run(target: Handle, out: &str, gate: Option<&str>, hz: u64) {
             // A caller's address is a return address; step back into the call.
             let pc = if i == 0 { *f } else { f.wrapping_sub(1) };
             line.push(' ');
-            line.push_str(&format!("{:x}", pc.wrapping_sub(base)));
+            if pc >= base && pc < exe_end {
+                line.push_str(&format!("{:x}", pc - base));
+            } else {
+                module_of(pc, &mut modules, &mut w);
+                line.push_str(&format!("@{pc:x}"));
+            }
         }
         let _ = writeln!(w, "{line}");
         if last_flush.elapsed() >= std::time::Duration::from_secs(1) {
