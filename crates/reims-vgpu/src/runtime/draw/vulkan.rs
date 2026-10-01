@@ -6164,6 +6164,18 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
 /// type's all-ones value: that is Metal's primitive-restart index, and whether
 /// the pipeline treats it as a restart or as a vertex is not this function's to
 /// decide, so a draw carrying one is not narrowed at all.
+/// The largest gathered index window [`indexed_vertex_max`] reads on the CPU
+/// to bound a draw's vertex fetch (a handful of quads is tens of bytes).
+const INDEX_RUNS_READ_MAX_BYTES: u64 = 64 * 1024;
+
+/// TEMP (lab): see the guest-runs arm where the draw path bounds its vertex
+/// fetch by its indices. On by default; `REIMS_VGPU_LAB_INDEX_RUNS_MAX=off`
+/// restores the byte-content-only reading. Latched.
+fn lab_index_runs_max() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_INDEX_RUNS_MAX").map_or(true, |v| v != "off"))
+}
+
 fn indexed_vertex_max(info: &IndexedDrawInfo, bytes: &[u8]) -> Option<u64> {
     use crate::protocol::render::IndexType as Contract;
     let count = info.index_count as usize;
@@ -9412,9 +9424,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // content is handed to the index bind below. Without this every indexed
         // draw staged each vertex-indexed `device T*` buffer whole — ~2 GB/s on
         // a driven CSS animation, ~200 KB a draw for a handful of quads.
+        //
+        // An index buffer the gather rail carries (guest runs, e.g. a held
+        // whole-allocation window) is read the same way: its window is already
+        // narrowed to the index bytes this draw consumes, so the read is that
+        // many bytes, and the GPU gathers the same window when the draw runs.
+        // TEMP (lab): `REIMS_VGPU_LAB_INDEX_RUNS_MAX=off` reads byte content only.
         let indexed_vertex_max = match (req.indexed.as_ref(), early_index.as_ref()) {
             (Some(idx), Some(Ok(crate::backend::vulkan::engine::BufferContent::Bytes(bytes)))) => {
                 indexed_vertex_max(idx, bytes)
+            }
+            (
+                Some(idx),
+                Some(Ok(content @ crate::backend::vulkan::engine::BufferContent::GuestRuns(src))),
+            ) if lab_index_runs_max() && src.total_len <= INDEX_RUNS_READ_MAX_BYTES => {
+                crate::runtime::drain::note_store_route("lab_index_runs_max");
+                indexed_vertex_max(idx, &content.cpu_bytes())
             }
             _ => None,
         };
