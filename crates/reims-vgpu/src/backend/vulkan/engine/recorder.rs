@@ -270,7 +270,7 @@ fn worker_spin() -> Duration {
     })
 }
 
-/// Lab `REIMS_VGPU_LAB_RECORDER_DEPTH=N` (1..=16, default 1): how many deferred
+/// Lab `REIMS_VGPU_LAB_RECORDER_DEPTH=N` (1..=16, default 4): how many deferred
 /// draws may be out at once. Above 1 the drain's explicit join before the next
 /// draw takes only a failure already found and does not wait; a failure is then
 /// reported up to N-1 draws later, which those draws' preparation has run past
@@ -281,7 +281,9 @@ pub(crate) fn depth() -> u32 {
         std::env::var("REIMS_VGPU_LAB_RECORDER_DEPTH")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1u32)
+            // 4 since the 5K drag A/B (fq*, interleaved x2): busy 849/840 ->
+            // 822/825 ms/s, 14.2 -> 13.4 us a draw, explicit join 80 -> 50 ms/s.
+            .unwrap_or(4u32)
             .clamp(1, 16)
     })
 }
