@@ -2854,14 +2854,22 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     only: Option<&[(u64, u64)]>,
     site: &str,
 ) -> bool {
-    if copy.is_write() {
-        // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
-        // witness. The read direction shares this walk and writes nothing.
-        state.note_host_wrote_mapping(mapping_id);
-    }
     let page_size = state.page_size();
     let len = copy.len();
     let need_end = off.saturating_add(len as u64);
+    if copy.is_write() {
+        // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
+        // witness. The read direction shares this walk and writes nothing.
+        // TEMP (lab, `REIMS_VGPU_LAB_NOTE_SELECTED`): a selected write names
+        // only the pages it moves - ~1 600 of a 5K frame's 10 800 a payment,
+        // where every page of the mapping was stamped each time.
+        match only {
+            Some(sel) if lab_note_selected() => {
+                state.note_host_wrote_mapping_selected(mapping_id, sel, off, need_end)
+            }
+            _ => state.note_host_wrote_mapping(mapping_id),
+        }
+    }
     // Fast path: one packed view covering the whole range.
     if let Some((ptr, view_len)) = ensure_contig_view(state, host, mapping_id) {
         if (view_len as u64) >= need_end && (off as usize) + len <= view_len {
@@ -2974,6 +2982,13 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         ));
     }
     true
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_NOTE_SELECTED=off` stamps every page of a mapping
+/// on a selected write again, as before. On by default. Latched.
+fn lab_note_selected() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_NOTE_SELECTED").map_or(true, |v| v != "off"))
 }
 
 /// TEMP (lab): [`par_land_write`] splits a large mapping write across the

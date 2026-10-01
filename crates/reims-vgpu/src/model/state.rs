@@ -6317,6 +6317,49 @@ impl DeviceState {
             }));
     }
 
+    /// [`Self::note_host_wrote_mapping`] for a write that moves only the byte
+    /// ranges `only` (mapping offsets) of `[off, end)`: the pages those ranges
+    /// touch are the ones it changes. Any of them that cannot be named makes the
+    /// write unnamed, as a whole mapping's unnamable page does there.
+    pub fn note_host_wrote_mapping_selected(
+        &mut self,
+        mapping_id: u32,
+        only: &[(u64, u64)],
+        off: u64,
+        end: u64,
+    ) {
+        let Some(entries) = self
+            .mappings
+            .get(&mapping_id)
+            .map(|mapping| mapping.page_entries.as_slice())
+            .filter(|entries| !entries.is_empty())
+        else {
+            self.host_writes.note_unknown();
+            return;
+        };
+        let shift = self.page_shift;
+        let mut pages: Vec<u64> = Vec::new();
+        for &(lo, hi) in only {
+            let (lo, hi) = (lo.max(off), hi.min(end));
+            if lo >= hi {
+                continue;
+            }
+            for index in (lo >> shift)..=((hi - 1) >> shift) {
+                match entries
+                    .get(index as usize)
+                    .and_then(|&entry| crate::protocol::iosurface_pages::entry_gpa_shift(entry, shift))
+                {
+                    Some(gpa) => pages.push(gpa),
+                    None => {
+                        self.host_writes.note_unknown();
+                        return;
+                    }
+                }
+            }
+        }
+        self.host_writes.note_page_iter(pages);
+    }
+
     /// Issue a sampled-content generation that has never been issued before.
     ///
     /// Every producer of a sampled-content identity must take its generation
@@ -7575,6 +7618,44 @@ mod fail_vocabulary_tests {
             state.mapping_reach_pages(3),
             None,
             "one unresolvable entry must unname the set, not shorten it"
+        );
+    }
+
+    /// A selected write names exactly the pages its ranges touch: a page of the
+    /// mapping it did not move reads quiet, one it did reads written, and an
+    /// unnamable page among the selected ones unnames the write.
+    #[test]
+    fn a_selected_mapping_write_names_only_the_pages_it_moves() {
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::runtime::host_writes::HostWriteVerdict;
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let page = 1u64 << shift;
+        let mut state = DeviceState::new(DeviceId(1), shift);
+        assert!(state.set_mapping_geom(3, 64, 64, 0x50));
+        let valid = |pfn: u32| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        state.mappings.get_mut(&3).unwrap().page_entries =
+            vec![valid(10), valid(20), valid(30), valid(40)];
+        let before = state.host_writes.epoch();
+        // Bytes 100..page+1 of the mapping: its pages 0 and 1.
+        state.note_host_wrote_mapping_selected(3, &[(100, page + 1)], 0, 4 * page);
+        assert_eq!(
+            state.host_writes.wrote_any_since(before, &[30 << shift, 40 << shift]),
+            HostWriteVerdict::Quiet,
+            "pages the selection never touched were not written"
+        );
+        assert_eq!(
+            state.host_writes.wrote_any_since(before, &[20 << shift]),
+            HostWriteVerdict::Overlap,
+            "a page a range ends in was written"
+        );
+        // The middle entry carries no VALID bit.
+        state.mappings.get_mut(&3).unwrap().page_entries = vec![valid(10), 0, valid(30), valid(40)];
+        let before = state.host_writes.epoch();
+        state.note_host_wrote_mapping_selected(3, &[(page, page + 8)], 0, 4 * page);
+        assert_eq!(
+            state.host_writes.wrote_any_since(before, &[40 << shift]),
+            HostWriteVerdict::Unnamed,
+            "a selected page that names no backing unnames the write"
         );
     }
 
