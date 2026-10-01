@@ -33,7 +33,67 @@
 
 use super::decline::{Decline, Refusal};
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Mutex, OnceLock};
+
+/// Hasher for the latch and census maps, whose keys are a handful of `&'static
+/// str` slugs and small integers this process chose or decoded itself — nothing
+/// a guest can pick to collide, so SipHash's flood resistance buys nothing here.
+///
+/// It was paid on every [`first_sight`], and that is asked on the drain's hot
+/// paths tens of thousands of times a second (a census of one driven 5K boot
+/// reads `seen:` counts of 13 000 a second for one slug alone): two SipHash
+/// passes over a slug and a key per call, against a few multiplies here. One word
+/// at a time, folded and multiplied — the shape `rustc` hashes its own tables
+/// with.
+#[derive(Default)]
+struct LatchHasher(u64);
+
+impl LatchHasher {
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl Hasher for LatchHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            self.mix(u64::from_le_bytes(
+                word.try_into().expect("a chunk of eight"),
+            ));
+        }
+        let rest = words.remainder();
+        if !rest.is_empty() {
+            let mut tail = 0u64;
+            for (i, &byte) in rest.iter().enumerate() {
+                tail |= u64::from(byte) << (8 * i);
+            }
+            // The length goes in with the tail so two slugs that differ only in
+            // trailing zero bytes still hash apart.
+            self.mix(tail | ((rest.len() as u64) << 56));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, byte: u8) {
+        self.mix(u64::from(byte));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, word: u64) {
+        self.mix(word);
+    }
+}
+
+type LatchBuild = BuildHasherDefault<LatchHasher>;
 
 /// How often [`count_refusal`] writes its census line.
 const REFUSAL_CENSUS_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
@@ -72,14 +132,14 @@ static REFUSAL_CENSUS: Mutex<Option<RefusalCensus>> = Mutex::new(None);
 /// window, the drain and the line shape are unit-tested without a five-second
 /// wait.
 struct RefusalCensus {
-    counts: HashMap<(&'static str, &'static str), u64>,
+    counts: HashMap<(&'static str, &'static str), u64, LatchBuild>,
     since: std::time::Instant,
 }
 
 impl RefusalCensus {
     fn new(now: std::time::Instant) -> Self {
         Self {
-            counts: HashMap::new(),
+            counts: HashMap::default(),
             since: now,
         }
     }
@@ -234,7 +294,7 @@ pub fn first_sight(reason: &'static str, discriminant: u64) -> bool {
     // Every sighting, not only the first, so a latched class still reports
     // its magnitude in `refusal_census` (as `seen:<reason>`).
     count_refusal("seen", reason);
-    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+    SEEN.get_or_init(|| Mutex::new(HashSet::default()))
         .lock()
         .map(|mut s| s.insert((reason, discriminant)))
         .unwrap_or(true)
@@ -247,7 +307,7 @@ pub fn first_sight(reason: &'static str, discriminant: u64) -> bool {
 // arm and reads as rot in the intra-doc pass.
 /// A file-level static rather than a `fn`-local one so `forget_all_latches`
 /// can reach it. Nothing outside this module touches it directly.
-static SEEN: OnceLock<Mutex<HashSet<(&'static str, u64)>>> = OnceLock::new();
+static SEEN: OnceLock<Mutex<HashSet<(&'static str, u64), LatchBuild>>> = OnceLock::new();
 
 /// `true` when `state` differs from the last state recorded for `subject` under
 /// `reason`. Records it either way, and is `true` on the first sighting.
@@ -476,6 +536,40 @@ mod tests {
         );
     }
 
+    /// The latch and census maps keep every key apart and find each again: the
+    /// hasher is a speed choice and must not be able to merge two keys.
+    #[test]
+    fn the_latch_hasher_keeps_distinct_keys_distinct() {
+        let mut seen: HashSet<(&'static str, u64), LatchBuild> = HashSet::default();
+        let slugs = [
+            "a",
+            "ab",
+            "abcdefgh",
+            "abcdefghi",
+            "abcdefg\0",
+            "ref_texture_owner_task",
+            "lab_frag_tex_bind",
+        ];
+        for slug in slugs {
+            for key in 0..200u64 {
+                assert!(seen.insert((slug, key)), "{slug} {key} was already there");
+            }
+        }
+        assert_eq!(seen.len(), slugs.len() * 200);
+        for slug in slugs {
+            for key in 0..200u64 {
+                assert!(!seen.insert((slug, key)), "{slug} {key} was lost");
+            }
+        }
+        let mut counts: HashMap<(&'static str, &'static str), u64, LatchBuild> = HashMap::default();
+        for event in ["seen", "blit"] {
+            for slug in slugs {
+                *counts.entry((event, slug)).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(counts.len(), 2 * slugs.len());
+    }
+
     /// The census is fed by every constructor that names a refusal, and ahead
     /// of the latch: a `first_sight` that answers "already said" still counts,
     /// which is the whole difference between the census and the log line. A
@@ -536,7 +630,7 @@ mod tests {
         let opened = std::time::Instant::now()
             .checked_sub(REFUSAL_CENSUS_WINDOW)
             .expect("the clock reaches one window back");
-        let mut counts = HashMap::new();
+        let mut counts = HashMap::default();
         counts.insert((event, "earlier_many"), 7);
         counts.insert((event, "earlier_one"), 1);
         *REFUSAL_CENSUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(RefusalCensus {

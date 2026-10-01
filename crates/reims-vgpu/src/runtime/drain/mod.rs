@@ -2809,6 +2809,14 @@ fn lab_flush_held_words<H: HostMemory + HostOps>(state: &mut DeviceState, host: 
     had
 }
 
+thread_local! {
+    /// The buffer [`settle_model_work`] lists the ready positions into. Taken for
+    /// the length of a settle and put back, so it is empty whenever anyone else
+    /// looks.
+    static SETTLE_READY: std::cell::Cell<Vec<reims_vgpu_core::identity::IngressOrdinal>> =
+        const { std::cell::Cell::new(Vec::new()) };
+}
+
 /// Advance what the model is waiting on, then run everything it has released.
 ///
 /// Called after each admission and at the end of each drain, on both rings. It
@@ -2816,6 +2824,14 @@ fn lab_flush_held_words<H: HostMemory + HostOps>(state: &mut DeviceState, host: 
 /// into the model and this takes work out of it, and neither is a function of
 /// where a ring's head happens to be.
 fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    // The list a pass walks is the one it began with, because running a position
+    // can settle other work (a child packet's arm reaches `drain_other`) and the
+    // store changes under it. It is filled into a buffer this thread keeps
+    // rather than collected afresh: this is entered after every packet, and a
+    // pass that finds one position ready — the usual one — used to allocate for
+    // it. A nested settle finds the buffer taken, builds its own, and leaves it
+    // for whoever sets theirs last; nothing reads one across the boundary.
+    let mut ready = SETTLE_READY.take();
     // **Until nothing more runs, not once.** Running a position publishes its
     // channel's completion words, and a published word discharges the stamp
     // waits other positions were admitted with — so one pass over what was
@@ -2823,8 +2839,8 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     // this device is next entered. A guest that ordered a packet behind a fence
     // this very drain published would wait on a doorbell instead.
     loop {
-        observe_awaited_stamps(state, host);
-        pump_translations(state, host);
+        observe_awaited_stamps(&*state, &*host);
+        pump_translations(&*state, &*host);
         for ingress in state.take_ready() {
             // `false` is a position the model released and this device holds no
             // bytes for. `mark_ready` has already named it; there is nothing
@@ -2832,7 +2848,9 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             let _ = state.parked.mark_ready(ingress);
         }
         let mut ran = false;
-        for ingress in state.parked.ready_in_order() {
+        ready.clear();
+        state.parked.ready_in_order_into(&mut ready);
+        for &ingress in &ready {
             if declined_by_the_device(state, ingress) {
                 continue;
             }
@@ -2849,11 +2867,14 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             break;
         }
     }
+    ready.clear();
+    SETTLE_READY.set(ready);
     // A position still parked is work this device owes, and the ring it came
     // from is empty — so nothing but a re-entry will run it. Asking the store
     // rather than a mask is what keeps "which timelines are owed" one fact:
-    // the store is what holds the work.
-    for ingress in state.parked.waiting_in_order() {
+    // the store is what holds the work. Walked in place: the body writes
+    // `state.pending`, a field of its own, and never the store being walked.
+    for ingress in state.parked.waiting() {
         match state.parked.domain_of(ingress) {
             Some(0) => state.pending.main_drain = true,
             Some(domain) => state.pending.child_mask |= 1u32.checked_shl(domain).unwrap_or(0),
@@ -2912,22 +2933,27 @@ fn declined_by_the_device(
 /// waits arrives, nothing looks at the slot again and the position waits
 /// forever. So the slots parked work is watching are read every pass, which is
 /// the same observation at the moment it has become the only one.
-fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &DeviceState, host: &H) {
     if state.gfx.fifo_base_page == 0 {
         return;
     }
-    let waiting = state.parked.waiting_in_order();
-    if waiting.is_empty() {
+    // Walked in place, which is safe because nothing below touches the store:
+    // the observation reads this device's own page and tells the ordering plane
+    // what it found, and the plane is not where the parked bytes live. The
+    // walk used to be a collected list of positions and a collected list of
+    // slots per position — an allocation per waiting position per pass, on a
+    // path that runs after every packet.
+    let mut waiting = state.parked.waiting().peekable();
+    if waiting.peek().is_none() {
         return;
     }
-    let mut seen: Vec<u32> = Vec::new();
+    let mut seen = SeenSlots::new();
     for ingress in waiting {
-        for index in state.parked.awaited_slots(ingress) {
+        for index in state.parked.awaited_slot_indices(ingress) {
             let index = stamp_slot_index(index);
-            if seen.contains(&index) {
+            if !seen.insert(index) {
                 continue;
             }
-            seen.push(index);
             // A slot past the stamp page names a FIFO this device does not
             // have, so no drain could ever write it. `admit` already holds the
             // position; nothing here can decide it and nothing here pretends to.
@@ -2945,6 +2971,43 @@ fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host
     }
 }
 
+/// The stamp slots one [`observe_awaited_stamps`] pass has read already, so a
+/// slot several parked positions wait on is read once.
+///
+/// The first few live inline: a pass reads a handful of distinct slots, and a
+/// `Vec` for them allocated on the first push of every pass that had any. Past
+/// the inline room the rest spill to the heap, so the answer is the same
+/// however many slots the parked positions name.
+struct SeenSlots {
+    inline: [u32; 16],
+    len: usize,
+    spill: Vec<u32>,
+}
+
+impl SeenSlots {
+    const fn new() -> Self {
+        Self {
+            inline: [0; 16],
+            len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    /// Record `index`; `false` if it was already recorded.
+    fn insert(&mut self, index: u32) -> bool {
+        if self.inline[..self.len].contains(&index) || self.spill.contains(&index) {
+            return false;
+        }
+        if self.len < self.inline.len() {
+            self.inline[self.len] = index;
+            self.len += 1;
+        } else {
+            self.spill.push(index);
+        }
+        true
+    }
+}
+
 /// Try to finish the translations every parked position is still waiting on.
 ///
 /// **The only thing that can release an exec packet parked on its own
@@ -2957,8 +3020,11 @@ fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host
 ///
 /// Nothing here runs anything. It moves pipelines to `Ready`, and readying a
 /// pipeline is what the model turns into released work.
-fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    for ingress in state.parked.waiting_in_order() {
+fn pump_translations<H: HostMemory + HostOps>(state: &DeviceState, host: &H) {
+    // Walked in place: every step below is a shared borrow of the device - the
+    // model's tables answer through their own locks - so nothing here can change
+    // which positions are parked while they are being listed.
+    for ingress in state.parked.waiting() {
         let Some((submission, resolved)) = state.parked.planning(ingress) else {
             continue;
         };
@@ -2982,7 +3048,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
         let mut measured_ns = 0u64;
         let pending = crate::runtime::exec::preflight_submission(
             state,
-            &*host,
+            host,
             submission,
             resolved,
             &mut measured_ns,
@@ -3000,9 +3066,8 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             }
             continue;
         }
-        let leases = leases.to_vec();
         note_store_route("parked_translations_finished");
-        for lease in leases {
+        for &lease in leases {
             ready_lease(state, task, lease, "pipeline_lease_ready_pump");
             // A lease the table would not ready names a pipeline that ended —
             // the guest deleted it (or this device retired its name) while the

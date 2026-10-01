@@ -813,23 +813,38 @@ fn decode_backing_plane(desc: &[u8], plane_index: usize) -> Option<BackingPlane>
 /// Public so the probe's notion of "undecoded" is pinned by a test rather than
 /// restated in a log format string.
 pub fn undecoded_backing_bytes(desc: &[u8]) -> Vec<u8> {
+    let (interior, tail) = undecoded_backing_parts(desc);
+    let mut out = Vec::with_capacity(interior.len() + tail.len());
+    out.extend_from_slice(interior);
+    out.extend_from_slice(tail);
+    out
+}
+
+/// [`undecoded_backing_bytes`] as the two stretches of `desc` it is made of, in
+/// order — the header's undecoded interior and whatever follows the last plane
+/// record — borrowed rather than gathered, so a caller that only has to compare
+/// the span with one it has seen does not pay for a copy of it. Both are empty
+/// for a descriptor too short to be a backing record or whose header will not
+/// read.
+fn undecoded_backing_parts(desc: &[u8]) -> (&[u8], &[u8]) {
     if desc.len() < TYPE4_MIN_LEN {
-        return Vec::new();
+        return (&[], &[]);
     }
     let Ok(h) = reims_vgpu_wire::device_desc::backing_header(desc) else {
-        return Vec::new();
+        return (&[], &[]);
     };
     let plane_count = (h.plane_count as usize).min(TYPE4_PLANE_CAP);
     let planes_end = backing_len_for(plane_count);
-    let mut out = Vec::new();
     // The header's undecoded interior, named by the field rather than by the
     // literal it used to be: a field added before it moves this with it.
     let reserved = core::mem::offset_of!(reims_vgpu_wire::device_desc::BackingHeader, reserved);
-    out.extend_from_slice(&desc[reserved..TYPE4_PLANES]);
-    if planes_end < desc.len() {
-        out.extend_from_slice(&desc[planes_end..]);
-    }
-    out
+    let interior = &desc[reserved..TYPE4_PLANES];
+    let tail = if planes_end < desc.len() {
+        &desc[planes_end..]
+    } else {
+        &[]
+    };
+    (interior, tail)
 }
 
 /// One always-on line per distinct `(len, undecoded span)`, capped.
@@ -854,17 +869,37 @@ fn note_backing_shape(desc: &[u8]) {
     const HEX_MAX: usize = 128;
     use std::sync::Mutex;
     type ShapeKey = (usize, Vec<u8>);
-    static SEEN: Mutex<Option<std::collections::BTreeSet<ShapeKey>>> = Mutex::new(None);
+    // A list, not a set: the cap keeps it to a couple of dozen entries, and a
+    // list can be asked "have you seen this span" with the span still borrowed
+    // from the descriptor. This runs once per decode of a backing record — on
+    // every present — and a decode after the first of its shape used to copy the
+    // span twice (once to build the key, once to try to insert it) to be told
+    // so.
+    static SEEN: Mutex<Vec<ShapeKey>> = Mutex::new(Vec::new());
 
-    let undecoded = undecoded_backing_bytes(desc);
+    let (interior, tail) = undecoded_backing_parts(desc);
+    let span_len = interior.len() + tail.len();
     let (fresh, distinct) = {
-        let mut guard = SEEN.lock().unwrap_or_else(|p| p.into_inner());
-        let seen = guard.get_or_insert_with(Default::default);
+        let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
         if seen.len() > MAX_SHAPES {
             return;
         }
-        (seen.insert((desc.len(), undecoded.clone())), seen.len())
+        let known = seen.iter().any(|(len, span)| {
+            *len == desc.len()
+                && span.len() == span_len
+                && span[..interior.len()] == *interior
+                && span[interior.len()..] == *tail
+        });
+        if known {
+            return;
+        }
+        let mut span = Vec::with_capacity(span_len);
+        span.extend_from_slice(interior);
+        span.extend_from_slice(tail);
+        seen.push((desc.len(), span));
+        (true, seen.len())
     };
+    let undecoded = undecoded_backing_bytes(desc);
     if !fresh {
         return;
     }
@@ -1583,6 +1618,63 @@ pub fn read_descriptor<M: HostMemory>(
     )
     .ok()?;
     Some(buf)
+}
+
+/// Bytes of a descriptor [`read_descriptor_small`] keeps on the stack. A backing
+/// record is 36 bytes plus 16 for every plane past the first, so this holds all
+/// eight planes (148); anything longer goes to the heap as it always did.
+const DESCRIPTOR_INLINE: usize = 160;
+
+/// A descriptor blob read for a list entry: inline when short, a `Vec` when not.
+/// Reads as the bytes either way.
+pub(crate) enum DescriptorBytes {
+    Inline {
+        bytes: [u8; DESCRIPTOR_INLINE],
+        len: usize,
+    },
+    Heap(Vec<u8>),
+}
+
+impl std::ops::Deref for DescriptorBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, len } => &bytes[..*len],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
+
+/// [`read_descriptor`] for a caller that only decodes the bytes and keeps
+/// nothing: the same read, the same answers, and a short descriptor is held on
+/// the stack instead of in a fresh allocation.
+///
+/// The present path re-reads one backing descriptor per mapping per frame to see
+/// whether the geometry moved, and the allocation was a trip into the heap for
+/// bytes that are decoded and dropped within the call.
+pub(crate) fn read_descriptor_small<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    entry: &ListObjectEntry,
+) -> Option<DescriptorBytes> {
+    let len =
+        crate::runtime::draw::host_alloc_len(entry.descriptor_length as u64).filter(|&n| n > 0)?;
+    if len > DESCRIPTOR_INLINE {
+        return read_descriptor(state, host, task_id, entry).map(DescriptorBytes::Heap);
+    }
+    let mut bytes = [0u8; DESCRIPTOR_INLINE];
+    gva_mem::read_task_gva_by_id(
+        host,
+        &state.tasks,
+        task_id,
+        entry.descriptor_gva,
+        &mut bytes[..len],
+        state.page_shift,
+    )
+    .ok()?;
+    Some(DescriptorBytes::Inline { bytes, len })
 }
 
 /// Which rung of the object-list ladder refused, as a value rather than a
@@ -5657,12 +5749,18 @@ fn backing_matches_latched_geom(m: &MappingEntry, surf: &BackingRecord) -> bool 
 }
 
 /// The order [`resolve_backing_ex`] probes task object lists in: task 0,
-/// then the cached owner hint, then every other task once.
+/// then the cached owner hint, then every other live task once, ascending.
 ///
-/// An iterator rather than a materialised list. The order is unchanged, but
-/// building it as a `Vec` allocated 257 elements on every call, and this runs
-/// from `ensure_surface_for_present` on every present for every resident
-/// mapping — thousands of times a boot to read element 0 and stop.
+/// A cursor rather than a list, and one that does not hold the task table
+/// between steps: [`Self::next`] borrows it for one lookup, because the loop it
+/// feeds needs `&mut DeviceState` for the probe each id leads to. Both earlier
+/// shapes paid for that: a `Vec` allocated up to 257 elements on every call, and
+/// this runs from `ensure_surface_for_present` on every present for every
+/// resident mapping — thousands of times a boot to read element 0 and stop —
+/// and the iterator the comment above the loop claimed could not be had under
+/// the `&mut`, which is why the list was collected. Stepping through the table
+/// by id costs a lookup per step the search actually takes and nothing for the
+/// steps it never reaches.
 ///
 /// A hint of 0 contributes nothing: 0 is already first, so admitting it would
 /// only cost the `!= hint` filter its meaning. A hint naming no live task is
@@ -5674,12 +5772,67 @@ fn backing_matches_latched_geom(m: &MappingEntry, surf: &BackingRecord) -> bool 
 /// those ids were only ever skipped, and yielding them cost the caller a
 /// liveness test per id per present. Task 0 leads whether or not it is live —
 /// see the caller for why the guest's kernel task is named rather than found —
-/// so it is filtered out of the tail rather than left to `live_ids` to omit.
+/// so the tail starts after it rather than leaving it to the table to omit.
+///
+/// The live set is read at each step, where the list read it once at the start.
+/// The two agree because nothing a probe calls defines or deletes a task: those
+/// are the guest's `DefineTask`/`DeleteTask` packets, handled by the drain
+/// between resolves, never from inside one.
+struct BackingProbeOrder {
+    hint: u32,
+    stage: BackingProbeStage,
+}
+
+#[derive(Clone, Copy)]
+enum BackingProbeStage {
+    /// Nothing yielded yet: task 0 is next.
+    Zero,
+    /// Task 0 yielded: the hint is next, when it names a task other than 0.
+    Hint,
+    /// Hint yielded: the live ids greater than this one are next.
+    Live { after: u32 },
+}
+
+impl BackingProbeOrder {
+    const fn new(hint: u32) -> Self {
+        Self {
+            hint,
+            stage: BackingProbeStage::Zero,
+        }
+    }
+
+    /// The next task id to probe, or `None` when every one has been offered.
+    fn next(&mut self, tasks: &TaskTable) -> Option<u32> {
+        loop {
+            match self.stage {
+                BackingProbeStage::Zero => {
+                    self.stage = BackingProbeStage::Hint;
+                    return Some(0);
+                }
+                BackingProbeStage::Hint => {
+                    self.stage = BackingProbeStage::Live { after: 0 };
+                    if self.hint != 0 {
+                        return Some(self.hint);
+                    }
+                }
+                BackingProbeStage::Live { after } => {
+                    let id = tasks.next_live_after(after)?;
+                    self.stage = BackingProbeStage::Live { after: id };
+                    // `id > after >= 0`, so it is never task 0.
+                    if id != self.hint {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The whole probe order of a hint, for the tests that state it as a list.
+#[cfg(test)]
 fn backing_probe_order(tasks: &TaskTable, hint: u32) -> Vec<u32> {
-    std::iter::once(0)
-        .chain(Some(hint).filter(|&h| h != 0))
-        .chain(tasks.live_ids().filter(move |&tid| tid != 0 && tid != hint))
-        .collect()
+    let mut order = BackingProbeOrder::new(hint);
+    std::iter::from_fn(|| order.next(tasks)).collect()
 }
 
 /// Take `task_id` as the owner of `surface_id` and report the search's exposure.
@@ -5719,17 +5872,19 @@ fn resolve_backing_ex<M: HostMemory>(
     // stopped on the first probe — and they are what makes `backing_claimants` able
     // to say a second task claims the id at all.
     //
-    // Built as an iterator rather than a `Vec`. The order is the same one, but
-    // materialising it allocated a 257-element vector on every call, and this is
-    // called from `ensure_surface_for_present` on every present for every
-    // resident mapping — thousands of times a boot to read element 0 and stop.
+    // Stepped through a cursor rather than collected into a `Vec`: the order is
+    // the same one, but materialising it allocated a 257-element vector on every
+    // call, and this is called from `ensure_surface_for_present` on every present
+    // for every resident mapping — thousands of times a boot to read element 0
+    // and stop. See [`BackingProbeOrder`].
     let hint = state
         .mappings
         .get(&surface_id)
         .map(|m| m.owner_task_hint)
         .unwrap_or(0);
 
-    for task_id in backing_probe_order(&state.tasks, hint) {
+    let mut probe_order = BackingProbeOrder::new(hint);
+    while let Some(task_id) = probe_order.next(&state.tasks) {
         // Count the guest-read cost of one active-task object-list probe.
         let Some(entry) = probe_list_entry(state, host, task_id, surface_id) else {
             continue;
@@ -5737,7 +5892,7 @@ fn resolve_backing_ex<M: HostMemory>(
         if entry.object_type != OBJECT_TYPE_BACKING {
             continue;
         }
-        let Some(desc) = read_descriptor(state, host, task_id, &entry) else {
+        let Some(desc) = read_descriptor_small(state, host, task_id, &entry) else {
             defer_backing_fail(
                 surface_id,
                 crate::observe::ladder_slug!("", desc_read),

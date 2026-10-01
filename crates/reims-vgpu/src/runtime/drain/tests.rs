@@ -7688,3 +7688,88 @@ mod arrivals {
         ));
     }
 }
+
+/// A settle pass over positions that are parked and still waiting — the
+/// passes that follow every packet while the guest has work held behind a
+/// fence — enters the heap allocator no more. The stamp observation listed the
+/// waiting positions, the slots of each, and the slots already seen; the
+/// translation pump listed the positions again; the ready list and the tail's
+/// owed-timeline walk collected theirs.
+///
+/// Warmed first: the first observations of a slot tell the ordering plane
+/// something it keeps, which is the plane's allocation and happens once.
+#[test]
+fn a_settle_pass_over_waiting_positions_does_not_allocate() {
+    use crate::runtime::parked::ParkedWork;
+    use reims_vgpu_core::identity::{DeviceEpoch, IngressOrdinal};
+
+    // The instrument sees the heap: a control that must trip.
+    let (_, control) = reims_vgpu_testkit::allocations::measure(|| vec![0u8; 64]);
+    assert!(control >= 1, "the counting allocator is not installed");
+
+    let page_size = 1usize << PAGE_SHIFT_X86;
+    let stamp_pfn = 5u64;
+    let mut host = FakeHost::new();
+    host.map_range(stamp_pfn << PAGE_SHIFT_X86, page_size, 0);
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    state.page_shift = PAGE_SHIFT_X86;
+    state.gfx.fifo_base_page = stamp_pfn as u32;
+
+    // Three waiting positions on two domains whose waits overlap, so the
+    // already-seen test has something to refuse.
+    for (n, (domain, slots)) in [(1u32, vec![1u32, 2]), (2, vec![2, 3]), (1, vec![1, 3, 1])]
+        .into_iter()
+        .enumerate()
+    {
+        let packet = Packet {
+            opcode: 0x37,
+            stamp_waits: slots
+                .into_iter()
+                .map(|index| StampWait { index, value: 1 })
+                .collect(),
+            total_size: 0,
+            completion_stamp: 0,
+            payload: vec![0u8; 8],
+            next_head: 0,
+        };
+        state.parked.park(
+            IngressOrdinal(n as u64 + 1),
+            ParkedWork::new(domain, DeviceEpoch::FIRST, packet),
+        );
+    }
+
+    // The plane's first sightings, and the census's first sight of each route
+    // they take, are one-time costs; a few passes get past all of them.
+    for _ in 0..3 {
+        settle_model_work(&mut state, &mut host);
+    }
+    assert_eq!(state.parked.len(), 3, "nothing here can release them");
+    assert_ne!(state.pending.child_mask & 0b10, 0, "domain 1 is still owed");
+    assert_ne!(
+        state.pending.child_mask & 0b100,
+        0,
+        "domain 2 is still owed"
+    );
+
+    let (_, trips) = reims_vgpu_testkit::allocations::measure(|| {
+        settle_model_work(&mut state, &mut host);
+        settle_model_work(&mut state, &mut host);
+    });
+    assert_eq!(trips, 0, "a warm settle pass enters the heap allocator");
+}
+
+/// The stamp slots a pass has read are remembered however many there are: the
+/// inline room and the spill past it answer alike.
+#[test]
+fn the_slots_a_pass_has_seen_are_remembered_past_the_inline_room() {
+    let mut seen = SeenSlots::new();
+    for index in 0..40u32 {
+        assert!(seen.insert(index), "{index} is new");
+    }
+    for index in 0..40u32 {
+        assert!(!seen.insert(index), "{index} was seen");
+    }
+    assert!(seen.insert(40), "a slot past them all is new");
+    assert!(!seen.insert(40));
+    assert!(seen.insert(u32::MAX));
+}

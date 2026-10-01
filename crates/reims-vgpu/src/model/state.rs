@@ -557,6 +557,22 @@ impl TaskTable {
         self.live().map(|(id, _)| id)
     }
 
+    /// The smallest live task id greater than `after`, if there is one.
+    ///
+    /// [`Self::live_ids`] one step at a time, for a walker that has to let go of
+    /// the table between steps: each call borrows it for the lookup alone, so
+    /// the caller can hold `&mut` to the device state for the work a step
+    /// leads to. Stepping from `after = id` of the previous answer visits
+    /// exactly the ids `live_ids` yields, in the same ascending order, without
+    /// collecting them first.
+    pub fn next_live_after(&self, after: u32) -> Option<u32> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.0
+            .range((Excluded(after), Unbounded))
+            .find(|(_, t)| t.active)
+            .map(|(&id, _)| id)
+    }
+
     /// How many tasks are live. Not the size of the id space — there is none.
     pub fn live_count(&self) -> usize {
         self.live_ids().count()

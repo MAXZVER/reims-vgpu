@@ -133,3 +133,13 @@ pub(crate) use device::{
     device_window_run_main, device_window_set_early_fb, device_window_start, device_window_stop,
     unwind_safe, ConsoleFeed, CursorGlyphInfo,
 };
+
+/// The heap-trip counter the unit tests measure with, so a test can state that a
+/// warm path does not enter the allocator (see `reims_vgpu_testkit::allocations`).
+///
+/// Per thread and off outside `measure`, so every other test pays one
+/// thread-local read per allocation and sees nothing else.
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: reims_vgpu_testkit::allocations::Counting =
+    reims_vgpu_testkit::allocations::Counting::new();
