@@ -1001,9 +1001,20 @@ impl<'u> ExecBuilder<'u> {
     /// check one lookup per entry.
     fn lease_pipeline(&mut self, pipeline: ResourceId) {
         if !self.pipeline_leases.contains(&pipeline) {
+            if self.pipeline_leases.capacity() == 0 {
+                // The first lease takes the room the usual packet needs. A
+                // `Vec` grown from empty goes 4, 8, 16 by reallocating, and a
+                // packet that binds five pipelines paid for the second step
+                // every time; this is one allocation for up to eight.
+                self.pipeline_leases.reserve_exact(Self::LEASES_FIRST_ROOM);
+            }
             self.pipeline_leases.push(pipeline);
         }
     }
+
+    /// Pipelines' worth of room [`Self::lease_pipeline`] reserves on the first
+    /// lease. Not a limit: a ninth lease grows the list as it always did.
+    const LEASES_FIRST_ROOM: usize = 8;
 
     pub fn require(&mut self, prerequisite: Prerequisite) {
         self.prerequisites.push(prerequisite);
@@ -1143,6 +1154,36 @@ impl UsageCensus {
 #[cfg(test)]
 mod usage_census_tests {
     use super::*;
+
+    /// The lease list is one allocation for the pipelines a packet usually
+    /// binds, and a repeat of one already held adds nothing.
+    #[test]
+    fn the_lease_list_takes_its_room_once_and_dedupes() {
+        let id = |slot: u32| ResourceId {
+            slot: crate::identity::ObjectListRef(slot),
+            generation: crate::identity::SlotGeneration::default(),
+        };
+        let mut b = ExecBuilder::new();
+        assert_eq!(
+            b.pipeline_leases.capacity(),
+            0,
+            "nothing is held before a lease"
+        );
+        for slot in 0..ExecBuilder::LEASES_FIRST_ROOM as u32 {
+            b.lease_pipeline(id(slot));
+            assert_eq!(
+                b.pipeline_leases.capacity(),
+                ExecBuilder::LEASES_FIRST_ROOM,
+                "lease {slot} fits the room the first one took"
+            );
+        }
+        b.lease_pipeline(id(3));
+        assert_eq!(b.pipeline_leases.len(), ExecBuilder::LEASES_FIRST_ROOM);
+        // Past the room it grows as a `Vec` does.
+        b.lease_pipeline(id(100));
+        assert_eq!(b.pipeline_leases.len(), ExecBuilder::LEASES_FIRST_ROOM + 1);
+        assert_eq!(b.pipeline_leases[0], id(0), "first-leased order is kept");
+    }
 
     /// The four draw outcomes are counted apart, because they name four
     /// different next moves.
