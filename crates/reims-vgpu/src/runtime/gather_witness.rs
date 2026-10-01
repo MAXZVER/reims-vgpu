@@ -1282,7 +1282,9 @@ pub(crate) fn plan_gather<M: crate::runtime::host::HostOps>(
         &mut warm_routes,
     );
     let token = next.token;
-    let lagged_gen = (token != 0).then(|| host.guest_write_gen_lagged(token)).flatten();
+    let lagged_gen = (token != 0)
+        .then(|| host.guest_write_gen_lagged(token))
+        .flatten();
     Some(PlannedGather {
         key,
         rail,
@@ -1307,14 +1309,7 @@ pub(crate) fn commit_gather<M: crate::runtime::host::HostOps>(
     plan: &PlannedGather,
     gpas: &[u64],
 ) -> Option<GatherOutcome> {
-    let entry = state.gather_witness.entries.get(&plan.key)?;
-    if entry.last_seen != plan.expect_last_seen || entry.gpas != gpas {
-        return None;
-    }
-    if witness_readings(state, &plan.key, gpas) != plan.readings {
-        return None;
-    }
-    if plan.token != 0 && host.guest_write_gen_lagged(plan.token) != plan.lagged_gen {
+    if !gather_plan_holds(state, host, plan, gpas) {
         return None;
     }
     use crate::runtime::drain::{note_store_route, note_store_route_n};
@@ -1341,6 +1336,38 @@ pub(crate) fn commit_gather<M: crate::runtime::host::HostOps>(
         },
         vouch: plan.seen.vouch,
     })
+}
+
+/// Whether [`commit_gather`] would apply `plan` now: the entry unwritten since
+/// the plan, the same readings, and no sync that moved the token's generation.
+/// Reads only, so a caller can ask before work it must not do twice.
+pub(crate) fn gather_plan_holds<M: crate::runtime::host::HostOps>(
+    state: &crate::model::DeviceState,
+    host: &M,
+    plan: &PlannedGather,
+    gpas: &[u64],
+) -> bool {
+    let Some(entry) = state.gather_witness.entries.get(&plan.key) else {
+        return false;
+    };
+    entry.last_seen == plan.expect_last_seen
+        && entry.gpas == gpas
+        && witness_readings(state, &plan.key, gpas) == plan.readings
+        && (plan.token == 0 || host.guest_write_gen_lagged(plan.token) == plan.lagged_gen)
+}
+
+impl PlannedGather {
+    /// What committing this plan answers: the identity and vouch the serial
+    /// observation would have produced at the plan's readings.
+    pub(crate) fn predicted(&self) -> GatherOutcome {
+        GatherOutcome {
+            identity: GatheredIdentity {
+                key: self.key.content_key(),
+                generation: self.seen.generation,
+            },
+            vouch: self.seen.vouch,
+        }
+    }
 }
 
 /// Record one zero-copy sampled gather against the guest-write witness, and
@@ -2046,7 +2073,10 @@ mod tests {
             let at = (block * FOLD_BLOCK + 17) as usize;
             buf[at] ^= 0x20;
             let moved = unsafe { fold_runs(&[run_over(&buf)], span) };
-            assert_ne!(base, moved, "a change in sampled block {block} folded the same");
+            assert_ne!(
+                base, moved,
+                "a change in sampled block {block} folded the same"
+            );
             buf[at] ^= 0x20;
         }
         // Whole-frame change (a new video frame, a scroll) always moves it.
@@ -2887,7 +2917,10 @@ mod tests {
         crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86)
     }
 
-    const PLAN_KEY: GatherKey = GatherKey::Mapping { mid: 5, base_off: 0 };
+    const PLAN_KEY: GatherKey = GatherKey::Mapping {
+        mid: 5,
+        base_off: 0,
+    };
 
     /// A planned witness decision applied at commit leaves the witness where
     /// the serial observation would have, and answers the same.
@@ -2902,18 +2935,48 @@ mod tests {
         );
         let rail = GatherRail::MapperRefTexture;
         // Arm both (the cold branch is serial-only).
-        let _ = note_gather(&mut planned, &mut host_p, rail, PLAN_KEY, one_page(&GPAS, &runs));
-        let _ = note_gather(&mut serial, &mut host_s, rail, PLAN_KEY, one_page(&GPAS, &runs));
+        let _ = note_gather(
+            &mut planned,
+            &mut host_p,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
+        let _ = note_gather(
+            &mut serial,
+            &mut host_s,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
         for _ in 0..3 {
             let plan = plan_gather(&planned, &host_p, rail, PLAN_KEY, one_page(&GPAS, &runs))
                 .expect("a tracked window with the same pages plans");
             let a = commit_gather(&mut planned, &host_p, &plan, &GPAS).expect("nothing moved");
-            let b = note_gather(&mut serial, &mut host_s, rail, PLAN_KEY, one_page(&GPAS, &runs));
+            let b = note_gather(
+                &mut serial,
+                &mut host_s,
+                rail,
+                PLAN_KEY,
+                one_page(&GPAS, &runs),
+            );
             assert_eq!(a, b);
         }
         // And the two witnesses keep agreeing on the next serial bind.
-        let a = note_gather(&mut planned, &mut host_p, rail, PLAN_KEY, one_page(&GPAS, &runs));
-        let b = note_gather(&mut serial, &mut host_s, rail, PLAN_KEY, one_page(&GPAS, &runs));
+        let a = note_gather(
+            &mut planned,
+            &mut host_p,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
+        let b = note_gather(
+            &mut serial,
+            &mut host_s,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
         assert_eq!(a, b);
     }
 
@@ -2942,9 +3005,21 @@ mod tests {
         let mut state = fresh_state();
         let mut host = crate::runtime::host::FakeHost::new();
         let rail = GatherRail::MapperRefTexture;
-        let _ = note_gather(&mut state, &mut host, rail, PLAN_KEY, one_page(&GPAS, &runs));
+        let _ = note_gather(
+            &mut state,
+            &mut host,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
         let plan = plan_gather(&state, &host, rail, PLAN_KEY, one_page(&GPAS, &runs)).unwrap();
-        let _ = note_gather(&mut state, &mut host, rail, PLAN_KEY, one_page(&GPAS, &runs));
+        let _ = note_gather(
+            &mut state,
+            &mut host,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
         assert!(commit_gather(&mut state, &host, &plan, &GPAS).is_none());
     }
 
@@ -2957,7 +3032,13 @@ mod tests {
         let mut state = fresh_state();
         let mut host = crate::runtime::host::FakeHost::new();
         let rail = GatherRail::MapperRefTexture;
-        let _ = note_gather(&mut state, &mut host, rail, PLAN_KEY, one_page(&GPAS, &runs));
+        let _ = note_gather(
+            &mut state,
+            &mut host,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
         let plan = plan_gather(&state, &host, rail, PLAN_KEY, one_page(&GPAS, &runs)).unwrap();
         host.guest_wrote_page(GPAS[0]);
         assert!(commit_gather(&mut state, &host, &plan, &GPAS).is_none());

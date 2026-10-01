@@ -9722,8 +9722,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // validated here serves the bind (on) or is compared with
                         // the serial ladder (shadow); otherwise the ladder runs.
                         let prefetched = prefetch::prefetched_source(
-                            &*state,
-                            &*host,
+                            state,
+                            host,
                             req.task_id,
                             texture_ref,
                             texture_resource.as_ref(),

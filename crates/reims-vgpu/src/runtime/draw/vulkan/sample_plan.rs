@@ -296,6 +296,15 @@ pub(crate) enum SampleBail {
     NoHostCache,
     /// The guest replaced the cache's bytes: the page rungs serve it.
     LowerRung,
+    /// A ref-texture view whose zero-copy rail declines the plane (format,
+    /// swizzle, window, floor or alias): the CPU loader serves it.
+    ZeroCopyDeclined,
+    /// The surface owes a writeback; paying it writes guest pages.
+    OwedFrame,
+    /// The mapping's window is not in its cache, or needs the mutating resolve.
+    ColdWindow,
+    /// The witness does not track this window with this page set yet.
+    ColdWitness,
 }
 
 impl SampleBail {
@@ -312,6 +321,10 @@ impl SampleBail {
             Self::GuestReplaced => "guest_replaced",
             Self::NoHostCache => "no_host_cache",
             Self::LowerRung => "lower_rung",
+            Self::ZeroCopyDeclined => "zero_copy_declined",
+            Self::OwedFrame => "owed_frame",
+            Self::ColdWindow => "cold_window",
+            Self::ColdWitness => "cold_witness",
         }
     }
 }
@@ -331,6 +344,12 @@ pub(crate) enum SampleInvalid {
     GuestWrite,
     /// The host cache entry was replaced.
     HostCache,
+    /// The mapping's cached window is not the one the plan read.
+    Window,
+    /// The witness entry or its readings moved since the plan.
+    Witness,
+    /// A writeback debt was armed on the surface since the plan.
+    Debt,
 }
 
 impl SampleInvalid {
@@ -342,6 +361,9 @@ impl SampleInvalid {
             Self::Backing => "backing",
             Self::GuestWrite => "guest_write",
             Self::HostCache => "host_cache",
+            Self::Window => "window",
+            Self::Witness => "witness",
+            Self::Debt => "debt",
         }
     }
 }
@@ -709,6 +731,308 @@ pub(super) fn commit_sampled_plan<M: HostOps>(
     Ok(take_sampled_plan(state, plan, true))
 }
 
+/// Why the zero-copy rail's backend import cannot serve a plane, so the guest
+/// runs do: the two answers `mapped_sampled_source` reaches without changing
+/// anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportGate {
+    /// No stable page alias, no contiguous view for this page list (refused and
+    /// remembered for this generation), or a view with no footprint.
+    NoView,
+    /// A contiguous view exists and the import map stands on a refusal; the
+    /// serial rail notes `zc_packed_alias_standing_refusal` on its way past.
+    StandingRefusal,
+}
+
+/// A ref-texture view's plane as the zero-copy rail derives it from the mapping
+/// row, and the import gate in front of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RefViewPlane {
+    native: TexelLayout,
+    sampled_vk_format: ash::vk::Format,
+    base_off: u64,
+    span: u64,
+    row_length_texels: u32,
+    import: ImportGate,
+}
+
+/// `try_ref_texture_sample_zero_copy`'s plane for `view` over `mid`, derived the
+/// same way from state this call only reads. `None` wherever that rail would
+/// decline, or would have to resolve or import something first.
+fn ref_view_plane<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mid: u32,
+    view: objects::RefTextureView,
+) -> Option<RefViewPlane> {
+    let (w, h) = (view.width, view.height);
+    if w == 0 || h == 0 || view.depth != 1 {
+        return None;
+    }
+    let m = state.mappings.get(&mid)?;
+    // `ensure_resolved_for_scanout` answers from the row alone only without a
+    // `mapping_internal`; with one it may re-resolve, which only the drain does.
+    if !m.mapped || m.page_entries.is_empty() || m.mapping_internal != 0 {
+        return None;
+    }
+    let (native, bpp) = match translate::pixel::sampled_pixels(view.pixel_format) {
+        Ok((layout, _decline, components)) if pixel_format::swizzle_is_identity(&components) => {
+            (layout, layout.bytes_per_texel())
+        }
+        _ => return None,
+    };
+    let (base_off, bpr_u32, _span_end) = crate::runtime::mapping_write::ref_texture_sample_window(
+        m,
+        view.plane_index,
+        w,
+        h,
+        view.pixel_format,
+    )?;
+    let sampled_vk_format = translate::pixel::translate(view.pixel_format).ok()?.vk;
+    let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, bpr_u32 as u64)?;
+    let import = if !host.map_pages_stable()
+        || (m.contig_ptr == 0 && m.contig_refused_gen == Some(m.map_generation))
+        || (m.contig_ptr != 0 && m.contig_footprint.is_none())
+    {
+        ImportGate::NoView
+    } else if m.contig_ptr != 0
+        && matches!(
+            crate::runtime::guest_ram_map::standing_refusal_resolved(),
+            Some(Some(_))
+        )
+    {
+        ImportGate::StandingRefusal
+    } else {
+        return None;
+    };
+    Some(RefViewPlane {
+        native,
+        sampled_vk_format,
+        base_off,
+        span,
+        row_length_texels,
+        import,
+    })
+}
+
+/// A ref-texture view's plane planned onto the zero-copy rail: the window the
+/// mapping's cache holds and the gather witness's decision for it, taken off the
+/// drain thread from state the plan only reads.
+///
+/// The serial counterpart is the materialization arm of [`resolve_sampled_source`]
+/// through [`try_ref_texture_sample_zero_copy`]. The witness decision moves the
+/// witness when it is applied, so a plan serves one bind of its ref per stream;
+/// the next bind of the same ref finds the entry moved and takes the serial path.
+pub(crate) struct RefViewPlan {
+    task_id: u32,
+    texture_ref: u32,
+    resource: std::sync::Arc<crate::model::TaskResource>,
+    mid: u32,
+    view: objects::RefTextureView,
+    /// [`crate::runtime::mapper::mapping_window_key_readonly`] when planned.
+    window_key: (u32, u64, usize),
+    plane: RefViewPlane,
+    gpas: std::sync::Arc<Vec<u64>>,
+    runs: std::sync::Arc<Vec<crate::backend::vulkan::engine::GuestRun>>,
+    gather: crate::runtime::gather_witness::PlannedGather,
+}
+
+/// Plan the zero-copy bind of a ref-texture view that needs materializing.
+///
+/// Every step the serial rail takes that could write anything — resolving the
+/// surface, paying an owed frame, building an import, filling the window cache,
+/// arming the witness — is a [`SampleBail`] here, so a plan exists only for a
+/// bind on which the serial rail would have done none of them.
+pub(crate) fn plan_ref_view_zero_copy<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+    resource: std::sync::Arc<crate::model::TaskResource>,
+) -> Result<RefViewPlan, SampleBail> {
+    if resource.entry.object_type != objects::OBJECT_TYPE_REF_TEXTURE {
+        return Err(SampleBail::NotSurface);
+    }
+    let desc = &resource.descriptor;
+    let mid = reims_vgpu_wire::device_desc::ref_texture_header(desc)
+        .map(|t5| t5.surface_id.get())
+        .unwrap_or(0);
+    let view = objects::decode_ref_texture_view(desc).ok_or(SampleBail::NotSurface)?;
+    if mid == 0 {
+        return Err(SampleBail::NotSurface);
+    }
+    // `ensure_surface_for_texture_bind`'s warm test; its cold arm mutates.
+    let m = state.mappings.get(&mid).ok_or(SampleBail::ColdBacking)?;
+    if !(m.mapped && !m.page_entries.is_empty() && m.has_geom) {
+        return Err(SampleBail::ColdBacking);
+    }
+    if !ref_texture_view_requires_materialization(m.has_geom, m.width, m.height, m.format, view) {
+        return Err(SampleBail::NotSurface);
+    }
+    let window_key = crate::runtime::mapper::mapping_window_key_readonly(state, mid)
+        .ok_or(SampleBail::ColdWindow)?;
+    let plane = ref_view_plane(state, host, mid, view).ok_or(SampleBail::ZeroCopyDeclined)?;
+    if !state.pending_writebacks.is_empty() && state.pending_writebacks.get(mid).is_some() {
+        return Err(SampleBail::OwedFrame);
+    }
+    if !sampled_gather_floor_admits(SampledFloorRail::RefTexture, plane.native, plane.span)
+        || !guest_run_alias_available(host)
+    {
+        return Err(SampleBail::ZeroCopyDeclined);
+    }
+    if crate::runtime::lab_runs::mode() != crate::runtime::lab_runs::Mode::On {
+        return Err(SampleBail::ColdWindow);
+    }
+    let (gpas, runs) =
+        crate::runtime::mapper::mapping_window_cached(state, mid, plane.base_off, plane.span)
+            .ok_or(SampleBail::ColdWindow)?;
+    let gather = crate::runtime::gather_witness::plan_gather(
+        state,
+        host,
+        crate::runtime::gather_witness::GatherRail::RefTexture,
+        crate::runtime::gather_witness::GatherKey::Mapping {
+            mid,
+            base_off: plane.base_off,
+        },
+        crate::runtime::gather_witness::GatherWindow {
+            gpas: &gpas,
+            runs: &runs,
+            span: plane.span,
+            page_size: state.page_size() as usize,
+        },
+    )
+    .ok_or(SampleBail::ColdWitness)?;
+    Ok(RefViewPlan {
+        task_id,
+        texture_ref,
+        resource,
+        mid,
+        view,
+        window_key,
+        plane,
+        gpas,
+        runs,
+        gather,
+    })
+}
+
+/// Re-check a ref-view plan at the point the serial rail would run, and with
+/// `apply` take it: the field-window note and the routes the serial rail makes,
+/// the witness update, and the plane's guest-page window.
+///
+/// Without `apply` nothing is written or noted, and the answer is the plan's
+/// prediction with no page window, for a shadow comparison against the serial
+/// rail that runs next.
+pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    plan: &RefViewPlan,
+    task_id: u32,
+    texture_ref: u32,
+    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
+    apply: bool,
+) -> Result<(u32, u32, u32, SampledSourceRequest), SampleInvalid> {
+    if plan.task_id != task_id || plan.texture_ref != texture_ref {
+        return Err(SampleInvalid::Key);
+    }
+    if !resource.is_some_and(|r| std::sync::Arc::ptr_eq(r, &plan.resource)) {
+        return Err(SampleInvalid::Resource);
+    }
+    let mid = plan.mid;
+    let row_holds = state.mappings.get(&mid).is_some_and(|m| {
+        m.mapped
+            && !m.page_entries.is_empty()
+            && m.has_geom
+            && ref_texture_view_requires_materialization(
+                m.has_geom, m.width, m.height, m.format, plan.view,
+            )
+    });
+    if !row_holds
+        || crate::runtime::mapper::mapping_window_key_readonly(state, mid) != Some(plan.window_key)
+        || ref_view_plane(&*state, &*host, mid, plan.view) != Some(plan.plane)
+    {
+        return Err(SampleInvalid::Mapping);
+    }
+    if !state.pending_writebacks.is_empty() && state.pending_writebacks.get(mid).is_some() {
+        return Err(SampleInvalid::Debt);
+    }
+    let (base_off, span) = (plan.plane.base_off, plan.plane.span);
+    let cached = crate::runtime::mapper::mapping_window_cached(state, mid, base_off, span);
+    if !cached.is_some_and(|(gpas, runs)| {
+        std::sync::Arc::ptr_eq(&gpas, &plan.gpas) && std::sync::Arc::ptr_eq(&runs, &plan.runs)
+    }) {
+        return Err(SampleInvalid::Window);
+    }
+    if !crate::runtime::gather_witness::gather_plan_holds(state, &*host, &plan.gather, &plan.gpas) {
+        return Err(SampleInvalid::Witness);
+    }
+    let view = plan.view;
+    let source = |pages, outcome: crate::runtime::gather_witness::GatherOutcome| {
+        (
+            view.width,
+            view.height,
+            mid,
+            SampledSourceRequest::GuestRuns(
+                crate::backend::vulkan::engine::GuestRunSource {
+                    runs: std::sync::Arc::clone(&plan.runs),
+                    source_offset: 0,
+                    total_len: span,
+                    row_length_texels: plan.plane.row_length_texels,
+                    pages,
+                    direct_image: None,
+                },
+                plan.plane.native,
+                plan.plane.sampled_vk_format,
+                1,
+                Some(LinearSampleIdentity::from(outcome.identity)),
+                outcome.vouch,
+                pixel_format::swizzle_identity(),
+            ),
+        )
+    };
+    if !apply {
+        return Ok(source(None, plan.gather.predicted()));
+    }
+    // What the serial rail notes before it decides how to carry the plane.
+    if let Some(bpp) = crate::protocol::pixel_format::bytes_per_pixel(view.pixel_format) {
+        if let Some((field_off, bpr, _)) = state.mappings.get(&mid).and_then(|m| {
+            crate::runtime::mapping_write::ref_texture_sample_window(
+                m,
+                view.plane_index,
+                view.width,
+                view.height,
+                view.pixel_format,
+            )
+        }) {
+            crate::runtime::scanout::note_sampled_surface_field_window(
+                &*state,
+                &*host,
+                mid,
+                texture_ref,
+                "ref_texture_view",
+                crate::runtime::scanout::SampledFieldWindow {
+                    width: view.width,
+                    height: view.height,
+                    format: u32::from(view.pixel_format),
+                    base_off: field_off,
+                    bpr,
+                    bpp,
+                },
+            );
+        }
+    }
+    if plan.plane.import == ImportGate::StandingRefusal {
+        crate::runtime::drain::note_store_route("zc_packed_alias_standing_refusal");
+    }
+    crate::runtime::drain::note_store_route("lab_rf_wc_hit");
+    let outcome =
+        crate::runtime::gather_witness::commit_gather(state, &*host, &plan.gather, &plan.gpas)
+            .ok_or(SampleInvalid::Witness)?;
+    let page = state.page_size();
+    let pages = guest_page_window(host, &plan.gpas, page, base_off % page, span);
+    Ok(source(pages, outcome))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,5 +1288,195 @@ mod tests {
             commit_sampled_plan(&state, &host, &plan, 1, texture_ref, Some(&res), true).err(),
             Some(SampleInvalid::Backing)
         );
+    }
+
+    /// A ref-texture (`texture_ref` 2) whose descriptor views surface 72 as
+    /// sRGB BGRA8 while the surface is declared unorm BGRA8, 256x128: a view
+    /// that needs materializing, over 32 guest pages scattered two apart on a
+    /// host that aliases packed runs only, so no contiguous view or import
+    /// exists and the zero-copy rail gathers the guest runs.
+    fn view_fixture() -> (DeviceState, FakeHost, u32, u32, Vec<u64>) {
+        use crate::protocol::endian::st32;
+        use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+        use crate::runtime::gva_mem;
+        use reims_vgpu_protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.stable_map_pages = true;
+        host.strict_linux_map = true;
+        let (dir_pfn, root_pfn) = (2u32, 3u32);
+        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_X86;
+        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        let mut dir = [0u8; 8];
+        st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+        st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
+        assert!(host.write_gpa(dir_gpa, &dir).is_ok());
+        for i in 0..3u32 {
+            let pfn = 4 + i;
+            host.map_range((pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
+            let mut pte = [0u8; 4];
+            st32(&mut pte, pfn);
+            assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+        }
+        state.define_task(1, 0x1000, dir_pfn);
+        assert!(state.set_object_list(1, 0, 32));
+        let (texture_ref, surface_id, desc_gva) = (2u32, 72u32, 0x1000u64);
+        let built = reims_vgpu_wire::device_desc::RefTextureBuilder::new(
+            surface_id,
+            0,
+            0,
+            reims_vgpu_wire::device_desc::TYPE5_RECORD_TAG_COLOR_VIEW,
+        )
+        .geometry(MTL_FORMAT_BGRA8_UNORM_SRGB, 256, 128, 1);
+        assert!(gva_mem::write_task_gva(
+            &mut host,
+            &state.tasks[1],
+            desc_gva,
+            built.bytes(),
+            PAGE_SHIFT_X86
+        )
+        .is_ok());
+        let list_off = list_object_entry_offset(texture_ref, 32).unwrap();
+        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        let packed =
+            (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((built.bytes().len() as u32) << 8);
+        st32(&mut list_entry, packed);
+        list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        assert!(gva_mem::write_task_gva(
+            &mut host,
+            &state.tasks[1],
+            list_off,
+            &list_entry,
+            PAGE_SHIFT_X86
+        )
+        .is_ok());
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpas: Vec<u64> = (0..32u64).map(|i| 0x5000_0000 + 2 * i * page).collect();
+        for &gpa in &gpas {
+            host.map_range(gpa, page as usize, 0x33);
+        }
+        assert!(state.map_surface(surface_id));
+        assert!(state.set_mapping_geom(surface_id, 256, 128, MTL_FORMAT_BGRA8_UNORM));
+        state.mappings.get_mut(&surface_id).unwrap().page_entries = gpas
+            .iter()
+            .map(|&gpa| {
+                (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+            })
+            .collect();
+        (state, host, texture_ref, surface_id, gpas)
+    }
+
+    /// The fields of a guest-run serve two fixtures can agree on (host pointers
+    /// differ between fixtures, so the runs are compared by shape).
+    fn runs_shape(
+        served: &(u32, u32, u32, SampledSourceRequest),
+    ) -> (
+        u32,
+        u32,
+        u32,
+        u64,
+        u32,
+        usize,
+        TexelLayout,
+        ash::vk::Format,
+        Option<LinearSampleIdentity>,
+        crate::runtime::gather_witness::GatherVouch,
+    ) {
+        let (w, h, mid, src) = served;
+        let SampledSourceRequest::GuestRuns(source, layout, format, _, identity, vouch, _) = src
+        else {
+            panic!("expected a guest-run serve")
+        };
+        (
+            *w,
+            *h,
+            *mid,
+            source.total_len,
+            source.row_length_texels,
+            source.runs.len(),
+            *layout,
+            *format,
+            *identity,
+            *vouch,
+        )
+    }
+
+    fn serial(
+        state: &mut DeviceState,
+        host: &mut FakeHost,
+        texture_ref: u32,
+        res: &std::sync::Arc<crate::model::TaskResource>,
+    ) -> (u32, u32, u32, SampledSourceRequest) {
+        resolve_sampled_source(state, host, 1, texture_ref, Some(res.clone()), true)
+            .expect("the view resolves")
+    }
+
+    /// A planned ref-view bind serves what the serial rail serves, and leaves the
+    /// witness where the serial rail leaves it.
+    #[test]
+    fn a_planned_ref_view_serves_the_serial_answer() {
+        let (mut a, mut a_host, texture_ref, _, _) = view_fixture();
+        let (mut b, mut b_host, _, _, _) = view_fixture();
+        let (ra, rb) = (
+            resource(&a, &a_host, texture_ref),
+            resource(&b, &b_host, texture_ref),
+        );
+        // The first bind arms the witness and fills the window cache: serial only.
+        let first_a = serial(&mut a, &mut a_host, texture_ref, &ra);
+        let first_b = serial(&mut b, &mut b_host, texture_ref, &rb);
+        assert_eq!(runs_shape(&first_a), runs_shape(&first_b));
+        for _ in 0..3 {
+            let plan = plan_ref_view_zero_copy(&b, &b_host, 1, texture_ref, rb.clone())
+                .unwrap_or_else(|bail| panic!("a warm view plans, got {bail:?}"));
+            let planned =
+                commit_ref_view_plan(&mut b, &mut b_host, &plan, 1, texture_ref, Some(&rb), true)
+                    .expect("nothing moved since the plan");
+            let serial_a = serial(&mut a, &mut a_host, texture_ref, &ra);
+            assert_eq!(runs_shape(&planned), runs_shape(&serial_a));
+        }
+        // And the next serial bind of each agrees: the witnesses match.
+        let next_a = serial(&mut a, &mut a_host, texture_ref, &ra);
+        let next_b = serial(&mut b, &mut b_host, texture_ref, &rb);
+        assert_eq!(runs_shape(&next_a), runs_shape(&next_b));
+    }
+
+    /// A guest store seen after the plan drops it, and a shadow commit leaves
+    /// nothing behind that the serial rail would not have.
+    #[test]
+    fn a_ref_view_plan_yields_to_a_guest_store_and_shadows_cleanly() {
+        let (mut b, mut b_host, texture_ref, _, gpas) = view_fixture();
+        let rb = resource(&b, &b_host, texture_ref);
+        serial(&mut b, &mut b_host, texture_ref, &rb);
+        let plan = plan_ref_view_zero_copy(&b, &b_host, 1, texture_ref, rb.clone()).expect("warm");
+        // Shadow: validated, predicted, nothing applied — so the plan still holds.
+        let predicted =
+            commit_ref_view_plan(&mut b, &mut b_host, &plan, 1, texture_ref, Some(&rb), false)
+                .expect("holds");
+        assert!(matches!(predicted.3, SampledSourceRequest::GuestRuns(..)));
+        b_host.guest_wrote_page(gpas[5]);
+        assert_eq!(
+            commit_ref_view_plan(&mut b, &mut b_host, &plan, 1, texture_ref, Some(&rb), true).err(),
+            Some(SampleInvalid::Witness)
+        );
+    }
+
+    /// A rewired mapping (a new page-list generation) has no cached window under
+    /// its new key, so the plan bails to the serial rail that re-resolves it.
+    #[test]
+    fn a_rewired_mapping_bails_the_ref_view_plan() {
+        let (mut b, mut b_host, texture_ref, sid, _) = view_fixture();
+        let rb = resource(&b, &b_host, texture_ref);
+        serial(&mut b, &mut b_host, texture_ref, &rb);
+        assert!(plan_ref_view_zero_copy(&b, &b_host, 1, texture_ref, rb.clone()).is_ok());
+        b.mappings.get_mut(&sid).unwrap().map_generation += 1;
+        assert!(matches!(
+            plan_ref_view_zero_copy(&b, &b_host, 1, texture_ref, rb.clone()),
+            Err(SampleBail::ColdWindow | SampleBail::ZeroCopyDeclined)
+        ));
     }
 }

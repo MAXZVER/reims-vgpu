@@ -9,10 +9,12 @@
 //! serves the bind (`on`), or is compared against the serial answer (`shadow`).
 //! A missing or invalid plan leaves the serial ladder to run, unchanged.
 //!
-//! A plan is not consumed by its first use. Taking it notes census routes and
-//! changes no device state, so its reads still describe the state after it,
-//! and every later draw of the stream that binds the same ref re-validates the
-//! same plan.
+//! A surface plan is not consumed by its first use. Taking it notes census
+//! routes and changes no device state, so its reads still describe the state
+//! after it, and every later draw of the stream that binds the same ref
+//! re-validates the same plan. A ref-view plan (the zero-copy plane of a
+//! ref-texture view) applies a gather-witness decision, which moves the
+//! witness, so it serves one bind and is then dropped.
 
 use super::*;
 use std::cell::RefCell;
@@ -41,7 +43,15 @@ pub(crate) fn prefetch_mode() -> PrefetchMode {
 
 thread_local! {
     /// The plans of each stream being encoded on this thread, innermost last.
-    static STACK: RefCell<Vec<HashMap<(u32, u32), SamplePlan>>> = const { RefCell::new(Vec::new()) };
+    static STACK: RefCell<Vec<HashMap<(u32, u32), StreamPlan>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One planned bind of a stream.
+pub(crate) enum StreamPlan {
+    /// A top rung of the surface ladder: a resident or the host cache.
+    Surface(SamplePlan),
+    /// A ref-texture view's plane on the zero-copy rail.
+    RefView(sample_plan::RefViewPlan),
 }
 
 /// Pops this stream's plans when the stream ends.
@@ -72,6 +82,10 @@ fn bail_route(bail: SampleBail) -> &'static str {
         SampleBail::GuestReplaced => "par_prefetch_bail_guest_replaced",
         SampleBail::NoHostCache => "par_prefetch_bail_no_host_cache",
         SampleBail::LowerRung => "par_prefetch_bail_lower_rung",
+        SampleBail::ZeroCopyDeclined => "par_prefetch_bail_zero_copy_declined",
+        SampleBail::OwedFrame => "par_prefetch_bail_owed_frame",
+        SampleBail::ColdWindow => "par_prefetch_bail_cold_window",
+        SampleBail::ColdWitness => "par_prefetch_bail_cold_witness",
     }
 }
 
@@ -83,6 +97,9 @@ fn invalid_route(invalid: SampleInvalid) -> &'static str {
         SampleInvalid::Backing => "par_prefetch_invalid_backing",
         SampleInvalid::GuestWrite => "par_prefetch_invalid_guest_write",
         SampleInvalid::HostCache => "par_prefetch_invalid_host_cache",
+        SampleInvalid::Window => "par_prefetch_invalid_window",
+        SampleInvalid::Witness => "par_prefetch_invalid_witness",
+        SampleInvalid::Debt => "par_prefetch_invalid_debt",
     }
 }
 
@@ -126,7 +143,18 @@ pub(crate) fn prefetch_stream<'a>(
     }
     let scoped = pool.scope(state, &items, |st, env, (texture_ref, resource)| {
         let host = env.host();
-        plan_sampled_source(st, &host, task_id, *texture_ref, resource.clone(), true)
+        match plan_sampled_source(st, &host, task_id, *texture_ref, resource.clone(), true) {
+            Ok(plan) => Ok(StreamPlan::Surface(plan)),
+            Err(SampleBail::RefTextureView) => sample_plan::plan_ref_view_zero_copy(
+                st,
+                &host,
+                task_id,
+                *texture_ref,
+                resource.clone(),
+            )
+            .map(StreamPlan::RefView),
+            Err(bail) => Err(bail),
+        }
     });
     crate::runtime::drain::note_store_route("par_prefetch_stream");
     crate::runtime::drain::note_store_route_n("par_fork_us", scoped.fork_us);
@@ -136,7 +164,10 @@ pub(crate) fn prefetch_stream<'a>(
     for ((texture_ref, _), result) in items.iter().zip(scoped.results) {
         match result {
             Ok(Ok(plan)) => {
-                crate::runtime::drain::note_store_route("par_prefetch_planned");
+                crate::runtime::drain::note_store_route(match plan {
+                    StreamPlan::Surface(_) => "par_prefetch_planned",
+                    StreamPlan::RefView(_) => "par_prefetch_planned_ref_view",
+                });
                 plans.insert((task_id, *texture_ref), plan);
             }
             Ok(Err(bail)) => crate::runtime::drain::note_store_route(bail_route(bail)),
@@ -159,9 +190,9 @@ pub(crate) enum Prefetched {
 
 /// The stream plan's answer for one bind, validated at the point the serial
 /// ladder would resolve it.
-pub(crate) fn prefetched_source<M: HostOps>(
-    state: &DeviceState,
-    host: &M,
+pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
     task_id: u32,
     texture_ref: u32,
     resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
@@ -172,31 +203,60 @@ pub(crate) fn prefetched_source<M: HostOps>(
         return Prefetched::Serial;
     }
     STACK.with(|stack| {
-        let stack = stack.borrow();
-        let Some(plan) = stack
-            .last()
-            .and_then(|plans| plans.get(&(task_id, texture_ref)))
-        else {
+        let mut stack = stack.borrow_mut();
+        let Some(plans) = stack.last_mut() else {
             return Prefetched::Serial;
         };
-        if let Err(invalid) = sample_plan::validate_sampled_plan(
-            state,
-            host,
-            plan,
-            task_id,
-            texture_ref,
-            resource,
-            may_bind_resident,
-        ) {
-            crate::runtime::drain::note_store_route(invalid_route(invalid));
-            return Prefetched::Serial;
-        }
-        match mode {
-            PrefetchMode::On => {
-                crate::runtime::drain::note_store_route("par_prefetch_hit");
-                Prefetched::Serve(sample_plan::take_sampled_plan(state, plan, true))
+        let key = (task_id, texture_ref);
+        match plans.get(&key) {
+            None => Prefetched::Serial,
+            Some(StreamPlan::Surface(plan)) => {
+                if let Err(invalid) = sample_plan::validate_sampled_plan(
+                    state,
+                    host,
+                    plan,
+                    task_id,
+                    texture_ref,
+                    resource,
+                    may_bind_resident,
+                ) {
+                    crate::runtime::drain::note_store_route(invalid_route(invalid));
+                    return Prefetched::Serial;
+                }
+                match mode {
+                    PrefetchMode::On => {
+                        crate::runtime::drain::note_store_route("par_prefetch_hit");
+                        Prefetched::Serve(sample_plan::take_sampled_plan(state, plan, true))
+                    }
+                    _ => Prefetched::Shadow(sample_plan::take_sampled_plan(state, plan, false)),
+                }
             }
-            _ => Prefetched::Shadow(sample_plan::take_sampled_plan(state, plan, false)),
+            Some(StreamPlan::RefView(plan)) => {
+                let apply = mode == PrefetchMode::On;
+                match sample_plan::commit_ref_view_plan(
+                    state,
+                    host,
+                    plan,
+                    task_id,
+                    texture_ref,
+                    resource,
+                    apply,
+                ) {
+                    Ok(served) if apply => {
+                        crate::runtime::drain::note_store_route("par_prefetch_hit_ref_view");
+                        plans.remove(&key);
+                        Prefetched::Serve(served)
+                    }
+                    Ok(predicted) => Prefetched::Shadow(predicted),
+                    Err(invalid) => {
+                        crate::runtime::drain::note_store_route(invalid_route(invalid));
+                        // Spent either way: the witness entry it rests on moves
+                        // with whatever the serial rail does next.
+                        plans.remove(&key);
+                        Prefetched::Serial
+                    }
+                }
+            }
         }
     })
 }
@@ -219,6 +279,28 @@ pub(crate) fn shadow_compare(
                     "par_shadow_match_target"
                 } else {
                     "par_shadow_mismatch_target"
+                }
+            }
+            (
+                SampledSourceRequest::GuestRuns(asrc, al, af, ad, aid, av, _),
+                SampledSourceRequest::GuestRuns(bsrc, bl, bf, bd, bid, bv, _),
+            ) => {
+                // A generation the witness spent this bind is issued from the
+                // device-global counter by whichever arm asked, so only a
+                // vouched one (the entry's own) can be compared.
+                let same_identity = aid.map(|i| i.key) == bid.map(|i| i.key)
+                    && (*av == crate::runtime::gather_witness::GatherVouch::Fresh
+                        || aid.map(|i| i.generation) == bid.map(|i| i.generation));
+                if std::sync::Arc::ptr_eq(&asrc.runs, &bsrc.runs)
+                    && asrc.source_offset == bsrc.source_offset
+                    && asrc.total_len == bsrc.total_len
+                    && asrc.row_length_texels == bsrc.row_length_texels
+                    && (al, af, ad, av) == (bl, bf, bd, bv)
+                    && same_identity
+                {
+                    "par_shadow_match_runs"
+                } else {
+                    "par_shadow_mismatch_runs"
                 }
             }
             (

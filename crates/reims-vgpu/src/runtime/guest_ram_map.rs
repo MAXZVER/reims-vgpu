@@ -436,6 +436,15 @@ pub fn standing_refusal<H: HostOps + ?Sized>(host: &mut H) -> Option<MapRefusal>
     with_map(host, |resolved| resolved.refusal)
 }
 
+/// [`standing_refusal`] without resolving the map: `None` until some caller with
+/// a host has resolved it, then the answer it resolved to. For a reader holding
+/// no host it may mutate, such as a plan on a pool thread, which treats "not yet
+/// resolved" as "cannot say".
+pub fn standing_refusal_resolved() -> Option<Option<MapRefusal>> {
+    let guard = MAP.lock().unwrap_or_else(|p| p.into_inner());
+    guard.as_ref().map(|resolved| resolved.refusal)
+}
+
 /// The refusal a site that would land GPU output in guest pages takes before
 /// asking for references, or `None` to go on.
 ///
