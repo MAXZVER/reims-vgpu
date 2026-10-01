@@ -129,18 +129,19 @@ impl Inner {
         self.tasks_of.get(&name).map_or(0, |tasks| {
             tasks
                 .iter()
-                .filter(|&&t| {
-                    t != task
-                        && self
-                            .state(t, name)
-                            .is_some_and(|s| !s.is_terminal())
-                })
+                .filter(|&&t| t != task && self.state(t, name).is_some_and(|s| !s.is_terminal()))
                 .count() as u64
         })
     }
 
     /// Classify the packets a shared entry's end or readiness reached.
-    fn reached(&self, task: u32, name: ResourceId, waiters: &[IngressOrdinal], routes: [&'static str; 4]) {
+    fn reached(
+        &self,
+        task: u32,
+        name: ResourceId,
+        waiters: &[IngressOrdinal],
+        routes: [&'static str; 4],
+    ) {
         let [own, cross_ready, cross_early, unregistered] = routes;
         for w in waiters {
             match self.waiting.get(w) {
@@ -200,22 +201,25 @@ impl LabShadow {
             } else {
                 "lab_pp_withdraw_foreign"
             });
-            let demoted = g
-                .tasks_of
-                .get(&name)
-                .map_or(0, |tasks| {
-                    tasks
-                        .iter()
-                        .filter(|&&t| t != task && g.state(t, name) == Some(PipelineState::Ready))
-                        .count() as u64
-                });
+            let demoted = g.tasks_of.get(&name).map_or(0, |tasks| {
+                tasks
+                    .iter()
+                    .filter(|&&t| t != task && g.state(t, name) == Some(PipelineState::Ready))
+                    .count() as u64
+            });
             note_store_route_n("lab_pp_withdraw_demoted_others", demoted);
         }
         g.table.withdraw(id(task, name));
     }
 
     /// The real table's `Ready` step, with the packets it was holding.
-    pub(crate) fn ready(&self, task: u32, name: ResourceId, waiters: &[IngressOrdinal], real_took: bool) {
+    pub(crate) fn ready(
+        &self,
+        task: u32,
+        name: ResourceId,
+        waiters: &[IngressOrdinal],
+        real_took: bool,
+    ) {
         if !enabled() {
             return;
         }
@@ -315,7 +319,13 @@ impl LabShadow {
 
     /// What the real table (`real`, one lease each) and this one say about a
     /// packet about to be admitted with `leases`.
-    pub(crate) fn admission(&self, task: u32, leases: &[ResourceId], generation: SessionGeneration, real: &[Lease]) {
+    pub(crate) fn admission(
+        &self,
+        task: u32,
+        leases: &[ResourceId],
+        generation: SessionGeneration,
+        real: &[Lease],
+    ) {
         if !enabled() || leases.is_empty() {
             return;
         }
@@ -399,7 +409,10 @@ impl LabShadow {
                     // task's own reflection says is: an edge the walk did not
                     // draw.
                     note_store_route("lab_pp_usage_diff_under");
-                    if crate::observe::first_sight("lab_pp_usage_diff_under", u64::from(name.slot.0)) {
+                    if crate::observe::first_sight(
+                        "lab_pp_usage_diff_under",
+                        u64::from(name.slot.0),
+                    ) {
                         crate::observe::fail(format!(
                             "lab_pp_usage_diff_under slot={} gen={} task={task} shared={shared:?} own={own:?}",
                             name.slot.0, name.generation.0

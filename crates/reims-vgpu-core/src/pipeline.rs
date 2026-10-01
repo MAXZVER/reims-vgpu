@@ -1692,8 +1692,15 @@ mod tests {
         assert_eq!(ended.destroy, vec![a], "a had a host build to destroy");
         assert!(t.get(a).is_none());
         assert!(!t.usage_published(a));
-        assert_eq!(t.lease(b, GEN), Lease::Absent(AbsentBecause::Retired), "b is untouched");
-        assert!(t.usage_published(shared), "a shared pipeline belongs to no task");
+        assert_eq!(
+            t.lease(b, GEN),
+            Lease::Absent(AbsentBecause::Retired),
+            "b is untouched"
+        );
+        assert!(
+            t.usage_published(shared),
+            "a shared pipeline belongs to no task"
+        );
 
         // The task is redefined under the same id: its first pipeline with the
         // same slot and generation is a new one.
@@ -1705,7 +1712,10 @@ mod tests {
         // ends without a word.
         let ended = t.task_ended(TaskId(3));
         assert_eq!(ended.removed, vec![b]);
-        assert!(ended.destroy.is_empty(), "a retired pipeline has nothing to destroy");
+        assert!(
+            ended.destroy.is_empty(),
+            "a retired pipeline has nothing to destroy"
+        );
         assert!(t.task_ended(TaskId(99)).removed.is_empty());
     }
 

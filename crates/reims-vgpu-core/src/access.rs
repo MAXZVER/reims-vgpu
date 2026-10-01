@@ -927,13 +927,22 @@ mod tests {
             assert_eq!(got.key, AccessKey::DomainOnly);
             assert_eq!(got.mode, mode);
             assert_eq!(got.domain, ChannelId(4));
-            assert_eq!((got.input_content_version, got.output_content_version), (None, None));
+            assert_eq!(
+                (got.input_content_version, got.output_content_version),
+                (None, None)
+            );
             assert_eq!(got.api_stages, 0x5);
         }
         // It meets everything in its domain, and an Unknown one meets readers.
         let unknown = participation(AccessMode::Unknown).resolve(ChannelId(1), key(9), None, None);
-        assert!(requires_edge(&unknown, &intent(AccessKey::Whole(key(77)), AccessMode::Read)));
-        assert!(requires_edge(&intent(AccessKey::Whole(key(77)), AccessMode::Read), &unknown));
+        assert!(requires_edge(
+            &unknown,
+            &intent(AccessKey::Whole(key(77)), AccessMode::Read)
+        ));
+        assert!(requires_edge(
+            &intent(AccessKey::Whole(key(77)), AccessMode::Read),
+            &unknown
+        ));
     }
 
     #[test]

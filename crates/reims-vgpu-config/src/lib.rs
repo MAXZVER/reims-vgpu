@@ -827,8 +827,9 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// what the packet touches instead of against everything.
 pub const ACCESS_EXACT: &str = "REIMS_VGPU_ACCESS_EXACT";
 
-/// `on` names a pipeline in the ordering model by the task that owns it and its
-/// id in that task's object list; off, by the object-list id alone.
+/// **Default off.** `on` names a pipeline in the ordering model by the task that
+/// owns it and its id in that task's object list; off, by the object-list id
+/// alone.
 ///
 /// # What it changes
 ///
@@ -838,23 +839,46 @@ pub const ACCESS_EXACT: &str = "REIMS_VGPU_ACCESS_EXACT";
 /// by the id alone, which makes one entry stand for every task that reuses the
 /// id: one task's build state, deletion tombstone, refusal, waits and published
 /// reflection answer for all of them. With this on each task's pipeline is its
-/// own entry.
+/// own entry, and it ends with its task's address space
+/// (`reims_vgpu_core::pipeline::PipelineTable::task_ended`).
 ///
-/// # Why it is a switch, and why only ever on
+/// # What it cost, measured
+///
+/// On a driven macos-26 desktop at 5120x2160, a second table named per task stepped
+/// beside the real one (`scratchpad/ppcensus.py`, the light animation and a window
+/// drag):
+///
+/// - **When work runs: almost nothing, and only while the desktop warms up.** In
+///   the steady windows (9 000 and 42 000 packets) no packet waited, ran or was
+///   refused differently. Over the whole boot 0.06 to 0.08 % of leases ran while
+///   their own pipeline was still building, and 1 to 6 % of build completions
+///   released a packet of another task whose own pipeline was not built.
+/// - **What the model knew: a great deal.** One task's delete tombstones the live
+///   pipelines of the tasks that reuse the id (57 to 60 such deletes a boot), a
+///   tombstone refuses a reflection and drops the one it had, and so 86 % (light)
+///   and 58 % (drag) of the walk's lookups found no reflection only because of a
+///   tombstone somebody else left. 37 to 56 % of leases bound one. No lookup was
+///   ever answered by a reflection that orders less than the task's own.
+///
+/// With this on, packets with an `Unknown`-mode access on a named backing go from
+/// 83 % to 0 (light) and 68 % to 0 (drag), `Unknown` participations fall by 98 %,
+/// and the model's edges per frame by a quarter on the drag; 0 packets ran ahead
+/// of an earlier one of their channel, the verification tour's frames differ from
+/// the default's no more than two default boots differ from each other, and
+/// `driver_call_quarantined` stays 0. Frame rate did not move beyond the spread
+/// between boots.
+///
+/// # Why it is a switch
 ///
 /// Nothing the guest can observe is computed differently: no record, no host
-/// command and no shader changes. What changes is when the model lets work go.
-/// A packet waits for the pipelines it leases, and with per-task naming it waits
-/// for *its task's* pipeline and not for a same-numbered pipeline of a task that
-/// has nothing to do with it, so a packet that used to wait on another task's
-/// compilation, or be refused for another task's failed build, no longer does.
-/// That can only remove a wait, never add one, but removing a wait changes the
-/// order this device executes in, so it gets a binary that runs both ways until
-/// the measurement of the frames it produces exists. It narrows what the device
-/// waits for; it widens nothing.
-///
-/// [`ACCESS_EXACT`] implies it: a reflection published for one task must not be
-/// answered to another, and exact accesses are what make the answer matter.
+/// command and no shader. But the model's knowledge is also what releases work,
+/// and this gives it far more of it, so a packet can be ready where it used to
+/// wait for an edge that only ignorance drew. That is a change to what this device
+/// may execute ahead of what, made on the strength of a claim about a guest
+/// (that a task's reflection is what its own pipeline does), and a claim of that
+/// shape gets a binary that runs both ways until the frames are measured for a
+/// long time. [`ACCESS_EXACT`] implies it: exact accesses are what make the
+/// reflection's answer matter.
 pub const PIPELINE_PER_TASK: &str = "REIMS_VGPU_PIPELINE_PER_TASK";
 
 /// `on` issues the draw-time guest buffer gather as one compute dispatch per

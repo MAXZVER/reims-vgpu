@@ -1758,7 +1758,11 @@ mod tests {
         assert_eq!(s.scheduler().waiting_on_pipelines(), 2);
         assert!(s.release_past_ended_pipeline(a.transaction.identity.ingress, one));
         assert_eq!(s.take_ready(), vec![a.transaction.identity.ingress]);
-        assert_eq!(s.scheduler().waiting_on_pipelines(), 1, "task 3's wait stands");
+        assert_eq!(
+            s.scheduler().waiting_on_pipelines(),
+            1,
+            "task 3's wait stands"
+        );
 
         // Task 3 still builds and releases its own packet.
         assert!(s.pipeline_ready(three));
