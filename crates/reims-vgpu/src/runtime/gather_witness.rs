@@ -1357,16 +1357,18 @@ pub struct GatheredIdentity {
 /// a test-and-clear delivered once per resource in an EXEC resource table) says
 /// that a CPU write happened before that submission; it says nothing about the
 /// writes after it, and the lagged generation cannot see those until the next
-/// sync. On the hunt tour the `on` arm leaves single-page black streaks across the
-/// wallpaper (one guest page of one row, 1024 pixels) that the `off` arm never
-/// does: `on` 2 of 2 boots, `witness` (the witness half alone) 1 of 2, `off` 0 of 2,
-/// `verify` 0 of 2. The streaks are invisible to every instrument the witness
-/// owns - `gw_audit_unsound`, `gwst_audit_unsound` and `lab_gw_lagged_caught` read 0
-/// on the boots that show them, because the fold reads ~1/42 of a 44 MB window and
-/// the lagged read only reports a write a later sync reveals - and were found by
-/// scanning the frames (`linescan.py`). `verify` also counts the verdict half
-/// vouching a host-side copy of a 5K surface while the synced generation already
-/// saw an unstated write into its pixels: 4 binds in ~407 000 over two boots.
+/// sync. On the hunt tour the lagged arms leave single-page black streaks across
+/// the wallpaper (one guest page of one row, 1024 pixels): `on` 2 of 2 boots,
+/// `witness` (the witness half alone) 1 of 2, `verdict` (the verdict half alone)
+/// 1 of 2 - against 0 of 12 for the arms that read the synced generation (`off`
+/// 2, `verify` 2, eight earlier boots of default builds). The streaks are
+/// invisible to every instrument the witness owns - `gw_audit_unsound`,
+/// `gwst_audit_unsound` and `lab_gw_lagged_caught` read 0 on the boots that show
+/// them, because the fold reads ~1/42 of a 44 MB window and the lagged read only
+/// reports a write a later sync reveals - and were found by scanning the frames
+/// (`linescan.py`). `verify` also counts the verdict half vouching a host-side
+/// copy of a 5K surface while the synced generation already saw an unstated write
+/// into its pixels: 4 binds in ~407 000 over two boots.
 pub(crate) fn lab_stated_vouch() -> bool {
     matches!(lab_stated_mode(), 1 | 3)
 }
