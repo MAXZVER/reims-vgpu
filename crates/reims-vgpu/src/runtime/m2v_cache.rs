@@ -857,7 +857,7 @@ mod disk {
 
     use super::{log_token, M2vResult, ShaderId, ShaderReflection};
 
-    /// The lab switch: a directory. Unset or empty leaves the cache off.
+    /// The lab switch: a directory, or `off`. Unset uses [`default_dir`].
     pub(super) const ENV: &str = "REIMS_VGPU_LAB_M2V_DISK";
 
     const MAGIC: [u8; 8] = *b"RVGPUM2V";
@@ -976,13 +976,33 @@ mod disk {
         error_reported: AtomicBool,
     }
 
-    /// The process's cache: `None` unless the lab switch names a directory (and
-    /// the executable could be stamped). Latched on first use.
+    /// Where the cache lives when the switch is unset: `m2v-cache` beside the
+    /// running executable. Unit tests get none, so they never touch the disk
+    /// unless they ask to.
+    #[cfg(not(test))]
+    fn default_dir() -> Option<PathBuf> {
+        Some(std::env::current_exe().ok()?.parent()?.join("m2v-cache"))
+    }
+
+    #[cfg(test)]
+    fn default_dir() -> Option<PathBuf> {
+        None
+    }
+
+    /// The process's cache: the switch's directory, `m2v-cache` beside the
+    /// executable when it is unset, `None` for `off` (or when the executable
+    /// could not be stamped). Latched on first use.
     pub(super) fn global() -> Option<&'static DiskCache> {
         static DISK: OnceLock<Option<DiskCache>> = OnceLock::new();
         DISK.get_or_init(|| {
-            let dir = std::env::var_os(ENV).filter(|v| !v.is_empty())?;
-            let dir = PathBuf::from(dir);
+            let dir = match std::env::var_os(ENV) {
+                Some(v) if v == "off" || v == "0" => return None,
+                Some(v) if !v.is_empty() => PathBuf::from(v),
+                // On by default: `m2v-cache` beside the executable. A cold boot's
+                // ~340 translations at 5-50 ms each, serialized on one lock, were
+                // most of a slow login and of every first-time animation.
+                _ => default_dir()?,
+            };
             match Stamp::current() {
                 Ok(stamp) => {
                     crate::observe::off(format!(
