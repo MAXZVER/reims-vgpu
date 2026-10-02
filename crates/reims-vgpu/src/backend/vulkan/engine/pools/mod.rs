@@ -2997,6 +2997,19 @@ pub(crate) fn released_retire_per_pass() -> usize {
     })
 }
 
+/// TEMP (lab): how many superseded-generation residents one maintenance pass
+/// retires (`ResourcePools::retire_stale_generation_residents`), or `None` when
+/// `REIMS_VGPU_LAB_STALE_RETIRE=off`. Default 64 a pass (passes are 100 ms
+/// apart, the drag makes ~170 a second).
+pub(crate) fn stale_retire_per_pass() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("REIMS_VGPU_LAB_STALE_RETIRE") {
+        Ok(v) if v == "off" => None,
+        Ok(v) => Some(v.parse().unwrap_or(64usize).max(1)),
+        Err(_) => Some(64),
+    })
+}
+
 /// Consecutive maintenance passes without upload activity required before the HOST_VISIBLE
 /// buffer pools (`staging_free`/`readback_free`) are trimmed. Unlike the image
 /// pools (cheap slab suballocation refill), a trimmed staging buffer costs a

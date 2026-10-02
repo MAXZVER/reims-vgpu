@@ -2342,6 +2342,141 @@ impl ResourcePools {
             .collect()
     }
 
+    /// TEMP (lab): what the registry holds, by namespace — total, recoverable
+    /// (unpinned, copied out), released by the guest, pinned, sole copy, and
+    /// how many are an older generation of an id that has a newer resident.
+    /// One line every two seconds from the maintenance pass.
+    pub(super) fn lab_registry_mix(&self, now_ms: u64) {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let last = LAST.load(Ordering::Relaxed);
+        if now_ms < last + 2000 {
+            return;
+        }
+        LAST.store(now_ms, Ordering::Relaxed);
+        // [total, recoverable, released, pinned, sole, stale_gen, window]
+        let mut by: [[u64; 7]; 4] = [[0; 7]; 4];
+        let mut newest: HashMap<(u8, u64), u64> = HashMap::new();
+        let key = |k: &TargetIdentity| -> (u8, u64, u64) {
+            match k {
+                TargetIdentity::Surface { id, generation, .. } => (0, u64::from(*id), *generation),
+                TargetIdentity::Texture { ref_, generation, .. } => {
+                    (1, u64::from(*ref_), *generation)
+                }
+                TargetIdentity::Gva { gva, generation, .. } => (2, *gva, *generation),
+                TargetIdentity::Anonymous { slot } => (3, *slot, 0),
+            }
+        };
+        for k in self.registry.keys() {
+            let (ns, id, g) = key(k);
+            let e = newest.entry((ns, id)).or_insert(g);
+            if g > *e {
+                *e = g;
+            }
+        }
+        let mut sizes: HashMap<(u32, u32), u64> = HashMap::new();
+        for (k, slot) in &self.registry {
+            let (ns, id, g) = key(k);
+            let row = &mut by[ns as usize];
+            row[0] += 1;
+            if slot.pin_count == 0 && !slot.gpu_only_content {
+                row[1] += 1;
+                *sizes.entry((slot.width, slot.height)).or_insert(0) += 1;
+            }
+            row[2] += u64::from(slot.resource_released);
+            row[3] += u64::from(slot.pin_count > 0);
+            row[4] += u64::from(slot.gpu_only_content);
+            row[5] += u64::from(newest.get(&(ns, id)).is_some_and(|&n| n > g));
+            row[6] += u64::from(self.window_holds(k));
+        }
+        let mut top: Vec<_> = sizes.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        let top: Vec<String> = top
+            .iter()
+            .take(6)
+            .map(|((w, h), n)| format!("{w}x{h}:{n}"))
+            .collect();
+        let names = ["surface", "texture", "gva", "anon"];
+        let mut line = String::from("lab_registry_mix");
+        for (i, r) in by.iter().enumerate() {
+            line.push_str(&format!(
+                " {}={}/rec{}/rel{}/pin{}/sole{}/stale{}/win{}",
+                names[i], r[0], r[1], r[2], r[3], r[4], r[5], r[6]
+            ));
+        }
+        line.push_str(&format!(" recoverable_sizes=[{}]", top.join(" ")));
+        crate::observe::off(line);
+    }
+
+    /// TEMP (lab): residents whose id has a newer generation registered, and
+    /// whose pixels are in the guest's pages and held by nobody — up to `max`,
+    /// oldest registration first.
+    ///
+    /// A resident's identity carries its generation, so the guest moving a
+    /// resource to a new generation registers a second resident beside the
+    /// first instead of replacing it, and the first is never looked up again:
+    /// every later request names the new generation. On the 5K drag that was
+    /// ~170 residents a second, none released by the guest and none reclaimed
+    /// (only an allocation refusal reclaims a recoverable resident), so the
+    /// image slab took a new 8 MiB block every ~2 s and each block lined up
+    /// with a ~35 ms frame.
+    fn stale_generation_resident_keys(&self, max: usize) -> Vec<TargetIdentity> {
+        use std::collections::HashMap;
+        fn id_of(k: &TargetIdentity) -> Option<(u8, u64, u64)> {
+            match k {
+                TargetIdentity::Surface { id, generation, .. } => {
+                    Some((0, u64::from(*id), *generation))
+                }
+                TargetIdentity::Texture { ref_, generation, .. } => {
+                    Some((1, u64::from(*ref_), *generation))
+                }
+                TargetIdentity::Gva { gva, generation, .. } => Some((2, *gva, *generation)),
+                TargetIdentity::Anonymous { .. } => None,
+            }
+        }
+        let mut newest: HashMap<(u8, u64), u64> = HashMap::with_capacity(self.registry.len());
+        for k in self.registry.keys() {
+            if let Some((ns, id, g)) = id_of(k) {
+                let e = newest.entry((ns, id)).or_insert(g);
+                if g > *e {
+                    *e = g;
+                }
+            }
+        }
+        self.registry_order
+            .iter()
+            .filter(|k| {
+                !self.window_holds(k)
+                    && id_of(k).is_some_and(|(ns, id, g)| {
+                        newest.get(&(ns, id)).is_some_and(|&n| n > g)
+                    })
+                    && self
+                        .registry
+                        .get(*k)
+                        .is_some_and(|slot| slot.pin_count == 0 && !slot.gpu_only_content)
+            })
+            .take(max)
+            .cloned()
+            .collect()
+    }
+
+    /// TEMP (lab): retire what [`Self::stale_generation_resident_keys`] names.
+    /// The image goes to the recycle pool, where the newer generations'
+    /// allocations of the same shape take it back.
+    pub(super) unsafe fn retire_stale_generation_residents(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        max: usize,
+    ) -> usize {
+        let victims = self.stale_generation_resident_keys(max);
+        for identity in &victims {
+            unsafe { self.retire_resident(ctx, identity, ResidentReclaim::Recreated, counters) };
+        }
+        victims.len()
+    }
+
     pub(super) unsafe fn retire_released_residents(
         &mut self,
         ctx: &DeviceContext,
