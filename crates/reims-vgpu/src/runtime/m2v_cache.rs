@@ -832,13 +832,19 @@ fn capture_air(air: &[u8], stage: Stage, spirv: &[u8]) {
 /// # What invalidates it
 ///
 /// The [`Stamp`] in the header. `metal2vulkan` is patched in from a sibling
-/// checkout that is edited constantly, so its crate version means nothing; what
-/// changes on every rebuild is the executable. The stamp is that executable's
-/// size and mtime, the reflection ABI version, and the `METAL2VULKAN_*`
-/// environment (several of those toggles change what is emitted). The stamp is a
-/// header field rather than part of the file name so a rebuilt binary overwrites
-/// the entries it invalidates instead of leaving a second generation beside
-/// them: the directory holds at most one file per distinct shader.
+/// checkout that is edited constantly, so its crate version means nothing. The
+/// build script digests what produces a translation instead: the translator's
+/// sources when they are that checkout, the workspace `Cargo.lock` (the pinned
+/// rev and every crate it builds with), and the toolchain. With the reflection
+/// ABI version and the `METAL2VULKAN_*` environment (several of those toggles
+/// change what is emitted) that is the stamp. It used to be the executable's
+/// size and mtime, so every relink of QEMU — a change anywhere in it, or the
+/// same binary copied — made the next boot translate every shader cold.
+///
+/// The stamp is a header field rather than part of the file name so a rebuilt
+/// translator overwrites the entries it invalidates instead of leaving a second
+/// generation beside them: the directory holds at most one file per distinct
+/// shader.
 ///
 /// # Cost
 ///
@@ -878,26 +884,28 @@ mod disk {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) struct Stamp {
         pub reflection_version: u32,
-        pub exe_size: u64,
-        pub exe_mtime_ns: u64,
+        /// The translator's sources and locked dependencies (`build.rs`).
+        pub translator: u64,
+        /// `rustc -V`: the entry names are `DefaultHasher` digests (`build.rs`).
+        pub toolchain: u64,
         /// Digest of every `METAL2VULKAN_*` variable in the environment.
         pub env_hash: u64,
     }
 
     impl Stamp {
-        /// The running executable's stamp, or why there is none.
+        /// This build's stamp, or why there is none.
         ///
         /// Without one nothing could tell a fresh entry from a stale one, so the
         /// cache stays off rather than guess.
         pub(super) fn current() -> Result<Self, String> {
-            let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-            let meta = std::fs::metadata(&exe).map_err(|e| format!("metadata: {e}"))?;
-            let mtime = meta.modified().map_err(|e| format!("mtime: {e}"))?;
-            let since_epoch = mtime
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| format!("mtime before epoch: {e}"))?;
-            let exe_mtime_ns = u64::try_from(since_epoch.as_nanos())
-                .map_err(|_| "mtime out of range".to_string())?;
+            let digest = |name: &str, hex: &str| {
+                u64::from_str_radix(hex, 16).map_err(|e| format!("{name}: {e}"))
+            };
+            let translator = digest(
+                "translator digest",
+                env!("REIMS_VGPU_M2V_TRANSLATOR_DIGEST"),
+            )?;
+            let toolchain = digest("toolchain digest", env!("REIMS_VGPU_M2V_TOOLCHAIN_DIGEST"))?;
 
             let mut vars: Vec<(String, String)> = std::env::vars_os()
                 .map(|(k, v)| {
@@ -918,8 +926,8 @@ mod disk {
             }
             Ok(Self {
                 reflection_version: metal2vulkan::reflect::REFLECTION_VERSION,
-                exe_size: meta.len(),
-                exe_mtime_ns,
+                translator,
+                toolchain,
                 env_hash: checksum(&env),
             })
         }
@@ -1006,12 +1014,12 @@ mod disk {
             match Stamp::current() {
                 Ok(stamp) => {
                     crate::observe::off(format!(
-                        "linux_m2v_disk enabled dir={} schema={SCHEMA} reflection={} exe_size={} \
-                         exe_mtime_ns={} env={:016x}",
+                        "linux_m2v_disk enabled dir={} schema={SCHEMA} reflection={} translator={:016x} \
+                         toolchain={:016x} env={:016x}",
                         log_token(&dir.display().to_string()),
                         stamp.reflection_version,
-                        stamp.exe_size,
-                        stamp.exe_mtime_ns,
+                        stamp.translator,
+                        stamp.toolchain,
                         stamp.env_hash,
                     ));
                     Some(DiskCache::new(dir, stamp))
@@ -1235,7 +1243,7 @@ mod disk {
     ///
     /// ```text
     /// magic[8] schema:u32
-    /// stamp: reflection_version:u32 exe_size:u64 exe_mtime_ns:u64 env_hash:u64
+    /// stamp: reflection_version:u32 translator:u64 toolchain:u64 env_hash:u64
     /// stage:u8 has_local_size:u8 local_size:[u32;3]
     /// air_len:u64 spirv_len:u64 json_len:u64
     /// air spirv json
@@ -1247,8 +1255,8 @@ mod disk {
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&SCHEMA.to_le_bytes());
         out.extend_from_slice(&stamp.reflection_version.to_le_bytes());
-        out.extend_from_slice(&stamp.exe_size.to_le_bytes());
-        out.extend_from_slice(&stamp.exe_mtime_ns.to_le_bytes());
+        out.extend_from_slice(&stamp.translator.to_le_bytes());
+        out.extend_from_slice(&stamp.toolchain.to_le_bytes());
         out.extend_from_slice(&stamp.env_hash.to_le_bytes());
         out.push(id.stage);
         out.push(u8::from(id.local_size.is_some()));
@@ -1316,8 +1324,8 @@ mod disk {
         }
         let stored = Stamp {
             reflection_version: r.u32().ok_or(truncated)?,
-            exe_size: r.u64().ok_or(truncated)?,
-            exe_mtime_ns: r.u64().ok_or(truncated)?,
+            translator: r.u64().ok_or(truncated)?,
+            toolchain: r.u64().ok_or(truncated)?,
             env_hash: r.u64().ok_or(truncated)?,
         };
         if stored != *stamp {
@@ -2759,8 +2767,8 @@ mod tests {
     fn stamp() -> disk::Stamp {
         disk::Stamp {
             reflection_version: metal2vulkan::reflect::REFLECTION_VERSION,
-            exe_size: 1_000_000,
-            exe_mtime_ns: 1_700_000_000_000_000_000,
+            translator: 0x0123_4567_89ab_cdef,
+            toolchain: 0x0fed_cba9_8765_4321,
             env_hash: 0x1234,
         }
     }
@@ -3017,11 +3025,11 @@ mod tests {
 
         let others = [
             disk::Stamp {
-                exe_size: stamp().exe_size + 1,
+                translator: stamp().translator ^ 1,
                 ..stamp()
             },
             disk::Stamp {
-                exe_mtime_ns: stamp().exe_mtime_ns + 1,
+                toolchain: stamp().toolchain ^ 1,
                 ..stamp()
             },
             disk::Stamp {
@@ -3056,18 +3064,18 @@ mod tests {
         );
     }
 
-    /// The stamp of the running executable exists and is stable, which is what
-    /// lets a second process find the first one's entries at all.
+    /// The build's stamp exists and is stable, which is what lets a second
+    /// process find the first one's entries at all.
     #[test]
-    fn the_running_executable_has_a_stable_stamp() {
-        let a = disk::Stamp::current().expect("the test executable can be stamped");
+    fn the_build_has_a_stable_stamp() {
+        let a = disk::Stamp::current().expect("the build script stamps every build");
         let b = disk::Stamp::current().unwrap();
         assert_eq!(a, b);
         assert_eq!(
             a.reflection_version,
             metal2vulkan::reflect::REFLECTION_VERSION
         );
-        assert!(a.exe_size > 0 && a.exe_mtime_ns > 0);
+        assert!(a.translator != 0 && a.toolchain != 0);
     }
 
     /// A torn, truncated, foreign or bit-rotted file is a miss. It is also never
