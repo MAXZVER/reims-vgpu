@@ -59,6 +59,23 @@ use crate::runtime::resident_target::ResidentTarget;
 /// cannot lose pixels. `wbdebt_evicted` reports when a workload reaches it.
 pub const MAX_DEBTS: usize = 32;
 
+/// TEMP (lab): `REIMS_VGPU_LAB_MAX_DEBTS=N` (32..1024) raises the ledger bound.
+/// Fast Safari wheel scrolling at 5K evicted 5-14 debts a second, each paid
+/// synchronously inside the draw that armed the next one (18 % of the drain's
+/// samples). Latched; [`MAX_DEBTS`] outside the lab.
+pub fn lab_max_debts() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("REIMS_VGPU_LAB_MAX_DEBTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(MAX_DEBTS, |n| n.clamp(MAX_DEBTS, 1024));
+        crate::observe::off(format!("lab_max_debts n={n}"));
+        n
+    })
+}
+
 /// A synthetic resident target, for tests that arm a debt without a device.
 ///
 /// Here rather than in each test module because it is the one place that knows
@@ -456,7 +473,7 @@ impl PendingWritebacks {
         height: u32,
         map_generation: u32,
     ) -> Option<WritebackKey> {
-        let evict = match self.debts.len() >= MAX_DEBTS && !self.debts.contains_key(&mapping_id) {
+        let evict = match self.debts.len() >= lab_max_debts() && !self.debts.contains_key(&mapping_id) {
             true => self.oldest(),
             false => None,
         };
@@ -982,9 +999,37 @@ pub fn lab_pay_after_stamp<M: HostMemory + HostOps>(
     {
         return;
     }
+    // TEMP (lab): at most one payment per `REIMS_VGPU_LAB_PAY_AFTER_MS`; the
+    // frames in between stay owed, and the next payment lands what changed
+    // since, so a scroll that rewrites the window every frame pays it once per
+    // interval rather than every frame.
+    static LAST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let gap_us = lab_pay_after_ms() * 1000;
+    let now = crate::observe::elapsed_us();
+    if gap_us > 0 && now.saturating_sub(LAST_US.load(Relaxed)) < gap_us {
+        crate::runtime::drain::note_store_route("wbdebt_pay_after_rate_limited");
+        return;
+    }
     if let Some(debt) = state.pending_writebacks.take(mapping_id) {
+        LAST_US.store(now, Relaxed);
         pay(state, host, mapping_id, debt, "wbdebt_paid_after_stamp");
     }
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_AFTER_MS=N` (0..1000, default 0 = every
+/// presented frame): the least interval between two pay-after-stamp payments.
+/// Latched.
+fn lab_pay_after_ms() -> u64 {
+    use std::sync::OnceLock;
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        let ms = std::env::var("REIMS_VGPU_LAB_PAY_AFTER_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(0, |v| v.min(1000));
+        crate::observe::off(format!("pay_after_ms ms={ms}"));
+        ms
+    })
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_PAY_EARLY_FLUSH=off` leaves a presented frame's
