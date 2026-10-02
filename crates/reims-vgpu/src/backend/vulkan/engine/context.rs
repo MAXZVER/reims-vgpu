@@ -111,6 +111,26 @@ const PIPELINE_CACHE_HEADER_ONE_LEN: usize = 32;
 /// costs more than that and reports nothing.
 const PIPELINE_CACHE_MAX_WARM_BYTES: usize = 8 * 1024 * 1024;
 
+/// TEMP (lab): [`PIPELINE_CACHE_MAX_WARM_BYTES`], or `REIMS_VGPU_LAB_PCACHE_MAX_MB=N`
+/// MiB (1..=256). Latched.
+fn lab_pcache_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PCACHE_MAX_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|mb| (1..=256).contains(mb))
+            .map_or(PIPELINE_CACHE_MAX_WARM_BYTES, |mb| mb * 1024 * 1024)
+    })
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PCACHE_KEEP=on` stops saving past the bound but
+/// keeps the last blob that fit instead of discarding it. Latched.
+fn lab_pcache_keep() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PCACHE_KEEP").is_ok_and(|v| v == "on"))
+}
+
 /// The largest blob a single boot has been measured to settle at: 3.85 MB on
 /// macos-13, 3.4 MB on macos-15, rounded up to a whole MiB.
 ///
@@ -468,10 +488,10 @@ fn read_pipeline_cache_blob(
     match std::fs::read(path) {
         // Size is checked before compatibility only so the larger, cheaper-to-
         // decide refusal wins the report; both are cold starts either way.
-        Ok(blob) if blob.len() > PIPELINE_CACHE_MAX_WARM_BYTES => {
+        Ok(blob) if blob.len() > lab_pcache_cap() => {
             Err(PipelineCacheDecline::TooLarge {
                 bytes: blob.len(),
-                cap: PIPELINE_CACHE_MAX_WARM_BYTES,
+                cap: lab_pcache_cap(),
             })
         }
         Ok(blob) if pipeline_cache_blob_compatible(&blob, props) => Ok(Some(blob)),
@@ -1572,15 +1592,22 @@ impl DeviceContext {
         // interleaved macos-15 boots priced at 3.9x per compile against a
         // right-sized one. Discarding it is what makes the next boot cold and
         // the one after that warm at this workload's own working-set size.
-        if data.len() > PIPELINE_CACHE_MAX_WARM_BYTES {
+        if data.len() > lab_pcache_cap() {
             crate::observe::Emit::decline(
                 "vk_pipeline_cache_save",
                 &PipelineCacheDecline::TooLarge {
                     bytes: data.len(),
-                    cap: PIPELINE_CACHE_MAX_WARM_BYTES,
+                    cap: lab_pcache_cap(),
                 },
             )
             .fail_once(0);
+            // TEMP (lab, REIMS_VGPU_LAB_PCACHE_KEEP=on): keep the last blob that
+            // fit. Tahoe at 5K settles at ~9 MiB, past the 8 MiB bound, so the
+            // discard made every boot cold (load bytes=0) and its first
+            // transitions compiled at 0.6-0.7 s a second.
+            if lab_pcache_keep() {
+                return;
+            }
             persist::submit(persist::Job::Discard { path });
             return;
         }
