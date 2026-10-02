@@ -270,10 +270,43 @@ fn narrow_to_window<M: HostOps>(
         return SurfaceCurrency::WroteUnknown;
     }
     if ranges_touch_window(&ranges, base_off, span_end) {
+        lab_note_wrote_pixels(mapping_id, width, height, &pages, &ranges, span_end - base_off);
         SurfaceCurrency::WrotePixels(GuestOwned { ranges, seen })
     } else {
         SurfaceCurrency::WroteElsewhere
     }
+}
+
+/// TEMP (lab, black-stripe hunt): one line per guest-written-pixels verdict on a
+/// surface at least 512 wide (WebKit tiles), at most 3000 a boot: which pages the
+/// witness says the guest wrote since the device's own Store, against the
+/// window's size. A partial list on a GPU-rendered tile is the candidate for the
+/// black rows (guest pages overlaid onto the resident).
+fn lab_note_wrote_pixels(
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    pages: &[u64],
+    ranges: &[(u64, u64)],
+    window_bytes: u64,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static LEFT: AtomicU32 = AtomicU32::new(3000);
+    if width < 512 || LEFT.fetch_sub(1, Ordering::Relaxed) == 0 {
+        return;
+    }
+    let bytes: u64 = ranges.iter().map(|&(s, e)| e - s).sum();
+    let first: Vec<String> = ranges
+        .iter()
+        .take(6)
+        .map(|&(s, e)| format!("{:x}-{:x}", s, e))
+        .collect();
+    crate::observe::off(format!(
+        "lab_wrote_pixels mid={mapping_id} {width}x{height} pages={} ranges={} bytes={bytes} window={window_bytes} first={}",
+        pages.len(),
+        ranges.len(),
+        first.join(",")
+    ));
 }
 
 /// Whether any mapping-offset range intersects `[base_off, span_end)`.
