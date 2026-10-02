@@ -117,6 +117,11 @@ struct Entry {
     /// the arming window — and can never equal a live generation, because the
     /// host's first readable one is 1.
     gen_at_store: u64,
+    /// TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`): `gen_at_store` was read synced
+    /// at the Store. A lagged one ([`note_store_eager`]) may predate guest writes
+    /// made before the Store, which a reader may count against the Store (a
+    /// re-read) but a writer may not ([`armed`], [`written_pages`]).
+    exact: bool,
     /// `host_writes.epoch()` as it stood at the Store, read *after* the Store
     /// recorded its own write so the Store does not invalidate itself.
     host_epoch_at_store: u64,
@@ -228,6 +233,53 @@ pub fn note_store<H: HostOps>(
     key: GvaTargetKey,
     gpas: &[u64],
 ) {
+    stamp(state, host, key, gpas, false);
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`, on unless `=off`): whether an eager
+/// Store re-stamps an armed target from the generation its set was last synced
+/// to rather than syncing it now.
+fn lab_lagged_enabled() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GVAW_LAGGED").map_or(true, |v| v != "off"))
+}
+
+/// [`note_store`] for a Store that landed the whole frame in the guest's pages
+/// now (nothing deferred), which leaves only readers to answer.
+///
+/// TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`): an already armed target is
+/// re-stamped from the lagged generation. The synced read was a foreground
+/// dirty sync of the target's pages at every Store — 95 % of this function's
+/// cost and ~10 % of the drain on fullscreen transitions (n81) — and the next
+/// reader syncs the same set again anyway. An older baseline only ever moves
+/// a reader towards "written" (a re-read), never towards a false `Quiet`:
+/// generations are monotonic. A first Store still reads synced, so a new target
+/// leaves its arming window at once.
+pub fn note_store_eager<H: HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    key: GvaTargetKey,
+    gpas: &[u64],
+) {
+    let lagged = lab_lagged_enabled()
+        && state
+            .gva_store_witness
+            .entries
+            .get(&key)
+            .is_some_and(|e| e.gen_at_store != 0);
+    stamp(state, host, key, gpas, lagged);
+}
+
+fn stamp<H: HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    key: GvaTargetKey,
+    gpas: &[u64],
+    lagged: bool,
+) {
     if key.generation == 0 || gpas.is_empty() {
         crate::runtime::drain::note_store_route("gvaw_unnamed_alloc");
         return;
@@ -255,9 +307,18 @@ pub fn note_store<H: HostOps>(
             }
         }
     };
-    let gen_at_store = match host.guest_write_gen(token) {
+    let read = if lagged {
+        host.guest_write_gen_lagged(token)
+    } else {
+        host.guest_write_gen(token)
+    };
+    let gen_at_store = match read {
         Some(g) => {
-            crate::runtime::drain::note_store_route("gvaw_armed");
+            crate::runtime::drain::note_store_route(if lagged {
+                "lab_gvaw_armed_lagged"
+            } else {
+                "gvaw_armed"
+            });
             g
         }
         None => {
@@ -277,6 +338,7 @@ pub fn note_store<H: HostOps>(
             token,
             gpas: gpas.to_vec(),
             gen_at_store,
+            exact: !lagged,
             host_epoch_at_store,
             last_seen,
         },
@@ -366,7 +428,15 @@ pub fn reach<H: HostOps>(state: &DeviceState, host: &H, key: GvaTargetKey) -> Gv
     }
     match host.guest_write_gen(e.token) {
         Some(g) if g == e.gen_at_store => {}
-        Some(_) => return GvaWriteReach::Guest(GuestWriteVerdict::Wrote),
+        Some(_) => {
+            // TEMP (lab): how often a lagged stamp reads written, against a synced one.
+            crate::runtime::drain::note_store_route(if e.exact {
+                "lab_gvaw_reach_wrote_exact"
+            } else {
+                "lab_gvaw_reach_wrote_lagged"
+            });
+            return GvaWriteReach::Guest(GuestWriteVerdict::Wrote);
+        }
         None => return GvaWriteReach::Guest(GuestWriteVerdict::Unreadable),
     }
     let host_verdict = state
@@ -394,7 +464,7 @@ pub fn armed(state: &DeviceState, key: GvaTargetKey) -> bool {
         .gva_store_witness
         .entries
         .get(&key)
-        .is_some_and(|e| e.gen_at_store != 0)
+        .is_some_and(|e| e.gen_at_store != 0 && e.exact)
 }
 
 /// Which of `key`'s pages the hypervisor has observed the guest write since the
@@ -424,6 +494,10 @@ pub fn written_pages<H: HostOps>(
     };
     if e.gen_at_store == 0 {
         crate::runtime::drain::note_store_route("gvaw_pages_unarmed");
+        return None;
+    }
+    if !e.exact {
+        crate::runtime::drain::note_store_route("lab_gvaw_pages_lagged");
         return None;
     }
     let answer = host.guest_written_pages(e.token, e.gen_at_store);
@@ -509,6 +583,37 @@ mod tests {
         // target for the rest of the boot.
         armed(&mut state, &mut host, key(0xabc), &pages);
         assert_eq!(reach(&state, &host, key(0xabc)), GvaWriteReach::Quiet);
+    }
+
+    /// TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`): an eager re-stamp from the
+    /// lagged generation still licenses readers — quiet until the guest writes,
+    /// written after — but no longer arms a writer, whose page merge needs the
+    /// Store's exact baseline. A synced Store arms it again.
+    #[test]
+    fn an_eager_restamp_serves_readers_but_not_writers() {
+        let mut state = device();
+        let mut host = FakeHost::new();
+        let pages = [3 * PAGE, 4 * PAGE];
+        note_store_eager(&mut state, &mut host, key(0xabc), &pages);
+        assert!(
+            super::armed(&state, key(0xabc)),
+            "a first Store reads synced"
+        );
+
+        note_store_eager(&mut state, &mut host, key(0xabc), &pages);
+        assert_eq!(reach(&state, &host, key(0xabc)), GvaWriteReach::Quiet);
+        assert!(!super::armed(&state, key(0xabc)));
+        assert_eq!(written_pages(&state, &host, key(0xabc)), None);
+
+        host.guest_wrote_page(4 * PAGE);
+        assert_eq!(
+            reach(&state, &host, key(0xabc)),
+            GvaWriteReach::Guest(GuestWriteVerdict::Wrote)
+        );
+
+        armed(&mut state, &mut host, key(0xabc), &pages);
+        assert!(super::armed(&state, key(0xabc)));
+        assert_eq!(written_pages(&state, &host, key(0xabc)), Some(Vec::new()));
     }
 
     /// A write by another rail of this device is invisible to the hypervisor,

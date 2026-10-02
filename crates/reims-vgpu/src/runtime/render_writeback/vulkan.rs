@@ -967,7 +967,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
             pages.ordered_complete(c0.target_gva, state.page_size()),
         ) {
             let gpas = gpas.to_vec();
-            crate::runtime::gva_store_witness::note_store(state, host, key, &gpas);
+            crate::runtime::gva_store_witness::note_store_eager(state, host, key, &gpas);
         }
     }
     crate::runtime::drain::note_store_route("gva_flush_copied");
@@ -1338,7 +1338,7 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
     // image — the clamped one. The eager eight-bit `gva_store_sync` still leaves
     // none, which is safe for the formats it now carries.
     if let Some(key) = crate::backend::vulkan::gva_witness_key(identity) {
-        crate::runtime::gva_store_witness::note_store(state, host, key, gpas);
+        crate::runtime::gva_store_witness::note_store_eager(state, host, key, gpas);
     }
     Ok(extent)
 }
