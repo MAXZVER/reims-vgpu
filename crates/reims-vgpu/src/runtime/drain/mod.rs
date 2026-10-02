@@ -9156,7 +9156,11 @@ fn lab_preempt_control<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
         return;
     }
     let open = state.drainable_child_mask();
-    for ch in [2u32, 4] {
+    // `all` adds the display ring: with ch2 no longer holding WindowServer
+    // back, ch1's ring kept refilling while it was read and the presenting
+    // channel waited up to 640 ms inside one tranche (n67 fpe1).
+    let channels: &[u32] = if lab_chan::preempt_display() { &[2, 4, 5] } else { &[2, 4] };
+    for &ch in channels {
         let bit = 1u32 << ch;
         if open & bit == 0 || state.draining_mask & bit != 0 {
             continue;
@@ -9239,7 +9243,14 @@ mod lab_chan {
 
     pub(super) fn preempt_on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CTRL_PREEMPT").is_ok_and(|v| v == "on"))
+        *ON.get_or_init(|| {
+            std::env::var("REIMS_VGPU_LAB_CTRL_PREEMPT").is_ok_and(|v| v == "on" || v == "all")
+        })
+    }
+
+    pub(super) fn preempt_display() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CTRL_PREEMPT").is_ok_and(|v| v == "all"))
     }
 
     thread_local! {
