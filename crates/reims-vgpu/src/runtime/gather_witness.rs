@@ -503,8 +503,17 @@ impl AuditDensity {
     /// Binds of one window between baselines.
     fn stride(self) -> u32 {
         match self {
+            Self::Strided if lab_audit_sparse() => AUDIT_STRIDE * 16,
             Self::Strided => AUDIT_STRIDE,
             Self::EveryBind => 1,
+        }
+    }
+
+    /// Consecutive refused binds an armed window re-baselines through.
+    fn rebaseline_limit(self) -> u8 {
+        match self {
+            Self::Strided if lab_audit_sparse() => 1,
+            _ => AUDIT_REBASELINE_LIMIT,
         }
     }
 
@@ -518,6 +527,15 @@ impl AuditDensity {
     fn stays_armed(self) -> bool {
         matches!(self, Self::EveryBind)
     }
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_GW_AUDIT=sparse` folds the strided content
+/// audit at a sixteenth of its density (stride 1024, one re-baseline per arm).
+/// The audit is a diagnostic; on the 5K drag its folds were ~3 % of the drain,
+/// mostly re-baselines of windows the witness refuses. Latched.
+fn lab_audit_sparse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GW_AUDIT").is_ok_and(|v| v == "sparse"))
 }
 
 /// Upper bound on tracked windows.
@@ -1908,7 +1926,7 @@ fn decide_warm<M: crate::runtime::host::HostOps>(
             entry.rebaselines = 0;
             entry.binds_since_fold = 0;
             audit
-        } else if entry.rebaselines < AUDIT_REBASELINE_LIMIT {
+        } else if entry.rebaselines < density.rebaseline_limit() {
             // Refused, so the bytes were free to move and the old baseline says
             // nothing. The gather is about to read this window anyway, so a
             // fresh baseline costs the fold and keeps the arm alive for the
