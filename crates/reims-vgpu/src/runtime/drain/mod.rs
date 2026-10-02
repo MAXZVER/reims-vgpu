@@ -3167,7 +3167,9 @@ fn run_parked_packet<H: HostMemory + HostOps>(
         state.draining_channel = domain;
         state.draining_mask |= bit;
         let started = std::time::Instant::now();
+        let lab_prev_act = lab_act(0x100 | u32::from(work.packet().opcode));
         let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
+        lab_act(lab_prev_act);
         census::note_drain_proc(work.packet().opcode, started.elapsed().as_nanos() as u64);
         lab_chan::lat_ran(domain, work.packet().completion_stamp, started.elapsed().as_micros() as u64);
         lab_dag_run(ingress.0, domain, work.packet().opcode, started.elapsed().as_micros() as u64);
@@ -9185,6 +9187,14 @@ fn lab_preempt_control<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
     }
 }
 
+/// TEMP (lab): what the drain worker is doing now, for `slow=` in
+/// `lab_stamp_lat` — 0 idle, 1 guest work, 2 early publish, 3 pay-after-stamp,
+/// 4 debt trim, 5 tail submit, 6 window publish, 7 post sweeps, 0x1XX running
+/// a packet of opcode XX. Returns the previous value.
+pub(crate) fn lab_act(act: u32) -> u32 {
+    lab_chan::ACT.swap(act, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// TEMP (lab): the guest rang `channel`'s doorbell (lock-free MMIO path) — the
 /// earliest unserved ring is the start of its packets' stamp latency.
 pub(crate) fn lab_note_doorbell(channel: u32) {
@@ -9359,6 +9369,14 @@ mod lab_chan {
     // (`exec`), to the word for its slot reaching a value at or past its own
     // (`post`: publication order behind earlier positions).
     static DB_US: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    pub(super) static ACT: AtomicU32 = AtomicU32::new(0);
+    static DB_ACT: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
+
+    fn slow() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<(u32, u32), (u64, u64)>> {
+        static M: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<(u32, u32), (u64, u64)>>> =
+            std::sync::OnceLock::new();
+        M.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+    }
     static DRAIN_DB: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
     static DRAIN_T0: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
     static SLOT: [AtomicU32; N] = [const { AtomicU32::new(u32::MAX) }; N];
@@ -9450,7 +9468,9 @@ mod lab_chan {
         let c = channel as usize;
         if c < N {
             let now = now_us();
-            let _ = DB_US[c].compare_exchange(0, now, Relaxed, Relaxed);
+            if DB_US[c].compare_exchange(0, now, Relaxed, Relaxed).is_ok() {
+                DB_ACT[c].store(ACT.load(Relaxed), Relaxed);
+            }
             DB_N[c].fetch_add(1, Relaxed);
             let mut r = rings();
             if r[c].len() >= 1024 {
@@ -9478,6 +9498,12 @@ mod lab_chan {
             SRV_N[c].fetch_add(1, Relaxed);
             SRV_US[c].fetch_add(d, Relaxed);
             SRV_MAX[c].fetch_max(d, Relaxed);
+            if d > 4000 {
+                let mut m = slow();
+                let e = m.entry((channel, DB_ACT[c].load(Relaxed))).or_default();
+                e.0 += 1;
+                e.1 += d;
+            }
         }
     }
 
@@ -9604,6 +9630,10 @@ mod lab_chan {
             if n > 0 {
                 line.push_str(&format!("ch{i}:{n}:{}:{mx},", us / n));
             }
+        }
+        line.push_str(" slow=");
+        for ((ch, act), (n, us)) in std::mem::take(&mut *slow()) {
+            line.push_str(&format!("ch{ch}@{act:x}:{n}:{us},"));
         }
         line.push_str(" ops=");
         for i in 1..N {

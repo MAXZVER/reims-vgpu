@@ -674,6 +674,7 @@ pub fn device_drain(id: u64) -> bool {
     // can say how late in this tranche it happened without threading a start
     // time through every call. See `census::tranche_elapsed_us`.
     crate::runtime::drain::note_tranche_started(crate::observe::elapsed_us());
+    crate::runtime::drain::lab_act(1); // TEMP (lab)
     device.drain(&mut host);
     // TEMP (lab, REIMS_VGPU_LAB_IRQ_BATCH): the gfx pulse held for this tranche.
     host.flush_deferred_irqs();
@@ -684,6 +685,7 @@ pub fn device_drain(id: u64) -> bool {
     // submitted first, so the window's blit is queued after the frame's draws.
     let early_publish = lab_early_publish();
     if early_publish {
+        crate::runtime::drain::lab_act(2);
         crate::backend::selected().flush_deferred_submissions(&device.state);
         publish_present_boundary(&slot, device.state.present.frame_flush_seen);
         #[cfg(feature = "host-window")]
@@ -691,12 +693,14 @@ pub fn device_drain(id: u64) -> bool {
     }
     // TEMP (lab, REIMS_VGPU_LAB_PAY_AFTER): the replayed presented frame, paid
     // now that the guest has its completion.
+    crate::runtime::drain::lab_act(3);
     crate::runtime::writeback_debt::lab_pay_after_stamp(
         &mut device.state,
         &mut host,
         slot.child_doorbell_rung.load(Ordering::Acquire) != 0,
     );
     // TEMP (lab, REIMS_VGPU_LAB_DEBT_TRIM): the ledger paid back to its bound.
+    crate::runtime::drain::lab_act(4);
     crate::runtime::writeback_debt::lab_trim_debts(
         &mut device.state,
         &mut host,
@@ -713,6 +717,7 @@ pub fn device_drain(id: u64) -> bool {
     // size on the one thread every guest packet serializes through cannot be
     // left to inference.
     let tail_started = std::time::Instant::now();
+    crate::runtime::drain::lab_act(5);
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
@@ -727,6 +732,7 @@ pub fn device_drain(id: u64) -> bool {
     let publish_started = std::time::Instant::now();
     // Push the finished present frame to the host-owned window (if running).
     // Off the QEMU main loop; a small dedicated mutex, never the render lock.
+    crate::runtime::drain::lab_act(6);
     #[cfg(feature = "host-window")]
     if !early_publish {
         window_publish::publish_window_frame(&slot, &mut device.state);
@@ -741,6 +747,7 @@ pub fn device_drain(id: u64) -> bool {
     // sweeps below run on the worker's own wall clock and are outside both
     // `drain_us` and `publish_us`, so `duty` cannot see them.
     let busy_end_us = crate::observe::elapsed_us();
+    crate::runtime::drain::lab_act(7);
     use crate::runtime::drain::{post_sweep, PostSweep};
     // Same one-second cadence, so the cache trend lines up row-for-row with
     // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
@@ -812,6 +819,7 @@ pub fn device_drain(id: u64) -> bool {
         slot.present_action_pending.store(true, Ordering::Release);
     }
     crate::runtime::drain::note_drain_exit(busy_end_us, false);
+    crate::runtime::drain::lab_act(0); // TEMP (lab): idle
     true
 }
 
