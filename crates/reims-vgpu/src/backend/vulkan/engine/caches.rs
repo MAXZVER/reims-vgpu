@@ -1940,7 +1940,7 @@ impl ObjectCaches {
         // negative cache entry here and the guest's work is declined by name.
         // See `crate::runtime::spirv_bind::validate`.
         if let crate::runtime::spirv_bind::SpirvValidation::Rejected(why) =
-            crate::runtime::spirv_bind::validate(words)
+            crate::runtime::spirv_bind::validate_memo((key.a, key.b), words)
         {
             let err = DrawError::Unsupported(super::reason::DrawReason::SpirvInvalid);
             // Print what the capability derivation saw alongside the

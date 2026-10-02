@@ -817,6 +817,12 @@ pub enum SpirvValidation {
 /// dispatch because a developer tool is missing would be the widening this
 /// device is not allowed to do in either direction.
 pub fn validate(words: &[u32]) -> SpirvValidation {
+    validate_inner(words).0
+}
+
+/// [`validate`], and whether a validator actually ran: an `Accepted` from an
+/// absent tool is not evidence and must not be remembered as a verdict.
+fn validate_inner(words: &[u32]) -> (SpirvValidation, bool) {
     let mut bytes = Vec::with_capacity(words.len() * 4);
     for word in words {
         bytes.extend_from_slice(&word.to_le_bytes());
@@ -839,12 +845,12 @@ pub fn validate(words: &[u32]) -> SpirvValidation {
                 "spirv_validate reason=validator_unavailable detail={e}"
             ));
         }
-        return SpirvValidation::Accepted;
+        return (SpirvValidation::Accepted, false);
     }
     let verdict = metal2vulkan::tools::spirv_val_bytes(&bytes, &dir);
     let _ = std::fs::remove_dir_all(&dir);
     match verdict {
-        Ok(()) => SpirvValidation::Accepted,
+        Ok(()) => (SpirvValidation::Accepted, true),
         Err(why) => {
             // A missing or unrunnable tool reads as an error from the same call
             // as a rejected module, and the two must not be confused: one is a
@@ -857,7 +863,7 @@ pub fn validate(words: &[u32]) -> SpirvValidation {
                         why.lines().next().unwrap_or("")
                     ));
                 }
-                return SpirvValidation::Accepted;
+                return (SpirvValidation::Accepted, false);
             }
             // The whole message on one line. Its first line is the wrapper's
             // own "spirv-val failed:" and the validator's diagnosis — the part
@@ -868,9 +874,65 @@ pub fn validate(words: &[u32]) -> SpirvValidation {
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
                 .collect();
-            SpirvValidation::Rejected(flattened.join(" | "))
+            (SpirvValidation::Rejected(flattened.join(" | ")), true)
         }
     }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_SPIRV_VAL_MEMO=off` disables): [`validate`],
+/// remembered by the module's 128-bit digest, in memory and in
+/// `spirv-val-ok.txt` beside the m2v disk cache.
+///
+/// Every validation spawns `spirv-val`, ~10-30 ms of process creation on
+/// Windows, on the recorder worker that the drain then waits for: the 33 ms
+/// recorder jobs of a full-screen transition, where new pipelines appear. The
+/// verdict is a function of the bytes, so a module accepted once is accepted
+/// again; only a validator that ran and accepted is remembered (an absent tool
+/// proves nothing), and a rejection is never remembered here (the shader cache
+/// keeps its own negative entry).
+pub fn validate_memo(digest: (u64, u64), words: &[u32]) -> SpirvValidation {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SPIRV_VAL_MEMO").map_or(true, |v| v != "off")) {
+        return validate(words);
+    }
+    static ACCEPTED: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
+    let file = crate::runtime::m2v_cache::disk_dir().map(|d| d.join("spirv-val-ok.txt"));
+    let set = ACCEPTED.get_or_init(|| {
+        let mut set = HashSet::new();
+        if let Some(text) = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()) {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.len() == 32 {
+                    if let (Ok(a), Ok(b)) = (
+                        u64::from_str_radix(&line[..16], 16),
+                        u64::from_str_radix(&line[16..], 16),
+                    ) {
+                        set.insert((a, b));
+                    }
+                }
+            }
+        }
+        crate::observe::off(format!("lab_spirv_val_memo loaded={}", set.len()));
+        Mutex::new(set)
+    });
+    if set.lock().unwrap_or_else(|e| e.into_inner()).contains(&digest) {
+        crate::runtime::drain::note_store_route("lab_spirv_val_memo_hit");
+        return SpirvValidation::Accepted;
+    }
+    crate::runtime::drain::note_store_route("lab_spirv_val_memo_miss");
+    let (verdict, ran) = validate_inner(words);
+    if ran && verdict == SpirvValidation::Accepted {
+        set.lock().unwrap_or_else(|e| e.into_inner()).insert(digest);
+        if let Some(f) = file {
+            use std::io::Write;
+            if let Ok(mut out) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
+                let _ = writeln!(out, "{:016x}{:016x}", digest.0, digest.1);
+            }
+        }
+    }
+    verdict
 }
 
 /// Reflect the explicit texel format for one image descriptor binding.

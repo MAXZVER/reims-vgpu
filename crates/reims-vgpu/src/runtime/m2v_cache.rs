@@ -967,7 +967,7 @@ mod disk {
     }
 
     pub(super) struct DiskCache {
-        dir: PathBuf,
+        pub(super) dir: PathBuf,
         stamp: Stamp,
         hits: AtomicU64,
         misses: AtomicU64,
@@ -3239,4 +3239,10 @@ mod tests {
             disk::obtain(None, id, || Ok((sample_spirv(), sample_reflection(false)))).unwrap();
         assert_eq!(raw.1, sample_reflection(false));
     }
+}
+
+/// TEMP (lab): the m2v disk cache's directory when it is on, for sibling records
+/// keyed on module bytes (`spirv_bind::validate_memo`).
+pub(crate) fn disk_dir() -> Option<&'static std::path::Path> {
+    disk::global().map(|d| d.dir.as_path())
 }
