@@ -591,6 +591,12 @@ pub fn device_drain(id: u64) -> bool {
         &mut host,
         slot.child_doorbell_rung.load(Ordering::Acquire) != 0,
     );
+    // TEMP (lab, REIMS_VGPU_LAB_DEBT_TRIM): the ledger paid back to its bound.
+    crate::runtime::writeback_debt::lab_trim_debts(
+        &mut device.state,
+        &mut host,
+        slot.child_doorbell_rung.load(Ordering::Acquire) != 0,
+    );
     host.flush_deferred_irqs();
     // TEMP (lab): REIMS_VGPU_LAB_PAR_SELFTEST. A no-op fork-join on this thread,
     // under this lock, to measure the pool; free when the switch is unset.

@@ -76,6 +76,69 @@ pub fn lab_max_debts() -> usize {
     })
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_DEBT_TRIM` (on by default; `=off` restores the
+/// synchronous eviction). The ledger bound becomes soft: an arm evicts (and so
+/// pays inside the arming draw) only past eight times [`lab_max_debts`], and
+/// [`lab_trim_debts`] pays the ledger back down to the bound at the tranche end,
+/// after the stamps, yielding to a guest already waiting. Fast Safari wheel
+/// scrolling paid ~100 evicted debts a second inside draws, the frame's critical
+/// path (18 % of the drain's samples). A debt kept longer is the same debt: any
+/// reader that names it still pays it first. Latched.
+fn lab_debt_trim() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_DEBT_TRIM").map_or(true, |v| v != "off");
+        crate::observe::off(format!("lab_debt_trim on={on}"));
+        on
+    })
+}
+
+/// TEMP (lab): the ledger size past which an arm evicts synchronously.
+fn lab_debt_hard_cap() -> usize {
+    if lab_debt_trim() {
+        lab_max_debts() * 8
+    } else {
+        lab_max_debts()
+    }
+}
+
+/// TEMP (lab): pay the oldest surface debts down to [`lab_max_debts`] at a
+/// tranche end, at most 16 at a time, yielding (up to 8 tranche ends in a row)
+/// while a doorbell is already rung. See [`lab_debt_trim`].
+pub fn lab_trim_debts<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    guest_waiting: bool,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    static YIELDS: AtomicU32 = AtomicU32::new(0);
+    if !lab_debt_trim() {
+        return;
+    }
+    let cap = lab_max_debts();
+    if state.pending_writebacks.debts.len() <= cap {
+        YIELDS.store(0, Relaxed);
+        return;
+    }
+    if guest_waiting && YIELDS.fetch_add(1, Relaxed) < 8 {
+        crate::runtime::drain::note_store_route("wbdebt_trim_yielded");
+        return;
+    }
+    YIELDS.store(0, Relaxed);
+    for _ in 0..16 {
+        if state.pending_writebacks.debts.len() <= cap {
+            break;
+        }
+        let Some(WritebackKey::Mapping(mapping_id)) = state.pending_writebacks.oldest() else {
+            break;
+        };
+        if let Some(debt) = state.pending_writebacks.take(mapping_id) {
+            pay(state, host, mapping_id, debt, "wbdebt_paid_trimmed");
+        }
+    }
+}
+
 /// A synthetic resident target, for tests that arm a debt without a device.
 ///
 /// Here rather than in each test module because it is the one place that knows
@@ -473,7 +536,7 @@ impl PendingWritebacks {
         height: u32,
         map_generation: u32,
     ) -> Option<WritebackKey> {
-        let evict = match self.debts.len() >= lab_max_debts() && !self.debts.contains_key(&mapping_id) {
+        let evict = match self.debts.len() >= lab_debt_hard_cap() && !self.debts.contains_key(&mapping_id) {
             true => self.oldest(),
             false => None,
         };
