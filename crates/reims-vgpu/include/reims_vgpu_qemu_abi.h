@@ -573,6 +573,8 @@ int reims_vgpu_qemu_iosfc_write(uint64_t handle, uint64_t offset, uint64_t data,
 int reims_vgpu_qemu_device_drain(uint64_t handle);
 /* gfx_update tick: re-drive display ONLINE after guest enable() (pending+IRQ). */
 int reims_vgpu_qemu_device_poll(uint64_t handle);
+/* TEMP (lab): microseconds until the next VBL grid point; 0 when due or unknown. */
+uint32_t reims_vgpu_qemu_vbl_due_us(uint64_t handle);
 /* Returns REIMS_VGPU_QEMU_OK + fills *out, or REIMS_VGPU_QEMU_EMPTY. */
 int reims_vgpu_qemu_device_pop_action(uint64_t handle, ReimsVgpuHostAction *out);
 

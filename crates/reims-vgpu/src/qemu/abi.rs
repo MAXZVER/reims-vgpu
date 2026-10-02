@@ -51,7 +51,7 @@ use crate::{
     backend_name, device_console_feed, device_create, device_cursor_glyph_copy,
     device_cursor_glyph_info, device_destroy, device_drain, device_efi_console_copy,
     device_gfx_read, device_gfx_write, device_iosfc_read, device_iosfc_write, device_poll,
-    device_pop_action, device_reset, device_scanout_copy, device_scanout_may_paint,
+    device_pop_action, device_reset, device_scanout_copy, device_scanout_may_paint, device_vbl_due_us,
     device_window_run_main, device_window_set_early_fb, device_window_start, device_window_stop,
     unwind_safe, ConsoleFeed, CursorGlyphInfo,
 };
@@ -610,6 +610,22 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_poll(handle: u64) -> c_int {
             }
         },
         REIMS_VGPU_QEMU_ERR_PANIC,
+    )
+}
+
+/// TEMP (lab): microseconds until the next VBL grid point, for the heartbeat's
+/// grid-exact mode (`REIMS_VGPU_LAB_HB_GRID`); 0 when due or unknown.
+#[no_mangle]
+pub unsafe extern "C" fn reims_vgpu_qemu_vbl_due_us(handle: u64) -> u32 {
+    unwind_safe(
+        "reims_vgpu_qemu_vbl_due_us",
+        || {
+            if handle == 0 {
+                return 0;
+            }
+            device_vbl_due_us(handle).min(u64::from(u32::MAX)) as u32
+        },
+        0,
     )
 }
 

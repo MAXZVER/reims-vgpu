@@ -704,6 +704,22 @@ pub fn device_drain(id: u64) -> bool {
 ///
 /// Enqueues HostActions (gfx IRQ / scanout); QEMU must deliver actions after
 /// this call.
+/// TEMP (lab): microseconds until the display's next VBL grid point
+/// ([`crate::runtime::drain::claim_display_vbl`]), for a heartbeat that sleeps
+/// to it instead of polling on a coarse period; 0 when it is due, or before the
+/// first VBL set a grid.
+pub fn device_vbl_due_us(id: u64) -> u64 {
+    let Some(slot) = device_slot(id) else {
+        return 0;
+    };
+    let last = slot.vbl_last_us.load(Ordering::Acquire);
+    if last == 0 {
+        return 0;
+    }
+    (last + crate::runtime::drain::display_vbl_interval_us())
+        .saturating_sub(crate::observe::elapsed_us())
+}
+
 pub fn device_poll(id: u64) -> bool {
     // Before the lock, and before the `device_slot` miss can return: this is the
     // only periodic callback that runs on a thread other than the drain worker,
