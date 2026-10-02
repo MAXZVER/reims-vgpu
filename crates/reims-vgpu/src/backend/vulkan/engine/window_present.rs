@@ -1225,9 +1225,34 @@ impl WindowPresenter {
         if restamped.is_some() {
             stale = false;
         }
-        let selected = source
-            .filter(|_| !stale)
-            .map(|source| (source.identity.clone(), restamped.unwrap_or(source.resolved)));
+        // TEMP (lab, `REIMS_VGPU_LAB_RERESOLVE`, on by default): a source the
+        // drain made stale between its publish and this present is re-resolved
+        // from the registry under the engine lock this present holds, with the
+        // publish's own decision (`slot_present_decline`) and resolution, and
+        // re-recorded as published. In a quiet 5K scene ~1 present in 10 found
+        // its source stale (the pay-after-stamp readback moves the presented
+        // framebuffer's access right after the publish) and drew slate.
+        let reresolved = source
+            .filter(|_| stale && restamped.is_none() && lab_reresolve_enabled())
+            .and_then(|source| {
+                let slot = pools.registry_get(&source.identity)?;
+                if super::pools::slot_present_decline(slot, source.width, source.height).is_some() {
+                    return None;
+                }
+                let resolved = super::pools::slot_window_resolution(slot);
+                pools.note_window_published(Some(&source.identity));
+                crate::runtime::drain::note_store_route("lab_window_reresolved");
+                Some(resolved)
+            });
+        if reresolved.is_some() {
+            stale = false;
+        }
+        let selected = source.filter(|_| !stale).map(|source| {
+            (
+                source.identity.clone(),
+                restamped.or(reresolved).unwrap_or(source.resolved),
+            )
+        });
         // Only reached when no resident carries this present: upload the CPU
         // bytes instead. `None` here means the window shows slate.
         let staged = if selected.is_some() {
@@ -1901,6 +1926,17 @@ fn lab_restamp_enabled() -> bool {
     static ON: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
         let on = std::env::var("REIMS_VGPU_LAB_RESTAMP").map_or(true, |v| v != "off");
         crate::observe::off(format!("lab_restamp on={on}"));
+        on
+    });
+    *ON
+}
+
+/// TEMP (lab): see the stale-source re-resolve in `begin_present`. Latched; on
+/// by default.
+fn lab_reresolve_enabled() -> bool {
+    static ON: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_RERESOLVE").map_or(true, |v| v != "off");
+        crate::observe::off(format!("lab_reresolve on={on}"));
         on
     });
     *ON
