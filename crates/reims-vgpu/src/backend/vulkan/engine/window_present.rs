@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use super::context::DeviceContext;
 use super::pools::ResourcePools;
-use super::types::{DrawError, PresentRect, WindowPresentSource};
+use super::types::{DrawError, PresentRect, TargetIdentity, WindowPresentSource};
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::translate;
 
@@ -557,6 +557,16 @@ pub(crate) struct WindowPresenter {
     /// a second query is a second answer that could disagree with the one
     /// attach already refused on.
     present_family_supported: bool,
+    /// TEMP (lab): the source this presenter re-vouched for after its own blit
+    /// moved the window epoch — `(identity, epoch after the move, resolution
+    /// with the access the blit left)`. The blit's `registry_note_access` is a
+    /// change of a published slot's access, which moves the epoch and made the
+    /// window's *own* source stale: the next present of the same frame (a redraw
+    /// with no new publish) drew slate instead of the guest's frame, ~half the
+    /// presents of a quiet scene. Valid only while the epoch has not moved
+    /// again, and the identity is put back into the published set so a removal
+    /// still moves it. `REIMS_VGPU_LAB_RESTAMP=off` restores the old behaviour.
+    lab_restamp: Option<(TargetIdentity, u64, super::pools::ResolvedResident)>,
 }
 
 /// Everything one in-flight present owns for as long as its blit is running.
@@ -819,6 +829,7 @@ impl WindowPresenter {
             // Attach refused above unless this was true, so the presenter that
             // exists is one whose queue can address its surface.
             present_family_supported: present_capable,
+            lab_restamp: None,
         };
         // A window created while minimized has no swapchain yet, which is not a
         // failure to attach: `begin_present` retries every frame until the
@@ -1201,11 +1212,22 @@ impl WindowPresenter {
         // still standing: the image is registered, its pixels landed, its byte
         // order is the scanout's, its extent is the one being presented, and the
         // barrier below names the access the image is actually in.
-        let stale =
-            source.is_some_and(|source| source.epoch != super::pools::window_source_epoch());
+        let epoch_now = super::pools::window_source_epoch();
+        let mut stale = source.is_some_and(|source| source.epoch != epoch_now);
+        // TEMP (lab): a source this presenter itself re-vouched for at the
+        // current epoch (see `lab_restamp`).
+        let restamped = source.filter(|_| stale && lab_restamp_enabled()).and_then(|source| {
+            self.lab_restamp
+                .as_ref()
+                .filter(|(identity, epoch, _)| *epoch == epoch_now && *identity == source.identity)
+                .map(|(_, _, resolved)| *resolved)
+        });
+        if restamped.is_some() {
+            stale = false;
+        }
         let selected = source
             .filter(|_| !stale)
-            .map(|source| (source.identity.clone(), source.resolved));
+            .map(|source| (source.identity.clone(), restamped.unwrap_or(source.resolved)));
         // Only reached when no resident carries this present: upload the CPU
         // bytes instead. `None` here means the window shows slate.
         let staged = if selected.is_some() {
@@ -1392,10 +1414,22 @@ impl WindowPresenter {
                 // present becomes a transaction against the device that owns the
                 // registry — not before, and not by moving the write alone.
                 if let Some((identity, now)) = selected.as_ref() {
-                    pools.registry_note_access(
-                        identity,
-                        super::pools::ResidentAccess::transfer_read(now.guest_imported),
-                    );
+                    let access = super::pools::ResidentAccess::transfer_read(now.guest_imported);
+                    let before = super::pools::window_source_epoch();
+                    pools.registry_note_access(identity, access);
+                    // TEMP (lab): re-vouch for the source this blit just made
+                    // stale (see `lab_restamp`).
+                    if lab_restamp_enabled() {
+                        let after = super::pools::window_source_epoch();
+                        if after != before {
+                            pools.note_window_published(Some(identity));
+                        }
+                        self.lab_restamp = Some((
+                            identity.clone(),
+                            super::pools::window_source_epoch(),
+                            super::pools::ResolvedResident { access, ..*now },
+                        ));
+                    }
                 }
             } else {
                 ctx.device.cmd_clear_color_image(
@@ -1860,6 +1894,16 @@ impl WindowPresenter {
         }
         self.surface_loader.destroy_surface(self.surface, None);
     }
+}
+
+/// TEMP (lab): see `WindowPresenter::lab_restamp`. Latched; on by default.
+fn lab_restamp_enabled() -> bool {
+    static ON: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_RESTAMP").map_or(true, |v| v != "off");
+        crate::observe::off(format!("lab_restamp on={on}"));
+        on
+    });
+    *ON
 }
 
 /// TEMP (lab): input-to-present latency probe. `REIMS_VGPU_LAB_PROBE` names a
