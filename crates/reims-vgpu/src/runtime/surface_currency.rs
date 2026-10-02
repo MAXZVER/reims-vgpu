@@ -218,6 +218,10 @@ pub fn surface_currency<M: HostOps>(
         return SurfaceCurrency::Unwritten(verdict);
     }
     let currency = narrow_to_window(state, host, mapping_id, width, height);
+    if matches!(currency, SurfaceCurrency::WroteUnknown) && width >= 512 {
+        // TEMP (lab, black-stripe hunt): the whole window is then re-read from guest pages.
+        lab_note_wrote_pixels(mapping_id, width, height, &[], &[], 0);
+    }
     if lab_miss {
         // TEMP (lab, verify): the lagged generation would have served this window's
         // host-side copy. Whether that was a stale serve depends on where the
