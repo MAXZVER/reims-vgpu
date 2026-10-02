@@ -529,13 +529,18 @@ impl AuditDensity {
     }
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_GW_AUDIT=sparse` folds the strided content
-/// audit at a sixteenth of its density (stride 1024, one re-baseline per arm).
+/// TEMP (lab): the strided content audit folds at a sixteenth of its density
+/// (stride 1024, one re-baseline per arm) unless `REIMS_VGPU_LAB_GW_AUDIT=full`.
 /// The audit is a diagnostic; on the 5K drag its folds were ~3 % of the drain,
-/// mostly re-baselines of windows the witness refuses. Latched.
+/// mostly re-baselines of windows the witness refuses, and sparse took the
+/// sampled resolve from 77-88 to 60 ms/s (fxs*, 2026-10-02). Test builds keep
+/// the full density their suites were written against. Latched.
 fn lab_audit_sparse() -> bool {
+    if cfg!(test) {
+        return false;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GW_AUDIT").is_ok_and(|v| v == "sparse"))
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GW_AUDIT").map_or(true, |v| v != "full"))
 }
 
 /// Upper bound on tracked windows.
