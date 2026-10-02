@@ -811,6 +811,10 @@ pub(crate) struct DeviceContext {
     /// Byte length of the last persisted cache blob — the growth debounce
     /// for [`Self::persist_pipeline_cache`].
     pub pipeline_cache_saved_len: AtomicUsize,
+    /// TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SAVE_MS`): when (device ms) the cache was
+    /// last snapshotted, and whether a compile since then is still unsaved.
+    pub pipeline_cache_saved_ms: AtomicU64,
+    pub pipeline_cache_save_pending: std::sync::atomic::AtomicBool,
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
     #[cfg(feature = "host-window")]
     pub swapchain: bool,
@@ -1513,6 +1517,8 @@ impl DeviceContext {
             queue_owner,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
+            pipeline_cache_saved_ms: AtomicU64::new(0),
+            pipeline_cache_save_pending: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "host-window")]
             swapchain,
         })
@@ -1529,6 +1535,24 @@ impl DeviceContext {
         let Some(path) = self.pipeline_cache_path.clone() else {
             return;
         };
+        // TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SAVE_MS`, default 5000; 0 = every
+        // growth): at most one snapshot per interval. A login compiled ~400
+        // pipelines in ~20 s and snapshotted the whole blob (up to 8 MiB) after
+        // each — 1.8 GB serialized on the recorder thread and written to disk.
+        // The rest is picked up by `persist_pipeline_cache_if_due`.
+        let interval = lab_pcache_save_ms();
+        if interval > 0 {
+            let now = crate::observe::elapsed_ms() as u64;
+            let last = self.pipeline_cache_saved_ms.load(Ordering::Relaxed);
+            if last != 0 && now.saturating_sub(last) < interval {
+                self.pipeline_cache_save_pending
+                    .store(true, Ordering::Relaxed);
+                return;
+            }
+            self.pipeline_cache_saved_ms.store(now.max(1), Ordering::Relaxed);
+            self.pipeline_cache_save_pending
+                .store(false, Ordering::Relaxed);
+        }
         let data = match unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache) } {
             Ok(d) => d,
             Err(e) => {
@@ -1573,7 +1597,25 @@ impl DeviceContext {
         persist::submit(persist::Job::Write { path, data });
     }
 
+    /// TEMP (lab): the snapshot `persist_pipeline_cache` deferred, once its
+    /// interval has passed. Called from the periodic maintenance.
+    pub(crate) fn persist_pipeline_cache_if_due(&self) {
+        if !self.pipeline_cache_save_pending.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = crate::observe::elapsed_ms() as u64;
+        let last = self.pipeline_cache_saved_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= lab_pcache_save_ms() {
+            self.persist_pipeline_cache();
+        }
+    }
+
     pub(crate) unsafe fn destroy(&mut self) {
+        // TEMP (lab): whatever the interval deferred lands before the cache goes.
+        if self.pipeline_cache_save_pending.load(Ordering::Relaxed) {
+            self.pipeline_cache_saved_ms.store(0, Ordering::Relaxed);
+            self.persist_pipeline_cache();
+        }
         // The queue owner may still hold ended command buffers and a clone of
         // the device. Drain it before stopping completion publication or
         // destroying anything a queued submission names.
@@ -2772,4 +2814,16 @@ mod persist_owner_tests {
         }
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PCACHE_SAVE_MS` — the least interval between two
+/// pipeline-cache snapshots (default 5000; 0 snapshots on every growth).
+fn lab_pcache_save_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PCACHE_SAVE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000)
+    })
 }

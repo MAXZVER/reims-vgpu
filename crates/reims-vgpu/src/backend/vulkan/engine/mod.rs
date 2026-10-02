@@ -7519,6 +7519,8 @@ pub fn maintain_resources(now_ms: u64) {
     unsafe {
         pools.advance_registry_maintenance(ctx, counters, now_ms);
     }
+    // TEMP (lab, REIMS_VGPU_LAB_PCACHE_SAVE_MS): the deferred cache snapshot.
+    ctx.persist_pipeline_cache_if_due();
 }
 
 /// Snapshot of create/alloc/hit-miss counters (for tests and thrash proxies).
