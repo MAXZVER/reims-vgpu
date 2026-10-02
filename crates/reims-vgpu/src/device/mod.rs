@@ -206,6 +206,9 @@ static LAB_LOCK_WAIT_N: [std::sync::atomic::AtomicU64; LAB_HOLDERS] =
 static LAB_LOCK_INGRESS_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAB_LOCK_INGRESS_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAB_LOCK_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAB_LOCK_APPLY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAB_LOCK_TOTAL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAB_LOCK_TOTAL_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// TEMP (lab): mark the site that now holds `inner`.
 #[inline]
@@ -238,6 +241,12 @@ fn lab_drain_lock_note(holder: usize, us: u64) {
     let n = LAB_LOCK_INGRESS_N.swap(0, Ordering::Relaxed);
     let w = LAB_LOCK_INGRESS_US.swap(0, Ordering::Relaxed);
     line.push_str(&format!(" ingress={n}/{w}us"));
+    line.push_str(&format!(
+        " total={}/{}us apply={}us",
+        LAB_LOCK_TOTAL_N.swap(0, Ordering::Relaxed),
+        LAB_LOCK_TOTAL_US.swap(0, Ordering::Relaxed),
+        LAB_LOCK_APPLY_US.swap(0, Ordering::Relaxed)
+    ));
     crate::observe::off(line);
 }
 
@@ -264,10 +273,14 @@ fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner
         LAB_LOCK_INGRESS_US.fetch_add(lab_ingress_us, Ordering::Relaxed);
         LAB_LOCK_INGRESS_N.fetch_add(1, Ordering::Relaxed);
     }
+    let lab_t2 = std::time::Instant::now();
     while let Some(write) = ingress.pop_front() {
         apply_gfx_write(&mut inner, slot, write);
     }
     drop(ingress);
+    LAB_LOCK_APPLY_US.fetch_add(lab_t2.elapsed().as_micros() as u64, Ordering::Relaxed);
+    LAB_LOCK_TOTAL_US.fetch_add(lab_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    LAB_LOCK_TOTAL_N.fetch_add(1, Ordering::Relaxed);
     // Here rather than only inside `drain_pending`, because this is the one
     // point every entry to the drain passes through. `device_drain` returns
     // before `drain_pending` when the device has no host ops, and
