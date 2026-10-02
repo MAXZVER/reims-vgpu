@@ -901,11 +901,53 @@ pub fn pay_cpu_shared_mapping<M: HostMemory + HostOps>(
         // pinned. The frame stays owed to any reader that names it.
         if state.pending_writebacks.get(mapping_id).is_some() {
             crate::runtime::drain::note_store_route("wbdebt_cpu_shared_left_for_replay");
+            if lab_pay_after_stamp_enabled() {
+                LAB_PAY_AFTER_STAMP.store(mapping_id, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         return;
     }
     if let Some(debt) = state.pending_writebacks.take(mapping_id) {
         pay(state, host, mapping_id, debt, "wbdebt_paid_cpu_shared");
+    }
+}
+
+/// TEMP (lab): the presented mapping whose frame [`lab_pay_after_stamp`] pays
+/// once the tranche that presented it has delivered its stamps; 0 when none.
+static LAB_PAY_AFTER_STAMP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_AFTER=off` leaves a replayed presented frame
+/// owed until a reader names it. On by default: with no payment at all the
+/// framebuffer pages fall a whole frame behind, and the first named
+/// synchronize (the 5K drag's start) paid three full 44 MB frames in one
+/// 38-700 ms tranche. Paying after the stamp keeps the pages one frame fresh
+/// without the guest waiting for it. Latched.
+fn lab_pay_after_stamp_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_PAY_AFTER").map_or(true, |v| v != "off");
+        crate::observe::off(format!("pay_after_stamp on={on}"));
+        on
+    })
+}
+
+/// TEMP (lab): pay the frame [`pay_cpu_shared_mapping`] left owed under replay,
+/// after the drain delivered the swap's completion. The guest builds its next
+/// frame meanwhile; a CPU copy it makes from these pages before they land is
+/// the replay's case, as it was with no payment at all.
+pub fn lab_pay_after_stamp<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
+    let mapping_id = LAB_PAY_AFTER_STAMP.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if mapping_id == 0
+        || !state
+            .mappings
+            .get(&mapping_id)
+            .is_some_and(|m| m.scanout_presented)
+    {
+        return;
+    }
+    if let Some(debt) = state.pending_writebacks.take(mapping_id) {
+        pay(state, host, mapping_id, debt, "wbdebt_paid_after_stamp");
     }
 }
 

@@ -584,6 +584,10 @@ pub fn device_drain(id: u64) -> bool {
     device.drain(&mut host);
     // TEMP (lab, REIMS_VGPU_LAB_IRQ_BATCH): the gfx pulse held for this tranche.
     host.flush_deferred_irqs();
+    // TEMP (lab, REIMS_VGPU_LAB_PAY_AFTER): the replayed presented frame, paid
+    // now that the guest has its completion.
+    crate::runtime::writeback_debt::lab_pay_after_stamp(&mut device.state, &mut host);
+    host.flush_deferred_irqs();
     // TEMP (lab): REIMS_VGPU_LAB_PAR_SELFTEST. A no-op fork-join on this thread,
     // under this lock, to measure the pool; free when the switch is unset.
     crate::runtime::par::selftest::tick(&device.state);
