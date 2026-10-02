@@ -1173,8 +1173,24 @@ impl ApplicationHandler<FramePublished> for App {
     /// disagree about the backstop — `about_to_wait` runs after this and after
     /// every other event, so it is the one place that can hold that decision.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: FramePublished) {
+        // TEMP (lab): `REIMS_VGPU_LAB_DIRECT_REDRAW=1` presents here, on the
+        // publish's own wake, instead of asking for a redraw: on Windows that
+        // request is a WM_PAINT, which the message loop delivers only once
+        // nothing else is queued.
+        if lab_direct_redraw() && self.window.is_some() {
+            self.loop_census.draws += 1;
+            self.draw();
+            self.next_backstop = std::time::Instant::now() + WINDOW_REDRAW_BACKSTOP;
+            return;
+        }
         self.frame_pending = true;
     }
+}
+
+/// TEMP (lab): see `user_event`. Latched.
+fn lab_direct_redraw() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DIRECT_REDRAW").is_ok_and(|v| v == "1"))
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_PRESENT_GAPS=1` also times the host window's
