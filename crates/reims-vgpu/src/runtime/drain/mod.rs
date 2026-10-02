@@ -9439,7 +9439,7 @@ mod lab_chan {
     struct Lat {
         pending: std::collections::HashMap<u32, std::collections::VecDeque<Entry>>,
         agg: std::collections::BTreeMap<(u32, u32), Agg>,
-        waits: std::collections::BTreeMap<(u32, u32), WaitAgg>,
+        waits: std::collections::BTreeMap<(u32, u32, u32), WaitAgg>,
     }
 
     fn lat() -> std::sync::MutexGuard<'static, Lat> {
@@ -9600,7 +9600,7 @@ mod lab_chan {
                 a.gt16 += u64::from(tot > 16_000);
                 a.gt33 += u64::from(tot > 33_000);
                 a.gt64 += u64::from(tot > 64_000);
-                let w = waits.entry((slot, e.waits)).or_default();
+                let w = waits.entry((slot, e.task, e.waits)).or_default();
                 let park = run.saturating_sub(e.admit);
                 w.n += 1;
                 w.park += park;
@@ -9677,10 +9677,11 @@ mod lab_chan {
                 a.gt64,
             ));
         }
-        for ((slot, on), w) in std::mem::take(waits) {
+        for ((slot, task, on), w) in std::mem::take(waits) {
             let n = w.n.max(1);
             line.push_str(&format!(
-                " w{slot}<s{}={}:park{}:pmax{}:ahead{}",
+                " w{slot}t{}<s{}={}:park{}:pmax{}:ahead{}",
+                task as i32,
                 on as i32,
                 w.n,
                 w.park / n,
