@@ -359,7 +359,7 @@ pub(crate) fn lab_publish_report() -> Option<String> {
     let late = gaps.iter().filter(|&&us| us > 12_500).count();
     Some(format!(
         "lab_publish_gaps n={} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} max_ms={:.2} late={late} \
-         pub2present_n={} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} max_ms={:.2}",
+         pub2present_n={} lat50_ms={:.2} lat95_ms={:.2} lat99_ms={:.2} latmax_ms={:.2}",
         gaps.len(),
         at(&gaps, 0.5),
         at(&gaps, 0.95),
