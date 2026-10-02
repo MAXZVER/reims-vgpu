@@ -148,6 +148,26 @@ pub struct GvaStoreWitness {
 /// whether the bound binds rather than leaving it assumed.
 const MAX_TRACKED_TARGETS: usize = 128;
 
+/// TEMP (lab): the bound [`note_store`] evicts at. 512 unless
+/// `REIMS_VGPU_LAB_GVAW_MAX` names another (16..=4096); test builds keep
+/// [`MAX_TRACKED_TARGETS`]. Mission Control stores past 128 live targets and
+/// evicted 233 a second, each an untrack and a fresh track through the
+/// hypervisor (~12 % of its draw path); the harvest walk the bound was sized
+/// against is the on-demand sync now, which reads a set only when asked.
+fn max_tracked_targets() -> usize {
+    if cfg!(test) {
+        return MAX_TRACKED_TARGETS;
+    }
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_GVAW_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512usize)
+            .clamp(16, 4096)
+    })
+}
+
 impl GvaStoreWitness {
     /// Detach every tracking token, for release through
     /// [`HostOps::untrack_guest_writes`].
@@ -218,7 +238,7 @@ pub fn note_store<H: HostOps>(
     let token = match state.gva_store_witness.entries.get(&key) {
         Some(e) => e.token,
         None => {
-            while state.gva_store_witness.entries.len() >= MAX_TRACKED_TARGETS {
+            while state.gva_store_witness.entries.len() >= max_tracked_targets() {
                 let mut retired = Vec::new();
                 state.gva_store_witness.evict_oldest(&mut retired);
                 state.retired_guest_write_tokens.extend(retired);
