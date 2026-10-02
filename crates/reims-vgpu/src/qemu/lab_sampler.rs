@@ -124,8 +124,19 @@ fn wr(ctx: &mut Context, off: usize, v: u64) {
 /// Called on the drain thread; the first call starts the sampler.
 pub(crate) fn start_once() {
     static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let Ok(out) = std::env::var("REIMS_VGPU_LAB_SAMPLER") else {
+    ONCE.call_once(|| start_for_current_thread("REIMS_VGPU_LAB_SAMPLER"));
+}
+
+/// TEMP (lab): called on the recorder worker thread; `REIMS_VGPU_LAB_SAMPLER_REC=<out
+/// file>` samples that thread the same way (gate and rate are shared).
+pub(crate) fn start_recorder_once() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| start_for_current_thread("REIMS_VGPU_LAB_SAMPLER_REC"));
+}
+
+fn start_for_current_thread(var: &str) {
+    {
+        let Ok(out) = std::env::var(var) else {
             return;
         };
         let gate = std::env::var("REIMS_VGPU_LAB_SAMPLER_GATE").ok();
@@ -159,7 +170,7 @@ pub(crate) fn start_once() {
                 let target = target;
                 run(target.0, &out, gate.as_deref(), hz, stack)
             });
-    });
+    }
 }
 
 fn run(target: Handle, out: &str, gate: Option<&str>, hz: u64, stack: (u64, u64)) {

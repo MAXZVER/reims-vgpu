@@ -358,6 +358,8 @@ impl Handoff {
         crate::lab_cores::pin_to_performance_cores(self.name);
         if std::ptr::eq(self, &DRAW) {
             mark_recorder_thread();
+            #[cfg(windows)]
+            crate::qemu::lab_sampler::start_recorder_once(); // TEMP (lab)
         }
         loop {
             let spin_until = Instant::now() + worker_spin();
