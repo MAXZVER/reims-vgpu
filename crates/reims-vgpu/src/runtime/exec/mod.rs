@@ -1079,6 +1079,8 @@ fn execute_submission<M: HostMemory + HostOps>(
         let finish_ns = finish_started.elapsed().as_nanos() as u64;
         *measured_ns += finish_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
+        // TEMP (lab, `REIMS_VGPU_LAB_PREEMPT_INNER`): the control channels, between streams.
+        crate::runtime::drain::lab_preempt_between_streams(state, host);
     }
 }
 

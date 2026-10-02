@@ -9215,6 +9215,33 @@ fn lab_preempt_control<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
     }
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_PREEMPT_INNER=on`): serve the control channels
+/// between the render streams of a running EXEC, at most every 0.5 ms.
+///
+/// [`lab_preempt_control`] runs before each EXEC, so a ch2 command — a
+/// MapMemory2, DeleteResource or Unmap WindowServer submits and then waits on
+/// synchronously (n65 DTrace: `finishEvent` on its own stamp) — still waits out
+/// the whole EXEC in front of it: `slow=ch2@137` read up to 237 ms on
+/// transitions (n81). Between two streams the previous one is closed and its
+/// Store routed, and the nested drain defers every EXEC it would release, so
+/// only control packets the model finds independent of the running one run.
+pub(crate) fn lab_preempt_between_streams<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+) {
+    if !lab_chan::preempt_inner_on() || lab_chan::in_preempt() {
+        return;
+    }
+    let now = crate::observe::elapsed_us();
+    let last = lab_chan::INNER_LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < 500 {
+        return;
+    }
+    lab_chan::INNER_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    note_store_route("lab_preempt_inner_check");
+    lab_preempt_control(state, host);
+}
+
 /// TEMP (lab): what the drain worker is doing now, for `slow=` in
 /// `lab_stamp_lat` — 0 idle, 1 guest work, 2 early publish, 3 pay-after-stamp,
 /// 4 debt trim, 5 tail submit, 6 window publish, 7 post sweeps, 0x1XX running
@@ -9301,6 +9328,13 @@ mod lab_chan {
         // On by default since n73/n74 (WindowServer's idx-2 waits halved by DTrace);
         // `=off` restores serving ch2/ch4 in channel order only.
         *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CTRL_PREEMPT").map_or(true, |v| v != "off"))
+    }
+
+    pub(super) static INNER_LAST: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn preempt_inner_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PREEMPT_INNER").is_ok_and(|v| v == "on"))
     }
 
     pub(super) fn preempt_display() -> bool {
