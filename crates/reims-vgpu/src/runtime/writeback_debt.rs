@@ -916,6 +916,19 @@ pub fn pay_cpu_shared_mapping<M: HostMemory + HostOps>(
 /// once the tranche that presented it has delivered its stamps; 0 when none.
 static LAB_PAY_AFTER_STAMP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// TEMP (lab): tranche ends in a row [`lab_pay_after_stamp`] may yield to a
+/// waiting guest before it pays anyway.
+const LAB_PAY_AFTER_MAX_YIELDS: u32 = 8;
+
+/// TEMP (lab): see [`lab_pay_after_stamp`]. Latched.
+fn lab_pay_after_yield() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PAY_AFTER_YIELD").map_or(true, |v| v != "off")
+    })
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_PAY_AFTER=off` leaves a replayed presented frame
 /// owed until a reader names it. On by default: with no payment at all the
 /// framebuffer pages fall a whole frame behind, and the first named
@@ -936,8 +949,31 @@ fn lab_pay_after_stamp_enabled() -> bool {
 /// after the drain delivered the swap's completion. The guest builds its next
 /// frame meanwhile; a CPU copy it makes from these pages before they land is
 /// the replay's case, as it was with no payment at all.
-pub fn lab_pay_after_stamp<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
-    let mapping_id = LAB_PAY_AFTER_STAMP.swap(0, std::sync::atomic::Ordering::Relaxed);
+///
+/// `guest_waiting`: a doorbell is already rung for the next tranche. The
+/// payment then yields — the frame stays owed and is paid at the next tranche
+/// end that finds the guest idle — up to [`LAB_PAY_AFTER_MAX_YIELDS`] in a row,
+/// so a saturated drain keeps its time for guest work and the pages still never
+/// fall more than a few frames behind. `REIMS_VGPU_LAB_PAY_AFTER_YIELD=off`
+/// pays at every tranche end.
+pub fn lab_pay_after_stamp<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    guest_waiting: bool,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    static YIELDS: AtomicU32 = AtomicU32::new(0);
+    let mapping_id = LAB_PAY_AFTER_STAMP.swap(0, Relaxed);
+    if mapping_id != 0 && guest_waiting && lab_pay_after_yield() {
+        if YIELDS.fetch_add(1, Relaxed) < LAB_PAY_AFTER_MAX_YIELDS {
+            // A newer swap overwrites this; the older frame then stays owed to
+            // whatever names it, as it would with no payment at all.
+            let _ = LAB_PAY_AFTER_STAMP.compare_exchange(0, mapping_id, Relaxed, Relaxed);
+            crate::runtime::drain::note_store_route("wbdebt_pay_after_yielded");
+            return;
+        }
+    }
+    YIELDS.store(0, Relaxed);
     if mapping_id == 0
         || !state
             .mappings

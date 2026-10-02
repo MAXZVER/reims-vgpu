@@ -586,7 +586,11 @@ pub fn device_drain(id: u64) -> bool {
     host.flush_deferred_irqs();
     // TEMP (lab, REIMS_VGPU_LAB_PAY_AFTER): the replayed presented frame, paid
     // now that the guest has its completion.
-    crate::runtime::writeback_debt::lab_pay_after_stamp(&mut device.state, &mut host);
+    crate::runtime::writeback_debt::lab_pay_after_stamp(
+        &mut device.state,
+        &mut host,
+        slot.child_doorbell_rung.load(Ordering::Acquire) != 0,
+    );
     host.flush_deferred_irqs();
     // TEMP (lab): REIMS_VGPU_LAB_PAR_SELFTEST. A no-op fork-join on this thread,
     // under this lock, to measure the pool; free when the switch is unset.
