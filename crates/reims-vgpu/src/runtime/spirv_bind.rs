@@ -890,6 +890,241 @@ fn validate_inner(words: &[u32]) -> (SpirvValidation, bool) {
 /// again; only a validator that ran and accepted is remembered (an absent tool
 /// proves nothing), and a rejection is never remembered here (the shader cache
 /// keeps its own negative entry).
+/// TEMP (lab, `REIMS_VGPU_LAB_LOOP_BUDGET=N`, N iterations, 0/unset = off): a
+/// per-invocation loop budget for **fragment** modules.
+///
+/// Three device losses (fpa0b, frs1, fpe2 — 2.4-2.6 s freezes, then a device
+/// rebuild) all named the same draw: a 260 735-word fragment module (88 KB of
+/// AIR, 168 loops, a structurizer state machine) over the whole 4935x1895
+/// window. On an Apple GPU it runs every frame; here some data makes it run
+/// past Windows' 2 s TDR. Every loop header gets `cnt += 1; check(cnt)`, and
+/// `check` is a new function that `OpKill`s past the budget, so the module's
+/// own control flow is untouched — a new header-to-merge edge would break the
+/// dominance of every value the loop defines and uses after it. A pixel that
+/// spends its budget is discarded; the GPU is not lost.
+///
+/// `None` when off, when the module is not a fragment module, or has no loop.
+pub fn lab_loop_budget(words: &[u32]) -> Option<Vec<u32>> {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<u32> = OnceLock::new();
+    let cap = *CAP.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_LOOP_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    });
+    if cap == 0 {
+        return None;
+    }
+    let (result, loops) = loop_budget_words(words, cap)?;
+    crate::runtime::drain::note_store_route("lab_loop_budget_module");
+    crate::observe::off(format!(
+        "lab_loop_budget module words={}->{} loops={loops} cap={cap}",
+        words.len(),
+        result.len()
+    ));
+    Some(result)
+}
+
+/// [`lab_loop_budget`]'s rewrite, pure: the budgeted module and how many loop
+/// headers it instrumented, or `None` for a non-fragment, loop-free or
+/// malformed module.
+fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
+    const OP_ENTRY_POINT: u32 = 15;
+    const OP_TYPE_VOID: u32 = 19;
+    const OP_TYPE_BOOL: u32 = 20;
+    const OP_TYPE_INT: u32 = 21;
+    const OP_TYPE_POINTER: u32 = 32;
+    const OP_TYPE_FUNCTION: u32 = 33;
+    const OP_CONSTANT: u32 = 43;
+    const OP_FUNCTION: u32 = 54;
+    const OP_FUNCTION_PARAMETER: u32 = 55;
+    const OP_FUNCTION_END: u32 = 56;
+    const OP_FUNCTION_CALL: u32 = 57;
+    const OP_VARIABLE: u32 = 59;
+    const OP_LOAD: u32 = 61;
+    const OP_STORE: u32 = 62;
+    const OP_IADD: u32 = 128;
+    const OP_UGREATER_THAN_EQUAL: u32 = 174;
+    const OP_LOOP_MERGE: u32 = 246;
+    const OP_SELECTION_MERGE: u32 = 247;
+    const OP_LABEL: u32 = 248;
+    const OP_BRANCH_CONDITIONAL: u32 = 250;
+    const OP_KILL: u32 = 252;
+    const OP_RETURN: u32 = 253;
+    const STORAGE_FUNCTION: u32 = 7;
+    const MODEL_FRAGMENT: u32 = 4;
+
+    if words.len() < 5 {
+        return None;
+    }
+    let mut ins: Vec<&[u32]> = Vec::new();
+    let mut i = 5;
+    while i < words.len() {
+        let n = (words[i] >> 16) as usize;
+        if n == 0 || i + n > words.len() {
+            return None;
+        }
+        ins.push(&words[i..i + n]);
+        i += n;
+    }
+    let op = |x: &[u32]| x[0] & 0xffff;
+    if !ins
+        .iter()
+        .any(|x| op(x) == OP_ENTRY_POINT && x.len() > 1 && x[1] == MODEL_FRAGMENT)
+    {
+        return None;
+    }
+    if !ins.iter().any(|x| op(x) == OP_LOOP_MERGE) {
+        return None;
+    }
+    let first_fn = ins.iter().position(|x| op(x) == OP_FUNCTION)?;
+    let mut bound = words[3];
+    let mut next = || {
+        bound += 1;
+        bound - 1
+    };
+    let globals = &ins[..first_fn];
+    let find = |pred: &dyn Fn(&[u32]) -> bool| globals.iter().find(|x| pred(x)).map(|x| x[1]);
+    let mut added: Vec<Vec<u32>> = Vec::new();
+    let t_void = match find(&|x| op(x) == OP_TYPE_VOID) {
+        Some(t) => t,
+        None => {
+            let t = next();
+            added.push(vec![OP_TYPE_VOID, t]);
+            t
+        }
+    };
+    let t_uint = match find(&|x| op(x) == OP_TYPE_INT && x.len() == 4 && x[2] == 32 && x[3] == 0) {
+        Some(t) => t,
+        None => {
+            let t = next();
+            added.push(vec![OP_TYPE_INT, t, 32, 0]);
+            t
+        }
+    };
+    let t_bool = match find(&|x| op(x) == OP_TYPE_BOOL) {
+        Some(t) => t,
+        None => {
+            let t = next();
+            added.push(vec![OP_TYPE_BOOL, t]);
+            t
+        }
+    };
+    let t_ptr = match find(&|x| {
+        op(x) == OP_TYPE_POINTER && x.len() == 4 && x[2] == STORAGE_FUNCTION && x[3] == t_uint
+    }) {
+        Some(t) => t,
+        None => {
+            let t = next();
+            added.push(vec![OP_TYPE_POINTER, t, STORAGE_FUNCTION, t_uint]);
+            t
+        }
+    };
+    let t_fn = match find(&|x| op(x) == OP_TYPE_FUNCTION && x.len() == 4 && x[2] == t_void && x[3] == t_uint) {
+        Some(t) => t,
+        None => {
+            let t = next();
+            added.push(vec![OP_TYPE_FUNCTION, t, t_void, t_uint]);
+            t
+        }
+    };
+    let (c0, c1, ccap) = (next(), next(), next());
+    added.push(vec![OP_CONSTANT, t_uint, c0, 0]);
+    added.push(vec![OP_CONSTANT, t_uint, c1, 1]);
+    added.push(vec![OP_CONSTANT, t_uint, ccap, cap]);
+    let fcheck = next();
+
+    let mut out: Vec<Vec<u32>> = globals.iter().map(|x| x.to_vec()).collect();
+    out.extend(added);
+    let mut k = first_fn;
+    let mut cnt = 0u32;
+    let mut loops = 0u32;
+    while k < ins.len() {
+        let x = ins[k];
+        if op(x) == OP_FUNCTION {
+            out.push(x.to_vec());
+            k += 1;
+            while k < ins.len() && op(ins[k]) != OP_LABEL {
+                out.push(ins[k].to_vec());
+                k += 1;
+            }
+            if k >= ins.len() {
+                return None;
+            }
+            out.push(ins[k].to_vec());
+            k += 1;
+            while k < ins.len() && op(ins[k]) == OP_VARIABLE {
+                out.push(ins[k].to_vec());
+                k += 1;
+            }
+            cnt = next();
+            out.push(vec![OP_VARIABLE, t_ptr, cnt, STORAGE_FUNCTION, c0]);
+            continue;
+        }
+        if op(x) == OP_LOOP_MERGE && cnt != 0 {
+            let (a, b, r) = (next(), next(), next());
+            out.push(vec![OP_LOAD, t_uint, a, cnt]);
+            out.push(vec![OP_IADD, t_uint, b, a, c1]);
+            out.push(vec![OP_STORE, cnt, b]);
+            out.push(vec![OP_FUNCTION_CALL, t_void, r, fcheck, b]);
+            loops += 1;
+        }
+        out.push(x.to_vec());
+        k += 1;
+    }
+    let (p, l0, lk, lr, over) = (next(), next(), next(), next(), next());
+    out.push(vec![OP_FUNCTION, t_void, fcheck, 0, t_fn]);
+    out.push(vec![OP_FUNCTION_PARAMETER, t_uint, p]);
+    out.push(vec![OP_LABEL, l0]);
+    out.push(vec![OP_UGREATER_THAN_EQUAL, t_bool, over, p, ccap]);
+    out.push(vec![OP_SELECTION_MERGE, lr, 0]);
+    out.push(vec![OP_BRANCH_CONDITIONAL, over, lk, lr]);
+    out.push(vec![OP_LABEL, lk]);
+    out.push(vec![OP_KILL]);
+    out.push(vec![OP_LABEL, lr]);
+    out.push(vec![OP_RETURN]);
+    out.push(vec![OP_FUNCTION_END]);
+
+    let mut result = words[..5].to_vec();
+    result[3] = bound;
+    for x in out {
+        let n = x.len() as u32;
+        result.push((n << 16) | x[0]);
+        result.extend_from_slice(&x[1..]);
+    }
+    Some((result, loops))
+}
+
+#[cfg(test)]
+mod lab_loop_budget_tests {
+    /// The real module behind the three device losses, rewritten and checked by
+    /// spirv-val when both the module dump and the validator are present.
+    #[test]
+    fn the_budgeted_pipe40_module_validates() {
+        let path = std::env::var("REIMS_LAB_LOOP_BUDGET_SPV").unwrap_or_default();
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let (out, loops) = super::loop_budget_words(&words, 4096).expect("fragment module with loops");
+        assert_eq!(loops, 168);
+        let out_path = std::env::temp_dir().join("lab-loop-budget-test.spv");
+        let bytes: Vec<u8> = out.iter().flat_map(|w| w.to_le_bytes()).collect();
+        std::fs::write(&out_path, bytes).unwrap();
+        let st = std::process::Command::new(r"C:\msys64\ucrt64\bin\spirv-val.exe")
+            .args(["--target-env", "vulkan1.2"])
+            .arg(&out_path)
+            .status();
+        if let Ok(st) = st {
+            assert!(st.success(), "spirv-val rejected the budgeted module");
+        }
+    }
+}
+
 pub fn validate_memo(digest: (u64, u64), words: &[u32]) -> SpirvValidation {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};

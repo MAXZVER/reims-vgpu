@@ -1923,6 +1923,16 @@ impl ObjectCaches {
         } else {
             words
         };
+        // TEMP (lab, REIMS_VGPU_LAB_LOOP_BUDGET): fragment loops capped per
+        // invocation, so a runaway module discards pixels instead of losing the GPU.
+        let budgeted;
+        let words = match crate::runtime::spirv_bind::lab_loop_budget(words) {
+            Some(v) => {
+                budgeted = v;
+                &budgeted[..]
+            }
+            None => words,
+        };
         let key = Digest128::of_u32_words(words);
         if let Some(err) = self.shaders.get_negative(&key) {
             counters.shader_misses.fetch_add(1, Ordering::Relaxed);
