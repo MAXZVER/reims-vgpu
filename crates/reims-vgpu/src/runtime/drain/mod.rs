@@ -2171,6 +2171,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
         });
     }
     let arrived = arrival_work(state, host, fifo, &packet);
+    lab_chan::note_admit(fifo.domain().0, arrived.submission.as_ref().map(|s| s.task_id()), packet.opcode);
     let session = state.session_generation();
     let built = crate::runtime::ingress::device_packet(
         state,
@@ -9037,12 +9038,21 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     // worker is guaranteed another wakeup for whatever this pass leaves.
     for _ in 0..CHILD_DOORBELL_REFILLS {
         let mut remaining = mask;
-        for ch in 1..MAX_CHANNELS as u32 {
+        // TEMP (lab, REIMS_VGPU_LAB_COMPOSITOR_FIRST): the presenting channel's
+        // work ahead of the other channels this pass serves.
+        let first = lab_chan::compositor_first().filter(|&c| mask & (1u32 << c) != 0);
+        let order = first
+            .into_iter()
+            .chain((1..MAX_CHANNELS as u32).filter(move |&c| Some(c) != first));
+        for ch in order {
             let bit = 1u32 << ch;
             if mask & bit != 0 {
                 remaining &= !bit;
                 served |= bit;
+                let lab_t = std::time::Instant::now();
+                let lab_wait = census::tranche_elapsed_us();
                 drain_child_fifo(state, host, ch);
+                lab_chan::note_drained(ch, lab_wait, lab_t.elapsed().as_micros() as u64);
                 if state.translation_deferred_mask != 0 {
                     state.pending.child_mask |= remaining | state.translation_deferred_mask;
                     note_translation_order_hold(state, remaining);
@@ -9101,3 +9111,83 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
 
 #[cfg(test)]
 mod tests;
+
+/// TEMP (lab): per-channel census of the child drains — how long each channel's
+/// drain waited inside its tranche behind the channels served before it, how
+/// long it ran, and which task last submitted on it — and the switch that
+/// serves the presenting (compositor) channel first.
+mod lab_chan {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+
+    const N: usize = super::MAX_CHANNELS;
+    static TASK: [AtomicU32; N] = [const { AtomicU32::new(u32::MAX) }; N];
+    static PRESENTS: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
+    static RUNS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static BUSY_US: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static WAIT_US: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static WAIT_MAX: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static COMPOSITOR: AtomicU32 = AtomicU32::new(0);
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn compositor_first() -> Option<u32> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_COMPOSITOR_FIRST").is_ok_and(|v| v == "on")) {
+            return None;
+        }
+        match COMPOSITOR.load(Relaxed) {
+            0 => None,
+            c => Some(c),
+        }
+    }
+
+    pub(super) fn note_admit(channel: u32, task: Option<u32>, opcode: u16) {
+        let c = channel as usize;
+        if c == 0 || c >= N {
+            return;
+        }
+        if let Some(t) = task {
+            TASK[c].store(t, Relaxed);
+        }
+        if matches!(
+            opcode,
+            super::CHILD_OP_DISPLAY_SWAP | super::CHILD_OP_DISPLAY_TRANSACTION2 | super::CHILD_OP_DISPLAY_TRANSACTION3
+        ) {
+            PRESENTS[c].fetch_add(1, Relaxed);
+            COMPOSITOR.store(channel, Relaxed);
+        }
+    }
+
+    pub(super) fn note_drained(channel: u32, wait_us: u64, busy_us: u64) {
+        let c = channel as usize;
+        if c >= N {
+            return;
+        }
+        RUNS[c].fetch_add(1, Relaxed);
+        BUSY_US[c].fetch_add(busy_us, Relaxed);
+        WAIT_US[c].fetch_add(wait_us, Relaxed);
+        WAIT_MAX[c].fetch_max(wait_us, Relaxed);
+        let now = crate::observe::elapsed_ms() as u64;
+        let last = LAST_MS.load(Relaxed);
+        if now.saturating_sub(last) < 1000
+            || LAST_MS.compare_exchange(last, now, Relaxed, Relaxed).is_err()
+        {
+            return;
+        }
+        let mut line = format!("lab_channel_census compositor={}", COMPOSITOR.load(Relaxed));
+        for i in 1..N {
+            let runs = RUNS[i].swap(0, Relaxed);
+            if runs == 0 {
+                continue;
+            }
+            line.push_str(&format!(
+                " ch{i}=task{}:runs{runs}:busy{}:wait{}:wmax{}:pres{}",
+                TASK[i].load(Relaxed) as i64,
+                BUSY_US[i].swap(0, Relaxed),
+                WAIT_US[i].swap(0, Relaxed),
+                WAIT_MAX[i].swap(0, Relaxed),
+                PRESENTS[i].swap(0, Relaxed),
+            ));
+        }
+        crate::observe::off(line);
+    }
+}
