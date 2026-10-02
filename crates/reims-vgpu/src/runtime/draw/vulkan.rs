@@ -13502,8 +13502,16 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
                     } else {
                         0
                     };
+                    // Does the cached page list still name the surface's memory?
+                    // A silent re-point (no packet) leaves the old PFNs in hand,
+                    // and their new owner's stores read as this surface's.
+                    let walk = match crate::runtime::mapper::backing_pages_witness(state, &*host, mapping_id) {
+                        crate::runtime::mapper::BackingWitness::Verified => "verified",
+                        crate::runtime::mapper::BackingWitness::Drifted => "drifted",
+                        crate::runtime::mapper::BackingWitness::Unwitnessed(why) => why,
+                    };
                     crate::observe::off(format!(
-                        "lab_overlay_zero mid={mapping_id} gpas={} tok={} mapgen={} at_store={} seen={} now={} shared=[{}]",
+                        "lab_overlay_zero mid={mapping_id} gpas={} tok={} mapgen={} at_store={} seen={} now={} walk={walk} shared=[{}]",
                         gpas.len(),
                         m.guest_write_token,
                         m.map_generation,
