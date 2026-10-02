@@ -193,12 +193,77 @@ fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfx
     }
 }
 
+/// TEMP (lab): which site last took `inner` (0 = the drain), and the drain's waits
+/// for it by that holder: 1 gfx read, 2 MMIO write, 3 vCPU iosfc, 4 heartbeat poll,
+/// 5 action pop, 6 console feed, 7 display surface, 8 scanout copy, 9 cursor info,
+/// 10 cursor copy.
+pub(crate) static LAB_INNER_HOLDER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const LAB_HOLDERS: usize = 11;
+static LAB_LOCK_WAIT_US: [std::sync::atomic::AtomicU64; LAB_HOLDERS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; LAB_HOLDERS];
+static LAB_LOCK_WAIT_N: [std::sync::atomic::AtomicU64; LAB_HOLDERS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; LAB_HOLDERS];
+static LAB_LOCK_INGRESS_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAB_LOCK_INGRESS_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAB_LOCK_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// TEMP (lab): mark the site that now holds `inner`.
+#[inline]
+pub(crate) fn lab_held(site: u8) {
+    LAB_INNER_HOLDER.store(site, Ordering::Relaxed);
+}
+
+/// TEMP (lab): one contended drain lock; a line a second while any wait happened.
+fn lab_drain_lock_note(holder: usize, us: u64) {
+    let h = holder.min(LAB_HOLDERS - 1);
+    LAB_LOCK_WAIT_US[h].fetch_add(us, Ordering::Relaxed);
+    LAB_LOCK_WAIT_N[h].fetch_add(1, Ordering::Relaxed);
+    let now = crate::observe::elapsed_ms() as u64;
+    let last = LAB_LOCK_LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 1000
+        || LAB_LOCK_LAST_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let mut line = String::from("lab_drain_lock_wait");
+    for i in 0..LAB_HOLDERS {
+        let n = LAB_LOCK_WAIT_N[i].swap(0, Ordering::Relaxed);
+        let w = LAB_LOCK_WAIT_US[i].swap(0, Ordering::Relaxed);
+        if n > 0 {
+            line.push_str(&format!(" h{i}={n}/{w}us"));
+        }
+    }
+    let n = LAB_LOCK_INGRESS_N.swap(0, Ordering::Relaxed);
+    let w = LAB_LOCK_INGRESS_US.swap(0, Ordering::Relaxed);
+    line.push_str(&format!(" ingress={n}/{w}us"));
+    crate::observe::off(line);
+}
+
 /// Apply queued MMIO writes in publication order. Lock order is ingress then
 /// inner everywhere; producers use `try_lock` for inner and therefore never
 /// wait behind shader translation/GPU work.
 fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner> {
+    let lab_t0 = std::time::Instant::now(); // TEMP (lab)
     let mut ingress = slot.gfx_ingress.lock();
-    let mut inner = slot.inner.lock();
+    let lab_ingress_us = lab_t0.elapsed().as_micros() as u64;
+    let mut inner = match slot.inner.try_lock() {
+        Some(g) => g,
+        None => {
+            // TEMP (lab): who held it, and for how long the drain waited.
+            let holder = LAB_INNER_HOLDER.load(Ordering::Relaxed);
+            let t1 = std::time::Instant::now();
+            let g = slot.inner.lock();
+            lab_drain_lock_note(holder as usize, t1.elapsed().as_micros() as u64);
+            g
+        }
+    };
+    LAB_INNER_HOLDER.store(0, Ordering::Relaxed);
+    if lab_ingress_us >= 20 {
+        LAB_LOCK_INGRESS_US.fetch_add(lab_ingress_us, Ordering::Relaxed);
+        LAB_LOCK_INGRESS_N.fetch_add(1, Ordering::Relaxed);
+    }
     while let Some(write) = ingress.pop_front() {
         apply_gfx_write(&mut inner, slot, write);
     }
@@ -399,6 +464,7 @@ pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
         }
     }
     if let Some(mut d) = slot.inner.try_lock() {
+        lab_held(1);
         let value = d.device.gfx_read(offset, size);
         slot.gfx_read_cache.lock().insert((offset, size), value);
         slot.gfx_read_busy_logged.store(false, Ordering::Relaxed);
@@ -474,6 +540,7 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
     let mut ingress = slot.gfx_ingress.lock();
     if ingress.is_empty() {
         if let Some(mut inner) = slot.inner.try_lock() {
+            lab_held(2);
             apply_gfx_write(&mut inner, &slot, write);
             return true;
         }
@@ -499,11 +566,13 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
 /// access pays nothing for the instrument.
 fn lock_device_for_vcpu(slot: &BoundDevice) -> impl std::ops::DerefMut<Target = DeviceInner> + '_ {
     if let Some(guard) = slot.inner.try_lock() {
+        lab_held(3);
         crate::runtime::drain::note_vcpu_lock_free();
         return guard;
     }
     let waited = std::time::Instant::now();
     let guard = slot.inner.lock();
+    lab_held(3);
     crate::runtime::drain::note_vcpu_lock_wait(waited.elapsed().as_micros() as u64);
     guard
 }
@@ -775,6 +844,7 @@ pub fn device_poll(id: u64) -> bool {
         vbl_contended_pulse(&slot);
         return true;
     };
+    lab_held(4);
     let Some(ops) = slot.ops else {
         return true;
     };
@@ -901,6 +971,7 @@ pub fn device_pop_action(id: u64) -> Option<HostAction> {
         }
     }
     let mut d = slot.inner.try_lock()?;
+    lab_held(5);
     d.actions.pop_front()
 }
 

@@ -80,6 +80,7 @@ pub fn device_console_feed(id: u64) -> Option<ConsoleFeed> {
     let Some(d) = slot.inner.try_lock() else {
         return Some(ConsoleFeed::Firmware);
     };
+    super::lab_held(6);
     Some(
         match crate::runtime::scanout::early_scanout_target(&d.device.state) {
             // `Early` guarantees a paintable target, so the shims do not re-test
@@ -221,6 +222,7 @@ pub fn device_scanout_copy(
         };
         d
     };
+    super::lab_held(8);
     if let Some(ops) = slot.ops {
         let DeviceInner { device, actions } = &mut *d;
         let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
