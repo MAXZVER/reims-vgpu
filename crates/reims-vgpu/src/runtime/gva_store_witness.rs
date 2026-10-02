@@ -233,6 +233,24 @@ pub fn note_store<H: HostOps>(
     key: GvaTargetKey,
     gpas: &[u64],
 ) {
+    // TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED=all`): measurement only — the
+    // deferral's arming reads lagged too and still counts as exact, so a guest
+    // write made between the set's last sync and this Store would be kept over
+    // the device's frame at the merge. An upper bound on what an exact arming
+    // that needs no foreground sync could buy; never a mode to run.
+    if lab_lagged_mode() == 2
+        && state
+            .gva_store_witness
+            .entries
+            .get(&key)
+            .is_some_and(|e| e.gen_at_store != 0)
+    {
+        stamp(state, host, key, gpas, true);
+        if let Some(e) = state.gva_store_witness.entries.get_mut(&key) {
+            e.exact = true;
+        }
+        return;
+    }
     stamp(state, host, key, gpas, false);
 }
 
@@ -240,11 +258,22 @@ pub fn note_store<H: HostOps>(
 /// Store re-stamps an armed target from the generation its set was last synced
 /// to rather than syncing it now.
 fn lab_lagged_enabled() -> bool {
+    lab_lagged_mode() != 0
+}
+
+/// 0 `off`, 1 eager Stores only (default), 2 `all` (measurement, see [`note_store`]).
+fn lab_lagged_mode() -> u8 {
     if cfg!(test) {
-        return true;
+        return 1;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GVAW_LAGGED").map_or(true, |v| v != "off"))
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("REIMS_VGPU_LAB_GVAW_LAGGED").as_deref() {
+            Ok("off") => 0,
+            Ok("all") => 2,
+            _ => 1,
+        },
+    )
 }
 
 /// [`note_store`] for a Store that landed the whole frame in the guest's pages
