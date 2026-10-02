@@ -2560,15 +2560,17 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         let mut load_action = att.load_action;
         let mut clear_color = att.clear_color;
         let mut seed = None;
+        // Whether the running rail reads a clear's CPU seed at all.
+        let clear_seeds = crate::backend::selected().consumes_cpu_clear_seeds();
         if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
             // Clear-only stream record for this attachment: real Metal Clear.
             load_action = MTL_LOAD_ACTION_CLEAR;
             clear_color = cl.clear_color;
-            if mapping_id == 0 {
+            if mapping_id == 0 && clear_seeds {
                 seed = Some(solid_rgba8(mw, mh, &cl.clear_color));
             }
         } else if att.load_action == MTL_LOAD_ACTION_CLEAR {
-            if mapping_id == 0 {
+            if mapping_id == 0 && clear_seeds {
                 seed = Some(solid_rgba8(mw, mh, &att.clear_color));
             }
         } else if att.load_action == MTL_LOAD_ACTION_LOAD && mapping_id == 0 {

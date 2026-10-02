@@ -231,7 +231,22 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // clock: `drain_duty`'s `draw_us` brackets exactly this function, and the
     // whole reading is that the phases sum to it.
     let _phase = crate::runtime::chain_phase::ChainTimer::start();
-    let colors: Vec<ColorRtRequest> = req.colors.clone();
+    // The local copy is read for geometry, store actions and Store routing,
+    // never for the seeds, and a seed is a whole attachment of pixels: Mission
+    // Control's cleared MRT attachments made this clone ~7 % of the drain. The
+    // seeds stay in `req`, which is what every seed consumer reads.
+    let colors: Vec<ColorRtRequest> = {
+        let seeds: Vec<Option<Vec<u8>>> = req
+            .colors
+            .iter_mut()
+            .map(|c| c.target_seed_rgba.take())
+            .collect();
+        let colors = req.colors.clone();
+        for (c, seed) in req.colors.iter_mut().zip(seeds) {
+            c.target_seed_rgba = seed;
+        }
+        colors
+    };
     let Some((pass_w, pass_h)) = colors.first().map(|c0| (c0.width, c0.height)) else {
         return (EncodeStatus::BadArgs("draw_vk_no_color_target"), None);
     };

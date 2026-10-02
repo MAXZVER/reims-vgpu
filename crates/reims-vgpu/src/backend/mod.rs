@@ -442,6 +442,14 @@ pub(crate) trait Backend: Copy {
     /// Idle-time upkeep, on the device heartbeat.
     fn maintain(&self, _now_ms: u64) {}
 
+    /// Whether this rail reads a cleared attachment's CPU seed
+    /// (`ColorRtRequest::target_seed_rgba` built from the clear colour). A rail
+    /// that clears on the GPU from the colour alone answers `false`, and the
+    /// draw path then does not build a whole attachment of one colour for it.
+    fn consumes_cpu_clear_seeds(&self) -> bool {
+        true
+    }
+
     /// Submit anything the rail has been holding back for batching.
     ///
     /// Called at the drain tail, so a deferred batch cannot sit until the next
@@ -1565,6 +1573,15 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.maintain(now_ms),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.maintain(now_ms),
+        }
+    }
+
+    fn consumes_cpu_clear_seeds(&self) -> bool {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.consumes_cpu_clear_seeds(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.consumes_cpu_clear_seeds(),
         }
     }
 

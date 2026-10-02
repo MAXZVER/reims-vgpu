@@ -151,6 +151,15 @@ pub(crate) fn gva_window(identity: &engine::TargetIdentity) -> Option<GvaWindow>
 }
 
 impl Backend for VulkanBackend {
+    /// A cleared attachment is a CLEAR pass key here: the draw path takes no
+    /// seed for it (`runtime::draw::vulkan`, the seed block's `Clear` arm), so a
+    /// CPU seed built from the clear colour would only be allocated, filled and
+    /// copied around. Mission Control's cleared MRT attachments made that ~5 %
+    /// of the drain.
+    fn consumes_cpu_clear_seeds(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         Rail::Vulkan.name()
     }
