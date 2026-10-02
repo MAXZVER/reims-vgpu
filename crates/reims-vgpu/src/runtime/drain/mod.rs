@@ -2871,6 +2871,9 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             if declined_by_the_device(state, ingress) {
                 continue;
             }
+            if lab_chan::deferred_here(state.parked.domain_of(ingress), state.parked.opcode(ingress)) {
+                continue;
+            }
             let Some(work) = state
                 .parked
                 .release(ingress, crate::runtime::parked::Release::Ready)
@@ -7552,6 +7555,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     state.draining_mask |= bit;
 
     let mut lab_consumed = false;
+    let lab_defer_prev = lab_chan::defer_enter(channel_id);
     loop {
         let regs_started = std::time::Instant::now();
         let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
@@ -7649,6 +7653,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         }
     }
 
+    lab_chan::defer_exit(lab_defer_prev);
     // Every `break` above lands here, and what it owes is the same thing a
     // drain that ran the ring dry owes: a last look at what the model has
     // released. A drain that stopped on a decode fault or a host-action yield
@@ -9152,6 +9157,52 @@ mod lab_chan {
     static WAIT_MAX: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
     static COMPOSITOR: AtomicU32 = AtomicU32::new(0);
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+    /// TEMP (lab, `REIMS_VGPU_LAB_DEFER_EXEC=on`): while one child channel's
+    /// ring is being read, a released EXEC of *another* channel waits for that
+    /// ring to run dry instead of running after each admission.
+    ///
+    /// ch1 carries every command buffer and parks most of them on ch2's
+    /// stamp (MapMemory/Unmap/Delete); each ch2 admission then released and
+    /// ran a slice of that heavy work before the next ch2 packet — 30 us of
+    /// work each — was even read, so ch2's word (which WindowServer waits on,
+    /// idx 2) trailed by ~6 ms. A declined position keeps its place and is
+    /// offered again (the present-backpressure gate relies on the same), and
+    /// the drain's end-of-ring settle runs it.
+    fn defer_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DEFER_EXEC").is_ok_and(|v| v == "on"))
+    }
+
+    thread_local! {
+        static DEFER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn defer_enter(channel: u32) -> u32 {
+        if !defer_on() {
+            return 0;
+        }
+        DEFER.with(|d| d.replace(channel))
+    }
+
+    pub(super) fn defer_exit(prev: u32) {
+        if defer_on() {
+            DEFER.with(|d| d.set(prev));
+        }
+    }
+
+    pub(super) fn deferred_here(domain: Option<u32>, opcode: Option<u16>) -> bool {
+        let serving = DEFER.with(std::cell::Cell::get);
+        if serving == 0 {
+            return false;
+        }
+        let deferred = matches!(domain, Some(d) if d != 0 && d != serving)
+            && opcode == Some(super::CHILD_OP_EXEC_INDIRECT2);
+        if deferred {
+            super::note_store_route("lab_defer_exec");
+        }
+        deferred
+    }
 
     pub(super) fn compositor_first() -> Option<u32> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
