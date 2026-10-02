@@ -5397,6 +5397,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         ));
     }
 
+    census::lab_ft(census::LabFtPoint::Swap);
     state.present.present_mapping = mapping;
     state.present.host_mapping = mapping;
     state.present.valid = true;
@@ -7884,6 +7885,7 @@ pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: 
         .is_ok();
     if claimed {
         lab_vbl_late_note(now_us, gap - interval, gap >= 2 * interval);
+        census::lab_ft(census::LabFtPoint::Vbl);
     }
     claimed
 }

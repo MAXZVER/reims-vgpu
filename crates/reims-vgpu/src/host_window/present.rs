@@ -316,6 +316,7 @@ static LAB_PUBLISH: std::sync::Mutex<(Option<std::time::Instant>, Vec<u32>, Vec<
 
 /// TEMP (lab): a frame was published to the window slot.
 pub(crate) fn lab_publish_note() {
+    crate::runtime::drain::lab_ft(crate::runtime::drain::LabFtPoint::Publish);
     if std::env::var_os("REIMS_VGPU_LAB_PRESENT_GAPS").is_none() {
         return;
     }
@@ -329,6 +330,7 @@ pub(crate) fn lab_publish_note() {
 
 /// TEMP (lab): a present went out; how long after the last publish.
 pub(crate) fn lab_present_after_publish() {
+    crate::runtime::drain::lab_ft(crate::runtime::drain::LabFtPoint::Present);
     let now = std::time::Instant::now();
     let mut g = LAB_PUBLISH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(last) = g.0 {

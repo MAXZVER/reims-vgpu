@@ -2731,6 +2731,99 @@ pub fn note_resident_window_flushed() {
     RESIDENT_ARM.note_flush(crate::observe::elapsed_us());
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_FRAME_TRACE=1`): one frame's path through the
+/// device, in [`crate::observe::elapsed_us`]: the VBL that started it, the
+/// first drain tranche after that VBL, the DisplaySwap, the end of the tranche
+/// holding the swap, the window publish. The present emits it.
+struct LabFrameTrace {
+    vbl: u64,
+    drain: u64,
+    swap: u64,
+    end: u64,
+    publish: u64,
+}
+
+static LAB_FT: std::sync::Mutex<LabFrameTrace> = std::sync::Mutex::new(LabFrameTrace {
+    vbl: 0,
+    drain: 0,
+    swap: 0,
+    end: 0,
+    publish: 0,
+});
+
+/// TEMP (lab): whether `lab_ft` lines are on. Latched.
+pub fn lab_ft_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_FRAME_TRACE").is_ok_and(|v| v == "1"))
+}
+
+/// TEMP (lab): which point of the frame's path just happened.
+#[derive(Clone, Copy)]
+pub enum LabFtPoint {
+    Vbl,
+    Drain,
+    Swap,
+    End,
+    Publish,
+    Present,
+}
+
+/// TEMP (lab): note a point of the frame trace; the present emits the frame.
+pub fn lab_ft(point: LabFtPoint) {
+    if !lab_ft_on() {
+        return;
+    }
+    let now = crate::observe::elapsed_us();
+    let mut g = LAB_FT.lock().unwrap_or_else(|e| e.into_inner());
+    match point {
+        LabFtPoint::Vbl => {
+            g.vbl = now;
+            g.drain = 0;
+        }
+        LabFtPoint::Drain => {
+            if g.drain == 0 && g.vbl != 0 {
+                g.drain = now;
+            }
+        }
+        LabFtPoint::Swap => {
+            g.swap = now;
+            g.end = 0;
+        }
+        LabFtPoint::End => {
+            if g.swap != 0 && g.end == 0 {
+                g.end = now;
+            }
+        }
+        LabFtPoint::Publish => g.publish = now,
+        LabFtPoint::Present => {
+            if g.vbl == 0 {
+                return;
+            }
+            let rel = |t: u64| -> i64 {
+                if t == 0 {
+                    -1
+                } else {
+                    t as i64 - g.vbl as i64
+                }
+            };
+            let line = format!(
+                "lab_ft vbl={} d={} s={} e={} p={} q={}",
+                g.vbl,
+                rel(g.drain),
+                rel(g.swap),
+                rel(g.end),
+                rel(g.publish),
+                rel(now)
+            );
+            g.swap = 0;
+            g.end = 0;
+            g.publish = 0;
+            drop(g);
+            crate::observe::off(line);
+        }
+    }
+}
+
 /// When the drain tranche now running started, in [`crate::observe::elapsed_us`].
 ///
 /// One word, written once per tranche by the worker that owns it. A device runs
@@ -2742,6 +2835,7 @@ static TRANCHE_START_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Mark the start of a drain tranche, for [`tranche_elapsed_us`].
 pub fn note_tranche_started(now_us: u64) {
     TRANCHE_START_US.store(now_us, std::sync::atomic::Ordering::Relaxed);
+    lab_ft(LabFtPoint::Drain);
     LAB_TRANCHE_SNAP.with(|c| c.set(DRAIN_DUTY.lab_snap()));
 }
 
@@ -2896,6 +2990,7 @@ pub fn note_drain_tranche(
     publish_us: u64,
 ) {
     lab_slow_tranche(drain_us.saturating_add(publish_us));
+    lab_ft(LabFtPoint::End);
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
         // The rail this device is running on, asked four times below at the
