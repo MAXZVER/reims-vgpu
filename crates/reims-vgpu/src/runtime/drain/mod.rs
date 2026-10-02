@@ -1710,6 +1710,7 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
     channel: Option<u32>,
     packet: &Packet,
 ) {
+    lab_chan::lat_unmet_reset();
     for wait in &packet.stamp_waits {
         let index = stamp_slot_index(wait.index);
         // Census, deciding nothing: would the ordering plane answer this wait
@@ -1817,6 +1818,7 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
         }
         note_store_route("packet_stamp_wait_unmet");
         against_model(false, "stamp_wait_model_agrees_unmet");
+        lab_chan::lat_unmet(index, wait.value.wrapping_sub(current));
         // Census only, and it does not change the verdict below. Says whether
         // this device was holding the awaited word (publishable early, and
         // ordering-safe because publication carries the settle), had already
@@ -9230,6 +9232,34 @@ mod lab_chan {
         admit: u64,
         run: u64,
         exec: u64,
+        waits: u32,
+        ahead: u32,
+    }
+
+    thread_local! {
+        static UNMET: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((u32::MAX, 0)) };
+    }
+
+    pub(super) fn lat_unmet_reset() {
+        UNMET.with(|u| u.set((u32::MAX, 0)));
+    }
+
+    /// The first unmet wait of the packet being read: its slot, and how far
+    /// ahead of the slot's current word the awaited value is.
+    pub(super) fn lat_unmet(slot: u32, ahead: u32) {
+        UNMET.with(|u| {
+            if u.get().0 == u32::MAX {
+                u.set((slot, ahead));
+            }
+        });
+    }
+
+    #[derive(Default)]
+    struct WaitAgg {
+        n: u64,
+        park: u64,
+        park_max: u64,
+        ahead: u64,
     }
 
     #[derive(Default)]
@@ -9251,6 +9281,7 @@ mod lab_chan {
     struct Lat {
         pending: std::collections::HashMap<u32, std::collections::VecDeque<Entry>>,
         agg: std::collections::BTreeMap<(u32, u32), Agg>,
+        waits: std::collections::BTreeMap<(u32, u32), WaitAgg>,
     }
 
     fn lat() -> std::sync::MutexGuard<'static, Lat> {
@@ -9294,7 +9325,8 @@ mod lab_chan {
         if q.len() >= 4096 {
             q.pop_front();
         }
-        q.push_back(Entry { value, task: task.unwrap_or(u32::MAX), db, t0, admit, run: 0, exec: 0 });
+        let (waits, ahead) = UNMET.with(|u| u.replace((u32::MAX, 0)));
+        q.push_back(Entry { value, task: task.unwrap_or(u32::MAX), db, t0, admit, run: 0, exec: 0, waits, ahead });
     }
 
     pub(super) fn lat_ran(channel: u32, value: u32, us: u64) {
@@ -9320,7 +9352,7 @@ mod lab_chan {
     pub(super) fn lat_published(slot: u32, value: u32) {
         let now = now_us();
         let mut l = lat();
-        let Lat { pending, agg } = &mut *l;
+        let Lat { pending, agg, waits } = &mut *l;
         if let Some(q) = pending.get_mut(&slot) {
             while q.front().is_some_and(|e| (value.wrapping_sub(e.value) as i32) >= 0) {
                 let e = q.pop_front().expect("front");
@@ -9338,6 +9370,12 @@ mod lab_chan {
                 a.gt16 += u64::from(tot > 16_000);
                 a.gt33 += u64::from(tot > 33_000);
                 a.gt64 += u64::from(tot > 64_000);
+                let w = waits.entry((slot, e.waits)).or_default();
+                let park = run.saturating_sub(e.admit);
+                w.n += 1;
+                w.park += park;
+                w.park_max = w.park_max.max(park);
+                w.ahead += u64::from(e.ahead);
             }
         }
         let ms = now / 1000;
@@ -9370,6 +9408,17 @@ mod lab_chan {
                 a.gt16,
                 a.gt33,
                 a.gt64,
+            ));
+        }
+        for ((slot, on), w) in std::mem::take(waits) {
+            let n = w.n.max(1);
+            line.push_str(&format!(
+                " w{slot}<s{}={}:park{}:pmax{}:ahead{}",
+                on as i32,
+                w.n,
+                w.park / n,
+                w.park_max,
+                w.ahead / n
             ));
         }
         crate::observe::off(line);
