@@ -2185,6 +2185,24 @@ impl DrainDutyCensus {
     /// testable without a log sink: that the window resets on report (so the
     /// figure is a rate over the window, not a lifetime average), and that duty
     /// is busy time over elapsed time.
+    /// TEMP (lab): the counters [`lab_slow_tranche`] differences, and the
+    /// report clock that says whether a reset fell between two snapshots.
+    fn lab_snap(&self) -> [u64; LAB_SNAP_N] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            self.draws.load(Relaxed),
+            self.draw_us.load(Relaxed),
+            self.flushes.load(Relaxed),
+            self.flush_us.load(Relaxed),
+            self.packets.load(Relaxed),
+            self.computes.load(Relaxed),
+            self.compute_us.load(Relaxed),
+            self.irq_wait_us.load(Relaxed),
+            self.tail_us.load(Relaxed),
+            self.last_report_ms.load(Relaxed),
+        ]
+    }
+
     pub(crate) fn note(&self, drain_us: u64, publish_us: u64, now_ms: u64) -> Option<String> {
         use std::sync::atomic::Ordering::Relaxed;
         self.tranches.fetch_add(1, Relaxed);
@@ -2724,6 +2742,51 @@ static TRANCHE_START_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Mark the start of a drain tranche, for [`tranche_elapsed_us`].
 pub fn note_tranche_started(now_us: u64) {
     TRANCHE_START_US.store(now_us, std::sync::atomic::Ordering::Relaxed);
+    LAB_TRANCHE_SNAP.with(|c| c.set(DRAIN_DUTY.lab_snap()));
+}
+
+thread_local! {
+    /// TEMP (lab): the drain counters as the running tranche started.
+    static LAB_TRANCHE_SNAP: std::cell::Cell<[u64; LAB_SNAP_N]> =
+        const { std::cell::Cell::new([0; LAB_SNAP_N]) };
+}
+
+/// TEMP (lab): fields of [`LAB_TRANCHE_SNAP`], in order.
+const LAB_SNAP_NAMES: [&str; LAB_SNAP_N] = [
+    "draws",
+    "draw_us",
+    "flushes",
+    "flush_us",
+    "packets",
+    "computes",
+    "compute_us",
+    "irq_wait_us",
+    "tail_us",
+    "report_ms",
+];
+const LAB_SNAP_N: usize = 10;
+
+/// TEMP (lab): a tranche of at least 10 ms, as the change in the drain counters
+/// across it — which of draws, flushes, compute or waits it was spent on.
+/// Skipped when the per-second report reset the counters inside the tranche.
+fn lab_slow_tranche(tranche_us: u64) {
+    if tranche_us < 10_000 {
+        return;
+    }
+    let start = LAB_TRANCHE_SNAP.with(|c| c.get());
+    let now = DRAIN_DUTY.lab_snap();
+    if now[LAB_SNAP_N - 1] != start[LAB_SNAP_N - 1] {
+        return;
+    }
+    let mut line = format!("lab_slow_tranche us={tranche_us}");
+    for i in 0..LAB_SNAP_N - 1 {
+        line.push_str(&format!(
+            " {}={}",
+            LAB_SNAP_NAMES[i],
+            now[i].saturating_sub(start[i])
+        ));
+    }
+    crate::observe::off(line);
 }
 
 /// How long the tranche now running has been running.
@@ -2832,6 +2895,7 @@ pub fn note_drain_tranche(
     drain_us: u64,
     publish_us: u64,
 ) {
+    lab_slow_tranche(drain_us.saturating_add(publish_us));
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
         // The rail this device is running on, asked four times below at the
