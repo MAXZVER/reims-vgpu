@@ -2874,6 +2874,9 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             if lab_chan::deferred_here(state.parked.domain_of(ingress), state.parked.opcode(ingress)) {
                 continue;
             }
+            if state.parked.opcode(ingress) == Some(CHILD_OP_EXEC_INDIRECT2) {
+                lab_preempt_control(state, host);
+            }
             let Some(work) = state
                 .parked
                 .release(ingress, crate::runtime::parked::Release::Ready)
@@ -9135,6 +9138,49 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
 #[cfg(test)]
 mod tests;
 
+/// TEMP (lab, `REIMS_VGPU_LAB_CTRL_PREEMPT=on`): serve the control rings (ch2
+/// map/unmap/delete, ch4 synchronize) before the next command buffer runs.
+///
+/// DTrace in the guest: WindowServer submits MapMemory2 / Unmap / DeleteResource
+/// on ch2 and blocks in `finishEvent` until its own stamp lands — 192 waits,
+/// 2.0 s per 40 s of transitions — and ch4's synchronize is waited on the same
+/// way. Those packets cost ~30 us here but sat ~8 ms behind command buffers
+/// (other passes' ch1 drain, or ch1 work their own admissions released). A
+/// ring with packets is read now, and the EXECs of other channels it releases
+/// wait for the caller's settle (they are not run inside this drain).
+fn lab_preempt_control<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    if !lab_chan::preempt_on() || lab_chan::in_preempt() {
+        return;
+    }
+    if state.gfx.root_page == 0 {
+        return;
+    }
+    let open = state.drainable_child_mask();
+    for ch in [2u32, 4] {
+        let bit = 1u32 << ch;
+        if open & bit == 0 || state.draining_mask & bit != 0 {
+            continue;
+        }
+        let Some(regs_off) = child_reg_block_offset(ch) else {
+            continue;
+        };
+        let regs_gpa = state.pfn_gpa(state.gfx.root_page) + regs_off;
+        let (Ok(head), Ok(tail)) = (
+            crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_HEAD),
+            crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL),
+        ) else {
+            continue;
+        };
+        if head == tail {
+            continue;
+        }
+        note_store_route("lab_ctrl_preempt");
+        let prev = lab_chan::preempt_enter(ch);
+        drain_child_fifo(state, host, ch);
+        lab_chan::preempt_exit(prev);
+    }
+}
+
 /// TEMP (lab): the guest rang `channel`'s doorbell (lock-free MMIO path) — the
 /// earliest unserved ring is the start of its packets' stamp latency.
 pub(crate) fn lab_note_doorbell(channel: u32) {
@@ -9189,6 +9235,31 @@ mod lab_chan {
         if defer_on() {
             DEFER.with(|d| d.set(prev));
         }
+    }
+
+    pub(super) fn preempt_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CTRL_PREEMPT").is_ok_and(|v| v == "on"))
+    }
+
+    thread_local! {
+        static PREEMPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn in_preempt() -> bool {
+        PREEMPT.with(std::cell::Cell::get)
+    }
+
+    /// A preemptive drain of `channel`: other channels' EXECs it releases are
+    /// deferred whether or not `REIMS_VGPU_LAB_DEFER_EXEC` is on.
+    pub(super) fn preempt_enter(channel: u32) -> u32 {
+        PREEMPT.with(|p| p.set(true));
+        DEFER.with(|d| d.replace(channel))
+    }
+
+    pub(super) fn preempt_exit(prev: u32) {
+        DEFER.with(|d| d.set(prev));
+        PREEMPT.with(|p| p.set(false));
     }
 
     pub(super) fn deferred_here(domain: Option<u32>, opcode: Option<u16>) -> bool {
