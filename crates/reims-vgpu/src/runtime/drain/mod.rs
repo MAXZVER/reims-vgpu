@@ -2048,6 +2048,7 @@ fn publish_word<H: HostMemory + HostOps>(
         return;
     }
     write_stamp(state, host, slot, value);
+    lab_chan::lat_published(stamp_slot_index(slot), value);
 }
 
 /// Everything the device does with one arrived packet *before* the model
@@ -2172,6 +2173,12 @@ fn admit_and_park<H: HostMemory + HostOps>(
     }
     let arrived = arrival_work(state, host, fifo, &packet);
     lab_chan::note_admit(fifo.domain().0, arrived.submission.as_ref().map(|s| s.task_id()), packet.opcode);
+    lab_chan::lat_admit(
+        fifo.domain().0,
+        stamp_slot_index(completion_slot),
+        packet.completion_stamp,
+        arrived.submission.as_ref().map(|s| s.task_id()),
+    );
     let session = state.session_generation();
     let built = crate::runtime::ingress::device_packet(
         state,
@@ -3147,6 +3154,7 @@ fn run_parked_packet<H: HostMemory + HostOps>(
         let started = std::time::Instant::now();
         let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
         census::note_drain_proc(work.packet().opcode, started.elapsed().as_nanos() as u64);
+        lab_chan::lat_ran(domain, work.packet().completion_stamp, started.elapsed().as_micros() as u64);
         lab_dag_run(ingress.0, domain, work.packet().opcode, started.elapsed().as_micros() as u64);
         if lab_hold_present_stamp() {
             if state.lab_hold_since.is_some() {
@@ -7499,6 +7507,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
             return;
         }
     };
+    lab_chan::lat_drain_start(channel_id, stamp_slot_index(stamp_index));
     let base_pfn = match crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_BASE_PFN) {
         Ok(v) => v,
         Err(_) => {
@@ -9112,6 +9121,12 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
 #[cfg(test)]
 mod tests;
 
+/// TEMP (lab): the guest rang `channel`'s doorbell (lock-free MMIO path) — the
+/// earliest unserved ring is the start of its packets' stamp latency.
+pub(crate) fn lab_note_doorbell(channel: u32) {
+    lab_chan::lat_doorbell(channel);
+}
+
 /// TEMP (lab): per-channel census of the child drains — how long each channel's
 /// drain waited inside its tranche behind the channels served before it, how
 /// long it ran, and which task last submitted on it — and the switch that
@@ -9186,6 +9201,175 @@ mod lab_chan {
                 WAIT_US[i].swap(0, Relaxed),
                 WAIT_MAX[i].swap(0, Relaxed),
                 PRESENTS[i].swap(0, Relaxed),
+            ));
+        }
+        crate::observe::off(line);
+    }
+
+    // ---- TEMP (lab): stamp latency, doorbell -> word published, per slot and task.
+    //
+    // WindowServer blocks in `waitForStamp` ~3 s per 40 s of full-screen
+    // transitions while its command buffers share ch1 with Safari's. Each packet
+    // is followed from the earliest doorbell its channel had not been served
+    // for, through the start of the drain that read it (`pre`: other channels
+    // and earlier tranches), its admission (`ring`: packets ahead of it in the
+    // same ring), the start of its run (`park`: held by the model), its own run
+    // (`exec`), to the word for its slot reaching a value at or past its own
+    // (`post`: publication order behind earlier positions).
+    static DB_US: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static DRAIN_DB: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static DRAIN_T0: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static SLOT: [AtomicU32; N] = [const { AtomicU32::new(u32::MAX) }; N];
+    static LAT_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+    struct Entry {
+        value: u32,
+        task: u32,
+        db: u64,
+        t0: u64,
+        admit: u64,
+        run: u64,
+        exec: u64,
+    }
+
+    #[derive(Default)]
+    struct Agg {
+        n: u64,
+        tot: u64,
+        tot_max: u64,
+        pre: u64,
+        ring: u64,
+        park: u64,
+        exec: u64,
+        post: u64,
+        gt16: u64,
+        gt33: u64,
+        gt64: u64,
+    }
+
+    #[derive(Default)]
+    struct Lat {
+        pending: std::collections::HashMap<u32, std::collections::VecDeque<Entry>>,
+        agg: std::collections::BTreeMap<(u32, u32), Agg>,
+    }
+
+    fn lat() -> std::sync::MutexGuard<'static, Lat> {
+        static L: std::sync::OnceLock<std::sync::Mutex<Lat>> = std::sync::OnceLock::new();
+        L.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn now_us() -> u64 {
+        crate::observe::elapsed_us() + 1
+    }
+
+    pub(super) fn lat_doorbell(channel: u32) {
+        let c = channel as usize;
+        if c < N {
+            let _ = DB_US[c].compare_exchange(0, now_us(), Relaxed, Relaxed);
+        }
+    }
+
+    pub(super) fn lat_drain_start(channel: u32, slot: u32) {
+        let c = channel as usize;
+        if c >= N {
+            return;
+        }
+        let t0 = now_us();
+        let db = DB_US[c].swap(0, Relaxed);
+        DRAIN_DB[c].store(if db == 0 { t0 } else { db }, Relaxed);
+        DRAIN_T0[c].store(t0, Relaxed);
+        SLOT[c].store(slot, Relaxed);
+    }
+
+    pub(super) fn lat_admit(channel: u32, slot: u32, value: u32, task: Option<u32>) {
+        let c = channel as usize;
+        if c == 0 || c >= N {
+            return;
+        }
+        let admit = now_us();
+        let t0 = DRAIN_T0[c].load(Relaxed).min(admit);
+        let db = DRAIN_DB[c].load(Relaxed).min(t0);
+        let mut l = lat();
+        let q = l.pending.entry(slot).or_default();
+        if q.len() >= 4096 {
+            q.pop_front();
+        }
+        q.push_back(Entry { value, task: task.unwrap_or(u32::MAX), db, t0, admit, run: 0, exec: 0 });
+    }
+
+    pub(super) fn lat_ran(channel: u32, value: u32, us: u64) {
+        let c = channel as usize;
+        if c == 0 || c >= N {
+            return;
+        }
+        let slot = SLOT[c].load(Relaxed);
+        let end = now_us();
+        let mut l = lat();
+        if let Some(e) = l
+            .pending
+            .get_mut(&slot)
+            .and_then(|q| q.iter_mut().rev().find(|e| e.value == value))
+        {
+            if e.run == 0 {
+                e.run = end.saturating_sub(us).max(e.admit);
+            }
+            e.exec += us;
+        }
+    }
+
+    pub(super) fn lat_published(slot: u32, value: u32) {
+        let now = now_us();
+        let mut l = lat();
+        let Lat { pending, agg } = &mut *l;
+        if let Some(q) = pending.get_mut(&slot) {
+            while q.front().is_some_and(|e| (value.wrapping_sub(e.value) as i32) >= 0) {
+                let e = q.pop_front().expect("front");
+                let run = if e.run == 0 { now } else { e.run };
+                let tot = now.saturating_sub(e.db);
+                let a = agg.entry((slot, e.task)).or_default();
+                a.n += 1;
+                a.tot += tot;
+                a.tot_max = a.tot_max.max(tot);
+                a.pre += e.t0.saturating_sub(e.db);
+                a.ring += e.admit.saturating_sub(e.t0);
+                a.park += run.saturating_sub(e.admit);
+                a.exec += e.exec;
+                a.post += now.saturating_sub(run + e.exec);
+                a.gt16 += u64::from(tot > 16_000);
+                a.gt33 += u64::from(tot > 33_000);
+                a.gt64 += u64::from(tot > 64_000);
+            }
+        }
+        let ms = now / 1000;
+        let last = LAT_LAST_MS.load(Relaxed);
+        if ms.saturating_sub(last) < 1000
+            || LAT_LAST_MS.compare_exchange(last, ms, Relaxed, Relaxed).is_err()
+        {
+            return;
+        }
+        let mut line = String::from("lab_stamp_lat map=");
+        for i in 1..N {
+            let s = SLOT[i].load(Relaxed);
+            if s != u32::MAX {
+                line.push_str(&format!("ch{i}>s{s},"));
+            }
+        }
+        for ((slot, task), a) in std::mem::take(agg) {
+            let n = a.n.max(1);
+            line.push_str(&format!(
+                " s{slot}/t{}={}:avg{}:max{}:pre{}:ring{}:park{}:exec{}:post{}:gt16_{}:gt33_{}:gt64_{}",
+                task as i32,
+                a.n,
+                a.tot / n,
+                a.tot_max,
+                a.pre / n,
+                a.ring / n,
+                a.park / n,
+                a.exec / n,
+                a.post / n,
+                a.gt16,
+                a.gt33,
+                a.gt64,
             ));
         }
         crate::observe::off(line);

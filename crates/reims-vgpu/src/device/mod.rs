@@ -539,6 +539,7 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
                 slot.child_doorbell_rung
                     .fetch_or(1u32 << channel, Ordering::AcqRel);
                 crate::runtime::drain::note_doorbell_lock_free();
+                crate::runtime::drain::lab_note_doorbell(channel); // TEMP (lab)
                 schedule_device(&slot);
             }
             return true;
