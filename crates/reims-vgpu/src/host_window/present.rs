@@ -950,7 +950,24 @@ impl ApplicationHandler<FramePublished> for App {
                 self.config.width,
                 self.config.height,
             ));
-        if self.config.mode == WindowMode::Borderless {
+        // TEMP (lab): `REIMS_VGPU_LAB_WINDOW_BACKGROUND=1` opens the window off
+        // screen, without activating it and without a taskbar button, so lab
+        // runs (device-side frame dumps, census, QMP input) can go on while the
+        // operator works at the same desktop: the VM never takes focus and never
+        // covers anything. Full screen is ignored in this mode.
+        let background = std::env::var("REIMS_VGPU_LAB_WINDOW_BACKGROUND").is_ok_and(|v| v == "1");
+        if background {
+            attrs = attrs
+                .with_active(false)
+                .with_position(winit::dpi::PhysicalPosition::new(-16000, 0));
+            #[cfg(windows)]
+            {
+                use winit::platform::windows::WindowAttributesExtWindows;
+                attrs = attrs.with_skip_taskbar(true);
+            }
+            crate::observe::off("host_window_background on=1");
+        }
+        if self.config.mode == WindowMode::Borderless && !background {
             // `None` means "the monitor this window opens on", which is the only
             // answer available before the window exists — winit has no monitor
             // handle to name until the window system has placed it, and picking
