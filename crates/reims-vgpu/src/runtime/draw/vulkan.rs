@@ -18273,6 +18273,122 @@ fn memo_read_bgra8<M: HostMemory + HostOps>(
 /// magnification burst re-binds the same static icons ~1000×, so this collapses
 /// the `t11_guest` CPU copies that saturate the serial drain worker (the
 /// dock-hover whole-VM freeze). Returns `(rgba, identity)`.
+/// TEMP (lab, `REIMS_VGPU_LAB_MEMO_STAMP=off` disables): what the
+/// mapper-ref-texture memo saw when it last read a surface, so the next bind can
+/// tell "unchanged" without reading the surface again.
+///
+/// The memo re-reads the whole surface from guest RAM on every bind and
+/// compares it byte for byte with the copy it keeps, to find out whether
+/// anything wrote it. A window surface in Mission Control is ~10 MB, bound by
+/// several draws a frame: that read and compare were most of the transition's
+/// drain time. The two writers it was guarding against are both recorded
+/// elsewhere - the guest's stores by the mapping's guest-write token, this
+/// device's by `host_writes` - so a stamp of both, taken before the read,
+/// answers the same question. Anything the stamp cannot vouch for (no token, a
+/// token still arming, a new page list, an unpaid GPU frame owed to the
+/// mapping, a device write on its pages) takes the read and compare as before.
+mod lab_memo_stamp {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    #[derive(Clone, Copy)]
+    pub(super) struct Stamp {
+        map_generation: u32,
+        token: u64,
+        guest_gen: u64,
+        host_epoch: u64,
+    }
+
+    thread_local! {
+        static STAMPS: RefCell<HashMap<(u32, u32, u32), (Stamp, u64)>> =
+            RefCell::new(HashMap::new());
+    }
+
+    fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("REIMS_VGPU_LAB_MEMO_STAMP").map_or(true, |v| v != "off")
+        })
+    }
+
+    fn mapping_gpas(state: &DeviceState, mid: u32) -> Option<Vec<u64>> {
+        let m = state.mappings.get(&mid)?;
+        let shift = state.page_shift;
+        m.page_entries
+            .iter()
+            .map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, shift))
+            .collect()
+    }
+
+    /// The stamp to record if the read about to happen succeeds.
+    pub(super) fn take<M: HostMemory + HostOps>(
+        state: &mut DeviceState,
+        host: &mut M,
+        mid: u32,
+    ) -> Option<Stamp> {
+        if !enabled() {
+            return None;
+        }
+        let token = crate::runtime::mapper::ensure_guest_write_token(state, host, mid)?;
+        let guest_gen = host.guest_write_gen(token)?;
+        let m = state.mappings.get(&mid)?;
+        Some(Stamp {
+            map_generation: m.map_generation,
+            token,
+            guest_gen,
+            host_epoch: state.host_writes.epoch(),
+        })
+    }
+
+    pub(super) fn put(key: (u32, u32, u32), stamp: Option<Stamp>, generation: u64) {
+        STAMPS.with(|t| {
+            let mut t = t.borrow_mut();
+            match stamp {
+                Some(s) => {
+                    t.insert(key, (s, generation));
+                }
+                None => {
+                    t.remove(&key);
+                }
+            }
+        });
+    }
+
+    /// The memo's pixels and generation when the stamp vouches for them.
+    pub(super) fn hit<M: HostMemory + HostOps>(
+        state: &mut DeviceState,
+        host: &mut M,
+        mid: u32,
+        key: (u32, u32, u32),
+    ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+        if !enabled() {
+            return None;
+        }
+        let (stamp, generation) = STAMPS.with(|t| t.borrow().get(&key).copied())?;
+        let m = state.mappings.get(&mid)?;
+        if m.map_generation != stamp.map_generation
+            || m.guest_write_token != stamp.token
+            || state.pending_writebacks.get(mid).is_some()
+        {
+            return None;
+        }
+        if host.guest_write_gen(stamp.token)? != stamp.guest_gen {
+            return None;
+        }
+        let pages = mapping_gpas(state, mid)?;
+        if state
+            .host_writes
+            .wrote_any_since(stamp.host_epoch, &pages)
+            .wrote()
+        {
+            return None;
+        }
+        let memo = state.mapper_ref_texture_memo.peek(&key)?;
+        (memo.generation == generation).then(|| (memo.rgba.clone(), generation))
+    }
+}
+
 fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -18294,6 +18410,21 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
     // Coherence re-read: land any resident-authoritative writeback and read the
     // current native BGRA (read_mapping_bgra8 runs ensure_resolved_for_scanout +
     // flush internally). Reuse the scratch so a memo hit costs no allocation.
+    let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
+    // TEMP (lab): the surface has not moved since the memo was filled - skip
+    // the whole-surface read and the whole-surface compare below.
+    if let Some(hit) = lab_memo_stamp::hit(state, host, mid, (mid, w, h)) {
+        crate::runtime::drain::note_store_route("lab_memo_stamp_hit");
+        return Some((
+            hit.0,
+            LinearSampleIdentity {
+                key: identity_key,
+                generation: hit.1,
+            },
+        ));
+    }
+    // Taken before the read, so a write landing during it moves past the stamp.
+    let stamp = lab_memo_stamp::take(state, host, mid);
     let mut scratch = std::mem::take(&mut state.mapper_ref_texture_memo_scratch);
     prepare_memo_scratch(
         &mut scratch,
@@ -18318,13 +18449,13 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
     // Every producer draws its generation from
     // `DeviceState::next_sampled_content_generation`, so a (key, generation)
     // pair is unique device-wide and content can never alias on a collision.
-    let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
     let key = (mid, w, h);
     if let Some(m) = state.mapper_ref_texture_memo.get_touch(&key) {
         if m.native == scratch {
             let rgba = m.rgba.clone();
             let generation = m.generation;
             state.mapper_ref_texture_memo_scratch = scratch;
+            lab_memo_stamp::put(key, stamp, generation);
             return Some((
                 rgba,
                 LinearSampleIdentity {
@@ -18352,6 +18483,7 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
     }
     let rgba = std::sync::Arc::new(rgba);
     let generation = state.next_sampled_content_generation();
+    lab_memo_stamp::put(key, stamp, generation);
     let entry_bytes = scratch.len() + rgba.len();
     state.mapper_ref_texture_memo.insert(
         key,
