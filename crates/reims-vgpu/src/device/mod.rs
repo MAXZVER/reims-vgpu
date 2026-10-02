@@ -531,6 +531,16 @@ pub fn device_iosfc_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
 }
 
 /// Worker body: drain pending FIFOs using QEMU GPA callbacks; enqueue HostActions.
+/// TEMP (lab): see the early publish in [`device_drain`]. Latched.
+fn lab_early_publish() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_EARLY_PUBLISH").map_or(true, |v| v != "off");
+        crate::observe::off(format!("lab_early_publish on={on}"));
+        on
+    })
+}
+
 pub fn device_drain(id: u64) -> bool {
     let Some(slot) = device_slot(id) else {
         return false;
@@ -584,6 +594,18 @@ pub fn device_drain(id: u64) -> bool {
     device.drain(&mut host);
     // TEMP (lab, REIMS_VGPU_LAB_IRQ_BATCH): the gfx pulse held for this tranche.
     host.flush_deferred_irqs();
+    // TEMP (lab, REIMS_VGPU_LAB_EARLY_PUBLISH, on by default): the finished frame
+    // goes to the window before the tranche's tail work (the pay-after-stamp
+    // readback and the debt trim), which held every present back by a median
+    // 0.7 ms (p90 ~2 ms) in a quiet 5K scene. The deferred draw batch is
+    // submitted first, so the window's blit is queued after the frame's draws.
+    let early_publish = lab_early_publish();
+    if early_publish {
+        crate::backend::selected().flush_deferred_submissions(&device.state);
+        publish_present_boundary(&slot, device.state.present.frame_flush_seen);
+        #[cfg(feature = "host-window")]
+        window_publish::publish_window_frame(&slot, &mut device.state);
+    }
     // TEMP (lab, REIMS_VGPU_LAB_PAY_AFTER): the replayed presented frame, paid
     // now that the guest has its completion.
     crate::runtime::writeback_debt::lab_pay_after_stamp(
@@ -614,14 +636,18 @@ pub fn device_drain(id: u64) -> bool {
     crate::backend::selected().flush_deferred_submissions(&device.state);
     let tail_us = tail_started.elapsed().as_micros() as u64;
     let boundary_started = std::time::Instant::now();
-    publish_present_boundary(&slot, device.state.present.frame_flush_seen);
+    if !early_publish {
+        publish_present_boundary(&slot, device.state.present.frame_flush_seen);
+    }
     crate::runtime::drain::note_drain_tail(tail_us, boundary_started.elapsed().as_micros() as u64);
     let drain_us = tranche_started.elapsed().as_micros() as u64;
     let publish_started = std::time::Instant::now();
     // Push the finished present frame to the host-owned window (if running).
     // Off the QEMU main loop; a small dedicated mutex, never the render lock.
     #[cfg(feature = "host-window")]
-    window_publish::publish_window_frame(&slot, &mut device.state);
+    if !early_publish {
+        window_publish::publish_window_frame(&slot, &mut device.state);
+    }
     crate::runtime::drain::note_drain_tranche(
         &device.state,
         &host,
