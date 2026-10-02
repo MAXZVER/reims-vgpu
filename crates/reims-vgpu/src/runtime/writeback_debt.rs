@@ -951,9 +951,18 @@ pub fn fb_copy_replay_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let (state, value) = crate::config::read(crate::config::FB_COPY_REPLAY);
-        // Opt-in while the copy-source inference is not sound: with no swap
-        // payment every framebuffer's pages converge on the same stale bytes,
-        // so a byte match stops naming the buffer the guest copied from.
+        // TEMP (lab): on unless `off`. The copy-source inference is not sound
+        // in general — with no swap payment every framebuffer's pages converge
+        // on the same stale bytes, so a byte match stops naming the buffer the
+        // guest copied from, and the tie goes to the newest stored frame. On
+        // macOS 26 the 5K drag made one such copy in ~2100 swaps
+        // (`fb_replay_copied=1`), so the per-swap payment was paying for a copy
+        // that did not happen: dropping it took the drain from 697 to ~580 ms/s
+        // with a clean verification tour (fr9tour, 2026-10-02).
+        // The suites keep the opt-in default they were written against.
+        #[cfg(not(test))]
+        let on = !matches!(state, crate::config::Switch::Off);
+        #[cfg(test)]
         let on = matches!(state, crate::config::Switch::On);
         crate::observe::off(format!(
             "fb_copy_replay on={on} switch={state:?} value={}",
