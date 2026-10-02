@@ -7561,6 +7561,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
 
     let mut lab_consumed = false;
     let lab_defer_prev = lab_chan::defer_enter(channel_id);
+    let mut lab_snap_tail: Option<u32> = None;
     loop {
         let regs_started = std::time::Instant::now();
         let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
@@ -7579,6 +7580,25 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 break;
             }
         };
+        // TEMP (lab, REIMS_VGPU_LAB_RING_SNAPSHOT=on): read only what the ring
+        // held when this drain began. On full-screen transitions the guest
+        // refilled ch1 as fast as it was read, one drain ran for hundreds of ms,
+        // and ch2 (the MapMemory Safari's command buffers wait on) and ch5 (the
+        // frame) waited behind it. The rest is the next pass's: the heartbeat
+        // re-marks every open channel and wakes the worker within ~1 ms.
+        if lab_chan::ring_snapshot() {
+            match lab_snap_tail {
+                None => lab_snap_tail = Some(tail),
+                Some(snap) if head == snap => {
+                    if tail != head {
+                        note_store_route("lab_ring_snapshot_left");
+                        lab_chan::note_left(bit);
+                    }
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
         // Before the scope: a tail no doorbell's epoch covers gets one opened
         // after this read, and the scope below then makes the reads owe it.
         host.note_ring_tail(channel_id, tail);
@@ -9115,6 +9135,14 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     }
     // Whatever the refill cap left, handed back to the next wakeup.
     state.pending.child_mask |= mask;
+    // TEMP (lab, RING_SNAPSHOT): rings read only up to their tail at drain
+    // start; the refill above drops served channels, so the rest is handed back
+    // here and the worker woken for it.
+    let lab_left = lab_chan::take_left();
+    if lab_left != 0 {
+        state.pending.child_mask |= lab_left;
+        host.schedule_bh();
+    }
     if lab_flush_held_words(state, host) {
         settle_model_work(state, host);
     }
@@ -9249,6 +9277,21 @@ mod lab_chan {
         if defer_on() {
             DEFER.with(|d| d.set(prev));
         }
+    }
+
+    static LEFT: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) fn note_left(bit: u32) {
+        LEFT.fetch_or(bit, Relaxed);
+    }
+
+    pub(super) fn take_left() -> u32 {
+        LEFT.swap(0, Relaxed)
+    }
+
+    pub(super) fn ring_snapshot() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RING_SNAPSHOT").is_ok_and(|v| v == "on"))
     }
 
     pub(super) fn preempt_on() -> bool {
