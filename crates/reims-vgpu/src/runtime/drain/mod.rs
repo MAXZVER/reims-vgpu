@@ -2175,6 +2175,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
     }
     let arrived = arrival_work(state, host, fifo, &packet);
     lab_chan::note_admit(fifo.domain().0, arrived.submission.as_ref().map(|s| s.task_id()), packet.opcode);
+    lab_chan::lat_opcode(fifo.domain().0, packet.opcode);
     lab_chan::lat_admit(
         fifo.domain().0,
         stamp_slot_index(completion_slot),
@@ -9334,8 +9335,32 @@ mod lab_chan {
         let t0 = now_us();
         let db = DB_US[c].swap(0, Relaxed);
         DRAIN_DB[c].store(if db == 0 { t0 } else { db }, Relaxed);
-        DRAIN_T0[c].store(t0, Relaxed);
+        // A ring older than the previous drain's start had its packets read by
+        // that drain; left in the queue it would be matched to a later packet.
+        let prev = DRAIN_T0[c].swap(t0, Relaxed);
+        rings()[c].retain(|&t| t >= prev);
         SLOT[c].store(slot, Relaxed);
+        if db != 0 {
+            let d = t0.saturating_sub(db);
+            SRV_N[c].fetch_add(1, Relaxed);
+            SRV_US[c].fetch_add(d, Relaxed);
+            SRV_MAX[c].fetch_max(d, Relaxed);
+        }
+    }
+
+    // The exact half of `pre`: the earliest ring a channel had not been served
+    // for, to the start of the drain that serves it.
+    static SRV_N: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static SRV_US: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static SRV_MAX: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    // Opcodes per channel this second (up to 0x40).
+    static OPS: [[AtomicU32; 0x40]; N] = [const { [const { AtomicU32::new(0) }; 0x40] }; N];
+
+    pub(super) fn lat_opcode(channel: u32, opcode: u16) {
+        let c = channel as usize;
+        if c < N && (opcode as usize) < 0x40 {
+            OPS[c][opcode as usize].fetch_add(1, Relaxed);
+        }
     }
 
     pub(super) fn lat_admit(channel: u32, slot: u32, value: u32, task: Option<u32>) {
@@ -9436,6 +9461,32 @@ mod lab_chan {
             let s = SLOT[i].load(Relaxed);
             if s != u32::MAX {
                 line.push_str(&format!("ch{i}>s{s},"));
+            }
+        }
+        line.push_str(" srv=");
+        for i in 1..N {
+            let n = SRV_N[i].swap(0, Relaxed);
+            let us = SRV_US[i].swap(0, Relaxed);
+            let mx = SRV_MAX[i].swap(0, Relaxed);
+            if n > 0 {
+                line.push_str(&format!("ch{i}:{n}:{}:{mx},", us / n));
+            }
+        }
+        line.push_str(" ops=");
+        for i in 1..N {
+            let mut first = true;
+            for (op, n) in OPS[i].iter().enumerate() {
+                let n = n.swap(0, Relaxed);
+                if n > 0 {
+                    if first {
+                        line.push_str(&format!("ch{i}["));
+                        first = false;
+                    }
+                    line.push_str(&format!("{op:x}:{n};"));
+                }
+            }
+            if !first {
+                line.push_str("],");
             }
         }
         line.push_str(" db=");
