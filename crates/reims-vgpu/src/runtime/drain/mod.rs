@@ -2375,6 +2375,12 @@ fn admit_and_park<H: HostMemory + HostOps>(
             return;
         }
     };
+    lab_chan::lat_admitted(
+        stamp_slot_index(completion_slot),
+        packet.completion_stamp,
+        admission.admitted.ready,
+        admission.admitted.hazard_waits.len(),
+    );
     let mut transaction = admission.admitted.transaction;
     let ingress = transaction.identity.ingress;
     state.lab_pipeline_admitted(
@@ -9350,6 +9356,23 @@ mod lab_chan {
         }
         let (waits, ahead) = UNMET.with(|u| u.replace((u32::MAX, 0)));
         q.push_back(Entry { value, task: task.unwrap_or(u32::MAX), db, t0, admit, run: 0, exec: 0, waits, ahead });
+    }
+
+    /// What the model said at admission: when it did not release the packet
+    /// and no stamp wait was unmet, the park is filed under `s-2` (ordered
+    /// behind earlier positions' accesses) or `s-3` (anything else — a
+    /// pipeline lease still translating); `s-1` is released at admission.
+    pub(super) fn lat_admitted(slot: u32, value: u32, ready: bool, hazards: usize) {
+        let mut l = lat();
+        if let Some(e) = l
+            .pending
+            .get_mut(&slot)
+            .and_then(|q| q.iter_mut().rev().find(|e| e.value == value))
+        {
+            if e.waits == u32::MAX && !ready {
+                e.waits = if hazards > 0 { (-2i32) as u32 } else { (-3i32) as u32 };
+            }
+        }
     }
 
     pub(super) fn lat_ran(channel: u32, value: u32, us: u64) {
