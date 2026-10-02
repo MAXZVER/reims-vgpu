@@ -1589,6 +1589,12 @@ impl ResourcePools {
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let image = slot.image;
+                // The reuse is a use: the idle clock is what says an anonymous
+                // depth resident has gone unused (`idle_anonymous_depth_keys`).
+                let touch = self.idle_clock_ms;
+                if let Some(slot) = self.registry.get_mut(&identity) {
+                    slot.last_touch_ms = touch;
+                }
                 let view =
                     unsafe { self.registry_view(ctx, &identity, format.declared(), counters)? }
                         .expect("the slot reused on the line above is still registered");
@@ -2464,6 +2470,34 @@ impl ResourcePools {
             .collect()
     }
 
+    /// TEMP (lab): anonymous depth-chain residents (`render_chain_depth_identity`,
+    /// tag bit 63) nothing has touched for [`ANON_DEPTH_IDLE_MS`], unpinned and
+    /// holding no unpaid frame — up to `max`.
+    ///
+    /// That identity is keyed by the pass extent, so every distinct extent gets
+    /// its own resident and keeps it: a window drag's damage passes change size
+    /// every frame, which registered one or two new depth images a frame that
+    /// no later pass of another size could reuse. Their contents mean nothing
+    /// across passes (each pass clears), so an idle one is pure retained memory.
+    fn idle_anonymous_depth_keys(&self, max: usize) -> Vec<TargetIdentity> {
+        const ANON_DEPTH_IDLE_MS: u64 = 2000;
+        let now = self.idle_clock_ms;
+        self.registry_order
+            .iter()
+            .filter(|k| {
+                matches!(k, TargetIdentity::Anonymous { slot } if slot >> 63 == 1)
+                    && !self.window_holds(k)
+                    && self.registry.get(*k).is_some_and(|slot| {
+                        slot.pin_count == 0
+                            && !slot.gpu_only_content
+                            && now.saturating_sub(slot.last_touch_ms) >= ANON_DEPTH_IDLE_MS
+                    })
+            })
+            .take(max)
+            .cloned()
+            .collect()
+    }
+
     /// TEMP (lab): retire what [`Self::stale_generation_resident_keys`] names.
     /// The image goes to the recycle pool, where the newer generations'
     /// allocations of the same shape take it back.
@@ -2473,7 +2507,11 @@ impl ResourcePools {
         counters: &EngineCounters,
         max: usize,
     ) -> usize {
-        let victims = self.stale_generation_resident_keys(max);
+        let mut victims = self.stale_generation_resident_keys(max);
+        if victims.len() < max {
+            let more = self.idle_anonymous_depth_keys(max - victims.len());
+            victims.extend(more);
+        }
         for identity in &victims {
             unsafe { self.retire_resident(ctx, identity, ResidentReclaim::Recreated, counters) };
         }
