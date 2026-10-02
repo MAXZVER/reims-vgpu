@@ -21,9 +21,16 @@
 //! holding at most 1 MiB. `REIMS_VGPU_LAB_TCACHE=off` passes everything to the system heap. Read once,
 //! at the first allocation, before any block exists, so no block can be freed
 //! by a path other than the one that allocated it.
+//!
+//! Blocks of 1 MiB and more (whole frames: a 5K BGRA frame is 42 MiB) are kept
+//! in one shared, bounded list of freed blocks, by 1 MiB bucket. The system heap
+//! hands every such request fresh pages from the OS and returns them on free, so
+//! each 5K readback copy paid ~11 000 first-touch faults (8-15 ms `map` in
+//! `readback_split` during full-screen transitions). `REIMS_VGPU_LAB_LCACHE=off`
+//! sends them to the system heap again.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 const CLASS_SIZES: [usize; 24] = [
     16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192,
@@ -37,6 +44,30 @@ const MAX_CLASS_BYTES: usize = 1 << 20;
 /// The largest cached size, decided with the mode: 4 KiB (`on`) or 64 KiB (`big`).
 static LIMIT: AtomicUsize = AtomicUsize::new(0);
 const ALIGN: usize = 16;
+/// Blocks of at least this size go through the large-block list.
+const LARGE_MIN: usize = 1 << 20;
+/// Large blocks are allocated in whole buckets of this size.
+const LARGE_STEP: usize = 1 << 20;
+/// Entries and bytes the large-block list may hold.
+const LARGE_SLOTS: usize = 32;
+const LARGE_CAP_BYTES: usize = 384 << 20;
+/// Whether the large-block list is in use (1), decided with the mode.
+static LARGE_ON: AtomicU8 = AtomicU8::new(0);
+static LARGE_LOCK: AtomicBool = AtomicBool::new(false);
+
+struct LargeList {
+    sizes: [usize; LARGE_SLOTS],
+    ptrs: [*mut u8; LARGE_SLOTS],
+    bytes: usize,
+    victim: usize,
+}
+
+static mut LARGE: LargeList = LargeList {
+    sizes: [0; LARGE_SLOTS],
+    ptrs: [core::ptr::null_mut(); LARGE_SLOTS],
+    bytes: 0,
+    victim: 0,
+};
 
 /// Class index for a size of at most [`MAX_BIG`] bytes (a size of 0 is class 0).
 #[inline]
@@ -107,6 +138,16 @@ fn decide() -> bool {
     let off = n == 3 && buf[0] == u16::from(b'o') && buf[1] == u16::from(b'f') && buf[2] == u16::from(b'f');
     let big = n == 3 && buf[0] == u16::from(b'b') && buf[1] == u16::from(b'i') && buf[2] == u16::from(b'g');
     LIMIT.store(if big { MAX_BIG } else { MAX_SMALL }, Ordering::Relaxed);
+    const LNAME: &[u8] = b"REIMS_VGPU_LAB_LCACHE\0";
+    let mut lname = [0u16; 32];
+    for (i, b) in LNAME.iter().enumerate() {
+        lname[i] = u16::from(*b);
+    }
+    let mut lbuf = [0u16; 8];
+    // SAFETY: both buffers are ours and sized as passed.
+    let ln = unsafe { GetEnvironmentVariableW(lname.as_ptr(), lbuf.as_mut_ptr(), lbuf.len() as u32) };
+    let loff = ln == 3 && lbuf[0] == u16::from(b'o') && lbuf[1] == u16::from(b'f') && lbuf[2] == u16::from(b'f');
+    LARGE_ON.store(u8::from(!off && !loff), Ordering::Relaxed);
     let mut on = !off;
     if on {
         // SAFETY: plain Win32 call.
@@ -174,6 +215,101 @@ fn class_cap(c: usize) -> u32 {
     MAX_PER_CLASS.min((MAX_CLASS_BYTES / CLASS_SIZES[c]) as u32)
 }
 
+/// Whether the block goes through the large-block list; asked only once
+/// `enabled()` has decided the mode.
+#[inline]
+fn large(layout: &Layout) -> bool {
+    layout.size() >= LARGE_MIN && layout.align() <= ALIGN && LARGE_ON.load(Ordering::Relaxed) == 1
+}
+
+#[inline]
+fn bucket_layout(size: usize) -> Layout {
+    // SAFETY: a non-zero multiple of 1 MiB with ALIGN a power of two.
+    unsafe { Layout::from_size_align_unchecked(size.div_ceil(LARGE_STEP) * LARGE_STEP, ALIGN) }
+}
+
+fn large_lock() {
+    let mut spins = 0u32;
+    while LARGE_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        spins += 1;
+        if spins < 64 {
+            core::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
+fn large_unlock() {
+    LARGE_LOCK.store(false, Ordering::Release);
+}
+
+/// A cached block of exactly `size` bytes (a bucket size), or null.
+fn large_take(size: usize) -> *mut u8 {
+    large_lock();
+    // SAFETY: the list is only touched under LARGE_LOCK.
+    let p = unsafe {
+        let l = &mut *core::ptr::addr_of_mut!(LARGE);
+        let mut p = core::ptr::null_mut();
+        for i in 0..LARGE_SLOTS {
+            if l.sizes[i] == size {
+                p = l.ptrs[i];
+                l.sizes[i] = 0;
+                l.ptrs[i] = core::ptr::null_mut();
+                l.bytes -= size;
+                break;
+            }
+        }
+        p
+    };
+    large_unlock();
+    p
+}
+
+/// Keep a freed block of `size` bytes (a bucket size), evicting the oldest
+/// entries when the list is full; evicted blocks go back to the system heap
+/// outside the lock.
+fn large_put(ptr: *mut u8, size: usize) {
+    if size > LARGE_CAP_BYTES {
+        // SAFETY: allocated by the system heap with this bucket layout.
+        unsafe { System.dealloc(ptr, bucket_layout(size)) };
+        return;
+    }
+    let mut evicted: [(*mut u8, usize); LARGE_SLOTS] = [(core::ptr::null_mut(), 0); LARGE_SLOTS];
+    let mut n_evicted = 0;
+    large_lock();
+    // SAFETY: the list is only touched under LARGE_LOCK.
+    unsafe {
+        let l = &mut *core::ptr::addr_of_mut!(LARGE);
+        loop {
+            let free = (0..LARGE_SLOTS).find(|&i| l.sizes[i] == 0);
+            if let (Some(i), true) = (free, l.bytes + size <= LARGE_CAP_BYTES) {
+                l.sizes[i] = size;
+                l.ptrs[i] = ptr;
+                l.bytes += size;
+                break;
+            }
+            let v = l.victim;
+            l.victim = (v + 1) % LARGE_SLOTS;
+            if l.sizes[v] != 0 {
+                evicted[n_evicted] = (l.ptrs[v], l.sizes[v]);
+                n_evicted += 1;
+                l.bytes -= l.sizes[v];
+                l.sizes[v] = 0;
+                l.ptrs[v] = core::ptr::null_mut();
+            }
+        }
+    }
+    large_unlock();
+    for &(p, sz) in &evicted[..n_evicted] {
+        // SAFETY: each was allocated by the system heap with its bucket layout.
+        unsafe { System.dealloc(p, bucket_layout(sz)) };
+    }
+}
+
 unsafe impl GlobalAlloc for ThreadCache {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -181,7 +317,15 @@ unsafe impl GlobalAlloc for ThreadCache {
         // live block of at least the class size and 16-byte alignment, and the
         // cache pointer is this thread's own.
         unsafe {
-            if !enabled() || !small(&layout) {
+            if !enabled() {
+                return System.alloc(layout);
+            }
+            if large(&layout) {
+                let b = bucket_layout(layout.size());
+                let p = large_take(b.size());
+                return if p.is_null() { System.alloc(b) } else { p };
+            }
+            if !small(&layout) {
                 return System.alloc(layout);
             }
             let c = class_of(layout.size());
@@ -202,7 +346,19 @@ unsafe impl GlobalAlloc for ThreadCache {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // SAFETY: as `alloc`; the block is at least `layout.size()` bytes.
         unsafe {
-            if !enabled() || !small(&layout) {
+            if !enabled() {
+                return System.alloc_zeroed(layout);
+            }
+            if large(&layout) {
+                let b = bucket_layout(layout.size());
+                let p = large_take(b.size());
+                if p.is_null() {
+                    return System.alloc_zeroed(b);
+                }
+                core::ptr::write_bytes(p, 0, layout.size());
+                return p;
+            }
+            if !small(&layout) {
                 return System.alloc_zeroed(layout);
             }
             let p = self.alloc(layout);
@@ -218,7 +374,13 @@ unsafe impl GlobalAlloc for ThreadCache {
         // SAFETY: `ptr` was allocated by this allocator with `layout`, so a small
         // one is a class block (at least 16 bytes: room for the list link).
         unsafe {
-            if !enabled() || !small(&layout) {
+            if !enabled() {
+                return System.dealloc(ptr, layout);
+            }
+            if large(&layout) {
+                return large_put(ptr, bucket_layout(layout.size()).size());
+            }
+            if !small(&layout) {
                 return System.dealloc(ptr, layout);
             }
             let c = class_of(layout.size());
@@ -242,6 +404,24 @@ unsafe impl GlobalAlloc for ThreadCache {
                 return System.realloc(ptr, layout, new_size);
             }
             let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
+            let (old_large, new_large) = (large(&layout), large(&new_layout));
+            if old_large || new_large {
+                // A large block is a whole bucket and is returned as one, so it
+                // never goes through the system heap's realloc (which would hand
+                // back a block of the requested size, not the bucket's).
+                if old_large
+                    && new_large
+                    && bucket_layout(layout.size()).size() == bucket_layout(new_size).size()
+                {
+                    return ptr;
+                }
+                let p = self.alloc(new_layout);
+                if !p.is_null() {
+                    core::ptr::copy_nonoverlapping(ptr, p, layout.size().min(new_size));
+                    self.dealloc(ptr, layout);
+                }
+                return p;
+            }
             let (old_small, new_small) = (small(&layout), small(&new_layout));
             if !old_small && !new_small {
                 return System.realloc(ptr, layout, new_size);
@@ -269,6 +449,46 @@ mod tests {
             let c = class_of(size);
             assert!(CLASS_SIZES[c] >= size, "size {size} class {c}");
             assert!(c == 0 || CLASS_SIZES[c - 1] < size, "size {size} class {c} not the smallest");
+        }
+    }
+
+    #[test]
+    fn large_blocks_are_whole_buckets_reused_and_zeroed_on_request() {
+        let a = ThreadCache;
+        unsafe {
+            if !enabled() || LARGE_ON.load(Ordering::Relaxed) != 1 {
+                return; // switched off in this environment
+            }
+            let l = Layout::from_size_align(5120 * 2160 * 4, 16).unwrap();
+            let p = a.alloc(l);
+            assert!(!p.is_null());
+            core::ptr::write_bytes(p, 0xCD, l.size());
+            a.dealloc(p, l);
+            // Same bucket: the freed block comes back, and zeroed when asked.
+            let z = a.alloc_zeroed(Layout::from_size_align(5120 * 2160 * 4 - 100, 16).unwrap());
+            assert!(!z.is_null());
+            assert!((0..5120 * 2160 * 4 - 100).step_by(4093).all(|i| *z.add(i) == 0));
+            // Growing within the bucket keeps the block; past it moves the bytes.
+            let zl = Layout::from_size_align(5120 * 2160 * 4 - 100, 16).unwrap();
+            *z = 7;
+            let g = a.realloc(z, zl, 5120 * 2160 * 4);
+            assert_eq!(g, z);
+            let h = a.realloc(g, l, 64 << 20);
+            assert!(!h.is_null());
+            assert_eq!(*h, 7);
+            // Shrinking to a small block leaves the large path.
+            let s = a.realloc(h, Layout::from_size_align(64 << 20, 16).unwrap(), 100);
+            assert_eq!(*s, 7);
+            a.dealloc(s, Layout::from_size_align(100, 16).unwrap());
+            // Filling past the cap evicts instead of growing without bound.
+            let big = Layout::from_size_align(100 << 20, 16).unwrap();
+            let ps: Vec<*mut u8> = (0..6).map(|_| a.alloc(big)).collect();
+            for &q in &ps {
+                assert!(!q.is_null());
+                a.dealloc(q, big);
+            }
+            let held = (*core::ptr::addr_of!(LARGE)).bytes;
+            assert!(held <= LARGE_CAP_BYTES, "held {held}");
         }
     }
 
