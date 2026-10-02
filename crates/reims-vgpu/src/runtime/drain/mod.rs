@@ -7843,7 +7843,211 @@ pub(crate) const DISPLAY_VBL_MIN_INTERVAL_US: u64 =
 /// The VBL interval actually delivered: [`DISPLAY_VBL_MIN_INTERVAL_US`] unless
 /// the lab refresh override is set (see [`crate::model::display_refresh_hz`]).
 pub(crate) fn display_vbl_interval_us() -> u64 {
-    1_000_000 / crate::model::display_refresh_hz() as u64
+    let base = 1_000_000 / crate::model::display_refresh_hz() as u64;
+    lab_vsync::interval_us(base, crate::observe::elapsed_us()).unwrap_or(base)
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_VSYNC_LOCK=on` phase-locks the VBL grid to the
+/// host display's vblank, read from DWM's composition timing (Windows).
+///
+/// Free-running at 120.000 Hz against a 119.88 Hz monitor, the grid beats
+/// against the display: a frame is dropped or doubled every ~8 s, and the
+/// device's present lands at a random phase of the host's refresh, half a
+/// frame of extra latency on average before DWM even composes it. Locked, the
+/// interval is the host period divided by the nearest whole number of device
+/// frames per refresh, and every claimed grid point is nudged (at most 250 us a
+/// frame) towards `vblank - REIMS_VGPU_LAB_VSYNC_OFFSET_US` (default 6000: the
+/// guest's composition plus the drain, ~4-5 ms, plus a margin), so the present
+/// arrives just before the host's vblank. A stale or absent DWM vblank (a
+/// disconnected session reports one hundreds of ms old) leaves the grid free.
+mod lab_vsync {
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
+
+    /// The host's last vblank on the `elapsed_us` clock; 0 while unlocked.
+    static ANCHOR_US: AtomicU64 = AtomicU64::new(0);
+    /// The host's refresh period in nanoseconds; 0 while unlocked.
+    static PERIOD_NS: AtomicU64 = AtomicU64::new(0);
+    static POLLED_US: AtomicU64 = AtomicU64::new(0);
+    static LOGGED_US: AtomicU64 = AtomicU64::new(0);
+    static LAST_ERR_US: AtomicI64 = AtomicI64::new(0);
+
+    fn enabled() -> bool {
+        static ON: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
+            let on = std::env::var("REIMS_VGPU_LAB_VSYNC_LOCK").is_ok_and(|v| v == "on");
+            crate::observe::off(format!("lab_vsync enabled={on} offset_us={}", offset_us()));
+            on
+        });
+        *ON
+    }
+
+    fn offset_us() -> u64 {
+        static US: once_cell::sync::Lazy<u64> = once_cell::sync::Lazy::new(|| {
+            std::env::var("REIMS_VGPU_LAB_VSYNC_OFFSET_US")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6000)
+        });
+        *US
+    }
+
+    /// `(anchor_us, period_ns)` of a fresh host vblank, polled at most every 100 ms.
+    fn host(now_us: u64) -> Option<(u64, u64)> {
+        if !enabled() {
+            return None;
+        }
+        let polled = POLLED_US.load(Relaxed);
+        if polled == 0 || now_us.saturating_sub(polled) >= 100_000 {
+            POLLED_US.store(now_us.max(1), Relaxed);
+            refresh(now_us);
+        }
+        let (anchor, period) = (ANCHOR_US.load(Relaxed), PERIOD_NS.load(Relaxed));
+        (anchor != 0 && period != 0).then_some((anchor, period))
+    }
+
+    /// The locked interval: the host period over the nearest whole number of
+    /// device frames per refresh.
+    pub(super) fn interval_us(base_us: u64, now_us: u64) -> Option<u64> {
+        let (_, period_ns) = host(now_us)?;
+        let n = ((period_ns + base_us * 500) / (base_us * 1000)).max(1);
+        Some((period_ns / n / 1000).max(1))
+    }
+
+    /// Nudge a claimed grid point towards the locked phase.
+    pub(super) fn nudge(next_us: u64, interval_us: u64, now_us: u64) -> u64 {
+        let Some((anchor, _)) = host(now_us) else {
+            return next_us;
+        };
+        let interval = interval_us as i64;
+        let off = (offset_us() % interval_us) as i64;
+        let desired = (anchor as i64 + interval * 1000 - off).rem_euclid(interval);
+        let current = (next_us as i64).rem_euclid(interval);
+        let mut err = desired - current;
+        if err > interval / 2 {
+            err -= interval;
+        } else if err < -interval / 2 {
+            err += interval;
+        }
+        LAST_ERR_US.store(err, Relaxed);
+        (next_us as i64 + err.clamp(-250, 250)).max(0) as u64
+    }
+
+    #[cfg(windows)]
+    fn refresh(now_us: u64) {
+        use std::ffi::c_void;
+        #[repr(C, packed)]
+        #[derive(Clone, Copy, Default)]
+        struct Ratio {
+            num: u32,
+            den: u32,
+        }
+        // DWM_TIMING_INFO, which dwmapi.h declares under pshpack1.
+        #[repr(C, packed)]
+        #[derive(Clone, Copy, Default)]
+        struct TimingInfo {
+            cb_size: u32,
+            rate_refresh: Ratio,
+            qpc_refresh_period: u64,
+            rate_compose: Ratio,
+            qpc_vblank: u64,
+            c_refresh: u64,
+            c_dx_refresh: u32,
+            qpc_compose: u64,
+            c_frame: u64,
+            c_dx_present: u32,
+            c_refresh_frame: u64,
+            c_frame_submitted: u64,
+            c_dx_present_submitted: u32,
+            c_frame_confirmed: u64,
+            c_dx_present_confirmed: u32,
+            c_refresh_confirmed: u64,
+            c_dx_refresh_confirmed: u32,
+            c_frames_late: u64,
+            c_frames_outstanding: u32,
+            c_frame_displayed: u64,
+            qpc_frame_displayed: u64,
+            c_refresh_frame_displayed: u64,
+            c_frame_complete: u64,
+            qpc_frame_complete: u64,
+            c_frame_pending: u64,
+            qpc_frame_pending: u64,
+            c_frames_displayed: u64,
+            c_frames_complete: u64,
+            c_frames_pending: u64,
+            c_frames_available: u64,
+            c_frames_dropped: u64,
+            c_frames_missed: u64,
+            c_refresh_next_displayed: u64,
+            c_refresh_next_presented: u64,
+            c_refreshes_displayed: u64,
+            c_refreshes_presented: u64,
+            c_refresh_started: u64,
+            c_pixels_received: u64,
+            c_pixels_drawn: u64,
+            c_buffers_empty: u64,
+        }
+        type GetTiming = unsafe extern "system" fn(*mut c_void, *mut TimingInfo) -> i32;
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+            fn QueryPerformanceCounter(count: *mut i64) -> i32;
+            fn QueryPerformanceFrequency(freq: *mut i64) -> i32;
+        }
+        // Resolved at run time: the QEMU link line carries no dwmapi.
+        static GET: once_cell::sync::Lazy<usize> = once_cell::sync::Lazy::new(|| unsafe {
+            let module = LoadLibraryA(b"dwmapi.dll\0".as_ptr());
+            if module.is_null() {
+                return 0;
+            }
+            GetProcAddress(module, b"DwmGetCompositionTimingInfo\0".as_ptr()) as usize
+        });
+        let unlock = || {
+            ANCHOR_US.store(0, Relaxed);
+            PERIOD_NS.store(0, Relaxed);
+        };
+        if *GET == 0 {
+            return unlock();
+        }
+        let mut info = TimingInfo {
+            cb_size: std::mem::size_of::<TimingInfo>() as u32,
+            ..TimingInfo::default()
+        };
+        let (mut qpc_now, mut freq) = (0i64, 0i64);
+        // SAFETY: GET is DwmGetCompositionTimingInfo's address, called with a
+        // correctly sized DWM_TIMING_INFO; the QPC calls write one i64 each.
+        let hr = unsafe {
+            let get: GetTiming = std::mem::transmute(*GET);
+            let hr = get(std::ptr::null_mut(), &mut info);
+            QueryPerformanceCounter(&mut qpc_now);
+            QueryPerformanceFrequency(&mut freq);
+            hr
+        };
+        let (vblank, period_ticks) = (info.qpc_vblank as i64, info.qpc_refresh_period as i64);
+        if hr != 0 || freq <= 0 || period_ticks <= 0 || vblank <= 0 || qpc_now < vblank {
+            return unlock();
+        }
+        let period_ns = (period_ticks as i128 * 1_000_000_000 / freq as i128) as u64;
+        let age_us = ((qpc_now - vblank) as i128 * 1_000_000 / freq as i128) as u64;
+        // A disconnected session reports a vblank hundreds of ms old.
+        if !(4_000_000..=20_000_000).contains(&period_ns) || age_us > 4 * period_ns / 1000 {
+            return unlock();
+        }
+        ANCHOR_US.store(now_us.saturating_sub(age_us).max(1), Relaxed);
+        PERIOD_NS.store(period_ns, Relaxed);
+        let logged = LOGGED_US.load(Relaxed);
+        if logged == 0 || now_us.saturating_sub(logged) >= 1_000_000 {
+            LOGGED_US.store(now_us.max(1), Relaxed);
+            crate::observe::off(format!(
+                "lab_vsync locked period_ns={period_ns} vblank_age_us={age_us} phase_err_us={}",
+                LAST_ERR_US.load(Relaxed)
+            ));
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn refresh(_now_us: u64) {
+        ANCHOR_US.store(0, Relaxed);
+        PERIOD_NS.store(0, Relaxed);
+    }
 }
 
 /// Atomically claim the next display VBL for either the locked or lock-free
@@ -7877,6 +8081,7 @@ pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: 
     } else {
         last + interval
     };
+    let next = lab_vsync::nudge(next, interval, now_us);
     let claimed = last_us
         .compare_exchange(
             last,
