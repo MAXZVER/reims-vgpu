@@ -2361,10 +2361,12 @@ impl ResourcePools {
         let key = |k: &TargetIdentity| -> (u8, u64, u64) {
             match k {
                 TargetIdentity::Surface { id, generation, .. } => (0, u64::from(*id), *generation),
-                TargetIdentity::Texture { ref_, generation, .. } => {
-                    (1, u64::from(*ref_), *generation)
-                }
-                TargetIdentity::Gva { gva, generation, .. } => (2, *gva, *generation),
+                TargetIdentity::Texture {
+                    ref_, generation, ..
+                } => (1, u64::from(*ref_), *generation),
+                TargetIdentity::Gva {
+                    gva, generation, ..
+                } => (2, *gva, *generation),
                 TargetIdentity::Anonymous { slot } => (3, *slot, 0),
             }
         };
@@ -2428,10 +2430,12 @@ impl ResourcePools {
                 TargetIdentity::Surface { id, generation, .. } => {
                     Some((0, u64::from(*id), *generation))
                 }
-                TargetIdentity::Texture { ref_, generation, .. } => {
-                    Some((1, u64::from(*ref_), *generation))
-                }
-                TargetIdentity::Gva { gva, generation, .. } => Some((2, *gva, *generation)),
+                TargetIdentity::Texture {
+                    ref_, generation, ..
+                } => Some((1, u64::from(*ref_), *generation)),
+                TargetIdentity::Gva {
+                    gva, generation, ..
+                } => Some((2, *gva, *generation)),
                 TargetIdentity::Anonymous { .. } => None,
             }
         }
@@ -2448,9 +2452,8 @@ impl ResourcePools {
             .iter()
             .filter(|k| {
                 !self.window_holds(k)
-                    && id_of(k).is_some_and(|(ns, id, g)| {
-                        newest.get(&(ns, id)).is_some_and(|&n| n > g)
-                    })
+                    && id_of(k)
+                        .is_some_and(|(ns, id, g)| newest.get(&(ns, id)).is_some_and(|&n| n > g))
                     && self
                         .registry
                         .get(*k)

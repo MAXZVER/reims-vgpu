@@ -7874,14 +7874,73 @@ pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: 
     } else {
         last + interval
     };
-    last_us
+    let claimed = last_us
         .compare_exchange(
             last,
             next,
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
         )
-        .is_ok()
+        .is_ok();
+    if claimed {
+        lab_vbl_late_note(now_us, gap - interval, gap >= 2 * interval);
+    }
+    claimed
+}
+
+/// TEMP (lab): how far past its grid point each delivered VBL was claimed —
+/// the poll heartbeat's lateness, which the guest's frame start inherits — as
+/// one `lab_vbl_late` line a second: buckets <0.25/<0.5/<1/<2/<4/>=4 ms, mean,
+/// max, and how many resynced the grid (a gap of two intervals or more).
+fn lab_vbl_late_note(now_us: u64, late_us: u64, resync: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static B: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    static SUM: AtomicU64 = AtomicU64::new(0);
+    static MAX: AtomicU64 = AtomicU64::new(0);
+    static RESYNC: AtomicU64 = AtomicU64::new(0);
+    static SINCE: AtomicU64 = AtomicU64::new(0);
+    let i = match late_us {
+        0..250 => 0,
+        250..500 => 1,
+        500..1000 => 2,
+        1000..2000 => 3,
+        2000..4000 => 4,
+        _ => 5,
+    };
+    B[i].fetch_add(1, Relaxed);
+    SUM.fetch_add(late_us, Relaxed);
+    MAX.fetch_max(late_us, Relaxed);
+    if resync {
+        RESYNC.fetch_add(1, Relaxed);
+    }
+    let since = SINCE.load(Relaxed);
+    if since == 0 {
+        SINCE.store(now_us, Relaxed);
+        return;
+    }
+    if now_us < since + 1_000_000
+        || SINCE
+            .compare_exchange(since, now_us, Relaxed, Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let b: Vec<u64> = B.iter().map(|x| x.swap(0, Relaxed)).collect();
+    let n: u64 = b.iter().sum();
+    let sum = SUM.swap(0, Relaxed);
+    crate::observe::off(format!(
+        "lab_vbl_late n={n} lt250={} lt500={} lt1000={} lt2000={} lt4000={} ge4000={} \
+         mean_us={} max_us={} resync={}",
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        sum / n.max(1),
+        MAX.swap(0, Relaxed),
+        RESYNC.swap(0, Relaxed)
+    ));
 }
 
 /// Pulse VBL at the phase-locked ~120 Hz cadence (grid interval
