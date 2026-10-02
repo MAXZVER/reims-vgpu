@@ -9293,10 +9293,30 @@ mod lab_chan {
         crate::observe::elapsed_us() + 1
     }
 
+    // Every ring, in order: a channel's k-th packet is matched to its k-th
+    // doorbell (`db=chN:rings/packets` on the line says whether that holds).
+    static DB_N: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static PK_N: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+
+    fn rings() -> std::sync::MutexGuard<'static, Vec<std::collections::VecDeque<u64>>> {
+        static R: std::sync::OnceLock<std::sync::Mutex<Vec<std::collections::VecDeque<u64>>>> =
+            std::sync::OnceLock::new();
+        R.get_or_init(|| std::sync::Mutex::new((0..N).map(|_| Default::default()).collect()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     pub(super) fn lat_doorbell(channel: u32) {
         let c = channel as usize;
         if c < N {
-            let _ = DB_US[c].compare_exchange(0, now_us(), Relaxed, Relaxed);
+            let now = now_us();
+            let _ = DB_US[c].compare_exchange(0, now, Relaxed, Relaxed);
+            DB_N[c].fetch_add(1, Relaxed);
+            let mut r = rings();
+            if r[c].len() >= 1024 {
+                r[c].pop_front();
+            }
+            r[c].push_back(now);
         }
     }
 
@@ -9319,7 +9339,10 @@ mod lab_chan {
         }
         let admit = now_us();
         let t0 = DRAIN_T0[c].load(Relaxed).min(admit);
-        let db = DRAIN_DB[c].load(Relaxed).min(t0);
+        PK_N[c].fetch_add(1, Relaxed);
+        // This packet's own ring when there is one left to match; otherwise it
+        // arrived without one we saw, and the drain's start bounds it.
+        let db = rings()[c].pop_front().unwrap_or(t0).min(admit);
         let mut l = lat();
         let q = l.pending.entry(slot).or_default();
         if q.len() >= 4096 {
@@ -9363,7 +9386,7 @@ mod lab_chan {
                 a.tot += tot;
                 a.tot_max = a.tot_max.max(tot);
                 a.pre += e.t0.saturating_sub(e.db);
-                a.ring += e.admit.saturating_sub(e.t0);
+                a.ring += e.admit.saturating_sub(e.t0.max(e.db));
                 a.park += run.saturating_sub(e.admit);
                 a.exec += e.exec;
                 a.post += now.saturating_sub(run + e.exec);
@@ -9390,6 +9413,13 @@ mod lab_chan {
             let s = SLOT[i].load(Relaxed);
             if s != u32::MAX {
                 line.push_str(&format!("ch{i}>s{s},"));
+            }
+        }
+        line.push_str(" db=");
+        for i in 1..N {
+            let (d, p) = (DB_N[i].swap(0, Relaxed), PK_N[i].swap(0, Relaxed));
+            if d + p > 0 {
+                line.push_str(&format!("ch{i}:{d}/{p},"));
             }
         }
         for ((slot, task), a) in std::mem::take(agg) {
