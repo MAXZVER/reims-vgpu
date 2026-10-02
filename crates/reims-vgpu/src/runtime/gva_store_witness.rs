@@ -117,10 +117,11 @@ struct Entry {
     /// the arming window — and can never equal a live generation, because the
     /// host's first readable one is 1.
     gen_at_store: u64,
-    /// TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`): `gen_at_store` was read synced
-    /// at the Store. A lagged one ([`note_store_eager`]) may predate guest writes
-    /// made before the Store, which a reader may count against the Store (a
-    /// re-read) but a writer may not ([`armed`], [`written_pages`]).
+    /// TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`): a writer may use
+    /// `gen_at_store` ([`armed`], [`written_pages`]). False for an eager
+    /// Store's lagged stamp, which may predate guest writes made before the
+    /// Store: a reader may count those against the Store (a re-read), a writer
+    /// may not. A deferral's lagged stamp ([`note_store_deferral`]) is usable.
     exact: bool,
     /// `host_writes.epoch()` as it stood at the Store, read *after* the Store
     /// recorded its own write so the Store does not invalidate itself.
@@ -233,25 +234,49 @@ pub fn note_store<H: HostOps>(
     key: GvaTargetKey,
     gpas: &[u64],
 ) {
-    // TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED=all`): measurement only — the
-    // deferral's arming reads lagged too and still counts as exact, so a guest
-    // write made between the set's last sync and this Store would be kept over
-    // the device's frame at the merge. An upper bound on what an exact arming
-    // that needs no foreground sync could buy; never a mode to run.
-    if lab_lagged_mode() == 2
+    stamp(state, host, key, gpas, false);
+}
+
+/// [`note_store`] for a Store about to be deferred: the writer's arming.
+///
+/// TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`, on unless `=off`): an armed target
+/// whose resource the guest has never declared a CPU write to (`undeclared`,
+/// `BufferWriteGens::declared`) is re-stamped from the lagged generation.
+/// Nearly every GVA Store is deferred (n83: ~23k a boot, 76 % superseded
+/// before payment, 0-1 merges), and the synced read here was a foreground sync
+/// of the target's pages each time — store routing halved on transitions
+/// without it (n84 fga2: 48-59 -> 25 us a chain).
+///
+/// What the lagged baseline changes: [`written_pages`] may also name pages
+/// the guest wrote between the set's last sync and this Store, and a merge
+/// keeps the guest's bytes there. The merge runs only after the guest declares
+/// a write since the Store. A CPU write made before the Store is declared to
+/// the device by the next command buffer that uses the object — the Store's
+/// own, if it came first — so an object with no declaration at all has had no
+/// such write the device was not told of, and for it the superset is the exact
+/// set. An object with declarations keeps the synced read. `=all` (measurement
+/// only) takes the lagged read for every object.
+pub fn note_store_deferral<H: HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    key: GvaTargetKey,
+    gpas: &[u64],
+    undeclared: bool,
+) {
+    let mode = lab_lagged_mode();
+    let lagged = (mode == 2 || (mode == 1 && undeclared))
         && state
             .gva_store_witness
             .entries
             .get(&key)
-            .is_some_and(|e| e.gen_at_store != 0)
-    {
-        stamp(state, host, key, gpas, true);
+            .is_some_and(|e| e.gen_at_store != 0);
+    stamp(state, host, key, gpas, lagged);
+    if lagged {
+        crate::runtime::drain::note_store_route("lab_gvaw_deferral_lagged");
         if let Some(e) = state.gva_store_witness.entries.get_mut(&key) {
             e.exact = true;
         }
-        return;
     }
-    stamp(state, host, key, gpas, false);
 }
 
 /// TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`, on unless `=off`): whether an eager
@@ -261,7 +286,8 @@ fn lab_lagged_enabled() -> bool {
     lab_lagged_mode() != 0
 }
 
-/// 0 `off`, 1 eager Stores only (default), 2 `all` (measurement, see [`note_store`]).
+/// 0 `off`, 1 eager Stores and undeclared deferrals (default), 2 `all`
+/// (measurement, see [`note_store_deferral`]).
 fn lab_lagged_mode() -> u8 {
     if cfg!(test) {
         return 1;
@@ -641,6 +667,34 @@ mod tests {
         );
 
         armed(&mut state, &mut host, key(0xabc), &pages);
+        assert!(super::armed(&state, key(0xabc)));
+        assert_eq!(written_pages(&state, &host, key(0xabc)), Some(Vec::new()));
+    }
+
+    /// TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`): a deferral re-stamp of an
+    /// undeclared object arms the writer and names the pages written after it;
+    /// a declared object's deferral still reads synced.
+    #[test]
+    fn an_undeclared_deferral_restamp_arms_the_writer() {
+        let mut state = device();
+        let mut host = FakeHost::new();
+        let pages = [3 * PAGE, 4 * PAGE];
+        note_store_deferral(&mut state, &mut host, key(0xabc), &pages, true);
+        assert!(
+            super::armed(&state, key(0xabc)),
+            "a first Store reads synced"
+        );
+
+        note_store_deferral(&mut state, &mut host, key(0xabc), &pages, true);
+        assert!(super::armed(&state, key(0xabc)));
+        assert_eq!(written_pages(&state, &host, key(0xabc)), Some(Vec::new()));
+        host.guest_wrote_page(4 * PAGE);
+        assert_eq!(
+            written_pages(&state, &host, key(0xabc)),
+            Some(vec![4 * PAGE])
+        );
+
+        note_store_deferral(&mut state, &mut host, key(0xabc), &pages, false);
         assert!(super::armed(&state, key(0xabc)));
         assert_eq!(written_pages(&state, &host, key(0xabc)), Some(Vec::new()));
     }

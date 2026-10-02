@@ -1891,7 +1891,10 @@ fn gva_writeback_is_recoverable<B: crate::backend::Backend, M: HostMemory + Host
         crate::runtime::drain::note_store_route("gvadebt_arm_unnamed");
         return false;
     };
-    crate::runtime::gva_store_witness::note_store(state, host, key, &ordered);
+    let undeclared = !state
+        .buffer_write_gen
+        .declared(plane.resource.task_id, plane.resource.texture_ref);
+    crate::runtime::gva_store_witness::note_store_deferral(state, host, key, &ordered, undeclared);
     if crate::runtime::gva_store_witness::armed(state, key) {
         true
     } else {

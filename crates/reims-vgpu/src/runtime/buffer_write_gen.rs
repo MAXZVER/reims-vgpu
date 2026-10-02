@@ -81,6 +81,16 @@ impl BufferWriteGens {
         }
     }
 
+    /// Whether the guest has declared any write to this object that the map
+    /// still remembers. TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`): what lets a
+    /// deferral of a never-declared object arm from a lagged generation — see
+    /// `gva_store_witness::note_store_deferral`. A clear past [`Self::MAX`]
+    /// forgets history, after which an object reads undeclared until it
+    /// declares again.
+    pub fn declared(&self, task_id: u32, object_id: u32) -> bool {
+        self.gens.contains_key(&(task_id, object_id))
+    }
+
     /// Forget one task's objects, because the task's ids no longer name them.
     ///
     /// Retiring by task rather than by object for the reason
