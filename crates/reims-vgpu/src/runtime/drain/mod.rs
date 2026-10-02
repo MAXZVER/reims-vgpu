@@ -5993,6 +5993,8 @@ fn apply_map_family<H: HostMemory + HostOps>(
     packet: &Packet,
     family: MapFamily,
 ) {
+    // TEMP (lab): translations cached this tranche may name the pages moved.
+    crate::runtime::gva_mem::lab_tlb::new_epoch();
     // Every branch below stamps the packet complete whatever it did with
     // it: the guest is waiting on the stamp, and a lifecycle event this
     // device chose not to act on is still an event the guest performed.

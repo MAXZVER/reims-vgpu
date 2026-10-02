@@ -76,6 +76,17 @@ pub fn read_task_gva<M: HostMemory>(
         return Err(MemError::NoTaskDirectory);
     }
     let geom = geometry_for_page_shift(page_shift).ok_or(MemError::UnsupportedPageShift)?;
+    // TEMP (lab): a read inside one page whose translation this tranche already
+    // walked is one guest-physical read.
+    let page_mask = (1u64 << page_shift) - 1;
+    let single_page = (gva & page_mask) + buf.len() as u64 <= page_mask + 1;
+    let tlb = single_page && lab_tlb::enabled();
+    if tlb {
+        if let Some(base) = lab_tlb::get(task.directory_pfn, gva >> page_shift) {
+            return host.read_gpa(base + (gva & page_mask), buf);
+        }
+    }
+    let mut first_gpa: Option<u64> = None;
     let reader = HostPhys(host);
     let gr_task = Task {
         active: true,
@@ -88,6 +99,9 @@ pub fn read_task_gva<M: HostMemory>(
     // shared and the write needs it exclusively.
     let mut result: Result<(), MemError> = Ok(());
     visit_span_chunks(&reader, geom, &gr_task, gva, buf.len(), &mut |chunk| {
+        if first_gpa.is_none() {
+            first_gpa = Some(chunk.gpa);
+        }
         match host.read_gpa(chunk.gpa, &mut buf[chunk.range()]) {
             Ok(()) => true,
             Err(e) => {
@@ -100,7 +114,78 @@ pub fn read_task_gva<M: HostMemory>(
         }
     })
     .map_err(span_refusal_error)?;
+    if tlb && result.is_ok() {
+        if let Some(gpa) = first_gpa {
+            lab_tlb::put(task.directory_pfn, gva >> page_shift, gpa - (gva & page_mask));
+        }
+    }
     result
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_GVA_TLB=off` disables): per-thread, direct-mapped
+/// cache of task page translations, valid for one drain tranche.
+///
+/// A list-entry or descriptor read walks the task's directory and four table
+/// levels — five guest-physical reads — to fetch one entry, and a stream reads
+/// many entries from the same few pages. A translation is kept only until the
+/// next tranche starts or the guest announces a map or unmap (`new_epoch`):
+/// within that window a page the walk resolved is the page it would resolve
+/// again, short of the guest rewriting a table under a live submission, which
+/// the uncached walk does not guard against either.
+pub(crate) mod lab_tlb {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    const SLOTS: usize = 256;
+    static EPOCH: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Clone, Copy)]
+    struct Slot {
+        epoch: u64,
+        dir: u32,
+        page: u64,
+        base: u64,
+    }
+
+    thread_local! {
+        static TLB: [Cell<Slot>; SLOTS] = const {
+            [const { Cell::new(Slot { epoch: 0, dir: 0, page: 0, base: 0 }) }; SLOTS]
+        };
+    }
+
+    pub(crate) fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GVA_TLB").map_or(true, |v| v != "off"))
+    }
+
+    /// Forget every translation: a tranche starts, or the guest remapped.
+    pub(crate) fn new_epoch() {
+        EPOCH.fetch_add(1, Relaxed);
+    }
+
+    fn index(dir: u32, page: u64) -> usize {
+        ((page ^ (page >> 8) ^ u64::from(dir).wrapping_mul(0x9e37_79b9)) as usize) & (SLOTS - 1)
+    }
+
+    pub(super) fn get(dir: u32, page: u64) -> Option<u64> {
+        let epoch = EPOCH.load(Relaxed);
+        TLB.with(|t| {
+            let s = t[index(dir, page)].get();
+            (s.epoch == epoch && s.dir == dir && s.page == page).then_some(s.base)
+        })
+    }
+
+    pub(super) fn put(dir: u32, page: u64, base: u64) {
+        let epoch = EPOCH.load(Relaxed);
+        TLB.with(|t| {
+            t[index(dir, page)].set(Slot {
+                epoch,
+                dir,
+                page,
+                base,
+            })
+        });
+    }
 }
 
 /// Read `[gva, gva+len)` under the task the guest named. **That task, or an

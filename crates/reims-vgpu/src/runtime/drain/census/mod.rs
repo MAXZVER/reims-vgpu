@@ -2835,6 +2835,7 @@ static TRANCHE_START_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Mark the start of a drain tranche, for [`tranche_elapsed_us`].
 pub fn note_tranche_started(now_us: u64) {
     TRANCHE_START_US.store(now_us, std::sync::atomic::Ordering::Relaxed);
+    crate::runtime::gva_mem::lab_tlb::new_epoch();
     lab_ft(LabFtPoint::Drain);
     LAB_TRANCHE_SNAP.with(|c| c.set(DRAIN_DUTY.lab_snap()));
 }
