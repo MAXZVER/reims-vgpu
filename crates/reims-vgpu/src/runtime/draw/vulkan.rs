@@ -13457,6 +13457,63 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
                 }
             }
             let debt = state.pending_writebacks.get(mapping_id).is_some();
+            // TEMP lab (black-stripe hunt): a mostly-zero overlay is the stripe
+            // candidate. Name the generations the verdict compared, and whether the
+            // guest pages it is about to adopt also belong to another live mapping
+            // (pages the guest freed and reused while this mapping kept them).
+            if zero * 10 >= n * 9 {
+                if let Some(m) = state.mappings.get(&mapping_id) {
+                    let shift = state.page_shift;
+                    let mut gpas = std::collections::HashSet::new();
+                    for span in &spans {
+                        let (lo, hi) = (base_off + span.window_start, base_off + span.window_end);
+                        let mut p = lo >> shift;
+                        while (p << shift) < hi {
+                            if let Some(&e) = m.page_entries.get(p as usize) {
+                                if let Some(gpa) =
+                                    crate::protocol::iosurface_pages::entry_gpa_shift(e, shift)
+                                {
+                                    gpas.insert(gpa);
+                                }
+                            }
+                            p += 1;
+                        }
+                    }
+                    let mut shared: Vec<String> = Vec::new();
+                    for (&other, om) in state.mappings.iter() {
+                        if other == mapping_id || om.page_entries.is_empty() {
+                            continue;
+                        }
+                        let hits = om
+                            .page_entries
+                            .iter()
+                            .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, shift))
+                            .filter(|g| gpas.contains(g))
+                            .count();
+                        if hits > 0 {
+                            shared.push(format!(
+                                "mid{other}:{hits}:{}x{}:mapped={}:mapgen={}:tok={}",
+                                om.width, om.height, om.mapped, om.map_generation, om.guest_write_token
+                            ));
+                        }
+                    }
+                    let now = if m.guest_write_token != 0 {
+                        host.guest_write_gen(m.guest_write_token).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    crate::observe::off(format!(
+                        "lab_overlay_zero mid={mapping_id} gpas={} tok={} mapgen={} at_store={} seen={} now={} shared=[{}]",
+                        gpas.len(),
+                        m.guest_write_token,
+                        m.map_generation,
+                        m.guest_write_gen_at_store,
+                        guest_owned.seen.gen_,
+                        now,
+                        shared.join(",")
+                    ));
+                }
+            }
             // How much of each guest-owned span actually differs from the
             // resident: a true small guest write differs in a few texels, a
             // stale page in most of them.
