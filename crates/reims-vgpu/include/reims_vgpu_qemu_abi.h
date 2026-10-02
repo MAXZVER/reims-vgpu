@@ -575,6 +575,8 @@ int reims_vgpu_qemu_device_drain(uint64_t handle);
 int reims_vgpu_qemu_device_poll(uint64_t handle);
 /* TEMP (lab): microseconds until the next VBL grid point; 0 when due or unknown. */
 uint32_t reims_vgpu_qemu_vbl_due_us(uint64_t handle);
+/* TEMP (lab): input latency mark from the HID layer (REIMS_VGPU_LAB_PROBE). */
+void reims_vgpu_qemu_lab_mark(uint32_t kind, uint32_t arg);
 /* Returns REIMS_VGPU_QEMU_OK + fills *out, or REIMS_VGPU_QEMU_EMPTY. */
 int reims_vgpu_qemu_device_pop_action(uint64_t handle, ReimsVgpuHostAction *out);
 

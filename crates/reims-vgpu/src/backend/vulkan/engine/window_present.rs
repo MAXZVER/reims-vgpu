@@ -863,7 +863,9 @@ impl WindowPresenter {
                 continue;
             }
             end_present_in_flight(&mut self.frames[ix]);
+            lab_probe_retire(ctx, ix);
         }
+        lab_probe_flush();
         Ok(!self.frames[self.frame_ix].submitted)
     }
 
@@ -1244,6 +1246,8 @@ impl WindowPresenter {
             })
             .or(staged);
 
+        // TEMP (lab): whether this present carries a `REIMS_VGPU_LAB_PROBE` copy.
+        let mut probe_armed = false;
         let submit_result = (|| {
             ctx.device
                 .reset_fences(&[frame_in_flight])
@@ -1347,6 +1351,17 @@ impl WindowPresenter {
                     (0, 0, base_width, base_height),
                     (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
                 );
+                if selected.is_some() {
+                    probe_armed = lab_probe_record(
+                        ctx,
+                        frame_cmd,
+                        frame_ix,
+                        self.frames.len(),
+                        blit.image(),
+                        src_layout,
+                        (base_width, base_height),
+                    );
+                }
                 // The window's last contact with the resident registry, and the
                 // one that stays. Two ways out of it were looked for and both
                 // are unsound; recording that here so the third reader does not
@@ -1427,6 +1442,9 @@ impl WindowPresenter {
         // A plain `?` now the failure arm has nothing to undo: it used to have to
         // drop the pins this present had taken before returning.
         let submission = submit_result?;
+        if probe_armed {
+            lab_probe_submitted(frame_ix);
+        }
         // Claimed before the latch, so the slot is never observed clear while
         // the latch says an entry is outstanding.
         begin_present_in_flight();
@@ -1841,6 +1859,227 @@ impl WindowPresenter {
             self.swapchain = vk::SwapchainKHR::null();
         }
         self.surface_loader.destroy_surface(self.surface, None);
+    }
+}
+
+/// TEMP (lab): input-to-present latency probe. `REIMS_VGPU_LAB_PROBE` names a
+/// file holding `X Y` (guest-frame pixels, re-read every 200 ms; absent = off).
+/// Every presented resident frame copies its pixel at (X, Y) into a host-visible
+/// slot of its present entry; when the entry retires, a value different from the
+/// last one logs `lab_probe us=<submit> done_us=<retire seen> v=<bytes>`. Paired
+/// with QEMU's HID `lab_mark` lines (same microsecond clock) this is the time
+/// from an input reaching the device model to the frame showing its effect.
+struct LabProbe {
+    device: vk::Device,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: MappedStaging,
+    /// Per present entry: the microsecond clock at submit, while a copy is in flight.
+    pending: Vec<Option<u64>>,
+    /// Retired this sweep, sorted into submit order before logging.
+    retired: Vec<(u64, u32)>,
+    last: Option<u32>,
+}
+
+const LAB_PROBE_STRIDE: u64 = 256;
+
+static LAB_PROBE: std::sync::Mutex<Option<LabProbe>> = std::sync::Mutex::new(None);
+
+fn lab_probe_point() -> Option<(u32, u32)> {
+    use std::sync::atomic::AtomicU64;
+    static PATH: once_cell::sync::Lazy<Option<String>> =
+        once_cell::sync::Lazy::new(|| std::env::var("REIMS_VGPU_LAB_PROBE").ok());
+    // x+1 in the high half, y in the low half; 0 = no point.
+    static POINT: AtomicU64 = AtomicU64::new(0);
+    static READ_MS: AtomicU64 = AtomicU64::new(0);
+    let path = PATH.as_ref()?;
+    let now = crate::observe::elapsed_us() / 1000;
+    let last = READ_MS.load(Ordering::Relaxed);
+    if last == 0 || now.saturating_sub(last) >= 200 {
+        READ_MS.store(now.max(1), Ordering::Relaxed);
+        let point = std::fs::read_to_string(path).ok().and_then(|text| {
+            let mut it = text.split_whitespace().map(|v| v.parse::<u32>().ok());
+            Some((it.next()??, it.next()??))
+        });
+        POINT.store(
+            point.map_or(0, |(x, y)| ((u64::from(x) + 1) << 32) | u64::from(y)),
+            Ordering::Relaxed,
+        );
+    }
+    let p = POINT.load(Ordering::Relaxed);
+    (p != 0).then(|| (((p >> 32) - 1) as u32, p as u32))
+}
+
+unsafe fn lab_probe_new(ctx: &DeviceContext, entries: usize) -> Option<LabProbe> {
+    let size = LAB_PROBE_STRIDE * entries as u64;
+    let buffer = ctx
+        .device
+        .create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )
+        .ok()?;
+    let req = ctx.device.get_buffer_memory_requirements(buffer);
+    let Some(mt) = ctx.memory_type_for(
+        req.memory_type_bits,
+        req.size,
+        crate::backend::vulkan::caps::memory_topology::MemoryClass::Readback,
+    ) else {
+        ctx.device.destroy_buffer(buffer, None);
+        return None;
+    };
+    let Ok(memory) = ctx.device.allocate_memory(
+        &vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(mt),
+        None,
+    ) else {
+        ctx.device.destroy_buffer(buffer, None);
+        return None;
+    };
+    let mapped = ctx
+        .device
+        .bind_buffer_memory(buffer, memory, 0)
+        .and_then(|()| {
+            ctx.device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        });
+    let Ok(mapped) = mapped else {
+        ctx.device.free_memory(memory, None);
+        ctx.device.destroy_buffer(buffer, None);
+        return None;
+    };
+    crate::observe::off(format!("lab_probe_ready entries={entries}"));
+    Some(LabProbe {
+        device: ctx.device.handle(),
+        buffer,
+        memory,
+        mapped: MappedStaging(mapped.cast()),
+        pending: vec![None; entries],
+        retired: Vec::new(),
+        last: None,
+    })
+}
+
+/// Record the probe copy for entry `ix` after the present blit read `image`
+/// (already in `layout` for transfer reads). Returns whether it was recorded.
+#[allow(clippy::too_many_arguments, reason = "TEMP lab instrument")]
+unsafe fn lab_probe_record(
+    ctx: &DeviceContext,
+    cmd: vk::CommandBuffer,
+    ix: usize,
+    entries: usize,
+    image: vk::Image,
+    layout: vk::ImageLayout,
+    (width, height): (u32, u32),
+) -> bool {
+    let Some((x, y)) = lab_probe_point() else {
+        return false;
+    };
+    if x >= width || y >= height {
+        return false;
+    }
+    let mut guard = LAB_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+    let stale = guard
+        .as_ref()
+        .is_some_and(|p| p.device != ctx.device.handle() || p.pending.len() != entries);
+    if stale {
+        // A new device or ring: the old handles belong to what is gone.
+        *guard = None;
+    }
+    if guard.is_none() {
+        *guard = lab_probe_new(ctx, entries);
+    }
+    let Some(probe) = guard.as_ref() else {
+        return false;
+    };
+    let region = vk::BufferImageCopy::default()
+        .buffer_offset(LAB_PROBE_STRIDE * ix as u64)
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .layer_count(1),
+        )
+        .image_offset(vk::Offset3D {
+            x: x as i32,
+            y: y as i32,
+            z: 0,
+        })
+        .image_extent(vk::Extent3D {
+            width: 1,
+            height: 1,
+            depth: 1,
+        });
+    ctx.device
+        .cmd_copy_image_to_buffer(cmd, image, layout, probe.buffer, &[region]);
+    ctx.device.cmd_pipeline_barrier(
+        cmd,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::HOST,
+        vk::DependencyFlags::empty(),
+        &[vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)],
+        &[],
+        &[],
+    );
+    true
+}
+
+fn lab_probe_submitted(ix: usize) {
+    let mut guard = LAB_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = guard.as_mut().and_then(|p| p.pending.get_mut(ix)) {
+        *slot = Some(crate::observe::elapsed_us());
+    }
+}
+
+/// Entry `ix`'s fence has signalled: take its probed pixel.
+unsafe fn lab_probe_retire(ctx: &DeviceContext, ix: usize) {
+    let mut guard = LAB_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(probe) = guard.as_mut() else {
+        return;
+    };
+    let Some(submitted) = probe.pending.get_mut(ix).and_then(Option::take) else {
+        return;
+    };
+    let _ = ctx
+        .device
+        .invalidate_mapped_memory_ranges(&[vk::MappedMemoryRange::default()
+            .memory(probe.memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)]);
+    let value = std::ptr::read_volatile(
+        probe
+            .mapped
+            .0
+            .add((LAB_PROBE_STRIDE * ix as u64) as usize)
+            .cast::<u32>(),
+    );
+    probe.retired.push((submitted, value));
+}
+
+/// Log the changes among this sweep's retired probes, in submit order.
+fn lab_probe_flush() {
+    let mut guard = LAB_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(probe) = guard.as_mut() else {
+        return;
+    };
+    if probe.retired.is_empty() {
+        return;
+    }
+    probe.retired.sort_unstable_by_key(|&(t, _)| t);
+    let done = crate::observe::elapsed_us();
+    for (t, value) in std::mem::take(&mut probe.retired) {
+        if probe.last != Some(value) {
+            crate::observe::off(format!(
+                "lab_probe us={t} done_us={done} v={value:08x} was={}",
+                probe.last.map_or("none".to_string(), |v| format!("{v:08x}"))
+            ));
+            probe.last = Some(value);
+        }
     }
 }
 

@@ -629,6 +629,25 @@ pub unsafe extern "C" fn reims_vgpu_qemu_vbl_due_us(handle: u64) -> u32 {
     )
 }
 
+/// TEMP (lab): an input latency mark from QEMU's HID layer, installed when
+/// `REIMS_VGPU_LAB_PROBE` is set: kind 1 key event queued, 2 keyboard report
+/// taken by the guest with events pending, 3 pointer event made guest-visible,
+/// 4 pointer report taken with events pending. One `lab_mark` line on the
+/// microsecond clock the window's `lab_probe` lines use.
+#[no_mangle]
+pub unsafe extern "C" fn reims_vgpu_qemu_lab_mark(kind: u32, arg: u32) {
+    unwind_safe(
+        "reims_vgpu_qemu_lab_mark",
+        || {
+            crate::observe::off(format!(
+                "lab_mark k={kind} a={arg} us={}",
+                crate::observe::elapsed_us()
+            ));
+        },
+        (),
+    )
+}
+
 /// Pop one HostAction for the QEMU BH. Returns REIMS_VGPU_QEMU_OK with *out filled,
 /// REIMS_VGPU_QEMU_EMPTY when the queue is empty.
 /// SAFETY: out non-null when a value is expected.
