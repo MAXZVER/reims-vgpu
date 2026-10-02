@@ -1274,7 +1274,10 @@ mod tests {
         ops.guest_ram_regions = callback;
         let mut actions = VecDeque::new();
         let prompt = parking_lot::Mutex::new(VecDeque::new());
-        QemuHost::new(&ops, &mut actions, &prompt).guest_ram_regions()
+        // Bound first so the host (it flushes on drop) is gone before the locals
+        // it borrows; as a tail expression its temporary would outlive them.
+        let regions = QemuHost::new(&ops, &mut actions, &prompt).guest_ram_regions();
+        regions
     }
 
     /// A shim older than v17 has no such callback, and that is a named refusal
@@ -1371,6 +1374,7 @@ mod tests {
         host.enqueue(HA::cursor(10, 20, true));
         host.enqueue(HA::cursor(30, 40, true)); // latest cursor wins
         host.enqueue(HA::scanout_gen(1, 1920, 1080, 7));
+        drop(host);
 
         let q = prompt.lock();
         assert_eq!(q.len(), 3, "gfx pulse + iosfc pulse + one cursor");
@@ -1509,11 +1513,13 @@ mod tests {
         let prompt = parking_lot::Mutex::new(VecDeque::new());
         let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0x4000], 0x4000), None);
+        drop(host);
 
         ops.map_pages = Some(fail_map_pages);
         let prompt = parking_lot::Mutex::new(VecDeque::new());
         let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0x8000], 0x4000), None);
+        drop(host);
 
         ops.map_pages = Some(null_map_pages);
         let prompt = parking_lot::Mutex::new(VecDeque::new());
@@ -1672,6 +1678,7 @@ mod tests {
         drain.read_gpa(0x1000, &mut again).expect("the table reads");
         assert_eq!(again, buf);
         assert_eq!(drain.guest_write_gen(41), worker.guest_write_gen(41));
+        drop(drain);
 
         // Everything the drain alone may do is refused or dropped, and said so.
         assert_eq!(worker.write_gpa(0x1000, &[1]), Err(MemError::ReadOnlyHost));

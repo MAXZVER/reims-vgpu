@@ -799,7 +799,571 @@ fn capture_air(air: &[u8], stage: Stage, spirv: &[u8]) {
     }
 }
 
+/// TEMP lab: the on-disk translation cache, `REIMS_VGPU_LAB_M2V_DISK=<dir>`.
+///
+/// A translation is 5-50 ms and a cold 5K boot misses ~340 of them, each one a
+/// stall the guest sees as a slow first draw or a slow login. The in-memory
+/// [`Cache`] forgets all of it at process exit; this keeps the translator's raw
+/// output between boots, one file per shader.
+///
+/// # What is stored, and what is not
+///
+/// The translator's own output — the SPIR-V bytes and the [`ShaderReflection`]
+/// `metal2vulkan` returned — and nothing downstream of it. [`finish_translated`]
+/// (layout repair, reflection validation, band widening) runs on a loaded entry
+/// exactly as it runs on a fresh translation, so the reims-side post-processing
+/// stays live code: editing it takes effect on the next boot without the stamp
+/// having to know about it.
+///
+/// # A hit is byte-exact
+///
+/// The file name is the stage and the 64-bit [`air_key`], and that digest decides
+/// nothing — the entry carries the whole AIR (and a kernel's LocalSize) and a
+/// load compares them against what the guest supplied, for the same reason
+/// [`ShaderId`] does. A collision or a stale file is a miss. A checksum over the
+/// whole file turns a torn or bit-rotted entry into a miss too, because the
+/// SPIR-V bytes are the one part nothing else would compare.
+///
+/// The digest does have to be the same in the next process: `air_key` hashes with
+/// `DefaultHasher::new()`, whose keys are fixed, so it is for one build of the
+/// standard library. A build with another one is another executable and so
+/// another stamp, and a digest that moved anyway would only cost a miss.
+///
+/// # What invalidates it
+///
+/// The [`Stamp`] in the header. `metal2vulkan` is patched in from a sibling
+/// checkout that is edited constantly, so its crate version means nothing; what
+/// changes on every rebuild is the executable. The stamp is that executable's
+/// size and mtime, the reflection ABI version, and the `METAL2VULKAN_*`
+/// environment (several of those toggles change what is emitted). The stamp is a
+/// header field rather than part of the file name so a rebuilt binary overwrites
+/// the entries it invalidates instead of leaving a second generation beside
+/// them: the directory holds at most one file per distinct shader.
+///
+/// # Cost
+///
+/// A lookup happens only where a translation was about to run — an in-memory
+/// miss — and runs before the translation lock, so a hit never queues behind
+/// another thread's translation. The write follows a fresh translation, once per
+/// shader.
+///
+/// A disk failure never fails a translation. It is counted, reported once
+/// through [`crate::observe::fail`], and the translator's own result is used.
+mod disk {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    use super::{log_token, M2vResult, ShaderId, ShaderReflection};
+
+    /// The lab switch: a directory. Unset or empty leaves the cache off.
+    pub(super) const ENV: &str = "REIMS_VGPU_LAB_M2V_DISK";
+
+    const MAGIC: [u8; 8] = *b"RVGPUM2V";
+
+    /// The framing below and the JSON inside it. Bump on any change to either.
+    const SCHEMA: u32 = 1;
+
+    /// Magic, schema, stamp, stage, LocalSize flag and value, three lengths.
+    const HEADER_LEN: usize = 8 + 4 + STAMP_LEN + 1 + 1 + 12 + 3 * 8;
+    const STAMP_LEN: usize = 4 + 8 + 8 + 8;
+    const TRAILER_LEN: usize = 8;
+
+    /// The translator's raw output: SPIR-V bytes and the reflection beside them.
+    pub(super) type Raw = (Vec<u8>, ShaderReflection);
+
+    /// What a translation was produced by. Entries made under a different stamp
+    /// are not trusted — see the module doc.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Stamp {
+        pub reflection_version: u32,
+        pub exe_size: u64,
+        pub exe_mtime_ns: u64,
+        /// Digest of every `METAL2VULKAN_*` variable in the environment.
+        pub env_hash: u64,
+    }
+
+    impl Stamp {
+        /// The running executable's stamp, or why there is none.
+        ///
+        /// Without one nothing could tell a fresh entry from a stale one, so the
+        /// cache stays off rather than guess.
+        pub(super) fn current() -> Result<Self, String> {
+            let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+            let meta = std::fs::metadata(&exe).map_err(|e| format!("metadata: {e}"))?;
+            let mtime = meta.modified().map_err(|e| format!("mtime: {e}"))?;
+            let since_epoch = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| format!("mtime before epoch: {e}"))?;
+            let exe_mtime_ns = u64::try_from(since_epoch.as_nanos())
+                .map_err(|_| "mtime out of range".to_string())?;
+
+            let mut vars: Vec<(String, String)> = std::env::vars_os()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+                .filter(|(k, _)| k.starts_with("METAL2VULKAN_"))
+                .collect();
+            vars.sort();
+            let mut env = Vec::new();
+            for (k, v) in vars {
+                env.extend_from_slice(k.as_bytes());
+                env.push(b'=');
+                env.extend_from_slice(v.as_bytes());
+                env.push(0);
+            }
+            Ok(Self {
+                reflection_version: metal2vulkan::reflect::REFLECTION_VERSION,
+                exe_size: meta.len(),
+                exe_mtime_ns,
+                env_hash: checksum(&env),
+            })
+        }
+    }
+
+    /// Why an entry that exists was not used.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Stale {
+        Magic,
+        Schema,
+        Stamp,
+        Stage,
+        LocalSize,
+        Length,
+        Air,
+        Checksum,
+        Reflection,
+        Io,
+    }
+
+    impl Stale {
+        pub(super) fn as_str(self) -> &'static str {
+            match self {
+                Self::Magic => "magic",
+                Self::Schema => "schema",
+                Self::Stamp => "stamp",
+                Self::Stage => "stage",
+                Self::LocalSize => "local_size",
+                Self::Length => "length",
+                Self::Air => "air",
+                Self::Checksum => "checksum",
+                Self::Reflection => "reflection",
+                Self::Io => "io",
+            }
+        }
+    }
+
+    /// The counters the census line carries.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) struct Census {
+        pub hits: u64,
+        pub misses: u64,
+        pub stale: u64,
+        pub write_failures: u64,
+    }
+
+    pub(super) struct DiskCache {
+        dir: PathBuf,
+        stamp: Stamp,
+        hits: AtomicU64,
+        misses: AtomicU64,
+        stale: AtomicU64,
+        write_failures: AtomicU64,
+        error_reported: AtomicBool,
+    }
+
+    /// The process's cache: `None` unless the lab switch names a directory (and
+    /// the executable could be stamped). Latched on first use.
+    pub(super) fn global() -> Option<&'static DiskCache> {
+        static DISK: OnceLock<Option<DiskCache>> = OnceLock::new();
+        DISK.get_or_init(|| {
+            let dir = std::env::var_os(ENV).filter(|v| !v.is_empty())?;
+            let dir = PathBuf::from(dir);
+            match Stamp::current() {
+                Ok(stamp) => {
+                    crate::observe::off(format!(
+                        "linux_m2v_disk enabled dir={} schema={SCHEMA} reflection={} exe_size={} \
+                         exe_mtime_ns={} env={:016x}",
+                        log_token(&dir.display().to_string()),
+                        stamp.reflection_version,
+                        stamp.exe_size,
+                        stamp.exe_mtime_ns,
+                        stamp.env_hash,
+                    ));
+                    Some(DiskCache::new(dir, stamp))
+                }
+                Err(e) => {
+                    crate::observe::fail(format!(
+                        "linux_m2v_disk reason=no_stamp err={} (cache stays off: without an \
+                         executable stamp a stale entry cannot be told from a fresh one)",
+                        log_token(&e)
+                    ));
+                    None
+                }
+            }
+        })
+        .as_ref()
+    }
+
+    /// Run `translate` for an in-memory miss, answering from disk when `disk`
+    /// holds this exact shader and writing the result when it does not.
+    ///
+    /// Everything the caller does with the result is the same on both paths;
+    /// that is the point of caching the translator's output rather than ours.
+    pub(super) fn obtain(
+        disk: Option<&DiskCache>,
+        id: ShaderId<'_>,
+        translate: impl FnOnce() -> M2vResult<Raw>,
+    ) -> M2vResult<Raw> {
+        let Some(disk) = disk else {
+            return translate();
+        };
+        if let Some(raw) = disk.load(id) {
+            return Ok(raw);
+        }
+        let raw = translate()?;
+        disk.store(id, &raw.0, &raw.1);
+        Ok(raw)
+    }
+
+    fn tag_name(tag: u8) -> &'static str {
+        match tag {
+            1 => "vertex",
+            2 => "fragment",
+            3 => "kernel",
+            _ => "unknown",
+        }
+    }
+
+    impl DiskCache {
+        pub(super) fn new(dir: PathBuf, stamp: Stamp) -> Self {
+            Self {
+                dir,
+                stamp,
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+                stale: AtomicU64::new(0),
+                write_failures: AtomicU64::new(0),
+                error_reported: AtomicBool::new(false),
+            }
+        }
+
+        pub(super) fn census(&self) -> Census {
+            Census {
+                hits: self.hits.load(Ordering::Relaxed),
+                misses: self.misses.load(Ordering::Relaxed),
+                stale: self.stale.load(Ordering::Relaxed),
+                write_failures: self.write_failures.load(Ordering::Relaxed),
+            }
+        }
+
+        /// One file per shader, named by stage and the bucket digest.
+        pub(super) fn path(&self, id: ShaderId<'_>) -> PathBuf {
+            self.dir
+                .join(format!("{}-{:016x}.m2v", tag_name(id.stage), id.digest))
+        }
+
+        /// The stored translation of exactly this shader, or `None`.
+        pub(super) fn load(&self, id: ShaderId<'_>) -> Option<Raw> {
+            let started = Instant::now();
+            let path = self.path(id);
+            let result = match std::fs::read(&path) {
+                Ok(bytes) => decode(&self.stamp, &bytes, id).map_err(Some),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(None),
+                Err(e) => {
+                    self.report_once("read", &path, &e.to_string());
+                    Err(Some(Stale::Io))
+                }
+            };
+            let us = started.elapsed().as_micros();
+            match result {
+                Ok(raw) => {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    self.line("hit", id, &format!("spv={} us={us}", raw.0.len()));
+                    Some(raw)
+                }
+                Err(None) => {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    self.line("miss", id, &format!("us={us}"));
+                    None
+                }
+                Err(Some(why)) => {
+                    self.stale.fetch_add(1, Ordering::Relaxed);
+                    self.line("stale", id, &format!("why={} us={us}", why.as_str()));
+                    None
+                }
+            }
+        }
+
+        /// Persist a fresh translation. Never fails the caller.
+        pub(super) fn store(&self, id: ShaderId<'_>, spirv: &[u8], reflection: &ShaderReflection) {
+            let started = Instant::now();
+            match self.try_store(id, spirv, reflection) {
+                Ok(bytes) => {
+                    let us = started.elapsed().as_micros();
+                    self.line("stored", id, &format!("bytes={bytes} us={us}"));
+                }
+                Err((op, detail)) => {
+                    self.write_failures.fetch_add(1, Ordering::Relaxed);
+                    self.report_once(op, &self.path(id), &detail);
+                    let us = started.elapsed().as_micros();
+                    self.line("write_fail", id, &format!("op={op} us={us}"));
+                }
+            }
+        }
+
+        fn try_store(
+            &self,
+            id: ShaderId<'_>,
+            spirv: &[u8],
+            reflection: &ShaderReflection,
+        ) -> Result<usize, (&'static str, String)> {
+            let json = serde_json::to_vec(reflection).map_err(|e| ("serialize", e.to_string()))?;
+            // JSON cannot carry a non-finite float: serde_json writes `null` for
+            // one and then refuses to read it back, which would make this entry a
+            // stale file on every boot and a write on every boot after. Prove the
+            // round trip now, while the original is in hand, and keep such a
+            // shader out of the directory instead.
+            match serde_json::from_slice::<ShaderReflection>(&json) {
+                Ok(back) if back == *reflection => {}
+                Ok(_) => return Err(("roundtrip", "reflection changed in transit".into())),
+                Err(e) => return Err(("roundtrip", e.to_string())),
+            }
+            let bytes = encode(&self.stamp, id, spirv, &json);
+
+            std::fs::create_dir_all(&self.dir).map_err(|e| ("mkdir", e.to_string()))?;
+            // Written beside the destination and renamed over it, so a reader —
+            // this process, or the other VM's — sees the old file or the whole new
+            // one. The name carries the pid and a sequence so two processes (or an
+            // inline and a background translation of the same shader) cannot
+            // share a temporary.
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let path = self.path(id);
+            let tmp = path.with_extension(format!(
+                "{}.{}.tmp",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::write(&tmp, &bytes).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                ("write", e.to_string())
+            })?;
+            std::fs::rename(&tmp, &path).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                ("rename", e.to_string())
+            })?;
+            Ok(bytes.len())
+        }
+
+        /// The first disk error of the process, on the always-on channel. Every
+        /// one is counted; one line is enough to say the cache is not working.
+        fn report_once(&self, op: &str, path: &std::path::Path, detail: &str) {
+            if !self.error_reported.swap(true, Ordering::Relaxed) {
+                crate::observe::fail(format!(
+                    "linux_m2v_disk reason=io_error op={op} file={} err={} (the translation is \
+                     used regardless; further disk errors are counted, not logged)",
+                    log_token(&path.display().to_string()),
+                    log_token(detail)
+                ));
+            }
+        }
+
+        /// The census line: one per disk event, each carrying the running
+        /// counters, so the last one in a log is the boot's total.
+        fn line(&self, event: &str, id: ShaderId<'_>, detail: &str) {
+            let c = self.census();
+            crate::observe::off(format!(
+                "linux_m2v_disk {event} stage={} key={:016x} air={} {detail} disk_hits={} \
+                 disk_misses={} disk_stale={} disk_write_fail={}",
+                tag_name(id.stage),
+                id.digest,
+                id.air.len(),
+                c.hits,
+                c.misses,
+                c.stale,
+                c.write_failures
+            ));
+        }
+    }
+
+    /// Integrity check, not a security one: every step is a bijection of the
+    /// running value, so corruption confined to one 8-byte lane always changes
+    /// the result, and the length is mixed in so truncation does too.
+    pub(super) fn checksum(bytes: &[u8]) -> u64 {
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut h = 0xcbf2_9ce4_8422_2325u64 ^ bytes.len() as u64;
+        let mut lanes = bytes.chunks_exact(8);
+        for c in &mut lanes {
+            let lane = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+            h = (h ^ lane).wrapping_mul(PRIME);
+        }
+        let rest = lanes.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            h = (h ^ u64::from_le_bytes(last)).wrapping_mul(PRIME);
+        }
+        h ^ (h >> 32)
+    }
+
+    /// The entry file for `id`: header, AIR, SPIR-V, reflection JSON, checksum
+    /// of everything before it. All integers little-endian.
+    ///
+    /// ```text
+    /// magic[8] schema:u32
+    /// stamp: reflection_version:u32 exe_size:u64 exe_mtime_ns:u64 env_hash:u64
+    /// stage:u8 has_local_size:u8 local_size:[u32;3]
+    /// air_len:u64 spirv_len:u64 json_len:u64
+    /// air spirv json
+    /// checksum:u64
+    /// ```
+    pub(super) fn encode(stamp: &Stamp, id: ShaderId<'_>, spirv: &[u8], json: &[u8]) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(HEADER_LEN + id.air.len() + spirv.len() + json.len() + TRAILER_LEN);
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&SCHEMA.to_le_bytes());
+        out.extend_from_slice(&stamp.reflection_version.to_le_bytes());
+        out.extend_from_slice(&stamp.exe_size.to_le_bytes());
+        out.extend_from_slice(&stamp.exe_mtime_ns.to_le_bytes());
+        out.extend_from_slice(&stamp.env_hash.to_le_bytes());
+        out.push(id.stage);
+        out.push(u8::from(id.local_size.is_some()));
+        for d in id.local_size.unwrap_or([0; 3]) {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        for len in [id.air.len(), spirv.len(), json.len()] {
+            out.extend_from_slice(&(len as u64).to_le_bytes());
+        }
+        out.extend_from_slice(id.air);
+        out.extend_from_slice(spirv);
+        out.extend_from_slice(json);
+        let sum = checksum(&out);
+        out.extend_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    struct Reader<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> Reader<'a> {
+        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+            let end = self.pos.checked_add(n)?;
+            let slice = self.bytes.get(self.pos..end)?;
+            self.pos = end;
+            Some(slice)
+        }
+
+        fn u8(&mut self) -> Option<u8> {
+            self.take(1).map(|b| b[0])
+        }
+
+        fn u32(&mut self) -> Option<u32> {
+            self.take(4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        }
+
+        fn u64(&mut self) -> Option<u64> {
+            self.take(8)
+                .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        }
+    }
+
+    /// An entry's translation, if the file is a whole, current entry for exactly
+    /// `id`; otherwise the first reason it is not. Total over every byte string.
+    pub(super) fn decode(stamp: &Stamp, bytes: &[u8], id: ShaderId<'_>) -> Result<Raw, Stale> {
+        let mut r = Reader { bytes, pos: 0 };
+        let truncated = Stale::Length;
+        if bytes.len() < HEADER_LEN + TRAILER_LEN {
+            // Too short to hold a header: say *what* it is if the prefix we have
+            // is not even ours, so a foreign file and a torn one read differently.
+            return Err(if bytes.get(..MAGIC.len()) == Some(&MAGIC[..]) {
+                truncated
+            } else {
+                Stale::Magic
+            });
+        }
+        if r.take(MAGIC.len()) != Some(&MAGIC[..]) {
+            return Err(Stale::Magic);
+        }
+        if r.u32() != Some(SCHEMA) {
+            return Err(Stale::Schema);
+        }
+        let stored = Stamp {
+            reflection_version: r.u32().ok_or(truncated)?,
+            exe_size: r.u64().ok_or(truncated)?,
+            exe_mtime_ns: r.u64().ok_or(truncated)?,
+            env_hash: r.u64().ok_or(truncated)?,
+        };
+        if stored != *stamp {
+            return Err(Stale::Stamp);
+        }
+        if r.u8().ok_or(truncated)? != id.stage {
+            return Err(Stale::Stage);
+        }
+        let has_local = r.u8().ok_or(truncated)?;
+        let local = [
+            r.u32().ok_or(truncated)?,
+            r.u32().ok_or(truncated)?,
+            r.u32().ok_or(truncated)?,
+        ];
+        let stored_local = match has_local {
+            0 if local == [0; 3] => None,
+            1 => Some(local),
+            _ => return Err(Stale::LocalSize),
+        };
+        if stored_local != id.local_size {
+            return Err(Stale::LocalSize);
+        }
+        let mut lens = [0usize; 3];
+        for len in &mut lens {
+            *len = usize::try_from(r.u64().ok_or(truncated)?).map_err(|_| truncated)?;
+        }
+        let [air_len, spirv_len, json_len] = lens;
+        // The lengths are the file's own claim: they are believed only once they
+        // account for every byte, and nothing is allocated from them.
+        let payload = air_len
+            .checked_add(spirv_len)
+            .and_then(|n| n.checked_add(json_len))
+            .ok_or(truncated)?;
+        if HEADER_LEN
+            .checked_add(payload)
+            .and_then(|n| n.checked_add(TRAILER_LEN))
+            != Some(bytes.len())
+        {
+            return Err(truncated);
+        }
+        let air = r.take(air_len).ok_or(truncated)?;
+        if air != id.air {
+            return Err(Stale::Air);
+        }
+        let spirv = r.take(spirv_len).ok_or(truncated)?;
+        let json = r.take(json_len).ok_or(truncated)?;
+        let body_end = r.pos;
+        let sum = r.u64().ok_or(truncated)?;
+        if sum != checksum(&bytes[..body_end]) {
+            return Err(Stale::Checksum);
+        }
+        let reflection =
+            serde_json::from_slice::<ShaderReflection>(json).map_err(|_| Stale::Reflection)?;
+        Ok((spirv.to_vec(), reflection))
+    }
+}
+
 fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
+    let id = ShaderId::render(stage, air);
+    let (spirv, reflection) = disk::obtain(disk::global(), id, || translate_air_raw(air, stage))?;
+    capture_air(air, stage, &spirv);
+    finish_translated(spirv, reflection, stage)
+}
+
+/// The translator's own output for a render stage: no cache, no post-processing.
+fn translate_air_raw(air: &[u8], stage: Stage) -> M2vResult<disk::Raw> {
     // metal2vulkan's tool boundary uses fixed scratch names inside `tmp_dir`.
     // Serialize sync and background calls so their AIR/LLVM/SPIR-V files never
     // alias one another.
@@ -815,14 +1379,29 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     // Reflected translate: byte-identical SPIR-V PLUS the stage-interface facade.
     // `reflection.datalayout` carries the source `target datalayout` the sanitizer
     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
-    let (spirv, reflection) =
-        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
-            .map_err(|e| translate_decline(stage, e.to_string()))?;
-    capture_air(air, stage, &spirv);
-    finish_translated(spirv, reflection, stage)
+    metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
+        .map_err(|e| translate_decline(stage, e.to_string()))
 }
 
 fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedShader> {
+    let id = ShaderId::kernel(air, local_size);
+    let (spirv, reflection) = disk::obtain(disk::global(), id, || {
+        translate_kernel_air_raw(air, local_size)
+    })?;
+    capture_air(air, Stage::Kernel, &spirv);
+    if reflection.local_size != Some(local_size) {
+        return Err(M2vCacheDecline::KernelLocalSizeMismatch {
+            requested: local_size,
+            reflected: reflection.local_size,
+        });
+    }
+    finish_translated(spirv, reflection, Stage::Kernel)
+}
+
+/// The translator's own output for a kernel at `local_size`: no cache, no
+/// post-processing, and no check that the reflection agrees with the request —
+/// that one runs on a stored translation too.
+fn translate_kernel_air_raw(air: &[u8], local_size: [u32; 3]) -> M2vResult<disk::Raw> {
     let _guard = translation_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tmp_dir();
     let path = tmp.join("k.air");
@@ -833,7 +1412,7 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
         kernel_local_size: local_size,
         ..Default::default()
     };
-    let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
+    metal2vulkan::translate_reflected_with_options(
         path.to_str().unwrap_or("k.air"),
         Stage::Kernel,
         &tmp,
@@ -841,15 +1420,7 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
     )
     .map_err(|e| M2vCacheDecline::KernelTranslate {
         detail: e.to_string(),
-    })?;
-    capture_air(air, Stage::Kernel, &spirv);
-    if reflection.local_size != Some(local_size) {
-        return Err(M2vCacheDecline::KernelLocalSizeMismatch {
-            requested: local_size,
-            reflected: reflection.local_size,
-        });
-    }
-    finish_translated(spirv, reflection, Stage::Kernel)
+    })
 }
 
 /// Post-emit ABI reconciliation + package the translated shader with its reflection.
@@ -2132,5 +2703,520 @@ mod tests {
         slugs.dedup();
         assert_eq!(before, 12, "the m2v cache decline census moved");
         assert_eq!(before, slugs.len(), "duplicate m2v cache decline");
+    }
+
+    // ---- the on-disk translation cache (`mod disk`) ---------------------------
+    //
+    // Tested at the cache's own boundary: a `DiskCache` over a scratch directory,
+    // with the translator replaced by a closure, because the property under test
+    // is what a second boot is handed and not what the translator produces. The
+    // process-global `disk::global()` is latched from the environment and is not
+    // touched here.
+
+    /// A scratch directory removed on drop. Not created up front: the first
+    /// `store` has to make it, and that is part of what is under test.
+    struct DiskDir(std::path::PathBuf);
+
+    impl DiskDir {
+        fn new(tag: &str) -> Self {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "reims-vgpu-m2v-disk-test-{}-{n}-{tag}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+    }
+
+    impl Drop for DiskDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn stamp() -> disk::Stamp {
+        disk::Stamp {
+            reflection_version: metal2vulkan::reflect::REFLECTION_VERSION,
+            exe_size: 1_000_000,
+            exe_mtime_ns: 1_700_000_000_000_000_000,
+            env_hash: 0x1234,
+        }
+    }
+
+    /// A reflection with enough in it that a lossy round trip would show: a
+    /// sampler binding carrying a static sampler whose floats are not integers,
+    /// a datalayout, an entry point, and for a kernel its LocalSize.
+    fn sample_reflection(kernel: bool) -> ShaderReflection {
+        use metal2vulkan::reflect::{
+            DescriptorLayout, DescriptorLocation, ResourceBinding, ResourceKind,
+            SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerCoordinates,
+            SamplerFilter, SamplerMipFilter, SamplerReduction, ShaderStage, StaticSamplerState,
+            REFLECTION_VERSION, RESOURCE_DESCRIPTOR_SET, SAMPLER_BINDING_BASE,
+        };
+        let metal_index = 3;
+        ShaderReflection {
+            reflection_version: REFLECTION_VERSION,
+            stage: if kernel {
+                ShaderStage::Kernel
+            } else {
+                ShaderStage::Fragment
+            },
+            entry_point: Some("shader_main".to_string()),
+            bindings: vec![ResourceBinding {
+                // The kind that owns a static sampler state: reflection
+                // validation refuses the state on any other.
+                kind: ResourceKind::StaticSampler,
+                metal_index,
+                descriptor: Some(DescriptorLocation {
+                    set: RESOURCE_DESCRIPTOR_SET,
+                    binding: SAMPLER_BINDING_BASE + metal_index,
+                    count: 1,
+                }),
+                param_index: None,
+                stage_input_location: None,
+                address_space: None,
+                declared_size: None,
+                extent: None,
+                footprint: None,
+                type_layout: None,
+                type_name: Some("sampler".to_string()),
+                texture_shape: None,
+                embedded_source: None,
+                access: None,
+                static_sampler: Some(StaticSamplerState {
+                    min_filter: SamplerFilter::Linear,
+                    mag_filter: SamplerFilter::Nearest,
+                    mip_filter: SamplerMipFilter::Linear,
+                    address_mode_s: SamplerAddressMode::Repeat,
+                    address_mode_t: SamplerAddressMode::ClampToEdge,
+                    address_mode_r: SamplerAddressMode::MirroredRepeat,
+                    coordinates: SamplerCoordinates::Normalized,
+                    compare_function: SamplerCompareFunction::None,
+                    max_anisotropy: 4,
+                    lod_min_clamp: 0.1,
+                    lod_max_clamp: 65504.0,
+                    border_color: SamplerBorderColor::OpaqueBlack,
+                    reduction: SamplerReduction::WeightedAverage,
+                    lod_bias: -0.333_333_3,
+                    raw_words: [u64::MAX, 0x0123_4567_89ab_cdef],
+                }),
+            }],
+            argument_buffer_fields: vec![],
+            vertex_attributes: vec![],
+            varyings: vec![],
+            render_targets: vec![],
+            depth_members: vec![],
+            depth_qualifier: None,
+            stencil_members: vec![],
+            local_size: kernel.then_some([16, 16, 1]),
+            max_work_group_size: None,
+            vertex_builtins: None,
+            tessellation: None,
+            imageblock_layouts: vec![],
+            implicit_imageblock_attachments: vec![],
+            fragment_imageblock: None,
+            datalayout: Some(
+                "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64\
+                 -v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128\
+                 -v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+                    .to_string(),
+            ),
+            descriptor_layout: DescriptorLayout::default(),
+            kernel_dispatch: None,
+            runtime_sampler_specializations: vec![],
+            runtime_storage_image_specializations: vec![],
+            function_constants: vec![],
+        }
+    }
+
+    /// A SPIR-V module the post-processing accepts, so `finish_translated` can
+    /// run on what the disk hands back.
+    fn sample_spirv() -> Vec<u8> {
+        let base = metal2vulkan::reflect::SAMPLER_BINDING_BASE;
+        crate::runtime::spirv_bind::test_module_with_samplers(&[base + 3])
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect()
+    }
+
+    fn entry_bytes(id: ShaderId<'_>, kernel: bool) -> Vec<u8> {
+        let json = serde_json::to_vec(&sample_reflection(kernel)).unwrap();
+        disk::encode(&stamp(), id, &sample_spirv(), &json)
+    }
+
+    /// The point of the cache: a second boot is handed the first boot's
+    /// translator output, byte for byte, without running the translator, and the
+    /// post-processing that follows cannot tell it from a fresh translation.
+    ///
+    /// The second boot is a new `DiskCache` over the same directory: nothing is
+    /// shared with the first but the files, which is what a new process has.
+    #[test]
+    fn a_translation_stored_by_one_boot_is_handed_to_the_next_unchanged() {
+        let _guard = test_lock();
+        reset_for_test();
+        let dir = DiskDir::new("roundtrip");
+        let air = b"air-of-a-fragment-shader-worth-keeping";
+        let id = ShaderId::render(Stage::Fragment, air);
+        let translations = std::cell::Cell::new(0u32);
+        let translate = || -> M2vResult<disk::Raw> {
+            translations.set(translations.get() + 1);
+            Ok((sample_spirv(), sample_reflection(false)))
+        };
+
+        let first = disk::DiskCache::new(dir.0.clone(), stamp());
+        let fresh = disk::obtain(Some(&first), id, translate).unwrap();
+        assert_eq!(translations.get(), 1, "an empty directory translates");
+        assert_eq!(
+            first.census(),
+            disk::Census {
+                hits: 0,
+                misses: 1,
+                stale: 0,
+                write_failures: 0
+            }
+        );
+        assert_eq!(
+            first.path(id).file_name().unwrap().to_str().unwrap(),
+            format!("fragment-{:016x}.m2v", air_key(Stage::Fragment, air)),
+            "one file per entry, named by stage and air_key"
+        );
+        assert!(first.path(id).is_file(), "the translation reached the disk");
+
+        let second = disk::DiskCache::new(dir.0.clone(), stamp());
+        let loaded = disk::obtain(Some(&second), id, translate).unwrap();
+        assert_eq!(translations.get(), 1, "a hit must not run the translator");
+        assert_eq!(second.census().hits, 1);
+        assert_eq!(second.census().misses, 0);
+        assert_eq!(loaded.0, fresh.0, "identical SPIR-V bytes");
+        assert_eq!(loaded.1, fresh.1, "identical reflection");
+
+        // Same input to the post-processing, same output from it.
+        let from_fresh = finish_translated(fresh.0, fresh.1, Stage::Fragment).unwrap();
+        let from_disk = finish_translated(loaded.0, loaded.1, Stage::Fragment).unwrap();
+        assert_eq!(from_disk.spirv, from_fresh.spirv);
+        assert_eq!(*from_disk.words, *from_fresh.words);
+        assert_eq!(*from_disk.reflection, *from_fresh.reflection);
+        reset_for_test();
+    }
+
+    /// A kernel's LocalSize is part of its identity, on disk as in memory: one
+    /// AIR blob at two geometries is two entries, and a stored one is not an
+    /// answer for the other even if the digests were to meet.
+    #[test]
+    fn a_kernel_entry_answers_only_the_local_size_it_was_translated_at() {
+        let dir = DiskDir::new("kernel");
+        let air = b"air-of-a-kernel";
+        let cache = disk::DiskCache::new(dir.0.clone(), stamp());
+        let id = ShaderId::kernel(air, [16, 16, 1]);
+        cache.store(id, &sample_spirv(), &sample_reflection(true));
+        assert!(cache.load(id).is_some());
+
+        let other = ShaderId::kernel(air, [8, 8, 1]);
+        assert_ne!(
+            other.digest, id.digest,
+            "distinct geometries, distinct files"
+        );
+        assert!(cache.load(other).is_none());
+
+        // Forced into the same file: the entry's own LocalSize decides.
+        let bytes = entry_bytes(id, true);
+        let forged = ShaderId {
+            local_size: Some([8, 8, 1]),
+            ..id
+        };
+        assert_eq!(
+            disk::decode(&stamp(), &bytes, forged).err(),
+            Some(disk::Stale::LocalSize)
+        );
+        let not_a_kernel = ShaderId {
+            local_size: None,
+            ..id
+        };
+        assert_eq!(
+            disk::decode(&stamp(), &bytes, not_a_kernel).err(),
+            Some(disk::Stale::LocalSize)
+        );
+    }
+
+    /// The digest names the file and decides nothing: other AIR under the same
+    /// key is a miss, and so is the same bytes asked for as another stage.
+    #[test]
+    fn other_air_under_the_same_key_is_a_miss() {
+        let dir = DiskDir::new("air");
+        let cache = disk::DiskCache::new(dir.0.clone(), stamp());
+        let id = ShaderId::render(Stage::Fragment, b"the-air-that-was-translated");
+        cache.store(id, &sample_spirv(), &sample_reflection(false));
+        assert!(cache.load(id).is_some());
+
+        // The same digest — so the same file — over different bytes. One byte
+        // differing, a longer blob that begins with the stored one, a shorter
+        // prefix of it, and nothing at all.
+        let colliding_air: [&[u8]; 4] = [
+            b"the-air-that-was-translateD",
+            b"the-air-that-was-translated-and-then-some",
+            b"the-air",
+            b"",
+        ];
+        for air in colliding_air {
+            let colliding = ShaderId { air, ..id };
+            assert!(cache.load(colliding).is_none(), "{air:?}");
+        }
+        assert_eq!(
+            cache.census().stale,
+            4,
+            "all four found the file and refused it"
+        );
+
+        // Another stage under that digest names another file, and the entry
+        // itself also says what stage it is.
+        let as_vertex = ShaderId { stage: 1, ..id };
+        assert!(cache.load(as_vertex).is_none());
+        let bytes = entry_bytes(id, false);
+        assert_eq!(
+            disk::decode(&stamp(), &bytes, as_vertex).err(),
+            Some(disk::Stale::Stage)
+        );
+        assert_eq!(
+            disk::decode(&stamp(), &bytes, ShaderId { air: b"x", ..id }).err(),
+            Some(disk::Stale::Air)
+        );
+    }
+
+    /// Any difference in what produced an entry makes it a miss, and the miss is
+    /// repaired in place: the rebuilt binary's translation replaces the file, so
+    /// the directory keeps one entry per shader rather than one per build.
+    #[test]
+    fn an_entry_from_another_build_is_a_miss_and_is_replaced() {
+        let dir = DiskDir::new("stamp");
+        let id = ShaderId::render(Stage::Vertex, b"air-for-the-stamp-test");
+        let old = disk::DiskCache::new(dir.0.clone(), stamp());
+        old.store(id, &sample_spirv(), &sample_reflection(false));
+        assert!(old.load(id).is_some());
+
+        let others = [
+            disk::Stamp {
+                exe_size: stamp().exe_size + 1,
+                ..stamp()
+            },
+            disk::Stamp {
+                exe_mtime_ns: stamp().exe_mtime_ns + 1,
+                ..stamp()
+            },
+            disk::Stamp {
+                reflection_version: stamp().reflection_version + 1,
+                ..stamp()
+            },
+            disk::Stamp {
+                env_hash: stamp().env_hash ^ 1,
+                ..stamp()
+            },
+        ];
+        for other in others {
+            let rebuilt = disk::DiskCache::new(dir.0.clone(), other);
+            assert!(rebuilt.load(id).is_none(), "{other:?}");
+            assert_eq!(rebuilt.census().stale, 1, "{other:?}");
+            assert_eq!(rebuilt.census().hits, 0, "{other:?}");
+        }
+        assert!(
+            old.load(id).is_some(),
+            "refusing an entry must not damage it"
+        );
+
+        // The newer build translates, writes, and from then on owns the file.
+        let newer = disk::DiskCache::new(dir.0.clone(), others[0]);
+        newer.store(id, &sample_spirv(), &sample_reflection(false));
+        assert!(newer.load(id).is_some());
+        assert!(old.load(id).is_none(), "the file is the newer build's now");
+        let files = std::fs::read_dir(&dir.0).unwrap().count();
+        assert_eq!(
+            files, 1,
+            "one file per shader, and no temporaries left behind"
+        );
+    }
+
+    /// The stamp of the running executable exists and is stable, which is what
+    /// lets a second process find the first one's entries at all.
+    #[test]
+    fn the_running_executable_has_a_stable_stamp() {
+        let a = disk::Stamp::current().expect("the test executable can be stamped");
+        let b = disk::Stamp::current().unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            a.reflection_version,
+            metal2vulkan::reflect::REFLECTION_VERSION
+        );
+        assert!(a.exe_size > 0 && a.exe_mtime_ns > 0);
+    }
+
+    /// A torn, truncated, foreign or bit-rotted file is a miss. It is also never
+    /// a panic and never a hit — the SPIR-V bytes are the one part nothing else
+    /// compares, so every single-byte change must be caught by *something*.
+    #[test]
+    fn a_corrupt_or_truncated_entry_is_a_miss_not_a_panic() {
+        let air = b"air-for-the-corruption-test";
+        for (id, kernel) in [
+            (ShaderId::render(Stage::Fragment, air), false),
+            (ShaderId::kernel(air, [16, 16, 1]), true),
+        ] {
+            let good = entry_bytes(id, kernel);
+            assert!(
+                disk::decode(&stamp(), &good, id).is_ok(),
+                "the fixture is a valid entry"
+            );
+
+            for n in 0..good.len() {
+                assert!(
+                    disk::decode(&stamp(), &good[..n], id).is_err(),
+                    "a {n}-byte prefix of a {}-byte entry was accepted",
+                    good.len()
+                );
+            }
+            let mut padded = good.clone();
+            padded.push(0);
+            assert_eq!(
+                disk::decode(&stamp(), &padded, id).err(),
+                Some(disk::Stale::Length),
+                "bytes beyond the checksum"
+            );
+            for at in 0..good.len() {
+                let mut flipped = good.clone();
+                flipped[at] ^= 0xff;
+                assert!(
+                    disk::decode(&stamp(), &flipped, id).is_err(),
+                    "flipping byte {at} of {} went unnoticed",
+                    good.len()
+                );
+            }
+        }
+
+        // Lengths that claim more than the file has, or more than a usize.
+        let id = ShaderId::render(Stage::Fragment, air);
+        let good = entry_bytes(id, false);
+        // Header: magic 8, schema 4, stamp 28, stage 1, flag 1, local 12.
+        let lengths_at = 8 + 4 + 28 + 1 + 1 + 12;
+        for lengths in [[u64::MAX; 3], [u64::MAX, 1, 1], [1 << 62, 1 << 62, 1 << 62]] {
+            let mut huge = good.clone();
+            for (i, len) in lengths.iter().enumerate() {
+                let at = lengths_at + 8 * i;
+                huge[at..at + 8].copy_from_slice(&len.to_le_bytes());
+            }
+            assert_eq!(
+                disk::decode(&stamp(), &huge, id).err(),
+                Some(disk::Stale::Length)
+            );
+        }
+
+        // A frame that is intact end to end around a reflection that is not
+        // JSON the type reads: the checksum cannot catch it, the parse does.
+        for json in [&b"not json"[..], &b"{}"[..], &b""[..], &b"null"[..]] {
+            let framed = disk::encode(&stamp(), id, &sample_spirv(), json);
+            assert_eq!(
+                disk::decode(&stamp(), &framed, id).err(),
+                Some(disk::Stale::Reflection),
+                "{json:?}"
+            );
+        }
+    }
+
+    /// The same, through the file path: an entry on disk that is garbage, empty,
+    /// or cut short is a counted miss, and a fresh translation then repairs it.
+    #[test]
+    fn a_damaged_file_is_repaired_by_the_next_translation() {
+        let dir = DiskDir::new("damaged");
+        let id = ShaderId::render(Stage::Fragment, b"air-for-the-damaged-file-test");
+        let cache = disk::DiskCache::new(dir.0.clone(), stamp());
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let good = entry_bytes(id, false);
+        for damaged in [
+            Vec::new(),
+            b"not an entry at all".to_vec(),
+            good[..good.len() / 2].to_vec(),
+        ] {
+            std::fs::write(cache.path(id), &damaged).unwrap();
+            let translations = std::cell::Cell::new(0u32);
+            let raw = disk::obtain(Some(&cache), id, || {
+                translations.set(translations.get() + 1);
+                Ok((sample_spirv(), sample_reflection(false)))
+            })
+            .unwrap();
+            assert_eq!(
+                translations.get(),
+                1,
+                "a damaged entry falls back to the translator"
+            );
+            assert_eq!(raw.1, sample_reflection(false));
+            assert!(
+                cache.load(id).is_some(),
+                "and the write that follows repairs it"
+            );
+        }
+        assert_eq!(cache.census().stale, 3);
+        assert_eq!(cache.census().write_failures, 0);
+    }
+
+    /// A disk that will not take the write does not fail the translation: the
+    /// translator's result still comes back, and the failure is counted.
+    #[test]
+    fn a_disk_that_cannot_be_written_does_not_fail_the_translation() {
+        let dir = DiskDir::new("unwritable");
+        // The cache directory is a file, so neither reads nor mkdir can work.
+        std::fs::write(&dir.0, b"in the way").unwrap();
+        let cache = disk::DiskCache::new(dir.0.clone(), stamp());
+        let id = ShaderId::render(Stage::Fragment, b"air-for-the-unwritable-test");
+        let raw = disk::obtain(Some(&cache), id, || {
+            Ok((sample_spirv(), sample_reflection(false)))
+        })
+        .expect("the translation succeeded; the disk is not its business");
+        assert_eq!(raw.0, sample_spirv());
+        let census = cache.census();
+        assert_eq!(census.write_failures, 1);
+        assert_eq!(census.hits, 0);
+
+        // And a translator failure is still the translator's: nothing is stored.
+        let failing = ShaderId::render(Stage::Fragment, b"air-that-does-not-translate");
+        let err = disk::obtain(Some(&cache), failing, || {
+            Err(M2vCacheDecline::FragmentTranslate {
+                detail: "no".into(),
+            })
+        });
+        assert_eq!(
+            err.err(),
+            Some(M2vCacheDecline::FragmentTranslate {
+                detail: "no".into()
+            })
+        );
+        assert_eq!(cache.census().write_failures, 1);
+    }
+
+    /// A reflection JSON cannot carry stays out of the directory: `serde_json`
+    /// writes `null` for a non-finite float and cannot read it back, so storing
+    /// it would make a stale file of it on every boot.
+    #[test]
+    fn a_reflection_that_does_not_survive_json_is_not_stored() {
+        let dir = DiskDir::new("nonfinite");
+        let cache = disk::DiskCache::new(dir.0.clone(), stamp());
+        let id = ShaderId::render(Stage::Fragment, b"air-with-an-infinite-lod");
+        let mut reflection = sample_reflection(false);
+        if let Some(sampler) = reflection.bindings[0].static_sampler.as_mut() {
+            sampler.lod_max_clamp = f32::INFINITY;
+        }
+        cache.store(id, &sample_spirv(), &reflection);
+        assert_eq!(cache.census().write_failures, 1);
+        assert!(!cache.path(id).exists(), "nothing was written");
+    }
+
+    /// With the switch unset the cache is not there: the translator runs and
+    /// nothing else happens.
+    #[test]
+    fn with_the_switch_unset_the_translator_runs_and_nothing_is_stored() {
+        if std::env::var_os(disk::ENV).is_none_or(|v| v.is_empty()) {
+            assert!(disk::global().is_none());
+        }
+        let id = ShaderId::render(Stage::Fragment, b"air-with-no-disk");
+        let raw =
+            disk::obtain(None, id, || Ok((sample_spirv(), sample_reflection(false)))).unwrap();
+        assert_eq!(raw.1, sample_reflection(false));
     }
 }
