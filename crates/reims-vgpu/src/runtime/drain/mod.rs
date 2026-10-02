@@ -9291,14 +9291,16 @@ mod lab_chan {
 
     pub(super) fn ring_snapshot() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RING_SNAPSHOT").is_ok_and(|v| v == "on"))
+        // On by default since n73/n74 (ch2 2.8-3.1 ms against 5.8-8.0, srv halved,
+        // no stripes, no device loss); `=off` reads rings to the live tail again.
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RING_SNAPSHOT").map_or(true, |v| v != "off"))
     }
 
     pub(super) fn preempt_on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            std::env::var("REIMS_VGPU_LAB_CTRL_PREEMPT").is_ok_and(|v| v == "on" || v == "all")
-        })
+        // On by default since n73/n74 (WindowServer's idx-2 waits halved by DTrace);
+        // `=off` restores serving ch2/ch4 in channel order only.
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CTRL_PREEMPT").map_or(true, |v| v != "off"))
     }
 
     pub(super) fn preempt_display() -> bool {

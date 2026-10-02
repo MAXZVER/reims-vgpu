@@ -911,7 +911,9 @@ pub fn lab_loop_budget(words: &[u32]) -> Option<Vec<u32>> {
         std::env::var("REIMS_VGPU_LAB_LOOP_BUDGET")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
+            // On by default since n74 (three stripe hunts clean, no device loss,
+            // frames unchanged); `=0` turns it off.
+            .unwrap_or(16384)
     });
     if cap == 0 {
         return None;
