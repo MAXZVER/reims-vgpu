@@ -307,6 +307,72 @@ impl WindowWaker {
     }
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_GAPS`): gaps between successive device
+/// publishes, the last publish's instant, and how long each present came after
+/// the publish it showed. Whether the present-gap tail is born before the
+/// window (guest and drain) or in it (winit's redraw path).
+static LAB_PUBLISH: std::sync::Mutex<(Option<std::time::Instant>, Vec<u32>, Vec<u32>)> =
+    std::sync::Mutex::new((None, Vec::new(), Vec::new()));
+
+/// TEMP (lab): a frame was published to the window slot.
+pub(crate) fn lab_publish_note() {
+    if std::env::var_os("REIMS_VGPU_LAB_PRESENT_GAPS").is_none() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut g = LAB_PUBLISH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(last) = g.0.replace(now) {
+        let us = now.duration_since(last).as_micros().min(u128::from(u32::MAX)) as u32;
+        g.1.push(us);
+    }
+}
+
+/// TEMP (lab): a present went out; how long after the last publish.
+pub(crate) fn lab_present_after_publish() {
+    let now = std::time::Instant::now();
+    let mut g = LAB_PUBLISH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(last) = g.0 {
+        let us = now.duration_since(last).as_micros().min(u128::from(u32::MAX)) as u32;
+        g.2.push(us);
+    }
+}
+
+/// TEMP (lab): the publish-gap and publish-to-present lines for the window
+/// just reported, or `None` when nothing was published.
+pub(crate) fn lab_publish_report() -> Option<String> {
+    let (mut gaps, mut lat) = {
+        let mut g = LAB_PUBLISH.lock().unwrap_or_else(|e| e.into_inner());
+        (std::mem::take(&mut g.1), std::mem::take(&mut g.2))
+    };
+    if gaps.is_empty() {
+        return None;
+    }
+    gaps.sort_unstable();
+    lat.sort_unstable();
+    let at = |v: &Vec<u32>, q: f64| {
+        if v.is_empty() {
+            0.0
+        } else {
+            v[((v.len() - 1) as f64 * q).round() as usize] as f64 / 1000.0
+        }
+    };
+    let late = gaps.iter().filter(|&&us| us > 12_500).count();
+    Some(format!(
+        "lab_publish_gaps n={} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} max_ms={:.2} late={late} \
+         pub2present_n={} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} max_ms={:.2}",
+        gaps.len(),
+        at(&gaps, 0.5),
+        at(&gaps, 0.95),
+        at(&gaps, 0.99),
+        at(&gaps, 1.0),
+        lat.len(),
+        at(&lat, 0.5),
+        at(&lat, 0.95),
+        at(&lat, 0.99),
+        at(&lat, 1.0)
+    ))
+}
+
 /// Offer a published frame's CPU bytes to the rail's presenter.
 ///
 /// The presenter prefers the resident and only reads these when none carries the

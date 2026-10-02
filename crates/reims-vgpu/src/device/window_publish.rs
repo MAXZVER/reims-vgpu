@@ -416,6 +416,7 @@ fn window_write_frame(
         Err(_) => false,
     };
     if stored {
+        crate::host_window::present::lab_publish_note();
         link.wake.wake();
     }
     stored

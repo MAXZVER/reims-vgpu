@@ -1897,6 +1897,7 @@ fn lab_present_gap_note() {
     if !lab_present_gaps_on() {
         return;
     }
+    crate::host_window::present::lab_present_after_publish();
     let now = Instant::now();
     let mut g = LAB_PRESENT_GAPS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(last) = g.0.replace(now) {
@@ -1931,6 +1932,9 @@ fn lab_present_gap_report() {
         at(0.99),
         at(1.0)
     ));
+    if let Some(line) = crate::host_window::present::lab_publish_report() {
+        crate::observe::off(line);
+    }
 }
 
 struct CadenceBusy {
