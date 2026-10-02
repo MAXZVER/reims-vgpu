@@ -148,7 +148,7 @@ pub struct GvaStoreWitness {
 /// whether the bound binds rather than leaving it assumed.
 const MAX_TRACKED_TARGETS: usize = 128;
 
-/// TEMP (lab): the bound [`note_store`] evicts at. 512 unless
+/// TEMP (lab): the bound [`note_store`] evicts at. 128 unless
 /// `REIMS_VGPU_LAB_GVAW_MAX` names another (16..=4096); test builds keep
 /// [`MAX_TRACKED_TARGETS`]. Mission Control stores past 128 live targets and
 /// evicted 233 a second, each an untrack and a fresh track through the
@@ -163,7 +163,7 @@ fn max_tracked_targets() -> usize {
         std::env::var("REIMS_VGPU_LAB_GVAW_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(512usize)
+            .unwrap_or(MAX_TRACKED_TARGETS)
             .clamp(16, 4096)
     })
 }

@@ -18273,7 +18273,7 @@ fn memo_read_bgra8<M: HostMemory + HostOps>(
 /// magnification burst re-binds the same static icons ~1000×, so this collapses
 /// the `t11_guest` CPU copies that saturate the serial drain worker (the
 /// dock-hover whole-VM freeze). Returns `(rgba, identity)`.
-/// TEMP (lab, `REIMS_VGPU_LAB_MEMO_STAMP=off` disables): what the
+/// TEMP (lab, opt-in `REIMS_VGPU_LAB_MEMO_STAMP=on`): what the
 /// mapper-ref-texture memo saw when it last read a surface, so the next bind can
 /// tell "unchanged" without reading the surface again.
 ///
@@ -18308,7 +18308,7 @@ mod lab_memo_stamp {
     fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| {
-            std::env::var("REIMS_VGPU_LAB_MEMO_STAMP").map_or(true, |v| v != "off")
+            std::env::var("REIMS_VGPU_LAB_MEMO_STAMP").is_ok_and(|v| v == "on")
         })
     }
 
