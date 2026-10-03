@@ -6633,8 +6633,7 @@ fn apply_clear<M: HostMemory + HostOps>(
     // Format and clear representation are one contract decision. Continuous
     // colour keeps the semantic RGBA8 carrier the existing converters consume;
     // integer targets carry their own texels, where `1` remains the integer 1.
-    let Some(clear) =
-        pixel_format::solid_clear_image(c0.format, c0.width, c0.height, &att.clear_color)
+    let Some(clear) = lab_cached_clear_image(c0.format, c0.width, c0.height, &att.clear_color)
     else {
         note_clear_dropped(
             "target_clear_image_unrepresentable",
@@ -6710,6 +6709,54 @@ fn apply_clear<M: HostMemory + HostOps>(
         state.note_surface_clear(c0.mapping_id);
     }
     ok
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_CLEAR_CACHE`, on unless `=off`): the solid image
+/// of a clear-only pass, kept for the next clear of the same format, size and
+/// colour. A 5K clear built and filled ~42 MB every time; on fullscreen
+/// transitions the clear-only prelude cost ~1.9 ms a stream (n102 fs2o1:
+/// `fin_prelude_clear` 535 streams, 1.0 s), and the same new-size surfaces are
+/// cleared again and again. Two entries: the image is the pass result and
+/// immutable, so sharing it changes nothing a writer sees.
+fn lab_cached_clear_image(
+    format: u16,
+    width: u32,
+    height: u32,
+    clear: &[f64; pixel_format::COMPONENT_COUNT],
+) -> Option<std::rc::Rc<pixel_format::ClearImage>> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    type Key = (u16, u32, u32, [u64; pixel_format::COMPONENT_COUNT]);
+    thread_local! {
+        static CACHE: RefCell<Vec<(Key, Rc<pixel_format::ClearImage>)>> = const { RefCell::new(Vec::new()) };
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_CLEAR_CACHE").map_or(true, |v| v != "off")
+    });
+    if !on {
+        return pixel_format::solid_clear_image(format, width, height, clear).map(Rc::new);
+    }
+    let key: Key = (format, width, height, clear.map(f64::to_bits));
+    if let Some(hit) = CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let i = c.iter().position(|(k, _)| *k == key)?;
+        let e = c.remove(i);
+        let img = Rc::clone(&e.1);
+        c.insert(0, e);
+        Some(img)
+    }) {
+        crate::runtime::drain::note_store_route("lab_clear_cache_hit");
+        return Some(hit);
+    }
+    let img = Rc::new(pixel_format::solid_clear_image(format, width, height, clear)?);
+    crate::runtime::drain::note_store_route("lab_clear_cache_miss");
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.insert(0, (key, Rc::clone(&img)));
+        c.truncate(2);
+    });
+    Some(img)
 }
 
 pub(crate) mod finish_phase;
