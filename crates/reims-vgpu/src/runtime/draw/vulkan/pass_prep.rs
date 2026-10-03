@@ -19,14 +19,17 @@
 //! `off` mode is byte-for-byte the old path — neither this module nor the
 //! frame it pushes exists then.
 //!
-//! # The consumed-ref replan (design H6)
+//! # The consumed-ref replan (design H6, removed in step 2)
 //!
-//! A ref-view plan moves the gather witness when it is applied, so it serves
-//! one bind; [`prefetch::prefetched_source`] leaves the ref in the frame's
-//! `consumed` list. The next `ahead` takes that list and drops those refs from
-//! `planned`, so a later chunk that binds the ref again plans it *again* —
-//! from the witness's post-commit state — instead of re-serving a plan whose
-//! witness readings can no longer hold.
+//! The witness-backing plans (ref-view, the linear and mapper-ref gather
+//! arms) move the gather witness when they apply; since step 2 each commit
+//! hands back [`crate::runtime::gather_witness::PlannedGather::repeat`] — the
+//! plan for the next bind of the same key, from the post-commit state — so
+//! one plan per key serves the whole pass. A plan that *failed* validation
+//! still leaves the ref in the frame's `consumed` list through
+//! [`prefetch::prefetched_source`]; the next `ahead` takes that list and drops
+//! those refs from `planned`, so a later chunk that binds the ref plans it
+//! again from the witness's current state.
 
 use super::prefetch::{self, PrefetchGuard, StreamPlan};
 use super::*;
@@ -415,7 +418,9 @@ mod tests {
                     texture_ref: refs[which as usize],
                     resource: Some(
                         objects::resolve_resource(state, host, 1, refs[which as usize])
-                            .expect("fixture resource"),
+                            .unwrap_or_else(|e| {
+                                panic!("fixture resource ref {}: {e:?}", refs[which as usize])
+                            }),
                     ),
                 }]
             })
@@ -470,17 +475,52 @@ mod tests {
 
     /// Every bind a chunked `on` pass serves answers what the serial ladder
     /// answers for the same bind, and the fixture's observable state — the
-    /// host cache each answer came from and the mappings' epochs — is left
-    /// where the serial ladder leaves it.
+    /// host cache each answer came from, the mappings' epochs, and (for the
+    /// memo-bound refs) the memo itself — is left where the serial ladder
+    /// leaves it.
     #[test]
     fn chunked_answers_equal_serial() {
         let _mode = test_mode(PassPrepMode::On);
-        let refs = [2u32, 3, 4, 5, 6];
+        let refs = [2u32, 3, 4, 5, 6, 7, 8];
+        // Draws bind the five host-cache refs (pattern 0..5 → refs 2..6) and
+        // the two memo refs (pattern 5..6 → refs 7, 8) in a mix that repeats
+        // every rung across chunk boundaries.
         let pattern: Vec<u32> = vec![
-            0, 1, 2, 0, 3, 4, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1,
+            0, 1, 2, 0, // draws 0..4 (chunk 0): refs 2, 3, 4 are new
+            5, 3, 6, 4, // draws 4..8 (chunk 1): memo refs 7, 8 are new
+            0, 1, 2, 5, 3, 6, 4, 5, // draws 8..16: repeats across chunks
+            0, 6, 5, 1, // draws 16..20: more repeats
         ];
-        let (mut planned_state, mut planned_host) = multi_ref_fixture(&refs);
-        let (mut serial_state, mut serial_host) = multi_ref_fixture(&refs);
+        assert_eq!(pattern.len(), 20);
+        let (mut planned_state, mut planned_host) = multi_ref_fixture(&refs[..5]);
+        let (mut serial_state, mut serial_host) = multi_ref_fixture(&refs[..5]);
+        for (state, host) in [
+            (&mut planned_state, &mut planned_host),
+            (&mut serial_state, &mut serial_host),
+        ] {
+            host.stable_map_pages = true;
+            host.strict_linux_map = true;
+            add_memo_ref(state, host, 7, 81, 0x2800);
+            add_memo_ref(state, host, 8, 82, 0x2900);
+        }
+        // One serial bind per memo ref on the planned arm primes what the memo
+        // plan borrows (the contig refusal, the cached window, the token, the
+        // memo entry itself); the serial arm primes itself on its own first
+        // bind of each.
+        for &memo_ref in &refs[5..] {
+            let resource =
+                objects::resolve_resource(&planned_state, &planned_host, 1, memo_ref)
+                    .expect("memo resource");
+            let _prime = resolve_sampled_source(
+                &mut planned_state,
+                &mut planned_host,
+                1,
+                memo_ref,
+                Some(resource),
+                true,
+            )
+            .expect("the memo rung primes");
+        }
         let planned_binds = binds_for(&planned_state, &planned_host, &pattern, &refs);
         let planned_tables = tables_of(&planned_binds);
         let mut prep =
@@ -543,7 +583,7 @@ mod tests {
             }
         }
         drop(prep);
-        for (i, _) in refs.iter().enumerate() {
+        for (i, _) in refs[..5].iter().enumerate() {
             let surface_id = 71u32 + i as u32;
             let p = crate::runtime::surface_cache::get_shared_with_gen(
                 &planned_state,
@@ -566,6 +606,72 @@ mod tests {
                 "mapping epochs {surface_id}"
             );
         }
+        // The memo the two arms leave: same bytes, same generations.
+        for (n, &surface_id) in [81u32, 82].iter().enumerate() {
+            let key = (surface_id, 60, 64);
+            let p = planned_state.mapper_ref_texture_memo.peek(&key);
+            let s = serial_state.mapper_ref_texture_memo.peek(&key);
+            let shape = |m: Option<&crate::model::GuestLinearMemo>| {
+                m.map(|m| (m.native.clone(), m.rgba[..].to_vec(), m.generation, m.layout))
+            };
+            assert_eq!(shape(p), shape(s), "memo state {surface_id} #{n}");
+            assert!(p.is_some(), "the memo rung filled {surface_id}");
+        }
+    }
+
+    /// One memo-bound ref (`texture_ref` over `surface_id`, its descriptor at
+    /// `desc_gva`): 60x64 BGRA8 over four scattered pages with no host cache
+    /// and no resident, plus a mapping write token — the shape whose binds the
+    /// guest-memo rung serves once a serial bind has primed it.
+    fn add_memo_ref(
+        state: &mut DeviceState,
+        host: &mut FakeHost,
+        texture_ref: u32,
+        surface_id: u32,
+        desc_gva: u64,
+    ) {
+        use crate::protocol::endian::st32;
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+        use crate::runtime::gva_mem;
+        let built = reims_vgpu_wire::device_desc::RefTextureBuilder::new(surface_id, 0, 0, 0)
+            .with_len(objects::TYPE5_MIN_LEN);
+        assert!(gva_mem::write_task_gva(
+            host,
+            &state.tasks[1],
+            desc_gva,
+            built.bytes(),
+            PAGE_SHIFT_X86
+        )
+        .is_ok());
+        let list_off = list_object_entry_offset(texture_ref, 32).unwrap();
+        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        let packed =
+            (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((objects::TYPE5_MIN_LEN as u32) << 8);
+        st32(&mut list_entry, packed);
+        list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        assert!(gva_mem::write_task_gva(
+            host,
+            &state.tasks[1],
+            list_off,
+            &list_entry,
+            PAGE_SHIFT_X86
+        )
+        .is_ok());
+        assert!(state.map_surface(surface_id));
+        assert!(state.set_mapping_geom(surface_id, 60, 64, MTL_FORMAT_BGRA8_UNORM));
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpas: Vec<u64> = (0..4u64).map(|i| 0x6000_0000 + 2 * i * page).collect();
+        for (n, &gpa) in gpas.iter().enumerate() {
+            host.map_range(gpa, page as usize, 0x60 + n as u8);
+        }
+        state.mappings.get_mut(&surface_id).unwrap().page_entries = gpas
+            .iter()
+            .map(|&gpa| {
+                (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+            })
+            .collect();
+        let _ = crate::runtime::mapper::ensure_guest_write_token(state, host, surface_id);
     }
 
     /// A mapping whose generation moved between the chunk that planned it and
@@ -605,11 +711,12 @@ mod tests {
         drop(prep);
     }
 
-    /// A ref-view plan consumed by one chunk's bind is planned again by the
-    /// next chunk that binds the ref — from the witness state the consumed
-    /// plan's commit left — and serves again (design H6's removal).
+    /// A ref-view plan's commit hands back the gather repeat, so the second
+    /// bind of the same ref in the pass serves from the post state without a
+    /// replan (design H6's removal) — and no later chunk needs to plan the ref
+    /// again while the witness holds.
     #[test]
-    fn consumed_ref_view_is_replanned() {
+    fn a_repeated_key_serves_the_pass_from_the_post_state() {
         let _mode = test_mode(PassPrepMode::On);
         // The view fixture's shape plus two host-cache refs, so every chunk
         // that matters carries two new refs and forks: the view ref beside a
@@ -658,7 +765,7 @@ mod tests {
         // view ref plans.
         prep.ahead(&state, 0);
         assert_eq!(delta("par_prefetch_planned_ref_view", before_planned), 1);
-        // Draw 0 consumes the view plan: the commit moves the witness.
+        // Draw 0 commits the view plan: the frame entry becomes the repeat.
         let served = prefetch::prefetched_source(
             &mut state,
             &mut host,
@@ -673,21 +780,20 @@ mod tests {
         );
         assert_eq!(delta("par_prefetch_hit_ref_view", before_hit), 1);
         // Chunk 1 = draws 2..4: binds the cache ref only (nothing new); the
-        // view ref is consumed but not bound here, so it is *not* replanned yet.
+        // view ref's repeat stays in the frame untouched.
         prep.ahead(&state, 2);
         assert_eq!(
             delta("par_prefetch_planned_ref_view", before_planned),
             1,
             "no bind asked for the view ref, so no replan"
         );
-        // Chunk 2 = draws 4..6: binds the view ref (consumed, so new again)
-        // beside the second cache ref — the chunk forks and replans the view
-        // ref from the witness's post-commit state.
+        // Chunk 2 = draws 4..6: binds the view ref again — the repeat the
+        // first commit left serves it from the post state, with no replan.
         prep.ahead(&state, 4);
         assert_eq!(
             delta("par_prefetch_planned_ref_view", before_planned),
-            2,
-            "the consumed view ref is replanned"
+            1,
+            "the repeat covers the later bind; the ref is not replanned"
         );
         let again = prefetch::prefetched_source(
             &mut state,
@@ -699,7 +805,7 @@ mod tests {
         );
         assert!(
             matches!(again, prefetch::Prefetched::Serve(_)),
-            "the replanned view ref serves again"
+            "the repeated view plan serves the second bind"
         );
         assert_eq!(delta("par_prefetch_hit_ref_view", before_hit), 2);
         drop(prep);

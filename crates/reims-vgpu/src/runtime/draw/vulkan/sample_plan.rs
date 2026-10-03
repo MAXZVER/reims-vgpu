@@ -840,8 +840,9 @@ fn ref_view_plane<M: HostOps>(
 ///
 /// The serial counterpart is the materialization arm of [`resolve_sampled_source`]
 /// through [`try_ref_texture_sample_zero_copy`]. The witness decision moves the
-/// witness when it is applied, so a plan serves one bind of its ref per stream;
-/// the next bind of the same ref finds the entry moved and takes the serial path.
+/// witness when it is applied; the commit hands back the repeat for the next
+/// bind of the same ref (design H6's removal), committed from the post state.
+#[derive(Clone)]
 pub(crate) struct RefViewPlan {
     task_id: u32,
     texture_ref: u32,
@@ -941,7 +942,9 @@ pub(crate) fn plan_ref_view_zero_copy<M: HostMemory + HostOps>(
 ///
 /// Without `apply` nothing is written or noted, and the answer is the plan's
 /// prediction with no page window, for a shadow comparison against the serial
-/// rail that runs next.
+/// rail that runs next. With `apply` the pair's second element is the plan for
+/// the next bind of the same ref — the gather repeat, committed from the state
+/// this commit left (design H6's removal: one plan per key serves the pass).
 pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -950,7 +953,13 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
     texture_ref: u32,
     resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
     apply: bool,
-) -> Result<(u32, u32, u32, SampledSourceRequest), SampleInvalid> {
+) -> Result<
+    (
+        (u32, u32, u32, SampledSourceRequest),
+        Option<RefViewPlan>,
+    ),
+    SampleInvalid,
+> {
     if plan.task_id != task_id || plan.texture_ref != texture_ref {
         return Err(SampleInvalid::Key);
     }
@@ -1010,7 +1019,7 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
         )
     };
     if !apply {
-        return Ok(source(None, plan.gather.predicted()));
+        return Ok((source(None, plan.gather.predicted()), None));
     }
     // What the serial rail notes before it decides how to carry the plane.
     if let Some(bpp) = crate::protocol::pixel_format::bytes_per_pixel(view.pixel_format) {
@@ -1044,12 +1053,19 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("zc_packed_alias_standing_refusal");
     }
     crate::runtime::drain::note_store_route("lab_rf_wc_hit");
-    let outcome =
-        crate::runtime::gather_witness::commit_gather(state, &*host, &plan.gather, &plan.gpas)
-            .ok_or(SampleInvalid::Witness)?;
+    let (outcome, repeat) = crate::runtime::gather_witness::commit_gather_repeatable(
+        state,
+        &*host,
+        &plan.gather,
+        &plan.gpas,
+        &plan.runs,
+    )
+    .ok_or(SampleInvalid::Witness)?;
     let page = state.page_size();
     let pages = guest_page_window(host, &plan.gpas, page, base_off % page, span);
-    Ok(source(pages, outcome))
+    let mut next = plan.clone();
+    next.gather = repeat;
+    Ok((source(pages, outcome), Some(next)))
 }
 
 /// Whether the GVA-resident rung that sits above the linear zero-copy rail
@@ -2746,11 +2762,15 @@ mod tests {
         for _ in 0..3 {
             let plan = plan_ref_view_zero_copy(&b, &b_host, 1, texture_ref, rb.clone())
                 .unwrap_or_else(|bail| panic!("a warm view plans, got {bail:?}"));
-            let planned =
+            let (planned, repeat) =
                 commit_ref_view_plan(&mut b, &mut b_host, &plan, 1, texture_ref, Some(&rb), true)
                     .expect("nothing moved since the plan");
             let serial_a = serial(&mut a, &mut a_host, texture_ref, &ra);
             assert_eq!(runs_shape(&planned), runs_shape(&serial_a));
+            // The repeat is the plan the next bind of the ref commits; the
+            // loop re-plans from the witness anyway, which the two fixtures'
+            // continued agreement below covers.
+            drop(repeat);
         }
         // And the next serial bind of each agrees: the witnesses match.
         let next_a = serial(&mut a, &mut a_host, texture_ref, &ra);
@@ -2767,7 +2787,7 @@ mod tests {
         serial(&mut b, &mut b_host, texture_ref, &rb);
         let plan = plan_ref_view_zero_copy(&b, &b_host, 1, texture_ref, rb.clone()).expect("warm");
         // Shadow: validated, predicted, nothing applied — so the plan still holds.
-        let predicted =
+        let (predicted, _) =
             commit_ref_view_plan(&mut b, &mut b_host, &plan, 1, texture_ref, Some(&rb), false)
                 .expect("holds");
         assert!(matches!(predicted.3, SampledSourceRequest::GuestRuns(..)));
@@ -3560,8 +3580,10 @@ mod tests {
         );
     }
 
-    /// A cold memo (no entry, no primed window) is not planned, and a fill
-    /// that would exceed the chunk's budget is the `MemoBudget` refusal.
+    /// A cold memo (no entry, no primed window) is not planned, a debt under
+    /// the mapping is the `OwedFrame` refusal (the serial memo pays before it
+    /// reads), and a fill that would exceed the chunk's budget is the
+    /// `MemoBudget` refusal.
     #[test]
     fn cold_and_over_budget_memo_binds_stay_serial() {
         let (mut a, mut a_host, texture_ref, sid) = memo_fixture();
@@ -3581,6 +3603,28 @@ mod tests {
         // Primed by one serial bind, then planned against a spent budget.
         let _ = crate::runtime::mapper::ensure_guest_write_token(&mut a, &mut a_host, sid);
         let _ = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra.clone()), true);
+        // The mapping's debt is the one refusal before anything else: the
+        // serial memo settles (pays) before it reads, and a plan never pays.
+        a.pending_writebacks.arm(
+            sid,
+            crate::runtime::writeback_debt::test_resident_identity(sid, 60, 64, 1),
+            60,
+            64,
+            1,
+        );
+        assert_eq!(
+            plan_mapper_ref_memo(
+                &a,
+                &a_host,
+                1,
+                texture_ref,
+                ra.clone(),
+                &std::sync::atomic::AtomicU64::new(memo_fill_chunk_limit()),
+            )
+            .err(),
+            Some(SampleBail::OwedFrame)
+        );
+        a.pending_writebacks.take(sid);
         // The memo holds the surface now, so a plain plan hits; spend the
         // budget and rewrite a page so the next plan must fill.
         assert!(

@@ -12,12 +12,13 @@
 //! A surface plan is not consumed by its first use. Taking it notes census
 //! routes and changes no device state, so its reads still describe the state
 //! after it, and every later draw of the stream that binds the same ref
-//! re-validates the same plan. A ref-view plan (the zero-copy plane of a
-//! ref-texture view) applies a gather-witness decision, which moves the
-//! witness, so it serves one bind and is then dropped: the ref lands in the
-//! frame's `consumed` list, which [`super::pass_prep`]'s `ahead` reads to drop
-//! the ref from its planned set, so the next chunk that needs it plans it
-//! again from the witness's new state (the H6 repeat of the design).
+//! re-validates the same plan. The witness-backing plans (a ref-texture view's
+//! zero-copy plane, the linear and mapper-ref gather arms) move the witness
+//! when they apply, so each commit hands back the repeat for the next bind of
+//! the same key — [`crate::runtime::gather_witness::PlannedGather::repeat`],
+//! committed from the post state (design H6's removal): one plan per key
+//! serves the whole pass, and only a plan that failed validation lands the ref
+//! in the frame's `consumed` list for [`super::pass_prep`]'s `ahead` to replan.
 
 use super::*;
 use std::cell::RefCell;
@@ -360,13 +361,23 @@ pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
                     resource,
                     apply,
                 ) {
-                    Ok(served) if apply => {
+                    Ok((served, repeat)) if apply => {
                         crate::runtime::drain::note_store_route("par_prefetch_hit_ref_view");
-                        frame.map.remove(&key);
-                        frame.consumed.push(texture_ref);
+                        // The repeat commits the pass's later binds of the ref
+                        // from the post state (H6); a missing repeat only when
+                        // the entry vanished under the commit, which replans.
+                        match repeat {
+                            Some(next) => {
+                                frame.map.insert(key, StreamPlan::RefView(next));
+                            }
+                            None => {
+                                frame.map.remove(&key);
+                                frame.consumed.push(texture_ref);
+                            }
+                        }
                         Prefetched::Serve(served)
                     }
-                    Ok(predicted) => Prefetched::Shadow(predicted),
+                    Ok((predicted, _)) => Prefetched::Shadow(predicted),
                     Err(invalid) => {
                         crate::runtime::drain::note_store_route(invalid_route(invalid));
                         // Spent either way: the witness entry it rests on moves
