@@ -1403,9 +1403,11 @@ fn lab_frame_dump(source: &WindowPresentSource) {
         }
         LAST_MS.store(now, Ordering::Relaxed);
     }
+    let t0 = crate::observe::elapsed_us();
     let Ok(rb) = read_target(&source.identity) else {
         return;
     };
+    let readback_us = crate::observe::elapsed_us().saturating_sub(t0);
     let Some(bgra) = rb.into_bgra8() else {
         return;
     };
@@ -1413,22 +1415,60 @@ fn lab_frame_dump(source: &WindowPresentSource) {
     if bgra.len() < w * h * 4 {
         return;
     }
-    let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-    out.reserve(w * h * 3);
-    for px in bgra[..w * h * 4].chunks_exact(4) {
-        out.extend_from_slice(&[px[2], px[1], px[0]]);
-    }
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    // TEMP (lab): written under a temporary name and renamed, so a host script
-    // polling for the file never reads a half-written frame.
     let name = match tag {
         Some(tag) => format!("{dir}/frame-{n:04}-{now}-{tag}.ppm"),
         None => format!("{dir}/frame-{n:04}-{now}.ppm"),
     };
-    let tmp = format!("{name}.part");
-    if std::fs::write(&tmp, out).is_ok() {
-        let _ = std::fs::rename(&tmp, &name);
-    }
+    // TEMP (lab, n125): the PPM conversion and the disk write (a 5K frame is
+    // 44 MB in, 33 MB out) run on a writer thread, not on the window thread
+    // that presents the guest's frames; a backlog drops the frame.
+    let queued = lab_frame_writer()
+        .try_send(LabFrameJob { name, w, h, bgra })
+        .is_ok();
+    crate::observe::off(format!(
+        "lab_frame_dump n={n} t={} readback_us={readback_us} queued={queued}",
+        now
+    ));
+}
+
+/// TEMP (lab): one frame for [`lab_frame_writer`].
+#[cfg(feature = "host-window")]
+struct LabFrameJob {
+    name: String,
+    w: usize,
+    h: usize,
+    bgra: Vec<u8>,
+}
+
+/// TEMP (lab): the frame-dump writer thread, started on first use; up to four
+/// frames wait for it.
+#[cfg(feature = "host-window")]
+fn lab_frame_writer() -> &'static std::sync::mpsc::SyncSender<LabFrameJob> {
+    static TX: once_cell::sync::OnceCell<std::sync::mpsc::SyncSender<LabFrameJob>> =
+        once_cell::sync::OnceCell::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LabFrameJob>(4);
+        let _ = std::thread::Builder::new()
+            .name("reims-lab-frame-dump".into())
+            .spawn(move || {
+                for job in rx {
+                    let (w, h) = (job.w, job.h);
+                    let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                    out.reserve(w * h * 3);
+                    for px in job.bgra[..w * h * 4].chunks_exact(4) {
+                        out.extend_from_slice(&[px[2], px[1], px[0]]);
+                    }
+                    // Written under a temporary name and renamed, so a host
+                    // script polling for the file never reads a half-written frame.
+                    let tmp = format!("{}.part", job.name);
+                    if std::fs::write(&tmp, out).is_ok() {
+                        let _ = std::fs::rename(&tmp, &job.name);
+                    }
+                }
+            });
+        tx
+    })
 }
 
 /// TEMP (lab): on-demand frame dumps for `REIMS_LAB_FRAME_DUMP`. A file
