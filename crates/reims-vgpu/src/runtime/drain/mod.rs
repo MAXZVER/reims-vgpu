@@ -8163,16 +8163,6 @@ mod lab_vsync {
     }
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_VBL_ALWAYS=on`, see `signal_display_refresh_classes`. Latched.
-fn lab_vbl_always() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var("REIMS_VGPU_LAB_VBL_ALWAYS").is_ok_and(|v| v == "on");
-        crate::observe::off(format!("lab_vbl_always on={on}"));
-        on
-    })
-}
-
 /// Atomically claim the next display VBL for either the locked or lock-free
 /// poll path. A single shared timestamp makes the cadence independent of device
 /// lock contention and prevents both paths from signaling the same interval.
@@ -8590,12 +8580,7 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     let mask = ld32(&mask_le);
     crate::runtime::drain::census::note_display_enable_mask(mask);
 
-    // TEMP (lab, `REIMS_VGPU_LAB_VBL_ALWAYS=on`): keep the VBL class running
-    // while the guest has it disarmed. n109's gap trace: each ~190 ms transition
-    // hitch is a fully silent guest — no doorbell from any task, the VBL class
-    // disarmed — until WindowServer's CA synchronize timeout; the device owes
-    // nothing. Whether a VBL left running changes what the guest waits for.
-    let vbl = mask & DISPLAY_VBL_EVENT_MASK != 0 || lab_vbl_always();
+    let vbl = mask & DISPLAY_VBL_EVENT_MASK != 0;
     let transaction = mask & DISPLAY_PRESENT_EVENT_MASK != 0;
 
     // A tick that finds nothing armed returns **without consuming a grid slot**.
