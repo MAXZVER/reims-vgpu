@@ -322,6 +322,9 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     if let Some(pool) = &par {
         dev.state.install_par_pool(Arc::clone(pool));
     }
+    if let Some(ops) = ops.as_ref() {
+        crate::runtime::write_baseline::install(ops);
+    }
     let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
     let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);

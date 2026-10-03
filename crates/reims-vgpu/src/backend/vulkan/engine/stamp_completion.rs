@@ -165,6 +165,10 @@ struct Waiting {
     word: crate::runtime::guest_ram::GuestRef,
     /// The FIFO completion value published into `word`.
     stamp: u32,
+    /// TEMP (lab): the newest writer-witness read issued when this stamp was
+    /// queued. The word is not published before it resolves — see
+    /// `crate::runtime::write_baseline`.
+    baseline: u64,
     /// When this stamp was registered, for the publish-latency census.
     ///
     /// This is the clock the guest actually experiences: it is blocked from the
@@ -448,7 +452,7 @@ impl StampCompletion {
             index,
             word,
             stamp,
-
+            baseline: crate::runtime::write_baseline::issued(),
             queued_at: std::time::Instant::now(),
         });
         PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
@@ -490,7 +494,7 @@ impl StampCompletion {
             index,
             word,
             stamp,
-
+            baseline: crate::runtime::write_baseline::issued(),
             queued_at: std::time::Instant::now(),
         });
         PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
@@ -618,6 +622,9 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
             // verdict. Reaching here now means the device reported an error or
             // is shutting down, not merely that the GPU was slow.
             crate::runtime::drain::census::note_store_route("stamp_word_abandoned");
+        }
+        if should_publish(completed, stopping) {
+            crate::runtime::write_baseline::wait_resolved(waiting.baseline);
         }
         if should_publish(completed, stopping) && !publish_stamp_word(&waiting) {
             crate::observe::fail(format!(
@@ -916,6 +923,7 @@ mod tests {
             index,
             word: crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word"),
             stamp,
+            baseline: 0,
             queued_at: std::time::Instant::now(),
         }
     }
@@ -1082,6 +1090,7 @@ mod tests {
             index: 2,
             word,
             stamp: 0x89ab_cdef,
+            baseline: 0,
             queued_at: std::time::Instant::now(),
         };
 

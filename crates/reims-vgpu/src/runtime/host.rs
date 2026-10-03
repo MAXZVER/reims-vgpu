@@ -668,6 +668,18 @@ pub trait HostOps {
         self.guest_write_gen(token)
     }
 
+    /// TEMP (lab, `REIMS_VGPU_LAB_ASYNC_BASELINE`): start the
+    /// [`Self::guest_write_gen`] read of `token` on another thread and return
+    /// its answer to come. `None` when this host has no such thread — read
+    /// synced. Every completion stamp queued after this call waits for the
+    /// answer; see [`crate::runtime::write_baseline`].
+    fn guest_write_gen_deferred(
+        &self,
+        _token: u64,
+    ) -> Option<crate::runtime::write_baseline::PendingGen> {
+        None
+    }
+
     /// Which pages of `token`'s set the host has observed written since
     /// `since_gen`, in ascending GPA order.
     ///

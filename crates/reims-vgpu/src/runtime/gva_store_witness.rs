@@ -115,8 +115,13 @@ struct Entry {
     gpas: Vec<u64>,
     /// `guest_write_gen` as it stood at the Store. 0 means "no usable stamp" —
     /// the arming window — and can never equal a live generation, because the
-    /// host's first readable one is 1.
+    /// host's first readable one is 1. Meaningless while `pending` is set.
     gen_at_store: u64,
+    /// TEMP (lab, `REIMS_VGPU_LAB_ASYNC_BASELINE`): the synced read of
+    /// `gen_at_store` is still out on the baseline thread. Until it resolves the
+    /// completion stamp of the packet that made this Store is held, so the guest
+    /// has not written the target since — see [`crate::runtime::write_baseline`].
+    pending: Option<crate::runtime::write_baseline::PendingGen>,
     /// TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`): a writer may use
     /// `gen_at_store` ([`armed`], [`written_pages`]). False for an eager
     /// Store's lagged stamp, which may predate guest writes made before the
@@ -128,6 +133,22 @@ struct Entry {
     host_epoch_at_store: u64,
     /// Store ordinal, for the eviction order.
     last_seen: u64,
+}
+
+impl Entry {
+    /// The generation at the Store, or `None` while its read is still out.
+    fn gen(&self) -> Option<u64> {
+        match &self.pending {
+            Some(p) => p.get(),
+            None => Some(self.gen_at_store),
+        }
+    }
+
+    /// Whether the Store left a usable stamp: a resolved non-zero generation,
+    /// or a read still out (it resolves before the guest can write the target).
+    fn stamped(&self) -> bool {
+        self.gen().map_or(true, |g| g != 0)
+    }
 }
 
 /// Per-device witness state: one entry per GVA render target stamped.
@@ -234,7 +255,7 @@ pub fn note_store<H: HostOps>(
     key: GvaTargetKey,
     gpas: &[u64],
 ) {
-    stamp(state, host, key, gpas, false);
+    stamp(state, host, key, gpas, Read::Synced);
 }
 
 /// [`note_store`] for a Store about to be deferred: the writer's arming.
@@ -269,8 +290,12 @@ pub fn note_store_deferral<H: HostOps>(
             .gva_store_witness
             .entries
             .get(&key)
-            .is_some_and(|e| e.gen_at_store != 0);
-    stamp(state, host, key, gpas, lagged);
+            .is_some_and(Entry::stamped);
+    // A deferral is armed from the draw path, inside the packet that rendered
+    // the target, which is what lets its synced read wait for that packet's
+    // stamp instead of running here.
+    let read = if lagged { Read::Lagged } else { Read::Deferred };
+    stamp(state, host, key, gpas, read);
     if lagged {
         crate::runtime::drain::note_store_route("lab_gvaw_deferral_lagged");
         if let Some(e) = state.gva_store_witness.entries.get_mut(&key) {
@@ -324,8 +349,21 @@ pub fn note_store_eager<H: HostOps>(
             .gva_store_witness
             .entries
             .get(&key)
-            .is_some_and(|e| e.gen_at_store != 0);
-    stamp(state, host, key, gpas, lagged);
+            .is_some_and(Entry::stamped);
+    let read = if lagged { Read::Lagged } else { Read::Synced };
+    stamp(state, host, key, gpas, read);
+}
+
+/// How [`stamp`] reads the generation at the Store.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Read {
+    Synced,
+    /// TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`).
+    Lagged,
+    /// TEMP (lab, `REIMS_VGPU_LAB_ASYNC_BASELINE`): synced, on the baseline
+    /// thread when the host has one. Only for a Store made inside the packet
+    /// whose completion stamp is still to come.
+    Deferred,
 }
 
 fn stamp<H: HostOps>(
@@ -333,8 +371,9 @@ fn stamp<H: HostOps>(
     host: &mut H,
     key: GvaTargetKey,
     gpas: &[u64],
-    lagged: bool,
+    read: Read,
 ) {
+    let lagged = read == Read::Lagged;
     if key.generation == 0 || gpas.is_empty() {
         crate::runtime::drain::note_store_route("gvaw_unnamed_alloc");
         return;
@@ -362,12 +401,32 @@ fn stamp<H: HostOps>(
             }
         }
     };
-    let read = if lagged {
+    // A re-Store while the previous Store's read is still out keeps that read:
+    // its stamp is held, so the guest has written nothing since either Store,
+    // and the lagged answer for a set not synced yet would be the arming window.
+    let inherited = match state.gva_store_witness.entries.get(&key) {
+        Some(e) if read != Read::Synced && e.gen().is_none() => e.pending.clone(),
+        _ => None,
+    };
+    let lagged = lagged && inherited.is_none();
+    let pending = match inherited {
+        Some(p) => {
+            crate::runtime::drain::note_store_route("lab_gvaw_armed_inherited");
+            Some(p)
+        }
+        None if read == Read::Deferred => host.guest_write_gen_deferred(token),
+        None => None,
+    };
+    let read = if pending.is_some() {
+        crate::runtime::drain::note_store_route("lab_gvaw_armed_async");
+        None
+    } else if lagged {
         host.guest_write_gen_lagged(token)
     } else {
         host.guest_write_gen(token)
     };
     let gen_at_store = match read {
+        None if pending.is_some() => 0,
         Some(g) => {
             crate::runtime::drain::note_store_route(if lagged {
                 "lab_gvaw_armed_lagged"
@@ -393,6 +452,7 @@ fn stamp<H: HostOps>(
             token,
             gpas: gpas.to_vec(),
             gen_at_store,
+            pending,
             exact: !lagged,
             host_epoch_at_store,
             last_seen,
@@ -478,21 +538,17 @@ pub fn reach<H: HostOps>(state: &DeviceState, host: &H, key: GvaTargetKey) -> Gv
     let Some(e) = state.gva_store_witness.entries.get(&key) else {
         return GvaWriteReach::Guest(GuestWriteVerdict::NoMapping);
     };
-    if e.gen_at_store == 0 {
-        return GvaWriteReach::Guest(GuestWriteVerdict::NoStamp);
-    }
-    match host.guest_write_gen(e.token) {
-        Some(g) if g == e.gen_at_store => {}
-        Some(_) => {
-            // TEMP (lab): how often a lagged stamp reads written, against a synced one.
-            crate::runtime::drain::note_store_route(if e.exact {
-                "lab_gvaw_reach_wrote_exact"
-            } else {
-                "lab_gvaw_reach_wrote_lagged"
-            });
-            return GvaWriteReach::Guest(GuestWriteVerdict::Wrote);
+    match e.gen() {
+        // TEMP (lab): the Store's read is still out, so its packet's stamp is
+        // held and the guest has not written the target since the Store. Only
+        // the host-write half is left to ask.
+        None => crate::runtime::drain::note_store_route("lab_gvaw_reach_pending"),
+        Some(0) => return GvaWriteReach::Guest(GuestWriteVerdict::NoStamp),
+        Some(gen_at_store) => {
+            if let Some(answer) = guest_half(host, e, gen_at_store) {
+                return answer;
+            }
         }
-        None => return GvaWriteReach::Guest(GuestWriteVerdict::Unreadable),
     }
     let host_verdict = state
         .host_writes
@@ -500,6 +556,23 @@ pub fn reach<H: HostOps>(state: &DeviceState, host: &H, key: GvaTargetKey) -> Gv
     match host_verdict {
         HostWriteVerdict::Quiet => GvaWriteReach::Quiet,
         other => GvaWriteReach::Host(other),
+    }
+}
+
+/// The guest half of [`reach`] against a resolved stamp: `None` when clean.
+fn guest_half<H: HostOps>(host: &H, e: &Entry, gen_at_store: u64) -> Option<GvaWriteReach> {
+    match host.guest_write_gen(e.token) {
+        Some(g) if g == gen_at_store => None,
+        Some(_) => {
+            // TEMP (lab): how often a lagged stamp reads written, against a synced one.
+            crate::runtime::drain::note_store_route(if e.exact {
+                "lab_gvaw_reach_wrote_exact"
+            } else {
+                "lab_gvaw_reach_wrote_lagged"
+            });
+            Some(GvaWriteReach::Guest(GuestWriteVerdict::Wrote))
+        }
+        None => Some(GvaWriteReach::Guest(GuestWriteVerdict::Unreadable)),
     }
 }
 
@@ -519,7 +592,7 @@ pub fn armed(state: &DeviceState, key: GvaTargetKey) -> bool {
         .gva_store_witness
         .entries
         .get(&key)
-        .is_some_and(|e| e.gen_at_store != 0 && e.exact)
+        .is_some_and(|e| e.stamped() && e.exact)
 }
 
 /// Which of `key`'s pages the hypervisor has observed the guest write since the
@@ -547,7 +620,15 @@ pub fn written_pages<H: HostOps>(
         crate::runtime::drain::note_store_route("gvaw_pages_no_entry");
         return None;
     };
-    if e.gen_at_store == 0 {
+    let gen_at_store = match (e.gen(), &e.pending) {
+        (Some(g), _) => g,
+        (None, Some(p)) => {
+            crate::runtime::drain::note_store_route("lab_gvaw_pages_joined");
+            p.wait()
+        }
+        (None, None) => unreachable!("only a pending read is unresolved"),
+    };
+    if gen_at_store == 0 {
         crate::runtime::drain::note_store_route("gvaw_pages_unarmed");
         return None;
     }
@@ -555,7 +636,7 @@ pub fn written_pages<H: HostOps>(
         crate::runtime::drain::note_store_route("lab_gvaw_pages_lagged");
         return None;
     }
-    let answer = host.guest_written_pages(e.token, e.gen_at_store);
+    let answer = host.guest_written_pages(e.token, gen_at_store);
     crate::runtime::drain::note_store_route(match answer {
         Some(_) => "gvaw_pages_named",
         None => "gvaw_pages_unreadable",
@@ -912,5 +993,122 @@ mod tests {
             GvaWriteReach::Quiet,
             "another target's entry is untouched"
         );
+    }
+
+    /// A host whose deferred reads answer only when the test resolves them —
+    /// the baseline thread, held still.
+    struct DeferHost {
+        inner: FakeHost,
+        out: std::cell::RefCell<Vec<(u64, std::sync::Arc<std::sync::atomic::AtomicU64>)>>,
+    }
+
+    impl DeferHost {
+        fn new() -> Self {
+            Self {
+                inner: FakeHost::new(),
+                out: Default::default(),
+            }
+        }
+
+        /// Answer every read still out with what a synced read says now.
+        fn resolve(&self) {
+            for (token, slot) in self.out.borrow_mut().drain(..) {
+                let g = self.inner.guest_write_gen(token).unwrap_or(0);
+                slot.store(g, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    impl HostOps for DeferHost {
+        fn mono_ns(&self) -> u64 {
+            0
+        }
+        fn enqueue(&mut self, action: crate::runtime::host::HostAction) {
+            self.inner.enqueue(action);
+        }
+        fn schedule_bh(&mut self) {}
+        fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {
+            self.inner.track_guest_writes(gpas, page_size)
+        }
+        fn untrack_guest_writes(&mut self, token: u64) {
+            self.inner.untrack_guest_writes(token);
+        }
+        fn guest_write_gen(&self, token: u64) -> Option<u64> {
+            self.inner.guest_write_gen(token)
+        }
+        fn guest_write_gen_lagged(&self, token: u64) -> Option<u64> {
+            self.inner.guest_write_gen_lagged(token)
+        }
+        fn guest_write_gen_deferred(
+            &self,
+            token: u64,
+        ) -> Option<crate::runtime::write_baseline::PendingGen> {
+            let (pending, slot) = crate::runtime::write_baseline::PendingGen::unresolved();
+            self.out.borrow_mut().push((token, slot));
+            Some(pending)
+        }
+        fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
+            self.inner.guest_written_pages(token, since_gen)
+        }
+    }
+
+    /// A deferral's read runs off the drain: the target is armed at once, a
+    /// reader while the read is out answers quiet (the packet's stamp is held,
+    /// so the guest has not written it), and once the read resolves the usual
+    /// generation test is back — a guest write after it reads written.
+    #[test]
+    fn a_deferred_read_arms_at_once_and_resolves_to_the_ordinary_test() {
+        let mut state = device();
+        let mut host = DeferHost::new();
+        let pages = [3 * PAGE, 4 * PAGE];
+        note_store_deferral(&mut state, &mut host, key(0xabc), &pages, false);
+        assert!(super::armed(&state, key(0xabc)), "a read still out arms the writer");
+        assert_eq!(reach(&state, &host, key(0xabc)), GvaWriteReach::Quiet);
+
+        host.resolve();
+        assert!(super::armed(&state, key(0xabc)));
+        assert_eq!(reach(&state, &host, key(0xabc)), GvaWriteReach::Quiet);
+        assert_eq!(written_pages(&state, &host, key(0xabc)), Some(vec![]));
+
+        host.inner.guest_wrote_page(pages[1] + 8);
+        assert_eq!(
+            reach(&state, &host, key(0xabc)),
+            GvaWriteReach::Guest(GuestWriteVerdict::Wrote)
+        );
+        assert_eq!(written_pages(&state, &host, key(0xabc)), Some(vec![pages[1]]));
+    }
+
+    /// A re-Store while the first read is still out keeps that read rather
+    /// than taking the lagged answer of a set that has not been synced yet.
+    #[test]
+    fn a_restore_while_the_read_is_out_inherits_it() {
+        let mut state = device();
+        let mut host = DeferHost::new();
+        let pages = [3 * PAGE];
+        note_store_deferral(&mut state, &mut host, key(0xabc), &pages, false);
+        note_store_deferral(&mut state, &mut host, key(0xabc), &pages, true);
+        assert_eq!(host.out.borrow().len(), 1, "one read, inherited");
+        assert!(super::armed(&state, key(0xabc)));
+        host.resolve();
+        assert!(super::armed(&state, key(0xabc)));
+        assert_eq!(reach(&state, &host, key(0xabc)), GvaWriteReach::Quiet);
+    }
+
+    /// A read that resolves unarmed is the arming window, exactly as a synced
+    /// one: no writer licence, and readers refuse.
+    #[test]
+    fn a_read_that_resolves_unarmed_licenses_nothing() {
+        let mut state = device();
+        let mut host = DeferHost::new();
+        note_store_deferral(&mut state, &mut host, key(0xabc), &[3 * PAGE], false);
+        for (_, slot) in host.out.borrow_mut().drain(..) {
+            slot.store(0, std::sync::atomic::Ordering::Release);
+        }
+        assert!(!super::armed(&state, key(0xabc)));
+        assert_eq!(
+            reach(&state, &host, key(0xabc)),
+            GvaWriteReach::Guest(GuestWriteVerdict::NoStamp)
+        );
+        assert_eq!(written_pages(&state, &host, key(0xabc)), None);
     }
 }

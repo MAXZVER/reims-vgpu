@@ -1032,6 +1032,16 @@ impl HostOps for QemuHost<'_> {
         self.ops.write_gen_lagged(token)
     }
 
+    fn guest_write_gen_deferred(
+        &self,
+        token: u64,
+    ) -> Option<crate::runtime::write_baseline::PendingGen> {
+        if token == 0 || self.ops.guest_write_gen.is_none() {
+            return None;
+        }
+        crate::runtime::write_baseline::issue(token)
+    }
+
     fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
         self.ops.written_pages(token, since_gen)
     }

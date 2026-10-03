@@ -152,6 +152,8 @@ pub mod task_slot;
 pub mod texture;
 /// Track host-authoritative surface and GVA frames, and transfer them on demand.
 pub mod writeback_debt;
+/// TEMP (lab): writer-witness generation reads off the drain.
+pub mod write_baseline;
 
 /// The unit-test host double, gated with its definition. An ungated re-export
 /// would keep it reachable and so keep it in the staticlib.
