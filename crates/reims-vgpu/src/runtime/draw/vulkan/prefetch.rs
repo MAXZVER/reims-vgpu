@@ -14,7 +14,10 @@
 //! after it, and every later draw of the stream that binds the same ref
 //! re-validates the same plan. A ref-view plan (the zero-copy plane of a
 //! ref-texture view) applies a gather-witness decision, which moves the
-//! witness, so it serves one bind and is then dropped.
+//! witness, so it serves one bind and is then dropped: the ref lands in the
+//! frame's `consumed` list, which [`super::pass_prep`]'s `ahead` reads to drop
+//! the ref from its planned set, so the next chunk that needs it plans it
+//! again from the witness's new state (the H6 repeat of the design).
 
 use super::*;
 use std::cell::RefCell;
@@ -41,9 +44,17 @@ pub(crate) fn prefetch_mode() -> PrefetchMode {
     )
 }
 
+/// One stream's (or pass's) plans, plus the refs whose ref-view plan a bind
+/// has consumed. `consumed` is drained by [`super::pass_prep::PassPrep::ahead`],
+/// which replans those refs from the witness's post-consumption state.
+pub(crate) struct PassPlans {
+    map: HashMap<(u32, u32), StreamPlan>,
+    consumed: Vec<u32>,
+}
+
 thread_local! {
     /// The plans of each stream being encoded on this thread, innermost last.
-    static STACK: RefCell<Vec<HashMap<(u32, u32), StreamPlan>>> = const { RefCell::new(Vec::new()) };
+    static STACK: RefCell<Vec<PassPlans>> = const { RefCell::new(Vec::new()) };
 }
 
 /// One planned bind of a stream.
@@ -69,7 +80,59 @@ impl Drop for PrefetchGuard {
     }
 }
 
-fn bail_route(bail: SampleBail) -> &'static str {
+/// Push an empty plans frame for this stream and return the guard that pops it.
+pub(super) fn push_empty_frame() -> PrefetchGuard {
+    STACK.with(|stack| stack.borrow_mut().push(PassPlans {
+        map: HashMap::new(),
+        consumed: Vec::new(),
+    }));
+    PrefetchGuard { pushed: true }
+}
+
+/// Merge planned binds into the current (innermost) frame. Plans replace a
+/// same-key entry, which is how a replanned ref-view ref supersedes the
+/// consumed plan it leaves behind.
+pub(super) fn merge_into_frame(plans: impl IntoIterator<Item = ((u32, u32), StreamPlan)>) {
+    STACK.with(|stack| {
+        if let Some(frame) = stack.borrow_mut().last_mut() {
+            frame.map.extend(plans);
+        }
+    });
+}
+
+/// Take the refs whose ref-view plans binds consumed since the last call, so
+/// the caller can plan them again for the witness's current state.
+pub(super) fn take_consumed_refs() -> Vec<u32> {
+    STACK.with(|stack| {
+        stack
+            .borrow_mut()
+            .last_mut()
+            .map_or_else(Vec::new, |frame| std::mem::take(&mut frame.consumed))
+    })
+}
+
+/// The one job body both [`prefetch_stream`] and [`super::pass_prep`] run per
+/// item, on the pool: the surface ladder's plannable top, and — where it bails
+/// with a materializing ref-texture view — that view's zero-copy plane.
+pub(super) fn plan_item(
+    st: &DeviceState,
+    env: &crate::runtime::par::WorkerEnv<'_>,
+    task_id: u32,
+    texture_ref: u32,
+    resource: std::sync::Arc<crate::model::TaskResource>,
+) -> Result<StreamPlan, SampleBail> {
+    let host = env.host();
+    match plan_sampled_source(st, &host, task_id, texture_ref, resource.clone(), true) {
+        Ok(plan) => Ok(StreamPlan::Surface(plan)),
+        Err(SampleBail::RefTextureView) => {
+            sample_plan::plan_ref_view_zero_copy(st, &host, task_id, texture_ref, resource)
+                .map(StreamPlan::RefView)
+        }
+        Err(bail) => Err(bail),
+    }
+}
+
+pub(super) fn bail_route(bail: SampleBail) -> &'static str {
     match bail {
         SampleBail::NullRef => "par_prefetch_bail_null_ref",
         SampleBail::BufferTexture => "par_prefetch_bail_buffer_texture",
@@ -89,7 +152,7 @@ fn bail_route(bail: SampleBail) -> &'static str {
     }
 }
 
-fn invalid_route(invalid: SampleInvalid) -> &'static str {
+pub(super) fn invalid_route(invalid: SampleInvalid) -> &'static str {
     match invalid {
         SampleInvalid::Key => "par_prefetch_invalid_key",
         SampleInvalid::Resource => "par_prefetch_invalid_resource",
@@ -142,19 +205,7 @@ pub(crate) fn prefetch_stream<'a>(
         return PrefetchGuard { pushed: false };
     }
     let scoped = pool.scope(state, &items, |st, env, (texture_ref, resource)| {
-        let host = env.host();
-        match plan_sampled_source(st, &host, task_id, *texture_ref, resource.clone(), true) {
-            Ok(plan) => Ok(StreamPlan::Surface(plan)),
-            Err(SampleBail::RefTextureView) => sample_plan::plan_ref_view_zero_copy(
-                st,
-                &host,
-                task_id,
-                *texture_ref,
-                resource.clone(),
-            )
-            .map(StreamPlan::RefView),
-            Err(bail) => Err(bail),
-        }
+        plan_item(st, env, task_id, *texture_ref, resource.clone())
     });
     crate::runtime::drain::note_store_route("par_prefetch_stream");
     crate::runtime::drain::note_store_route_n("par_fork_us", scoped.fork_us);
@@ -174,7 +225,10 @@ pub(crate) fn prefetch_stream<'a>(
             Err(_) => crate::runtime::drain::note_store_route("par_prefetch_panic"),
         }
     }
-    STACK.with(|stack| stack.borrow_mut().push(plans));
+    STACK.with(|stack| stack.borrow_mut().push(PassPlans {
+        map: plans,
+        consumed: Vec::new(),
+    }));
     PrefetchGuard { pushed: true }
 }
 
@@ -198,17 +252,24 @@ pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
     resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
     may_bind_resident: bool,
 ) -> Prefetched {
-    let mode = prefetch_mode();
+    // `REIMS_VGPU_LAB_PASS_PREP` supersedes `PAR_PREFETCH` while it is not
+    // `off`: its chunks push frames on this same stack, and the mode its
+    // plans are taken under is the PassPrep one.
+    let mode = match super::pass_prep::pass_prep_mode() {
+        super::pass_prep::PassPrepMode::Off => prefetch_mode(),
+        super::pass_prep::PassPrepMode::Shadow => PrefetchMode::Shadow,
+        super::pass_prep::PassPrepMode::On => PrefetchMode::On,
+    };
     if mode == PrefetchMode::Off {
         return Prefetched::Serial;
     }
     STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
-        let Some(plans) = stack.last_mut() else {
+        let Some(frame) = stack.last_mut() else {
             return Prefetched::Serial;
         };
         let key = (task_id, texture_ref);
-        match plans.get(&key) {
+        match frame.map.get(&key) {
             None => Prefetched::Serial,
             Some(StreamPlan::Surface(plan)) => {
                 if let Err(invalid) = sample_plan::validate_sampled_plan(
@@ -244,7 +305,8 @@ pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
                 ) {
                     Ok(served) if apply => {
                         crate::runtime::drain::note_store_route("par_prefetch_hit_ref_view");
-                        plans.remove(&key);
+                        frame.map.remove(&key);
+                        frame.consumed.push(texture_ref);
                         Prefetched::Serve(served)
                     }
                     Ok(predicted) => Prefetched::Shadow(predicted),
@@ -252,7 +314,8 @@ pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
                         crate::runtime::drain::note_store_route(invalid_route(invalid));
                         // Spent either way: the witness entry it rests on moves
                         // with whatever the serial rail does next.
-                        plans.remove(&key);
+                        frame.map.remove(&key);
+                        frame.consumed.push(texture_ref);
                         Prefetched::Serial
                     }
                 }

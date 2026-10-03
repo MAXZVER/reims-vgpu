@@ -986,7 +986,20 @@ pub enum FinishPhase {
     /// executes, the `draw_list` collect, `mrt_draw_request` for the first
     /// record, and the attachment template it is turned into. Derived rather
     /// than measured directly, so the parts sum to the whole by construction.
+    ///
+    /// TEMP (lab, PASS_PREP): the three named spans below were carved out of
+    /// this remainder (design §8.1, for C6 — the byte-heavy prelude candidates
+    /// `apply_clear`, the LOAD-seed read and the seed copy need their own bars
+    /// before any of them is moved to the pool). What is left here is the
+    /// `_rest` of the old `fin_prelude` line.
     Prelude,
+    /// The clear-only stream's `apply_clear` guest stores.
+    PreludeClear,
+    /// The ICB execute loop: `mrt_draw_request` per execute and its encode.
+    PreludeIcb,
+    /// The first record's `mrt_draw_request` and the attachment template it
+    /// becomes (the LOAD-seed read of the pass lives here).
+    PreludeMrt,
     /// `retarget_render_pass_draw` — rebuilding record N's `DrawRequest` from
     /// the pass template.
     ///
@@ -1016,10 +1029,13 @@ impl FinishPhase {
     /// How many parts there are. The census arrays are sized from this, so a new
     /// variant that forgets to bump it fails to build [`Self::ALL`] rather than
     /// overflowing an array at report time.
-    pub(crate) const COUNT: usize = 6;
+    pub(crate) const COUNT: usize = 9;
 
     pub(crate) const ALL: [FinishPhase; Self::COUNT] = [
         FinishPhase::Prelude,
+        FinishPhase::PreludeClear,
+        FinishPhase::PreludeIcb,
+        FinishPhase::PreludeMrt,
         FinishPhase::Retarget,
         FinishPhase::Binds,
         FinishPhase::Encode,
@@ -1030,17 +1046,23 @@ impl FinishPhase {
     pub(crate) const fn index(self) -> usize {
         match self {
             FinishPhase::Prelude => 0,
-            FinishPhase::Retarget => 1,
-            FinishPhase::Binds => 2,
-            FinishPhase::Encode => 3,
-            FinishPhase::Result => 4,
-            FinishPhase::Tail => 5,
+            FinishPhase::PreludeClear => 1,
+            FinishPhase::PreludeIcb => 2,
+            FinishPhase::PreludeMrt => 3,
+            FinishPhase::Retarget => 4,
+            FinishPhase::Binds => 5,
+            FinishPhase::Encode => 6,
+            FinishPhase::Result => 7,
+            FinishPhase::Tail => 8,
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
-            FinishPhase::Prelude => "fin_prelude",
+            FinishPhase::Prelude => "fin_prelude_rest",
+            FinishPhase::PreludeClear => "fin_prelude_clear",
+            FinishPhase::PreludeIcb => "fin_prelude_icb",
+            FinishPhase::PreludeMrt => "fin_prelude_mrt",
             FinishPhase::Retarget => "fin_retarget",
             FinishPhase::Binds => "fin_binds",
             FinishPhase::Encode => "fin_encode",

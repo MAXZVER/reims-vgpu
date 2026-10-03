@@ -58,6 +58,14 @@
 //! almost all of it the one `mrt_draw_request` that resolves the colour slots
 //! for record 0. Halving it would buy 0.27 µs of a 19.80 µs draw.
 //!
+//! TEMP (lab, PASS_PREP): the prelude itself is now split —
+//! `fin_prelude_clear` (the clear-only guest stores), `fin_prelude_icb` (the
+//! ICB execute loop) and `fin_prelude_mrt` (the first record's request and
+//! template, where the pass's LOAD-seed read lives) — with
+//! [`FinishPhase::Prelude`] as the `_rest`, per design §8.1. The named spans
+//! are C6's candidates (byte-heavy copies the pool could take); the remainder
+//! stays derived, so the parts still sum to `finish_us` by construction.
+//!
 //! # What the census costs
 //!
 //! One `Instant::now()` per phase transition, accumulated in a local array and

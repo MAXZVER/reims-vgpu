@@ -1134,6 +1134,19 @@ impl HostOps for WorkerHost<'_> {
     fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
         self.ops.written_pages(token, since_gen)
     }
+
+    /// The host's own answer, not the trait's conservative default. Aliasing
+    /// is a property of the host (`map_pages_stable=1` on x86), not of which
+    /// thread asks, and the whole point of a stable alias is that the worker
+    /// can read through the pointers the drain mapped without remapping them.
+    ///
+    /// While this answered `false`, every pool-planned ref-view bind declined
+    /// at `guest_run_alias_available` (`par_prefetch_bail_zero_copy_declined`,
+    /// the S1 run's zero ref-view plans whose reason was not chased down) —
+    /// the plan could never see the rail it exists for.
+    fn map_pages_stable(&self) -> bool {
+        self.ops.map_pages_stable != 0
+    }
 }
 
 #[cfg(test)]

@@ -25,6 +25,10 @@ mod sample_plan;
 pub(crate) use sample_plan::{plan_sampled_source, SampleBail, SampleInvalid, SamplePlan};
 mod prefetch;
 pub(crate) use prefetch::prefetch_stream;
+mod pass_prep;
+pub(crate) use pass_prep::{pass_prep_mode, DrawTables, PassPrep, PassPrepMode};
+#[cfg(test)]
+pub(crate) use pass_prep::test_mode;
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.

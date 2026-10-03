@@ -8716,3 +8716,234 @@ fn a_deferred_failure_found_after_the_loop_is_counted_as_a_failure() {
     count_deferred_failure_after_the_loop(&mut out);
     assert_eq!((out.metal_draws_ok, out.metal_draws_fail), (1, 1));
 }
+
+/// TEMP (lab, PASS_PREP): `finish_stream` with the chunked preparation on and
+/// off reports the same `ExecResult` counters. The pass binds two host-cache
+/// texture refs across four draws, so the `on` arm really plans chunks (a
+/// zero-helper pool keeps the planning deterministic); the encode then fails
+/// the same way in both arms — this host has no pipeline for it — which is the
+/// arm the counters describe.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn pass_prep_on_and_off_report_the_same_counters() {
+    use crate::runtime::draw::vulkan::{test_mode, PassPrepMode};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn fixture() -> (DeviceState, FakeHost, StreamAccum) {
+        use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+        use crate::runtime::gva_mem;
+        use crate::runtime::objects::{self, OBJECT_TYPE_BACKING, TYPE5_MIN_LEN};
+        use reims_vgpu_protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        state.page_shift = PAGE_SHIFT_X86;
+        // A zero-helper pool: chunks plan on the caller, in order.
+        let mut table = crate::qemu::host_ops::ReimsVgpuHostOps::null();
+        unsafe extern "C" fn nothing(_ctx: *mut std::os::raw::c_void) {}
+        table.thread_attach = Some(nothing);
+        table.thread_detach = Some(nothing);
+        let pool = Arc::new(
+            crate::runtime::par::Pool::new(
+                &table,
+                &crate::runtime::par::Settings {
+                    workers: 0,
+                    worker_spin: Duration::ZERO,
+                    join_spin: Duration::ZERO,
+                },
+            )
+            .expect("the table offers the registration pair"),
+        );
+        state.install_par_pool(pool);
+        // The task's directory, so object-list GVA reads work.
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data_gpa = 4u64 << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        host.map_range(data_gpa, 0x400, 0);
+        let mut d = [0u8; 8];
+        st32(&mut d[crate::protocol::gva::DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[crate::protocol::gva::DIRECTORY_DEPTH as usize..], 1);
+        let _ = host.write_gpa(dir_gpa, &d);
+        st32(&mut d[..4], 4);
+        let _ = host.write_gpa(root_gpa, &d[..4]);
+        st32(&mut d[..4], 0x50);
+        let _ = host.write_gpa(root_gpa + 0x50 * 4, &d[..4]);
+        state.define_task(1, 0x1000, 2);
+        assert!(state.set_object_list(1, 0, 32));
+
+        // Two ref-textures over two cached surfaces, the refs the draws bind.
+        // Their descriptors sit just past the 32-entry object list (384 bytes,
+        // GVA 0..0x180), in the task's first page (pte[0] -> pfn 4).
+        let refs = [9u32, 10];
+        for (i, &texture_ref) in refs.iter().enumerate() {
+            let surface_id = 71u32 + i as u32;
+            let desc_gva = 0x180u64 + 0x40 * i as u64;
+            let built = reims_vgpu_wire::device_desc::RefTextureBuilder::new(surface_id, 0, 0, 0)
+                .with_len(TYPE5_MIN_LEN);
+            assert!(gva_mem::write_task_gva(
+                &mut host,
+                &state.tasks[1],
+                desc_gva,
+                built.bytes(),
+                PAGE_SHIFT_X86
+            )
+            .is_ok());
+            let list_off = list_object_entry_offset(texture_ref, 32).unwrap();
+            let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+            st32(
+                &mut entry,
+                (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((TYPE5_MIN_LEN as u32) << 8),
+            );
+            entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+            assert!(gva_mem::write_task_gva(
+                &mut host,
+                &state.tasks[1],
+                list_off,
+                &entry,
+                PAGE_SHIFT_X86
+            )
+            .is_ok());
+            assert!(state.map_surface(surface_id));
+            assert!(state.set_mapping_geom(surface_id, 4, 3, MTL_FORMAT_BGRA8_UNORM));
+            state.mappings.get_mut(&surface_id).unwrap().page_entries = vec![1];
+            crate::runtime::surface_cache::store(
+                &mut state,
+                surface_id,
+                4,
+                3,
+                [(i * 40) as u8, 0, 255, 255].repeat(4 * 3),
+            );
+        }
+
+        // The render target: a resolvable backing at surface 5 (the shape of
+        // `nometal_draw_falls_back_to_backing_clear`, so `mrt_draw_request`
+        // answers and the loop reaches the encode).
+        let page = 0x50u64 << PAGE_SHIFT_X86;
+        host.map_range(page, 0x2000, 0);
+        let mut entry = [0u8; 12];
+        st32(&mut entry, (OBJECT_TYPE_BACKING as u32) | (0x30u32 << 8));
+        entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + 5 * 12, &entry);
+        let mut desc = vec![0u8; 0x30];
+        st64(&mut desc[0..], 0x1000);
+        st32(&mut desc[8..], 0x50);
+        st32(&mut desc[0xc..], 0x4247_5241);
+        desc[0x10] = 1;
+        st32(&mut desc[0x18..], 16);
+        st32(&mut desc[0x1c..], 16);
+        st32(&mut desc[0x20..], 64);
+        let _ = host.write_gpa(data_gpa + 0x80, &desc);
+        assert!(objects::resolve_backing(&mut state, &host, 5));
+
+        let att = ColorAttachment {
+            texture_ref: 5,
+            resolve_texture_ref: 0,
+            level: 0,
+            slice: 0,
+            depth_plane: 0,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: MTL_STORE_ACTION_STORE,
+            clear_color: [0.0, 1.0, 0.0, 1.0],
+        };
+        let mut acc = StreamAccum::default();
+        acc.clears.push(att);
+        acc.saw_draw = true;
+        acc.color_slots.push((0, att));
+        // Four draws, alternating the two texture refs, so the `on` arm plans
+        // a two-ref chunk before draw 0 and finds nothing new after.
+        for i in 0..4u32 {
+            let which = (i % 2) as usize;
+            let resource =
+                objects::resolve_resource(&state, &host, 1, refs[which]).expect("fixture ref");
+            acc.draws.push(PendingDraw {
+                visibility: None,
+                pipeline_ref: 7,
+                draw: DrawArgs {
+                    vertex_count: 3,
+                    instance_count: 1,
+                    primitive_type: 3,
+                    first_vertex: 0,
+                    base_instance: 0,
+                },
+                indexed: None,
+                vertex_buffers: Arc::new(vec![BufferBind {
+                    index: 0,
+                    buffer_ref: 1,
+                    offset: 0,
+                    attribute_stride: None,
+                    ..Default::default()
+                }]),
+                fragment_buffers: Arc::default(),
+                vertex_textures: Arc::default(),
+                fragment_textures: Arc::new(vec![TextureBind {
+                    index: 0,
+                    texture_ref: refs[which],
+                    resource: Some(resource),
+                }]),
+                vertex_samplers: Arc::default(),
+                fragment_samplers: Arc::default(),
+                viewports: Vec::new(),
+                scissors: Vec::new(),
+                blend_color: None,
+                cull_mode: None,
+                front_facing: None,
+                fill_mode: None,
+                depth_clip_mode: None,
+                line_width: None,
+                depth_bias: None,
+                depth_stencil_ref: 0,
+                stencil_ref: None,
+                depth_attach: None,
+                stencil_attach: None,
+            });
+        }
+        (state, host, acc)
+    }
+
+    let counters = |out: &ExecResult| {
+        (
+            out.clears_applied,
+            out.metal_draws_ok,
+            out.metal_draws_fail,
+            out.render_attachment_resolves,
+            out.render_guest_stores,
+            out.render_icb_ok,
+            out.render_icb_fail,
+            out.texture_unbinds,
+            out.sampler_unbinds,
+            out.buffer_unbinds,
+        )
+    };
+
+    let off = {
+        let _mode = test_mode(PassPrepMode::Off);
+        let (mut state, mut host, acc) = fixture();
+        let mut out = ExecResult::default();
+        finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+        counters(&out)
+    };
+    let before_planned = crate::runtime::drain::census::store_route_count("par_prefetch_planned");
+    let on = {
+        let _mode = test_mode(PassPrepMode::On);
+        let (mut state, mut host, acc) = fixture();
+        let mut out = ExecResult::default();
+        finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+        assert!(
+            crate::runtime::drain::census::store_route_count("par_prefetch_planned")
+                > before_planned,
+            "the on arm really planned"
+        );
+        counters(&out)
+    };
+    assert_eq!(off, on, "PASS_PREP on and off report the same counters");
+    // Both arms actually ran the draw loop rather than refusing it outright.
+    assert!(
+        on.1 + on.2 > 0,
+        "the fixture drew (ok={} fail={})",
+        on.1,
+        on.2
+    );
+}

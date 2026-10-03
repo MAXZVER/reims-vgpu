@@ -5358,6 +5358,10 @@ fn finish_stream<M: HostMemory + HostOps>(
     // guest store that would expose intermediate pixels to DisplaySwap.
     let will_draw = acc.saw_draw && !acc.color_slots.is_empty() && !acc.draws.is_empty();
     if !will_draw {
+        // TEMP (lab, PASS_PREP): the clear-only guest stores get their own bar
+        // (`fin_prelude_clear`), the first of the prelude split (design §8.1,
+        // for C6's byte-heavy candidates).
+        fin.enter(crate::runtime::drain::FinishPhase::PreludeClear);
         // TEMP (lab, REIMS_VGPU_LAB_CLEAR_LOG=1): every clear-only attachment,
         // whether it reaches guest pages, and whether a lazy Store is owed on it.
         if lab_clear_log() {
@@ -5385,6 +5389,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 out.clears_applied += 1;
             }
         }
+        fin.enter(crate::runtime::drain::FinishPhase::Prelude);
     }
 
     // Render ICB execute (`0x14`/`0x15`) — open pass over color slots and run ICB.
@@ -5444,6 +5449,9 @@ fn finish_stream<M: HostMemory + HostOps>(
     // which began at the first one, and re-running it would wipe what the ICB
     // before it drew.
     for (icb_index, exec) in acc.execute_icb.iter().enumerate() {
+        // TEMP (lab, PASS_PREP): each execute gets the ICB bar of the prelude
+        // split; `fin_prelude_icb_n` is the stream's execute count.
+        fin.enter(crate::runtime::drain::FinishPhase::PreludeIcb);
         crate::runtime::drain::note_store_route("icb_exec_seen");
         if !acc.color_slots.is_empty() {
             // `mrt_draw_request` gates on a non-zero pipeline ref, and an
@@ -5580,6 +5588,9 @@ fn finish_stream<M: HostMemory + HostOps>(
         }
         // ICB execute is the primary work; still allow a co-recorded draw below if present.
     }
+    if !acc.execute_icb.is_empty() {
+        fin.enter(crate::runtime::drain::FinishPhase::Prelude);
+    }
 
     if acc.saw_draw && !acc.color_slots.is_empty() && !acc.draws.is_empty() {
         // Archive multi-draw (apple-pv-gpu-exec DrawJob): every honorable draw of
@@ -5594,22 +5605,41 @@ fn finish_stream<M: HostMemory + HostOps>(
             .iter()
             .filter(|pd| pd.pipeline_ref != 0 && pd.draw.vertex_count > 0)
             .collect();
-        // TEMP (lab, REIMS_VGPU_LAB_PAR_PREFETCH): plan the stream's sampled
-        // sources on the worker pool before its draws encode; the plans live
-        // until the end of this block.
+        // TEMP (lab, REIMS_VGPU_LAB_PAR_PREFETCH / REIMS_VGPU_LAB_PASS_PREP):
+        // plan the pass's sampled sources ahead of the draws that bind them —
+        // the stream prefetch in one fork before the loop, or (PASS_PREP, not
+        // `off`, which supersedes it) the chunked driver inside the loop. The
+        // plans live until the end of this block.
+        #[cfg(feature = "backend-vulkan")]
+        let mut pass_prep = None;
         #[cfg(feature = "backend-vulkan")]
         let _prefetch = (crate::backend::selected().rail() == crate::backend::Rail::Vulkan)
             .then(|| {
-                crate::runtime::draw::vulkan::prefetch_stream(
-                    &*state,
-                    task_id,
-                    draw_list.iter().flat_map(|pd| {
-                        [
-                            pd.fragment_textures.as_slice(),
-                            pd.vertex_textures.as_slice(),
-                        ]
-                    }),
-                )
+                if crate::runtime::draw::vulkan::pass_prep_mode()
+                    != crate::runtime::draw::vulkan::PassPrepMode::Off
+                {
+                    let tables: Vec<crate::runtime::draw::vulkan::DrawTables<'_>> = draw_list
+                        .iter()
+                        .map(|pd| crate::runtime::draw::vulkan::DrawTables {
+                            fragment: pd.fragment_textures.as_slice(),
+                            vertex: pd.vertex_textures.as_slice(),
+                        })
+                        .collect();
+                    pass_prep =
+                        crate::runtime::draw::vulkan::PassPrep::open(&*state, task_id, tables);
+                    None
+                } else {
+                    Some(crate::runtime::draw::vulkan::prefetch_stream(
+                        &*state,
+                        task_id,
+                        draw_list.iter().flat_map(|pd| {
+                            [
+                                pd.fragment_textures.as_slice(),
+                                pd.vertex_textures.as_slice(),
+                            ]
+                        }),
+                    ))
+                }
             });
         let mut chain_rgba: Option<Vec<u8>> = None;
         // Occlusion counts, keyed by the guest byte offset each lands at.
@@ -5635,6 +5665,17 @@ fn finish_stream<M: HostMemory + HostOps>(
         if crate::backend::selected().rail() == crate::backend::Rail::Vulkan {
             crate::runtime::draw::vulkan::prewake_recorder_for_stream(draw_list.len());
         }
+        // TEMP (lab, PASS_PREP): the first chunk's scope runs here, before the
+        // first record's request is built, so its fork overlaps the recorder's
+        // wake and the plans are on the frame by the time draw 0 encodes.
+        #[cfg(feature = "backend-vulkan")]
+        if let Some(p) = pass_prep.as_mut() {
+            p.ahead(&*state, 0);
+        }
+        // TEMP (lab, PASS_PREP): the first record's request materialization and
+        // the template it becomes get the MRT bar of the prelude split — the
+        // LOAD-seed read of the pass lives here, C6's second candidate.
+        fin.enter(crate::runtime::drain::FinishPhase::PreludeMrt);
         let first_draw = draw_list.first().copied();
         let mut first_req = first_draw.and_then(|pd| {
             out.render_attachment_resolves = out.render_attachment_resolves.saturating_add(1);
@@ -5664,7 +5705,15 @@ fn finish_stream<M: HostMemory + HostOps>(
             out.metal_draws_fail = out.metal_draws_fail.saturating_add(1);
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
+        fin.enter(crate::runtime::drain::FinishPhase::Prelude);
         for (di, pd) in draw_list.iter().enumerate() {
+            // TEMP (lab, PASS_PREP): at the top of each record, plan the binds
+            // of the chunk this record opens (a no-op inside one already
+            // offered) while the recorder encodes the previous chunk.
+            #[cfg(feature = "backend-vulkan")]
+            if let Some(p) = pass_prep.as_mut() {
+                p.ahead(&*state, di);
+            }
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             resident_chain_before_last_record = resident_chain_before_this_record;
             resident_chain_before_this_record = resident_chain;
