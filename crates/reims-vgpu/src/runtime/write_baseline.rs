@@ -28,6 +28,13 @@
 //! the stamp is held, so the guest has not written the target since the Store
 //! (`gva_store_witness::reach`).
 //!
+//! A stamp with nothing else to wait for — a deferred Store writes no guest
+//! memory, so its packet's stamp is CPU-ready — is not joined on the drain
+//! (n142 fab0: 2559 joins, the whole read time back on the drain): it becomes a
+//! job of its own ([`publish_after`]) that this thread stores and announces
+//! after the reads ahead of it, with a ticket of its own so every later stamp
+//! of any FIFO is ordered after it.
+//!
 //! One thread, jobs in issue order, so "resolved" is a single watermark.
 
 use crate::qemu::host_ops::ReimsVgpuHostOps;
@@ -94,10 +101,20 @@ impl PendingGen {
     }
 }
 
-struct Job {
-    token: u64,
-    slot: Arc<AtomicU64>,
-    ticket: u64,
+enum Job {
+    Read {
+        token: u64,
+        slot: Arc<AtomicU64>,
+        ticket: u64,
+    },
+    Publish {
+        gpa: u64,
+        index: u32,
+        stamp: u32,
+        announce: fn(u32),
+        ticket: u64,
+        queued_at: Instant,
+    },
 }
 
 struct Service {
@@ -137,17 +154,45 @@ pub fn install(ops: &ReimsVgpuHostOps) {
         .spawn(move || {
             let _attachment = registrar.attach();
             while let Ok(job) = rx.recv() {
-                let t0 = Instant::now();
-                let gen_ = table.write_gen(job.token).unwrap_or(0);
-                job.slot.store(gen_, Ordering::Release);
-                RESOLVED.fetch_max(job.ticket, Ordering::AcqRel);
-                {
-                    let _g = GATE.lock();
-                    GATE_CV.notify_all();
-                }
-                note_wait("lab_baseline_read", t0.elapsed());
-                if gen_ == 0 {
-                    crate::runtime::drain::census::note_store_route("lab_baseline_unarmed");
+                match job {
+                    Job::Read {
+                        token,
+                        slot,
+                        ticket,
+                    } => {
+                        let t0 = Instant::now();
+                        let gen_ = table.write_gen(token).unwrap_or(0);
+                        slot.store(gen_, Ordering::Release);
+                        resolve(ticket);
+                        note_wait("lab_baseline_read", t0.elapsed());
+                        if gen_ == 0 {
+                            crate::runtime::drain::census::note_store_route(
+                                "lab_baseline_unarmed",
+                            );
+                        }
+                    }
+                    Job::Publish {
+                        gpa,
+                        index,
+                        stamp,
+                        announce,
+                        ticket,
+                        queued_at,
+                    } => {
+                        // The word lands before the ticket resolves, so a stamp
+                        // gated on this ticket can never be stored ahead of it.
+                        // Through QEMU's address space, as the drain's inline
+                        // publication does (this thread is RCU-registered).
+                        if !write_word(&table, gpa, stamp) {
+                            crate::observe::fail(format!(
+                                "lab_baseline_publish_failed index={index} gpa={gpa:#x} \
+                                 value={stamp:#x}"
+                            ));
+                        }
+                        resolve(ticket);
+                        announce(index);
+                        note_wait("lab_baseline_publish", queued_at.elapsed());
+                    }
                 }
             }
         });
@@ -158,6 +203,51 @@ pub fn install(ops: &ReimsVgpuHostOps) {
         }
         Err(e) => crate::observe::fail(format!("lab_baseline_spawn_failed err={e}")),
     }
+}
+
+fn write_word(table: &ReimsVgpuHostOps, gpa: u64, value: u32) -> bool {
+    let Some(f) = table.write_gpa else {
+        return false;
+    };
+    let bytes = value.to_le_bytes();
+    // SAFETY: QEMU owns ctx for the device lifetime; the buffer outlives the call.
+    unsafe { f(table.ctx, gpa, bytes.as_ptr(), bytes.len()) == 0 }
+}
+
+fn resolve(ticket: u64) {
+    RESOLVED.fetch_max(ticket, Ordering::AcqRel);
+    let _g = GATE.lock();
+    GATE_CV.notify_all();
+}
+
+/// Hand a completion stamp with nothing but reads to wait for to the baseline
+/// thread, which stores `stamp` at `gpa` and calls `announce(index)` once
+/// every read issued before it has resolved. `false` when there is no thread —
+/// the caller joins and publishes itself.
+pub fn publish_after(
+    gpa: u64,
+    index: u32,
+    stamp: u32,
+    announce: fn(u32),
+) -> bool {
+    let Some(svc) = SERVICE.get() else {
+        return false;
+    };
+    let ticket = ISSUED.load(Ordering::Acquire) + 1;
+    ISSUED.store(ticket, Ordering::Release);
+    let job = Job::Publish {
+        gpa,
+        index,
+        stamp,
+        announce,
+        ticket,
+        queued_at: Instant::now(),
+    };
+    if svc.tx.lock().send(job).is_err() {
+        RESOLVED.fetch_max(ticket, Ordering::AcqRel);
+        return false;
+    }
+    true
 }
 
 /// Start a synced generation read of `token` on the baseline thread. `None`
@@ -173,7 +263,7 @@ pub fn issue(token: u64) -> Option<PendingGen> {
     let slot = Arc::new(AtomicU64::new(UNRESOLVED));
     // Issued before it is sent, so a stamp queued after this call is gated on it.
     ISSUED.store(ticket, Ordering::Release);
-    let job = Job {
+    let job = Job::Read {
         token,
         slot: Arc::clone(&slot),
         ticket,
@@ -242,6 +332,10 @@ fn note_wait(prefix: &'static str, elapsed: Duration) {
         ("lab_baseline_gate", 100..=499) => "lab_baseline_gate_lt500us",
         ("lab_baseline_gate", 500..=1999) => "lab_baseline_gate_lt2ms",
         ("lab_baseline_gate", _) => "lab_baseline_gate_ge2ms",
+        ("lab_baseline_publish", 0..=99) => "lab_baseline_publish_lt100us",
+        ("lab_baseline_publish", 100..=499) => "lab_baseline_publish_lt500us",
+        ("lab_baseline_publish", 500..=1999) => "lab_baseline_publish_lt2ms",
+        ("lab_baseline_publish", _) => "lab_baseline_publish_ge2ms",
         (_, 0..=99) => "lab_baseline_join_lt100us",
         (_, 100..=499) => "lab_baseline_join_lt500us",
         (_, 500..=1999) => "lab_baseline_join_lt2ms",
@@ -252,6 +346,7 @@ fn note_wait(prefix: &'static str, elapsed: Duration) {
         match prefix {
             "lab_baseline_read" => "lab_baseline_read_us",
             "lab_baseline_gate" => "lab_baseline_gate_us",
+            "lab_baseline_publish" => "lab_baseline_publish_us",
             _ => "lab_baseline_join_us",
         },
         us,

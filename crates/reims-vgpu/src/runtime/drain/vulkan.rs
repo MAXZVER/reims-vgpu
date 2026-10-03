@@ -91,12 +91,23 @@ fn stamp_word_order_on_fifo<H: HostMemory + HostOps>(
         && engine::guest_access_outstanding();
     let fifo_pending = engine::stamp_completion::fifo_has_pending_stamp(index);
     if StampOrder::from_debt(guest_access, fifo_pending) == StampOrder::CpuReady {
-        // TEMP (lab): a writer-witness read still out holds this word too. The
-        // drain joins it here rather than queueing the word, because a queued
-        // word with no GPU work of its own would wait behind any older stamp
-        // parked on an open batch; the join costs at most what the read would
-        // have cost at the Store.
+        // TEMP (lab): a writer-witness read still out holds this word too. Not
+        // joined on the drain: the baseline thread stores and announces it after
+        // the reads ahead of it (`write_baseline::publish_after`).
         if crate::runtime::write_baseline::outstanding() {
+            if let Some(off) = stamp_slot_offset(index, state.page_size()) {
+                let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
+                note_stamp_direction(host, gpa, index, value);
+                if crate::runtime::write_baseline::publish_after(
+                    gpa,
+                    index,
+                    value,
+                    engine::stamp_completion::announce_published,
+                ) {
+                    note_store_route("lab_baseline_publish_queued");
+                    return StampOrder::Queued;
+                }
+            }
             note_store_route("lab_baseline_join_cpu_ready");
             crate::runtime::write_baseline::wait_resolved(crate::runtime::write_baseline::issued());
         }

@@ -134,6 +134,12 @@ pub fn install_announce(hook: AnnounceStamp) {
     *HOOK.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
 }
 
+/// TEMP (lab): [`announce`] for a stamp another thread published — the
+/// baseline thread's `publish_after` jobs (`crate::runtime::write_baseline`).
+pub(crate) fn announce_published(index: u32) {
+    announce(index);
+}
+
 fn announce(index: u32) {
     let hook = HOOK
         .lock()
