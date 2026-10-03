@@ -4,6 +4,7 @@
 
 use ash::vk;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 
 // ash Handle trait not required here.
@@ -959,6 +960,46 @@ pub(crate) struct ComputePipelineKey {
     pub entry: String,
     pub layout: LayoutId,
     pub local_size: Option<[u32; 3]>,
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SHARD`): the shard bucket digest — the
+/// key's content-stable members only. `attrs` and `layout` are per-boot
+/// ordinals issued in creation order (`AttrsId`, `LayoutId`), so hashing the
+/// whole key would move a pipeline to a different shard on any boot whose
+/// creation order differed, and its warm entry would never be found again.
+///
+/// A bucket digest may collide — two pipelines differing only in those two
+/// members share a shard — which costs nothing: the bucket is not the
+/// identity, and the driver still keys its cache entries on the pipeline's
+/// full content.
+impl PipelineKey {
+    pub(crate) fn shard_digest(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.vert.hash(&mut h);
+        self.frag.hash(&mut h);
+        self.topology.hash(&mut h);
+        self.blend.hash(&mut h);
+        self.secondary_blend.hash(&mut h);
+        self.color_write_mask.hash(&mut h);
+        self.pass.hash(&mut h);
+        self.feedback_colors.hash(&mut h);
+        self.raster.hash(&mut h);
+        self.depth_stencil.hash(&mut h);
+        self.viewport_slots.hash(&mut h);
+        h.finish()
+    }
+}
+
+/// Same contract as [`PipelineKey::shard_digest`]: the compute key's only
+/// per-boot member is `layout`.
+impl ComputePipelineKey {
+    pub(crate) fn shard_digest(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.spirv.hash(&mut h);
+        self.entry.hash(&mut h);
+        self.local_size.hash(&mut h);
+        h.finish()
+    }
 }
 
 /// A shader module and the words the driver compiles from it.
@@ -2871,9 +2912,14 @@ impl ObjectCaches {
                 return Err(err);
             }
         };
+        // TEMP (lab, REIMS_VGPU_LAB_PCACHE_SHARD): route this compile through
+        // its key's shard on the shard path, the monolithic cache otherwise
+        // (byte-for-byte). The digest is bucketing only — see
+        // [`PipelineKey::shard_digest`] for why it is not the whole key.
+        let pipeline_cache = ctx.pipeline_cache_for(|| key.shard_digest());
         let created = ctx
             .device
-            .create_graphics_pipelines(ctx.pipeline_cache, &[gpci], None);
+            .create_graphics_pipelines(pipeline_cache, &[gpci], None);
         breadcrumb.disarm();
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateGraphicsPipelines, e));
@@ -2972,9 +3018,12 @@ impl ObjectCaches {
                 return Err(err);
             }
         };
+        // TEMP (lab, REIMS_VGPU_LAB_PCACHE_SHARD): same shard routing as the
+        // graphics path — one bucket space for every compile site.
+        let pipeline_cache = ctx.pipeline_cache_for(|| key.shard_digest());
         let created = ctx
             .device
-            .create_compute_pipelines(ctx.pipeline_cache, &[cpci], None);
+            .create_compute_pipelines(pipeline_cache, &[cpci], None);
         breadcrumb.disarm();
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateComputePipelines, e));
@@ -4467,5 +4516,54 @@ mod object_cache_tests {
                 "{index}"
             );
         }
+    }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SHARD`): the bucket digest's one
+/// contract — stable across boots for the same content, which means the
+/// per-boot ordinals (`LayoutId`, and on the graphics key `AttrsId`) must not
+/// reach it. A key whose digest moved with creation order would never find
+/// its warm shard again, silently turning every reordered boot cold.
+#[cfg(test)]
+mod pcache_shard_digest_tests {
+    use super::*;
+    use super::super::pcache_shard;
+
+    fn compute_key(layout: LayoutId, spirv: &str, local: Option<[u32; 3]>) -> ComputePipelineKey {
+        ComputePipelineKey {
+            spirv: Digest128::of_bytes(spirv.as_bytes()),
+            entry: "main".to_owned(),
+            layout,
+            local_size: local,
+        }
+    }
+
+    #[test]
+    fn per_boot_layout_ordinals_do_not_move_the_bucket() {
+        let boot_one = compute_key(LayoutId(1), "kernel-a", None);
+        // Same content, but this boot issued the layout a different ordinal.
+        let boot_two = compute_key(LayoutId(9), "kernel-a", None);
+        assert_eq!(
+            boot_one.shard_digest(),
+            boot_two.shard_digest(),
+            "same content, different creation order, must share a shard"
+        );
+        assert_eq!(pcache_shard::shard_of(boot_one.shard_digest()), pcache_shard::shard_of(boot_two.shard_digest()));
+    }
+
+    #[test]
+    fn content_differences_do_move_the_bucket_key() {
+        let base = compute_key(LayoutId(1), "kernel-a", None);
+        assert_ne!(
+            base.shard_digest(),
+            compute_key(LayoutId(1), "kernel-b", None).shard_digest(),
+            "different module"
+        );
+        assert_ne!(
+            base.shard_digest(),
+            compute_key(LayoutId(1), "kernel-a", Some([8, 1, 1])).shard_digest(),
+            "different specialization"
+        );
+        assert_eq!(base.shard_digest(), compute_key(LayoutId(1), "kernel-a", None).shard_digest());
     }
 }

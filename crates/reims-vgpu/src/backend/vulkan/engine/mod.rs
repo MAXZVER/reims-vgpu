@@ -30,6 +30,10 @@ pub mod init_decline;
 mod linear_target_import;
 mod page_diff;
 mod pay_band;
+/// TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SHARD`): per-pipeline-key warm pipeline
+/// caches. `pub(crate)` for the census window line only; everything else is
+/// engine-internal.
+pub(crate) mod pcache_shard;
 mod pools;
 mod queue_owner;
 pub(crate) mod recorder;

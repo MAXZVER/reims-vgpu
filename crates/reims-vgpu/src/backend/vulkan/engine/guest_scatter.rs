@@ -446,8 +446,13 @@ impl ScatterPipeline {
         let info = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(layout)];
+        // TEMP (lab, REIMS_VGPU_LAB_PCACHE_SHARD): the engine's own kernel
+        // hashes into the same bucket space as guest pipelines, so this
+        // one-compile-per-boot create warm-starts from its own shard too.
+        let pipeline_cache =
+            ctx.pipeline_cache_for(|| super::pcache_shard::words_digest(&GUEST_SCATTER_SPIRV));
         let pipeline =
-            match unsafe { device.create_compute_pipelines(ctx.pipeline_cache, &info, None) } {
+            match unsafe { device.create_compute_pipelines(pipeline_cache, &info, None) } {
                 Ok(p) => p[0],
                 Err((_, e)) => {
                     unsafe {

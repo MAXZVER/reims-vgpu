@@ -298,8 +298,20 @@ fn write_cache_atomic(
         let _ = std::fs::remove_file(tmp);
         return Ok(CacheSaveOutcome::Superseded);
     }
+    write_renamed(path, tmp).map(|_| CacheSaveOutcome::Landed)
+}
+
+/// `rename(tmp → path)`, cleaning the tmp up on failure. The atomic tail of
+/// [`write_cache_atomic`] on its own, for callers whose ordering guarantee is
+/// not length — a shard wave replaces the job it displaces, so its files are
+/// newest by construction and a `fetch_max` guard would refuse the shorter
+/// ledger a trim legitimately produces.
+fn write_renamed(
+    path: &std::path::Path,
+    tmp: &std::path::Path,
+) -> Result<(), PipelineCacheDecline> {
     match std::fs::rename(tmp, path) {
-        Ok(()) => Ok(CacheSaveOutcome::Landed),
+        Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(tmp);
             Err(PipelineCacheDecline::rename(&e))
@@ -353,11 +365,18 @@ fn discard_cache_blob(
 /// newest decision about what the file should be. What it buys is the bound —
 /// a queue would let a compile storm grow the backlog without limit while the
 /// disk is the slow part.
+///
+/// TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SHARD`): a [`Job::WriteShardWave`] is
+/// one job the same way, and its supersession safety is *not* inherited
+/// from cache growth — it is built in by the engine side, which re-includes
+/// every shard of an unrun wave (the `ran` ack) when it builds the
+/// replacement. The two invariants live on different sides of the mailbox;
+/// both are load-bearing.
 mod persist {
-    use super::{discard_cache_blob, write_cache_atomic, CacheSaveOutcome};
+    use super::{discard_cache_blob, write_cache_atomic, write_renamed, CacheSaveOutcome};
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
     /// What the owner has been asked to make true of the on-disk blob.
     pub(super) enum Job {
@@ -365,6 +384,20 @@ mod persist {
         Write { path: PathBuf, data: Vec<u8> },
         /// Make the file not exist, and let the next boot start cold.
         Discard { path: PathBuf },
+        /// TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SHARD`): one shard save wave —
+        /// every changed shard blob, the rebuilt ledger, and the trim victims.
+        /// Replaces a waiting wave wholesale; the engine side builds the
+        /// replacement as a superset (see `pcache_shard::ShardSet::save_wave`
+        /// and the `ran` ack), so no shard's only write is dropped.
+        WriteShardWave {
+            writes: Vec<(PathBuf, Vec<u8>)>,
+            ledger: Option<(PathBuf, Vec<u8>)>,
+            deletes: Vec<PathBuf>,
+            /// Set when the owner *starts* the job, so the next wave built on
+            /// the engine thread knows these writes are landing and need not
+            /// be re-submitted.
+            ran: Arc<AtomicBool>,
+        },
     }
 
     struct Mailbox {
@@ -457,8 +490,63 @@ mod persist {
                     crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0);
                 }
             }
+            Job::WriteShardWave { writes, ledger, deletes, ran } => {
+                // Ack before the writes: a wave built while this one runs must
+                // not re-submit shards whose files are already landing.
+                ran.store(true, Ordering::Relaxed);
+                let pid = std::process::id();
+                for (path, data) in &writes {
+                    let tmp = path.with_extension(format!("tmp.{pid}"));
+                    // A shard blob is newest by construction (its wave
+                    // replaced any older one), so the length guard does not
+                    // apply — see `write_renamed`'s own doc.
+                    let landed = std::fs::write(&tmp, data)
+                        .map_err(|error| super::PipelineCacheDecline::write(&error))
+                        .and_then(|()| write_renamed(path, &tmp));
+                    match landed {
+                        Ok(()) => crate::observe::off(format!(
+                            "pcache_shard_saved shard={} bytes={} path={}",
+                            path.file_stem().and_then(|s| s.to_str()).unwrap_or("?"),
+                            data.len(),
+                            path.display(),
+                        )),
+                        Err(decline) => {
+                            // Shard writes carry their own routes; the failure
+                            // class is the same one the monolithic save names.
+                            crate::observe::Emit::decline("pcache_shard_write", &decline)
+                                .fail_once(0);
+                        }
+                    }
+                }
+                if let Some((path, data)) = &ledger {
+                    let tmp = path.with_extension(format!("tmp.{pid}"));
+                    if let Err(decline) = std::fs::write(&tmp, data)
+                        .map_err(|error| super::PipelineCacheDecline::write(&error))
+                        .and_then(|()| write_renamed(path, &tmp))
+                    {
+                        crate::observe::Emit::decline("pcache_shard_write", &decline).fail_once(0);
+                    }
+                }
+                for path in deletes {
+                    // A trim victim that is already gone is the outcome wanted.
+                    let _ = std::fs::remove_file(path);
+                }
+            }
         }
     }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SHARD`): hand one shard wave to the
+/// persistence owner. Sits here (and not in `pcache_shard`) so `persist`
+/// stays context-private; the wave's *contents* are decided by
+/// `pcache_shard::ShardSet::save_wave`, which is the only submitter.
+pub(super) fn submit_shard_wave(
+    writes: Vec<(std::path::PathBuf, Vec<u8>)>,
+    ledger: Option<(std::path::PathBuf, Vec<u8>)>,
+    deletes: Vec<std::path::PathBuf>,
+    ran: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    persist::submit(persist::Job::WriteShardWave { writes, ledger, deletes, ran });
 }
 
 /// Validate a candidate initial-data blob against the live device.
@@ -466,7 +554,10 @@ mod persist {
 /// prior `vkGetPipelineCacheData` on a compatible device — feeding it a
 /// stale/corrupt file is UB, so the VkPipelineCacheHeaderVersionOne fields
 /// are checked here, not left to the driver.
-fn pipeline_cache_blob_compatible(blob: &[u8], props: &vk::PhysicalDeviceProperties) -> bool {
+pub(super) fn pipeline_cache_blob_compatible(
+    blob: &[u8],
+    props: &vk::PhysicalDeviceProperties,
+) -> bool {
     if blob.len() < PIPELINE_CACHE_HEADER_ONE_LEN {
         return false;
     }
@@ -835,6 +926,12 @@ pub(crate) struct DeviceContext {
     /// last snapshotted, and whether a compile since then is still unsaved.
     pub pipeline_cache_saved_ms: AtomicU64,
     pub pipeline_cache_save_pending: std::sync::atomic::AtomicBool,
+    /// TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SHARD=on`): the per-pipeline shard
+    /// caches this device compiles through instead of the monolithic one —
+    /// `Some` exactly when the flag is on, so every shard-mode branch is
+    /// reachable only behind it and the off path is unchanged. See
+    /// [`super::pcache_shard`] for the scheme and its measurements.
+    pub pcache_shards: Option<Mutex<super::pcache_shard::ShardSet>>,
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
     #[cfg(feature = "host-window")]
     pub swapchain: bool,
@@ -1467,12 +1564,30 @@ impl DeviceContext {
         // incompatible cache, and the header is validated before use
         // (passing a blob not produced by vkGetPipelineCacheData for this
         // device is a Vulkan valid-usage violation, not a soft fallback).
+        //
+        // TEMP (lab, REIMS_VGPU_LAB_PCACHE_SHARD=on): the monolithic blob is
+        // left unread and untouched — an old 9 MiB file must not be declined
+        // and discarded by the monolithic bound while the shard directory is
+        // what this boot actually warms from — so toggling the flag back and
+        // forth leaves both caches intact for their A/B.
         let pipeline_cache_path = pipeline_cache_disk_path(&props.pipeline_cache_uuid);
-        let initial_blob = match read_pipeline_cache_blob(&pipeline_cache_path, &props) {
-            Ok(blob) => blob,
-            Err(decline) => {
-                crate::observe::Emit::decline("vk_pipeline_cache_load", &decline).fail_once(0);
-                None
+        let pcache_shards = if super::pcache_shard::enabled() {
+            Some(Mutex::new(super::pcache_shard::ShardSet::open(
+                &super::pcache_shard::disk_dir(&props.pipeline_cache_uuid),
+                &props,
+            )))
+        } else {
+            None
+        };
+        let initial_blob = if pcache_shards.is_some() {
+            None
+        } else {
+            match read_pipeline_cache_blob(&pipeline_cache_path, &props) {
+                Ok(blob) => blob,
+                Err(decline) => {
+                    crate::observe::Emit::decline("vk_pipeline_cache_load", &decline).fail_once(0);
+                    None
+                }
             }
         };
         let mut pcci = vk::PipelineCacheCreateInfo::default();
@@ -1539,9 +1654,33 @@ impl DeviceContext {
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
             pipeline_cache_saved_ms: AtomicU64::new(0),
             pipeline_cache_save_pending: std::sync::atomic::AtomicBool::new(false),
+            pcache_shards,
             #[cfg(feature = "host-window")]
             swapchain,
         })
+    }
+
+    /// The `VkPipelineCache` one pipeline compile should go through.
+    ///
+    /// Default path: the monolithic cache, byte-for-byte as before — the
+    /// digest closure is not even evaluated. Shard path
+    /// (`REIMS_VGPU_LAB_PCACHE_SHARD=on`): the digest's shard, created and
+    /// warm-loaded from its file on first use. Called once per actual compile
+    /// — the in-memory `ObjectCache` has already filtered the hits — so the
+    /// digest hash and (on first use) one file read are per-compile costs,
+    /// never per-draw.
+    ///
+    /// # Safety
+    ///
+    /// Creates Vulkan objects on first use per shard, so the caller must hold
+    /// the same external synchronization every other device use on this
+    /// context requires (the engine lock).
+    pub(crate) unsafe fn pipeline_cache_for(&self, digest: impl FnOnce() -> u64) -> vk::PipelineCache {
+        let Some(set) = self.pcache_shards.as_ref() else {
+            return self.pipeline_cache;
+        };
+        let mut set = set.lock().unwrap_or_else(|poison| poison.into_inner());
+        set.cache_for(digest(), &self.device)
     }
 
     /// Persist the pipeline cache to disk when it has grown since the last
@@ -1572,6 +1711,16 @@ impl DeviceContext {
             self.pipeline_cache_saved_ms.store(now.max(1), Ordering::Relaxed);
             self.pipeline_cache_save_pending
                 .store(false, Ordering::Relaxed);
+        }
+        // TEMP (lab, REIMS_VGPU_LAB_PCACHE_SHARD=on): the wave replaces the
+        // monolithic snapshot below. The monolithic `VkPipelineCache` never
+        // grows in this mode (nothing compiles through it), so snapshotting
+        // it would be a driver round trip for 32 header bytes; the shard
+        // caches own this boot's warm data and their own debounced saves.
+        if let Some(set) = self.pcache_shards.as_ref() {
+            let mut set = set.lock().unwrap_or_else(|poison| poison.into_inner());
+            set.save_wave(&self.device);
+            return;
         }
         let data = match unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache) } {
             Ok(d) => d,
@@ -1660,6 +1809,14 @@ impl DeviceContext {
         }
         if let Some(probe) = self.draw_spans.take() {
             self.device.destroy_query_pool(probe.pool, None);
+        }
+        // TEMP (lab, REIMS_VGPU_LAB_PCACHE_SHARD=on): the shard caches go with
+        // the device. Their last wave was already submitted by the flush above;
+        // the persistence owner owns no Vulkan handles, so its in-flight file
+        // writes are unaffected by this.
+        if let Some(set) = self.pcache_shards.take() {
+            let mut set = set.lock().unwrap_or_else(|poison| poison.into_inner());
+            set.destroy(&self.device);
         }
         self.device
             .destroy_pipeline_cache(self.pipeline_cache, None);
@@ -2839,6 +2996,56 @@ mod persist_owner_tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SHARD`): a wave is one job that lands
+    /// every shard file, the ledger, and the trim deletes — and acks before
+    /// the first byte moves, which is what lets the engine side build the next
+    /// wave while this one runs without re-submitting shards already landing.
+    ///
+    /// The mailbox is one job process-wide, so a concurrently running test can
+    /// displace this wave before it runs; the resubmit loop is the same
+    /// idempotent wave until its ack observes a run.
+    #[test]
+    fn a_shard_wave_lands_files_ledger_and_deletes() {
+        let dir = owner_dir("shard-wave");
+        let s1 = dir.join("s01.bin");
+        let s2 = dir.join("s02.bin");
+        let victim = dir.join("s03.bin");
+        let ledger = dir.join("ledger.bin");
+        std::fs::write(&victim, b"stale").unwrap();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wave = || {
+            persist::submit(persist::Job::WriteShardWave {
+                writes: vec![(s1.clone(), vec![0xABu8; 64]), (s2.clone(), vec![0xCDu8; 48])],
+                ledger: Some((ledger.clone(), b"RVPSHL01".to_vec())),
+                deletes: vec![victim.clone()],
+                ran: ran.clone(),
+            });
+        };
+        wave();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last_submit = std::time::Instant::now();
+        while !(ran.load(std::sync::atomic::Ordering::Relaxed)
+            && s1.exists()
+            && s2.exists()
+            && ledger.exists())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the wave never landed"
+            );
+            if last_submit.elapsed() >= std::time::Duration::from_millis(200) {
+                wave();
+                last_submit = std::time::Instant::now();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(std::fs::read(&s1).unwrap(), vec![0xABu8; 64]);
+        assert_eq!(std::fs::read(&s2).unwrap(), vec![0xCDu8; 48]);
+        assert_eq!(std::fs::read(&ledger).unwrap(), b"RVPSHL01".to_vec());
+        assert!(!victim.exists(), "the trim delete ran");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

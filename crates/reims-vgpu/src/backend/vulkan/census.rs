@@ -134,8 +134,20 @@ pub(crate) fn emit_engine_delta() {
         let _ = write!(line, " {name}={value}");
     }
     crate::observe::off(line);
+    emit_pcache_shard();
     emit_registry_pressure(&now);
     emit_draw_phase();
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SHARD=on`): the shard routes' window —
+/// hit/miss deltas beside levels, so a login storm's worst second reads next
+/// to `draw_phase`'s `pl_compile_us` on the same page. Silent when the lab
+/// flag is off (the off path changes nothing, log included) and until a
+/// device has actually opened a shard set.
+fn emit_pcache_shard() {
+    if let Some(line) = crate::backend::vulkan::engine::pcache_shard::census_window() {
+        crate::observe::off(line);
+    }
 }
 
 /// How far the resident registries reached, and what the populations that

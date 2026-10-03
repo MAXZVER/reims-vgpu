@@ -1044,7 +1044,12 @@ impl DiffPipeline {
             .flags(flags)
             .stage(stage)
             .layout(layout)];
-        let pipeline = unsafe { device.create_compute_pipelines(ctx.pipeline_cache, &info, None) }
+        // TEMP (lab, REIMS_VGPU_LAB_PCACHE_SHARD): same shard routing as the
+        // guest compile sites; the `dispatch_base` variant lands beside its
+        // base kernel because the bucket is keyed on the module's words, and
+        // a bucket holding both is the normal case.
+        let pipeline_cache = ctx.pipeline_cache_for(|| super::pcache_shard::words_digest(code));
+        let pipeline = unsafe { device.create_compute_pipelines(pipeline_cache, &info, None) }
             .map_err(|(_, e)| DrawError::VkCall(VkCall::new(VkOp::ScatterCreatePipeline, e)))?[0];
         let sizes = [
             vk::DescriptorPoolSize::default()
