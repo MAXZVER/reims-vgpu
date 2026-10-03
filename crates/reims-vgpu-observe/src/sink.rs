@@ -112,18 +112,29 @@ fn test_path(kind: &str) -> String {
     format!("/tmp/reims-vgpu-{kind}-test-{}.log", std::process::id())
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_LOG_DIR` moves the product logs into that
+/// directory, so several VMs on one host (the lab's home rig runs three or
+/// four) keep separate logs instead of sharing the drive-relative `/tmp`.
+#[cfg(not(any(test, feature = "testing")))]
+fn product_path(kind: &str) -> String {
+    match std::env::var("REIMS_VGPU_LAB_LOG_DIR") {
+        Ok(dir) if !dir.is_empty() => format!("{dir}/reims-vgpu-{kind}.log"),
+        _ => format!("/tmp/reims-vgpu-{kind}.log"),
+    }
+}
+
 pub fn fail_log_path() -> &'static str {
     #[cfg(any(test, feature = "testing"))]
     return FAIL_PATH.get_or_init(|| test_path("fail"));
     #[cfg(not(any(test, feature = "testing")))]
-    FAIL_PATH.get_or_init(|| "/tmp/reims-vgpu-fail.log".to_string())
+    FAIL_PATH.get_or_init(|| product_path("fail"))
 }
 
 pub fn draw_log_path() -> &'static str {
     #[cfg(any(test, feature = "testing"))]
     return DRAW_PATH.get_or_init(|| test_path("draw"));
     #[cfg(not(any(test, feature = "testing")))]
-    DRAW_PATH.get_or_init(|| "/tmp/reims-vgpu-draw.log".to_string())
+    DRAW_PATH.get_or_init(|| product_path("draw"))
 }
 
 /// Test-harness support: point the always-on sinks at per-process files so a
