@@ -85,7 +85,10 @@ fn stamp_word_order_on_fifo<H: HostMemory + HostOps>(
     // would let the older completion overwrite the slot with a prior value.
     // Reads count just as much as writes: once this stamp moves, the guest may
     // repaint or free pages a preceding command buffer still sources.
-    let guest_access = engine::guest_access_outstanding();
+    // TEMP (lab): a `Fast` control word frees no guest page, so recorded GPU
+    // reads of guest RAM are not its to wait for; the FIFO order still is.
+    let guest_access = super::lab_ctrl_stamp::current() != super::lab_ctrl_stamp::Kind::Fast
+        && engine::guest_access_outstanding();
     let fifo_pending = engine::stamp_completion::fifo_has_pending_stamp(index);
     if StampOrder::from_debt(guest_access, fifo_pending) == StampOrder::CpuReady {
         return StampOrder::CpuReady;

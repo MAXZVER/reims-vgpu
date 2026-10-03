@@ -700,6 +700,14 @@ impl HostOps for QemuHost<'_> {
         // queue (poppable without the device lock) and wake the delivery BH.
         let prompt = self.prompt;
         match action.kind {
+            // TEMP (lab): a control word a guest thread is blocked on skips the
+            // hold (`lab_ctrl_stamp`); the pulse below also carries any held one.
+            HostActionKind::IrqGfxPulse if crate::runtime::drain::lab_ctrl_stamp::urgent() => {
+                self.deferred_gfx = None;
+                crate::runtime::drain::note_store_route("lab_ctrl_stamp_irq_now");
+                self.raise_pulse(action);
+                return;
+            }
             HostActionKind::IrqGfxPulse if lab_irq_batch_us() > 0 => {
                 let now = crate::observe::elapsed_us();
                 match self.deferred_gfx {

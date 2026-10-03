@@ -3194,6 +3194,11 @@ fn run_parked_packet<H: HostMemory + HostOps>(
     }
     match state.complete_transaction(work.epoch(), ingress) {
         Ok(released) => {
+            // TEMP (lab): a guest thread blocks on these control packets' words
+            // (resource delete, GPU page-table map/unmap); see `lab_ctrl_stamp`.
+            // The fast answer is only for this packet's own word: a release that
+            // also carries an older position of the channel keeps the queue.
+            let ctrl = lab_ctrl_stamp::classify(u16::from(work.packet().opcode), released.len());
             for release in released {
                 // **Counted here because the model cannot count it, and a
                 // publisher nobody counts reads exactly like one that never
@@ -3214,6 +3219,7 @@ fn run_parked_packet<H: HostMemory + HostOps>(
                 match release.stamp {
                     Some(stamp) => {
                         note_store_route("stamp_published_by_channel");
+                        let _ctrl = lab_ctrl_stamp::scope(ctrl);
                         publish_word(state, host, domain, stamp.slot.0, stamp.value.0);
                     }
                     // A position whose channel released it owing no word. It is
@@ -3719,6 +3725,15 @@ pub fn write_stamp<H: HostMemory + HostOps>(
         // fence — which is what `armed_stamp_seq` is compared against, and
         // dating it from the completion would call that window punctual.
         state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
+        // TEMP (lab): a guest thread is blocked on this control word; the open
+        // batch it is parked behind would otherwise wait for the tranche's end.
+        if lab_ctrl_stamp::current() != lab_ctrl_stamp::Kind::None {
+            note_store_route(if crate::backend::selected().flush_batch_for_waiting_stamp(index) {
+                "lab_ctrl_stamp_flushed_batch"
+            } else {
+                "lab_ctrl_stamp_queued_in_flight"
+            });
+        }
         return;
     }
     let Some(off) = stamp_slot_offset(index, state.page_size()) else {
@@ -3754,6 +3769,86 @@ pub fn write_stamp<H: HostMemory + HostOps>(
 /// WindowServer resumes (fhz1b t=127780-127963: no packet, no VBL, no log line) —
 /// the shape of a waiter asleep on a word already written, released by CA's
 /// ~200 ms synchronize timeout. A spurious wake costs the guest one re-read.
+/// TEMP (lab, `REIMS_VGPU_LAB_CTRL_STAMP=on`, off by default): the guest driver
+/// blocks a thread on the word of each control packet it sends (resource delete,
+/// GPU page-table map/unmap, IOSurface backing delete); on full-screen
+/// transitions WindowServer's compositor spent 1.2 s of 12 transitions there,
+/// 3.2 ms a wait with 16-32 ms tails (n136), because the word was queued behind
+/// the open draw batch (submitted at the tranche's end) whenever any recorded
+/// draw read guest RAM, and its interrupt was held by the IRQ batch.
+///
+/// - `Fast` (delete resource 0x25, map 0x39): the packet frees no guest page, so
+///   its word owes no wait for GPU reads of guest RAM; it is still queued behind
+///   an older pending word of its FIFO (the slot order).
+/// - `Flush` (unmap 0x22, delete IOSurface backing 0x36): after the word the
+///   guest frees the pages, so the queue stays; the open batch is submitted at
+///   once and the word waits only for work already recorded.
+/// - Both raise their interrupt at once (no IRQ batch hold).
+pub(crate) mod lab_ctrl_stamp {
+    use super::{
+        CHILD_OP_DELETE_IOSURFACE_BACKING2, CHILD_OP_DELETE_RESOURCE, CHILD_OP_MAP_MEMORY2,
+        CHILD_OP_UNMAP_MEMORY,
+    };
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Kind {
+        None,
+        Fast,
+        Flush,
+    }
+
+    thread_local! {
+        static KIND: Cell<Kind> = const { Cell::new(Kind::None) };
+    }
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Off by default: n138 (on x2 / off x2) changed neither the transition
+        // frames nor WindowServer's waits — those control packets park on the
+        // compositor's frame stamp at the guest's own request.
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CTRL_STAMP").is_ok_and(|v| v == "on"))
+    }
+
+    /// The kind for a packet whose completion released `released` positions.
+    pub(crate) fn classify(opcode: u16, released: usize) -> Kind {
+        if !on() {
+            return Kind::None;
+        }
+        match opcode {
+            CHILD_OP_DELETE_RESOURCE | CHILD_OP_MAP_MEMORY2 if released == 1 => Kind::Fast,
+            CHILD_OP_DELETE_RESOURCE
+            | CHILD_OP_MAP_MEMORY2
+            | CHILD_OP_UNMAP_MEMORY
+            | CHILD_OP_DELETE_IOSURFACE_BACKING2 => Kind::Flush,
+            _ => Kind::None,
+        }
+    }
+
+    /// The kind of the word being published on this thread.
+    pub(crate) fn current() -> Kind {
+        KIND.with(|k| k.get())
+    }
+
+    /// Whether the word being published wants its interrupt raised at once.
+    pub(crate) fn urgent() -> bool {
+        current() != Kind::None
+    }
+
+    pub(crate) struct Scope(Kind);
+
+    /// Mark the words published until the guard drops.
+    pub(crate) fn scope(kind: Kind) -> Scope {
+        Scope(KIND.with(|k| k.replace(kind)))
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            KIND.with(|k| k.set(self.0));
+        }
+    }
+}
+
 pub(crate) mod lab_rewake {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
