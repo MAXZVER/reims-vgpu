@@ -237,12 +237,30 @@ impl<'a> PassPrep<'a> {
             u64::from(crate::backend::vulkan::engine::recorder_outstanding()),
         );
         let task_id = self.task_id;
+        // The chunk's memo-fill budget (design 8.2: a byte limit per portion),
+        // spent by whichever workers plan memo fills inside this scope.
+        let memo_budget =
+            std::sync::atomic::AtomicU64::new(sample_plan::memo_fill_chunk_limit());
         let scoped = pool.scope(state, &items, |st, env, item| {
-            prefetch::plan_item(st, env, task_id, item.texture_ref, item.resource.clone())
+            prefetch::plan_item(
+                st,
+                env,
+                task_id,
+                item.texture_ref,
+                item.resource.clone(),
+                &memo_budget,
+            )
         });
         crate::runtime::drain::note_store_route_n("pass_prep_fork_us", scoped.fork_us);
         crate::runtime::drain::note_store_route_n("pass_prep_wait_us", scoped.wait_us);
         crate::runtime::drain::note_store_route_n("pass_prep_helper_us", scoped.helper_busy_us);
+        // What the chunk's memo fills cost in bytes, against the budget above:
+        // the memcpy this driver added to the pool, priced where it ran.
+        crate::runtime::drain::note_store_route_n(
+            "pass_prep_memo_fill_bytes",
+            sample_plan::memo_fill_chunk_limit()
+                - memo_budget.load(std::sync::atomic::Ordering::Relaxed),
+        );
         let mut plans = Vec::with_capacity(items.len());
         for (item, result) in items.iter().zip(scoped.results) {
             // A bail is as final as a plan for this pass: the ladder below it
@@ -256,6 +274,8 @@ impl<'a> PassPrep<'a> {
                         StreamPlan::Surface(_) => "par_prefetch_planned",
                         StreamPlan::RefView(_) => "par_prefetch_planned_ref_view",
                         StreamPlan::Linear(_) => "par_prefetch_planned_linear",
+                        StreamPlan::MapperRef(_) => "par_prefetch_planned_mapper_ref",
+                        StreamPlan::Memo(_) => "par_prefetch_planned_memo",
                     });
                     plans.push(((task_id, item.texture_ref), plan));
                 }

@@ -917,6 +917,14 @@ impl PendingWrites {
     }
 }
 
+/// Whether a CPU read of `gpas` would race a submitted-but-unexecuted guest
+/// writeback — the question a pool-side plan asks where the serial reader
+/// settles (waits) first. Reads only: one atomic load when nothing is
+/// outstanding, the same gate the settle path opens with.
+pub(crate) fn writes_pending_over(gpas: &[u64]) -> bool {
+    !PendingWrites::over(gpas).settled()
+}
+
 /// The resolved window one gather will read.
 ///
 /// The pages and the host spans over them are both needed and neither implies

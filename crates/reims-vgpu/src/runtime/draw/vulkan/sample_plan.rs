@@ -1532,6 +1532,820 @@ pub(crate) fn commit_linear_plan<M: HostMemory + HostOps>(
     Ok((plan.source(guest_runs, Some(outcome)), Some(next)))
 }
 
+/// The surface id a sampled ref names, by the same classification
+/// [`plan_sampled_source`] applies — the ref-texture's descriptor surface, the
+/// backing ref's own id, or a mapper-ref-texture's registered mapping.
+fn sampled_surface_of(
+    resource: &std::sync::Arc<crate::model::TaskResource>,
+    texture_ref: u32,
+) -> Result<u32, SampleBail> {
+    let entry = resource.entry;
+    if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
+        let sid = reims_vgpu_wire::device_desc::ref_texture_header(&resource.descriptor)
+            .map(|t5| t5.surface_id.get())
+            .unwrap_or(0);
+        return (sid != 0).then_some(sid).ok_or(SampleBail::NotSurface);
+    }
+    if entry.object_type == objects::OBJECT_TYPE_BACKING {
+        return Ok(texture_ref);
+    }
+    if entry.object_type == crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE {
+        return resource
+            .registered_mapper_ref_texture_mapping()
+            .ok_or(SampleBail::ColdMapperRef);
+    }
+    Err(SampleBail::NotSurface)
+}
+
+/// Whether the mapping's direct image — the arm of
+/// [`try_mapper_ref_texture_sample_zero_copy`] that resolves (or borrows) the
+/// mapping's contiguous import — may serve this bind, from state this call only
+/// reads. Provable refusals only: an unstable host (the arm answers `None`
+/// before it resolves anything) and a contig view this page-list generation has
+/// already refused (the cached refusal answers without a host call — and a
+/// *live* view outranks the cached refusal, exactly as
+/// `ensure_contig_view_with_pages` orders the two). Everything else — no view
+/// yet, a view with no import, an import the alignment gate would rebuild — is
+/// the serial rail's to resolve, so the plan declines.
+fn mapper_direct_rung_above_may_serve<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mid: u32,
+) -> bool {
+    if !host.map_pages_stable() {
+        return false;
+    }
+    let Some(m) = state.mappings.get(&mid) else {
+        return false;
+    };
+    if m.contig_ptr != 0 {
+        // A view the serial resolve would borrow or rebuild an import over;
+        // either way the direct arm answers before the gather arm runs.
+        return true;
+    }
+    m.contig_refused_gen != Some(m.map_generation)
+}
+
+/// A mapper-ref surface's zero-copy bind planned off the drain thread: the
+/// window+gather arm of [`try_mapper_ref_texture_sample_zero_copy`] over the
+/// mapping's cached window ([`crate::runtime::mapper::mapping_window_cached`])
+/// and [`crate::runtime::gather_witness::plan_gather`] on
+/// `GatherRail::MapperRefTexture`.
+///
+/// The direct image arm above it is refused wherever it may serve
+/// ([`SampleBail::UpperRung`], conservatively — resolving it mutates), the
+/// mapping's owed frame is refused ([`SampleBail::OwedFrame`]; the serial rail
+/// pays before it looks at the pages), and a cold window cache is refused
+/// ([`SampleBail::ColdWindow`]; the serial resolve fills it). A commit hands
+/// back the repeat for the next bind of the same window.
+#[derive(Clone)]
+pub(crate) struct MapperRefPlan {
+    task_id: u32,
+    texture_ref: u32,
+    resource: std::sync::Arc<crate::model::TaskResource>,
+    mid: u32,
+    w: u32,
+    h: u32,
+    base_off: u64,
+    bpr: u64,
+    span: u64,
+    row_length_texels: u32,
+    native: TexelLayout,
+    sampled_vk_format: ash::vk::Format,
+    window_key: (u32, u64, usize),
+    gpas: std::sync::Arc<Vec<u64>>,
+    runs: std::sync::Arc<Vec<crate::backend::vulkan::engine::GuestRun>>,
+    gather: crate::runtime::gather_witness::PlannedGather,
+}
+
+/// Plan the mapper-ref zero-copy bind of one sampled ref. Every point where
+/// the serial rail would mutate — pay the mapping's debt, resolve the contig
+/// import, fill the window cache, arm the witness — is a [`SampleBail`] and
+/// the serial rail serves the bind unchanged.
+pub(crate) fn plan_mapper_ref_zero_copy<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+    resource: std::sync::Arc<crate::model::TaskResource>,
+) -> Result<MapperRefPlan, SampleBail> {
+    let mid = sampled_surface_of(&resource, texture_ref)?;
+    let m = state.mappings.get(&mid).ok_or(SampleBail::ColdBacking)?;
+    if !(m.mapped && !m.page_entries.is_empty() && m.has_geom) {
+        return Err(SampleBail::ColdBacking);
+    }
+    let (w, h) = (m.width, m.height);
+    if w == 0 || h == 0 {
+        return Err(SampleBail::NoGeometry);
+    }
+    let format = if m.format != 0 {
+        m.format
+    } else {
+        pixel_format::MTL_FORMAT_BGRA8_UNORM
+    };
+    // The same four-byte-colour + identity-swizzle gate the serial rail applies.
+    let native = match translate::pixel::sampled_pixels(format) {
+        Ok((layout, _decline, components))
+            if layout.is_four_byte_color() && pixel_format::swizzle_is_identity(&components) =>
+        {
+            layout
+        }
+        _ => return Err(SampleBail::ZeroCopyDeclined),
+    };
+    let sampled_vk_format = translate::pixel::translate(format)
+        .ok()
+        .ok_or(SampleBail::ZeroCopyDeclined)?
+        .vk;
+    let (base_off, bpr_u32, _) = crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+        m, w, h, format,
+    )
+    .ok_or(SampleBail::ZeroCopyDeclined)?;
+    let bpr = u64::from(bpr_u32);
+    let (span, row_length_texels) =
+        strided_window_extent(w, h, native.bytes_per_texel() as u64, bpr)
+            .ok_or(SampleBail::ZeroCopyDeclined)?;
+    // The plan never pays (H7).
+    if crate::runtime::writeback_debt::owes_mapping(state, mid) {
+        return Err(SampleBail::OwedFrame);
+    }
+    // The direct image arm above: refused wherever it may serve or resolve.
+    if mapper_direct_rung_above_may_serve(state, host, mid) {
+        return Err(SampleBail::UpperRung);
+    }
+    if !sampled_gather_floor_pure(native, span) {
+        return Err(SampleBail::ZeroCopyDeclined);
+    }
+    if crate::runtime::lab_runs::mode() != crate::runtime::lab_runs::Mode::On {
+        return Err(SampleBail::ColdWindow);
+    }
+    let window_key = crate::runtime::mapper::mapping_window_key_readonly(state, mid)
+        .ok_or(SampleBail::ColdWindow)?;
+    let (gpas, runs) =
+        crate::runtime::mapper::mapping_window_cached(state, mid, base_off, span)
+            .ok_or(SampleBail::ColdWindow)?;
+    if !guest_run_alias_available(host) {
+        return Err(SampleBail::ZeroCopyDeclined);
+    }
+    let gather = crate::runtime::gather_witness::plan_gather(
+        state,
+        host,
+        crate::runtime::gather_witness::GatherRail::MapperRefTexture,
+        crate::runtime::gather_witness::GatherKey::Mapping { mid, base_off },
+        crate::runtime::gather_witness::GatherWindow {
+            gpas: &gpas,
+            runs: &runs,
+            span,
+            page_size: state.page_size() as usize,
+        },
+    )
+    .ok_or(SampleBail::ColdWitness)?;
+    Ok(MapperRefPlan {
+        task_id,
+        texture_ref,
+        resource,
+        mid,
+        w,
+        h,
+        base_off,
+        bpr,
+        span,
+        row_length_texels,
+        native,
+        sampled_vk_format,
+        window_key,
+        gpas,
+        runs,
+        gather,
+    })
+}
+
+impl MapperRefPlan {
+    fn source(
+        &self,
+        pages: Option<std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>>,
+        outcome: crate::runtime::gather_witness::GatherOutcome,
+    ) -> (u32, u32, u32, SampledSourceRequest) {
+        (
+            self.w,
+            self.h,
+            self.mid,
+            SampledSourceRequest::GuestRuns(
+                crate::backend::vulkan::engine::GuestRunSource {
+                    runs: std::sync::Arc::clone(&self.runs),
+                    source_offset: 0,
+                    total_len: self.span,
+                    row_length_texels: self.row_length_texels,
+                    pages,
+                    direct_image: None,
+                },
+                self.native,
+                self.sampled_vk_format,
+                1,
+                Some(LinearSampleIdentity::from(outcome.identity)),
+                outcome.vouch,
+                pixel_format::swizzle_identity(),
+            ),
+        )
+    }
+}
+
+/// Re-check a mapper-ref plan at the point the serial rail would run, and with
+/// `apply` take it: the mapping row, the window key and its cached window, the
+/// debt and the direct arm above, and the witness plan — which commits through
+/// [`crate::runtime::gather_witness::commit_gather_repeatable`], so the Ok
+/// pair's second element is the repeat for the next bind of the same window.
+pub(crate) fn commit_mapper_ref_plan<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    plan: &MapperRefPlan,
+    task_id: u32,
+    texture_ref: u32,
+    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
+    apply: bool,
+) -> Result<
+    (
+        (u32, u32, u32, SampledSourceRequest),
+        Option<MapperRefPlan>,
+    ),
+    SampleInvalid,
+> {
+    if plan.task_id != task_id || plan.texture_ref != texture_ref {
+        return Err(SampleInvalid::Key);
+    }
+    if !resource.is_some_and(|r| std::sync::Arc::ptr_eq(r, &plan.resource)) {
+        return Err(SampleInvalid::Resource);
+    }
+    let mid = plan.mid;
+    let row_holds = state.mappings.get(&mid).is_some_and(|m| {
+        m.mapped && !m.page_entries.is_empty() && m.has_geom && m.width == plan.w && m.height == plan.h
+    });
+    let window_holds = state.mappings.get(&mid).and_then(|m| {
+        let format = if m.format != 0 {
+            m.format
+        } else {
+            pixel_format::MTL_FORMAT_BGRA8_UNORM
+        };
+        crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+            m,
+            plan.w,
+            plan.h,
+            format,
+        )
+        .map(|(base_off, bpr, _)| (base_off, u64::from(bpr)))
+    });
+    if !row_holds
+        || window_holds != Some((plan.base_off, plan.bpr))
+        || crate::runtime::mapper::mapping_window_key_readonly(state, mid) != Some(plan.window_key)
+    {
+        return Err(SampleInvalid::Mapping);
+    }
+    if crate::runtime::writeback_debt::owes_mapping(state, mid) {
+        return Err(SampleInvalid::Debt);
+    }
+    if mapper_direct_rung_above_may_serve(&*state, &*host, mid) {
+        return Err(SampleInvalid::UpperRung);
+    }
+    let cached = crate::runtime::mapper::mapping_window_cached(state, mid, plan.base_off, plan.span);
+    if !cached.is_some_and(|(gpas, runs)| {
+        std::sync::Arc::ptr_eq(&gpas, &plan.gpas) && std::sync::Arc::ptr_eq(&runs, &plan.runs)
+    }) {
+        return Err(SampleInvalid::Window);
+    }
+    if !apply {
+        return Ok((plan.source(None, plan.gather.predicted()), None));
+    }
+    crate::runtime::drain::note_store_route("t11rung_zero_copy");
+    let (outcome, repeat) = crate::runtime::gather_witness::commit_gather_repeatable(
+        state,
+        &*host,
+        &plan.gather,
+        &plan.gpas,
+        &plan.runs,
+    )
+    .ok_or(SampleInvalid::Witness)?;
+    let page = state.page_size();
+    let pages = guest_page_window(
+        host,
+        &plan.gpas,
+        page,
+        plan.base_off % page,
+        plan.span,
+    );
+    let mut next = plan.clone();
+    next.gather = repeat;
+    Ok((plan.source(pages, outcome), Some(next)))
+}
+
+/// TEMP (lab, step 2): the memo-fill byte budget one planning chunk may spend,
+/// `REIMS_VGPU_LAB_PASS_PREP_MEMO=KB` (default 4096 KiB). The serial memo has
+/// no budget — this bounds the memcpy a chunk's workers add, not the memo
+/// itself (the memo's own byte cap still governs what it retains).
+pub(crate) fn memo_fill_chunk_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PASS_PREP_MEMO")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(4096)
+            .saturating_mul(1024)
+    })
+}
+
+/// The mapping fields a memo plan's answer depends on, re-checked at commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MemoReads {
+    map_generation: u32,
+    width: u32,
+    height: u32,
+    format: u16,
+    mapped: bool,
+    has_geom: bool,
+    page_entries: usize,
+    mapping_internal: u64,
+    contig_ptr: usize,
+    contig_refused_gen: Option<u32>,
+    guest_write_token: u64,
+    content_generation: u32,
+}
+
+impl MemoReads {
+    fn of(state: &DeviceState, mid: u32) -> Option<Self> {
+        let m = state.mappings.get(&mid)?;
+        Some(Self {
+            map_generation: m.map_generation,
+            width: m.width,
+            height: m.height,
+            format: m.format,
+            mapped: m.mapped,
+            has_geom: m.has_geom,
+            page_entries: m.page_entries.len(),
+            mapping_internal: m.mapping_internal,
+            contig_ptr: m.contig_ptr,
+            contig_refused_gen: m.contig_refused_gen,
+            guest_write_token: m.guest_write_token,
+            content_generation: m.content_generation,
+        })
+    }
+}
+
+/// What a planned memo bind serves: the entry the plan proved unchanged (a
+/// hit, serving the memo's `Arc` and identity), or the entry the plan built
+/// from the rows it read (a fill, inserted at commit).
+enum MemoServe {
+    Hit {
+        rgba: std::sync::Arc<Vec<u8>>,
+        generation: u64,
+        layout: TexelLayout,
+    },
+    Fill {
+        native: Vec<u8>,
+        rgba: std::sync::Arc<Vec<u8>>,
+        generation: u64,
+        layout: TexelLayout,
+        entry_bytes: usize,
+    },
+}
+
+/// A mapper-ref surface's guest-memo bind planned off the drain thread: the
+/// rung under the zero-copy rail, whose serial cost is a whole-surface guest
+/// read + compare per bind.
+///
+/// The plan reads the surface's native rows itself, through the cached window
+/// runs' stable host pointers — the same bytes the serial fast path reads
+/// after its settles — and compares them against the memo:
+///
+/// * unchanged → a hit: the memo's `Arc` and content identity, no state moved;
+/// * changed or absent → a fill: converted rows plus a fresh generation,
+///   carried as the fact the commit inserts into the memo (the serial rail's
+///   insert, done off the drain thread), against the chunk's byte budget.
+///
+/// The coherence the serial rail buys with its settles is gated instead: no
+/// debt for the mapping (the payment is the drain's), no submitted writeback
+/// pending over the window's pages, and no device write into them since the
+/// epoch taken before the read. A guest write the plan's own compare did not
+/// see is bounded by the mapping token's lagged generation, re-checked at
+/// commit — the same plan/commit standard every gather plan rests on (H5).
+pub(crate) struct MemoPlan {
+    task_id: u32,
+    texture_ref: u32,
+    resource: std::sync::Arc<crate::model::TaskResource>,
+    mid: u32,
+    w: u32,
+    h: u32,
+    stride: u32,
+    span: u64,
+    base_off: u64,
+    sample_fmt: u16,
+    window_key: (u32, u64, usize),
+    gpas: std::sync::Arc<Vec<u64>>,
+    runs: std::sync::Arc<Vec<crate::backend::vulkan::engine::GuestRun>>,
+    reads: MemoReads,
+    observed_gen: Option<u64>,
+    /// `host_writes`' epoch before the plan's read; a device write since is a
+    /// race the serial rail's settle would have closed.
+    host_epoch: u64,
+    serve: MemoServe,
+}
+
+/// Plan the memo bind of one sampled ref. `budget` is the chunk's remaining
+/// memo-fill bytes; a fill that would exceed it is a [`SampleBail::MemoBudget`]
+/// refusal and the serial memo fills on the drain thread.
+pub(crate) fn plan_mapper_ref_memo<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+    resource: std::sync::Arc<crate::model::TaskResource>,
+    budget: &std::sync::atomic::AtomicU64,
+) -> Result<MemoPlan, SampleBail> {
+    let mid = sampled_surface_of(&resource, texture_ref)?;
+    let m = state.mappings.get(&mid).ok_or(SampleBail::ColdBacking)?;
+    if !(m.mapped && !m.page_entries.is_empty() && m.has_geom) {
+        return Err(SampleBail::ColdBacking);
+    }
+    let (w, h) = (m.width, m.height);
+    if w == 0 || h == 0 {
+        return Err(SampleBail::NoGeometry);
+    }
+    let sample_fmt =
+        effective_view_sample_format(pixel_format::MTL_FORMAT_BGRA8_UNORM, None)
+            .ok_or(SampleBail::ZeroCopyDeclined)?;
+    let stride = w.saturating_mul(4);
+    // The serial scratch's own sizing: `host_alloc_len(stride × h)`, which the
+    // memo's stored `native` is — the compare is over exactly these bytes.
+    let scratch_len = host_alloc_len(u64::from(stride).saturating_mul(u64::from(h)))
+        .ok_or(SampleBail::ZeroCopyDeclined)?;
+    if scratch_len == 0 {
+        return Err(SampleBail::ZeroCopyDeclined);
+    }
+    // The serial fast path's own window probe: the multi-run arm, a BGRA8
+    // mapping, no `mapping_internal`, and a contig refusal this page-list
+    // generation latched. Anything else takes the serial reader's other arm.
+    // The probe's span is the *window* (page-rounded), not the rect: the runs
+    // cover it while the compare covers the scratch.
+    let (base_off, bpr, window_span, tight) =
+        memo_read_window(state, mid, w, h, stride, scratch_len)
+            .ok_or(SampleBail::ColdWindow)?;
+    if crate::runtime::writeback_debt::owes_mapping(state, mid) {
+        return Err(SampleBail::OwedFrame);
+    }
+    let (gpas, runs) = crate::runtime::mapper::mapping_window_cached(
+        state,
+        mid,
+        base_off,
+        window_span,
+    )
+    .ok_or(SampleBail::ColdWindow)?;
+    // The serial reader settles before it reads; a plan may only ask that
+    // nothing it would wait for is outstanding over exactly these pages.
+    if crate::runtime::gather_witness::writes_pending_over(&gpas) {
+        return Err(SampleBail::OwedFrame);
+    }
+    let host_epoch = state.host_writes.epoch();
+    // The read: tight rows out of the cached runs' stable host pointers, in
+    // the same order the serial fast path reads them, over a scratch-sized
+    // buffer whose tail past the rect is zeroed as `prepare_memo_scratch`
+    // zeroes it — the compare is over the whole scratch.
+    let mut native = vec![0u8; scratch_len];
+    if runs.iter().map(|r| r.len()).sum::<u64>() != window_span {
+        return Err(SampleBail::ColdWindow);
+    }
+    let read_row = |dst: &mut [u8], mut at: u64| -> bool {
+        let (mut ri, mut run_lo) = (0usize, 0u64);
+        let mut done = 0usize;
+        while run_lo + runs[ri].len() <= at {
+            run_lo += runs[ri].len();
+            ri += 1;
+            if ri == runs.len() {
+                return false;
+            }
+        }
+        while done < tight {
+            while run_lo + runs[ri].len() <= at {
+                run_lo += runs[ri].len();
+                ri += 1;
+                if ri == runs.len() {
+                    return false;
+                }
+            }
+            let run = runs[ri];
+            let off = at - run_lo;
+            let n = ((run.len() - off) as usize).min(tight - done);
+            // SAFETY: `run` is a stable host's `map_pages` alias of guest RAM,
+            // valid for the life of the VM (`map_pages_stable`), and
+            // `off + n <= run.len()`; `dst[done..done + n]` is in bounds.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (run.host_ptr() as *const u8).add(off as usize),
+                    dst[done..].as_mut_ptr(),
+                    n,
+                );
+            }
+            done += n;
+            at += n as u64;
+        }
+        true
+    };
+    for y in 0..h as usize {
+        let row = &mut native[y * stride as usize..(y + 1) * stride as usize];
+        // The serial fast path indexes the same window: row `y` starts at
+        // `y * bpr` inside the window the runs cover.
+        if !read_row(row, y as u64 * bpr as u64) {
+            return Err(SampleBail::ColdWindow);
+        }
+    }
+    // A device write that raced the read invalidates it; the serial settle
+    // would have waited it out.
+    if state
+        .host_writes
+        .wrote_any_since(host_epoch, &gpas)
+        .wrote()
+    {
+        return Err(SampleBail::ColdWindow);
+    }
+    let reads = MemoReads::of(state, mid).ok_or(SampleBail::ColdBacking)?;
+    // The memo's own coherence is a byte compare the plan cannot repeat at
+    // commit; it rests on the mapping token's lagged generation instead (the
+    // H5 standard every plan/commit pair here uses). An unarmed token leaves
+    // the plan blind to guest writes the serial compare would catch, so those
+    // surfaces stay serial.
+    if reads.guest_write_token == 0 {
+        return Err(SampleBail::ColdWindow);
+    }
+    let observed_gen = host.guest_write_gen_lagged(reads.guest_write_token);
+    let window_key = crate::runtime::mapper::mapping_window_key_readonly(state, mid)
+        .ok_or(SampleBail::ColdWindow)?;
+    let key = (mid, w, h);
+    let serve = match state.mapper_ref_texture_memo.peek(&key) {
+        Some(entry) if entry.native[..] == native[..] => MemoServe::Hit {
+            rgba: std::sync::Arc::clone(&entry.rgba),
+            generation: entry.generation,
+            layout: entry.layout,
+        },
+        _ => {
+            // First sight or the native bytes changed: convert fresh, new
+            // generation — the serial fill, minus its drain-thread read.
+            let mut rgba = vec![0u8; (u64::from(stride) * u64::from(h)) as usize];
+            let converted =
+                pixel_format::RowToRgba8::for_format(sample_fmt).is_some_and(|row_rail| {
+                    (0..h as usize).all(|y| {
+                        let off = y * stride as usize;
+                        row_rail.convert(
+                            &native[off..off + (w as usize) * 4],
+                            w,
+                            &mut rgba[off..off + (w as usize) * 4],
+                        )
+                    })
+                });
+            if !converted {
+                return Err(SampleBail::ZeroCopyDeclined);
+            }
+            let entry_bytes = native.len() + rgba.len();
+            if take_memo_budget(budget, entry_bytes as u64).is_err() {
+                return Err(SampleBail::MemoBudget);
+            }
+            MemoServe::Fill {
+                native,
+                rgba: std::sync::Arc::new(rgba),
+                generation: state.next_sampled_content_generation(),
+                // This rail converts every format to RGBA8 unconditionally.
+                layout: TexelLayout::Rgba8,
+                entry_bytes,
+            }
+        }
+    };
+    Ok(MemoPlan {
+        task_id,
+        texture_ref,
+        resource,
+        mid,
+        w,
+        h,
+        stride,
+        // The window span: what the cached window and the runs cover.
+        span: window_span,
+        base_off,
+        sample_fmt,
+        window_key,
+        gpas,
+        runs,
+        reads,
+        observed_gen,
+        host_epoch,
+        serve,
+    })
+}
+
+/// Charge `bytes` against the chunk's fill budget, answering what remains.
+fn take_memo_budget(
+    budget: &std::sync::atomic::AtomicU64,
+    bytes: u64,
+) -> Result<u64, u64> {
+    budget.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |left| (left >= bytes).then_some(left - bytes),
+    )
+}
+
+impl MemoPlan {
+    fn identity(&self) -> LinearSampleIdentity {
+        // The identity key namespace the serial memo producer uses: bits 63+62
+        // mark mapper-ref-texture memo content.
+        LinearSampleIdentity {
+            key: (1u64 << 63) | (1u64 << 62) | u64::from(self.mid),
+            generation: match &self.serve {
+                MemoServe::Hit { generation, .. } | MemoServe::Fill { generation, .. } => {
+                    *generation
+                }
+            },
+        }
+    }
+
+    fn source(&self) -> (u32, u32, u32, SampledSourceRequest) {
+        self.source_with(Some(self.identity()))
+    }
+
+    /// The fill's shadow prediction: no identity, because the generation a
+    /// fill names is minted by whichever arm runs, and either arm's identity
+    /// forces the same engine upload.
+    fn shadow_source(&self) -> (u32, u32, u32, SampledSourceRequest) {
+        self.source_with(None)
+    }
+
+    fn source_with(
+        &self,
+        identity: Option<LinearSampleIdentity>,
+    ) -> (u32, u32, u32, SampledSourceRequest) {
+        let rgba = match &self.serve {
+            MemoServe::Hit { rgba, .. } | MemoServe::Fill { rgba, .. } => std::sync::Arc::clone(rgba),
+        };
+        let layout = match &self.serve {
+            MemoServe::Hit { layout, .. } | MemoServe::Fill { layout, .. } => *layout,
+        };
+        (
+            self.w,
+            self.h,
+            self.mid,
+            SampledSourceRequest::Bytes(
+                rgba,
+                identity,
+                SampledByteFormat::from_source(layout, self.sample_fmt),
+                crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
+            ),
+        )
+    }
+
+    /// The hit-shaped plan over a fill this commit inserted: what the next
+    /// bind of the ref serves if nothing moves.
+    fn hit_like(&self, rgba: std::sync::Arc<Vec<u8>>, generation: u64, layout: TexelLayout) -> Self {
+        Self {
+            task_id: self.task_id,
+            texture_ref: self.texture_ref,
+            resource: std::sync::Arc::clone(&self.resource),
+            mid: self.mid,
+            w: self.w,
+            h: self.h,
+            stride: self.stride,
+            span: self.span,
+            base_off: self.base_off,
+            sample_fmt: self.sample_fmt,
+            window_key: self.window_key,
+            gpas: std::sync::Arc::clone(&self.gpas),
+            runs: std::sync::Arc::clone(&self.runs),
+            reads: self.reads,
+            observed_gen: self.observed_gen,
+            host_epoch: self.host_epoch,
+            serve: MemoServe::Hit {
+                rgba,
+                generation,
+                layout,
+            },
+        }
+    }
+}
+
+/// Re-check a memo plan at the point the serial memo would run, and with
+/// `apply` take it. A hit serves the memo's `Arc` (bumping its recency, as the
+/// serial `get_touch` does); a fill inserts the entry the plan built — the
+/// serial insert, whose bytes were read off the drain thread — and hands back
+/// the hit-shaped plan for the next bind of the ref.
+///
+/// Without `apply` nothing is written; the fill's shadow prediction carries no
+/// identity, because the generation a fill names is minted by whichever arm
+/// runs, and either arm's identity forces the same engine upload.
+pub(crate) fn commit_memo_plan<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    plan: &MemoPlan,
+    task_id: u32,
+    texture_ref: u32,
+    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
+    apply: bool,
+) -> Result<
+    (
+        (u32, u32, u32, SampledSourceRequest),
+        Option<MemoPlan>,
+    ),
+    SampleInvalid,
+> {
+    if plan.task_id != task_id || plan.texture_ref != texture_ref {
+        return Err(SampleInvalid::Key);
+    }
+    if !resource.is_some_and(|r| std::sync::Arc::ptr_eq(r, &plan.resource)) {
+        return Err(SampleInvalid::Resource);
+    }
+    if MemoReads::of(state, plan.mid) != Some(plan.reads) {
+        return Err(SampleInvalid::Mapping);
+    }
+    if crate::runtime::mapper::mapping_window_key_readonly(state, plan.mid) != Some(plan.window_key)
+    {
+        return Err(SampleInvalid::Mapping);
+    }
+    if crate::runtime::writeback_debt::owes_mapping(state, plan.mid) {
+        return Err(SampleInvalid::Debt);
+    }
+    let cached = crate::runtime::mapper::mapping_window_cached(state, plan.mid, plan.base_off, plan.span);
+    if !cached.is_some_and(|(gpas, runs)| {
+        std::sync::Arc::ptr_eq(&gpas, &plan.gpas) && std::sync::Arc::ptr_eq(&runs, &plan.runs)
+    }) {
+        return Err(SampleInvalid::Window);
+    }
+    if crate::runtime::gather_witness::writes_pending_over(&plan.gpas) {
+        return Err(SampleInvalid::Debt);
+    }
+    if state
+        .host_writes
+        .wrote_any_since(plan.host_epoch, &plan.gpas)
+        .wrote()
+    {
+        return Err(SampleInvalid::Witness);
+    }
+    if let Some(gen) = plan.observed_gen {
+        if host.guest_write_gen_lagged(plan.reads.guest_write_token) != Some(gen) {
+            return Err(SampleInvalid::GuestWrite);
+        }
+    }
+    let key = (plan.mid, plan.w, plan.h);
+    match &plan.serve {
+        MemoServe::Hit {
+            rgba,
+            generation,
+            layout,
+        } => {
+            // The entry the plan proved unchanged must still be the memo's
+            // answer for this key — a fill in between replaced it.
+            let holds = state
+                .mapper_ref_texture_memo
+                .peek(&key)
+                .is_some_and(|entry| {
+                    entry.generation == *generation && std::sync::Arc::ptr_eq(&entry.rgba, rgba)
+                });
+            if !holds {
+                return Err(SampleInvalid::HostCache);
+            }
+            if !apply {
+                return Ok((plan.source(), None));
+            }
+            let _touched = state.mapper_ref_texture_memo.get_touch(&key);
+            crate::runtime::drain::note_store_route("t11rung_guest_memo");
+            Ok((
+                plan.source(),
+                Some(plan.hit_like(rgba.clone(), *generation, *layout)),
+            ))
+        }
+        MemoServe::Fill {
+            native,
+            rgba,
+            generation,
+            layout,
+            entry_bytes,
+        } => {
+            if !apply {
+                // No identity: the serial fill running next mints its own.
+                return Ok((plan.shadow_source(), None));
+            }
+            state.mapper_ref_texture_memo.insert(
+                key,
+                crate::model::GuestLinearMemo {
+                    native: native.clone(),
+                    rgba: std::sync::Arc::clone(rgba),
+                    layout: *layout,
+                    generation: *generation,
+                },
+                *entry_bytes,
+            );
+            crate::runtime::drain::note_store_route("t11rung_guest_memo");
+            // The inserted entry is what the next bind hits, under this fill's
+            // own identity (minted at the plan).
+            Ok((
+                plan.source(),
+                Some(plan.hit_like(rgba.clone(), *generation, *layout)),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2555,5 +3369,245 @@ mod tests {
         // allocation itself.
         let serial = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra), false);
         assert!(serial.is_some(), "the serial rail resolves what the plan refuses");
+    }
+
+    /// A mapper-ref surface above the gather floor (128x128 BGRA8 = 64 KiB,
+    /// sixteen scattered pages, a packed-only stable host), with no host cache
+    /// and no resident: one serial bind primes everything the zero-copy plan
+    /// borrows — the cached refusal of a contig view, the cached window, the
+    /// witness entry — and a mapping write token.
+    fn mapper_ref_zero_fixture() -> (DeviceState, FakeHost, u32, u32) {
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        let (mut state, mut host, texture_ref, surface_id) = fixture();
+        host.stable_map_pages = true;
+        host.strict_linux_map = true;
+        state.host_surfaces.remove(&surface_id);
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpas: Vec<u64> = (0..16u64).map(|i| 0x5000_0000 + 2 * i * page).collect();
+        for (n, &gpa) in gpas.iter().enumerate() {
+            host.map_range(gpa, page as usize, 0x40 + n as u8);
+        }
+        assert!(state.set_mapping_geom(surface_id, 128, 128, MTL_FORMAT_BGRA8_UNORM));
+        state.mappings.get_mut(&surface_id).unwrap().page_entries = gpas
+            .iter()
+            .map(|&gpa| {
+                (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+            })
+            .collect();
+        // The mapping's own token: the memo rung's plan rests on its lagged
+        // generation, and the zero-copy witness arms its own.
+        let _ = crate::runtime::mapper::ensure_guest_write_token(
+            &mut state,
+            &mut host,
+            surface_id,
+        );
+        (state, host, texture_ref, surface_id)
+    }
+
+    /// A planned mapper-ref zero-copy bind commits to the serial answer, and
+    /// the repeat the commit hands back serves the pass's later binds of the
+    /// same ref from the post state, leaving the witness where the serial
+    /// observations leave it.
+    #[test]
+    fn a_planned_mapper_ref_bind_commits_to_the_serial_answer() {
+        let (mut a, mut a_host, texture_ref, _) = mapper_ref_zero_fixture();
+        let (mut b, mut b_host, _, _) = mapper_ref_zero_fixture();
+        let (ra, rb) = (
+            resource(&a, &a_host, texture_ref),
+            resource(&b, &b_host, texture_ref),
+        );
+        // One serial bind on each arm primes the window and the witness.
+        let first_a = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra.clone()), true)
+            .expect("the fixture's first bind serves the zero-copy rung");
+        let first_b = resolve_sampled_source(&mut b, &mut b_host, 1, texture_ref, Some(rb.clone()), true)
+            .expect("the serial arm primes identically");
+        assert_eq!(runs_shape(&first_a), runs_shape(&first_b));
+
+        let mut plan =
+            plan_mapper_ref_zero_copy(&a, &a_host, 1, texture_ref, ra.clone())
+                .unwrap_or_else(|bail| panic!("a warm mapper-ref window plans, got {bail:?}"));
+        for _ in 0..3 {
+            let (planned, repeat) =
+                commit_mapper_ref_plan(&mut a, &mut a_host, &plan, 1, texture_ref, Some(&ra), true)
+                    .expect("nothing moved since the plan");
+            let serial = resolve_sampled_source(
+                &mut b,
+                &mut b_host,
+                1,
+                texture_ref,
+                Some(rb.clone()),
+                true,
+            )
+            .expect("the serial rail keeps serving the rung");
+            assert_eq!(runs_shape(&planned), runs_shape(&serial));
+            plan = repeat.expect("the repeat serves the next bind");
+        }
+        // And the two witnesses keep agreeing on the next serial bind.
+        let next_a = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra), true)
+            .expect("the planned arm still serves serially");
+        let next_b = resolve_sampled_source(&mut b, &mut b_host, 1, texture_ref, Some(rb), true)
+            .expect("the serial arm still serves");
+        assert_eq!(runs_shape(&next_a), runs_shape(&next_b));
+    }
+
+    /// A guest store the host observed between plan and commit moves the
+    /// witness readings, and the plan yields to the serial rail that re-reads.
+    #[test]
+    fn a_guest_store_drops_a_mapper_ref_plan_at_commit() {
+        let (mut a, mut a_host, texture_ref, sid) = mapper_ref_zero_fixture();
+        let ra = resource(&a, &a_host, texture_ref);
+        let _ = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra.clone()), true);
+        let plan = plan_mapper_ref_zero_copy(&a, &a_host, 1, texture_ref, ra.clone())
+            .expect("warm after the priming bind");
+        // The guest writes the first page of the window, between the plan and
+        // the commit.
+        a_host.guest_wrote_page(0x5000_0000);
+        assert_eq!(
+            commit_mapper_ref_plan(&mut a, &mut a_host, &plan, 1, texture_ref, Some(&ra), true)
+                .err(),
+            Some(SampleInvalid::Witness)
+        );
+        let serial = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra), true);
+        assert!(serial.is_some(), "the serial rail re-reads and serves");
+        let _ = sid;
+    }
+
+    /// A debt under the mapping is the plan's refusal (H7) and a commit's
+    /// invalidation; a resolved contig view is the rung above's.
+    #[test]
+    fn debt_and_the_direct_rung_refuse_a_mapper_ref_plan() {
+        let (mut a, mut a_host, texture_ref, sid) = mapper_ref_zero_fixture();
+        let ra = resource(&a, &a_host, texture_ref);
+        let _ = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra.clone()), true);
+        // The mapping's debt, armed directly on the ledger.
+        a.pending_writebacks.arm(
+            sid,
+            crate::runtime::writeback_debt::test_resident_identity(sid, 128, 128, 1),
+            128,
+            128,
+            1,
+        );
+        assert_eq!(
+            plan_mapper_ref_zero_copy(&a, &a_host, 1, texture_ref, ra.clone()).err(),
+            Some(SampleBail::OwedFrame)
+        );
+        a.pending_writebacks.take(sid);
+        // A resolved contig view makes the direct image the serial answer.
+        a.mappings.get_mut(&sid).unwrap().contig_ptr = 0x7f00_0000_0000;
+        assert_eq!(
+            plan_mapper_ref_zero_copy(&a, &a_host, 1, texture_ref, ra).err(),
+            Some(SampleBail::UpperRung)
+        );
+    }
+
+    /// A planned memo bind reads the surface's rows on the worker and commits
+    /// to the serial memo's answer — a hit serving the memo's own `Arc` and
+    /// identity — and the handed-back plan serves the next bind too. A guest
+    /// store the token saw between plan and commit drops it to serial.
+    #[test]
+    fn a_planned_memo_bind_commits_to_the_serial_answer() {
+        let budget = std::sync::atomic::AtomicU64::new(memo_fill_chunk_limit());
+        let (mut a, mut a_host, texture_ref, sid) = memo_fixture();
+        let (mut b, mut b_host, _, _) = memo_fixture();
+        let (ra, rb) = (
+            resource(&a, &a_host, texture_ref),
+            resource(&b, &b_host, texture_ref),
+        );
+        // Tokens, then one serial bind on each arm to prime the memo.
+        let _ = crate::runtime::mapper::ensure_guest_write_token(&mut a, &mut a_host, sid);
+        let _ = crate::runtime::mapper::ensure_guest_write_token(&mut b, &mut b_host, sid);
+        let first_a = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra.clone()), true)
+            .expect("the memo rung serves the fixture");
+        let first_b = resolve_sampled_source(&mut b, &mut b_host, 1, texture_ref, Some(rb.clone()), true)
+            .expect("the serial arm fills its memo identically");
+        let bytes_of = |s: &(u32, u32, u32, SampledSourceRequest)| match &s.3 {
+            SampledSourceRequest::Bytes(bytes, identity, fmt, _) => (
+                bytes.to_vec(),
+                identity.as_ref().map(|i| (i.key, i.generation)),
+                fmt.layout(),
+            ),
+            _ => panic!("expected a byte serve"),
+        };
+        assert_eq!(bytes_of(&first_a), bytes_of(&first_b));
+        let _ = first_a;
+
+        let mut plan = plan_mapper_ref_memo(&a, &a_host, 1, texture_ref, ra.clone(), &budget)
+            .unwrap_or_else(|bail| panic!("a primed memo plans, got {bail:?}"));
+        for _ in 0..2 {
+            let (planned, repeat) =
+                commit_memo_plan(&mut a, &mut a_host, &plan, 1, texture_ref, Some(&ra), true)
+                    .expect("nothing moved since the plan");
+            let serial = resolve_sampled_source(
+                &mut b,
+                &mut b_host,
+                1,
+                texture_ref,
+                Some(rb.clone()),
+                true,
+            )
+            .expect("the serial memo keeps serving");
+            assert_eq!(bytes_of(&planned), bytes_of(&serial));
+            plan = repeat.expect("the hit serves the next bind");
+        }
+        // A guest store the token observed drops the plan at commit.
+        let plan = plan_mapper_ref_memo(&a, &a_host, 1, texture_ref, ra.clone(), &budget)
+            .expect("still warm");
+        let gpa = 0x5000_0000;
+        a_host.guest_wrote_page(gpa);
+        assert_eq!(
+            commit_memo_plan(&mut a, &mut a_host, &plan, 1, texture_ref, Some(&ra), true).err(),
+            Some(SampleInvalid::GuestWrite)
+        );
+    }
+
+    /// A cold memo (no entry, no primed window) is not planned, and a fill
+    /// that would exceed the chunk's budget is the `MemoBudget` refusal.
+    #[test]
+    fn cold_and_over_budget_memo_binds_stay_serial() {
+        let (mut a, mut a_host, texture_ref, sid) = memo_fixture();
+        let ra = resource(&a, &a_host, texture_ref);
+        // Not primed: the window cache is cold and the token unarmed.
+        assert!(matches!(
+            plan_mapper_ref_memo(
+                &a,
+                &a_host,
+                1,
+                texture_ref,
+                ra.clone(),
+                &std::sync::atomic::AtomicU64::new(memo_fill_chunk_limit()),
+            ),
+            Err(SampleBail::ColdWindow | SampleBail::ColdBacking)
+        ));
+        // Primed by one serial bind, then planned against a spent budget.
+        let _ = crate::runtime::mapper::ensure_guest_write_token(&mut a, &mut a_host, sid);
+        let _ = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra.clone()), true);
+        // The memo holds the surface now, so a plain plan hits; spend the
+        // budget and rewrite a page so the next plan must fill.
+        assert!(
+            plan_mapper_ref_memo(
+                &a,
+                &a_host,
+                1,
+                texture_ref,
+                ra.clone(),
+                &std::sync::atomic::AtomicU64::new(memo_fill_chunk_limit()),
+            )
+            .is_ok(),
+            "the primed memo plans as a hit"
+        );
+        assert!(a_host.write_gpa(0x5000_0000, &[9, 9, 9, 9]).is_ok());
+        assert_eq!(
+            plan_mapper_ref_memo(
+                &a,
+                &a_host,
+                1,
+                texture_ref,
+                ra,
+                &std::sync::atomic::AtomicU64::new(1),
+            )
+            .err(),
+            Some(SampleBail::MemoBudget),
+            "a fill with no budget left is the serial memo's"
+        );
     }
 }

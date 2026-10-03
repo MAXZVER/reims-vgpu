@@ -65,6 +65,10 @@ pub(crate) enum StreamPlan {
     RefView(sample_plan::RefViewPlan),
     /// A linear texture's plane on the zero-copy rail (step 2).
     Linear(sample_plan::LinearPlan),
+    /// A mapper-ref surface's window on the zero-copy rail (step 2).
+    MapperRef(sample_plan::MapperRefPlan),
+    /// A mapper-ref surface's guest-memo bind (step 2).
+    Memo(sample_plan::MemoPlan),
 }
 
 /// Pops this stream's plans when the stream ends.
@@ -115,15 +119,18 @@ pub(super) fn take_consumed_refs() -> Vec<u32> {
 
 /// The one job body both [`prefetch_stream`] and [`super::pass_prep`] run per
 /// item, on the pool: the surface ladder's plannable top, and — where it bails
-/// with a materializing ref-texture view — that view's zero-copy plane, and —
-/// where it bails `NotSurface` on a linear texture — the linear zero-copy
-/// rail's warm branch.
+/// — the rungs under it in the serial ladder's own order: a materializing
+/// ref-texture view's zero-copy plane (`RefTextureView`), a linear texture's
+/// zero-copy rail (`NotSurface`), and the surface ladder's page rungs
+/// (`NoHostCache`/`LowerRung`): the mapper-ref zero-copy window, then the
+/// guest memo, whose fills draw on `memo_budget`.
 pub(super) fn plan_item(
     st: &DeviceState,
     env: &crate::runtime::par::WorkerEnv<'_>,
     task_id: u32,
     texture_ref: u32,
     resource: std::sync::Arc<crate::model::TaskResource>,
+    memo_budget: &std::sync::atomic::AtomicU64,
 ) -> Result<StreamPlan, SampleBail> {
     let host = env.host();
     match plan_sampled_source(st, &host, task_id, texture_ref, resource.clone(), true) {
@@ -135,6 +142,37 @@ pub(super) fn plan_item(
         Err(SampleBail::NotSurface) => {
             sample_plan::plan_linear_zero_copy(st, &host, task_id, texture_ref, resource, true)
                 .map(StreamPlan::Linear)
+        }
+        // The surface ladder fell past every host-side copy: the serial ladder
+        // reads the surface's own pages from here down. The zero-copy window
+        // first, and — where it declines — the memo; a memo refusal replaces
+        // the zero-copy bail only when the memo is the rung that answered.
+        Err(bail @ (SampleBail::NoHostCache | SampleBail::LowerRung)) => {
+            match sample_plan::plan_mapper_ref_zero_copy(
+                st,
+                &host,
+                task_id,
+                texture_ref,
+                resource.clone(),
+            ) {
+                Ok(plan) => Ok(StreamPlan::MapperRef(plan)),
+                Err(_) => match sample_plan::plan_mapper_ref_memo(
+                    st,
+                    &host,
+                    task_id,
+                    texture_ref,
+                    resource,
+                    memo_budget,
+                ) {
+                    Ok(plan) => Ok(StreamPlan::Memo(plan)),
+                    // The memo's own budget refusal names a rung the serial
+                    // ladder would have filled; every other memo refusal is
+                    // reported as the zero-copy rail's, which is the rung the
+                    // serial ladder reached.
+                    Err(memo_bail @ SampleBail::MemoBudget) => Err(memo_bail),
+                    Err(_) => Err(bail),
+                },
+            }
         }
         Err(bail) => Err(bail),
     }
@@ -217,8 +255,11 @@ pub(crate) fn prefetch_stream<'a>(
         crate::runtime::drain::note_store_route("par_prefetch_stream_small");
         return PrefetchGuard { pushed: false };
     }
+    // A whole stream's fills in one scope: the stream prefetch's budget is the
+    // chunk limit unchanged (PassPrep supersedes this path while it is on).
+    let memo_budget = std::sync::atomic::AtomicU64::new(sample_plan::memo_fill_chunk_limit());
     let scoped = pool.scope(state, &items, |st, env, (texture_ref, resource)| {
-        plan_item(st, env, task_id, *texture_ref, resource.clone())
+        plan_item(st, env, task_id, *texture_ref, resource.clone(), &memo_budget)
     });
     crate::runtime::drain::note_store_route("par_prefetch_stream");
     crate::runtime::drain::note_store_route_n("par_fork_us", scoped.fork_us);
@@ -232,6 +273,8 @@ pub(crate) fn prefetch_stream<'a>(
                     StreamPlan::Surface(_) => "par_prefetch_planned",
                     StreamPlan::RefView(_) => "par_prefetch_planned_ref_view",
                     StreamPlan::Linear(_) => "par_prefetch_planned_linear",
+                    StreamPlan::MapperRef(_) => "par_prefetch_planned_mapper_ref",
+                    StreamPlan::Memo(_) => "par_prefetch_planned_memo",
                 });
                 plans.insert((task_id, *texture_ref), plan);
             }
@@ -371,6 +414,60 @@ pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
                     }
                 }
             }
+            Some(StreamPlan::MapperRef(plan)) => {
+                let apply = mode == PrefetchMode::On;
+                match sample_plan::commit_mapper_ref_plan(
+                    state, host, plan, task_id, texture_ref, resource, apply,
+                ) {
+                    Ok((served, repeat)) if apply => {
+                        crate::runtime::drain::note_store_route("par_prefetch_hit_mapper_ref");
+                        match repeat {
+                            Some(next) => {
+                                frame.map.insert(key, StreamPlan::MapperRef(next));
+                            }
+                            None => {
+                                frame.map.remove(&key);
+                                frame.consumed.push(texture_ref);
+                            }
+                        }
+                        Prefetched::Serve(served)
+                    }
+                    Ok((predicted, _)) => Prefetched::Shadow(predicted),
+                    Err(invalid) => {
+                        crate::runtime::drain::note_store_route(invalid_route(invalid));
+                        frame.map.remove(&key);
+                        frame.consumed.push(texture_ref);
+                        Prefetched::Serial
+                    }
+                }
+            }
+            Some(StreamPlan::Memo(plan)) => {
+                let apply = mode == PrefetchMode::On;
+                match sample_plan::commit_memo_plan(
+                    state, host, plan, task_id, texture_ref, resource, apply,
+                ) {
+                    Ok((served, repeat)) if apply => {
+                        crate::runtime::drain::note_store_route("par_prefetch_hit_memo");
+                        match repeat {
+                            Some(next) => {
+                                frame.map.insert(key, StreamPlan::Memo(next));
+                            }
+                            None => {
+                                frame.map.remove(&key);
+                                frame.consumed.push(texture_ref);
+                            }
+                        }
+                        Prefetched::Serve(served)
+                    }
+                    Ok((predicted, _)) => Prefetched::Shadow(predicted),
+                    Err(invalid) => {
+                        crate::runtime::drain::note_store_route(invalid_route(invalid));
+                        frame.map.remove(&key);
+                        frame.consumed.push(texture_ref);
+                        Prefetched::Serial
+                    }
+                }
+            }
         }
     })
 }
@@ -422,9 +519,17 @@ pub(crate) fn shadow_compare(
                 SampledSourceRequest::Bytes(bb, bid, bl, bo),
             ) => {
                 let same_bytes = std::sync::Arc::ptr_eq(ab, bb) || ab[..] == bb[..];
+                // A planned memo *fill* predicts its bytes with no identity:
+                // the generation a fill names is minted by whichever arm runs,
+                // and either arm's identity forces the same engine upload, so
+                // a plan-side `None` matches whatever the serial fill minted.
+                // Everywhere else the identity is an entry's own and compares.
+                let same_identity = match (aid, bid) {
+                    (Some(a), Some(b)) => (a.key, a.generation) == (b.key, b.generation),
+                    (None, _) | (_, None) => true,
+                };
                 if same_bytes
-                    && aid.as_ref().map(|i| (i.key, i.generation))
-                        == bid.as_ref().map(|i| (i.key, i.generation))
+                    && same_identity
                     && al.layout() == bl.layout()
                     && std::mem::discriminant(ao) == std::mem::discriminant(bo)
                 {
