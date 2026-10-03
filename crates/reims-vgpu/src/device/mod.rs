@@ -400,6 +400,25 @@ fn announce_stamp_interrupt(id: u64, index: u32) {
     };
     let mut scratch = VecDeque::new();
     QemuHost::new(&ops, &mut scratch, &slot.prompt_actions).enqueue(HostAction::irq_gfx());
+    crate::runtime::drain::lab_rewake::note(index);
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_STAMP_REWAKE_MS`): the heartbeat's re-raise of
+/// recently published stamp slots; see [`crate::runtime::drain::lab_rewake`].
+/// Lock-free like [`announce_stamp_interrupt`], so a drain holding `inner` does
+/// not delay it.
+fn lab_stamp_rewake_tick(slot: &BoundDevice) {
+    let mask = crate::runtime::drain::lab_rewake::due(crate::observe::elapsed_us());
+    if mask == 0 {
+        return;
+    }
+    let Some(ops) = slot.ops else {
+        return;
+    };
+    slot.intr_gpu.fetch_or(mask, Ordering::AcqRel);
+    let mut scratch = VecDeque::new();
+    QemuHost::new(&ops, &mut scratch, &slot.prompt_actions).enqueue(HostAction::irq_gfx());
+    crate::runtime::drain::census::note_store_route("lab_stamp_rewake");
 }
 
 pub fn device_reset(id: u64) -> bool {
@@ -857,6 +876,7 @@ pub fn device_poll(id: u64) -> bool {
     let Some(slot) = device_slot(id) else {
         return false;
     };
+    lab_stamp_rewake_tick(&slot);
     let Some(mut d) = slot.inner.try_lock() else {
         // Contended: the drain worker owns `inner` doing present/GPU-encode.
         // The full poll below would early-return and drop the VBL — under load

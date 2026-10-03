@@ -973,6 +973,12 @@ pub const DISPLAY_REFRESH_HZ: u32 = 120;
 /// that could run faster saturates at the grid and its headroom is only
 /// visible as drain idle time; a higher lab refresh lets the frame rate itself
 /// show how fast the device can go.
+///
+/// TEMP (lab, n107): 240 by default outside tests (`=120` restores). WindowServer
+/// drops a fullscreen animation to half the advertised rate when it misses its
+/// deadline, and at 120 that half is the 60 Hz regime boots fell into; at 240 the
+/// fallback is 120. n107 (x3 interleaved): transitions 996/1043 frames, >25 ms
+/// 11/9 % at 240 against 709 frames, 15 % at 120.
 pub fn display_refresh_hz() -> u32 {
     static HZ: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *HZ.get_or_init(|| {
@@ -980,9 +986,12 @@ pub fn display_refresh_hz() -> u32 {
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .filter(|hz| (30..=1000).contains(hz))
-            .unwrap_or(DISPLAY_REFRESH_HZ)
+            .unwrap_or(if cfg!(test) { DISPLAY_REFRESH_HZ } else { LAB_DEFAULT_REFRESH_HZ })
     })
 }
+
+/// TEMP (lab, n107): the refresh [`display_refresh_hz`] defaults to outside tests.
+const LAB_DEFAULT_REFRESH_HZ: u32 = 240;
 pub const DISPLAY_PRODUCT_NAME: &[u8] = b"QEMU display\0";
 /// How many unacked ONLINE pulses this device sends before it stops.
 ///

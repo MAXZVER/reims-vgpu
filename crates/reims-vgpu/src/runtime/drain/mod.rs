@@ -2046,6 +2046,7 @@ fn publish_word<H: HostMemory + HostOps>(
                 .interrupt_status_gpu
                 .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
             host.enqueue(HostAction::irq_gfx());
+            lab_rewake::note(0);
         }
         return;
     }
@@ -3740,6 +3741,69 @@ pub fn write_stamp<H: HostMemory + HostOps>(
             .interrupt_status_gpu
             .fetch_or(1u32 << (index & 0x1f), std::sync::atomic::Ordering::AcqRel);
         host.enqueue(HostAction::irq_gfx());
+        lab_rewake::note(index);
+    }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_STAMP_REWAKE_MS=N`): re-raise the gfx interrupt for
+/// stamp slots published in the last N ms, from the device heartbeat (at most
+/// every 2 ms). A guest waiter that checked its word just before the publish and
+/// went to sleep just after the ISR ran has missed its only wakeup and sleeps
+/// until another interrupt names its slot. On fullscreen transitions the device
+/// goes fully idle for ~185-196 ms with the display VBL disarmed, then
+/// WindowServer resumes (fhz1b t=127780-127963: no packet, no VBL, no log line) —
+/// the shape of a waiter asleep on a word already written, released by CA's
+/// ~200 ms synchronize timeout. A spurious wake costs the guest one re-read.
+pub(crate) mod lab_rewake {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    static MASK: AtomicU32 = AtomicU32::new(0);
+    static UNTIL_US: AtomicU64 = AtomicU64::new(0);
+    static LAST_US: AtomicU64 = AtomicU64::new(0);
+
+    /// The window in microseconds; 0 is off. Latched.
+    pub(crate) fn window_us() -> u64 {
+        static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *US.get_or_init(|| {
+            let ms = std::env::var("REIMS_VGPU_LAB_STAMP_REWAKE_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+                .min(10_000);
+            crate::observe::off(format!("lab_stamp_rewake window_ms={ms}"));
+            ms * 1_000
+        })
+    }
+
+    /// A stamp slot's word was published and its interrupt raised.
+    pub(crate) fn note(index: u32) {
+        let window = window_us();
+        if window == 0 {
+            return;
+        }
+        MASK.fetch_or(1u32 << (index & 0x1f), Ordering::AcqRel);
+        UNTIL_US.store(crate::observe::elapsed_us() + window, Ordering::Release);
+    }
+
+    /// The status bits to re-raise now, or 0: nothing published inside the
+    /// window, or the last re-raise was under 2 ms ago.
+    pub(crate) fn due(now_us: u64) -> u32 {
+        if window_us() == 0 {
+            return 0;
+        }
+        if now_us > UNTIL_US.load(Ordering::Acquire) {
+            MASK.store(0, Ordering::Release);
+            return 0;
+        }
+        let last = LAST_US.load(Ordering::Acquire);
+        if now_us.saturating_sub(last) < 2_000
+            || LAST_US
+                .compare_exchange(last, now_us, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return 0;
+        }
+        MASK.load(Ordering::Acquire)
     }
 }
 
