@@ -774,6 +774,31 @@ impl PendingWritebacks {
             .collect()
     }
 
+    /// Whether [`Self::take_gva`] would take anything: the read-only twin a
+    /// pool-side plan asks before it decides a bind can be planned at all.
+    ///
+    /// A plan never pays (design H7) — paying writes guest pages, which is the
+    /// drain's to do — so "the payment would have work" is the plan's refusal,
+    /// not a cheaper way to the same answer.
+    pub fn owes_gva_resource(&self, key: GvaResourceKey) -> bool {
+        self.gva_debts.range(key.planes()).next().is_some()
+    }
+
+    /// Whether [`Self::take_gva_overlapping`] would take anything, over the same
+    /// overlap predicate it filters by — the read-only twin of that payment.
+    pub fn owes_gva_overlapping(&self, task_id: u32, gva: u64, span: u64) -> bool {
+        if span == 0 {
+            return false;
+        }
+        let end = gva.saturating_add(span);
+        self.gva_debts.iter().any(|(plane, debt)| {
+            let debt_end = debt.gva.saturating_add(
+                u64::from(debt.row_stride).saturating_mul(u64::from(debt.height)),
+            );
+            plane.resource.task_id == task_id && debt.gva < end && gva < debt_end
+        })
+    }
+
     /// Every plane debt of `task_id` whose frame window overlaps the guest span
     /// `[gva, gva + span)`, taken out of the ledger, whatever reference armed it.
     ///
@@ -1158,6 +1183,17 @@ pub fn fb_copy_replay_enabled() -> bool {
     })
 }
 
+/// Whether [`pay_for_mapping`] would pay anything — the read-only twin a
+/// pool-side plan asks where the serial rail pays.
+///
+/// Free in the same way: one ledger emptiness check when nothing is owed, which
+/// is the answer on nearly every bind. A plan that sees a debt refuses the bind
+/// ([`crate::runtime::draw::vulkan::sample_plan`]'s `OwedFrame` bail) and the
+/// serial rail pays on the drain thread exactly as before.
+pub fn owes_mapping(state: &DeviceState, mapping_id: u32) -> bool {
+    !state.pending_writebacks.is_empty() && state.pending_writebacks.get(mapping_id).is_some()
+}
+
 /// Pay `mapping_id`'s owed frame, if it owes one.
 ///
 /// The one call a reader of a named mapping's guest bytes makes before it reads
@@ -1523,6 +1559,35 @@ pub fn lab_pay_after_first_arm<M: HostMemory + HostOps>(
 /// references over the compositor's scanout allocation on an ordinary boot. A
 /// payment named through one of them leaves the other two's frames owed, and
 /// until that counter existed the alarm answered `disjoint` for it.
+/// Whether [`pay_for_texture`] would pay anything — the read-only twin a
+/// pool-side plan asks where the serial rail pays.
+///
+/// Both spellings the payment resolves, asked the same way: the GVA planes the
+/// reference's key owns, and the surface debts of every mapping the reference
+/// names through [`DeviceState::mappings_named_by`]. `lab_pay_block` counts as
+/// owed here even though the payment would skip it: a plan refused on that arm
+/// only loses the plan, while treating a blocked payment as "owes nothing"
+/// would let a worker plan a bind whose debt the drain then skips by the lab
+/// switch's own choice — the conservative side is the one that cannot diverge.
+pub fn owes_texture(state: &DeviceState, task_id: u32, texture_ref: u32) -> bool {
+    if state.pending_writebacks.is_empty() {
+        return false;
+    }
+    if state
+        .pending_writebacks
+        .owes_gva_resource(GvaResourceKey {
+            task_id,
+            texture_ref,
+        })
+    {
+        return true;
+    }
+    state
+        .mappings_named_by(task_id, texture_ref)
+        .iter()
+        .any(|mapping_id| state.pending_writebacks.get(mapping_id).is_some())
+}
+
 pub fn pay_for_texture<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3331,5 +3396,66 @@ mod tests {
             "a mapping with no backing walk has no owner to compare, so it is \
              named as before"
         );
+    }
+
+    /// The read-only twins answer what the payments would pay, on the same
+    /// names the payments resolve — so a pool-side plan refuses exactly the
+    /// binds whose debt the drain would land (`sample_plan`'s `OwedFrame`).
+    #[test]
+    fn the_owes_twins_answer_what_the_payments_would_pay() {
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        assert!(!owes_mapping(&state, 9), "an empty ledger owes nothing");
+        assert!(!owes_texture(&state, 3, 19), "an empty ledger owes nothing");
+
+        // The GVA half: a plane debt under the reference's own key.
+        let key = GvaResourceKey {
+            task_id: 3,
+            texture_ref: 19,
+        };
+        let _ = state.pending_writebacks.ensure_gva_resource(
+            key,
+            0x4000,
+            0x4000,
+            Some(vec![0x11, 0x12]),
+        );
+        assert!(
+            !owes_texture(&state, 3, 19),
+            "a declared resource that owes no frame plans as freely as serial binds it"
+        );
+        assert_eq!(state.pending_writebacks.arm_gva(key, gva_debt(7)), None);
+        assert!(state.pending_writebacks.owes_gva_resource(key));
+        assert!(owes_texture(&state, 3, 19));
+
+        // The overlap half: the same pages under another reference of the task.
+        assert!(state
+            .pending_writebacks
+            .owes_gva_overlapping(3, 0x5000, 0x1000));
+        assert!(
+            !state.pending_writebacks.owes_gva_overlapping(4, 0x5000, 0x1000),
+            "GVAs are per task, so another task's same address owes nothing"
+        );
+        assert!(
+            !state.pending_writebacks.owes_gva_overlapping(3, 0x9000, 0x1000),
+            "a window clear of every debt window owes nothing"
+        );
+        assert!(!state.pending_writebacks.owes_gva_overlapping(3, 0x5000, 0));
+
+        // The surface half: a debt under a mapping the reference names.
+        state.map_surface(10); // no backing walk, so any task's bare 10 names it
+        assert!(!owes_mapping(&state, 10));
+        assert_eq!(
+            state
+                .pending_writebacks
+                .arm(10, ident(10, 64, 64, 1), 64, 64, 1),
+            None
+        );
+        assert!(owes_mapping(&state, 10));
+        assert!(owes_texture(&state, 3, 10));
+
+        // And payment clears both twins with the ledger.
+        pay_all(&mut state, &mut crate::runtime::FakeHost::new());
+        assert!(!owes_mapping(&state, 10));
+        assert!(!owes_texture(&state, 3, 10));
+        assert!(!owes_texture(&state, 3, 19));
     }
 }
