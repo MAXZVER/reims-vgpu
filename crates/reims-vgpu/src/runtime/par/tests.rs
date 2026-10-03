@@ -4,7 +4,7 @@
 //! The shim is a table of counting callbacks whose `ctx` names per-test state, so
 //! a test reads exactly its own pool's registrations and never another test's.
 
-use super::{default_workers, Pool, Settings, DEFAULT_WORKER_CAP};
+use super::{default_workers, planning, Pool, Settings, DEFAULT_WORKER_CAP};
 use crate::model::{DeviceId, DeviceState, PAGE_SHIFT_X86};
 use crate::qemu::host_ops::ReimsVgpuHostOps;
 use std::os::raw::c_void;
@@ -409,4 +409,103 @@ fn accounting_counts_every_member_that_took_part() {
 fn the_default_helper_count_is_bounded() {
     assert!(default_workers() <= DEFAULT_WORKER_CAP);
     assert!(Settings::MAX_WORKERS >= DEFAULT_WORKER_CAP);
+}
+
+/// TEMP (lab, PASS_PREP): the planning flag is up for the whole of a scope on
+/// the coordinator and on every helper that serves it, down after, and down
+/// after a job panicked too — the recorder-settle bypass must never outlive the
+/// scope it was raised for, or the drain would stop settling for good.
+#[test]
+fn planning_flag_is_scoped() {
+    assert!(!planning(), "an ordinary thread does not plan");
+    // The serial pool first: a scope that cannot fork still plans, because its
+    // items run the same read-only job code on the caller.
+    {
+        let seen = Registrations::default();
+        let pool = pool(&seen, 0);
+        let items = [0u32, 1];
+        let out = pool.scope(&(), &items, |_, _, &i| {
+            assert!(planning(), "the coordinator plans inside its own scope");
+            i
+        });
+        assert_eq!(out.results[1], Ok(1));
+        assert!(!planning(), "the scope is over");
+        pool.shutdown();
+    }
+    // A forked scope: the flag is up on the coordinator and on the helpers,
+    // and comes down on both sides. The items spin briefly, or the coordinator
+    // would claim all of them before a helper wakes and the helper half of the
+    // claim would be untestable.
+    {
+        let seen = Registrations::default();
+        let pool = pool(&seen, 2);
+        let helper_saw_planning = AtomicUsize::new(0);
+        let coordinator_saw_planning = AtomicBool::new(false);
+        let items: Vec<u32> = (0..64).collect();
+        let out = pool.scope(&(), &items, |_, env, _| {
+            let until = Instant::now() + Duration::from_micros(100);
+            while Instant::now() < until {
+                std::hint::spin_loop();
+            }
+            if planning() {
+                if env.helper {
+                    helper_saw_planning.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    coordinator_saw_planning.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+        assert!(out.results.iter().all(Result::is_ok));
+        assert!(!planning(), "the scope is over on the coordinator");
+        assert!(
+            coordinator_saw_planning.load(Ordering::SeqCst),
+            "the coordinator planned"
+        );
+        wait_until("the helpers to register", || {
+            seen.attached.load(Ordering::SeqCst) == 2
+        });
+        assert!(
+            helper_saw_planning.load(Ordering::SeqCst) > 0,
+            "a helper planned"
+        );
+        // An ordinary thread outside the pool does not plan: the negative
+        // control for the flag being thread-local rather than global.
+        let helper = std::thread::spawn(|| {
+            assert!(!planning());
+        });
+        helper.join().unwrap();
+        pool.shutdown();
+    }
+    // A panicking job unwinds out of the scope's items only: the token's Drop
+    // still runs on the coordinator, so the flag is down afterwards.
+    {
+        let seen = Registrations::default();
+        let pool = pool(&seen, 2);
+        let items: Vec<u32> = (0..8).collect();
+        let _ = pool.scope(&(), &items, |_, _, &i| {
+            assert!(planning());
+            if i == 3 {
+                panic!("boom");
+            }
+        });
+        assert!(!planning(), "a panicked job leaves the flag down");
+        pool.shutdown();
+    }
+    // And a scope nested inside a job leaves the outer flag standing: the
+    // token restores what it found rather than clearing unconditionally.
+    {
+        let seen = Registrations::default();
+        let pool = pool(&seen, 0);
+        let items = [0u32, 1];
+        let _ = pool.scope(&(), &items, |_, _, _| {
+            assert!(planning());
+            let inner = [0u32, 1];
+            let _ = pool.scope(&(), &inner, |_, _, _| {
+                assert!(planning(), "the nested scope keeps the outer flag");
+            });
+            assert!(planning(), "the outer flag survived the nested scope");
+        });
+        assert!(!planning());
+        pool.shutdown();
+    }
 }

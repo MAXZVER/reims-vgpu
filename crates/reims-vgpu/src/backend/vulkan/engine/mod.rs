@@ -272,6 +272,13 @@ impl DeviceObjectCaches {
     /// earlier draw panicked would turn a recoverable refusal into a dead boot.
     #[track_caller]
     fn with<R>(&self, f: impl FnOnce(&mut ObjectCaches) -> R) -> R {
+        // A pool job must never reach the caches (par's rule 2); the settle it
+        // would have done is skipped for a planning thread, so this assert is
+        // what actually catches one that tries.
+        debug_assert!(
+            !crate::runtime::par::planning(),
+            "a planning thread took the caches lock"
+        );
         // TEMP (lab, S5a): the drain waits for a deferred draw before it takes
         // the caches the job holds; see `recorder`'s module doc for the order.
         recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Caches);
@@ -1110,6 +1117,13 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
 #[inline]
 #[track_caller]
 fn lock_engine() -> EngineGuard {
+    // A pool job must never reach the engine (par's rule 2): the settle it
+    // would have done is skipped for a planning thread, so this assert is what
+    // actually catches one that tries.
+    debug_assert!(
+        !crate::runtime::par::planning(),
+        "a planning thread took the engine lock"
+    );
     let site = calling_site();
     // TEMP (lab, S5a): the drain's every entry into engine state first waits for
     // a deferred draw; any other thread, the recorder included, does not.
@@ -1521,6 +1535,13 @@ pub fn prewake_recorder() {
 /// (`REIMS_VGPU_LAB_RECORDER_DEPTH`).
 pub fn recorder_depth() -> u32 {
     recorder::depth()
+}
+
+/// TEMP (lab, PASS_PREP): deferred draws posted and not yet finished. The
+/// PassPrep census reads this at a planning scope's entry: a positive reading
+/// is the overlap the scope exists for.
+pub fn recorder_outstanding() -> u32 {
+    recorder::DRAW.outstanding()
 }
 
 /// TEMP (lab, S5a): whether the drain owes the recorder a join — a draw is out,

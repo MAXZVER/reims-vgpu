@@ -341,6 +341,12 @@ impl Pool {
         F: Fn(&S, &WorkerEnv<'_>, &I) -> T + Sync,
     {
         let entered = Instant::now();
+        // The coordinator plans for the whole call, the serial path included:
+        // a scope that could not fork still runs its items through the same
+        // read-only job code, and the engine's doors must not settle for it
+        // either. Restores the previous value, so a scope nested inside a job
+        // leaves the outer one standing.
+        let _planning = super::enter_planning();
         let total = items.len();
         let sh = &self.shared;
         let slots: Vec<Mutex<Option<Result<T, JobPanic>>>> =
@@ -719,6 +725,11 @@ fn worker_main(shared: &Arc<Shared>, index: usize) {
     let attachment = shared.registrar.attach();
     shared.attached.fetch_add(1, Ordering::AcqRel);
     let member = WorkerId(index as u16);
+    // A helper is a planning thread for its whole life: every engine door it
+    // could reach (it must reach none) would skip the recorder settle. The
+    // token is dropped when the thread's stack unwinds, which is never a
+    // concern anyone else can observe.
+    let _planning = super::enter_planning();
     let env = WorkerEnv {
         worker: member,
         helper: true,

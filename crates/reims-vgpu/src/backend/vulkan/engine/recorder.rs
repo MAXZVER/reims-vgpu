@@ -328,6 +328,14 @@ impl Handoff {
         self.in_flight.load(Ordering::Acquire) || self.stash_pending.load(Ordering::Acquire)
     }
 
+    /// TEMP (lab, PASS_PREP): jobs posted and not yet finished (queued or
+    /// running). The census reads this at a planning scope's entry: a positive
+    /// reading is the overlap the scope exists for — the recorder had draws to
+    /// encode while the pool planned the next chunk.
+    pub(crate) fn outstanding(&self) -> u32 {
+        self.inner.lock().outstanding
+    }
+
     /// Called with `lifecycle` held, so no stop is retiring the worker.
     fn ensure_worker(&'static self) -> bool {
         if self.alive.load(Ordering::Acquire) {
@@ -749,12 +757,28 @@ pub(crate) fn enabled() -> bool {
 /// The wait every drain-side engine door performs. The caller says whether it
 /// is the drain; any other thread (the recorder itself, the window, a vCPU)
 /// must not wait for a job it may be part of or has no ordering claim on.
+///
+/// TEMP (lab, PASS_PREP): a thread inside a pool scope (`crate::runtime::par`)
+/// does not wait either — waiting for the recorder from inside a scope is what
+/// the scope exists to overlap (the scope plans the next chunk of draws while
+/// the recorder encodes the previous one). Safe because a planning job only
+/// reads: whatever it read as "not settled yet" is a version the commit after
+/// the scope re-validates, and the engine's own locks carry a
+/// `debug_assert!` that no planning thread ever takes them.
 #[inline]
 #[track_caller]
 pub(crate) fn settle_if_drain(is_drain: bool, site: JoinSite) {
-    if is_drain {
-        DRAW.settle(site);
+    if !is_drain {
+        return;
     }
+    // TEMP (lab, PASS_PREP): a planning thread skips the wait and the census
+    // says so — but only when there is a job to skip, so the route's count is
+    // the number of overlapped opportunities, not of door calls.
+    if crate::runtime::par::planning() && DRAW.in_flight() {
+        crate::runtime::drain::note_store_route("pass_prep_settle_skipped");
+        return;
+    }
+    DRAW.settle(site);
 }
 
 #[cfg(test)]
@@ -1197,5 +1221,83 @@ mod tests {
             Some(JobResult::Done)
         ));
         let _ = DRAW.stop();
+    }
+
+    /// TEMP (lab, PASS_PREP): a drain thread inside a pool scope — a planning
+    /// coordinator — does not wait for the recorder job; the same thread
+    /// outside the scope does. The scope is the serial pool (no helpers), which
+    /// is the honest form of the question: it is the *scope*, not the fork,
+    /// that carries the bypass.
+    #[test]
+    fn planning_coordinator_does_not_settle() {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        let _serial = SERIAL.lock();
+        unsafe extern "C" fn nothing(_ctx: *mut std::os::raw::c_void) {}
+        let mut table = crate::qemu::host_ops::ReimsVgpuHostOps::null();
+        table.thread_attach = Some(nothing);
+        table.thread_detach = Some(nothing);
+        let pool = crate::runtime::par::Pool::new(
+            &table,
+            &crate::runtime::par::Settings {
+                workers: 0,
+                worker_spin: Duration::ZERO,
+                join_spin: Duration::ZERO,
+            },
+        )
+        .expect("the table offers the registration pair");
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let effect = Arc::new(AtomicBool::new(false));
+        let (s, r, e) = (
+            Arc::clone(&started),
+            Arc::clone(&release),
+            Arc::clone(&effect),
+        );
+        super::super::mark_drain_thread();
+        DRAW.submit(ok_job(move || {
+            s.store(true, Ordering::SeqCst);
+            while !r.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+            e.store(true, Ordering::SeqCst);
+        }));
+        while !started.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+        // Released from outside rather than after the assertions, so a scope
+        // that wrongly waits for the job still unwedges and fails a check
+        // instead of hanging the suite.
+        let releaser = std::thread::spawn({
+            let release = Arc::clone(&release);
+            move || {
+                std::thread::sleep(Duration::from_millis(100));
+                release.store(true, Ordering::SeqCst);
+            }
+        });
+        let skipped_before =
+            crate::runtime::drain::census::store_route_count("pass_prep_settle_skipped");
+        let items = [0u8, 1];
+        pool.scope(&(), &items, |_, _, _| {
+            settle_if_drain(true, JoinSite::Reader);
+        });
+        assert_eq!(
+            crate::runtime::drain::census::store_route_count("pass_prep_settle_skipped"),
+            skipped_before + items.len() as u64,
+            "each in-scope settle is counted as skipped"
+        );
+        assert!(
+            !effect.load(Ordering::SeqCst),
+            "the planning coordinator did not join the job"
+        );
+        // Outside the scope the same door waits, as it always did.
+        settle_if_drain(true, JoinSite::Reader);
+        assert!(
+            effect.load(Ordering::SeqCst),
+            "the ordinary drain still joins the job"
+        );
+        releaser.join().unwrap();
+        let _ = DRAW.take(JoinSite::Explicit);
+        let _ = DRAW.stop();
+        pool.shutdown();
     }
 }

@@ -35,6 +35,13 @@
 //!    and the sysbus shim is one.
 //! 4. **A panic is data.** It comes back as [`JobPanic`] in that item's slot,
 //!    and the caller treats it like any other reason to do the work serially.
+//! 5. **No recorder settle.** While a job runs the thread reports
+//!    [`planning()`] as `true` (the coordinator for the scope's length, a
+//!    helper for its life), and the engine's drain-side doors skip their wait
+//!    for the draw recorder on that flag — waiting for the recorder from
+//!    inside a scope is what the scope exists to overlap. A job that *did*
+//!    reach engine state would still be caught by the `debug_assert!`s on the
+//!    engine's locks; the flag only removes the wait, never the rule.
 //!
 //! # Lifetime
 //!
@@ -64,7 +71,45 @@ mod tests;
 
 pub use pool::{JobPanic, Pool, PoolStats, Scoped, WorkerEnv};
 
+use std::cell::Cell;
 use std::time::Duration;
+
+thread_local! {
+    /// Whether this thread is inside a pool scope right now: the coordinator
+    /// for the length of [`Pool::scope`] (see [`enter_planning`]), a helper for
+    /// its whole life. A job running under this flag must not wait for the
+    /// recorder — the recorder is exactly what the scope is meant to overlap —
+    /// so the engine's drain-side doors consult [`planning`] before they settle.
+    static PLANNING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the calling thread is running pool jobs — as a scope's coordinator
+/// or as a helper. See [`PLANNING`].
+#[inline]
+pub fn planning() -> bool {
+    PLANNING.with(Cell::get)
+}
+
+/// Mark the calling thread as planning for the lifetime of the returned token,
+/// unwinding included. The token restores the previous value rather than
+/// clearing, so a scope nested inside another scope's job leaves the outer
+/// flag standing.
+pub(crate) fn enter_planning() -> PlanningToken {
+    let was = PLANNING.with(|flag| flag.replace(true));
+    PlanningToken { was }
+}
+
+/// Restores the planning flag [`enter_planning`] found. Invariant: the token
+/// never outlives its `enter_planning` call's frame.
+pub(crate) struct PlanningToken {
+    was: bool,
+}
+
+impl Drop for PlanningToken {
+    fn drop(&mut self) {
+        PLANNING.with(|flag| flag.set(self.was));
+    }
+}
 
 /// How the pool is sized and how it waits. Read once from the environment by
 /// [`Settings::from_env`]; built directly by tests.
