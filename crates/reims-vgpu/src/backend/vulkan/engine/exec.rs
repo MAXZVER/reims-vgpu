@@ -2739,6 +2739,17 @@ fn depth_stencil_state(
     .expect("every ordinal in a draw request was parsed from an enum on the way in")
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_DRAW_SUBMIT_ASYNC=off` restores the synchronous
+/// submit of an unbatched draw (see its call in [`execute_draw_inner`]). Latched.
+fn lab_draw_submit_async() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_DRAW_SUBMIT_ASYNC").map_or(true, |v| v != "off");
+        crate::observe::off(format!("lab_draw_submit_async on={on}"));
+        on
+    })
+}
+
 pub(crate) unsafe fn execute_draw_inner(
     owner: &mut ContextOwner,
     caches: &mut ObjectCaches,
@@ -5849,7 +5860,20 @@ pub(crate) unsafe fn execute_draw_inner(
 
     if !defer_submit {
         let cbs = [cb];
-        match ctx.submit_guest_work(&cbs, fence) {
+        // TEMP (lab, `REIMS_VGPU_LAB_DRAW_SUBMIT_ASYNC`, on unless `=off`): hand
+        // the command buffer to the queue owner without waiting for its reply
+        // that `vkQueueSubmit` returned, as `batch_flush` already does for a
+        // batched draw. Everything after this reads the fence, not the reply,
+        // and a failed submit reaches the next submit or wait through the
+        // owner's failure latch. n113: the reply wait was ~29 % of the
+        // recorder's busy time on transitions, and the drain sat in
+        // `wait_below` (recorder queue full) for 8.5 % of its samples.
+        let submitted = if lab_draw_submit_async() {
+            ctx.submit_guest_work_async(&cbs, fence)
+        } else {
+            ctx.submit_guest_work(&cbs, fence)
+        };
+        match submitted {
             Ok(()) => {}
             Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
                 return Err(DrawError::DeviceLost(DeviceLostDecline::Driver {

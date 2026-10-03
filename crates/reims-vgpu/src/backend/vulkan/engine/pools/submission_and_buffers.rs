@@ -7058,11 +7058,18 @@ mod recycle_tests {
 fn exchange_rb_into(src: &[u8], dst: &mut [u8]) {
     let n = src.len().min(dst.len());
     let whole = n / 4 * 4;
+    // Each whole pixel as a little-endian word: R is bits 0..8 and B bits
+    // 16..24, so the exchange is masks and two shifts, which the baseline
+    // (SSE2) target vectorises. The byte-index form did not, and ran at
+    // ~8 GB/s (`swap_rb_kb`/`swap_rb_us`) against ~24 GB/s for a plain copy
+    // into the same staging memory (`stage_phase runs_b/runs_us`).
     for (s, d) in src[..whole]
         .chunks_exact(4)
         .zip(dst[..whole].chunks_exact_mut(4))
     {
-        d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+        let p = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+        let q = (p & 0xff00_ff00) | ((p >> 16) & 0x0000_00ff) | ((p & 0x0000_00ff) << 16);
+        d.copy_from_slice(&q.to_le_bytes());
     }
     dst[whole..n].copy_from_slice(&src[whole..n]);
 }
