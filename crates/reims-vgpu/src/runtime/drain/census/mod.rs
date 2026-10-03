@@ -2779,6 +2779,81 @@ pub fn lab_ft_on() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_FRAME_TRACE").is_ok_and(|v| v == "1"))
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_FRAME_TRACE=1`): what the device saw inside a long
+/// present gap. Doorbells, stamp publications (slot, task, doorbell-to-publish
+/// latency), VBLs and IRQ deliveries go into a ring; a present that ends a gap
+/// over 120 ms dumps the events inside it as one `lab_gap` line. The ~190 ms
+/// transition hitches read as an idle device in the per-second census; this says
+/// whether anything arrived, completed or was signalled while the guest was quiet.
+pub(crate) mod lab_gap {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    pub(crate) const DOORBELL: u8 = b'D';
+    pub(crate) const PUBLISHED: u8 = b'P';
+    pub(crate) const VBL: u8 = b'V';
+    pub(crate) const IRQ: u8 = b'I';
+
+    struct Ev {
+        t: u64,
+        kind: u8,
+        a: u32,
+        b: u32,
+        c: u32,
+    }
+
+    static RING: Mutex<VecDeque<Ev>> = Mutex::new(VecDeque::new());
+    static LAST_PRESENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    pub(crate) fn note(kind: u8, a: u32, b: u32, c: u32) {
+        if !super::lab_ft_on() {
+            return;
+        }
+        let t = crate::observe::elapsed_us();
+        let mut r = RING.lock().unwrap_or_else(|e| e.into_inner());
+        if r.len() >= 8192 {
+            r.pop_front();
+        }
+        r.push_back(Ev { t, kind, a, b, c });
+    }
+
+    /// Called at each present: the gap line, when the gap since the last present
+    /// was over 120 ms.
+    pub(crate) fn present(now: u64) -> Option<String> {
+        let prev = LAST_PRESENT.swap(now, std::sync::atomic::Ordering::Relaxed);
+        if prev == 0 || now.saturating_sub(prev) < 120_000 {
+            return None;
+        }
+        let r = RING.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut d, mut p, mut v, mut i) = (0u32, 0u32, 0u32, 0u32);
+        let mut list = String::new();
+        let mut listed = 0;
+        for e in r.iter().filter(|e| e.t > prev && e.t <= now) {
+            let ms = (e.t - prev) / 1000;
+            match e.kind {
+                DOORBELL => d += 1,
+                PUBLISHED => p += 1,
+                VBL => v += 1,
+                _ => i += 1,
+            }
+            if listed < 160 && e.kind != VBL && e.kind != IRQ {
+                listed += 1;
+                match e.kind {
+                    PUBLISHED => list.push_str(&format!("P{}t{}l{}@{ms},", e.a, e.b as i32, e.c / 1000)),
+                    _ => list.push_str(&format!("D{}@{ms},", e.a)),
+                }
+            } else if listed < 160 && e.kind == VBL {
+                listed += 1;
+                list.push_str(&format!("V@{ms},"));
+            }
+        }
+        Some(format!(
+            "lab_gap from={prev} gap_ms={} doorbells={d} published={p} vbl={v} irq={i} ev={list}",
+            (now - prev) / 1000
+        ))
+    }
+}
+
 /// TEMP (lab): which point of the frame's path just happened.
 #[derive(Clone, Copy)]
 pub enum LabFtPoint {
@@ -2801,6 +2876,7 @@ pub fn lab_ft(point: LabFtPoint) {
         LabFtPoint::Vbl => {
             g.vbl = now;
             g.drain = 0;
+            lab_gap::note(lab_gap::VBL, 0, 0, 0);
         }
         LabFtPoint::Drain => {
             if g.drain == 0 && g.vbl != 0 {
@@ -2842,6 +2918,9 @@ pub fn lab_ft(point: LabFtPoint) {
             g.publish = 0;
             drop(g);
             crate::observe::off(line);
+            if let Some(gap) = lab_gap::present(now) {
+                crate::observe::off(gap);
+            }
         }
     }
 }
@@ -3260,6 +3339,7 @@ pub fn note_irq_armed() {
 /// The QEMU action BH has just emptied the prompt queue.
 pub fn note_irq_delivered() {
     DRAIN_DUTY.note_irq_delivered(crate::observe::elapsed_us());
+    lab_gap::note(lab_gap::IRQ, 0, 0, 0);
 }
 
 /// Close a drain entry: everything since `busy_end_us` is post-tranche work, or
