@@ -1118,6 +1118,7 @@ pub(crate) fn refuse_pipeline<M: HostMemory + HostOps>(
 /// ~4.7 CPU snapshots/draw under Safari scroll, each of which previously paid
 /// the object-list entry read + descriptor read + decode in the failed ZC
 /// attempt *and* again in the CPU fallback).
+#[derive(Clone, Copy)]
 pub(super) struct BufferBacking {
     pub(super) gva: u64,
     pub(super) size: u64,

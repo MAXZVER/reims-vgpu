@@ -4795,12 +4795,20 @@ pub(super) enum SampledFloorRail {
 ///
 /// A decline is recorded here rather than at the call site, banded by span, so
 /// a rail cannot be added that declines without saying so.
+/// The floor's decision, with no census side effect — the form a pool-side
+/// plan takes, where the serial rail's decline note must still be made by the
+/// serial rail that runs after the plan's bail (a plan that noted it would
+/// double-count every planned refusal).
+pub(super) fn sampled_gather_floor_pure(native: TexelLayout, span: u64) -> bool {
+    !native.a_cost_floor_may_decline() || span >= SAMPLED_GATHER_MIN_BYTES
+}
+
 pub(super) fn sampled_gather_floor_admits(
     rail: SampledFloorRail,
     native: TexelLayout,
     span: u64,
 ) -> bool {
-    if !native.a_cost_floor_may_decline() || span >= SAMPLED_GATHER_MIN_BYTES {
+    if sampled_gather_floor_pure(native, span) {
         return true;
     }
     crate::runtime::drain::note_store_route(match (rail, span) {

@@ -63,6 +63,8 @@ pub(crate) enum StreamPlan {
     Surface(SamplePlan),
     /// A ref-texture view's plane on the zero-copy rail.
     RefView(sample_plan::RefViewPlan),
+    /// A linear texture's plane on the zero-copy rail (step 2).
+    Linear(sample_plan::LinearPlan),
 }
 
 /// Pops this stream's plans when the stream ends.
@@ -113,7 +115,9 @@ pub(super) fn take_consumed_refs() -> Vec<u32> {
 
 /// The one job body both [`prefetch_stream`] and [`super::pass_prep`] run per
 /// item, on the pool: the surface ladder's plannable top, and — where it bails
-/// with a materializing ref-texture view — that view's zero-copy plane.
+/// with a materializing ref-texture view — that view's zero-copy plane, and —
+/// where it bails `NotSurface` on a linear texture — the linear zero-copy
+/// rail's warm branch.
 pub(super) fn plan_item(
     st: &DeviceState,
     env: &crate::runtime::par::WorkerEnv<'_>,
@@ -127,6 +131,10 @@ pub(super) fn plan_item(
         Err(SampleBail::RefTextureView) => {
             sample_plan::plan_ref_view_zero_copy(st, &host, task_id, texture_ref, resource)
                 .map(StreamPlan::RefView)
+        }
+        Err(SampleBail::NotSurface) => {
+            sample_plan::plan_linear_zero_copy(st, &host, task_id, texture_ref, resource, true)
+                .map(StreamPlan::Linear)
         }
         Err(bail) => Err(bail),
     }
@@ -149,6 +157,9 @@ pub(super) fn bail_route(bail: SampleBail) -> &'static str {
         SampleBail::OwedFrame => "par_prefetch_bail_owed_frame",
         SampleBail::ColdWindow => "par_prefetch_bail_cold_window",
         SampleBail::ColdWitness => "par_prefetch_bail_cold_witness",
+        SampleBail::UpperRung => "par_prefetch_bail_upper_rung",
+        SampleBail::ColdPacked => "par_prefetch_bail_cold_packed",
+        SampleBail::MemoBudget => "par_prefetch_bail_memo_budget",
     }
 }
 
@@ -163,6 +174,8 @@ pub(super) fn invalid_route(invalid: SampleInvalid) -> &'static str {
         SampleInvalid::Window => "par_prefetch_invalid_window",
         SampleInvalid::Witness => "par_prefetch_invalid_witness",
         SampleInvalid::Debt => "par_prefetch_invalid_debt",
+        SampleInvalid::UpperRung => "par_prefetch_invalid_upper_rung",
+        SampleInvalid::Packed => "par_prefetch_invalid_packed",
     }
 }
 
@@ -218,6 +231,7 @@ pub(crate) fn prefetch_stream<'a>(
                 crate::runtime::drain::note_store_route(match plan {
                     StreamPlan::Surface(_) => "par_prefetch_planned",
                     StreamPlan::RefView(_) => "par_prefetch_planned_ref_view",
+                    StreamPlan::Linear(_) => "par_prefetch_planned_linear",
                 });
                 plans.insert((task_id, *texture_ref), plan);
             }
@@ -314,6 +328,43 @@ pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
                         crate::runtime::drain::note_store_route(invalid_route(invalid));
                         // Spent either way: the witness entry it rests on moves
                         // with whatever the serial rail does next.
+                        frame.map.remove(&key);
+                        frame.consumed.push(texture_ref);
+                        Prefetched::Serial
+                    }
+                }
+            }
+            Some(StreamPlan::Linear(plan)) => {
+                let apply = mode == PrefetchMode::On;
+                match sample_plan::commit_linear_plan(
+                    state,
+                    host,
+                    plan,
+                    task_id,
+                    texture_ref,
+                    resource,
+                    may_bind_resident,
+                    apply,
+                ) {
+                    Ok((served, repeat)) if apply => {
+                        crate::runtime::drain::note_store_route("par_prefetch_hit_linear");
+                        // The direct arm hands its own plan back (it moved
+                        // nothing) and the gather arm its repeat; both serve
+                        // the next bind of the ref from the post state.
+                        match repeat {
+                            Some(next) => {
+                                frame.map.insert(key, StreamPlan::Linear(next));
+                            }
+                            None => {
+                                frame.map.remove(&key);
+                                frame.consumed.push(texture_ref);
+                            }
+                        }
+                        Prefetched::Serve(served)
+                    }
+                    Ok((predicted, _)) => Prefetched::Shadow(predicted),
+                    Err(invalid) => {
+                        crate::runtime::drain::note_store_route(invalid_route(invalid));
                         frame.map.remove(&key);
                         frame.consumed.push(texture_ref);
                         Prefetched::Serial

@@ -1273,7 +1273,7 @@ fn note_observation(seen: &GatherObservation, key: GatherKey, span: u64) {
 
 /// A gather decision planned off the drain thread: the warm branch of the
 /// witness run on a clone of the window's entry, with the readings it rests on.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PlannedGather {
     key: GatherKey,
     rail: GatherRail,

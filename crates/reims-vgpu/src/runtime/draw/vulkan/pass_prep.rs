@@ -255,6 +255,7 @@ impl<'a> PassPrep<'a> {
                     crate::runtime::drain::note_store_route(match plan {
                         StreamPlan::Surface(_) => "par_prefetch_planned",
                         StreamPlan::RefView(_) => "par_prefetch_planned_ref_view",
+                        StreamPlan::Linear(_) => "par_prefetch_planned_linear",
                     });
                     plans.push(((task_id, item.texture_ref), plan));
                 }

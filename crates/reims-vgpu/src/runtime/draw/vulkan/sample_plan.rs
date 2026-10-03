@@ -305,6 +305,16 @@ pub(crate) enum SampleBail {
     ColdWindow,
     /// The witness does not track this window with this page set yet.
     ColdWitness,
+    /// A rung above the planned one would answer the bind (a GVA resident for
+    /// the linear rail, the mapping's direct image for the mapper-ref rail):
+    /// the serial ladder serves a different shape there, so the plan declines.
+    UpperRung,
+    /// The task's packed allocation for this reference is not retained (or is
+    /// retained under another window): the serial rail would resolve or copy.
+    ColdPacked,
+    /// The memo fill this bind would carry exceeds the chunk's byte budget;
+    /// the serial memo has no budget and fills on the drain thread.
+    MemoBudget,
 }
 
 impl SampleBail {
@@ -325,6 +335,9 @@ impl SampleBail {
             Self::OwedFrame => "owed_frame",
             Self::ColdWindow => "cold_window",
             Self::ColdWitness => "cold_witness",
+            Self::UpperRung => "upper_rung",
+            Self::ColdPacked => "cold_packed",
+            Self::MemoBudget => "memo_budget",
         }
     }
 }
@@ -350,6 +363,10 @@ pub(crate) enum SampleInvalid {
     Witness,
     /// A writeback debt was armed on the surface since the plan.
     Debt,
+    /// A rung above the planned one became servable since the plan.
+    UpperRung,
+    /// The retained packed allocation the plan borrowed moved or vanished.
+    Packed,
 }
 
 impl SampleInvalid {
@@ -364,6 +381,8 @@ impl SampleInvalid {
             Self::Window => "window",
             Self::Witness => "witness",
             Self::Debt => "debt",
+            Self::UpperRung => "upper_rung",
+            Self::Packed => "packed",
         }
     }
 }
@@ -1031,6 +1050,486 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
     let page = state.page_size();
     let pages = guest_page_window(host, &plan.gpas, page, base_off % page, span);
     Ok(source(pages, outcome))
+}
+
+/// Whether the GVA-resident rung that sits above the linear zero-copy rail
+/// (`try_gva_resident_sample`) may serve this bind, from state this call only
+/// reads — the question a linear plan must answer before it plans the rung
+/// below, because a bind that rung serves is a `Target` and the plan would
+/// answer `GuestRuns`.
+///
+/// Conservative by construction: every case the read-only ledger and witness
+/// cannot prove a refusal for answers `true`, and the plan bails to the serial
+/// ladder that runs the rung itself. The provable refusals are the two the
+/// serial rung takes without mutating:
+///
+/// * a declared plane whose window the store witness will not call quiet
+///   (`reach` answers anything but its `Quiet` verdict) — the serial rung
+///   refuses with `Wrote` and falls through to the linear rail;
+/// * `may_bind_resident == false`, which the caller checks itself and the
+///   serial ladder honours by skipping the rung entirely.
+///
+/// The unprovable cases: an undeclared plane (the serial declaration may mint
+/// a generation or keep one — a kept generation can already have witness
+/// state), and a quiet witness (the serial rung asks readiness and may serve).
+fn linear_resident_rung_above_may_serve<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+    gva: u64,
+    row_stride: u32,
+    w: u32,
+    h: u32,
+    format: u16,
+) -> bool {
+    // The span the identity is declared at, spelled as `gva_span_identity`
+    // spells it: row_stride × height.
+    let span_bytes = u64::from(row_stride).saturating_mul(u64::from(h));
+    let key = crate::runtime::writeback_debt::GvaResourceKey {
+        task_id,
+        texture_ref,
+    };
+    let Some(generation) =
+        crate::runtime::writeback_debt::gva_plane_generation(state, key, gva, span_bytes)
+    else {
+        // Never declared, declared at another span, or declared without
+        // walkable pages: the serial path's declaration may keep a generation
+        // the witness already tracks, which this cannot rule out.
+        return true;
+    };
+    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva,
+        width: w,
+        height: h,
+        generation,
+        format: gva_resident_format(format),
+    };
+    // An unpaid Store over this window makes the resident authoritative; the
+    // serial rung's answer then turns on readiness alone.
+    if crate::backend::vulkan::gva_window(&identity)
+        .is_some_and(|window| crate::runtime::writeback_debt::gva_resident_authoritative(state, window))
+    {
+        return true;
+    }
+    let Some(witness_key) = crate::backend::vulkan::gva_witness_key(&identity) else {
+        return true;
+    };
+    // Quiet is the one answer the serial rung carries past; every other verdict
+    // is a refusal that lands it on this plan's rail.
+    crate::runtime::gva_store_witness::reach(state, host, witness_key).is_quiet()
+}
+
+/// A linear texture's zero-copy bind planned off the drain thread: the warm
+/// branch of [`try_linear_sample_zero_copy`], which is the whole of that
+/// function's packed-allocation arms.
+///
+/// What the serial rail does before those arms that a plan cannot: pay the
+/// texture's and the allocation's debts (the plan refuses them, `OwedFrame`),
+/// and answer the GVA-resident rung above (the plan refuses the binds that rung
+/// may serve, `UpperRung`). What it does that a plan repeats at commit: the
+/// two debt predicates, and the identity of the retained packed allocation.
+///
+/// The direct single-plane arm ([`direct_linear_sample_from_packed`]) moves
+/// nothing at all — its plan serves every bind of the ref that still
+/// validates. The multi-plane gather arm arms the witness through
+/// [`crate::runtime::gather_witness::plan_gather`], so a commit hands back the
+/// repeat for the next bind of the same key (design H6's removal).
+#[derive(Clone)]
+pub(crate) struct LinearPlan {
+    task_id: u32,
+    texture_ref: u32,
+    may_bind_resident: bool,
+    resource: std::sync::Arc<crate::model::TaskResource>,
+    /// The level-0 window the serial rail derives from the same descriptor.
+    gva: u64,
+    w: u32,
+    h: u32,
+    layout_offset: u64,
+    row_stride: u64,
+    span: u64,
+    row_length_texels: u32,
+    native: TexelLayout,
+    sampled_vk_format: ash::vk::Format,
+    native_components: pixel_format::SwizzlePlan,
+    planes: u32,
+    /// The allocation the packed resource retains — what the commit re-asks
+    /// `packed_available` with.
+    allocation: BufferBacking,
+    /// The retained packed allocation's identity, re-checked at commit.
+    packed_head: u64,
+    packed_runs: std::sync::Arc<Vec<crate::backend::vulkan::engine::GuestRun>>,
+    packed_pages: std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>,
+    /// The gather arm's witness window, cut from the packed allocation exactly
+    /// as the serial rail cuts it; `None` on the direct arm.
+    gather: Option<crate::runtime::gather_witness::PlannedGather>,
+    witness_gpas: Vec<u64>,
+    witness_run: Option<crate::backend::vulkan::engine::GuestRun>,
+}
+
+/// Plan the linear zero-copy bind of one texture ref from state this call only
+/// reads. Every point where the serial rail would mutate — resolve a packed
+/// allocation, pay a debt, answer the resident rung above — is a
+/// [`SampleBail`] and the serial rail serves the bind unchanged.
+pub(crate) fn plan_linear_zero_copy<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+    resource: std::sync::Arc<crate::model::TaskResource>,
+    may_bind_resident: bool,
+) -> Result<LinearPlan, SampleBail> {
+    use crate::runtime::decode::resource::Descriptor;
+    if !matches!(
+        resource.entry.object_type,
+        crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE
+            | crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
+    ) {
+        return Err(SampleBail::NotSurface);
+    }
+    let tex = match resource.decoded() {
+        Ok(Descriptor::Texture(tex)) => tex,
+        _ => return Err(SampleBail::NotSurface),
+    };
+    // The same format gates the serial rail applies, quiet here so the serial
+    // rail's decline routes are noted by the serial rail that takes them.
+    let declared_format = tex.declared_pixel_format().ok_or(SampleBail::ZeroCopyDeclined)?;
+    let (native, sampled_vk_format, native_components) =
+        match translate::pixel::sampled_pixels(declared_format) {
+            Ok((layout, _decline, components))
+                if crate::backend::vulkan::engine::supports_sampled_layout_bind(layout) =>
+            {
+                let format = translate::pixel::translate(declared_format)
+                    .ok()
+                    .ok_or(SampleBail::ZeroCopyDeclined)?
+                    .vk;
+                (layout, format, components)
+            }
+            _ => return Err(SampleBail::ZeroCopyDeclined),
+        };
+    let (gva, layout) = tex
+        .level_gva(0, state.page_shift)
+        .ok_or(SampleBail::ZeroCopyDeclined)?;
+    let (w, h) = (layout.width, layout.height);
+    if w == 0 || h == 0 {
+        return Err(SampleBail::ZeroCopyDeclined);
+    }
+    let (span, row_length_texels) =
+        strided_level_extent(layout, native.block()).ok_or(SampleBail::ZeroCopyDeclined)?;
+    let planes = layout.planes();
+    if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
+        return Err(SampleBail::ZeroCopyDeclined);
+    }
+    // The rung above (`try_gva_resident_sample`): a bind it serves is a Target
+    // and must stay the serial ladder's answer.
+    if may_bind_resident
+        && linear_resident_rung_above_may_serve(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            gva,
+            u32::try_from(layout.row_stride).map_err(|_| SampleBail::ZeroCopyDeclined)?,
+            w,
+            h,
+            tex.pixel_format,
+        )
+    {
+        return Err(SampleBail::UpperRung);
+    }
+    // The plan never pays (H7): both debts the serial rail pays before it
+    // touches the allocation are refusals here.
+    if crate::runtime::writeback_debt::owes_texture(state, task_id, texture_ref) {
+        return Err(SampleBail::OwedFrame);
+    }
+    let allocation_gva = tex
+        .allocation_base_gva(state.page_shift)
+        .filter(|_| tex.allocation_size != 0)
+        .ok_or(SampleBail::ColdPacked)?;
+    let allocation = BufferBacking {
+        gva: allocation_gva,
+        size: tex.allocation_size,
+    };
+    if state
+        .pending_writebacks
+        .owes_gva_overlapping(task_id, allocation.gva, allocation.size)
+    {
+        return Err(SampleBail::OwedFrame);
+    }
+    // Copied out before the resource moves: the construction below cannot
+    // borrow the decode it is built from.
+    let (layout_offset, row_stride) = (layout.offset, layout.row_stride);
+    // The warm packed allocation. `ensure_packed_resource` resolves (mutates)
+    // on a miss, so a plan takes only what `bound_buffers` already holds.
+    let packed = state
+        .bound_buffers
+        .packed_available(task_id, texture_ref, allocation.gva, allocation.size)
+        .ok_or(SampleBail::ColdPacked)?;
+    // The direct single-plane arm: pure construction from the borrowed
+    // allocation, verified feasible here and rebuilt at commit.
+    if planes == 1 {
+        if direct_linear_sample_from_packed(
+            packed,
+            layout_offset,
+            row_stride,
+            span,
+            row_length_texels,
+            native,
+            sampled_vk_format,
+            native_components,
+            resource.lifetime_ref(),
+        )
+        .is_none()
+        {
+            return Err(SampleBail::ColdPacked);
+        }
+        return Ok(LinearPlan {
+            task_id,
+            texture_ref,
+            may_bind_resident,
+            resource,
+            gva,
+            w,
+            h,
+            layout_offset,
+            row_stride,
+            span,
+            row_length_texels,
+            native,
+            sampled_vk_format,
+            native_components,
+            planes,
+            allocation,
+            packed_head: packed.head,
+            packed_runs: std::sync::Arc::clone(&packed.runs),
+            packed_pages: std::sync::Arc::clone(&packed.pages),
+            gather: None,
+            witness_gpas: Vec::new(),
+            witness_run: None,
+        });
+    }
+    // The multi-plane gather arm, over the import's own coordinates exactly as
+    // the serial rail cuts them.
+    if !sampled_gather_floor_pure(native, span) {
+        return Err(SampleBail::ZeroCopyDeclined);
+    }
+    let page = state.page_size();
+    let packed_offset = packed
+        .head
+        .checked_add(layout_offset)
+        .ok_or(SampleBail::ColdPacked)?;
+    let first_page = usize::try_from(packed_offset / page).map_err(|_| SampleBail::ColdPacked)?;
+    let head_off = packed_offset % page;
+    let page_count = usize::try_from(head_off.checked_add(span).ok_or(SampleBail::ColdPacked)?)
+        .map_err(|_| SampleBail::ColdPacked)?
+        .div_ceil(page as usize);
+    let witness_gpas = packed
+        .gpas
+        .get(first_page..first_page.checked_add(page_count).ok_or(SampleBail::ColdPacked)?)
+        .ok_or(SampleBail::ColdPacked)?
+        .to_vec();
+    let witness_run = crate::backend::vulkan::engine::GuestRun::in_mapping(
+        packed.import.host_base(),
+        packed.import.len(),
+        packed_offset,
+        span,
+    )
+    .ok_or(SampleBail::ColdPacked)?;
+    let witness_runs = [witness_run];
+    let gather = crate::runtime::gather_witness::plan_gather(
+        state,
+        host,
+        crate::runtime::gather_witness::GatherRail::Linear,
+        crate::runtime::gather_witness::GatherKey::TaskGva { task_id, gva },
+        crate::runtime::gather_witness::GatherWindow {
+            gpas: &witness_gpas,
+            runs: &witness_runs,
+            span,
+            page_size: page as usize,
+        },
+    )
+    .ok_or(SampleBail::ColdWitness)?;
+    Ok(LinearPlan {
+        task_id,
+        texture_ref,
+        may_bind_resident,
+        resource,
+        gva,
+        w,
+        h,
+        layout_offset,
+        row_stride,
+        span,
+        row_length_texels,
+        native,
+        sampled_vk_format,
+        native_components,
+        planes,
+        allocation,
+        packed_head: packed.head,
+        packed_runs: std::sync::Arc::clone(&packed.runs),
+        packed_pages: std::sync::Arc::clone(&packed.pages),
+        gather: Some(gather),
+        witness_gpas,
+        witness_run: Some(witness_run),
+    })
+}
+
+impl LinearPlan {
+    /// The serve both arms answer, from the witness outcome the gather arm
+    /// produced (or the direct arm's witness-free request).
+    fn source(
+        &self,
+        request: crate::backend::vulkan::engine::GuestRunSource,
+        outcome: Option<crate::runtime::gather_witness::GatherOutcome>,
+    ) -> (u32, u32, u32, SampledSourceRequest) {
+        (
+            self.w,
+            self.h,
+            0,
+            SampledSourceRequest::GuestRuns(
+                request,
+                self.native,
+                self.sampled_vk_format,
+                self.planes,
+                outcome.map(|seen| LinearSampleIdentity::from(seen.identity)),
+                outcome.map_or(
+                    crate::runtime::gather_witness::GatherVouch::Fresh,
+                    |seen| seen.vouch,
+                ),
+                self.native_components,
+            ),
+        )
+    }
+}
+
+/// Re-check a linear plan at the point the serial rail would run
+/// [`try_linear_sample_zero_copy`], and with `apply` take it: the debt
+/// predicates, the rung above, the packed allocation's identity, and (gather
+/// arm) the witness plan. The Ok pair's second element is the plan for the
+/// next bind of the same ref — the direct arm's own plan again (it moved
+/// nothing), the gather arm's repeat (design H6).
+///
+/// Without `apply` nothing is written or noted, and the answer is the plan's
+/// prediction with no witness outcome applied, for a shadow comparison against
+/// the serial rail that runs next.
+pub(crate) fn commit_linear_plan<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    plan: &LinearPlan,
+    task_id: u32,
+    texture_ref: u32,
+    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
+    may_bind_resident: bool,
+    apply: bool,
+) -> Result<
+    (
+        (u32, u32, u32, SampledSourceRequest),
+        Option<LinearPlan>,
+    ),
+    SampleInvalid,
+> {
+    if plan.task_id != task_id
+        || plan.texture_ref != texture_ref
+        || plan.may_bind_resident != may_bind_resident
+    {
+        return Err(SampleInvalid::Key);
+    }
+    if !resource.is_some_and(|r| std::sync::Arc::ptr_eq(r, &plan.resource)) {
+        return Err(SampleInvalid::Resource);
+    }
+    // The predicates the plan refused through, repeated: a debt armed since the
+    // plan is the drain's to pay, on the serial rail.
+    if crate::runtime::writeback_debt::owes_texture(state, task_id, texture_ref)
+        || state
+            .pending_writebacks
+            .owes_gva_overlapping(task_id, plan.allocation.gva, plan.allocation.size)
+    {
+        return Err(SampleInvalid::Debt);
+    }
+    // The rung above, repeated: it became servable since the plan (a Store
+    // armed the witness, a resident turned ready) — the serial answer changed
+    // shape above this rail.
+    let tex = match plan.resource.decoded() {
+        Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => tex,
+        _ => return Err(SampleInvalid::Resource),
+    };
+    if may_bind_resident
+        && linear_resident_rung_above_may_serve(
+            &*state,
+            &*host,
+            task_id,
+            texture_ref,
+            plan.gva,
+            u32::try_from(plan.row_stride).map_err(|_| SampleInvalid::Resource)?,
+            plan.w,
+            plan.h,
+            tex.pixel_format,
+        )
+    {
+        return Err(SampleInvalid::UpperRung);
+    }
+    let packed = state
+        .bound_buffers
+        .packed_available(task_id, texture_ref, plan.allocation.gva, plan.allocation.size)
+        .ok_or(SampleInvalid::Packed)?;
+    if plan.packed_head != packed.head
+        || !std::sync::Arc::ptr_eq(&plan.packed_runs, &packed.runs)
+        || !std::sync::Arc::ptr_eq(&plan.packed_pages, &packed.pages)
+    {
+        return Err(SampleInvalid::Packed);
+    }
+    // Cloned out before the witness commit takes `state` mutably: the serve
+    // below names the same allocation the identity check just proved.
+    let (packed_runs, packed_pages) = (std::sync::Arc::clone(&packed.runs), std::sync::Arc::clone(&packed.pages));
+    let guest_runs = crate::backend::vulkan::engine::GuestRunSource {
+        runs: packed_runs,
+        source_offset: plan.layout_offset,
+        total_len: plan.span,
+        row_length_texels: plan.row_length_texels,
+        pages: Some(packed_pages),
+        direct_image: None,
+    };
+    if plan.gather.is_none() {
+        // The direct arm: rebuilt from the same borrowed allocation, moving
+        // nothing — the plan serves again for the next bind of the ref.
+        let request = direct_linear_sample_from_packed(
+            packed,
+            plan.layout_offset,
+            plan.row_stride,
+            plan.span,
+            plan.row_length_texels,
+            plan.native,
+            plan.sampled_vk_format,
+            plan.native_components,
+            plan.resource.lifetime_ref(),
+        )
+        .ok_or(SampleInvalid::Packed)?;
+        if apply && plan.span < SAMPLED_GATHER_MIN_BYTES {
+            crate::runtime::drain::note_store_route("zc_lin_direct_under_floor_span");
+        }
+        let SampledSourceRequest::GuestRuns(source, ..) = request else {
+            return Err(SampleInvalid::Packed);
+        };
+        return Ok((plan.source(source, None), apply.then(|| plan.clone())));
+    }
+    let gather = plan.gather.as_ref().expect("checked above");
+    let run = plan.witness_run.expect("the gather arm carries its run");
+    if !apply {
+        return Ok((plan.source(guest_runs, Some(gather.predicted())), None));
+    }
+    let (outcome, repeat) =
+        crate::runtime::gather_witness::commit_gather_repeatable(
+            state,
+            &*host,
+            gather,
+            &plan.witness_gpas,
+            std::slice::from_ref(&run),
+        )
+        .ok_or(SampleInvalid::Witness)?;
+    let mut next = plan.clone();
+    next.gather = Some(repeat);
+    Ok((plan.source(guest_runs, Some(outcome)), Some(next)))
 }
 
 #[cfg(test)]
@@ -1774,5 +2273,287 @@ mod tests {
         time("note_ref_backing", &mut || {
             note_sampled_ref_backing(&state, 1, texture_ref, 60, 64, sid, "bytes");
         });
+    }
+
+    /// A linear texture (`texture_ref` 2, OBJECT_TYPE_TEXTURE) over a 64x64
+    /// BGRA8 level at task GVA `handle << 12`, four pages, whose packed
+    /// allocation is already retained in `bound_buffers` — the warm state the
+    /// serial rail's `ensure_packed_resource` answers without resolving.
+    fn linear_fixture() -> (DeviceState, FakeHost, u32) {
+        use crate::protocol::endian::{st16, st32, st64};
+        use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::runtime::bound_buffers::{
+            BoundBuffers, PackedBuffer, PackedBufferResolution,
+        };
+        use crate::runtime::decode::resource::{
+            list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE,
+            TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
+            TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE,
+        };
+        use crate::runtime::gva_mem;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.stable_map_pages = true;
+        host.strict_linux_map = true;
+        let (dir_pfn, root_pfn) = (2u32, 3u32);
+        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_X86;
+        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        let mut dir = [0u8; 8];
+        st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+        st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
+        assert!(host.write_gpa(dir_gpa, &dir).is_ok());
+        for i in 0..3u32 {
+            let pfn = 4 + i;
+            host.map_range((pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
+            let mut pte = [0u8; 4];
+            st32(&mut pte, pfn);
+            assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+        }
+        state.define_task(1, 0x1000, dir_pfn);
+        assert!(state.set_object_list(1, 0, 32));
+
+        // The descriptor: handle 32 (allocation base 0x20_000), 64x64 BGRA8 at
+        // 256 B/row, allocation exactly the level's four pages.
+        let (texture_ref, handle, w, h, bpr) = (2u32, 32u32, 64u32, 64u32, 256u32);
+        let span = u64::from(bpr) * u64::from(h);
+        let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
+        st64(&mut desc[LINEAR_DESC_SIZE..], span);
+        st32(&mut desc[LINEAR_DESC_HANDLE..], handle);
+        st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], bpr);
+        st32(&mut desc[TEXTURE_DESC_WIDTH..], w);
+        st32(&mut desc[TEXTURE_DESC_HEIGHT..], h);
+        st16(&mut desc[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
+        let desc_gva = 0x1000u64;
+        assert!(gva_mem::write_task_gva(
+            &mut host,
+            &state.tasks[1],
+            desc_gva,
+            &desc,
+            PAGE_SHIFT_X86
+        )
+        .is_ok());
+        let list_off = list_object_entry_offset(texture_ref, 32).unwrap();
+        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut list_entry,
+            (OBJECT_TYPE_TEXTURE as u32) | ((TEXTURE_DESC_BASE_LEN as u32) << 8),
+        );
+        list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        assert!(gva_mem::write_task_gva(
+            &mut host,
+            &state.tasks[1],
+            list_off,
+            &list_entry,
+            PAGE_SHIFT_X86
+        )
+        .is_ok());
+
+        // The allocation's pages, mapped in the task table (slots 32..36) and
+        // the host, so a copied-fallback walk would resolve them too.
+        let gpas: Vec<u64> = (0..4u64).map(|i| ((handle + i as u32) as u64) << PAGE_SHIFT_X86).collect();
+        for (i, &gpa) in gpas.iter().enumerate() {
+            host.map_range(gpa, 0x1000, 0x50 + i as u8);
+            let mut pte = [0u8; 4];
+            st32(&mut pte, (gpa >> PAGE_SHIFT_X86) as u32);
+            assert!(host.write_gpa(root_gpa + ((handle + i as u32) as u64) * 4, &pte).is_ok());
+        }
+
+        // The warm packed allocation: what `ensure_packed_resource` would have
+        // retained after one serial bind, held so the plan takes the arm the
+        // serial rail takes without resolving anything.
+        let base = 0x7f00_0000_0000usize;
+        let import = std::sync::Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                base, 0x8000, 0x1000,
+            )
+            .expect("aligned allocation"),
+        );
+        let run = crate::runtime::guest_ram::GuestRun::in_mapping(base, 0x8000, 0, span)
+            .expect("the run covers the allocation");
+        state.bound_buffers.insert_packed(
+            1,
+            texture_ref,
+            PackedBufferResolution::Available(PackedBuffer {
+                gva: u64::from(handle) << PAGE_SHIFT_X86,
+                size: span,
+                head: 0,
+                import,
+                gpas: std::sync::Arc::new(gpas),
+                runs: std::sync::Arc::new(vec![run]),
+                pages: std::sync::Arc::new(Vec::new()),
+            }),
+        );
+        (state, host, texture_ref)
+    }
+
+    /// The fields of a linear serve two fixtures can agree on (host pointers
+    /// differ between fixtures, so the source is compared by shape).
+    #[allow(clippy::type_complexity)]
+    fn linear_shape(
+        served: &(u32, u32, u32, SampledSourceRequest),
+    ) -> (
+        u32,
+        u32,
+        u32,
+        u64,
+        u32,
+        u64,
+        usize,
+        bool,
+        TexelLayout,
+        Option<LinearSampleIdentity>,
+        crate::runtime::gather_witness::GatherVouch,
+    ) {
+        let (w, h, mid, src) = served;
+        let SampledSourceRequest::GuestRuns(source, layout, _vk, planes, identity, vouch, _) = src
+        else {
+            panic!("expected a linear guest-run serve");
+        };
+        (
+            *w,
+            *h,
+            *mid,
+            source.total_len,
+            source.row_length_texels,
+            source.source_offset,
+            *planes as usize,
+            source.direct_image.is_some(),
+            *layout,
+            *identity,
+            *vouch,
+        )
+    }
+
+    /// A planned linear zero-copy bind commits to the serial answer (the direct
+    /// single-plane arm, off the warm packed allocation), and — that arm moving
+    /// nothing — the plan the commit hands back serves the next bind too.
+    #[test]
+    fn a_planned_linear_bind_commits_to_the_serial_answer() {
+        let (mut a, mut a_host, texture_ref) = linear_fixture();
+        let (mut b, mut b_host, _) = linear_fixture();
+        let (ra, rb) = (
+            resource(&a, &a_host, texture_ref),
+            resource(&b, &b_host, texture_ref),
+        );
+        let mut plan = plan_linear_zero_copy(&a, &a_host, 1, texture_ref, ra.clone(), false)
+            .unwrap_or_else(|bail| panic!("a warm linear texture plans, got {bail:?}"));
+        for _ in 0..2 {
+            let (planned, repeat) =
+                commit_linear_plan(&mut a, &mut a_host, &plan, 1, texture_ref, Some(&ra), false, true)
+                    .expect("nothing moved since the plan");
+            let serial = resolve_sampled_source(
+                &mut b,
+                &mut b_host,
+                1,
+                texture_ref,
+                Some(rb.clone()),
+                false,
+            )
+            .expect("the serial rail serves the same bind");
+            assert_eq!(linear_shape(&planned), linear_shape(&serial));
+            assert!(
+                matches!(&serial.3, SampledSourceRequest::GuestRuns(s, ..) if s.direct_image.is_some()),
+                "the serial rail serves the direct arm this plan planned"
+            );
+            plan = repeat.expect("the direct arm serves again");
+        }
+    }
+
+    /// A writeback debt armed under the texture's own GVA resource key is the
+    /// one refusal the plan takes before anything else: paying it writes guest
+    /// pages, which is the drain's to do (design H7).
+    #[test]
+    fn an_owed_frame_refuses_the_linear_plan_and_invalidates_a_committed_one() {
+        let (mut a, mut a_host, texture_ref) = linear_fixture();
+        let ra = resource(&a, &a_host, texture_ref);
+        // The span the resident identity would be declared at.
+        let (gva, row_stride, w, h) = (0x20_000u64, 256u32, 64u32, 64u32);
+        let key = crate::runtime::writeback_debt::GvaResourceKey {
+            task_id: 1,
+            texture_ref,
+        };
+        let arm = |state: &mut DeviceState| {
+            state.pending_writebacks.ensure_gva_resource(
+                key,
+                gva,
+                u64::from(row_stride) * u64::from(h),
+                Some(vec![0x28_000]),
+            );
+            state.pending_writebacks.arm_gva(
+                key,
+                crate::runtime::writeback_debt::GvaWritebackDebt {
+                    gva,
+                    row_stride,
+                    width: w,
+                    height: h,
+                    format: MTL_FORMAT_BGRA8_UNORM,
+                    generation: 1,
+                    guest_write: Default::default(),
+                    seq: 0,
+                },
+            );
+        };
+        arm(&mut a);
+        assert_eq!(
+            plan_linear_zero_copy(&a, &a_host, 1, texture_ref, ra.clone(), false).err(),
+            Some(SampleBail::OwedFrame),
+            "the plan never pays"
+        );
+        // The same debt armed *after* a plan invalidates it at commit, and the
+        // serial rail then pays and serves.
+        let (mut b, mut b_host, _) = linear_fixture();
+        let rb = resource(&b, &b_host, texture_ref);
+        let plan = plan_linear_zero_copy(&b, &b_host, 1, texture_ref, rb.clone(), false)
+            .expect("no debt when planned");
+        arm(&mut b);
+        assert_eq!(
+            commit_linear_plan(&mut b, &mut b_host, &plan, 1, texture_ref, Some(&rb), false, true)
+                .err(),
+            Some(SampleInvalid::Debt)
+        );
+        let serial = resolve_sampled_source(
+            &mut b,
+            &mut b_host,
+            1,
+            texture_ref,
+            Some(rb),
+            false,
+        );
+        assert!(serial.is_some(), "the serial rail pays the debt and serves");
+    }
+
+    /// The GVA-resident rung above the linear rail is the serial ladder's
+    /// answer wherever it may serve, so the plan refuses those binds —
+    /// conservatively, including an undeclared resource whose serial
+    /// declaration this read-only question cannot predict.
+    #[test]
+    fn the_resident_rung_above_refuses_the_linear_plan() {
+        let (a, a_host, texture_ref) = linear_fixture();
+        let ra = resource(&a, &a_host, texture_ref);
+        assert_eq!(
+            plan_linear_zero_copy(&a, &a_host, 1, texture_ref, ra, true).err(),
+            Some(SampleBail::UpperRung),
+            "may_bind_resident makes the rung above the serial answer"
+        );
+    }
+
+    /// Without the retained packed allocation the plan refuses (`ColdPacked`)
+    /// and the serial rail resolves or copies on the drain thread.
+    #[test]
+    fn a_cold_packed_refusal_leaves_the_serial_rail() {
+        let (mut a, mut a_host, texture_ref) = linear_fixture();
+        a.bound_buffers = crate::runtime::bound_buffers::BoundBuffers::default();
+        let ra = resource(&a, &a_host, texture_ref);
+        assert_eq!(
+            plan_linear_zero_copy(&a, &a_host, 1, texture_ref, ra.clone(), false).err(),
+            Some(SampleBail::ColdPacked)
+        );
+        // And the serial rail still serves the bind, by resolving the
+        // allocation itself.
+        let serial = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra), false);
+        assert!(serial.is_some(), "the serial rail resolves what the plan refuses");
     }
 }
