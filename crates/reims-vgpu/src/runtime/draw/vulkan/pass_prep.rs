@@ -61,14 +61,20 @@ pub(crate) fn pass_prep_mode() -> PassPrepMode {
             1 => return PassPrepMode::Off,
             2 => return PassPrepMode::Shadow,
             3 => return PassPrepMode::On,
-            _ => {}
+            // Unit tests keep the serial ladder unless they ask: the product
+            // default (on) is for the running device, not for every test.
+            _ => return PassPrepMode::Off,
         }
     }
     *MODE.get_or_init(
         || match std::env::var("REIMS_VGPU_LAB_PASS_PREP").as_deref() {
-            Ok("on") => PassPrepMode::On,
+            // On by default (n102: fullscreen transitions 14-15 % frames >25 ms
+            // against 21-22 % off, +15-22 % frames, sampled 16 against 21-22 us a
+            // chain; drag and input latency neutral); `=off` restores the serial
+            // ladder, `=shadow` plans and compares.
+            Ok("off") => PassPrepMode::Off,
             Ok("shadow") => PassPrepMode::Shadow,
-            _ => PassPrepMode::Off,
+            _ => PassPrepMode::On,
         },
     )
 }
