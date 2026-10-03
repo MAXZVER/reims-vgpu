@@ -475,6 +475,15 @@ impl Default for GatherWitness {
     }
 }
 
+impl GatherWitness {
+    /// The `last_seen` a tracked window's entry carries now — the stamp a
+    /// [`commit_gather`] of it left, which the repeat plan for its next bind
+    /// expects to still find.
+    pub(crate) fn entry_last_seen(&self, key: GatherKey) -> Option<u64> {
+        self.entries.get(&key).map(|entry| entry.last_seen)
+    }
+}
+
 /// How often the content audit compares a window against its own past.
 ///
 /// The audit is a standing alarm on the one rule this whole module exists to
@@ -1371,6 +1380,29 @@ pub(crate) fn commit_gather<M: crate::runtime::host::HostOps>(
     })
 }
 
+/// [`commit_gather`], plus the plan for the *next* bind of the same window,
+/// committed from the state this commit left (design H6's removal: one plan
+/// per key no longer serves one bind).
+///
+/// The repeat re-runs the warm decision over the entry this commit inserted —
+/// the same `decide_warm` the next serial bind would run, over the same entry
+/// state, with the same readings (which its own commit re-checks through
+/// [`gather_plan_holds`]) — so a second bind of the key inside one pass serves
+/// without the drain replanning it. `runs` are the window's runs, for the audit
+/// stride's fold: the same runs the committed plan named, which the caller
+/// holds with the plan.
+pub(crate) fn commit_gather_repeatable<M: crate::runtime::host::HostOps>(
+    state: &mut crate::model::DeviceState,
+    host: &M,
+    plan: &PlannedGather,
+    gpas: &[u64],
+    runs: &[crate::runtime::guest_ram::GuestRun],
+) -> Option<(GatherOutcome, PlannedGather)> {
+    let outcome = commit_gather(state, host, plan, gpas)?;
+    let post_last_seen = state.gather_witness.entry_last_seen(plan.key)?;
+    Some((outcome, plan.repeat(state, host, post_last_seen, runs)))
+}
+
 /// Whether [`commit_gather`] would apply `plan` now: the entry unwritten since
 /// the plan, the same readings, and no sync that moved the token's generation.
 /// Reads only, so a caller can ask before work it must not do twice.
@@ -1399,6 +1431,62 @@ impl PlannedGather {
                 generation: self.seen.generation,
             },
             vouch: self.seen.vouch,
+        }
+    }
+
+    /// The plan for the next bind of the same window, from the state a commit
+    /// of this plan left: the entry the commit inserted (this plan's `next`,
+    /// with `post_last_seen` stamped into it), re-decided for the next bind.
+    ///
+    /// The readings, token and lagged generation carry over unchanged — the
+    /// next commit re-checks all three against the state it finds
+    /// ([`gather_plan_holds`]), so anything that moved between the two binds
+    /// drops the repeat and the serial rail serves, exactly as it would drop a
+    /// fresh plan. The fresh generation is drawn from the device counter here,
+    /// on the drain thread, at the moment a serial bind would have drawn one;
+    /// a repeat that never commits simply spends it, as a planned-but-dropped
+    /// bind already can.
+    pub(crate) fn repeat<M: crate::runtime::host::HostOps>(
+        &self,
+        state: &crate::model::DeviceState,
+        host: &M,
+        post_last_seen: u64,
+        runs: &[crate::runtime::guest_ram::GuestRun],
+    ) -> Self {
+        // The entry the commit inserted, before its `last_seen` was stamped.
+        let mut next = self.next.clone();
+        next.last_seen = post_last_seen;
+        let mut warm_routes = Vec::new();
+        let fresh = state.next_sampled_content_generation();
+        let seen = decide_warm(
+            &mut next,
+            host,
+            self.key,
+            runs,
+            self.span,
+            self.readings.pages_wrote,
+            self.readings.pending,
+            self.readings.stated_gen,
+            self.readings.pages_epoch,
+            fresh,
+            state.gather_witness.audit,
+            &mut warm_routes,
+        );
+        let token = next.token;
+        let lagged_gen = (token != 0)
+            .then(|| host.guest_write_gen_lagged(token))
+            .flatten();
+        Self {
+            key: self.key,
+            rail: self.rail,
+            span: self.span,
+            expect_last_seen: post_last_seen,
+            readings: self.readings,
+            token,
+            lagged_gen,
+            next,
+            seen,
+            warm_routes,
         }
     }
 }
@@ -3098,5 +3186,107 @@ mod tests {
         let plan = plan_gather(&state, &host, rail, PLAN_KEY, one_page(&GPAS, &runs)).unwrap();
         host.guest_wrote_page(GPAS[0]);
         assert!(commit_gather(&mut state, &host, &plan, &GPAS).is_none());
+    }
+
+    /// One plan serves a whole run of binds of its window (design H6's
+    /// removal): the repeat a commit hands back commits from the post state,
+    /// and answers — and leaves the witness — where the serial observations
+    /// answer and leave it.
+    #[test]
+    fn a_repeated_plan_serves_each_next_bind_of_the_window() {
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let (mut planned, mut serial) = (fresh_state(), fresh_state());
+        let (mut host_p, mut host_s) = (
+            crate::runtime::host::FakeHost::new(),
+            crate::runtime::host::FakeHost::new(),
+        );
+        let rail = GatherRail::MapperRefTexture;
+        // Arm both (the cold branch is serial-only).
+        let _ = note_gather(
+            &mut planned,
+            &mut host_p,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
+        let _ = note_gather(
+            &mut serial,
+            &mut host_s,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
+        // Bind 1 plans once; every later bind commits the repeat the previous
+        // commit handed back.
+        let mut plan = plan_gather(&planned, &host_p, rail, PLAN_KEY, one_page(&GPAS, &runs))
+            .expect("a tracked window with the same pages plans");
+        for _ in 0..4 {
+            let (a, repeat) =
+                commit_gather_repeatable(&mut planned, &host_p, &plan, &GPAS, &runs)
+                    .expect("nothing moved since the plan");
+            let b = note_gather(
+                &mut serial,
+                &mut host_s,
+                rail,
+                PLAN_KEY,
+                one_page(&GPAS, &runs),
+            );
+            assert_eq!(a, b);
+            plan = repeat;
+        }
+        // And the two witnesses keep agreeing on the next serial bind: the
+        // repeats left the entry where four serial observations leave it.
+        let a = note_gather(
+            &mut planned,
+            &mut host_p,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
+        let b = note_gather(
+            &mut serial,
+            &mut host_s,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
+        assert_eq!(a, b);
+    }
+
+    /// A repeat is a plan like any other: a guest store the hypervisor saw
+    /// between the two binds it spans drops it, and the serial rail serves.
+    #[test]
+    fn a_guest_store_between_two_binds_drops_the_repeat() {
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let mut state = fresh_state();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let rail = GatherRail::MapperRefTexture;
+        let _ = note_gather(
+            &mut state,
+            &mut host,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
+        let plan = plan_gather(&state, &host, rail, PLAN_KEY, one_page(&GPAS, &runs)).unwrap();
+        let (_, repeat) = commit_gather_repeatable(&mut state, &host, &plan, &GPAS, &runs)
+            .expect("the first bind commits");
+        // The guest writes between the two binds; a sync observes it.
+        host.guest_wrote_page(GPAS[0]);
+        assert!(
+            commit_gather_repeatable(&mut state, &host, &repeat, &GPAS, &runs).is_none(),
+            "the repeat rested on a generation that moved"
+        );
+        // And the serial observation still serves the bind the repeat refused.
+        let served = note_gather(
+            &mut state,
+            &mut host,
+            rail,
+            PLAN_KEY,
+            one_page(&GPAS, &runs),
+        );
+        assert_eq!(served.vouch, GatherVouch::Fresh);
     }
 }
