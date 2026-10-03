@@ -1765,6 +1765,41 @@ impl MapperRefPlan {
     }
 }
 
+/// Whether the surface ladder's resident rung — the rung every mapper-ref and
+/// memo plan falls past, because the resident was absent (or the guest had
+/// replaced it) when the ladder planned — has become servable since the plan:
+/// a warm lease where there was none, or a readiness the registry has
+/// published since (a render the recorder was still holding when the pool
+/// planned).
+///
+/// This is the readiness nondeterminism the design names: a plan reads the
+/// pre-state of a recorder job, the serial ladder the post-state, and "both
+/// are versions, validate decides". The surface plans re-check their backing
+/// for exactly this; the page-rung plans must too, or a bind whose serial
+/// answer became a `Target` keeps answering `GuestRuns`/`Bytes`.
+///
+/// Cheap by design: the readiness side table is versioned and lock-free, and
+/// the lease is the resource's own map. The currency question is *not* asked
+/// here — that is the sync hypervisor query the plan exists to avoid; when
+/// this fires the bind yields to the serial ladder, which pays it and serves
+/// whichever rung it serves.
+fn surface_resident_appeared(
+    state: &DeviceState,
+    resource: &std::sync::Arc<crate::model::TaskResource>,
+    mid: u32,
+    w: u32,
+    h: u32,
+) -> bool {
+    let identity = crate::backend::vulkan::present_identity::surface_identity(state, mid, w, h);
+    if resource_type_owns_surface_resident(resource.entry.object_type)
+        && resource_lease::resident_target_backing_warm(resource, &identity).is_some()
+    {
+        return true;
+    }
+    crate::backend::vulkan::engine::resident_content_backing(&identity)
+        != ResidentContentBacking::NotReady
+}
+
 /// Re-check a mapper-ref plan at the point the serial rail would run, and with
 /// `apply` take it: the mapping row, the window key and its cached window, the
 /// debt and the direct arm above, and the witness plan — which commits through
@@ -1819,6 +1854,12 @@ pub(crate) fn commit_mapper_ref_plan<M: HostMemory + HostOps>(
         return Err(SampleInvalid::Debt);
     }
     if mapper_direct_rung_above_may_serve(&*state, &*host, mid) {
+        return Err(SampleInvalid::UpperRung);
+    }
+    // The resident rung above the whole page ladder: the plan fell past it
+    // when the surface ladder planned, and a readiness that appeared since
+    // changes the serial answer's shape above this rail.
+    if surface_resident_appeared(&*state, &plan.resource, mid, plan.w, plan.h) {
         return Err(SampleInvalid::UpperRung);
     }
     let cached = crate::runtime::mapper::mapping_window_cached(state, mid, plan.base_off, plan.span);
@@ -2280,6 +2321,12 @@ pub(crate) fn commit_memo_plan<M: HostMemory + HostOps>(
     }
     if crate::runtime::writeback_debt::owes_mapping(state, plan.mid) {
         return Err(SampleInvalid::Debt);
+    }
+    // The resident rung above the page ladder, as the mapper-ref commit
+    // re-checks it: a readiness that appeared since the plan changes the
+    // serial answer's shape above this rail.
+    if surface_resident_appeared(&*state, &plan.resource, plan.mid, plan.w, plan.h) {
+        return Err(SampleInvalid::UpperRung);
     }
     let cached = crate::runtime::mapper::mapping_window_cached(state, plan.mid, plan.base_off, plan.span);
     if !cached.is_some_and(|(gpas, runs)| {
@@ -3653,5 +3700,71 @@ mod tests {
             Some(SampleBail::MemoBudget),
             "a fill with no budget left is the serial memo's"
         );
+    }
+
+    /// A resident that appeared between the plan and the commit — the
+    /// readiness flip a recorder job landing mid-pass makes — changes the
+    /// serial answer's shape above the page rungs, and both page-rung plans
+    /// yield the bind to the serial ladder. This is the fs2s1 shadow class
+    /// (lab/resolve 394d5c9a: ~3 080 `par_shadow_mismatch_variant` binds,
+    /// planned GuestRuns/Bytes against a serial `Target`), reproduced here by
+    /// the same lease seeding the surface-plan tests use for their flip.
+    #[test]
+    fn a_resident_appearing_above_drops_the_page_rung_plans() {
+        use crate::backend::vulkan::engine::ResidentContentBacking;
+        // The zero-copy arm, above the floor.
+        let (mut a, mut a_host, texture_ref, sid) = mapper_ref_zero_fixture();
+        let ra = resource(&a, &a_host, texture_ref);
+        let _ = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra.clone()), true);
+        let plan =
+            plan_mapper_ref_zero_copy(&a, &a_host, 1, texture_ref, ra.clone()).expect("warm");
+        let identity =
+            crate::backend::vulkan::present_identity::surface_identity(&a, sid, 128, 128);
+        resource_lease::seed_warm_lease_for_test(
+            &ra,
+            &identity,
+            ResidentContentBacking::DeviceAllocation,
+        );
+        assert_eq!(
+            commit_mapper_ref_plan(&mut a, &mut a_host, &plan, 1, texture_ref, Some(&ra), true)
+                .err(),
+            Some(SampleInvalid::UpperRung),
+            "the resident that appeared is the serial answer's rung now"
+        );
+        assert!(matches!(
+            resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra), true),
+            Some((_, _, _, SampledSourceRequest::Target(..)))
+        ));
+
+        // The memo arm, under the floor.
+        let (mut b, mut b_host, texture_ref, sid) = memo_fixture();
+        let rb = resource(&b, &b_host, texture_ref);
+        let _ = crate::runtime::mapper::ensure_guest_write_token(&mut b, &mut b_host, sid);
+        let _ = resolve_sampled_source(&mut b, &mut b_host, 1, texture_ref, Some(rb.clone()), true);
+        let plan = plan_mapper_ref_memo(
+            &b,
+            &b_host,
+            1,
+            texture_ref,
+            rb.clone(),
+            &std::sync::atomic::AtomicU64::new(memo_fill_chunk_limit()),
+        )
+        .expect("the primed memo plans");
+        let identity =
+            crate::backend::vulkan::present_identity::surface_identity(&b, sid, 60, 64);
+        resource_lease::seed_warm_lease_for_test(
+            &rb,
+            &identity,
+            ResidentContentBacking::DeviceAllocation,
+        );
+        assert_eq!(
+            commit_memo_plan(&mut b, &mut b_host, &plan, 1, texture_ref, Some(&rb), true).err(),
+            Some(SampleInvalid::UpperRung),
+            "the memo rung yields the same way"
+        );
+        assert!(matches!(
+            resolve_sampled_source(&mut b, &mut b_host, 1, texture_ref, Some(rb), true),
+            Some((_, _, _, SampledSourceRequest::Target(..)))
+        ));
     }
 }

@@ -118,6 +118,23 @@ pub(super) fn take_consumed_refs() -> Vec<u32> {
     })
 }
 
+/// Whether the memo rung may be planned after the zero-copy rail refused a
+/// bind: only where the *serial* ladder refuses that rail too, which is the
+/// floor (`ZeroCopyDeclined` — the same `SAMPLED_GATHER_MIN_BYTES` crossover
+/// both arms apply).
+///
+/// Every other refusal is one the serial ladder resolves on the drain and the
+/// plan cannot: a cold window cache or a cold witness (`ColdWindow`,
+/// `ColdWitness`) the serial rail fills and re-arms before serving the gather,
+/// an upper rung, a debt. Letting the memo plan answer those binds would serve
+/// `Bytes` where the serial ladder serves `GuestRuns` off the very pages the
+/// memo read — the shadow gate's `par_shadow_mismatch_variant` class the fs2s1
+/// boot caught (lab/resolve 394d5c9a: ~3 080 binds, surfaces 283x512/512x512,
+/// serial on the rungs above).
+pub(super) fn memo_plan_may_follow(zero_copy_bail: SampleBail) -> bool {
+    matches!(zero_copy_bail, SampleBail::ZeroCopyDeclined)
+}
+
 /// The one job body both [`prefetch_stream`] and [`super::pass_prep`] run per
 /// item, on the pool: the surface ladder's plannable top, and — where it bails
 /// — the rungs under it in the serial ladder's own order: a materializing
@@ -146,8 +163,7 @@ pub(super) fn plan_item(
         }
         // The surface ladder fell past every host-side copy: the serial ladder
         // reads the surface's own pages from here down. The zero-copy window
-        // first, and — where it declines — the memo; a memo refusal replaces
-        // the zero-copy bail only when the memo is the rung that answered.
+        // first; the memo only where the serial ladder would take it too.
         Err(bail @ (SampleBail::NoHostCache | SampleBail::LowerRung)) => {
             match sample_plan::plan_mapper_ref_zero_copy(
                 st,
@@ -157,22 +173,30 @@ pub(super) fn plan_item(
                 resource.clone(),
             ) {
                 Ok(plan) => Ok(StreamPlan::MapperRef(plan)),
-                Err(_) => match sample_plan::plan_mapper_ref_memo(
-                    st,
-                    &host,
-                    task_id,
-                    texture_ref,
-                    resource,
-                    memo_budget,
-                ) {
-                    Ok(plan) => Ok(StreamPlan::Memo(plan)),
-                    // The memo's own budget refusal names a rung the serial
-                    // ladder would have filled; every other memo refusal is
-                    // reported as the zero-copy rail's, which is the rung the
-                    // serial ladder reached.
-                    Err(memo_bail @ SampleBail::MemoBudget) => Err(memo_bail),
-                    Err(_) => Err(bail),
-                },
+                Err(zero_copy) => {
+                    if !memo_plan_may_follow(zero_copy) {
+                        // The refusal names the rung the serial ladder reached
+                        // (or resolves itself); the memo must not answer past
+                        // it.
+                        return Err(zero_copy);
+                    }
+                    match sample_plan::plan_mapper_ref_memo(
+                        st,
+                        &host,
+                        task_id,
+                        texture_ref,
+                        resource,
+                        memo_budget,
+                    ) {
+                        Ok(plan) => Ok(StreamPlan::Memo(plan)),
+                        // The memo's own budget refusal names a fill the
+                        // serial memo would have made; every other memo
+                        // refusal is reported as the floor's, which is the
+                        // refusal both arms share.
+                        Err(memo_bail @ SampleBail::MemoBudget) => Err(memo_bail),
+                        Err(_) => Err(zero_copy),
+                    }
+                }
             }
         }
         Err(bail) => Err(bail),
@@ -549,7 +573,15 @@ pub(crate) fn shadow_compare(
                     "par_shadow_mismatch_bytes"
                 }
             }
-            _ => "par_shadow_mismatch_variant",
+            // A cross-variant answer. The total keeps the gate's name (it
+            // stays zero on a healthy boot); the split beside it names the
+            // pair, so a boot that breaks it says *which* rung answered
+            // differently without a rebuild — the fs2s1 diagnosis needed
+            // exactly this and had to infer the pair from the census.
+            pair => {
+                crate::runtime::drain::note_store_route(variant_pair_route(pair));
+                "par_shadow_mismatch_variant"
+            }
         },
     };
     crate::runtime::drain::note_store_route(verdict);
@@ -557,7 +589,44 @@ pub(crate) fn shadow_compare(
         && crate::observe::first_sight("par_shadow_mismatch", u64::from(texture_ref))
     {
         crate::observe::fail(format!(
-            "par_shadow_mismatch ref={texture_ref} kind={verdict} planned_mid={pmid} {pw}x{ph}"
+            "par_shadow_mismatch ref={texture_ref} kind={verdict} planned_mid={pmid} {pw}x{ph}{}",
+            match serial {
+                Some((_, _, _, ssrc)) => format!(
+                    " planned={} serial={}",
+                    variant_name(psrc),
+                    variant_name(ssrc)
+                ),
+                None => String::new(),
+            }
         ));
+    }
+}
+
+/// The cross-variant pair a `par_shadow_mismatch_variant` bind answered, as a
+/// census route: e.g. `par_shadow_variant_runs_vs_target` — the plan served
+/// `GuestRuns`, the serial ladder a resident `Target` (the readiness-flip
+/// class the fs2s1 boot hit).
+fn variant_pair_route(
+    pair: (
+        &SampledSourceRequest,
+        &SampledSourceRequest,
+    ),
+) -> &'static str {
+    let (planned, serial) = pair;
+    match (variant_name(planned), variant_name(serial)) {
+        ("target", "runs") => "par_shadow_variant_target_vs_runs",
+        ("target", "bytes") => "par_shadow_variant_target_vs_bytes",
+        ("runs", "target") => "par_shadow_variant_runs_vs_target",
+        ("runs", "bytes") => "par_shadow_variant_runs_vs_bytes",
+        ("bytes", "target") => "par_shadow_variant_bytes_vs_target",
+        _ => "par_shadow_variant_bytes_vs_runs",
+    }
+}
+
+fn variant_name(src: &SampledSourceRequest) -> &'static str {
+    match src {
+        SampledSourceRequest::Target(..) => "target",
+        SampledSourceRequest::GuestRuns(..) => "runs",
+        SampledSourceRequest::Bytes(..) => "bytes",
     }
 }

@@ -961,6 +961,100 @@ mod tests {
         assert_eq!(parse_chunk(Some(" 12 ")), 12);
     }
 
+    /// The memo rung may only be planned where the serial ladder refuses the
+    /// zero-copy rail too — the floor. A cold window or witness is a refusal
+    /// the serial rail resolves itself (fills the window, re-arms the
+    /// witness), so a memo plan answering those binds would serve `Bytes`
+    /// where serial serves `GuestRuns`.
+    #[test]
+    fn the_memo_rung_follows_only_the_floor_refusal() {
+        assert!(prefetch::memo_plan_may_follow(SampleBail::ZeroCopyDeclined));
+        for other in [
+            SampleBail::ColdWindow,
+            SampleBail::ColdWitness,
+            SampleBail::UpperRung,
+            SampleBail::OwedFrame,
+            SampleBail::ColdBacking,
+        ] {
+            assert!(
+                !prefetch::memo_plan_may_follow(other),
+                "the memo must not answer past {other:?}"
+            );
+        }
+    }
+
+    /// A cross-variant shadow answer is counted by its pair as well as by the
+    /// gate's total, and the fail line names both sides — the split the fs2s1
+    /// diagnosis had to infer from the census (planned GuestRuns/Bytes against
+    /// a serial `Target`, the resident-readiness flip).
+    #[test]
+    fn a_cross_variant_shadow_answer_names_its_pair() {
+        use crate::backend::vulkan::engine::TargetIdentity;
+        let target = (
+            4u32,
+            3u32,
+            9u32,
+            SampledSourceRequest::Target(
+                TargetIdentity::Surface {
+                    id: 9,
+                    width: 4,
+                    height: 3,
+                    generation: 1,
+                    format: ash::vk::Format::B8G8R8A8_UNORM,
+                },
+                ash::vk::Format::B8G8R8A8_UNORM,
+            ),
+        );
+        let runs = (
+            4u32,
+            3u32,
+            9u32,
+            SampledSourceRequest::GuestRuns(
+                crate::backend::vulkan::engine::GuestRunSource {
+                    runs: Arc::new(Vec::new()),
+                    source_offset: 0,
+                    total_len: 48,
+                    row_length_texels: 0,
+                    pages: None,
+                    direct_image: None,
+                },
+                crate::protocol::pixel_format::TexelLayout::Bgra8,
+                ash::vk::Format::B8G8R8A8_UNORM,
+                1,
+                None,
+                crate::runtime::gather_witness::GatherVouch::Fresh,
+                pixel_format::swizzle_identity(),
+            ),
+        );
+        let bytes = (
+            4u32,
+            3u32,
+            9u32,
+            SampledSourceRequest::Bytes(
+                Arc::new(vec![0u8; 48]),
+                None,
+                SampledByteFormat::from_source(
+                    crate::protocol::pixel_format::TexelLayout::Rgba8,
+                    MTL_FORMAT_BGRA8_UNORM,
+                ),
+                crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
+            ),
+        );
+        let before_total = store_route_count("par_shadow_mismatch_variant");
+        let before_runs = store_route_count("par_shadow_variant_runs_vs_target");
+        let before_bytes = store_route_count("par_shadow_variant_bytes_vs_target");
+        prefetch::shadow_compare(31, &runs, Some(&target));
+        prefetch::shadow_compare(32, &bytes, Some(&target));
+        assert_eq!(delta("par_shadow_mismatch_variant", before_total), 2);
+        assert_eq!(delta("par_shadow_variant_runs_vs_target", before_runs), 1);
+        assert_eq!(delta("par_shadow_variant_bytes_vs_target", before_bytes), 1);
+        // And the comparison itself is not relaxed: same-variant binds still
+        // compare their contents.
+        let before_match = store_route_count("par_shadow_match_bytes");
+        prefetch::shadow_compare(33, &bytes, Some(&bytes));
+        assert_eq!(delta("par_shadow_match_bytes", before_match), 1);
+    }
+
     /// A pass under two draws, or a device with no pool, opens nothing — the
     /// byte-for-byte old path — and `off` refuses even a full pass.
     #[test]
