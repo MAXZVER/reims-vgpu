@@ -1024,8 +1024,16 @@ impl HostOps for QemuHost<'_> {
         }
     }
 
+    #[track_caller]
     fn guest_write_gen(&self, token: u64) -> Option<u64> {
-        self.ops.write_gen(token)
+        if !lab_gen_prof::on() {
+            return self.ops.write_gen(token);
+        }
+        let site = std::panic::Location::caller();
+        let t0 = std::time::Instant::now();
+        let answer = self.ops.write_gen(token);
+        lab_gen_prof::note(site, t0.elapsed());
+        answer
     }
 
     fn guest_write_gen_lagged(&self, token: u64) -> Option<u64> {
@@ -1044,6 +1052,66 @@ impl HostOps for QemuHost<'_> {
 
     fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
         self.ops.written_pages(token, since_gen)
+    }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_GEN_PROF=on`): the drain's synced generation
+/// reads timed per call site (`#[track_caller]`), into the per-second
+/// `store_routes` window as `lab_gw_<file>_<line>_n` / `_us` / `_slow` (>= 50 us,
+/// i.e. a read that synced rather than hit the epoch's answer).
+mod lab_gen_prof {
+    use std::collections::HashMap;
+    use std::panic::Location;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    type Names = (&'static str, &'static str, &'static str);
+
+    pub(super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            matches!(std::env::var("REIMS_VGPU_LAB_GEN_PROF").as_deref(), Ok("on"))
+        })
+    }
+
+    fn names(site: &'static Location<'static>) -> Names {
+        static SITES: OnceLock<Mutex<HashMap<(&'static str, u32), Names>>> = OnceLock::new();
+        let map = SITES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+        *map.entry((site.file(), site.line())).or_insert_with(|| {
+            let parts: Vec<&str> = site
+                .file()
+                .split(['/', '\\'])
+                .rev()
+                .take(2)
+                .collect();
+            let file: String = parts
+                .iter()
+                .rev()
+                .map(|p| p.trim_end_matches(".rs"))
+                .collect::<Vec<_>>()
+                .join("_")
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+                .collect();
+            let base = format!("lab_gw_{file}_{}", site.line());
+            (
+                Box::leak(format!("{base}_n").into_boxed_str()),
+                Box::leak(format!("{base}_us").into_boxed_str()),
+                Box::leak(format!("{base}_slow").into_boxed_str()),
+            )
+        })
+    }
+
+    pub(super) fn note(site: &'static Location<'static>, elapsed: Duration) {
+        use crate::runtime::drain::census::{note_store_route, note_store_route_n};
+        let (n, us_name, slow) = names(site);
+        let us = elapsed.as_micros() as u64;
+        note_store_route(n);
+        note_store_route_n(us_name, us);
+        if us >= 50 {
+            note_store_route(slow);
+        }
     }
 }
 
