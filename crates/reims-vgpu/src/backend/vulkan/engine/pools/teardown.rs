@@ -45,6 +45,12 @@ impl ResourcePools {
                 self.attachment_snapshot_live
                     .extend(pending.attachment_snapshots);
                 self.storage_image_live.extend(pending.storage_images);
+                // TEMP (lab, PASS_STAGE): the fences above were waited (or
+                // died with a lost device), so the arena windows they read
+                // are nobody's anymore.
+                for read in pending.staged {
+                    read.ring.release(read.window);
+                }
             }
         }
         self.in_flight = 0;
@@ -239,6 +245,9 @@ impl ResourcePools {
             device.destroy_command_pool(self.cmd_pool, None);
             self.cmd_pool = vk::CommandPool::null();
         }
+        // TEMP (lab, PASS_STAGE): the worker arenas, after every fence above,
+        // so no submission can still name a buffer being destroyed.
+        super::super::pass_stage::destroy_all(device);
         self.initialized = false;
     }
 }

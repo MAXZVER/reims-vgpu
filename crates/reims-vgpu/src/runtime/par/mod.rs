@@ -66,6 +66,7 @@
 
 mod pool;
 pub(crate) mod selftest;
+pub(crate) mod staging;
 #[cfg(test)]
 mod tests;
 

@@ -6406,6 +6406,11 @@ impl DeviceState {
     /// Give this state the pool its bound device created. Called once, at
     /// device creation, before any guest work exists.
     pub fn install_par_pool(&mut self, pool: Arc<crate::runtime::par::Pool>) {
+        // TEMP (lab, PASS_STAGE): the pool's population sizes the staging
+        // arenas the engine creates on first need (design §8.4) — one arena
+        // per pool member, the coordinator included. Stated here because the
+        // engine never sees the pool itself, only its members' ids.
+        crate::runtime::par::staging::set_population(pool.workers() + 1);
         self.par = Some(pool);
     }
 

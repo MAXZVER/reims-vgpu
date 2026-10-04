@@ -526,6 +526,14 @@ pub struct DrawRequest {
     /// `surface_cache` does — can seed a draw with a refcount instead of a
     /// whole-framebuffer copy.
     pub target_rgba8: Option<std::sync::Arc<Vec<u8>>>,
+    /// TEMP (lab, PASS_STAGE, design §8.4): a worker's staging of the seed
+    /// above, filled while this request sits in the recorder FIFO (the
+    /// PAY_DEFER shape: the request carries the cell, a later chunk's scope
+    /// job copies the bytes — R/B exchange included — into its arena, and the
+    /// recorder takes whichever side is ready at the seed staging phase).
+    /// `None` on every arm but the four-byte seed; a cell that arrives still
+    /// `Pending` falls back to [`Self::target_rgba8`] unchanged.
+    pub target_seed_stage: Option<std::sync::Arc<super::pass_stage::SeedStageCell>>,
     /// Guest-page form of the same LOAD seed. Mutually exclusive with
     /// [`Self::target_rgba8`], [`Self::load_from_target`] and
     /// [`Self::seed_from_target`]. The engine imports/gathers these bytes in
@@ -1062,10 +1070,20 @@ pub struct StorageBufferResource {
 /// at least as fresh as the CPU path's encode-time read (the same in-flight
 /// window contract the sampled `SampledSource::GuestRuns` rail relies on).
 /// `row_length_texels` MUST be 0 (buffers have no row stride semantics).
+///
+/// `Staged` is TEMP (lab, PASS_STAGE, design §8.4): the bytes a pool worker
+/// already memcpy'd into its arena. The engine binds `(buffer, offset)` and
+/// records nothing else — no acquire, no write, no copy.
 #[derive(Clone, Debug)]
 pub enum BufferContent {
     Bytes(std::sync::Arc<Vec<u8>>),
     GuestRuns(GuestRunSource),
+    /// TEMP (lab, PASS_STAGE): a worker arena window holding the bind's
+    /// bytes. `Clone` shares the window (the command-buffer bind memo keys on
+    /// it); each *submission* that reads it takes its own reference through
+    /// the pools' `note_staged_read`, and the fact's own reference is
+    /// released by the pass frame that planned it.
+    Staged(super::pass_stage::StagedSlice),
 }
 
 impl BufferContent {
@@ -1074,6 +1092,7 @@ impl BufferContent {
         match self {
             Self::Bytes(b) => b.len(),
             Self::GuestRuns(src) => src.total_len as usize,
+            Self::Staged(slice) => slice.window.len as usize,
         }
     }
 
@@ -1108,6 +1127,11 @@ impl BufferContent {
     pub fn cpu_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
         match self {
             Self::Bytes(b) => std::borrow::Cow::Borrowed(b.as_slice()),
+            Self::Staged(slice) => {
+                // SAFETY: the fact is alive for this borrow, which is the
+                // whole contract of reading a staged window's bytes back.
+                unsafe { std::borrow::Cow::Borrowed(slice.bytes()) }
+            }
             Self::GuestRuns(src) => {
                 let mut out = Vec::with_capacity(src.total_len as usize);
                 let mut skip = src.source_offset;
@@ -2277,6 +2301,22 @@ pub enum SampledSource {
     /// identity. If the backend declines one, the copy fallback therefore runs
     /// conservatively instead of reusing content that was never witnessed.
     GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherVouch),
+    /// TEMP (lab, PASS_STAGE, design §8.4): a [`Self::GuestRuns`] bind whose
+    /// window a pool worker pre-gathered into its arena. The engine resolves
+    /// it exactly as the guest-runs bind it stands for — the content cache's
+    /// elision first, the host-pointer import second — and only where the
+    /// serial path would have CPU-gathered (`write_staging_from_runs`) does
+    /// it record the buffer→image copy from the ready window instead.
+    Staged(StagedSampled),
+}
+
+/// The guest-runs source a [`SampledSource::Staged`] bind stands for, plus
+/// the worker's window holding its bytes.
+#[derive(Debug)]
+pub struct StagedSampled {
+    pub src: GuestRunSource,
+    pub vouch: crate::runtime::gather_witness::GatherVouch,
+    pub staged: super::pass_stage::StagedSlice,
 }
 
 /// One packed-contiguous guest-RAM span (a direct RAMBlock alias from

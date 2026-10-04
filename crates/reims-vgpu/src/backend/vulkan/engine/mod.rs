@@ -29,6 +29,7 @@ mod host_ram;
 pub mod init_decline;
 mod linear_target_import;
 mod page_diff;
+mod pass_stage;
 mod pay_band;
 /// TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SHARD`): per-pipeline-key warm pipeline
 /// caches. `pub(crate)` for the census window line only; everything else is
@@ -412,6 +413,9 @@ impl EngineState {
     /// `host_window::present::App::reattach_engine` is what builds it again.
     fn flush_device_derived(&mut self, caches: &mut ObjectCaches) {
         clear_device_capabilities();
+        // TEMP (lab, PASS_STAGE): the arenas name buffers of the device that
+        // is going away; the recreate installs fresh ones on its first draw.
+        pass_stage::reset_lost();
         invalidate_all_resident_holders();
         // Taken and published unconditionally, before anything fallible. The
         // presenter's swapchain, surface and semaphores were made against the
@@ -1707,6 +1711,13 @@ fn execute_draw_request_with(
     req: &DrawRequest,
 ) -> Result<DrawOutput, DrawError> {
     let mut guard = lock_engine();
+    // TEMP (lab, PASS_STAGE): the worker arenas are created on the first draw
+    // of a PASS_STAGE boot, under the engine lock every other Vulkan call
+    // goes through. Until then the planners' `ColdRings` bail keeps the rail
+    // on the serial staging path.
+    if let Some(ctx) = guard.owner.ctx.as_ref() {
+        unsafe { pass_stage::ensure_installed(ctx) };
+    }
     let EngineState {
         ref mut owner,
         ref mut pools,
@@ -1789,6 +1800,11 @@ fn flush_batched_draws_with(caches: &mut ObjectCaches) {
         lock_started.elapsed().as_micros() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
+    // TEMP (lab, PASS_STAGE): the per-tranche census point. Once per drain
+    // tranche is the resolution every other tail counter already has, and the
+    // tail holds the engine lock the snapshot does not need — it reads only
+    // the arenas' own atomics-guarded bookkeeping.
+    pass_stage::note_census();
     // This runs at the end of every drain tranche, including hundreds of short
     // tranches per second under load, so it is where a loss
     // observed by a thread that cannot take the engine lock gets acted on. See

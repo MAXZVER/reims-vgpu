@@ -1081,6 +1081,8 @@ fn content_variant(c: &crate::backend::vulkan::engine::BufferContent) -> &'stati
     match c {
         crate::backend::vulkan::engine::BufferContent::GuestRuns(_) => "runs",
         crate::backend::vulkan::engine::BufferContent::Bytes(_) => "bytes",
+        // TEMP (lab, PASS_STAGE): the staged rail the plan serves.
+        crate::backend::vulkan::engine::BufferContent::Staged(_) => "staged",
     }
 }
 

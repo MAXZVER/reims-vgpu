@@ -1573,6 +1573,14 @@ fn lab_cover_tex(
                 .first()
                 .map(|r| format!("{:?}", r).chars().take(60).collect::<String>())
         ),
+        // TEMP (lab, PASS_STAGE): the staged rail's bytes sit in a worker
+        // arena; the note names the window, never the bytes.
+        crate::backend::vulkan::engine::SampledSource::Staged(staged) => format!(
+            "staged(runs={} len={} window={:?})",
+            staged.src.runs.len(),
+            staged.src.total_len,
+            staged.staged.window
+        ),
     };
     crate::observe::fail(format!(
         "lab_cover_tex pt={pt} task={} pipe={} idx={index} ref={texture_ref} {}x{} fmt={:?} ident={:?} src={src}",
@@ -6003,6 +6011,9 @@ fn lab_note_bind_bytes(
     let (bytes, runs) = match content {
         BufferContent::GuestRuns(src) => (src.total_len, true),
         BufferContent::Bytes(b) => (b.len() as u64, false),
+        // TEMP (lab, PASS_STAGE): the staged window's bytes, counted with the
+        // bytes rail they replace.
+        BufferContent::Staged(slice) => (slice.window.len, false),
     };
     let (n, b) = match (stage, capped, runs) {
         ("vtx", true, true) => ("lab_bb_vtx_capped_runs", "lab_bb_vtx_capped_runs_b"),
@@ -12300,6 +12311,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     crate::backend::vulkan::engine::SampledSource::Bytes(_) => 1,
                     crate::backend::vulkan::engine::SampledSource::Target(_) => 2,
                     crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => 3,
+                    // TEMP (lab, PASS_STAGE): the staged rail beside the
+                    // guest-runs one it stands for.
+                    crate::backend::vulkan::engine::SampledSource::Staged(..) => 4,
                 },
                 format: image.format.as_raw() as u32,
                 width: image.width,
