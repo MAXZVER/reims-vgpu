@@ -376,7 +376,7 @@ fn plan_from_backing<M: HostMemory + HostOps>(
         Some(
             crate::runtime::bound_buffers::PackedBufferResolution::Unavailable { gva: bg, size: bs },
         ) => {
-            if bg != gva || bs != size {
+            if *bg != gva || *bs != size {
                 return Err(BufferBail::ColdPacked);
             }
         }

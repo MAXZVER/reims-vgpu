@@ -163,7 +163,7 @@ pub(crate) struct DrawTables<'a> {
 impl DrawTables<'_> {
     /// The draw's buffer binds, vertex stage first (the order the drain's
     /// bind loop reads them in).
-    fn buffers(&self) -> impl Iterator<Item = &BufferBind> {
+    fn buffers(&self) -> impl Iterator<Item = &BufferBind> + '_ {
         self.vertex_buffers.iter().chain(self.fragment_buffers.iter())
     }
 }
