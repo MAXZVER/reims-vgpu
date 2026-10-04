@@ -5670,7 +5670,7 @@ fn finish_stream<M: HostMemory + HostOps>(
         // wake and the plans are on the frame by the time draw 0 encodes.
         #[cfg(feature = "backend-vulkan")]
         if let Some(p) = pass_prep.as_mut() {
-            p.ahead(&*state, 0);
+            p.ahead(&*state, &*host, 0);
         }
         // TEMP (lab, PASS_PREP): the first record's request materialization and
         // the template it becomes get the MRT bar of the prelude split — the
@@ -5712,7 +5712,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             // offered) while the recorder encodes the previous chunk.
             #[cfg(feature = "backend-vulkan")]
             if let Some(p) = pass_prep.as_mut() {
-                p.ahead(&*state, di);
+                p.ahead(&*state, &*host, di);
             }
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             resident_chain_before_last_record = resident_chain_before_this_record;

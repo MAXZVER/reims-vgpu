@@ -21,7 +21,10 @@
 extern "C" {
 #endif
 
-/* v25: ReimsVgpuHostOps.note_ring_tail and reims_vgpu_qemu_child_tail_gpa — a
+/* v26: ReimsVgpuHostOps.guest_write_sync_many — TEMP lab PREP_SYNC: bring the named tracked
+ *      sets up to date in one merged dirty-log query, so the reads that follow (a pass's planned
+ *      binds) find them synced. NULL: each read syncs its own set, as before.
+ * v25: ReimsVgpuHostOps.note_ring_tail and reims_vgpu_qemu_child_tail_gpa — a
  *      child ring's tail is read from guest memory, so the drain can run packets
  *      whose doorbell has not been noted, or that were appended behind the tail
  *      a doorbell covered. The shim reads the tail Rust names before a child
@@ -122,7 +125,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 25u
+#define REIMS_VGPU_QEMU_ABI_VERSION 26u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -460,6 +463,12 @@ typedef struct ReimsVgpuHostOps {
      * reads owe what the doorbells alone bind, as before.
      */
     void (*note_ring_tail)(void *ctx, uint32_t channel, uint32_t tail);
+    /*
+     * TEMP lab PREP_SYNC: bring the tracked sets of `count` tokens up to date for the reads that
+     * follow, in one merged hypervisor query. Unknown, unarmed, protected or already synced tokens
+     * are skipped. Safe from any thread. NULL: no merged sync.
+     */
+    void (*guest_write_sync_many)(void *ctx, const uint64_t *tokens, size_t count);
 } ReimsVgpuHostOps;
 
 /*

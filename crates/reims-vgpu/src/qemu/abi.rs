@@ -105,7 +105,7 @@ use std::slice;
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
 /// v20 gives `map_pages` a structured per-call failure output.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 25;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 26;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -1072,10 +1072,10 @@ mod tests {
         assert_eq!(
             &fields[fields.len() - 4..],
             [
-                "void (*note_work_scope)(void *ctx, uint32_t scope)",
                 "void (*thread_attach)(void *ctx)",
                 "void (*thread_detach)(void *ctx)",
                 "void (*note_ring_tail)(void *ctx, uint32_t channel, uint32_t tail)",
+                "void (*guest_write_sync_many)(void *ctx, const uint64_t *tokens, size_t count)",
             ],
             "the header's HostOps tail must match the Rust struct's"
         );
@@ -1094,9 +1094,13 @@ mod tests {
             std::mem::offset_of!(ReimsVgpuHostOps, thread_detach) + word
         );
         assert_eq!(
+            std::mem::offset_of!(ReimsVgpuHostOps, guest_write_sync_many),
+            std::mem::offset_of!(ReimsVgpuHostOps, note_ring_tail) + word
+        );
+        assert_eq!(
             std::mem::size_of::<ReimsVgpuHostOps>(),
-            std::mem::offset_of!(ReimsVgpuHostOps, note_ring_tail) + word,
-            "nothing may follow the ring tail on either side"
+            std::mem::offset_of!(ReimsVgpuHostOps, guest_write_sync_many) + word,
+            "nothing may follow the merged sync (v26) on either side"
         );
     }
 

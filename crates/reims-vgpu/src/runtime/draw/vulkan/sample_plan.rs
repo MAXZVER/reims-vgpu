@@ -477,6 +477,37 @@ impl SamplePlan {
 /// Returns the plan for a bind the top of the surface ladder serves — a direct
 /// or ready resident, or the host cache — and a [`SampleBail`] for every other
 /// bind, which the serial ladder then serves on the drain thread.
+/// TEMP (lab, `REIMS_VGPU_LAB_PREP_SYNC`): the guest-write token of the mapping
+/// a planned bind of `resource` would ask about — [`plan_sampled_source`]'s own
+/// classification, read only — when that token watches the mapping's current
+/// page list. `None` for anything the plan would not reach the surface rungs
+/// with.
+pub(super) fn plan_guest_write_token(
+    state: &DeviceState,
+    texture_ref: u32,
+    resource: &crate::model::TaskResource,
+) -> Option<u64> {
+    let entry = resource.entry;
+    let mid = if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
+        reims_vgpu_wire::device_desc::ref_texture_header(&resource.descriptor)
+            .ok()
+            .map(|t5| t5.surface_id.get())
+            .filter(|sid| *sid != 0)?
+    } else if entry.object_type == objects::OBJECT_TYPE_BACKING {
+        texture_ref
+    } else if entry.object_type == crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE
+    {
+        resource.registered_mapper_ref_texture_mapping()?
+    } else {
+        return None;
+    };
+    state
+        .mappings
+        .get(&mid)
+        .filter(|m| m.guest_write_token != 0 && m.guest_write_token_gen == m.map_generation)
+        .map(|m| m.guest_write_token)
+}
+
 pub(crate) fn plan_sampled_source<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,

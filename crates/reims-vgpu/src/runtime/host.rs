@@ -668,6 +668,12 @@ pub trait HostOps {
         self.guest_write_gen(token)
     }
 
+    /// TEMP (lab, `REIMS_VGPU_LAB_PREP_SYNC`): bring the tracked sets of
+    /// `tokens` up to date in one merged query, so the
+    /// [`Self::guest_write_gen`] reads that follow find them synced. A hint: a
+    /// host without it does nothing and each read syncs its own set.
+    fn guest_write_sync_many(&self, _tokens: &[u64]) {}
+
     /// TEMP (lab, `REIMS_VGPU_LAB_ASYNC_BASELINE`): start the
     /// [`Self::guest_write_gen`] read of `token` on another thread and return
     /// its answer to come. `None` when this host has no such thread — read

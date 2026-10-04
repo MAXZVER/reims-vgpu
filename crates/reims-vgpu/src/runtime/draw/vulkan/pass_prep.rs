@@ -35,6 +35,15 @@ use super::prefetch::{self, PrefetchGuard, StreamPlan};
 use super::*;
 use std::collections::HashSet;
 
+/// TEMP (lab): `REIMS_VGPU_LAB_PREP_SYNC=on` — see [`PassPrep::ahead`]. Latched.
+fn lab_prep_sync() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("REIMS_VGPU_LAB_PREP_SYNC").as_deref(), Ok("on")))
+}
+
 /// Which way the pass preparation runs. `REIMS_VGPU_LAB_PASS_PREP`, read once;
 /// supersedes `REIMS_VGPU_LAB_PAR_PREFETCH` while not `off`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,7 +208,12 @@ impl<'a> PassPrep<'a> {
     /// The scope is fork-join, so this call is the drain's share of the
     /// planning and its wait for the helpers' — during which the recorder runs
     /// the draws the loop already submitted, which is the whole point.
-    pub(crate) fn ahead(&mut self, state: &DeviceState, di: usize) {
+    pub(crate) fn ahead<H: crate::runtime::host::HostOps>(
+        &mut self,
+        state: &DeviceState,
+        host: &H,
+        di: usize,
+    ) {
         if di < self.offered {
             return;
         }
@@ -237,6 +251,24 @@ impl<'a> PassPrep<'a> {
         let Some(pool) = state.par() else {
             return;
         };
+        // TEMP (lab, `REIMS_VGPU_LAB_PREP_SYNC=on`): one merged sync of the sets
+        // the items are about to ask about, instead of each item syncing its own
+        // on its own thread and settling behind the others' queries (n156: 20 % of
+        // the drain inside those items; n159: one merged list costs a third of the
+        // hypervisor time of per-set queries).
+        if lab_prep_sync() {
+            let tokens: Vec<u64> = items
+                .iter()
+                .filter_map(|item| {
+                    sample_plan::plan_guest_write_token(state, item.texture_ref, &item.resource)
+                })
+                .collect();
+            if !tokens.is_empty() {
+                let _span = crate::runtime::chain_phase::CostSpan::new("lab_prep_sync_us");
+                crate::runtime::drain::note_store_route_n("lab_prep_sync_tokens", tokens.len() as u64);
+                host.guest_write_sync_many(&tokens);
+            }
+        }
         crate::runtime::drain::note_store_route("pass_prep_chunk");
         crate::runtime::drain::note_store_route_n("pass_prep_items", items.len() as u64);
         // The overlap this driver exists to prove: draws still recording while
@@ -466,7 +498,7 @@ mod tests {
         let before_small = store_route_count("pass_prep_chunk_small");
         let mut prep = PassPrep::open_with_chunk(&state, 1, tables, 4).expect("the pass opens");
         for di in 0..20 {
-            prep.ahead(&state, di);
+            prep.ahead(&state, &crate::runtime::host::FakeHost::new(), di);
         }
         drop(prep);
         assert_eq!(
@@ -532,7 +564,7 @@ mod tests {
         let mut prep =
             PassPrep::open_with_chunk(&planned_state, 1, planned_tables, 4).expect("opens");
         for di in 0..pattern.len() {
-            prep.ahead(&planned_state, di);
+            prep.ahead(&planned_state, &crate::runtime::host::FakeHost::new(), di);
             let texture_ref = refs[pattern[di] as usize];
             let resource =
                 objects::resolve_resource(&planned_state, &planned_host, 1, texture_ref)
@@ -692,7 +724,7 @@ mod tests {
         let binds = binds_for(&state, &host, &pattern, &refs);
         let tables = tables_of(&binds);
         let mut prep = PassPrep::open_with_chunk(&state, 1, tables, 4).expect("opens");
-        prep.ahead(&state, 0);
+        prep.ahead(&state, &crate::runtime::host::FakeHost::new(), 0);
         // The guest rewires surface 71 between the chunk and the bind.
         state.mappings.get_mut(&71u32).unwrap().map_generation += 1;
         let texture_ref = refs[0];
@@ -769,7 +801,7 @@ mod tests {
         let mut prep = PassPrep::open_with_chunk(&state, 1, tables, 2).expect("opens");
         // Chunk 0 = draws 0..2: both refs are new, so the chunk forks and the
         // view ref plans.
-        prep.ahead(&state, 0);
+        prep.ahead(&state, &crate::runtime::host::FakeHost::new(), 0);
         assert_eq!(delta("par_prefetch_planned_ref_view", before_planned), 1);
         // Draw 0 commits the view plan: the frame entry becomes the repeat.
         let served = prefetch::prefetched_source(
@@ -787,7 +819,7 @@ mod tests {
         assert_eq!(delta("par_prefetch_hit_ref_view", before_hit), 1);
         // Chunk 1 = draws 2..4: binds the cache ref only (nothing new); the
         // view ref's repeat stays in the frame untouched.
-        prep.ahead(&state, 2);
+        prep.ahead(&state, &crate::runtime::host::FakeHost::new(), 2);
         assert_eq!(
             delta("par_prefetch_planned_ref_view", before_planned),
             1,
@@ -795,7 +827,7 @@ mod tests {
         );
         // Chunk 2 = draws 4..6: binds the view ref again — the repeat the
         // first commit left serves it from the post state, with no replan.
-        prep.ahead(&state, 4);
+        prep.ahead(&state, &crate::runtime::host::FakeHost::new(), 4);
         assert_eq!(
             delta("par_prefetch_planned_ref_view", before_planned),
             1,

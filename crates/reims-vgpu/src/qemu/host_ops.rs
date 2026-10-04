@@ -160,6 +160,10 @@ pub struct ReimsVgpuHostOps {
     pub thread_detach: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
     /// The drain read child channel `channel`'s ring tail; see the ABI header.
     pub note_ring_tail: Option<unsafe extern "C" fn(ctx: *mut c_void, channel: u32, tail: u32)>,
+    /// TEMP lab PREP_SYNC: bring the named tracked sets up to date in one merged
+    /// query; see the ABI header.
+    pub guest_write_sync_many:
+        Option<unsafe extern "C" fn(ctx: *mut c_void, tokens: *const u64, count: usize)>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -278,6 +282,7 @@ impl ReimsVgpuHostOps {
             thread_attach: None,
             thread_detach: None,
             note_ring_tail: None,
+            guest_write_sync_many: None,
         }
     }
 }
@@ -1050,6 +1055,17 @@ impl HostOps for QemuHost<'_> {
         crate::runtime::write_baseline::issue(token)
     }
 
+    fn guest_write_sync_many(&self, tokens: &[u64]) {
+        if tokens.is_empty() {
+            return;
+        }
+        if let Some(f) = self.ops.guest_write_sync_many {
+            // SAFETY: QEMU owns ctx; the slice outlives the call, which copies
+            // nothing it keeps.
+            unsafe { f(self.ops.ctx, tokens.as_ptr(), tokens.len()) }
+        }
+    }
+
     fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
         self.ops.written_pages(token, since_gen)
     }
@@ -1075,10 +1091,14 @@ mod lab_gen_prof {
     }
 
     fn names(site: &'static Location<'static>) -> Names {
+        names_with(site, "")
+    }
+
+    fn names_with(site: &'static Location<'static>, tag: &'static str) -> Names {
         static SITES: OnceLock<Mutex<HashMap<(&'static str, u32), Names>>> = OnceLock::new();
         let map = SITES.get_or_init(|| Mutex::new(HashMap::new()));
         let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
-        *map.entry((site.file(), site.line())).or_insert_with(|| {
+        *map.entry((site.file(), site.line() | if tag.is_empty() { 0 } else { 1 << 31 })).or_insert_with(|| {
             let parts: Vec<&str> = site
                 .file()
                 .split(['/', '\\'])
@@ -1094,7 +1114,7 @@ mod lab_gen_prof {
                 .chars()
                 .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
                 .collect();
-            let base = format!("lab_gw_{file}_{}", site.line());
+            let base = format!("lab_gw{tag}_{file}_{}", site.line());
             (
                 Box::leak(format!("{base}_n").into_boxed_str()),
                 Box::leak(format!("{base}_us").into_boxed_str()),
@@ -1103,9 +1123,17 @@ mod lab_gen_prof {
         })
     }
 
+    /// [`note`] for a parallel-pool worker's read (`lab_gww_...`).
+    pub(super) fn note_worker(site: &'static Location<'static>, elapsed: Duration) {
+        record(names_with(site, "w"), elapsed);
+    }
+
     pub(super) fn note(site: &'static Location<'static>, elapsed: Duration) {
+        record(names(site), elapsed);
+    }
+
+    fn record((n, us_name, slow): Names, elapsed: Duration) {
         use crate::runtime::drain::census::{note_store_route, note_store_route_n};
-        let (n, us_name, slow) = names(site);
         let us = elapsed.as_micros() as u64;
         note_store_route(n);
         note_store_route_n(us_name, us);
@@ -1209,8 +1237,16 @@ impl HostOps for WorkerHost<'_> {
         self.ops.is_ram(gpa)
     }
 
+    #[track_caller]
     fn guest_write_gen(&self, token: u64) -> Option<u64> {
-        self.ops.write_gen(token)
+        if !lab_gen_prof::on() {
+            return self.ops.write_gen(token);
+        }
+        let site = std::panic::Location::caller();
+        let t0 = std::time::Instant::now();
+        let answer = self.ops.write_gen(token);
+        lab_gen_prof::note_worker(site, t0.elapsed());
+        answer
     }
 
     fn guest_write_gen_lagged(&self, token: u64) -> Option<u64> {
