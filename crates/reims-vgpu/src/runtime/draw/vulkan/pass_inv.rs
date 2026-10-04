@@ -72,10 +72,13 @@ pub(crate) fn pass_inv_mode() -> bool {
             _ => {}
         }
     }
+    // On by default (n205, on the PASS_PREP-on base): fullscreen transitions
+    // 19/10 % frames >25/>50 ms with the invariants against 26/12 % without,
+    // stripes 0; `=off` restores the per-record recomputation.
     *MODE.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("REIMS_VGPU_LAB_PASS_INVARIANTS").as_deref(),
-            Ok("on")
+            Ok("off")
         )
     })
 }
