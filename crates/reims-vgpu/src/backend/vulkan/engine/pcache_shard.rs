@@ -115,7 +115,10 @@ const SHARD_TOTAL_WARM_BYTES: usize = 32 * 1024 * 1024;
 /// flat, no size pathology across boots).
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PCACHE_SHARD").is_ok_and(|v| v != "off"))
+    *ON.get_or_init(|| match std::env::var("REIMS_VGPU_LAB_PCACHE_SHARD") {
+        Ok(v) => v != "off",
+        Err(_) => true,   // unset: on (the default since n200)
+    })
 }
 
 /// TEMP (lab): total shard-directory bound — [`SHARD_TOTAL_WARM_BYTES`], or
