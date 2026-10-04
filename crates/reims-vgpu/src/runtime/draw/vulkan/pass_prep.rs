@@ -30,7 +30,18 @@
 //! [`prefetch::prefetched_source`]; the next `ahead` takes that list and drops
 //! those refs from `planned`, so a later chunk that binds the ref plans it
 //! again from the witness's current state.
+//!
+//! # Step 3 — the buffer arms (design §8.3)
+//!
+//! The same chunks plan the draws' buffer binds and index binds beside the
+//! sampled sources, and carry the pass's Store page walk
+//! ([`PassPrep::note_store_target`] latches the colour-0 the drain's template
+//! resolved; the next chunk's scope walks it). Those plans live in the same
+//! frame and serve through [`super::buffer_plan`]'s asks at the points the
+//! serial buffer ladder resolves — see that module for what is planned, what
+//! bails, and the facts its commits land.
 
+use super::buffer_plan;
 use super::prefetch::{self, PrefetchGuard, StreamPlan};
 use super::*;
 use std::collections::HashSet;
@@ -134,15 +145,60 @@ fn parse_chunk(raw: Option<&str>) -> usize {
 }
 
 /// One draw's sampled tables, borrowed from the stream's `PendingDraw` list.
+///
+/// TEMP (lab, PASS_PREP step 3): the same tables carry the draw's buffer
+/// binds and index bind, so one chunk plans the binds of both families.
 pub(crate) struct DrawTables<'a> {
     pub fragment: &'a [TextureBind],
     pub vertex: &'a [TextureBind],
+    /// TEMP (lab, PASS_PREP step 3): the draw's retained buffer tables.
+    pub vertex_buffers: &'a [BufferBind],
+    pub fragment_buffers: &'a [BufferBind],
+    /// TEMP (lab, PASS_PREP step 3): the draw's index bind, when it drew
+    /// indexed — the one buffer bind whose extent is a function of the
+    /// record, and so the one the planner can key exactly.
+    pub indexed: Option<&'a IndexedDrawInfo>,
+}
+
+impl DrawTables<'_> {
+    /// The draw's buffer binds, vertex stage first (the order the drain's
+    /// bind loop reads them in).
+    fn buffers(&self) -> impl Iterator<Item = &BufferBind> {
+        self.vertex_buffers.iter().chain(self.fragment_buffers.iter())
+    }
 }
 
 /// One planned bind candidate: the ref and the resource the walk retained.
-struct PrepItem {
-    texture_ref: u32,
-    resource: std::sync::Arc<crate::model::TaskResource>,
+enum PrepItem {
+    /// A sampled-source bind (`plan_item`'s own ladder).
+    Sample {
+        texture_ref: u32,
+        resource: std::sync::Arc<crate::model::TaskResource>,
+    },
+    /// TEMP (lab, PASS_PREP step 3): a buffer bind's warm rails.
+    Buffer {
+        buffer_ref: u32,
+        resource: std::sync::Arc<crate::model::TaskResource>,
+    },
+    /// TEMP (lab, PASS_PREP step 3): an indexed draw's index bind, planned
+    /// under its exact `(ref, offset, need)` key.
+    Index {
+        key: buffer_plan::BufferExactKey,
+        info: IndexedDrawInfo,
+    },
+    /// TEMP (lab, PASS_PREP step 3): the pass's Store page walk, for the key
+    /// the drain latched from the pass's colour-0.
+    StorePages {
+        key: buffer_plan::StoreTargetKey,
+    },
+}
+
+/// What one planned item produced.
+enum PrepOutcome {
+    Sample(Result<StreamPlan, SampleBail>),
+    Buffer(Result<buffer_plan::BufferContentPlan, buffer_plan::BufferBail>),
+    /// The Store walk resolves pages or not; `None` is no plan, not a bail.
+    Store(Option<buffer_plan::StorePagesPlan>),
 }
 
 /// Draw-ahead preparation of one render pass. Lives for the draw loop; the
@@ -156,6 +212,17 @@ pub(crate) struct PassPrep<'a> {
     /// Refs this pass holds a plan or a bail for; a consumed ref-view plan
     /// leaves it, so the next chunk replans the ref.
     planned: HashSet<u32>,
+    /// TEMP (lab, PASS_PREP step 3): buffer references this pass holds a rail
+    /// plan or a bail for.
+    planned_buffers: HashSet<u32>,
+    /// TEMP (lab, PASS_PREP step 3): index binds this pass holds an exact
+    /// plan or a bail for, under the bind's own key.
+    planned_indexes: HashSet<buffer_plan::BufferExactKey>,
+    /// TEMP (lab, PASS_PREP step 3): the pass's colour-0 as the drain latched
+    /// it once the attachment template existed, and whether a scope has taken
+    /// the Store walk yet.
+    store_target: Option<buffer_plan::StoreTargetKey>,
+    store_pages_planned: bool,
     _frame: PrefetchGuard,
 }
 
@@ -197,8 +264,22 @@ impl<'a> PassPrep<'a> {
             chunk,
             offered: 0,
             planned: HashSet::new(),
+            planned_buffers: HashSet::new(),
+            planned_indexes: HashSet::new(),
+            store_target: None,
+            store_pages_planned: false,
             _frame: prefetch::push_empty_frame(),
         })
+    }
+
+    /// TEMP (lab, PASS_PREP step 3): latch the pass's colour-0 for the Store
+    /// page walk. The drain calls this once, after the attachment template
+    /// exists (the template is built from the first record's request, after
+    /// `ahead(0)` has already run); the next chunk's scope plans the walk.
+    /// A pass small enough to live in one chunk never plans it — the walk is
+    /// once per pass, and the drain does it in the time the store takes.
+    pub(crate) fn note_store_target(&mut self, c0: &ColorRtRequest) {
+        self.store_target = buffer_plan::latch_store_target(c0);
     }
 
     /// At the top of record `di`: when `di >= offered`, plan the new refs of
@@ -224,7 +305,11 @@ impl<'a> PassPrep<'a> {
         }
         let end = (self.offered + self.chunk).min(self.tables.len());
         let mut seen = HashSet::new();
-        let mut items = Vec::new();
+        let mut items: Vec<PrepItem> = Vec::new();
+        // TEMP (lab, PASS_PREP step 3): the same chunk plans the draws'
+        // buffer rails and index binds beside the sampled sources.
+        let mut seen_buffers = HashSet::new();
+        let mut seen_indexes = HashSet::new();
         for table in &self.tables[self.offered..end] {
             for bind in table.fragment.iter().chain(table.vertex.iter()) {
                 if bind.texture_ref == 0 || self.planned.contains(&bind.texture_ref) {
@@ -234,12 +319,46 @@ impl<'a> PassPrep<'a> {
                     continue;
                 };
                 if seen.insert(bind.texture_ref) {
-                    items.push(PrepItem {
+                    items.push(PrepItem::Sample {
                         texture_ref: bind.texture_ref,
                         resource,
                     });
                 }
             }
+            for bind in table.buffers() {
+                if bind.buffer_ref == 0 || self.planned_buffers.contains(&bind.buffer_ref) {
+                    continue;
+                }
+                let Some(resource) = bind.resource.clone() else {
+                    continue;
+                };
+                if seen_buffers.insert(bind.buffer_ref) {
+                    items.push(PrepItem::Buffer {
+                        buffer_ref: bind.buffer_ref,
+                        resource,
+                    });
+                }
+            }
+            if let Some(info) = table.indexed {
+                let Some(key) = buffer_plan::index_key(self.task_id, info) else {
+                    continue;
+                };
+                if !self.planned_indexes.contains(&key) && seen_indexes.insert(key) {
+                    items.push(PrepItem::Index {
+                        key,
+                        info: info.clone(),
+                    });
+                }
+            }
+        }
+        // The Store walk, once per pass, once the drain has latched the
+        // colour-0 key and a later chunk than the first exists to carry it.
+        // It counts toward the fork gate like any other item: a scope of one
+        // would run on the drain and be the serial walk with extra steps.
+        let mut store_taken = false;
+        if let (Some(key), false) = (self.store_target, self.store_pages_planned) {
+            store_taken = true;
+            items.push(PrepItem::StorePages { key });
         }
         self.offered = end;
         if items.len() < 2 {
@@ -247,6 +366,9 @@ impl<'a> PassPrep<'a> {
             // pool, and planning it here would only double its resolve.
             crate::runtime::drain::note_store_route("pass_prep_chunk_small");
             return;
+        }
+        if store_taken {
+            self.store_pages_planned = true;
         }
         let Some(pool) = state.par() else {
             return;
@@ -259,8 +381,12 @@ impl<'a> PassPrep<'a> {
         if lab_prep_sync() {
             let tokens: Vec<u64> = items
                 .iter()
-                .filter_map(|item| {
-                    sample_plan::plan_guest_write_token(state, item.texture_ref, &item.resource)
+                .filter_map(|item| match item {
+                    PrepItem::Sample {
+                        texture_ref,
+                        resource,
+                    } => sample_plan::plan_guest_write_token(state, *texture_ref, resource),
+                    _ => None,
                 })
                 .collect();
             if !tokens.is_empty() {
@@ -283,14 +409,36 @@ impl<'a> PassPrep<'a> {
         let memo_budget =
             std::sync::atomic::AtomicU64::new(sample_plan::memo_fill_chunk_limit());
         let scoped = pool.scope(state, &items, |st, env, item| {
-            prefetch::plan_item(
-                st,
-                env,
-                task_id,
-                item.texture_ref,
-                item.resource.clone(),
-                &memo_budget,
-            )
+            let mut host = env.host();
+            match item {
+                PrepItem::Sample {
+                    texture_ref,
+                    resource,
+                } => PrepOutcome::Sample(prefetch::plan_item(
+                    st,
+                    env,
+                    task_id,
+                    *texture_ref,
+                    resource.clone(),
+                    &memo_budget,
+                )),
+                PrepItem::Buffer {
+                    buffer_ref,
+                    resource,
+                } => PrepOutcome::Buffer(buffer_plan::plan_buffer_rails(
+                    st,
+                    &mut host,
+                    task_id,
+                    *buffer_ref,
+                    resource.clone(),
+                )),
+                PrepItem::Index { info, .. } => {
+                    PrepOutcome::Buffer(buffer_plan::plan_index_content(st, &mut host, task_id, info))
+                }
+                PrepItem::StorePages { key } => {
+                    PrepOutcome::Store(buffer_plan::plan_store_pages(st, &host, task_id, *key))
+                }
+            }
         });
         crate::runtime::drain::note_store_route_n("pass_prep_fork_us", scoped.fork_us);
         crate::runtime::drain::note_store_route_n("pass_prep_wait_us", scoped.wait_us);
@@ -303,30 +451,72 @@ impl<'a> PassPrep<'a> {
                 - memo_budget.load(std::sync::atomic::Ordering::Relaxed),
         );
         let mut plans = Vec::with_capacity(items.len());
+        // TEMP (lab, PASS_PREP step 3): the chunk's buffer plans, merged into
+        // the frame beside the sampled ones.
+        let mut buffer_rails = Vec::new();
+        let mut buffer_exacts = Vec::new();
+        let mut store_plan = None;
         for (item, result) in items.iter().zip(scoped.results) {
             // A bail is as final as a plan for this pass: the ladder below it
             // would refuse the same way on the next chunk, so it is not asked
             // again. A consumed ref-view plan leaves `planned` through the
             // consumed list, not here.
-            self.planned.insert(item.texture_ref);
-            match result {
-                Ok(Ok(plan)) => {
-                    crate::runtime::drain::note_store_route(match plan {
-                        StreamPlan::Surface(_) => "par_prefetch_planned",
-                        StreamPlan::RefView(_) => "par_prefetch_planned_ref_view",
-                        StreamPlan::Linear(_) => "par_prefetch_planned_linear",
-                        StreamPlan::MapperRef(_) => "par_prefetch_planned_mapper_ref",
-                        StreamPlan::Memo(_) => "par_prefetch_planned_memo",
-                    });
-                    plans.push(((task_id, item.texture_ref), plan));
+            match item {
+                PrepItem::Sample { texture_ref, .. } => {
+                    self.planned.insert(*texture_ref);
+                    match result {
+                        Ok(PrepOutcome::Sample(Ok(plan))) => {
+                            crate::runtime::drain::note_store_route(match plan {
+                                StreamPlan::Surface(_) => "par_prefetch_planned",
+                                StreamPlan::RefView(_) => "par_prefetch_planned_ref_view",
+                                StreamPlan::Linear(_) => "par_prefetch_planned_linear",
+                                StreamPlan::MapperRef(_) => "par_prefetch_planned_mapper_ref",
+                                StreamPlan::Memo(_) => "par_prefetch_planned_memo",
+                            });
+                            plans.push(((task_id, *texture_ref), plan));
+                        }
+                        Ok(PrepOutcome::Sample(Err(bail))) => {
+                            crate::runtime::drain::note_store_route(prefetch::bail_route(bail))
+                        }
+                        _ => crate::runtime::drain::note_store_route("par_prefetch_panic"),
+                    }
                 }
-                Ok(Err(bail)) => {
-                    crate::runtime::drain::note_store_route(prefetch::bail_route(bail))
+                PrepItem::Buffer { buffer_ref, .. } => {
+                    self.planned_buffers.insert(*buffer_ref);
+                    match result {
+                        Ok(PrepOutcome::Buffer(Ok(plan))) => {
+                            crate::runtime::drain::note_store_route(buffer_plan::planned_route(&plan));
+                            buffer_rails.push(((task_id, *buffer_ref), plan));
+                        }
+                        Ok(PrepOutcome::Buffer(Err(bail))) => {
+                            crate::runtime::drain::note_store_route(buffer_plan::bail_route(bail))
+                        }
+                        _ => crate::runtime::drain::note_store_route("pass_prep_buf_panic"),
+                    }
                 }
-                Err(_) => crate::runtime::drain::note_store_route("par_prefetch_panic"),
+                PrepItem::Index { key, .. } => {
+                    self.planned_indexes.insert(*key);
+                    match result {
+                        Ok(PrepOutcome::Buffer(Ok(plan))) => {
+                            crate::runtime::drain::note_store_route(buffer_plan::planned_route(&plan));
+                            buffer_exacts.push((*key, plan));
+                        }
+                        Ok(PrepOutcome::Buffer(Err(bail))) => {
+                            crate::runtime::drain::note_store_route(buffer_plan::bail_route(bail))
+                        }
+                        _ => crate::runtime::drain::note_store_route("pass_prep_buf_panic"),
+                    }
+                }
+                PrepItem::StorePages { .. } => {
+                    if let Ok(PrepOutcome::Store(Some(plan))) = result {
+                        crate::runtime::drain::note_store_route("pass_prep_buf_planned_store");
+                        store_plan = Some(plan);
+                    }
+                }
             }
         }
         prefetch::merge_into_frame(plans);
+        buffer_plan::merge_buffer_plans(buffer_rails, buffer_exacts, store_plan);
     }
 }
 
@@ -349,12 +539,21 @@ mod tests {
     /// page aliasing, as the x86 QEMU shim's does, so the zero-copy rungs the
     /// jobs plan through the worker host are the ones production sees.
     fn pooled_state() -> DeviceState {
+        pooled_state_over_table(|table| {
+            table.map_pages_stable = 1;
+        })
+    }
+
+    /// [`pooled_state`] around a table the caller completes — the buffer
+    /// fixtures add a `read_gpa` over a leaked host, so a pool job's
+    /// `WorkerHost` reads the same guest memory the drain's host serves.
+    fn pooled_state_over_table(fill: impl FnOnce(&mut crate::qemu::host_ops::ReimsVgpuHostOps)) -> DeviceState {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut table = crate::qemu::host_ops::ReimsVgpuHostOps::null();
         unsafe extern "C" fn nothing(_ctx: *mut std::os::raw::c_void) {}
         table.thread_attach = Some(nothing);
         table.thread_detach = Some(nothing);
-        table.map_pages_stable = 1;
+        fill(&mut table);
         let pool = Arc::new(
             crate::runtime::par::Pool::new(
                 &table,
@@ -368,6 +567,310 @@ mod tests {
         );
         state.install_par_pool(pool);
         state
+    }
+
+    /// `read_gpa` over a leaked host, for the tables the buffer-fixture pool
+    /// reads through. The shim reads exactly what `HostMemory for FakeHost`
+    /// reads; the drain owns the host and the pool only borrows it, as in the
+    /// product where QEMU owns `ctx`.
+    unsafe extern "C" fn shim_read_gpa(
+        ctx: *mut std::os::raw::c_void,
+        gpa: u64,
+        buf: *mut u8,
+        len: usize,
+    ) -> i32 {
+        // SAFETY: `ctx` is the leaked FakeHost the table was built with, alive
+        // for the test's life; `buf` is the shim's own contract (valid for
+        // `len` for the duration of the call).
+        let host = unsafe { &*(ctx as *const FakeHost) };
+        match host.read_gpa(gpa, unsafe { std::slice::from_raw_parts_mut(buf, len) }) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    }
+
+    /// TEMP (lab, PASS_PREP step 3): a pooled device whose worker host reads
+    /// one leaked `FakeHost` — the drain's own host, borrowed — beside buffer
+    /// objects at `(ref, size)` over allocations starting at task GVA 0x4000.
+    /// The guest RAM behind the task's pages is one contiguous range, so a
+    /// window's `map_pages` answer is the same whichever arm walks it.
+    fn pooled_buffer_state(
+        host: &'static mut FakeHost,
+        specs: &[(u32, u64)],
+    ) -> DeviceState {
+        use crate::protocol::endian::st32;
+        use crate::runtime::decode::resource::{
+            list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER,
+        };
+        use crate::runtime::gva_mem;
+
+        let state = pooled_state_over_table(|table| {
+            table.map_pages_stable = 1;
+            table.read_gpa = Some(shim_read_gpa);
+            table.ctx = host as *mut FakeHost as *mut std::os::raw::c_void;
+        });
+        let mut state = state;
+        state.define_task(1, 0x1000, 2);
+        assert!(state.set_object_list(1, 0, 64));
+        for (n, &(buffer_ref, size)) in specs.iter().enumerate() {
+            let handle = 4u32 + n as u32;
+            let mut bdesc = [0u8; 16];
+            bdesc[0..8].copy_from_slice(&size.to_le_bytes());
+            st32(&mut bdesc[8..], handle);
+            let desc_gva = 0x200u64 + 0x40 * n as u64;
+            assert!(
+                gva_mem::write_task_gva(host, &state.tasks[1], desc_gva, &bdesc, PAGE_SHIFT_X86)
+                    .is_ok()
+            );
+            let list_off = list_object_entry_offset(buffer_ref, 64).unwrap();
+            let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+            let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
+            st32(&mut list_entry, packed);
+            list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+            assert!(
+                gva_mem::write_task_gva(host, &state.tasks[1], list_off, &list_entry, PAGE_SHIFT_X86)
+                    .is_ok()
+            );
+        }
+        state
+    }
+
+    /// The task, page table and guest RAM the buffer fixtures stand on: task 1
+    /// with its directory at pfn 2, root at pfn 3, and task GVA pages 0..36
+    /// mapped one-to-one onto GPA pages 16..52 of one contiguous range.
+    fn buffer_host() -> FakeHost {
+        use crate::protocol::endian::st32;
+        use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+        let mut host = FakeHost::new();
+        host.stable_map_pages = true;
+        let (dir_pfn, root_pfn) = (2u32, 3u32);
+        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_X86;
+        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        let mut dir = [0u8; 8];
+        st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+        st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
+        assert!(host.write_gpa(dir_gpa, &dir).is_ok());
+        host.map_range(0x10000, 0xA000, 0x40);
+        for i in 0..36u32 {
+            let pfn = 16 + i;
+            let mut pte = [0u8; 4];
+            st32(&mut pte, pfn);
+            assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+        }
+        host
+    }
+
+    /// A complete buffer-fixture pair: the leaked host (the drain's, mutable)
+    /// and the pooled state whose workers read it.
+    fn pooled_buffer_fixture(specs: &[(u32, u64)]) -> (DeviceState, &'static mut FakeHost) {
+        let host = Box::leak(Box::new(buffer_host()));
+        let state = pooled_buffer_state(host, specs);
+        (state, host)
+    }
+
+    /// Two `BufferContent`s agree structurally — the arms resolve
+    /// independently, so run host pointers are not identity; lengths, source
+    /// offsets and the pages' presence are the answer's shape.
+    fn contents_agree(
+        a: &crate::backend::vulkan::engine::BufferContent,
+        b: &crate::backend::vulkan::engine::BufferContent,
+    ) -> bool {
+        use crate::backend::vulkan::engine::BufferContent;
+        match (a, b) {
+            (BufferContent::GuestRuns(a), BufferContent::GuestRuns(b)) => {
+                let lens = |src: &crate::backend::vulkan::engine::GuestRunSource| {
+                    src.runs.iter().map(|r| r.len()).collect::<Vec<_>>()
+                };
+                lens(a) == lens(b)
+                    && a.source_offset == b.source_offset
+                    && a.total_len == b.total_len
+                    && a.pages.is_some() == b.pages.is_some()
+            }
+            (BufferContent::Bytes(a), BufferContent::Bytes(b)) => a[..] == b[..],
+            _ => false,
+        }
+    }
+
+    /// The chunked driver's buffer arms: every bind a chunked `on` pass serves
+    /// answers what the serial ladder answers for the same bind, and the
+    /// registry is left where the serial ladder leaves it.
+    #[test]
+    fn chunked_buffer_binds_equal_serial() {
+        let _mode = test_mode(PassPrepMode::On);
+        let specs = [(7u32, 0x8000u64), (8, 0x8000)];
+        let (mut planned_state, planned_host) = pooled_buffer_fixture(&specs);
+        let (mut serial_state, serial_host) = pooled_buffer_fixture(&specs);
+        // One serial bind of each reference per arm primes the packed aliases
+        // the rail plans borrow.
+        for (state, host) in [
+            (&mut planned_state, &mut *planned_host),
+            (&mut serial_state, &mut *serial_host),
+        ] {
+            for &(buffer_ref, _) in &specs {
+                let resource = crate::runtime::objects::resolve_resource(
+                    &*state, &*host, 1, buffer_ref,
+                )
+                .expect("fixture resource");
+                let _prime = load_buffer_content_serial(
+                    state, host, 1, buffer_ref, Some(&resource), 0, true, None,
+                )
+                .expect("the prime constructs the packed alias");
+            }
+        }
+        let pattern = [0u32, 1, 0, 1, 0, 1, 0, 1];
+        let make_binds = |state: &DeviceState, host: &FakeHost| -> Vec<Vec<BufferBind>> {
+            pattern
+                .iter()
+                .map(|&which| {
+                    let buffer_ref = specs[which as usize].0;
+                    vec![BufferBind {
+                        index: 0,
+                        buffer_ref,
+                        resource: Some(
+                            crate::runtime::objects::resolve_resource(
+                                state, host, 1, buffer_ref,
+                            )
+                            .expect("bind resource"),
+                        ),
+                        offset: 0x40 * which as u64,
+                        attribute_stride: None,
+                    }]
+                })
+                .collect()
+        };
+        let planned_binds = make_binds(&planned_state, &*planned_host);
+        let serial_binds = make_binds(&serial_state, &*serial_host);
+        let tables: Vec<DrawTables<'_>> = planned_binds
+            .iter()
+            .map(|one| DrawTables {
+                fragment: &[],
+                vertex: &[],
+                vertex_buffers: one.as_slice(),
+                fragment_buffers: &[],
+                indexed: None,
+            })
+            .collect();
+        let before_planned = store_route_count("pass_prep_buf_planned_packed");
+        let before_hit = store_route_count("pass_prep_buf_hit");
+        let mut prep = PassPrep::open_with_chunk(&planned_state, 1, tables, 4).expect("opens");
+        for di in 0..pattern.len() {
+            prep.ahead(&planned_state, &FakeHost::new(), di);
+            let bind = &planned_binds[di];
+            let served = load_buffer_content(
+                &mut planned_state,
+                &mut *planned_host,
+                1,
+                bind.buffer_ref,
+                bind.resource.as_deref(),
+                bind.offset,
+                true,
+                None,
+            )
+            .expect("the planned arm serves");
+            let serial_bind = &serial_binds[di];
+            let serial = load_buffer_content(
+                &mut serial_state,
+                &mut *serial_host,
+                1,
+                serial_bind.buffer_ref,
+                serial_bind.resource.as_deref(),
+                serial_bind.offset,
+                true,
+                None,
+            )
+            .expect("the serial ladder serves");
+            assert!(
+                contents_agree(&served, &serial),
+                "draw {di} ref {} agrees with the serial ladder",
+                bind.buffer_ref
+            );
+        }
+        drop(prep);
+        assert!(delta("pass_prep_buf_planned_packed", before_planned) >= 1);
+        assert!(delta("pass_prep_buf_hit", before_hit) >= 1);
+        assert_eq!(
+            planned_state.bound_buffers.shape(),
+            serial_state.bound_buffers.shape(),
+            "the planned arm leaves the registry where the serial ladder does"
+        );
+    }
+
+    /// The pass's Store page walk: latched from the colour-0 after the
+    /// template, planned by a later chunk's scope, served at the storing
+    /// draw's commit point, and equal to the serial walk's answer.
+    #[test]
+    fn the_pass_store_pages_plan_serves_the_storing_draw() {
+        let _mode = test_mode(PassPrepMode::On);
+        let specs = [(7u32, 0x8000u64), (8, 0x8000), (9, 0x8000)];
+        let (mut state, host) = pooled_buffer_fixture(&specs);
+        // Prime the aliases the chunk-0 items plan.
+        for &(buffer_ref, _) in &specs[..2] {
+            let resource =
+                crate::runtime::objects::resolve_resource(&state, &*host, 1, buffer_ref)
+                    .expect("fixture resource");
+            let _prime = load_buffer_content_serial(
+                &mut state, &mut *host, 1, buffer_ref, Some(&resource), 0, true, None,
+            )
+            .expect("prime");
+        }
+        // Six draws: 0..2 bind refs 7, 8 (chunk 0's items), 2..4 bind ref 9
+        // beside the store walk (chunk 1's), 4..6 repeat.
+        let binds: Vec<Vec<BufferBind>> = [0usize, 1, 2, 2, 0, 1]
+            .iter()
+            .map(|&which| {
+                let buffer_ref = specs[which].0;
+                vec![BufferBind {
+                    index: 0,
+                    buffer_ref,
+                    resource: Some(
+                        crate::runtime::objects::resolve_resource(&state, &*host, 1, buffer_ref)
+                            .expect("bind resource"),
+                    ),
+                    offset: 0,
+                    attribute_stride: None,
+                }]
+            })
+            .collect();
+        let tables: Vec<DrawTables<'_>> = binds
+            .iter()
+            .map(|one| DrawTables {
+                fragment: &[],
+                vertex: &[],
+                vertex_buffers: one.as_slice(),
+                fragment_buffers: &[],
+                indexed: None,
+            })
+            .collect();
+        let c0 = ColorRtRequest {
+            target_gva: 0x8000,
+            row_stride: 256,
+            width: 64,
+            height: 4,
+            format: MTL_FORMAT_BGRA8_UNORM,
+            store_action: reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_STORE,
+            ..Default::default()
+        };
+        let mut prep = PassPrep::open_with_chunk(&state, 1, tables, 2).expect("opens");
+        prep.ahead(&state, &FakeHost::new(), 0);
+        // The drain latches the colour-0 once the attachment template exists
+        // — after the first chunk has already been offered.
+        prep.note_store_target(&c0);
+        let before_planned = store_route_count("pass_prep_buf_planned_store");
+        prep.ahead(&state, &FakeHost::new(), 2);
+        assert_eq!(delta("pass_prep_buf_planned_store", before_planned), 1);
+        // The storing draw's commit point: the planned walk answers, with the
+        // serial walk's own pages.
+        let before_hit = store_route_count("pass_prep_buf_store_hit");
+        let served = sync_store_allowed_pages(&state, &*host, 1, Some(&c0), true)
+            .expect("the planned walk serves");
+        assert_eq!(delta("pass_prep_buf_store_hit", before_hit), 1);
+        let serial = crate::runtime::draw::sync_store_target_pages(&state, &*host, 1, &c0)
+            .expect("the serial walk resolves the same pages");
+        assert!(served.ordered == serial.ordered && served.span == serial.span);
+        drop(prep);
     }
 
     /// The sample-plan fixture's shape, generalized to one ref-texture per
@@ -472,6 +975,9 @@ mod tests {
             .map(|one| DrawTables {
                 fragment: one.as_slice(),
                 vertex: &[],
+                vertex_buffers: &[],
+                fragment_buffers: &[],
+                indexed: None,
             })
             .collect()
     }
@@ -1111,6 +1617,9 @@ mod tests {
         let one = vec![DrawTables {
             fragment: &[],
             vertex: &[],
+            vertex_buffers: &[],
+            fragment_buffers: &[],
+            indexed: None,
         }];
         assert!(
             PassPrep::open_with_chunk(&state, 1, one, 4).is_none(),
@@ -1121,10 +1630,16 @@ mod tests {
             DrawTables {
                 fragment: &[],
                 vertex: &[],
+                vertex_buffers: &[],
+                fragment_buffers: &[],
+                indexed: None,
             },
             DrawTables {
                 fragment: &[],
                 vertex: &[],
+                vertex_buffers: &[],
+                fragment_buffers: &[],
+                indexed: None,
             },
         ];
         assert!(

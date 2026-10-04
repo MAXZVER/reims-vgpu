@@ -2915,7 +2915,11 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
 /// the struct: both fields are produced by the one walk either way, and a
 /// conditional shape would make the two arms disagree about what a Store's
 /// authorisation *is*.
+///
+/// `Clone` for the TEMP (lab, PASS_PREP step 3) Store-page plan's shadow arm,
+/// which holds the planned walk while the serial one runs beside it.
 #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+#[derive(Clone)]
 pub(crate) struct StoreTargetPages {
     ordered: Vec<u64>,
     set: std::collections::HashSet<u64>,

@@ -308,6 +308,16 @@ pub struct BoundBuffers {
     packed: HashMap<(u32, u32), PackedBufferResolution>,
     /// TEMP (lab): see [`WholeRuns`].
     whole: HashMap<(u32, u32), WholeRuns>,
+    /// TEMP (lab, PASS_PREP step 3): moved by every retirement rule and by
+    /// [`Self::clear`] — exactly the events that announce a page-table or
+    /// naming change. A pool-planned buffer bind reads it when it plans and
+    /// re-checks it when it commits: this registry has no per-entry
+    /// `map_generation` the way a mapping does, because an entry never
+    /// changes under its key — it is only ever inserted whole or dropped
+    /// whole, and every drop is one of those announcements. Inserts do not
+    /// move it: an insert only adds an answer below a rail a plan already
+    /// chose, and the plan re-checks the identity of its own rail regardless.
+    generation: u64,
 }
 
 impl BoundBuffers {
@@ -399,6 +409,7 @@ impl BoundBuffers {
     /// The answer for a page-table root change, a new object list, or a deleted
     /// task: in each case every reference may now name different bytes.
     pub fn retire_task(&mut self, task_id: u32) -> usize {
+        self.generation += 1;
         let before = self.held.len();
         self.held.retain(|k, _| k.task != task_id);
         self.packed.retain(|(task, _), _| *task != task_id);
@@ -432,6 +443,7 @@ impl BoundBuffers {
     /// packet — `CmdMapMemory2`, `CmdUnmapMemory` or `CmdReplacePhysical` — and
     /// those rules still retire by range or by task.
     pub fn retire_ref(&mut self, task_id: u32, buffer_ref: u32) -> usize {
+        self.generation += 1;
         let before = self.held.len();
         self.held
             .retain(|k, _| k.task != task_id || k.buffer_ref != buffer_ref);
@@ -444,6 +456,7 @@ impl BoundBuffers {
     ///
     /// The map/unmap answer, which carries the exact range that moved.
     pub fn retire_range(&mut self, task_id: u32, gva: u64, len: u64) -> usize {
+        self.generation += 1;
         let before = self.held.len();
         self.held
             .retain(|k, b| k.task != task_id || !b.overlaps(gva, len));
@@ -456,9 +469,17 @@ impl BoundBuffers {
 
     /// Drop everything. Device reset, where no guest state survives.
     pub fn clear(&mut self) {
+        self.generation += 1;
         self.held.clear();
         self.packed.clear();
         self.whole.clear();
+    }
+
+    /// TEMP (lab, PASS_PREP step 3): the retirement generation — see the field.
+    /// Monotonic for the device's life; a plan holds the value it read and a
+    /// commit answers "did any announcement land in between".
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// How many resolutions are held, for the census.

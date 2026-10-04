@@ -29,6 +29,8 @@ mod pass_prep;
 pub(crate) use pass_prep::{pass_prep_mode, DrawTables, PassPrep, PassPrepMode};
 #[cfg(test)]
 pub(crate) use pass_prep::test_mode;
+// TEMP (lab, PASS_PREP step 3): the buffer-bind and Store-page plans.
+mod buffer_plan;
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
@@ -6297,6 +6299,41 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     allow_zero_copy: bool,
     extent_cap: Option<u64>,
 ) -> Option<crate::backend::vulkan::engine::BufferContent> {
+    // TEMP (lab, PASS_PREP step 3): the pass frame's plan for this bind,
+    // validated here — where the serial ladder would resolve it. `on` serves
+    // from the plan (the warm rails' content, the walked window's hold);
+    // `shadow` holds the prediction for the compare below; a missing or
+    // invalid plan leaves the serial ladder to run, unchanged.
+    let asked = if allow_zero_copy {
+        buffer_plan::ask_buffer(state, task_id, buffer_ref, resource, offset, extent_cap)
+    } else {
+        buffer_plan::Ask::Serial
+    };
+    let was_shadow = matches!(asked, buffer_plan::Ask::Shadow);
+    if let buffer_plan::Ask::Serve(content) = asked {
+        return Some(content);
+    }
+    let answer =
+        load_buffer_content_serial(state, host, task_id, buffer_ref, resource, offset, allow_zero_copy, extent_cap);
+    if was_shadow {
+        buffer_plan::shadow_compare_buffer(buffer_ref, offset, true, answer.as_ref());
+    }
+    answer
+}
+
+/// [`load_buffer_content`]'s serial body: the held registry first, then the
+/// backing resolve and the zero-copy-or-CPU ladder. Unchanged by step 3.
+#[allow(clippy::too_many_arguments)]
+fn load_buffer_content_serial<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    buffer_ref: u32,
+    resource: Option<&crate::model::TaskResource>,
+    offset: u64,
+    allow_zero_copy: bool,
+    extent_cap: Option<u64>,
+) -> Option<crate::backend::vulkan::engine::BufferContent> {
     if allow_zero_copy {
         if let Some(content) = held_buffer_content(state, task_id, buffer_ref, offset, extent_cap) {
             return Some(content);
@@ -6375,6 +6412,33 @@ fn indexed_vertex_max(info: &IndexedDrawInfo, bytes: &[u8]) -> Option<u64> {
 }
 
 fn load_index_content_reason<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    info: &IndexedDrawInfo,
+) -> Result<crate::backend::vulkan::engine::BufferContent, IndexLoadReason> {
+    // TEMP (lab, PASS_PREP step 3): the index bind's plan — the one buffer
+    // bind whose exact key (ref, offset, need) the record alone states, so
+    // the frame holds it under that key. See [`load_buffer_content`].
+    let asked = buffer_plan::ask_index(state, host, task_id, info);
+    let was_shadow = matches!(asked, buffer_plan::Ask::Shadow);
+    if let buffer_plan::Ask::Serve(content) = asked {
+        return Ok(content);
+    }
+    let answer = load_index_content_reason_serial(state, host, task_id, info);
+    if was_shadow {
+        buffer_plan::shadow_compare_buffer(
+            info.index_buffer_ref,
+            info.index_buffer_offset,
+            true,
+            answer.as_ref().ok(),
+        );
+    }
+    answer
+}
+
+/// [`load_index_content_reason`]'s serial body, unchanged by step 3.
+fn load_index_content_reason_serial<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -8087,7 +8151,19 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
     if !writeback_guest {
         return None;
     }
-    sync_store_target_pages(state, host, task_id, color0?)
+    // TEMP (lab, PASS_PREP step 3): the pass frame's planned walk for this
+    // Store — read off the drain early (the chunk before the storing draw),
+    // validated here against the live colour-0 and the registry generation.
+    let asked = buffer_plan::ask_store_pages(state, task_id, color0);
+    let was_shadow = matches!(asked, buffer_plan::Ask::Shadow);
+    if let buffer_plan::Ask::Serve(pages) = asked {
+        return Some(pages);
+    }
+    let serial = color0.and_then(|c| sync_store_target_pages(state, host, task_id, c));
+    if was_shadow {
+        buffer_plan::shadow_compare_store(true, serial.as_ref());
+    }
+    serial
 }
 
 /// How much surface a taken mapper-ref-texture seed elision covered, in whole texels.

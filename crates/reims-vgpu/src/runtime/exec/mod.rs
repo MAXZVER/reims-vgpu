@@ -5623,6 +5623,12 @@ fn finish_stream<M: HostMemory + HostOps>(
                         .map(|pd| crate::runtime::draw::vulkan::DrawTables {
                             fragment: pd.fragment_textures.as_slice(),
                             vertex: pd.vertex_textures.as_slice(),
+                            // TEMP (lab, PASS_PREP step 3): the same draws'
+                            // buffer tables and index binds, borrowed the same
+                            // way.
+                            vertex_buffers: pd.vertex_buffers.as_slice(),
+                            fragment_buffers: pd.fragment_buffers.as_slice(),
+                            indexed: pd.indexed.as_ref(),
                         })
                         .collect();
                     pass_prep =
@@ -5695,6 +5701,17 @@ fn finish_stream<M: HostMemory + HostOps>(
         // re-walk the same guest object list/page tables (or clone a full-frame
         // GVA LOAD seed). The resident target itself preserves record order.
         let attachment_template = first_req.as_ref().map(render_pass_attachment_template);
+        // TEMP (lab, PASS_PREP step 3): latch the pass's colour-0 for the
+        // Store page walk, now that the template exists (`ahead(0)` ran
+        // before it, so the walk rides the next chunk's scope). A pass small
+        // enough to live in one chunk keeps the walk on the drain — it is
+        // once per pass.
+        #[cfg(feature = "backend-vulkan")]
+        if let Some(p) = pass_prep.as_mut() {
+            if let Some(c0) = first_req.as_ref().and_then(|req| req.colors.first()) {
+                p.note_store_target(c0);
+            }
+        }
         if first_draw.is_some() && first_req.is_none() {
             let refs: Vec<u32> = acc.color_slots.iter().map(|(_, a)| a.texture_ref).collect();
             crate::observe::fail(format!(

@@ -48,9 +48,23 @@ pub(crate) fn prefetch_mode() -> PrefetchMode {
 /// One stream's (or pass's) plans, plus the refs whose ref-view plan a bind
 /// has consumed. `consumed` is drained by [`super::pass_prep::PassPrep::ahead`],
 /// which replans those refs from the witness's post-consumption state.
+///
+/// TEMP (lab, PASS_PREP step 3): the same frame carries the pass's buffer
+/// plans — rail plans under `(task, reference)`, exact plans under the bind's
+/// own key, and the pass's one Store page walk — served by
+/// [`super::buffer_plan`] at the points the serial buffer ladder resolves.
 pub(crate) struct PassPlans {
     map: HashMap<(u32, u32), StreamPlan>,
     consumed: Vec<u32>,
+    /// TEMP (lab, PASS_PREP step 3): warm-rail plans (packed alias,
+    /// whole-allocation runs) — one per `(task, reference)`, serving every
+    /// offset and cap of that reference.
+    pub(super) buffer_rails: HashMap<(u32, u32), super::buffer_plan::BufferContentPlan>,
+    /// TEMP (lab, PASS_PREP step 3): exact plans (held entry, walked window)
+    /// under `(task, reference, offset, cap)`.
+    pub(super) buffer_exacts: HashMap<super::buffer_plan::BufferExactKey, super::buffer_plan::BufferContentPlan>,
+    /// TEMP (lab, PASS_PREP step 3): the pass's Store page walk, when planned.
+    pub(super) store_pages: Option<super::buffer_plan::StorePagesPlan>,
 }
 
 thread_local! {
@@ -92,8 +106,17 @@ pub(super) fn push_empty_frame() -> PrefetchGuard {
     STACK.with(|stack| stack.borrow_mut().push(PassPlans {
         map: HashMap::new(),
         consumed: Vec::new(),
+        buffer_rails: HashMap::new(),
+        buffer_exacts: HashMap::new(),
+        store_pages: None,
     }));
     PrefetchGuard { pushed: true }
+}
+
+/// TEMP (lab, PASS_PREP step 3): the innermost frame, for the buffer-plan ask
+/// and merge paths. `None` when no pass frame is pushed on this thread.
+pub(super) fn with_last_frame<R>(f: impl FnOnce(&mut PassPlans) -> R) -> Option<R> {
+    STACK.with(|stack| stack.borrow_mut().last_mut().map(f))
 }
 
 /// Merge planned binds into the current (innermost) frame. Plans replace a
@@ -310,6 +333,9 @@ pub(crate) fn prefetch_stream<'a>(
     STACK.with(|stack| stack.borrow_mut().push(PassPlans {
         map: plans,
         consumed: Vec::new(),
+        buffer_rails: HashMap::new(),
+        buffer_exacts: HashMap::new(),
+        store_pages: None,
     }));
     PrefetchGuard { pushed: true }
 }
