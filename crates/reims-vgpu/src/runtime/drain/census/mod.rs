@@ -2817,11 +2817,25 @@ pub(crate) mod lab_gap {
         r.push_back(Ev { t, kind, a, b, c });
     }
 
+    /// TEMP (lab): `REIMS_VGPU_LAB_GAP_MS=N` (2..10000, default 120) — the present
+    /// gap past which the line is written. A few VBL ticks (11-20 ms) is the
+    /// steady-scene frame-time tail; 120 ms was the transition hitch. Latched.
+    fn gap_us() -> u64 {
+        static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *US.get_or_init(|| {
+            std::env::var("REIMS_VGPU_LAB_GAP_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or(120, |ms| ms.clamp(2, 10_000))
+                * 1000
+        })
+    }
+
     /// Called at each present: the gap line, when the gap since the last present
-    /// was over 120 ms.
+    /// was over [`gap_us`].
     pub(crate) fn present(now: u64) -> Option<String> {
         let prev = LAST_PRESENT.swap(now, std::sync::atomic::Ordering::Relaxed);
-        if prev == 0 || now.saturating_sub(prev) < 120_000 {
+        if prev == 0 || now.saturating_sub(prev) < gap_us() {
             return None;
         }
         let r = RING.lock().unwrap_or_else(|e| e.into_inner());
