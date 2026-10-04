@@ -76,6 +76,7 @@ void (*whpx_wp_invalidate_hook)(void);
 static uint8_t hv_ro[NPAGES];
 static uint64_t n_wp_faults, n_wp_remaps;
 static int cfg_wp_nopause;
+static int cfg_packet_scope;   /* STRESS_PACKET_SCOPE: the drain scopes each packet to its channel */
 static QemuMutex vg_lock;
 static QemuCond vg_cond;
 static int vg_paused, vg_active;
@@ -621,7 +622,13 @@ static void *drain_thread(void *arg)
             }
         }
 
-        reims_vgpu_dirty_note_work_scope(D, 0xffffffffu);
+        /*
+         * STRESS_PACKET_SCOPE=1: the packet's own channel scope, as the device's PACKET_SCOPE runs a
+         * packet with no stamp wait (this model has none: a packet owes only what its own doorbell,
+         * or the publication of its tail, ordered before it).
+         */
+        reims_vgpu_dirty_note_work_scope(D, cfg_packet_scope && p->channel > 0
+                                                ? (uint32_t)p->channel : 0xffffffffu);
         reims_vgpu_dirty_note_work_scope(D, 0x80000000u | (uint32_t)(p->channel < 0 ? 0 : p->channel));
         qemu_mutex_lock(&set_lock);
         for (i = 0; i < nsets; i++) {
@@ -735,6 +742,7 @@ int main(int argc, char **argv)
     cfg_hole_us = (e = getenv("STRESS_HOLE_US")) ? atoi(e) : 40;
     nsets = (e = getenv("STRESS_SETS")) ? MIN(atoi(e), MAXSETS) : 16;
     cfg_wp_nopause = (e = getenv("STRESS_WP_NOPAUSE")) ? atoi(e) : 0;
+    cfg_packet_scope = (e = getenv("STRESS_PACKET_SCOPE")) ? atoi(e) : 0;
     qemu_mutex_init(&vg_lock);
     qemu_cond_init(&vg_cond);
 
