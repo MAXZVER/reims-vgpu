@@ -743,6 +743,25 @@ mod tests {
         };
         let planned_binds = make_binds(&planned_state, &*planned_host);
         let serial_binds = make_binds(&serial_state, &*serial_host);
+        // The serial arm runs to completion first: the pass frame is a
+        // thread-local, and both arms share this thread, so the serial binds
+        // must not see the planned arm's plans.
+        let serial_answers: Vec<_> = (0..pattern.len())
+            .map(|di| {
+                let serial_bind = &serial_binds[di];
+                load_buffer_content(
+                    &mut serial_state,
+                    &mut *serial_host,
+                    1,
+                    serial_bind.buffer_ref,
+                    serial_bind.resource.as_deref(),
+                    serial_bind.offset,
+                    true,
+                    None,
+                )
+                .expect("the serial ladder serves")
+            })
+            .collect();
         let tables: Vec<DrawTables<'_>> = planned_binds
             .iter()
             .map(|one| DrawTables {
@@ -770,20 +789,8 @@ mod tests {
                 None,
             )
             .expect("the planned arm serves");
-            let serial_bind = &serial_binds[di];
-            let serial = load_buffer_content(
-                &mut serial_state,
-                &mut *serial_host,
-                1,
-                serial_bind.buffer_ref,
-                serial_bind.resource.as_deref(),
-                serial_bind.offset,
-                true,
-                None,
-            )
-            .expect("the serial ladder serves");
             assert!(
-                contents_agree(&served, &serial),
+                contents_agree(&served, &serial_answers[di]),
                 "draw {di} ref {} agrees with the serial ladder",
                 bind.buffer_ref
             );
