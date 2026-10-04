@@ -16,7 +16,9 @@ HOLE = {'STRESS_HOLE': '25', 'STRESS_HOLE_US': '40'}
 RING = {'STRESS_RING': '1', 'STRESS_RING_SKIP': '30', 'STRESS_HOLE_US': '40'}
 # Pinned to the queried path: a hashed set (DIRTY_HASH, the default since n178) is never protected, so these rows
 # would stop exercising WP. The mixed path is the `hash:` rows and `DEFAULTS + wp`.
-WP = {G + 'DIRTY_WP': 'on', G + 'DIRTY_WP_MIN': '8', G + 'DIRTY_WP_STREAK': '2', G + 'DIRTY_HASH': 'off'}
+# DIRTY_WP_AGE_MS=0: the calm age floor (1 s + 2 ms a run) would leave the churned sets of a 10-s row unprotected.
+WP = {G + 'DIRTY_WP': 'on', G + 'DIRTY_WP_MIN': '8', G + 'DIRTY_WP_STREAK': '2', G + 'DIRTY_HASH': 'off',
+      G + 'DIRTY_WP_AGE_MS': '0'}
 WP0 = {k: v for k, v in WP.items() if k != G + 'DIRTY_HASH'}   # WP with the hash switch left to the row
 EXACT3 = {G + 'DIRTY_STEAL': 'on', G + 'GEN_MEMO': 'on', G + 'GEN_LOCKFREE': 'on'}
 cfgs = [
@@ -88,9 +90,14 @@ cfgs = [
     ('hash: cost model, named + exact3', dict(NAMED, **EXACT3, **{G + 'DIRTY_HASH': 'on'}), '0'),
     ('hash: every set + wp nopause, ring + hole=tail', dict(NAMED, **RING, **WP0, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on'}), '0'),
     ('hash: every set, small max (mixed), ring + hole=tail', dict(NAMED, **RING, **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on', G + 'DIRTY_HASH_MAX': '64'}), '0'),
+    ('hash: due on (background by read gaps), named + exact3', dict(NAMED, **EXACT3, **{G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_DUE': 'on'}), '0'),
+    ('hash: due on, every set, ring + hole=tail', dict(NAMED, **RING, **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on', G + 'DIRTY_HASH_DUE': 'on'}), '0'),
     ('hash=off: the queried path, named + exact3', dict(NAMED, **EXACT3, **{G + 'DIRTY_HASH': 'off'}), '0'),
     ('hash=off + wp nopause: ring + hole=tail', dict(NAMED, **RING, **WP0, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_HASH': 'off'}), '0'),
     ('CONTROL hash: drain reads lagged', {'STRESS_DRAIN_LAGGED': '1', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on'}, '>0'),
+    ('wp calm=off: wp nopause, ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_CALM': 'off'}), '0'),
+    ('wp calm=off: wp nopause + wp_hole, ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_HOLE': 'on', G + 'DIRTY_WP_CALM': 'off'}), '0'),
+    ('wp calm, real age floor: wp nopause, ring + hole=tail', dict(NAMED, **RING, **{k: v for k, v in WP.items() if k != G + 'DIRTY_WP_AGE_MS'}, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on'}), '0'),
 ]
 ORIGINAL = {G + 'DIRTY_STEAL': 'off', G + 'GEN_LOCKFREE': 'off', G + 'EPOCH_NAMED': 'off', G + 'DIRTY_HOLE': 'off'}
 KEYS = ('steals', 'steal_same', 'steal_late', 'memo_hit', 'memo_fresh', 'memo_diff', 'memo_bad', 'unnamed_skipped',

@@ -6206,7 +6206,13 @@ fn apply_map_family<H: HostMemory + HostOps>(
     family: MapFamily,
 ) {
     // TEMP (lab PAY_DEFER): a begun payment lands before any page moves under it.
-    crate::runtime::writeback_debt::land_deferred(state, host);
+    // A MapMemory2 moves none: the guest gives pages back through UnmapMemory and
+    // DeleteIOSurfaceBacking2, the two places the GPU-direct writebacks settle too
+    // (`settle_released_span`, `settle_released_mapping`). Waiting on every map for
+    // the landing was 36 % of this function on full-screen transitions (n185 fsz0).
+    if family != MapFamily::MapMemory2 || crate::runtime::writeback_debt::lab_map_land_all() {
+        crate::runtime::writeback_debt::land_deferred(state, host);
+    }
     // TEMP (lab): translations cached this tranche may name the pages moved.
     crate::runtime::gva_mem::lab_tlb::new_epoch();
     // Every branch below stamps the packet complete whatever it did with

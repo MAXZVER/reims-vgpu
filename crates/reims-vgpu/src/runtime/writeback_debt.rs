@@ -2442,6 +2442,19 @@ pub fn lab_pay_defer() -> bool {
     })
 }
 
+/// TEMP (lab PAY_DEFER): `REIMS_VGPU_LAB_MAP_LAND=all` makes a MapMemory2 land a
+/// begun payment too, as every map-family packet did before (default: only the
+/// packets that give pages back).
+pub fn lab_map_land_all() -> bool {
+    use std::sync::OnceLock;
+    static ALL: OnceLock<bool> = OnceLock::new();
+    *ALL.get_or_init(|| {
+        let all = std::env::var("REIMS_VGPU_LAB_MAP_LAND").is_ok_and(|v| v == "all");
+        crate::observe::off(format!("lab_map_land all={all}"));
+        all
+    })
+}
+
 /// TEMP (lab PAY_DEFER): [`pay`], leaving the landing owed when the rail can
 /// defer it. Lands a payment already begun first: one at a time.
 fn pay_deferred<M: HostMemory + HostOps>(
