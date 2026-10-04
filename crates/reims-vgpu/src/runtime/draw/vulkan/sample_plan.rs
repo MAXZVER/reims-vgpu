@@ -886,6 +886,10 @@ pub(crate) struct RefViewPlan {
     gpas: std::sync::Arc<Vec<u64>>,
     runs: std::sync::Arc<Vec<crate::backend::vulkan::engine::GuestRun>>,
     gather: crate::runtime::gather_witness::PlannedGather,
+    /// TEMP (lab, PASS_STAGE, design 8.4): the plan's gather window, staged
+    /// into a worker arena by [`attach_staged`]; the serve wraps it and the
+    /// engine's CPU-gather arm reads the window instead of gathering.
+    staged: Option<crate::backend::vulkan::engine::pass_stage::StagedSlice>,
 }
 
 /// Plan the zero-copy bind of a ref-texture view that needs materializing.
@@ -964,7 +968,63 @@ pub(crate) fn plan_ref_view_zero_copy<M: HostMemory + HostOps>(
         gpas,
         runs,
         gather,
+        staged: None,
     })
+}
+
+
+/// TEMP (lab, PASS_STAGE, design 8.4): wrap a guest-runs serve whose window a
+/// worker staged, as the staged request the engine resolves like the
+/// guest-runs bind it stands for. `unreachable` on any other variant because
+/// every caller built the guest-runs tuple on the line above.
+fn wrap_staged(
+    request: SampledSourceRequest,
+    staged: &crate::backend::vulkan::engine::pass_stage::StagedSlice,
+) -> SampledSourceRequest {
+    let SampledSourceRequest::GuestRuns(src, native, format, planes, identity, vouch, components) =
+        request
+    else {
+        unreachable!("a staged wrap is applied to a guest-runs serve");
+    };
+    SampledSourceRequest::Staged(Box::new(super::StagedSampledRequest {
+        src,
+        native,
+        format,
+        planes,
+        identity,
+        vouch,
+        components,
+        staged: staged.clone(),
+    }))
+}
+
+/// TEMP (lab, PASS_STAGE, design 8.4): stage the gather window of a
+/// guest-runs plan into the worker's arena -- the copy the engine's
+/// CPU-gather arm (`write_staging_from_runs`) would have paid, moved to the
+/// planning thread. Plans without a gather window are untouched; an arena
+/// refusal leaves the plan as it was (the serial gather serves).
+pub(crate) fn attach_staged(
+    plan: &mut super::prefetch::StreamPlan,
+    stager: &super::pass_stage::Stager,
+) {
+    let attached = match plan {
+        super::prefetch::StreamPlan::RefView(p) => stager
+            .stage_runs(&p.runs, 0, p.plane.span)
+            .map(|staged| p.staged = Some(staged))
+            .is_some(),
+        super::prefetch::StreamPlan::Linear(p) => stager
+            .stage_runs(&p.packed_runs, p.layout_offset, p.span)
+            .map(|staged| p.staged = Some(staged))
+            .is_some(),
+        super::prefetch::StreamPlan::MapperRef(p) => stager
+            .stage_runs(&p.runs, 0, p.span)
+            .map(|staged| p.staged = Some(staged))
+            .is_some(),
+        _ => false,
+    };
+    if attached {
+        crate::runtime::drain::note_store_route("pass_stage_sampled_planned");
+    }
 }
 
 /// Re-check a ref-view plan at the point the serial rail would run, and with
@@ -1049,8 +1109,14 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
             ),
         )
     };
+    // TEMP (lab, PASS_STAGE): the staged window, on every arm the closure
+    // below serves.
+    let wrap = |served: (u32, u32, u32, SampledSourceRequest)| match plan.staged.as_ref() {
+        Some(st) => (served.0, served.1, served.2, wrap_staged(served.3, st)),
+        None => served,
+    };
     if !apply {
-        return Ok((source(None, plan.gather.predicted()), None));
+        return Ok((wrap(source(None, plan.gather.predicted())), None));
     }
     // What the serial rail notes before it decides how to carry the plane.
     if let Some(bpp) = crate::protocol::pixel_format::bytes_per_pixel(view.pixel_format) {
@@ -1096,7 +1162,7 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
     let pages = guest_page_window(host, &plan.gpas, page, base_off % page, span);
     let mut next = plan.clone();
     next.gather = repeat;
-    Ok((source(pages, outcome), Some(next)))
+    Ok((wrap(source(pages, outcome)), Some(next)))
 }
 
 /// Whether the GVA-resident rung that sits above the linear zero-copy rail
@@ -1212,6 +1278,8 @@ pub(crate) struct LinearPlan {
     gather: Option<crate::runtime::gather_witness::PlannedGather>,
     witness_gpas: Vec<u64>,
     witness_run: Option<crate::backend::vulkan::engine::GuestRun>,
+    /// TEMP (lab, PASS_STAGE, design 8.4): see [`RefViewPlan::staged`].
+    staged: Option<crate::backend::vulkan::engine::pass_stage::StagedSlice>,
 }
 
 /// Plan the linear zero-copy bind of one texture ref from state this call only
@@ -1353,7 +1421,8 @@ pub(crate) fn plan_linear_zero_copy<M: HostMemory + HostOps>(
             gather: None,
             witness_gpas: Vec::new(),
             witness_run: None,
-        });
+                staged: None,
+    });
     }
     // The multi-plane gather arm, over the import's own coordinates exactly as
     // the serial rail cuts them.
@@ -1419,6 +1488,7 @@ pub(crate) fn plan_linear_zero_copy<M: HostMemory + HostOps>(
         gather: Some(gather),
         witness_gpas,
         witness_run: Some(witness_run),
+        staged: None,
     })
 }
 
@@ -1558,12 +1628,14 @@ pub(crate) fn commit_linear_plan<M: HostMemory + HostOps>(
         let SampledSourceRequest::GuestRuns(source, ..) = request else {
             return Err(SampleInvalid::Packed);
         };
-        return Ok((plan.source(source, None), apply.then(|| plan.clone())));
+        // TEMP (lab, PASS_STAGE): the staged window, when one was attached.
+        let served = plan.source(source, None);
+        return Ok((wrap_linear(plan, served), apply.then(|| plan.clone())));
     }
     let gather = plan.gather.as_ref().expect("checked above");
     let run = plan.witness_run.expect("the gather arm carries its run");
     if !apply {
-        return Ok((plan.source(guest_runs, Some(gather.predicted())), None));
+        return Ok((wrap_linear(plan, plan.source(guest_runs, Some(gather.predicted()))), None));
     }
     let (outcome, repeat) =
         crate::runtime::gather_witness::commit_gather_repeatable(
@@ -1576,7 +1648,19 @@ pub(crate) fn commit_linear_plan<M: HostMemory + HostOps>(
         .ok_or(SampleInvalid::Witness)?;
     let mut next = plan.clone();
     next.gather = Some(repeat);
-    Ok((plan.source(guest_runs, Some(outcome)), Some(next)))
+    Ok((wrap_linear(plan, plan.source(guest_runs, Some(outcome))), Some(next)))
+}
+
+/// TEMP (lab, PASS_STAGE): a linear plan's serve, wrapped with its staged
+/// window when one was attached (see [`attach_staged`]).
+fn wrap_linear(
+    plan: &LinearPlan,
+    served: (u32, u32, u32, SampledSourceRequest),
+) -> (u32, u32, u32, SampledSourceRequest) {
+    match plan.staged.as_ref() {
+        Some(st) => (served.0, served.1, served.2, wrap_staged(served.3, st)),
+        None => served,
+    }
 }
 
 /// The surface id a sampled ref names, by the same classification
@@ -1663,6 +1747,8 @@ pub(crate) struct MapperRefPlan {
     gpas: std::sync::Arc<Vec<u64>>,
     runs: std::sync::Arc<Vec<crate::backend::vulkan::engine::GuestRun>>,
     gather: crate::runtime::gather_witness::PlannedGather,
+    /// TEMP (lab, PASS_STAGE, design 8.4): see [`RefViewPlan::staged`].
+    staged: Option<crate::backend::vulkan::engine::pass_stage::StagedSlice>,
 }
 
 /// Plan the mapper-ref zero-copy bind of one sampled ref. Every point where
@@ -1763,6 +1849,7 @@ pub(crate) fn plan_mapper_ref_zero_copy<M: HostMemory + HostOps>(
         gpas,
         runs,
         gather,
+        staged: None,
     })
 }
 
@@ -1900,7 +1987,8 @@ pub(crate) fn commit_mapper_ref_plan<M: HostMemory + HostOps>(
         return Err(SampleInvalid::Window);
     }
     if !apply {
-        return Ok((plan.source(None, plan.gather.predicted()), None));
+        // TEMP (lab, PASS_STAGE): the staged window, when one was attached.
+        return Ok((wrap_mapper(plan, plan.source(None, plan.gather.predicted())), None));
     }
     crate::runtime::drain::note_store_route("t11rung_zero_copy");
     let (outcome, repeat) = crate::runtime::gather_witness::commit_gather_repeatable(
@@ -1921,7 +2009,19 @@ pub(crate) fn commit_mapper_ref_plan<M: HostMemory + HostOps>(
     );
     let mut next = plan.clone();
     next.gather = repeat;
-    Ok((plan.source(pages, outcome), Some(next)))
+    Ok((wrap_mapper(plan, plan.source(pages, outcome)), Some(next)))
+}
+
+/// TEMP (lab, PASS_STAGE): a mapper-ref plan's serve, wrapped with its staged
+/// window when one was attached (see [`attach_staged`]).
+fn wrap_mapper(
+    plan: &MapperRefPlan,
+    served: (u32, u32, u32, SampledSourceRequest),
+) -> (u32, u32, u32, SampledSourceRequest) {
+    match plan.staged.as_ref() {
+        Some(st) => (served.0, served.1, served.2, wrap_staged(served.3, st)),
+        None => served,
+    }
 }
 
 /// TEMP (lab, step 2): the memo-fill byte budget one planning chunk may spend,

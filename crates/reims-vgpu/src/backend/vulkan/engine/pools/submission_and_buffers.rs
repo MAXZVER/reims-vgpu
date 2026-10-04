@@ -6409,6 +6409,7 @@ mod recycle_tests {
                 dsets: Vec::new(),
                 scatter_dsets: Vec::new(),
                 staging: Vec::new(),
+                staged: Vec::new(),
                 gather: Vec::new(),
                 readback: Vec::new(),
                 sampled: Vec::new(),

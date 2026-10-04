@@ -557,13 +557,11 @@ mod tests {
             // reference count, derived from the calls and nothing else.
             let mut live: Vec<Vec<(u64, u64)>> = vec![Vec::new(); CHUNKS];
             let mut outstanding = vec![0u64; CHUNKS];
-            let mut handles: Vec<StagingWindow> = Vec::new();
+            // (window, references it still holds). A handle dies with its
+            // last reference -- the same bytes may be handed out again later,
+            // as a fresh handle with a fresh count.
+            let mut handles: Vec<(StagingWindow, u64)> = Vec::new();
             for _step in 0..120 {
-                let pick = |rng: &mut Rng, handles: &[StagingWindow]| {
-                    (!handles.is_empty()).then(|| {
-                        handles[rng.below(handles.len() as u64) as usize]
-                    })
-                };
                 match rng.below(4) {
                     0 | 1 => {
                         let len = 1 + rng.below(CHUNK / 3);
@@ -585,7 +583,7 @@ mod tests {
                                 }
                                 chunk.push((window.offset, window.offset + window.len));
                                 outstanding[window.chunk as usize] += 1;
-                                handles.push(window);
+                                handles.push((window, 1));
                                 allocs += 1;
                             }
                             Err(StagingRefusal::Exhausted) => {
@@ -603,21 +601,30 @@ mod tests {
                     }
                     2 => {
                         // A submission records a read of a random live window.
-                        if let Some(window) = pick(&mut rng, &handles) {
+                        if !handles.is_empty() {
+                            let at = rng.below(handles.len() as u64) as usize;
+                            let (window, refs) = handles[at];
                             if ring.retain(window) {
+                                handles[at].1 = refs + 1;
                                 outstanding[window.chunk as usize] += 1;
                             }
                         }
                     }
                     _ => {
                         // A reference drops: the fact's or a submission's.
-                        if let Some(window) = pick(&mut rng, &handles) {
+                        // Only handles that still hold one may drop it.
+                        let held: Vec<usize> = (0..handles.len())
+                            .filter(|&i| handles[i].1 > 0)
+                            .collect();
+                        if !held.is_empty() {
+                            let at = held[rng.below(held.len() as u64) as usize];
+                            let (window, refs) = handles[at];
                             ring.release(window);
-                            let at = window.chunk as usize;
-                            assert!(outstanding[at] > 0);
-                            outstanding[at] -= 1;
-                            if outstanding[at] == 0 {
-                                live[at].clear();
+                            handles[at].1 = refs - 1;
+                            let chunk = window.chunk as usize;
+                            outstanding[chunk] -= 1;
+                            if outstanding[chunk] == 0 {
+                                live[chunk].clear();
                             }
                         }
                     }
@@ -629,7 +636,7 @@ mod tests {
                 );
             }
         }
-        assert!(allocs > 10_000, "{allocs} allocations were driven");
-        assert!(exhaustions > 1_000, "{exhaustions} exhaustions were driven");
+        assert!(allocs > 4_000, "{allocs} allocations were driven");
+        assert!(exhaustions > 400, "{exhaustions} exhaustions were driven");
     }
 }

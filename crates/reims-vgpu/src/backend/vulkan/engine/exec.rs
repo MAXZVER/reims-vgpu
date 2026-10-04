@@ -4605,7 +4605,6 @@ pub(crate) unsafe fn execute_draw_inner(
                     &mut guest_gathers,
                 )?;
             }
-            _ => {}
         }
     }
 

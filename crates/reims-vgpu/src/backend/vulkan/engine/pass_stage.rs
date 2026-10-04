@@ -49,6 +49,9 @@ pub(crate) struct WorkerArena {
     /// The mapping, as a raw address the same way `BufferSlot` carries it (a
     /// `usize`, so engine state stays `Send`).
     pub mapped: usize,
+    /// The alignment every carve takes (see [`ensure_installed`]): wide
+    /// enough for the storage-buffer descriptors a staged bind may feed.
+    pub bind_align: u64,
 }
 
 impl WorkerArena {
@@ -69,17 +72,40 @@ impl WorkerArena {
 /// A carved window a fact carries: the release handle, the buffer the engine
 /// binds or copies from, and where the bytes sit in it.
 ///
-/// The fact's own reference (taken by the alloc) is released by whoever owns
-/// the fact — the pass frame's ledger, or a seed cell's drop. A submission
-/// that records a read of the window takes its own reference through
-/// [`Self::retain_for_submission`].
-#[derive(Clone)]
+/// **Every slice owns one ring reference**, the one [`WorkerArena::alloc`]
+/// took: [`Clone`] takes another ([`StagingRing::retain`]) and [`Drop`]
+/// releases one, so a fact that dies anywhere — an invalid plan popped with
+/// its frame, a request the engine declined, a planner that unwound — gives
+/// its window back by construction and no ledger has to follow it around. A
+/// submission that records a read takes its own reference through
+/// [`Self::retain_for_submission`], released by the retiring slot.
 pub(crate) struct StagedSlice {
     pub ring: Arc<StagingRing>,
     pub buffer: vk::Buffer,
     pub window: StagingWindow,
     /// The mapping; a `usize` so the fact stays `Send` (see `BufferSlot`).
     pub mapped: usize,
+}
+
+impl Drop for StagedSlice {
+    fn drop(&mut self) {
+        self.ring.release(self.window);
+    }
+}
+
+impl Clone for StagedSlice {
+    fn clone(&self) -> Self {
+        // A ring rebuilt behind a device loss cannot retain; the clone then
+        // names a dead window whose drop is ignored — the same honesty the
+        // engine's read registration has there.
+        let _ = self.ring.retain(self.window);
+        Self {
+            ring: Arc::clone(&self.ring),
+            buffer: self.buffer,
+            window: self.window,
+            mapped: self.mapped,
+        }
+    }
 }
 
 impl std::fmt::Debug for StagedSlice {
@@ -112,12 +138,6 @@ impl StagedSlice {
     /// reference. The submission's retire releases it.
     pub fn retain_for_submission(&self) -> bool {
         self.ring.retain(self.window)
-    }
-
-    /// The fact died without a submission reading it (an invalid plan, a
-    /// declined draw): give its own reference back.
-    pub fn release_fact(&self) {
-        self.ring.release(self.window);
     }
 }
 
@@ -170,6 +190,7 @@ pub(crate) unsafe fn ensure_installed(ctx: &DeviceContext) {
                 buffer,
                 memory,
                 mapped: mapped as usize,
+                bind_align: align,
             }),
             Err(e) => {
                 crate::observe::fail(format!(
@@ -184,7 +205,6 @@ pub(crate) unsafe fn ensure_installed(ctx: &DeviceContext) {
             }
         }
     }
-    let _ = align;
     crate::runtime::drain::note_store_route("pass_stage_arenas_installed");
     *ARENAS.write().unwrap_or_else(|e| e.into_inner()) = Some(built.into());
 }
@@ -280,7 +300,7 @@ pub(crate) fn reset_lost() {
 /// The R/B exchange folds into the worker's memcpy (`swap_rb`), so a staged
 /// seed is already in the attachment's physical order and the engine records
 /// only the buffer→image copy.
-pub(crate) struct SeedStageCell {
+pub struct SeedStageCell {
     state: std::sync::Mutex<SeedStageState>,
 }
 
@@ -299,12 +319,9 @@ enum SeedStageState {
 
 impl Drop for SeedStageCell {
     fn drop(&mut self) {
-        // The fact's reference. A consumed seed left `Spent`; the submission
-        // that read the window holds its own.
-        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        if let SeedStageState::Staged(slice) = state {
-            slice.release_fact();
-        }
+        // Nothing to do: a `Staged` state's slice owns its reference and
+        // releases it as the state drops. A consumed seed left `Spent`, and
+        // the submission that read the window holds its own reference.
     }
 }
 
@@ -343,9 +360,9 @@ impl SeedStageCell {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match *state {
             SeedStageState::Staging => *state = SeedStageState::Staged(slice),
-            // A consumer arrived mid-copy and went serial; the window is
-            // unused, so its own reference goes back.
-            SeedStageState::Spent => slice.release_fact(),
+            // A consumer arrived mid-copy and went serial; the slice drops
+            // here and its own reference goes back with it.
+            SeedStageState::Spent => {}
             _ => unreachable!("a staging worker owns the cell"),
         }
     }
@@ -376,6 +393,35 @@ impl SeedStageCell {
             SeedStageState::Pending { .. }
         )
     }
+}
+
+/// TEMP (lab, PASS_STAGE, tests): arenas over leaked host allocations, so
+/// the planning arms are driven on a machine with no GPU. `REIMS_VGPU_LAB_`
+/// sizing knobs are ignored here: the caller states the chunk, because the
+/// tests assert on exact exhaustion points.
+#[cfg(test)]
+pub(crate) fn install_test_arenas(count: usize, chunk: u64, chunks: usize) {
+    let mut built: Vec<WorkerArena> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let total = chunk.saturating_mul(chunks as u64) as usize;
+        let mapped: Box<[u8]> = vec![0u8; total].into_boxed_slice();
+        let leaked = Box::leak(mapped) as *mut [u8] as *mut u8;
+        built.push(WorkerArena {
+            ring: Arc::new(StagingRing::new(chunk, chunks)),
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            mapped: leaked as usize,
+            bind_align: 4,
+        });
+    }
+    *ARENAS.write().unwrap_or_else(|e| e.into_inner()) = Some(built.into());
+}
+
+/// TEMP (lab, PASS_STAGE, tests): drop the test arenas and check nothing was
+/// stranded: a non-zero flight is a fact that outlived its frame.
+#[cfg(test)]
+pub(crate) fn take_test_arenas() -> Option<Arc<[WorkerArena]>> {
+    ARENAS.write().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 /// Note the arenas' census deltas, as the `pass_stage_*` routes. Called from

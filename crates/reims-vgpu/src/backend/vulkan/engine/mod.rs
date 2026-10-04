@@ -29,7 +29,7 @@ mod host_ram;
 pub mod init_decline;
 mod linear_target_import;
 mod page_diff;
-mod pass_stage;
+pub(crate) mod pass_stage;
 mod pay_band;
 /// TEMP (lab, `REIMS_VGPU_LAB_PCACHE_SHARD`): per-pipeline-key warm pipeline
 /// caches. `pub(crate)` for the census window line only; everything else is
@@ -89,7 +89,8 @@ pub use types::{
     GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PipelineObjectIdentity,
     PrimitiveTopology, SampledByteOrigin, SampledContentIdentity, SampledImageResource,
     SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
-    SeedOrder, StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
+    SeedOrder, StagedSampled, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
+    StorageImageFormat,
     TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource,
     VertexStepFunction, ViewportResource, VisibilityResultMode, WindowPresentSource,
     COLOR_INPUT_BINDING,

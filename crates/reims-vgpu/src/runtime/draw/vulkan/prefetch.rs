@@ -654,5 +654,7 @@ fn variant_name(src: &SampledSourceRequest) -> &'static str {
         SampledSourceRequest::Target(..) => "target",
         SampledSourceRequest::GuestRuns(..) => "runs",
         SampledSourceRequest::Bytes(..) => "bytes",
+        // TEMP (lab, PASS_STAGE): the staged twin of the runs rail.
+        SampledSourceRequest::Staged(..) => "staged",
     }
 }

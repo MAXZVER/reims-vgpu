@@ -175,10 +175,20 @@ enum PrepItem {
         texture_ref: u32,
         resource: std::sync::Arc<crate::model::TaskResource>,
     },
-    /// TEMP (lab, PASS_PREP step 3): a buffer bind's warm rails.
+    /// TEMP (lab, PASS_PREP step 3): a buffer bind's warm rails. The offset
+    /// is the first bind of the chunk that named the reference (PASS_STAGE:
+    /// the staged arm reads one window, keyed by it).
     Buffer {
         buffer_ref: u32,
         resource: std::sync::Arc<crate::model::TaskResource>,
+        first_offset: u64,
+    },
+    /// TEMP (lab, PASS_STAGE, design 8.4): a CPU load seed armed on a
+    /// deferred draw now sitting in the recorder FIFO -- stage its bytes (R/B
+    /// exchange folded) into the job's arena, for the recorder to find at the
+    /// seed staging phase.
+    SeedStage {
+        cell: std::sync::Arc<crate::backend::vulkan::engine::pass_stage::SeedStageCell>,
     },
     /// TEMP (lab, PASS_PREP step 3): an indexed draw's index bind, planned
     /// under its exact `(ref, offset, need)` key.
@@ -336,6 +346,7 @@ impl<'a> PassPrep<'a> {
                     items.push(PrepItem::Buffer {
                         buffer_ref: bind.buffer_ref,
                         resource,
+                        first_offset: bind.offset,
                     });
                 }
             }
@@ -360,6 +371,20 @@ impl<'a> PassPrep<'a> {
             store_taken = true;
             items.push(PrepItem::StorePages { key });
         }
+        // TEMP (lab, PASS_STAGE): the seeds the drain armed since the last
+        // chunk -- cells of draws now sitting in the recorder FIFO. Only
+        // `Pending` cells are worth a job; a spent one is dropped.
+        let pending_seeds = pass_stage::take_pending_seeds();
+        let mut seed_jobs = 0;
+        for cell in &pending_seeds {
+            if cell.is_pending() {
+                seed_jobs += 1;
+                items.push(PrepItem::SeedStage {
+                    cell: std::sync::Arc::clone(cell),
+                });
+            }
+        }
+        crate::runtime::drain::note_store_route_n("pass_stage_seed_armed", seed_jobs);
         self.offered = end;
         if items.len() < 2 {
             // As with the stream prefetch: one ref gains nothing from the
@@ -410,33 +435,56 @@ impl<'a> PassPrep<'a> {
             std::sync::atomic::AtomicU64::new(sample_plan::memo_fill_chunk_limit());
         let scoped = pool.scope(state, &items, |st, env, item| {
             let mut host = env.host();
+            // TEMP (lab, PASS_STAGE): the job's own arena, when the rail may
+            // run on this thread.
+            let stager = pass_stage::stager_for(env);
             match item {
                 PrepItem::Sample {
                     texture_ref,
                     resource,
-                } => PrepOutcome::Sample(prefetch::plan_item(
-                    st,
-                    env,
-                    task_id,
-                    *texture_ref,
-                    resource.clone(),
-                    &memo_budget,
-                )),
+                } => {
+                    let mut outcome = prefetch::plan_item(
+                        st,
+                        env,
+                        task_id,
+                        *texture_ref,
+                        resource.clone(),
+                        &memo_budget,
+                    );
+                    // TEMP (lab, PASS_STAGE): the gather arms this plan serves
+                    // would CPU-stage at the engine; stage their windows
+                    // here, on this thread.
+                    if let Ok(plan) = &mut outcome {
+                        if let Some(stager) = stager.as_ref() {
+                            sample_plan::attach_staged(plan, stager);
+                        }
+                    }
+                    PrepOutcome::Sample(outcome)
+                }
                 PrepItem::Buffer {
                     buffer_ref,
                     resource,
+                    first_offset,
                 } => PrepOutcome::Buffer(buffer_plan::plan_buffer_rails(
                     st,
                     &mut host,
                     task_id,
                     *buffer_ref,
                     resource.clone(),
+                    *first_offset,
+                    stager.as_ref(),
                 )),
-                PrepItem::Index { info, .. } => {
-                    PrepOutcome::Buffer(buffer_plan::plan_index_content(st, &mut host, task_id, info))
-                }
+                PrepItem::Index { info, .. } => PrepOutcome::Buffer(
+                    buffer_plan::plan_index_content(st, &mut host, task_id, info, stager.as_ref()),
+                ),
                 PrepItem::StorePages { key } => {
                     PrepOutcome::Store(buffer_plan::plan_store_pages(st, &host, task_id, *key))
+                }
+                PrepItem::SeedStage { cell } => {
+                    if let Some(stager) = stager.as_ref() {
+                        pass_stage::stage_seed_job(stager, cell);
+                    }
+                    PrepOutcome::Store(None)
                 }
             }
         });
@@ -486,7 +534,17 @@ impl<'a> PassPrep<'a> {
                     match result {
                         Ok(PrepOutcome::Buffer(Ok(plan))) => {
                             crate::runtime::drain::note_store_route(buffer_plan::planned_route(&plan));
-                            buffer_rails.push(((task_id, *buffer_ref), plan));
+                            // TEMP (lab, PASS_STAGE): a staged plan answers one
+                            // exact bind; the rails answer every bind of the
+                            // reference.
+                            if plan.is_exact() {
+                                buffer_exacts.push((
+                                    (task_id, *buffer_ref, plan.exact_offset(), plan.exact_cap()),
+                                    plan,
+                                ));
+                            } else {
+                                buffer_rails.push(((task_id, *buffer_ref), plan));
+                            }
                         }
                         Ok(PrepOutcome::Buffer(Err(bail))) => {
                             crate::runtime::drain::note_store_route(buffer_plan::bail_route(bail))
@@ -512,6 +570,9 @@ impl<'a> PassPrep<'a> {
                         crate::runtime::drain::note_store_route("pass_prep_buf_planned_store");
                         store_plan = Some(plan);
                     }
+                }
+                PrepItem::SeedStage { .. } => {
+                    // The job's own census routes said what it did.
                 }
             }
         }
@@ -1655,4 +1716,126 @@ mod tests {
             "no pool, no preparation"
         );
     }
+
+/// TEMP (lab, PASS_STAGE): the staged buffer arm end to end. A cold,
+/// never-primed reference (every zero-copy rail refuses on this host) plans
+/// into a worker arena window, the commit serves `BufferContent::Staged`
+/// whose bytes are the serial ladder's `Bytes`, the census names both halves,
+/// and the frame's pop releases the window.
+#[test]
+fn a_cold_bind_stages_the_serial_bytes() {
+    let _stage = crate::runtime::par::staging::test_enable(true);
+    let _mode = test_mode(PassPrepMode::On);
+    crate::backend::vulkan::engine::pass_stage::install_test_arenas(1, 64 * 1024, 2);
+    // Sub-floor references (4 KiB against the 16 KiB zero-copy floor): the
+    // one population whose serial answer is provably the CPU read. Two of
+    // them, so the chunk's item list is worth a fork.
+    let specs = [(7u32, 0x1000u64), (8, 0x1000)];
+    let (mut planned_state, planned_host) = pooled_buffer_fixture(&specs);
+    let (mut serial_state, serial_host) = pooled_buffer_fixture(&specs);
+    // The binds: each draw names both refs at offset 0, so each ref's one
+    // staged window serves every draw.
+    let make_binds = |state: &DeviceState, host: &FakeHost| -> Vec<Vec<BufferBind>> {
+        [7u32, 8]
+            .iter()
+            .map(|&buffer_ref| {
+                vec![BufferBind {
+                    index: 0,
+                    buffer_ref,
+                    resource: Some(
+                        crate::runtime::objects::resolve_resource(state, host, 1, buffer_ref)
+                            .expect("bind resource"),
+                    ),
+                    offset: 0,
+                    attribute_stride: None,
+                }]
+            })
+            .collect()
+    };
+    let planned_binds = make_binds(&planned_state, &*planned_host);
+    let serial_binds = make_binds(&serial_state, &*serial_host);
+    // The serial arm first: no priming, so the ladder falls to its CPU read.
+    let mut serial_host = serial_host;
+    let serial_answers: Vec<_> = serial_binds
+        .iter()
+        .map(|one| {
+            let bind = one.first().expect("one bind per draw");
+            load_buffer_content(
+                &mut serial_state,
+                &mut *serial_host,
+                1,
+                bind.buffer_ref,
+                bind.resource.as_deref(),
+                bind.offset,
+                true,
+                None,
+            )
+            .expect("the serial ladder serves")
+        })
+        .collect();
+    for answer in &serial_answers {
+        assert!(
+            matches!(answer, crate::backend::vulkan::engine::BufferContent::Bytes(_)),
+            "the fixture's host refuses every zero-copy rail, so the serial arm reads CPU bytes"
+        );
+    }
+    let tables: Vec<DrawTables<'_>> = planned_binds
+        .iter()
+        .map(|one| DrawTables {
+            fragment: &[],
+            vertex: &[],
+            vertex_buffers: one.as_slice(),
+            fragment_buffers: &[],
+            indexed: None,
+        })
+        .collect();
+    let before_planned = store_route_count("pass_prep_buf_planned_staged");
+    let before_hit = store_route_count("pass_prep_buf_hit_staged");
+    let mut prep = PassPrep::open_with_chunk(&planned_state, 1, tables, 4).expect("opens");
+    for di in 0..2 {
+        prep.ahead(&planned_state, &FakeHost::new(), di);
+        let bind = planned_binds[di].first().expect("one bind per draw");
+        let served = load_buffer_content(
+            &mut planned_state,
+            &mut *planned_host,
+            1,
+            bind.buffer_ref,
+            bind.resource.as_deref(),
+            bind.offset,
+            true,
+            None,
+        )
+        .expect("the planned arm serves");
+        match &served {
+            crate::backend::vulkan::engine::BufferContent::Staged(slice) => {
+                // SAFETY: the fact is alive for this borrow.
+                let staged = unsafe { slice.bytes() };
+                match &serial_answers[di] {
+                    crate::backend::vulkan::engine::BufferContent::Bytes(b) => {
+                        assert_eq!(staged, &b[..], "draw {di}: the staged bytes are the serial ones");
+                    }
+                    other => panic!("draw {di}: serial answered {other:?}"),
+                }
+            }
+            other => panic!("draw {di}: the staged arm serves, got {other:?}"),
+        }
+    }
+    assert!(delta("pass_prep_buf_planned_staged", before_planned) >= 1);
+    assert!(delta("pass_prep_buf_hit_staged", before_hit) >= 1);
+    // The frame still holds the staged plan (it serves every draw); its pop
+    // is what releases the window.
+    let arenas = crate::backend::vulkan::engine::pass_stage::arenas().expect("installed");
+    assert!(arenas[0].ring.in_flight() >= 1, "the plan holds its window");
+    drop(prep);
+    assert_eq!(
+        arenas[0].ring.in_flight(),
+        0,
+        "the frame's pop releases every staged window"
+    );
+    drop(
+        crate::backend::vulkan::engine::pass_stage::take_test_arenas()
+            .expect("the test arenas are still installed"),
+    );
+    let _ = &mut planned_state;
+}
 }
