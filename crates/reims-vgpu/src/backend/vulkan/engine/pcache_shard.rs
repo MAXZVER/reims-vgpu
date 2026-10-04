@@ -109,12 +109,13 @@ const SHARD_MAX_WARM_BYTES: usize = 2 * 1024 * 1024;
 /// working sets.
 const SHARD_TOTAL_WARM_BYTES: usize = 32 * 1024 * 1024;
 
-/// TEMP (lab): `REIMS_VGPU_LAB_PCACHE_SHARD=on` enables this scheme. Latched;
-/// anything else (including unset, the default) keeps the byte-for-byte
-/// monolithic path.
+/// TEMP (lab): `REIMS_VGPU_LAB_PCACHE_SHARD=off` restores the byte-for-byte
+/// monolithic path. On by default (n200: per-boot compile 752/683 ms with the
+/// discarding monolith against 400 cold / 337-338 warm with shards, misses
+/// flat, no size pathology across boots).
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PCACHE_SHARD").is_ok_and(|v| v == "on"))
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PCACHE_SHARD").is_ok_and(|v| v != "off"))
 }
 
 /// TEMP (lab): total shard-directory bound — [`SHARD_TOTAL_WARM_BYTES`], or
