@@ -441,6 +441,30 @@ pub struct PendingWritebacks {
     gva_resources: std::collections::BTreeMap<GvaPlaneKey, GvaResourceState>,
     next_seq: u64,
     next_gva_generation: u64,
+    /// TEMP (lab PAY_DEFER): the one payment taken from the ledger whose rail
+    /// part is on the GPU and whose landing is still owed. See [`pay_deferred`].
+    deferred: DeferredSlot,
+}
+
+/// TEMP (lab PAY_DEFER): a payment taken from the ledger and begun, not landed.
+struct DeferredPay {
+    mapping_id: u32,
+    map_generation: u32,
+    target: ResidentTarget,
+    seen: crate::model::GuestWriteObservation,
+    pending: Box<dyn std::any::Any + Send + Sync>,
+}
+
+#[derive(Default)]
+struct DeferredSlot(Option<DeferredPay>);
+
+impl std::fmt::Debug for DeferredSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(d) => write!(f, "Deferred(mapping {})", d.mapping_id),
+            None => f.write_str("None"),
+        }
+    }
 }
 
 /// TEMP (lab): with `REIMS_VGPU_LAB_GPX` naming `mapping_id`, record each arm and
@@ -483,7 +507,20 @@ impl PendingWritebacks {
     /// Whether anything is owed at all — the check every reader makes, and the
     /// one that has to be free.
     pub fn is_empty(&self) -> bool {
-        self.debts.is_empty() && self.gva_debts.is_empty()
+        self.debts.is_empty() && self.gva_debts.is_empty() && self.deferred.0.is_none()
+    }
+
+    /// Whether `mapping_id`'s guest pages are still owed a frame: a debt, or a
+    /// payment begun and not landed (TEMP lab PAY_DEFER). A reader that cannot
+    /// pay — a planner on a pool thread — must not read those pages.
+    pub fn owes(&self, mapping_id: u32) -> bool {
+        self.debts.contains_key(&mapping_id)
+            || self.deferred.0.as_ref().is_some_and(|d| d.mapping_id == mapping_id)
+    }
+
+    /// TEMP (lab PAY_DEFER): the mapping a begun payment still owes its landing.
+    pub fn deferred_mapping(&self) -> Option<u32> {
+        self.deferred.0.as_ref().map(|d| d.mapping_id)
     }
 
     /// What `mapping_id` is owed, if anything.
@@ -1068,6 +1105,8 @@ pub fn lab_pay_after_stamp<M: HostMemory + HostOps>(
 ) {
     use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
     static YIELDS: AtomicU32 = AtomicU32::new(0);
+    // TEMP (lab PAY_DEFER): the previous tail payment, if its compare is done.
+    land_deferred_if_ready(state, host);
     let mapping_id = LAB_PAY_AFTER_STAMP.swap(0, Relaxed);
     if mapping_id != 0 && guest_waiting && lab_pay_after_yield() {
         if YIELDS.fetch_add(1, Relaxed) < LAB_PAY_AFTER_MAX_YIELDS {
@@ -1100,7 +1139,11 @@ pub fn lab_pay_after_stamp<M: HostMemory + HostOps>(
     }
     if let Some(debt) = state.pending_writebacks.take(mapping_id) {
         LAST_US.store(now, Relaxed);
-        pay(state, host, mapping_id, debt, "wbdebt_paid_after_stamp");
+        if lab_pay_defer() {
+            pay_deferred(state, host, mapping_id, debt, "wbdebt_paid_after_stamp");
+        } else {
+            pay(state, host, mapping_id, debt, "wbdebt_paid_after_stamp");
+        }
     }
 }
 
@@ -1207,6 +1250,10 @@ pub fn pay_for_mapping<M: HostMemory + HostOps>(
     if state.pending_writebacks.is_empty() {
         return;
     }
+    if state.pending_writebacks.deferred_mapping() == Some(mapping_id) {
+        crate::runtime::drain::note_store_route("lab_pay_defer_named");
+        land_deferred(state, host);
+    }
     let Some(debt) = state.pending_writebacks.take(mapping_id) else {
         return;
     };
@@ -1238,6 +1285,7 @@ pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
     if state.pending_writebacks.is_empty() {
         return;
     }
+    land_deferred(state, host); // TEMP (lab PAY_DEFER): an unnamed reader may alias it
     for mapping_id in state.pending_writebacks.mappings_by_age() {
         let Some(debt) = state.pending_writebacks.take(mapping_id) else {
             continue;
@@ -1615,6 +1663,10 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
     // for each costs a map lookup and cannot pay the wrong surface.
     let targets = state.mappings_named_by(task_id, texture_ref);
     for mapping_id in targets.iter() {
+        if state.pending_writebacks.deferred_mapping() == Some(mapping_id) {
+            crate::runtime::drain::note_store_route("lab_pay_defer_named");
+            land_deferred(state, host); // TEMP (lab PAY_DEFER)
+        }
         if state.pending_writebacks.get(mapping_id).is_some() {
             if lab_pay_block(mapping_id) {
                 continue;
@@ -2361,6 +2413,133 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
 ///   leaks per occurrence. `wbdebt_generation_moved` is how a boot says how many;
 ///   a reading above single digits is the signal to carry the arm's whole
 ///   identity rather than the four integers that re-derive it.
+/// TEMP (lab): `REIMS_VGPU_LAB_PAY_DEFER=on` — the payment of a presented frame
+/// after its stamp ([`lab_pay_after_stamp`]) stops once the changed-pages compare
+/// is on the GPU; the landing runs at the next payment of any kind, the next
+/// tranche end, before a map-family command, or when a reader names the mapping
+/// ([`pay_for_mapping`], [`pay_for_texture`], [`pay_all`]). n177/n179: the tail
+/// payments are ~20 % of the drain, half of it the fence wait for the frame's
+/// draws to finish; without them the glass scene ran +10 % (ceiling arm).
+/// Latched.
+pub fn lab_pay_defer() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_PAY_DEFER").is_ok_and(|v| v == "on");
+        crate::observe::off(format!("lab_pay_defer on={on}"));
+        on
+    })
+}
+
+/// TEMP (lab PAY_DEFER): [`pay`], leaving the landing owed when the rail can
+/// defer it. Lands a payment already begun first: one at a time.
+fn pay_deferred<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    debt: WritebackDebt,
+    route: &'static str,
+) {
+    land_deferred(state, host);
+    let Some(entry) = state.mappings.get(&mapping_id) else {
+        crate::runtime::drain::note_store_route("wbdebt_generation_moved");
+        lab_pay_exit(mapping_id, &debt, "no_mapping");
+        return;
+    };
+    let (map_generation, validity) = (entry.map_generation, entry.validity);
+    if map_generation != debt.map_generation {
+        crate::runtime::drain::note_store_route("wbdebt_generation_moved");
+        lab_pay_exit(mapping_id, &debt, "generation_moved");
+        return;
+    }
+    let rail = crate::backend::selected();
+    if crate::runtime::resource_validity::licence_of(validity)
+        == crate::runtime::resource_validity::WritebackLicence::Superseded
+    {
+        crate::runtime::drain::note_store_route("wbdebt_abandoned_guest_wrote");
+        lab_pay_exit(mapping_id, &debt, "abandoned_guest_wrote");
+        rail.abandon_resident(&debt.target);
+        return;
+    }
+    lab_pay_exit(mapping_id, &debt, "paying");
+    crate::runtime::drain::note_store_route(route);
+    let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);
+    match rail.begin_surface_writeback(
+        state,
+        host,
+        mapping_id,
+        &debt.target,
+        debt.width,
+        debt.height,
+    ) {
+        crate::backend::SurfacePay::Paid(paid) => {
+            if !paid {
+                crate::observe::fail(format!(
+                    "wbdebt_pay_lost mapping={mapping_id} {}x{} reason=store_refused",
+                    debt.width, debt.height
+                ));
+            }
+            crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
+        }
+        crate::backend::SurfacePay::Deferred(pending) => {
+            state.pending_writebacks.deferred.0 = Some(DeferredPay {
+                mapping_id,
+                map_generation,
+                target: debt.target.clone(),
+                seen,
+                pending,
+            });
+        }
+    }
+}
+
+/// TEMP (lab PAY_DEFER): land the payment [`pay_deferred`] began, if any —
+/// unless the mapping it was for moved on meanwhile (gone, re-mapped, or the
+/// guest declared its own copy newer), which drops it as [`pay`] would have
+/// refused it.
+pub fn land_deferred<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
+    let Some(d) = state.pending_writebacks.deferred.0.take() else {
+        return;
+    };
+    let rail = crate::backend::selected();
+    let live = state.mappings.get(&d.mapping_id).map(|m| (m.map_generation, m.validity));
+    match live {
+        Some((generation, validity))
+            if generation == d.map_generation
+                && crate::runtime::resource_validity::licence_of(validity)
+                    != crate::runtime::resource_validity::WritebackLicence::Superseded =>
+        {
+            let _span = crate::runtime::chain_phase::CostSpan::new("lab_pay_defer_land_us");
+            if !rail.land_surface_writeback(state, host, d.pending) {
+                crate::observe::fail(format!(
+                    "wbdebt_pay_lost mapping={} reason=deferred_store_refused",
+                    d.mapping_id
+                ));
+            }
+            crate::runtime::mapper::commit_guest_write_stamp(state, d.mapping_id, d.seen);
+        }
+        _ => {
+            crate::runtime::drain::note_store_route("lab_pay_defer_dropped");
+            drop(d.pending);
+            rail.abandon_resident(&d.target);
+        }
+    }
+}
+
+/// TEMP (lab PAY_DEFER): [`land_deferred`] when the begun payment's GPU part has
+/// finished — the tranche-end call, which must not wait for the GPU.
+pub fn land_deferred_if_ready<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
+    let ready = state
+        .pending_writebacks
+        .deferred
+        .0
+        .as_ref()
+        .is_some_and(|d| crate::backend::selected().surface_writeback_ready(&*d.pending));
+    if ready {
+        land_deferred(state, host);
+    }
+}
+
 fn pay<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2368,6 +2547,8 @@ fn pay<M: HostMemory + HostOps>(
     debt: WritebackDebt,
     route: &'static str,
 ) {
+    // TEMP (lab PAY_DEFER): the page-diff state is one; a begun payment lands first.
+    land_deferred(state, host);
     let Some(entry) = state.mappings.get(&mapping_id) else {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
         lab_pay_exit(mapping_id, &debt, "no_mapping");

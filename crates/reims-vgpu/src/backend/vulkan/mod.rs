@@ -540,6 +540,56 @@ impl Backend for VulkanBackend {
         paid
     }
 
+    fn begin_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        mapping_id: u32,
+        target: &crate::runtime::resident_target::ResidentTarget,
+        width: u32,
+        height: u32,
+    ) -> crate::backend::SurfacePay {
+        use crate::runtime::render_writeback::vulkan::BeginStore;
+        let Some(identity) = target.get::<engine::TargetIdentity>() else {
+            return crate::backend::SurfacePay::Paid(false);
+        };
+        match crate::runtime::render_writeback::vulkan::begin_render_frame(
+            state, host, mapping_id, identity, width, height,
+        ) {
+            BeginStore::Deferred(d) => crate::backend::SurfacePay::Deferred(Box::new(d)),
+            BeginStore::Done(paid) => {
+                if !paid {
+                    engine::note_resident_content_copied_out(identity);
+                }
+                crate::backend::SurfacePay::Paid(paid)
+            }
+        }
+    }
+
+    fn surface_writeback_ready(&self, pending: &(dyn std::any::Any + Send + Sync)) -> bool {
+        pending
+            .downcast_ref::<crate::runtime::render_writeback::vulkan::DeferredStore>()
+            .is_none_or(|d| d.ready())
+    }
+
+    fn land_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        pending: Box<dyn std::any::Any + Send + Sync>,
+    ) -> bool {
+        let Ok(d) = pending.downcast::<crate::runtime::render_writeback::vulkan::DeferredStore>()
+        else {
+            return false;
+        };
+        let identity = d.identity.clone();
+        let paid = crate::runtime::render_writeback::vulkan::land_render_frame(state, host, *d);
+        if !paid {
+            engine::note_resident_content_copied_out(&identity);
+        }
+        paid
+    }
+
     fn abandon_resident(&self, target: &crate::runtime::resident_target::ResidentTarget) {
         if let Some(identity) = target.get::<engine::TargetIdentity>() {
             engine::note_resident_content_copied_out(identity);

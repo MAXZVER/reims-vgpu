@@ -228,6 +228,15 @@ pub enum ObjectRetirement {
     NotRetained,
 }
 
+/// TEMP (lab PAY_DEFER): what [`Backend::begin_surface_writeback`] did with a
+/// payment — paid it (`true` when the guest's pages hold the frame), or put the
+/// rail's part on the GPU and handed back what landing it needs, opaque to the
+/// neutral ledger.
+pub enum SurfacePay {
+    Paid(bool),
+    Deferred(Box<dyn std::any::Any + Send + Sync>),
+}
+
 pub(crate) trait Backend: Copy {
     /// What this backend calls itself on the fail channel and in QEMU's trace.
     ///
@@ -1028,6 +1037,38 @@ pub(crate) trait Backend: Copy {
         _target: &ResidentTarget,
         _width: u32,
         _height: u32,
+    ) -> bool {
+        false
+    }
+
+    /// TEMP (lab PAY_DEFER): [`Self::pay_surface_writeback`] that may stop once
+    /// the rail's part is on the GPU, leaving the landing to
+    /// [`Self::land_surface_writeback`]. A rail that cannot defer pays here.
+    fn begin_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        mapping_id: u32,
+        target: &ResidentTarget,
+        width: u32,
+        height: u32,
+    ) -> SurfacePay {
+        SurfacePay::Paid(self.pay_surface_writeback(state, host, mapping_id, target, width, height))
+    }
+
+    /// TEMP (lab PAY_DEFER): whether a deferred payment's GPU part has finished,
+    /// so landing it would not wait.
+    fn surface_writeback_ready(&self, _pending: &(dyn std::any::Any + Send + Sync)) -> bool {
+        true
+    }
+
+    /// TEMP (lab PAY_DEFER): land what [`Self::begin_surface_writeback`] deferred;
+    /// `false` as for [`Self::pay_surface_writeback`].
+    fn land_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _pending: Box<dyn std::any::Any + Send + Sync>,
     ) -> bool {
         false
     }
@@ -1875,6 +1916,50 @@ impl Backend for SelectedBackend {
             Self::Vulkan(b) => {
                 b.pay_surface_writeback(state, host, mapping_id, target, width, height)
             }
+        }
+    }
+
+    fn begin_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        mapping_id: u32,
+        target: &ResidentTarget,
+        width: u32,
+        height: u32,
+    ) -> SurfacePay {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => {
+                b.begin_surface_writeback(state, host, mapping_id, target, width, height)
+            }
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => {
+                b.begin_surface_writeback(state, host, mapping_id, target, width, height)
+            }
+        }
+    }
+
+    fn surface_writeback_ready(&self, pending: &(dyn std::any::Any + Send + Sync)) -> bool {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => b.surface_writeback_ready(pending),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.surface_writeback_ready(pending),
+        }
+    }
+
+    fn land_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        pending: Box<dyn std::any::Any + Send + Sync>,
+    ) -> bool {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => b.land_surface_writeback(state, host, pending),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.land_surface_writeback(state, host, pending),
         }
     }
 

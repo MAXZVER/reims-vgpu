@@ -713,6 +713,7 @@ impl ResourcePools {
                         pending: None,
                         span: super::gpu_span::SlotSpan::Idle,
                         readback_span_armed: false,
+                        serial: 0,
                     });
                 }
                 Err(e) => {
@@ -1756,6 +1757,7 @@ impl ResourcePools {
             "current slot already owes cleanup"
         );
         self.slots[self.cur].pending = Some(cleanup);
+        self.slots[self.cur].serial = self.slots[self.cur].serial.wrapping_add(1);
         self.in_flight += 1;
         // The submission is now outstanding, and this is the one point both
         // submit paths reach — a batch flush and a lone draw's own submit. The
@@ -2189,6 +2191,55 @@ impl ResourcePools {
                 Err(e)
             }
         }
+    }
+
+    /// TEMP (lab PAY_DEFER): the submission [`Self::finish_entry_async`] parked
+    /// last — the one a caller that just submitted (its own entry or the batch
+    /// it appended to) wants to wait for later.
+    pub(crate) fn last_submission(&self) -> SubmissionToken {
+        SubmissionToken {
+            index: self.cur,
+            serial: self.slots.get(self.cur).map_or(0, |s| s.serial),
+        }
+    }
+
+    /// TEMP (lab PAY_DEFER): whether `token`'s submission has finished, without
+    /// waiting. A slot that no longer owes that submission's cleanup — retired,
+    /// which waits its fence first, or re-used under a newer serial — finished
+    /// it; one that still does answers with its fence.
+    pub(crate) unsafe fn submission_done(
+        &self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        token: SubmissionToken,
+    ) -> Result<bool, DrawError> {
+        let Some(slot) = self.slots.get(token.index) else {
+            return Ok(true); // a ring rebuilt since: the old one was drained first
+        };
+        if slot.serial != token.serial || slot.pending.is_none() {
+            return Ok(true);
+        }
+        ctx.device
+            .get_fence_status(slot.fence)
+            .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry))
+    }
+
+    /// TEMP (lab PAY_DEFER): wait for `token`'s submission without retiring the
+    /// ring — [`Self::wait_entry_fence`] for a submission whose fence may since
+    /// have been reset by a retire (then it had finished).
+    pub(crate) unsafe fn wait_submission(
+        &self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        token: SubmissionToken,
+    ) -> Result<(), DrawError> {
+        let Some(slot) = self.slots.get(token.index) else {
+            return Ok(());
+        };
+        if slot.serial != token.serial || slot.pending.is_none() {
+            return Ok(());
+        }
+        unsafe { self.wait_entry_fence(ctx, counters, slot.fence) }
     }
 
     /// Wait a single already-submitted entry fence WITHOUT retiring the ring.
@@ -6338,6 +6389,7 @@ mod recycle_tests {
             }),
             span: super::gpu_span::SlotSpan::Idle,
             readback_span_armed: false,
+            serial: 0,
         }
     }
 
@@ -6348,6 +6400,7 @@ mod recycle_tests {
             pending: None,
             span: super::gpu_span::SlotSpan::Idle,
             readback_span_armed: false,
+            serial: 0,
         }
     }
 

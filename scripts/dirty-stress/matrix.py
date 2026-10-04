@@ -14,7 +14,10 @@ G = 'REIMS_VGPU_LAB_'
 NAMED = {'STRESS_NAMED_ONLY': '1', 'STRESS_NONDB_HZ': '250'}
 HOLE = {'STRESS_HOLE': '25', 'STRESS_HOLE_US': '40'}
 RING = {'STRESS_RING': '1', 'STRESS_RING_SKIP': '30', 'STRESS_HOLE_US': '40'}
-WP = {G + 'DIRTY_WP': 'on', G + 'DIRTY_WP_MIN': '8', G + 'DIRTY_WP_STREAK': '2'}
+# Pinned to the queried path: a hashed set (DIRTY_HASH, the default since n178) is never protected, so these rows
+# would stop exercising WP. The mixed path is the `hash:` rows and `DEFAULTS + wp`.
+WP = {G + 'DIRTY_WP': 'on', G + 'DIRTY_WP_MIN': '8', G + 'DIRTY_WP_STREAK': '2', G + 'DIRTY_HASH': 'off'}
+WP0 = {k: v for k, v in WP.items() if k != G + 'DIRTY_HASH'}   # WP with the hash switch left to the row
 EXACT3 = {G + 'DIRTY_STEAL': 'on', G + 'GEN_MEMO': 'on', G + 'GEN_LOCKFREE': 'on'}
 cfgs = [
     ('off', {}, '0'),
@@ -58,6 +61,7 @@ cfgs = [
     ('wp + frontier + named, ring + hole=tail', dict(NAMED, **RING, **EXACT3, **WP, **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_FRONTIER': 'on', G + 'EPOCH_NAMED': 'on'}), '0'),
     ('CONTROL: wp protects without pausing the writers', dict(WP, STRESS_WP_NOPAUSE='1'), '>0'),
     ('DEFAULTS + wp: named model', dict(NAMED, **WP), '0'),
+    ('DEFAULTS + wp, hash by the cost model: named model', dict(NAMED, **WP0), '0'),
     ('DEFAULTS + wp: real ring protocol + hole=tail', dict(NAMED, **RING, **WP, **{G + 'DIRTY_HOLE': 'tail'}), '0'),
     ('wp nopause (writers never paused)', dict(WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_WP_NOPAUSE': 'on'}), '0'),
     ('wp nopause, every set (min 1), 1 clean sync', dict(WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_MIN': '1', G + 'DIRTY_WP_STREAK': '1'}), '0'),
@@ -82,8 +86,10 @@ cfgs = [
     ('DEFAULTS + wp nopause + wp_hole, settle_skip=off: ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_HOLE': 'on', G + 'DIRTY_SETTLE_SKIP': 'off'}), '0'),
     ('hash: every set hashed', {G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on'}, '0'),
     ('hash: cost model, named + exact3', dict(NAMED, **EXACT3, **{G + 'DIRTY_HASH': 'on'}), '0'),
-    ('hash: every set + wp nopause, ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on'}), '0'),
+    ('hash: every set + wp nopause, ring + hole=tail', dict(NAMED, **RING, **WP0, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on'}), '0'),
     ('hash: every set, small max (mixed), ring + hole=tail', dict(NAMED, **RING, **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on', G + 'DIRTY_HASH_MAX': '64'}), '0'),
+    ('hash=off: the queried path, named + exact3', dict(NAMED, **EXACT3, **{G + 'DIRTY_HASH': 'off'}), '0'),
+    ('hash=off + wp nopause: ring + hole=tail', dict(NAMED, **RING, **WP0, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_HASH': 'off'}), '0'),
     ('CONTROL hash: drain reads lagged', {'STRESS_DRAIN_LAGGED': '1', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on'}, '>0'),
 ]
 ORIGINAL = {G + 'DIRTY_STEAL': 'off', G + 'GEN_LOCKFREE': 'off', G + 'EPOCH_NAMED': 'off', G + 'DIRTY_HOLE': 'off'}

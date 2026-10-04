@@ -923,7 +923,7 @@ pub(crate) fn plan_ref_view_zero_copy<M: HostMemory + HostOps>(
     let window_key = crate::runtime::mapper::mapping_window_key_readonly(state, mid)
         .ok_or(SampleBail::ColdWindow)?;
     let plane = ref_view_plane(state, host, mid, view).ok_or(SampleBail::ZeroCopyDeclined)?;
-    if !state.pending_writebacks.is_empty() && state.pending_writebacks.get(mid).is_some() {
+    if !state.pending_writebacks.is_empty() && state.pending_writebacks.owes(mid) {
         return Err(SampleBail::OwedFrame);
     }
     if !sampled_gather_floor_admits(SampledFloorRail::RefTexture, plane.native, plane.span)
@@ -1012,7 +1012,7 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
     {
         return Err(SampleInvalid::Mapping);
     }
-    if !state.pending_writebacks.is_empty() && state.pending_writebacks.get(mid).is_some() {
+    if !state.pending_writebacks.is_empty() && state.pending_writebacks.owes(mid) {
         return Err(SampleInvalid::Debt);
     }
     let (base_off, span) = (plan.plane.base_off, plan.plane.span);

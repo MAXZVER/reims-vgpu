@@ -4091,7 +4091,8 @@ unsafe fn page_diff_submit(
     counters: &EngineCounters,
     between: impl FnOnce(),
     record: impl FnOnce(ash::vk::CommandBuffer),
-) -> Result<(), DrawError> {
+    wait: bool,
+) -> Result<pools::SubmissionToken, DrawError> {
     let ops = target_readback_ops();
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_submit_us"); // TEMP (lab)
     let appended = pools.batch_open_recording();
@@ -4144,6 +4145,9 @@ unsafe fn page_diff_submit(
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(&ctx.device, sealed);
     }
+    // The submission just parked — the batch's or this entry's own — named so a
+    // deferred payment (TEMP lab PAY_DEFER, `wait` false) can wait it later.
+    let token = pools.last_submission();
     drop(lab_span);
     if reap_after {
         let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_reap_us"); // TEMP (lab)
@@ -4153,10 +4157,12 @@ unsafe fn page_diff_submit(
         let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_between_us"); // TEMP (lab)
         between();
     }
-    let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_wait_us"); // TEMP (lab)
-    lab_spin_on_fence(ctx, fence);
-    pools.wait_entry_fence(ctx, counters, fence)?;
-    Ok(())
+    if wait {
+        let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_wait_us"); // TEMP (lab)
+        lab_spin_on_fence(ctx, fence);
+        pools.wait_entry_fence(ctx, counters, fence)?;
+    }
+    Ok(token)
 }
 
 /// TEMP (lab, `REIMS_VGPU_LAB_PAY_SPIN`): poll `fence` for up to the spin budget
@@ -4216,6 +4222,110 @@ pub fn read_target_changed_pages_with(
     force: &[u32],
     between: impl FnOnce(),
 ) -> Result<Option<ChangedPages>, DrawError> {
+    match read_target_changed_pages_inner(identity, mapping_id, key, force, between, false)? {
+        Some(CompareOutcome::Ready(changed)) => Ok(Some(changed)),
+        Some(CompareOutcome::Deferred(_)) => unreachable!("a synchronous compare is never deferred"),
+        None => Ok(None),
+    }
+}
+
+/// TEMP (lab PAY_DEFER): a page-diff compare submitted and not yet waited —
+/// everything [`finish_target_compare`] needs to wait it and answer exactly as
+/// [`read_target_changed_pages_with`] would have. Until it is finished (or
+/// dropped by its owner) no other compare may run: the page-diff buffers it
+/// will read the answer from are shared.
+pub struct CompareTicket {
+    token: pools::SubmissionToken,
+    device: u64,
+    identity: TargetIdentity,
+    pages: u64,
+    frame_bytes: u64,
+    full: bool,
+    one_trip: bool,
+    verify: bool,
+    band_mode: pay_band::PayBandMode,
+    band: pay_band::RowBand,
+    w: u32,
+    h: u32,
+    force: Vec<u32>,
+    read_access: pools::ResidentAccess,
+}
+
+enum CompareOutcome {
+    Ready(ChangedPages),
+    Deferred(CompareTicket),
+}
+
+/// TEMP (lab PAY_DEFER): [`read_target_changed_pages_with`] up to and including
+/// the compare's submit, without waiting it (`between` runs after the submit).
+/// `Ok(None)` is the same routing answer.
+pub fn submit_target_compare(
+    identity: &TargetIdentity,
+    mapping_id: u32,
+    key: (u32, u32, u32, u64),
+    force: &[u32],
+    between: impl FnOnce(),
+) -> Result<Option<CompareTicket>, DrawError> {
+    match read_target_changed_pages_inner(identity, mapping_id, key, force, between, true)? {
+        Some(CompareOutcome::Deferred(ticket)) => Ok(Some(ticket)),
+        Some(CompareOutcome::Ready(_)) => unreachable!("a deferred compare stops at the submit"),
+        None => Ok(None),
+    }
+}
+
+/// TEMP (lab PAY_DEFER): whether the compare `ticket` names has finished on the
+/// GPU (true too when nothing can be asked any more: the device went away).
+pub fn target_compare_done(ticket: &CompareTicket) -> bool {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let Ok(ctx) = owner.ensure(counters) else {
+        return true;
+    };
+    if ash::vk::Handle::as_raw(ctx.device.handle()) != ticket.device {
+        return true;
+    }
+    unsafe { pools.submission_done(ctx, counters, ticket.token) }.unwrap_or(true)
+}
+
+/// TEMP (lab PAY_DEFER): wait the compare `ticket` names and answer as
+/// [`read_target_changed_pages_with`] would have at its submit. `Ok(None)`: the
+/// device it ran on is gone, and nothing it computed can be read.
+pub fn finish_target_compare(ticket: &CompareTicket) -> Result<Option<ChangedPages>, DrawError> {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    if ash::vk::Handle::as_raw(ctx.device.handle()) != ticket.device {
+        return Ok(None);
+    }
+    let mut st_guard = page_diff::STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(st) = st_guard.as_mut().filter(|s| s.device == ticket.device) else {
+        return Ok(None);
+    };
+    {
+        let _lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_defer_wait_us"); // TEMP (lab)
+        unsafe { pools.wait_submission(ctx, counters, ticket.token)? };
+    }
+    unsafe { finish_compare_locked(ctx, pools, counters, st, ticket) }.map(Some)
+}
+
+fn read_target_changed_pages_inner(
+    identity: &TargetIdentity,
+    mapping_id: u32,
+    key: (u32, u32, u32, u64),
+    force: &[u32],
+    between: impl FnOnce(),
+    defer: bool,
+) -> Result<Option<CompareOutcome>, DrawError> {
     use ash::vk;
     use reims_vgpu_vulkan::memory::MemoryClass;
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_pd_lock_us"); // TEMP (lab)
@@ -4787,7 +4897,7 @@ pub fn read_target_changed_pages_with(
                 &[],
                 &[],
             );
-        })
+        }, !defer)
     };
     // TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND`): the shadow now equals the resident
     // as it was recorded when the compare ran, so no row differs from it — and
@@ -4806,7 +4916,49 @@ pub fn read_target_changed_pages_with(
             pools.registry_forget_paid(identity);
         }
     }
-    submitted?;
+    let token = submitted?;
+    let ticket = CompareTicket {
+        token,
+        device: device_handle,
+        identity: identity.clone(),
+        pages,
+        frame_bytes,
+        full,
+        one_trip,
+        verify,
+        band_mode,
+        band,
+        w,
+        h,
+        force: force.to_vec(),
+        read_access,
+    };
+    if defer {
+        return Ok(Some(CompareOutcome::Deferred(ticket)));
+    }
+    unsafe { finish_compare_locked(ctx, pools, counters, st, &ticket) }
+        .map(|changed| Some(CompareOutcome::Ready(changed)))
+}
+
+/// The half of a page-diff payment after its compare was submitted and waited:
+/// read the flags, take the second trip for the changed pages, and answer. Shared
+/// by the synchronous path and TEMP (lab PAY_DEFER) [`finish_target_compare`].
+unsafe fn finish_compare_locked(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &EngineCounters,
+    st: &mut page_diff::PageDiffState,
+    t: &CompareTicket,
+) -> Result<ChangedPages, DrawError> {
+    use ash::vk;
+    let identity = &t.identity;
+    let force: &[u32] = &t.force;
+    let (pages, frame_bytes, full, one_trip) = (t.pages, t.frame_bytes, t.full, t.one_trip);
+    let (band_mode, band, w, h, read_access) = (t.band_mode, t.band, t.w, t.h, t.read_access);
+    let flags = st.flags.as_ref().expect("ensured");
+    let hash_flags = if t.verify { st.hash_flags.as_ref() } else { None };
+    let out = st.out.as_ref().expect("ensured");
+    let (cur_b, out_b) = (st.cur.as_ref().expect("ensured").buffer, out.buffer);
     let _lab_post = crate::runtime::chain_phase::CostSpan::new("lab_pd_post_us"); // TEMP (lab)
     pools.registry_note_access(identity, read_access);
 
@@ -4893,6 +5045,7 @@ pub fn read_target_changed_pages_with(
                         &[],
                     );
                 },
+                true,
             )?;
         }
     }
@@ -4903,12 +5056,12 @@ pub fn read_target_changed_pages_with(
         changed.len() as u64 * page_diff::PAGE_BYTES
     };
     counters.note_target_read(n, TargetReadDelivery::Host);
-    Ok(Some(ChangedPages {
+    Ok(ChangedPages {
         pages: changed,
         frame_ptr: out.mapped,
         full,
         frame_bytes,
-    }))
+    })
 }
 
 /// Record a page-per-workgroup compare's dispatch over a frame of `pages`: all of

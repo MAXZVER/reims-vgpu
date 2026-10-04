@@ -1166,6 +1166,21 @@ struct CmdSlot {
     /// probes are armed by different callers and a slot can carry either, both
     /// or neither. Set by `readback_span_arm`, cleared by the read at retire.
     readback_span_armed: bool,
+    /// Submissions parked on this slot so far (`finish_entry_async`). With the
+    /// index it names one submission after its fence may have been reset: a
+    /// slot retired (no cleanup owed) or re-used (a newer serial) has finished
+    /// it. See [`SubmissionToken`].
+    serial: u64,
+}
+
+/// One submission, named so that its completion can be asked for after the
+/// ring may have retired its slot and reset the fence — which a raw
+/// `vk::Fence` cannot survive (TEMP lab PAY_DEFER: a payment's compare waited
+/// at the next tranche end instead of inside the one that submitted it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SubmissionToken {
+    index: usize,
+    serial: u64,
 }
 
 /// In-flight ring depth: the next draw/dispatch records + submits while

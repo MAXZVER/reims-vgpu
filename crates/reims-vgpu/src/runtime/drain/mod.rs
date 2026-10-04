@@ -6205,6 +6205,8 @@ fn apply_map_family<H: HostMemory + HostOps>(
     packet: &Packet,
     family: MapFamily,
 ) {
+    // TEMP (lab PAY_DEFER): a begun payment lands before any page moves under it.
+    crate::runtime::writeback_debt::land_deferred(state, host);
     // TEMP (lab): translations cached this tranche may name the pages moved.
     crate::runtime::gva_mem::lab_tlb::new_epoch();
     // Every branch below stamps the packet complete whatever it did with
