@@ -3442,15 +3442,21 @@ pub(crate) enum ColorSeed {
     Zero,
 }
 
-/// TEMP (lab, `REIMS_VGPU_LAB_ZERO_SEED=on`): a colour LOAD seed of all zeroes
-/// becomes a CLEAR to `[0; 4]` instead of a frame of zeroes read, converted and
-/// uploaded. Shared by the request builder and the Vulkan seed door.
+/// TEMP (lab, ZERO_SEED): a colour LOAD seed of all zeroes becomes a CLEAR to
+/// `[0; 4]` instead of a frame of zeroes read, converted and uploaded. Shared by
+/// the request builder and the Vulkan seed door.
+///
+/// On by default (hq034, AMD, 40 GB guest, 12 full-screen transitions, x2
+/// interleaved: 460-476 zero seeds, 5.0-5.4 GB, probed instead of read; frame
+/// gaps over 50 ms 38-39 against 52-56, p90 of the worst gap 264-300 ms against
+/// 343-361, WindowServer's delete waits -20 %, transition frames unchanged to
+/// the eye). `REIMS_VGPU_LAB_ZERO_SEED=off` restores the read.
 pub(crate) fn zero_seed_mode() -> bool {
     static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("REIMS_VGPU_LAB_ZERO_SEED").as_deref(),
-            Ok("on")
+            Ok("off")
         )
     })
 }
