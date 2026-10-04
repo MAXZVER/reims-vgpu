@@ -590,14 +590,11 @@ mod tests {
     }
 
     /// TEMP (lab, PASS_PREP step 3): a pooled device whose worker host reads
-    /// one leaked `FakeHost` — the drain's own host, borrowed — beside buffer
-    /// objects at `(ref, size)` over allocations starting at task GVA 0x4000.
-    /// The guest RAM behind the task's pages is one contiguous range, so a
-    /// window's `map_pages` answer is the same whichever arm walks it.
-    fn pooled_buffer_state(
-        host: &'static mut FakeHost,
-        specs: &[(u32, u64)],
-    ) -> DeviceState {
+    /// the drain's own host — passed mutable here, with the table's `ctx`
+    /// latched to its address (leaked by the caller so the address holds) —
+    /// beside buffer objects at `(ref, size)` over allocations starting at
+    /// task GVA 0x4000.
+    fn pooled_buffer_state(host: &mut FakeHost, specs: &[(u32, u64)]) -> DeviceState {
         use crate::protocol::endian::st32;
         use crate::runtime::decode::resource::{
             list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER,
@@ -608,8 +605,7 @@ mod tests {
             table.map_pages_stable = 1;
             table.read_gpa = Some(shim_read_gpa);
             table.ctx = host as *mut FakeHost as *mut std::os::raw::c_void;
-        });
-        let mut state = state;
+        });        let mut state = state;
         state.define_task(1, 0x1000, 2);
         assert!(state.set_object_list(1, 0, 64));
         for (n, &(buffer_ref, size)) in specs.iter().enumerate() {
@@ -653,7 +649,7 @@ mod tests {
         st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], root_pfn);
         st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
         assert!(host.write_gpa(dir_gpa, &dir).is_ok());
-        host.map_range(0x10000, 0xA000, 0x40);
+        host.map_range(0x10000, 0x24000, 0x40);
         for i in 0..36u32 {
             let pfn = 16 + i;
             let mut pte = [0u8; 4];
@@ -664,10 +660,12 @@ mod tests {
     }
 
     /// A complete buffer-fixture pair: the leaked host (the drain's, mutable)
-    /// and the pooled state whose workers read it.
+    /// and the pooled state whose workers read it. The leak happens first so
+    /// the table's `ctx` address holds for the device's life; the state is
+    /// built through a reborrow, leaving the leaked reference for the drain.
     fn pooled_buffer_fixture(specs: &[(u32, u64)]) -> (DeviceState, &'static mut FakeHost) {
-        let host = Box::leak(Box::new(buffer_host()));
-        let state = pooled_buffer_state(host, specs);
+        let host: &'static mut FakeHost = Box::leak(Box::new(buffer_host()));
+        let state = pooled_buffer_state(&mut *host, specs);
         (state, host)
     }
 
@@ -748,7 +746,7 @@ mod tests {
         // must not see the planned arm's plans.
         let serial_answers: Vec<_> = (0..pattern.len())
             .map(|di| {
-                let serial_bind = &serial_binds[di];
+                let serial_bind = serial_binds[di].first().expect("one bind per draw");
                 load_buffer_content(
                     &mut serial_state,
                     &mut *serial_host,
@@ -772,12 +770,12 @@ mod tests {
                 indexed: None,
             })
             .collect();
-        let before_planned = store_route_count("pass_prep_buf_planned_packed");
+        let before_planned = store_route_count("pass_prep_buf_planned_whole");
         let before_hit = store_route_count("pass_prep_buf_hit");
         let mut prep = PassPrep::open_with_chunk(&planned_state, 1, tables, 4).expect("opens");
         for di in 0..pattern.len() {
             prep.ahead(&planned_state, &FakeHost::new(), di);
-            let bind = &planned_binds[di];
+            let bind = planned_binds[di].first().expect("one bind per draw");
             let served = load_buffer_content(
                 &mut planned_state,
                 &mut *planned_host,
@@ -796,7 +794,10 @@ mod tests {
             );
         }
         drop(prep);
-        assert!(delta("pass_prep_buf_planned_packed", before_planned) >= 1);
+        // No import caps on the fixture host, so the packed construction
+        // refuses and the primes retain the whole runs: the chunks plan the
+        // whole rail. (The packed rail is the same shape one boot later.)
+        assert!(delta("pass_prep_buf_planned_whole", before_planned) >= 1);
         assert!(delta("pass_prep_buf_hit", before_hit) >= 1);
         assert_eq!(
             planned_state.bound_buffers.shape(),

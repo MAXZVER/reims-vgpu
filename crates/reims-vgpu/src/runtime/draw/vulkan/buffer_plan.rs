@@ -94,20 +94,6 @@ pub(crate) enum BufferBail {
     OffsetPastEnd,
 }
 
-impl BufferBail {
-    pub(crate) fn slug(self) -> &'static str {
-        match self {
-            Self::NullRef => "null_ref",
-            Self::ColdBacking => "cold_backing",
-            Self::ColdPacked => "cold_packed",
-            Self::ColdWhole => "cold_whole",
-            Self::ColdWindow => "cold_window",
-            Self::BelowFloor => "below_floor",
-            Self::OffsetPastEnd => "offset_past_end",
-        }
-    }
-}
-
 /// Why a plan was dropped at commit. The serial ladder serves the bind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BufferInvalid {
@@ -128,20 +114,6 @@ pub(crate) enum BufferInvalid {
     /// A rail above the planned one would answer the bind now — the serial
     /// answer's shape changed above this plan.
     UpperRung,
-}
-
-impl BufferInvalid {
-    pub(crate) fn slug(self) -> &'static str {
-        match self {
-            Self::Key => "key",
-            Self::Resource => "resource",
-            Self::Registry => "registry",
-            Self::Packed => "packed",
-            Self::Whole => "whole",
-            Self::Held => "held",
-            Self::UpperRung => "upper_rung",
-        }
-    }
 }
 
 /// The warm registry rail a planned bind serves.
@@ -791,7 +763,8 @@ pub(crate) enum Ask<T> {
     Serial,
 }
 
-/// The shadow prediction one bind holds while its serial ladder runs.
+// The shadow prediction one bind holds while its serial ladder runs. (A plain
+// comment: rustdoc does not document macro invocations.)
 thread_local! {
     static SHADOW: std::cell::RefCell<Option<ShadowHold>> =
         const { std::cell::RefCell::new(None) };
@@ -1201,7 +1174,7 @@ mod tests {
         // guest RAM behind them is ONE contiguous range, so a window's
         // `map_pages` answers the same stable alias whichever arm walks it —
         // separate per-page ranges would hand each walk its own bounce view.
-        host.map_range(0x10000, 0xA000, 0x40);
+        host.map_range(0x10000, 0x24000, 0x40);
         for i in 0..36u32 {
             let pfn = 16 + i;
             let mut pte = [0u8; 4];
@@ -1281,34 +1254,39 @@ mod tests {
         store_route_count(route).saturating_sub(before)
     }
 
-    /// A warm packed alias plans, commits to the serial ladder's answer, and
-    /// leaves the registry where the serial ladder leaves it.
+    /// A retained whole-allocation rail plans, commits to the serial ladder's
+    /// answer, and leaves the registry where the serial ladder leaves it.
+    ///
+    /// The fixture host has no Vulkan import caps, so the packed construction
+    /// refuses (a held negative) and the serial prime takes the whole walk —
+    /// exactly the shape the planner's rails cover. The packed-alias rail is
+    /// the same contract one boot later, where the caps exist.
     #[test]
-    fn a_packed_rail_plan_commits_to_the_serial_answer() {
+    fn a_whole_rail_plan_commits_to_the_serial_answer() {
         let (mut planned_state, mut planned_host) = buffer_fixture(&[(7, 0x8000)]);
         let (mut serial_state, mut serial_host) = buffer_fixture(&[(7, 0x8000)]);
         let resource = buffer_resource(&planned_state, &planned_host, 7);
-        // One serial bind on each arm constructs the packed alias.
+        // One serial bind on each arm walks and retains the whole runs.
         for (state, host) in [
             (&mut planned_state, &mut planned_host),
             (&mut serial_state, &mut serial_host),
         ] {
             let res = buffer_resource(state, host, 7);
             let _prime = load_buffer_content_serial(state, host, 1, 7, Some(&res), 0, true, None)
-                .expect("the serial ladder constructs the packed alias");
+                .expect("the serial ladder retains the whole runs");
         }
         let plan = plan_buffer_rails(&planned_state, &mut planned_host, 1, 7, resource.clone())
-            .expect("a warm packed alias plans");
+            .expect("a retained whole rail plans");
         assert!(
-            matches!(plan.rail, BufferRail::Packed { .. }),
-            "the primed alias answers the rail"
+            matches!(plan.rail, BufferRail::Whole { .. }),
+            "the primed whole runs answer the rail"
         );
         let _mode = super::super::pass_prep::test_mode(
             super::super::pass_prep::PassPrepMode::On,
         );
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans([((1, 7), plan)], [], None);
-        let before_hit = store_route_count("pass_prep_buf_hit_packed");
+        let before_hit = store_route_count("pass_prep_buf_hit_whole");
         let served = ask_buffer(
             &mut planned_state,
             1,
@@ -1318,15 +1296,16 @@ mod tests {
             Some(0x400),
         );
         let Ask::Serve(content) = served else {
-            panic!("a validated packed plan serves its bind");
+            panic!("a validated whole plan serves its bind");
         };
-        assert_eq!(delta("pass_prep_buf_hit_packed", before_hit), 1);
+        assert_eq!(delta("pass_prep_buf_hit_whole", before_hit), 1);
+        let serial_res = buffer_resource(&serial_state, &serial_host, 7);
         let serial = load_buffer_content_serial(
             &mut serial_state,
             &mut serial_host,
             1,
             7,
-            Some(buffer_resource(&serial_state, &serial_host, 7).as_ref()),
+            Some(serial_res.as_ref()),
             0x100,
             true,
             Some(0x400),
@@ -1339,7 +1318,7 @@ mod tests {
         assert_eq!(
             registry_shape(&planned_state),
             registry_shape(&serial_state),
-            "the packed rail moves no registry state"
+            "the whole rail moves no registry state"
         );
     }
 
@@ -1437,18 +1416,20 @@ mod tests {
         assert_eq!(registry_shape(&state), shape_before);
     }
 
-    /// The index bind's walked window: planned read-only on the drain host
-    /// (the shape a pool thread can only reach through the run memo), landed
-    /// at commit as the `BoundBufferHold` the serial walk inserts, and equal
-    /// to the serial ladder's answer and registry state.
+    /// The index bind's plan: the record's exact key holds a rail plan (the
+    /// whole runs here — no import caps in a unit test, so the packed alias
+    /// never constructs), committed at the point the serial loader resolves,
+    /// equal to the serial ladder's answer and registry state.
+    ///
+    /// The walked window — the arm whose commit lands the `BoundBufferHold` —
+    /// needs the exact window to be the arm the serial ladder takes, which on
+    /// this host it never is (no imports, so a bindable window is
+    /// gather-eligible and the whole rail already owns it); it stays a
+    /// pool-only shape, reached where the run memo answers a worker's walk.
     #[test]
-    fn an_index_window_plan_lands_the_serial_hold() {
-        // Sub-floor (below `ZERO_COPY_BUFFER_MIN_BYTES`) so the whole arm is
-        // skipped, and a hand-latched Unavailable packed answer so the
-        // construction is not re-run: the exact window is the arm both ladders
-        // take. The prime walks offset 0; the plan walks offset 0x100.
-        let (mut planned_state, mut planned_host) = buffer_fixture(&[(7, 0x2000)]);
-        let (mut serial_state, mut serial_host) = buffer_fixture(&[(7, 0x2000)]);
+    fn an_index_plan_commits_to_the_serial_answer() {
+        let (mut planned_state, mut planned_host) = buffer_fixture(&[(7, 0x8000)]);
+        let (mut serial_state, mut serial_host) = buffer_fixture(&[(7, 0x8000)]);
         let info = |offset: u64| IndexedDrawInfo {
             index_type: 0,
             index_count: 0x80,
@@ -1456,26 +1437,22 @@ mod tests {
             index_buffer_offset: offset,
             base_vertex: 0,
         };
+        // One serial index load per arm retains the whole runs.
         for (state, host) in [
             (&mut planned_state, &mut planned_host),
             (&mut serial_state, &mut serial_host),
         ] {
-            state.bound_buffers.insert_packed(
-                1,
-                7,
-                crate::runtime::bound_buffers::PackedBufferResolution::Unavailable {
-                    gva: 0x4000,
-                    size: 0x2000,
-                },
-            );
             let prime = info(0);
             let _ = load_index_content_reason_serial(state, host, 1, &prime)
-                .expect("the prime walks and holds offset 0");
+                .expect("the prime retains the whole runs");
         }
         let planned_info = info(0x100);
         let plan = plan_index_content(&planned_state, &mut planned_host, 1, &planned_info)
-            .expect("the exact window plans");
-        assert!(matches!(plan.rail, BufferRail::Walked { .. }));
+            .expect("the index bind plans");
+        assert!(
+            matches!(plan.rail, BufferRail::Whole { .. }),
+            "the retained whole runs answer the index bind"
+        );
         let _mode = super::super::pass_prep::test_mode(
             super::super::pass_prep::PassPrepMode::On,
         );
@@ -1488,21 +1465,20 @@ mod tests {
         let shape_before = registry_shape(&planned_state);
         let served = ask_index(&mut planned_state, &mut planned_host, 1, &planned_info);
         let Ask::Serve(content) = served else {
-            panic!("the walked plan serves");
+            panic!("the index plan serves");
         };
-        // The hold landed: one more entry than the prime left.
-        assert_eq!(
-            registry_shape(&planned_state).entries,
-            shape_before.entries + 1,
-            "the commit lands the BoundBufferHold"
-        );
         let serial = load_index_content_reason_serial(&mut serial_state, &mut serial_host, 1, &planned_info)
-            .expect("the serial ladder walks the same window");
+            .expect("the serial ladder serves the same bind");
         assert!(contents_agree(&content, &serial));
         assert_eq!(
-            registry_shape(&planned_state).entries,
-            registry_shape(&serial_state).entries,
-            "the hold the plan landed is the one the serial walk inserts"
+            registry_shape(&planned_state),
+            shape_before,
+            "the rail commit lands no hold"
+        );
+        assert_eq!(
+            registry_shape(&planned_state),
+            registry_shape(&serial_state),
+            "both arms leave the registry where the other does"
         );
     }
 
@@ -1541,65 +1517,43 @@ mod tests {
         assert!(pages.ordered == serial.ordered && pages.span == serial.span);
     }
 
-    /// A rail that appeared above the planned one is an `UpperRung`
-    /// invalidation: the serial ladder would answer from it, so the plan must
-    /// not answer past it.
+    /// A rail plan serves the binds its rail covers and falls past the ones it
+    /// does not: an offset at the end of the allocation is `Ok(None)` — the
+    /// plan stays in the frame, unspent — and the serial ladder reads the bind
+    /// on the CPU, exactly as it would without the plan.
+    ///
+    /// (The `UpperRung` invalidation of the exact arms needs a packed alias or
+    /// a whole rail to *appear* above the plan between plan and commit; on a
+    /// host with no import caps neither state is reachable from the serial
+    /// ladder, so it stays a defensive validation the shadow gate watches for
+    /// instead of a unit-tested one.)
     #[test]
-    fn an_appeared_packed_alias_drops_the_window_plan() {
-        let (mut state, mut host) = buffer_fixture(&[(7, 0x2000)]);
-        let (mut twin_state, mut twin_host) = buffer_fixture(&[(7, 0x2000)]);
-        // The shape that leaves the exact window as the arm both ladders
-        // take: a hand-latched Unavailable packed answer (the construction is
-        // not re-run) and a sub-floor remainder (the whole arm is skipped).
-        state.bound_buffers.insert_packed(
-            1,
-            7,
-            crate::runtime::bound_buffers::PackedBufferResolution::Unavailable {
-                gva: 0x4000,
-                size: 0x2000,
-            },
-        );
-        let info = IndexedDrawInfo {
-            index_type: 0,
-            index_count: 0x80,
-            index_buffer_ref: 7,
-            index_buffer_offset: 0,
-            base_vertex: 0,
-        };
-        let plan = plan_index_content(&state, &mut host, 1, &info).expect("the window plans");
-        assert!(matches!(plan.rail, BufferRail::Walked { .. }));
+    fn a_rail_plan_falls_past_a_past_end_offset() {
+        let (mut state, mut host) = buffer_fixture(&[(7, 0x8000)]);
+        let resource = buffer_resource(&state, &host, 7);
+        let _prime = load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
+            .expect("prime");
+        let plan = plan_buffer_rails(&state, &mut host, 1, 7, resource.clone()).expect("plans");
+        assert!(matches!(plan.rail, BufferRail::Whole { .. }));
         let _mode = super::super::pass_prep::test_mode(
             super::super::pass_prep::PassPrepMode::On,
         );
         let _frame = prefetch::push_empty_frame();
-        merge_buffer_plans([], [(index_key(1, &info).unwrap(), plan)], None);
-        // The alias appears between the plan and the commit — the shape a
-        // serial construction of the same reference produces on a later draw.
-        // Built on the twin and moved in, because retiring or re-constructing
-        // on this state would move the generation the commit also checks.
-        let twin_res = buffer_resource(&twin_state, &twin_host, 7);
-        let _ = load_buffer_content_serial(&mut twin_state, &mut twin_host, 1, 7, Some(&twin_res), 0, true, None)
-            .expect("the twin constructs the alias");
-        let packed = match twin_state.bound_buffers.packed(1, 7) {
-            Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(p)) => {
-                p.clone()
-            }
-            _ => panic!("the twin's serial load constructs an available alias"),
-        };
-        state.bound_buffers.insert_packed(
-            1,
-            7,
-            crate::runtime::bound_buffers::PackedBufferResolution::Available(packed),
-        );
-        let before = store_route_count("pass_prep_buf_invalid_upper_rung");
-        let served = ask_index(&mut state, &mut host, 1, &info);
-        assert!(matches!(served, Ask::Serial));
-        assert_eq!(delta("pass_prep_buf_invalid_upper_rung", before), 1);
-        let serial =
-            load_index_content_reason_serial(&mut state, &mut host, 1, &info).expect("serves");
+        merge_buffer_plans([((1, 7), plan)], [], None);
+        // A bind the rail covers still serves.
+        let covered = ask_buffer(&mut state, 1, 7, Some(resource.as_ref()), 0x40, None);
+        assert!(matches!(covered, Ask::Serve(_)));
+        // A bind past the allocation's end is not the rail's to answer: no
+        // invalidation, no hit, the serial ladder's own past-end refusal.
+        let before_invalid = store_route_count("pass_prep_buf_invalid_key");
+        let past_end = ask_buffer(&mut state, 1, 7, Some(resource.as_ref()), 0x8000, None);
         assert!(
-            matches!(serial, crate::backend::vulkan::engine::BufferContent::GuestRuns(_)),
-            "the serial ladder answers from the appeared alias"
+            matches!(past_end, Ask::Serial),
+            "a past-end offset is not the rail's bind"
         );
+        assert_eq!(delta("pass_prep_buf_invalid_key", before_invalid), 0);
+        // The plan survives: another covered bind still serves from it.
+        let again = ask_buffer(&mut state, 1, 7, Some(resource.as_ref()), 0x80, None);
+        assert!(matches!(again, Ask::Serve(_)));
     }
 }
