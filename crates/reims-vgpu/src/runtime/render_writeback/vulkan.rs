@@ -560,6 +560,9 @@ struct LandJob {
     done: std::sync::Arc<LandDone>,
     /// Mapping-linear `[lo, hi)` runs copied, for the footprint marks.
     runs: Vec<(u64, u64)>,
+    /// Page runs this landing mapped itself (`(ptr, len)`), unmapped by the drain
+    /// once the copy is in; empty when it wrote through the mapping's packed view.
+    mapped: Vec<(usize, usize)>,
     frame_len: usize,
     pages: usize,
     full: bool,
@@ -595,7 +598,14 @@ impl LandJob {
     }
 
     /// Hand `spans` to the landing thread (started on first use).
-    fn spawn(spans: LandSpans, runs: Vec<(u64, u64)>, frame_len: usize, pages: usize, full: bool) -> Self {
+    fn spawn(
+        spans: LandSpans,
+        runs: Vec<(u64, u64)>,
+        mapped: Vec<(usize, usize)>,
+        frame_len: usize,
+        pages: usize,
+        full: bool,
+    ) -> Self {
         use std::sync::{mpsc, Mutex, OnceLock};
         static TX: OnceLock<Mutex<mpsc::Sender<(LandSpans, std::sync::Arc<LandDone>)>>> =
             OnceLock::new();
@@ -637,13 +647,18 @@ impl LandJob {
             }
             done.flag.store(true, std::sync::atomic::Ordering::Release);
         }
-        Self { done, runs, frame_len, pages, full }
+        Self { done, runs, mapped, frame_len, pages, full }
     }
 }
 
 impl Drop for LandJob {
     fn drop(&mut self) {
         self.wait();
+        if !self.mapped.is_empty() {
+            // Abandoned before `complete_landing` (a stale landing): its views stay
+            // mapped. Rare, and named so it cannot grow unseen.
+            crate::runtime::drain::note_store_route_n("lab_pay_defer_views_leaked", self.mapped.len() as u64);
+        }
     }
 }
 
@@ -838,7 +853,7 @@ fn step_render_frame<M: HostMemory + HostOps>(
                     return None;
                 }
                 job.wait();
-                return Some(complete_landing(state, d, job));
+                return Some(complete_landing(state, host, d, job));
             }
             Stage::Taken => return Some(false),
         }
@@ -922,6 +937,7 @@ fn start_landing_copy<M: HostMemory + HostOps>(
         return None;
     }
     let need_end = base_off + changed.frame_bytes;
+    let src_base = changed.frame_ptr as usize;
     // `write_mapping_bytes_only`'s prologue, in its order.
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
@@ -933,37 +949,96 @@ fn start_landing_copy<M: HostMemory + HostOps>(
     if !vouched.covers(state, mapping_id) {
         return None; // the synchronous landing reports it
     }
-    let (ptr, view_len) = crate::runtime::mapper::ensure_contig_view(state, host, mapping_id)?;
-    if (view_len as u64) < need_end {
-        return None;
-    }
+    let mut mapped: Vec<(usize, usize)> = Vec::new();
+    let view = crate::runtime::mapper::ensure_contig_view(state, host, mapping_id)
+        .filter(|&(_, len)| len as u64 >= need_end);
+    let spans: LandSpans = match view {
+        // One packed view covers the frame: `copy_mapping_runs`' fast path.
+        Some((ptr, _)) => runs
+            .iter()
+            .map(|&(lo, hi)| (ptr + lo as usize, src_base + (lo - base_off) as usize, (hi - lo) as usize))
+            .collect(),
+        // Scattered pages: map only the page runs the selection touches, as
+        // `par_land_write` does, and keep them mapped until the copy is in.
+        None => {
+            if !host.map_pages_stable() {
+                return None;
+            }
+            let gpas = crate::runtime::mapper::mapping_page_gpas(state, host, mapping_id)?;
+            let page_size = state.page_size();
+            if need_end > (gpas.len() as u64).saturating_mul(page_size) {
+                return None;
+            }
+            crate::runtime::mapper::flush_retired_views(state, host);
+            let page_runs = reims_vgpu_paging::runs::contig_page_runs(&gpas, page_size);
+            let mut spans: LandSpans = Vec::new();
+            let mut first = 0usize; // the first selected run that may still meet a page run
+            for pr in &page_runs {
+                let run_mlo = (pr.start as u64).saturating_mul(page_size);
+                let run_mhi = (pr.end as u64).saturating_mul(page_size);
+                while first < runs.len() && runs[first].1 <= run_mlo {
+                    first += 1;
+                }
+                let mut ptr = None;
+                let mut i = first;
+                while i < runs.len() && runs[i].0 < run_mhi {
+                    let (a, b) = (runs[i].0.max(run_mlo), runs[i].1.min(run_mhi));
+                    if a < b {
+                        let base = match ptr {
+                            Some(base) => base,
+                            None => {
+                                let Some(base) = host.map_pages(&gpas[pr.clone()], page_size as usize)
+                                else {
+                                    for &(p, len) in &mapped {
+                                        host.unmap_pages(p, len);
+                                    }
+                                    return None;
+                                };
+                                mapped.push((base, (pr.end - pr.start) * page_size as usize));
+                                ptr = Some(base);
+                                base
+                            }
+                        };
+                        spans.push((
+                            base + (a - run_mlo) as usize,
+                            src_base + (a - base_off) as usize,
+                            (b - a) as usize,
+                        ));
+                    }
+                    i += 1;
+                }
+            }
+            crate::runtime::drain::note_store_route("lab_pay_defer_copy_runs");
+            spans
+        }
+    };
     // `copy_mapping_runs`' host-write note, before any byte moves.
     state.note_host_wrote_mapping_selected(mapping_id, &runs, base_off, need_end);
     // A draw the recorder still holds may read these pages.
     crate::backend::settle_deferred_draws_for_guest_write();
-    let spans: LandSpans = runs
-        .iter()
-        .map(|&(lo, hi)| {
-            (
-                ptr + lo as usize,
-                changed.frame_ptr as usize + (lo - base_off) as usize,
-                (hi - lo) as usize,
-            )
-        })
-        .collect();
     crate::runtime::drain::note_store_route("lab_pay_defer_copy_async");
     Some(LandJob::spawn(
         spans,
         runs,
+        mapped,
         changed.frame_bytes as usize,
         changed.pages.len(),
         changed.full,
     ))
 }
 
-/// The landing copy is in: [`land_changed_pages`]' bookkeeping.
-fn complete_landing(state: &mut DeviceState, d: &DeferredStore, job: LandJob) -> bool {
+/// The landing copy is in: [`land_changed_pages`]' bookkeeping, and the views it
+/// mapped unmapped.
+fn complete_landing<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    d: &DeferredStore,
+    mut job: LandJob,
+) -> bool {
     let mapping_id = d.mapping_id;
+    for (p, len) in std::mem::take(&mut job.mapped) {
+        host.unmap_pages(p, len);
+    }
     for &(lo, hi) in &job.runs {
         crate::runtime::mapper::note_mapping_write_footprint(state, mapping_id, lo, hi - lo);
     }
