@@ -9367,6 +9367,25 @@ pub(super) fn prepare_vertex_step_function(
     })
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_ZERO_SEED=on`): a colour LOAD seed of all zeroes
+/// becomes a CLEAR to `[0; 4]` instead of a staged upload of the frame.
+pub(super) fn zero_seed_mode() -> bool {
+    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        matches!(
+            std::env::var("REIMS_VGPU_LAB_ZERO_SEED").as_deref(),
+            Ok("on")
+        )
+    })
+}
+
+/// Every byte of `seed` zero, asked a 4 KiB block at a time so a seed with
+/// content leaves at its first non-zero block.
+pub(super) fn seed_is_zero(seed: &[u8]) -> bool {
+    seed.chunks(4096)
+        .all(|block| block.iter().fold(0u8, |acc, &b| acc | b) == 0)
+}
+
 /// Discharge [`DrawEncodeRequest::gva_load_from_resident`]: either chain colour0's
 /// LOAD off the engine resident, or put the CPU seed back.
 ///
@@ -11317,6 +11336,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .first_mut()
             .and_then(|c| c.target_seed_rgba.take());
         let mut color0_seed_consumed = false;
+        let mut zero_seed_cleared = false;
         if let Some(c0) = req.colors.first() {
             // Out of contract is DontCare here, same as on the Metal arm, and
             // it says so through the same helper — this arm used to take an
@@ -11425,7 +11445,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             // frame; off mode keeps the clone, so the two
                             // differ only in the bytes' journey, never in the
                             // answer either branch produces.
-                            if pass_inv_mode() {
+                            //
+                            // TEMP (lab, ZERO_SEED): an all-zero seed is the
+                            // prior content a CLEAR to [0; 4] writes, so the pass
+                            // clears instead of staging and uploading a frame of
+                            // zeroes (a surface the guest just allocated reads
+                            // back zero-filled).
+                            if zero_seed_mode()
+                                && color0_seed.as_deref().is_some_and(seed_is_zero)
+                            {
+                                let len = color0_seed.take().map_or(0, |seed| seed.len());
+                                color0_seed_consumed = true;
+                                zero_seed_cleared = true;
+                                target_clear = [0.0; 4];
+                                crate::runtime::drain::note_store_route("zero_seed_cleared");
+                                crate::runtime::drain::note_store_route_n(
+                                    "zero_seed_cleared_bytes",
+                                    len as u64,
+                                );
+                            } else if pass_inv_mode() {
                                 target_rgba8 = color0_seed.take().map(std::sync::Arc::new);
                                 color0_seed_consumed = target_rgba8.is_some();
                                 if let Some(bytes) = target_rgba8.as_ref() {
@@ -11490,7 +11528,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         w,
                         h,
                         req.pipeline_ref,
-                        target_rgba8.is_some() || target_guest_seed.is_some(),
+                        target_rgba8.is_some() || target_guest_seed.is_some() || zero_seed_cleared,
                         seed_door,
                     );
                     if matches!(declared, LoadAction::DontCare) {
@@ -11503,7 +11541,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // says how often the widening pays or what it costs.
                         // `note_load_seed_outcome`'s own counters cannot serve:
                         // they are the LOAD-only signal below.
-                        let served = target_rgba8.is_some() || target_guest_seed.is_some();
+                        let served = target_rgba8.is_some() || target_guest_seed.is_some() || zero_seed_cleared;
                         crate::runtime::drain::note_store_route(if served {
                             "dontcare_seed_served"
                         } else {
@@ -11528,7 +11566,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // retire the one counter that names the defect.
                         note_load_seed_outcome(
                             seed_door,
-                            target_rgba8.is_some() || target_guest_seed.is_some(),
+                            target_rgba8.is_some() || target_guest_seed.is_some() || zero_seed_cleared,
                             c0,
                             w,
                             h,
@@ -11687,7 +11725,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 w,
                 h,
                 req.colors.first().map(|c| c.load_action),
-                target_rgba8.is_some() || target_guest_seed.is_some(),
+                target_rgba8.is_some() || target_guest_seed.is_some() || zero_seed_cleared,
                 chain_load_from_target,
                 // Guest-visible backing is a mapper-ref-texture mapping or a task GVA, and
                 // the two are exclusive — `ColorRtRequest::target_gva` documents
@@ -11898,6 +11936,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .colors
             .first()
             .map(|c| reims_vgpu_protocol::pass_action::LoadAction::from_declared(c.load_action));
+        if zero_seed_cleared {
+            // TEMP (lab, ZERO_SEED): the zero seed became this pass's clear.
+            resources.color0_declared = Some(reims_vgpu_protocol::pass_action::LoadAction::Clear);
+        }
         if chain_load_from_target {
             // The GVA Load elision validated its own identity and is the only
             // rail here whose target is not also claimed by a Store rail: a pass
@@ -19049,5 +19091,25 @@ mod memo_scratch_tests {
             3,
             "two causes share a tag and cannot be told apart"
         );
+    }
+}
+
+#[cfg(test)]
+mod zero_seed_tests {
+    use super::seed_is_zero;
+
+    /// A seed is zero only when every byte is, wherever the first non-zero one
+    /// sits: in the first block, on a block boundary, or in a short tail block.
+    /// A seed turned into a CLEAR by mistake drops the attachment's prior
+    /// content, so the one wrong answer that matters is a `true` here.
+    #[test]
+    fn a_seed_is_zero_only_when_every_byte_is() {
+        assert!(seed_is_zero(&[]));
+        assert!(seed_is_zero(&vec![0u8; 3 * 4096 + 17]));
+        for at in [0, 4095, 4096, 2 * 4096 + 1, 3 * 4096 + 16] {
+            let mut seed = vec![0u8; 3 * 4096 + 17];
+            seed[at] = 0x01;
+            assert!(!seed_is_zero(&seed), "non-zero byte at {at} missed");
+        }
     }
 }
