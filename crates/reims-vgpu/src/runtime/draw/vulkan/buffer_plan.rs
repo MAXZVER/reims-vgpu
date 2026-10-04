@@ -494,8 +494,9 @@ fn plan_from_backing<M: HostMemory + HostOps>(
     // commit (H8's rule for anything the plan decides).
     let span = cap.map_or(full, |c| full.min(c));
     let narrowed = (span < full).then(|| full - span);
-    let Some((gpas, runs)) = task_gva_guest_run_window(state, host, gva + offset, span) else {
-        return Err(BufferBail::ColdWindow);
+    let (gpas, runs) = match task_gva_guest_run_window(state, host, task_id, gva + offset, span) {
+        Ok(w) => w,
+        Err(_) => return Err(BufferBail::ColdWindow),
     };
     let page = state.page_size();
     let pages = guest_page_window(host, &gpas, page, (gva + offset) % page, span);
@@ -1131,7 +1132,9 @@ pub(super) fn shadow_compare_store(asked_was_shadow: bool, serial: Option<&Store
     };
     crate::runtime::drain::note_store_route(verdict);
     if verdict.contains("mismatch") {
-        crate::observe::fail("par_shadow_buf_mismatch_store (planned vs serial Store pages)".into());
+        crate::observe::fail(String::from(
+            "par_shadow_buf_mismatch_store (planned vs serial Store pages)",
+        ));
     }
 }
 
