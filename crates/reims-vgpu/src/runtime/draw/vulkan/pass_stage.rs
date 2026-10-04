@@ -234,9 +234,26 @@ pub(crate) fn arm_seed_stage(resources: &mut crate::backend::vulkan::engine::Dra
         .target_identity
         .as_ref()
         .is_some_and(|id| id.is_bgra());
+    // A bounded list: a stream of single-draw passes never opens a PassPrep,
+    // so nothing would drain the armed cells -- the cap keeps that stream on
+    // the serial seed path rather than growing a thread-local forever.
+    let full = PENDING_SEEDS.with(|pending| pending.borrow().len() >= 32);
+    if full {
+        crate::runtime::drain::note_store_route("pass_stage_seed_backlog");
+        return;
+    }
     let cell = std::sync::Arc::new(SeedStageCell::new(std::sync::Arc::clone(bytes), swap_rb));
     resources.target_seed_stage = Some(std::sync::Arc::clone(&cell));
     PENDING_SEEDS.with(|pending| pending.borrow_mut().push(cell));
+}
+
+/// Spend whatever armed cells a stream leaves behind -- its last chunk had no
+/// successor to offer them to. The requests' own cells die with the requests;
+/// this clears the thread-local so the next stream starts empty.
+pub(crate) fn sweep_pending_seeds() {
+    for cell in take_pending_seeds() {
+        cell.take_staged();
+    }
 }
 
 /// Take the armed seed cells (the caller filters the spent ones); the next
