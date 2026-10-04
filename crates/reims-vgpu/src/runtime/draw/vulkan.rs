@@ -9367,18 +9367,6 @@ pub(super) fn prepare_vertex_step_function(
     })
 }
 
-/// TEMP (lab, `REIMS_VGPU_LAB_ZERO_SEED=on`): a colour LOAD seed of all zeroes
-/// becomes a CLEAR to `[0; 4]` instead of a staged upload of the frame.
-pub(super) fn zero_seed_mode() -> bool {
-    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        matches!(
-            std::env::var("REIMS_VGPU_LAB_ZERO_SEED").as_deref(),
-            Ok("on")
-        )
-    })
-}
-
 /// Every byte of `seed` zero, asked a 4 KiB block at a time so a seed with
 /// content leaves at its first non-zero block.
 pub(super) fn seed_is_zero(seed: &[u8]) -> bool {
@@ -11451,8 +11439,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             // clears instead of staging and uploading a frame of
                             // zeroes (a surface the guest just allocated reads
                             // back zero-filled).
-                            if zero_seed_mode()
-                                && color0_seed.as_deref().is_some_and(seed_is_zero)
+                            if zero_seed_mode() && color0_seed.as_deref().is_some_and(seed_is_zero)
                             {
                                 let len = color0_seed.take().map_or(0, |seed| seed.len());
                                 color0_seed_consumed = true;
@@ -11541,7 +11528,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // says how often the widening pays or what it costs.
                         // `note_load_seed_outcome`'s own counters cannot serve:
                         // they are the LOAD-only signal below.
-                        let served = target_rgba8.is_some() || target_guest_seed.is_some() || zero_seed_cleared;
+                        let served = target_rgba8.is_some()
+                            || target_guest_seed.is_some()
+                            || zero_seed_cleared;
                         crate::runtime::drain::note_store_route(if served {
                             "dontcare_seed_served"
                         } else {
@@ -11566,7 +11555,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // retire the one counter that names the defect.
                         note_load_seed_outcome(
                             seed_door,
-                            target_rgba8.is_some() || target_guest_seed.is_some() || zero_seed_cleared,
+                            target_rgba8.is_some()
+                                || target_guest_seed.is_some()
+                                || zero_seed_cleared,
                             c0,
                             w,
                             h,

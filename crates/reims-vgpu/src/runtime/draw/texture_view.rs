@@ -959,7 +959,7 @@ pub(crate) fn linear_native_upload_format(
 // a struct would hide which of them a call site varies, which is what the
 // wrappers above exist to make obvious.
 #[allow(clippy::too_many_arguments)]
-fn load_linear_texture_impl<M: HostMemory + HostOps>(
+fn plan_linear_texture_read<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -972,9 +972,8 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // pre-existing caller, and everything below is unchanged for it.
     face: u32,
     format_override: Option<u16>,
-    native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
-) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal> {
+) -> Result<LinearTextureRead, LinearLoadRefusal> {
     use LinearLoadRefusal as R;
     let (_entry, desc_bytes) = objects::resolve_descriptor(
         state,
@@ -1077,6 +1076,148 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         span,
         site,
     );
+    Ok(LinearTextureRead {
+        gva,
+        w,
+        h,
+        planes,
+        bpr,
+        tight,
+        storage_rows,
+        sample_fmt,
+        need_rgba,
+    })
+}
+
+/// What [`plan_linear_texture_read`] resolved for one level (and slice) of a
+/// linear texture: where its bytes start in the task's address space and how
+/// they are laid out. The guest's deferred writebacks over the span have been
+/// landed by the time a caller holds one, so the bytes it names are current.
+struct LinearTextureRead {
+    gva: u64,
+    w: u32,
+    h: u32,
+    planes: u32,
+    bpr: u64,
+    tight: u32,
+    storage_rows: u32,
+    sample_fmt: u16,
+    need_rgba: usize,
+}
+
+/// TEMP (lab, ZERO_SEED): whether level 0 of linear texture `texture_ref` is
+/// all zero bytes in guest memory, read a chunk at a time into a reused buffer
+/// so the answer costs no frame-sized allocation and stops at the first
+/// non-zero chunk. `None` when the texture is not a plain linear texture of
+/// exactly `width` x `height` (one plane), or its bytes cannot be read: the
+/// caller then takes its ordinary read, which reports.
+///
+/// A surface WindowServer allocates for a full-screen transition reads back
+/// zero-filled (the guest kernel zeroes its pages when it wires them): hq033
+/// found 413 of 419 colour LOAD seeds in 12 transitions all zero, 4.07 GB.
+pub(crate) fn linear_texture_is_zero<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+    site: crate::runtime::render_writeback::SettleSite,
+) -> Option<bool> {
+    const CHUNK: usize = 256 << 10;
+    thread_local! {
+        static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let plan =
+        plan_linear_texture_read(state, host, task_id, texture_ref, 0, 0, None, site).ok()?;
+    if plan.w != width || plan.h != height || plan.planes != 1 {
+        return None;
+    }
+    // Only where zero bytes convert to a zero RGBA8 seed: a format without
+    // alpha converts zero to opaque black, which no CLEAR to [0; 4] writes.
+    if !matches!(
+        pixel_format::sampled_class(plan.sample_fmt),
+        Some(pixel_format::SampledClass::Rgba8Unorm | pixel_format::SampledClass::Bgra8Unorm)
+    ) {
+        return None;
+    }
+    let rows = u64::from(plan.storage_rows);
+    let tight = u64::from(plan.tight);
+    // One contiguous span when the rows are tight, else one run per row.
+    let (runs, run_len) = if plan.bpr == tight {
+        (1, tight.checked_mul(rows)?)
+    } else {
+        (rows, tight)
+    };
+    BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if buf.len() < CHUNK {
+            buf.resize(CHUNK, 0);
+        }
+        for run in 0..runs {
+            let base = plan.gva.checked_add(run.checked_mul(plan.bpr)?)?;
+            let mut off = 0u64;
+            while off < run_len {
+                let n = (run_len - off).min(CHUNK as u64) as usize;
+                let dst = &mut buf[..n];
+                gva_mem::read_task_gva_by_id(
+                    host,
+                    &state.tasks,
+                    task_id,
+                    base + off,
+                    dst,
+                    state.page_shift,
+                )
+                .ok()?;
+                if dst.iter().fold(0u8, |acc, &b| acc | b) != 0 {
+                    return Some(false);
+                }
+                off += n as u64;
+            }
+        }
+        Some(true)
+    })
+}
+
+// Eight, because the last one is the caller's identity and the whole point of
+// it is that this leaf cannot derive it. Grouping the descriptor selectors into
+// a struct would hide which of them a call site varies, which is what the
+// wrappers above exist to make obvious.
+#[allow(clippy::too_many_arguments)]
+fn load_linear_texture_impl<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    level: u32,
+    // Array slice / cube face to read; see `plan_linear_texture_read`.
+    face: u32,
+    format_override: Option<u16>,
+    native: NativeUploads,
+    site: crate::runtime::render_writeback::SettleSite,
+) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal> {
+    use LinearLoadRefusal as R;
+    let LinearTextureRead {
+        gva,
+        w,
+        h,
+        planes,
+        bpr,
+        tight,
+        storage_rows,
+        sample_fmt,
+        need_rgba,
+    } = plan_linear_texture_read(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        level,
+        face,
+        format_override,
+        site,
+    )?;
+    let bpr_u32 = bpr as u32;
     // Tight display textures are the common compositor source. Read the whole
     // image with one task-root/cache lifetime: the row loop below otherwise
     // rebuilds the GVA walker cache once per row (1,080 times for the live

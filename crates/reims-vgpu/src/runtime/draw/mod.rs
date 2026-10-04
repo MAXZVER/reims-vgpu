@@ -2750,8 +2750,31 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 let elided = elided && colors.is_empty();
                 gva_load_from_resident = elided;
                 if !elided {
-                    seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
-                    if seed.is_none() {
+                    seed = match seed_color_load_or_zero(
+                        state,
+                        host,
+                        task_id,
+                        att.texture_ref,
+                        gva,
+                        mw,
+                        mh,
+                    ) {
+                        // TEMP (lab, ZERO_SEED): colour0's guest bytes are all
+                        // zero, so loading them is clearing to [0; 4] — the pass
+                        // says so and nothing is read or uploaded. Colour0 only,
+                        // like the elision above.
+                        Some(ColorSeed::Zero) if colors.is_empty() => {
+                            load_action = MTL_LOAD_ACTION_CLEAR;
+                            clear_color = [0.0; 4];
+                            crate::runtime::drain::note_store_route("zero_seed_load_cleared");
+                            (mapping_id == 0 && clear_seeds)
+                                .then(|| solid_rgba8(mw, mh, &clear_color))
+                        }
+                        Some(ColorSeed::Zero) => Some(vec![0u8; (mw as usize) * (mh as usize) * 4]),
+                        Some(ColorSeed::Bytes(bytes)) => Some(bytes),
+                        None => None,
+                    };
+                    if seed.is_none() && load_action != MTL_LOAD_ACTION_CLEAR {
                         crate::observe::fail(format!(
                             "color LOAD seed miss ref={} {}x{} fmt={:#x} gva={:#x} (archive: still encode)",
                             att.texture_ref, mw, mh, mfmt, gva
@@ -3404,6 +3427,45 @@ fn seed_color_load<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> Option<Vec<u8>> {
+    match seed_color_load_or_zero(state, host, task_id, texture_ref, target_gva, width, height)? {
+        ColorSeed::Bytes(bytes) => Some(bytes),
+        ColorSeed::Zero => Some(vec![0u8; (width as usize) * (height as usize) * 4]),
+    }
+}
+
+/// TEMP (lab, ZERO_SEED): what [`seed_color_load_or_zero`] found.
+pub(crate) enum ColorSeed {
+    /// The attachment's prior content, RGBA8.
+    Bytes(Vec<u8>),
+    /// The attachment's guest bytes are all zero: its prior content is what a
+    /// CLEAR to `[0; 4]` writes, and no bytes were read into a frame for it.
+    Zero,
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_ZERO_SEED=on`): a colour LOAD seed of all zeroes
+/// becomes a CLEAR to `[0; 4]` instead of a frame of zeroes read, converted and
+/// uploaded. Shared by the request builder and the Vulkan seed door.
+pub(crate) fn zero_seed_mode() -> bool {
+    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        matches!(
+            std::env::var("REIMS_VGPU_LAB_ZERO_SEED").as_deref(),
+            Ok("on")
+        )
+    })
+}
+
+/// [`seed_color_load`], answering [`ColorSeed::Zero`] instead of reading a frame
+/// when the guest-memory rung would read nothing but zeroes (ZERO_SEED on).
+fn seed_color_load_or_zero<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    target_gva: u64,
+    width: u32,
+    height: u32,
+) -> Option<ColorSeed> {
     // Discrete GPU: exact target GVA is the strongest identity across object-ref
     // recycling. Fall back to the normal texture namespace, never the
     // unrelated backing record_id namespace. Guest memory is last.
@@ -3599,7 +3661,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
             None
         };
         if let Some(bgra) = cached {
-            return Some(swap_rb_channels(bgra));
+            return Some(ColorSeed::Bytes(swap_rb_channels(bgra)));
         }
         // The third door, and the only one a target with no address of its own
         // can reach. Both doors above are keyed on `target_gva`, so a rail whose
@@ -3620,7 +3682,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
         if let Some(seed) =
             seed_from_published_surface(state, host, task_id, texture_ref, width, height)
         {
-            return Some(seed);
+            return Some(ColorSeed::Bytes(seed));
         }
     }
     // normal-texture (or texture-view base) linear GVA → convert to RGBA8.
@@ -3642,6 +3704,30 @@ fn seed_color_load<M: HostMemory + HostOps>(
     // A colour LOAD seed is copied into a render target through the RGBA8-shaped
     // seed path, so this arm takes no native layout — the bytes must be what
     // that path reads them as.
+    //
+    // TEMP (lab, ZERO_SEED): the doors above have all missed, so the seed is
+    // the guest's own bytes; when every one of them is zero the frame need not
+    // be read, converted or uploaded at all.
+    if zero_seed_mode()
+        && width > 0
+        && height > 0
+        && texture_view::linear_texture_is_zero(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            width,
+            height,
+            crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
+        ) == Some(true)
+    {
+        crate::runtime::drain::note_store_route("zero_seed_probe_zero");
+        crate::runtime::drain::note_store_route_n(
+            "zero_seed_probe_zero_bytes",
+            u64::from(width) * u64::from(height) * 4,
+        );
+        return Some(ColorSeed::Zero);
+    }
     let (rgba, _layout) = load_sampled_rgba_static(
         state,
         host,
@@ -3650,7 +3736,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
         NativeUploads::NONE,
         crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
     )?;
-    Some(rgba)
+    Some(ColorSeed::Bytes(rgba))
 }
 
 /// This device's own last publication of a mapper-ref-texture surface, when the

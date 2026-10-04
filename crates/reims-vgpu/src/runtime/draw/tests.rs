@@ -8596,3 +8596,95 @@ fn a_record_leaving_with_a_deferred_failure_is_refused_not_ok() {
     let kept = refuse_after_deferred_failure((EncodeStatus::BadArgs("x"), None));
     assert_eq!(kept.0, EncodeStatus::BadArgs("x"));
 }
+
+/// TEMP (lab, ZERO_SEED): `texture_view::linear_texture_is_zero` answers for
+/// the texels only — a padded row's padding is not the texture's content and
+/// must not make a zero surface read as non-zero — and any non-zero texel, in
+/// the last row as well as the first, makes it non-zero. A geometry other than
+/// the attachment's is not answered at all, so the caller takes its ordinary
+/// read rather than clearing a surface of another size.
+#[test]
+fn a_linear_texture_is_zero_only_when_every_texel_is() {
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
+        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
+        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+    };
+    use crate::runtime::render_writeback::SettleSite;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let dir_pfn = 2u32;
+    let root_pfn = 3u32;
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    assert!(host.write_gpa(dir_gpa, &d).is_ok());
+    for i in 0..4u32 {
+        let pfn = 4 + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+    }
+    state.define_task(1, 0x1000, dir_pfn);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // 4x2 BGRA8, padded rows: tight 16 bytes, stride 24.
+    let tex_ref = 6u32;
+    let (w, h) = (4u32, 2u32);
+    let bpr = 24u32;
+    let body = TEXTURE_DESC_BASE_LEN;
+    let mut b = vec![0u8; body];
+    st64(&mut b[0..], 0x1000);
+    st32(&mut b[8..], 1);
+    st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
+    st32(&mut b[TEXTURE_DESC_USED_SIZE..], bpr * h);
+    st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], bpr);
+    st32(&mut b[TEXTURE_DESC_WIDTH..], w);
+    st32(&mut b[TEXTURE_DESC_WIDTH + 4..], h);
+    st16(&mut b[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
+    let desc_gva = 0x200u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &b);
+    let off = list_object_entry_offset(tex_ref, 32).unwrap();
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut le[0..],
+        (OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8),
+    );
+    le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+
+    // Zero texels, non-zero padding.
+    let texel_gva = 1u64 << PAGE_SHIFT_ARM64E;
+    let mut backing = Vec::new();
+    for _ in 0..h {
+        backing.extend_from_slice(&[0u8; 16]);
+        backing.extend_from_slice(&[0xEEu8; 8]);
+    }
+    write_task_gva_arm64e(&mut host, &state.tasks[1], texel_gva, &backing);
+    let site = SettleSite::LinearTextureSeed;
+    assert_eq!(
+        texture_view::linear_texture_is_zero(&mut state, &mut host, 1, tex_ref, w, h, site),
+        Some(true),
+        "zero texels behind non-zero padding are a zero surface"
+    );
+    assert_eq!(
+        texture_view::linear_texture_is_zero(&mut state, &mut host, 1, tex_ref, w + 1, h, site),
+        None,
+        "another geometry is not answered"
+    );
+    // One non-zero byte in the last texel of the last row.
+    write_task_gva_arm64e(&mut host, &state.tasks[1], texel_gva + u64::from(bpr) + 15, &[1]);
+    assert_eq!(
+        texture_view::linear_texture_is_zero(&mut state, &mut host, 1, tex_ref, w, h, site),
+        Some(false)
+    );
+}
