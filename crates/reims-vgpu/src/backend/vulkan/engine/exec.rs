@@ -700,10 +700,7 @@ unsafe fn stage_buffer_content(
         // window and record nothing else — the acquire and the memcpy this
         // arm's siblings pay are what the worker already paid.
         BufferContent::Staged(slice) => {
-            if !pools.note_staged_read(
-                std::sync::Arc::clone(&slice.ring),
-                slice.window,
-            ) {
+            if !pools.note_staged_read(std::sync::Arc::clone(&slice.ring), slice.window) {
                 // The ring was rebuilt behind a device loss; the serial path
                 // is the only honest answer for this bind.
                 return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedDraw));
@@ -1723,9 +1720,9 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             SampledSource::Target(identity) => identity == seed_identity,
             // A staged bind stands for a guest-runs source: no target, no
             // alias of the seed.
-            SampledSource::Bytes(_)
-            | SampledSource::GuestRuns(..)
-            | SampledSource::Staged(_) => false,
+            SampledSource::Bytes(_) | SampledSource::GuestRuns(..) | SampledSource::Staged(_) => {
+                false
+            }
         }) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SeedAlsoSampled,
@@ -2378,11 +2375,29 @@ fn batch_depth_disabled() -> bool {
 /// `nojoin_mrt` fired ~1 000/s against ~1 300 joins/s, and every firing is
 /// its own `vkQueueSubmit` and fence.
 fn lab_mrt_batch() -> bool {
+    #[cfg(test)]
+    {
+        // Tests drive both arms through their own door; 2 means "no
+        // override", the environment's latched answer.
+        match TEST_MRT_BATCH.load(Ordering::Relaxed) {
+            0 => return false,
+            1 => return true,
+            _ => {}
+        }
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(std::env::var("REIMS_VGPU_LAB_MRT_BATCH").as_deref(), Ok("on"))
+        matches!(
+            std::env::var("REIMS_VGPU_LAB_MRT_BATCH").as_deref(),
+            Ok("on")
+        )
     })
 }
+
+/// TEMP (lab, `REIMS_VGPU_LAB_MRT_BATCH`, tests): 0 = off, 1 = on, 2 = no
+/// override. See [`lab_mrt_batch`].
+#[cfg(test)]
+static TEST_MRT_BATCH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
 
 /// The `depth_barred` term, as the draw path computes it.
 ///
@@ -2511,7 +2526,6 @@ impl JoinTerms {
     }
 }
 
-
 /// TEMP (lab, PASS_STAGE): the guest-runs sampled ladder, shared verbatim by
 /// the plain bind and the staged one — `staged` carries the worker's window
 /// for the single branch the serial path CPU-gathers (`write_staging_from_runs`),
@@ -2550,9 +2564,7 @@ unsafe fn sample_guest_runs(
                 super::SampledByteOrigin::SurfaceGuestFallback => {
                     "sampled_direct_mapper_ref_texture"
                 }
-                super::SampledByteOrigin::SerializedSurfaceView => {
-                    "sampled_direct_ref_texture"
-                }
+                super::SampledByteOrigin::SerializedSurfaceView => "sampled_direct_ref_texture",
                 _ => "sampled_direct_other",
             });
             sampled.push(PreparedSampled::GuestDirect {
@@ -7218,6 +7230,20 @@ mod tests {
         );
     }
 
+    /// Sets [`TEST_MRT_BATCH`] for the guard's life (tests).
+    struct MrtBatchOverride(u8);
+    impl MrtBatchOverride {
+        fn new(v: u8) -> Self {
+            TEST_MRT_BATCH.store(v, Ordering::Relaxed);
+            Self(v)
+        }
+    }
+    impl Drop for MrtBatchOverride {
+        fn drop(&mut self) {
+            TEST_MRT_BATCH.store(2, Ordering::Relaxed);
+        }
+    }
+
     /// Build a `JoinTerms` from a bitmask, one bit per ladder rung in order.
     fn join_terms(bits: u32) -> JoinTerms {
         let b = |i: usize| bits & (1 << i) != 0;
@@ -7255,6 +7281,20 @@ mod tests {
             assert!(seen.insert(*name), "two rungs share the census name {name}");
         }
         assert_eq!(join_terms(0).refusal(), None, "no term set is a join");
+
+        // TEMP (lab, `REIMS_VGPU_LAB_MRT_BATCH`): the rung reads the flag.
+        // Off (the default), an MRT draw with no other term refuses with the
+        // name it always had; on, it joins -- the `vkQueueSubmit` and fence
+        // it used to pay alone (submit 7.6 us/draw on transitions) become
+        // the batch's to share.
+        let _arm_on = MrtBatchOverride::new(1);
+        let mrt_alone = join_terms(1 << 2);
+        assert!(mrt_alone.batch_eligible(), "with the arm on, MRT joins");
+        assert_eq!(mrt_alone.refusal(), None);
+        // And a rung above it still refuses first.
+        assert_eq!(join_terms(1 << 1).refusal(), Some("nojoin_quirk"));
+        let _arm_off = MrtBatchOverride::new(0);
+        assert_eq!(join_terms(1 << 2).refusal(), Some("nojoin_mrt"));
     }
 
     /// A depth attachment on its own must not stop a draw deferring its submit.

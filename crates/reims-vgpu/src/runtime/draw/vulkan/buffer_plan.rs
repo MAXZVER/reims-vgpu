@@ -395,11 +395,23 @@ fn plan_from_backing<M: HostMemory + HostOps>(
         // floor already refused the zero-copy rail (see `stage_or_bail`);
         // floor-clearing cold refs stay the drain's constructions.
         None => {
-            return stage_or_bail(state, host, stager, task_id, buffer_ref, &resource, gva, size, bind, BufferBail::ColdPacked)
+            return stage_or_bail(
+                state,
+                host,
+                stager,
+                task_id,
+                buffer_ref,
+                &resource,
+                gva,
+                size,
+                bind,
+                BufferBail::ColdPacked,
+            )
         }
-        Some(
-            crate::runtime::bound_buffers::PackedBufferResolution::Unavailable { gva: bg, size: bs },
-        ) => {
+        Some(crate::runtime::bound_buffers::PackedBufferResolution::Unavailable {
+            gva: bg,
+            size: bs,
+        }) => {
             if *bg != gva || *bs != size {
                 return Err(BufferBail::ColdPacked);
             }
@@ -525,7 +537,18 @@ fn plan_from_backing<M: HostMemory + HostOps>(
         Err(_) => {
             // The walk refused read-only; on the sub-floor population the
             // serial ladder was CPU-reading anyway.
-            return stage_or_bail(state, host, stager, task_id, buffer_ref, &resource, gva, size, bind, BufferBail::ColdWindow)
+            return stage_or_bail(
+                state,
+                host,
+                stager,
+                task_id,
+                buffer_ref,
+                &resource,
+                gva,
+                size,
+                bind,
+                BufferBail::ColdWindow,
+            );
         }
     };
     let page = state.page_size();
@@ -540,7 +563,18 @@ fn plan_from_backing<M: HostMemory + HostOps>(
         // rail there (the packed alias, the whole-runs walk), and a staged
         // window answering past a construction the commit cannot see warm is
         // the upper-rung hazard, not a saving.
-        return stage_or_bail(state, host, stager, task_id, buffer_ref, &resource, gva, size, bind, BufferBail::BelowFloor);
+        return stage_or_bail(
+            state,
+            host,
+            stager,
+            task_id,
+            buffer_ref,
+            &resource,
+            gva,
+            size,
+            bind,
+            BufferBail::BelowFloor,
+        );
     }
     Ok(BufferContentPlan {
         task_id,
@@ -562,7 +596,6 @@ fn plan_from_backing<M: HostMemory + HostOps>(
         },
     })
 }
-
 
 /// TEMP (lab, PASS_STAGE): the last rung of the planner — where every
 /// zero-copy rail has refused and the serial ladder would fall to its CPU
@@ -766,13 +799,7 @@ fn commit_buffer_plan(
         BufferRail::Held { bound } => {
             if packed_serves(state, task_id, buffer_ref, plan.gva, plan.size, offset)
                 || whole_serves(
-                    state,
-                    task_id,
-                    buffer_ref,
-                    plan.gva,
-                    plan.size,
-                    offset,
-                    extent_cap,
+                    state, task_id, buffer_ref, plan.gva, plan.size, offset, extent_cap,
                 )
             {
                 return Err(BufferInvalid::UpperRung);
@@ -794,13 +821,7 @@ fn commit_buffer_plan(
         BufferRail::Walked { bound, narrowed } => {
             if packed_serves(state, task_id, buffer_ref, plan.gva, plan.size, offset)
                 || whole_serves(
-                    state,
-                    task_id,
-                    buffer_ref,
-                    plan.gva,
-                    plan.size,
-                    offset,
-                    extent_cap,
+                    state, task_id, buffer_ref, plan.gva, plan.size, offset, extent_cap,
                 )
             {
                 return Err(BufferInvalid::UpperRung);
@@ -808,7 +829,10 @@ fn commit_buffer_plan(
             // A serial walk may have landed an entry at this key while the
             // plan waited (an earlier bind of the same draw fell back); the
             // hold is idempotent only against its own bytes.
-            if let Some(held) = state.bound_buffers.get(task_id, buffer_ref, offset, extent_cap) {
+            if let Some(held) = state
+                .bound_buffers
+                .get(task_id, buffer_ref, offset, extent_cap)
+            {
                 if !std::sync::Arc::ptr_eq(&held.runs, &bound.runs) {
                     return Err(BufferInvalid::Held);
                 }
@@ -851,13 +875,7 @@ fn commit_buffer_plan(
         } => {
             if packed_serves(state, task_id, buffer_ref, plan.gva, plan.size, offset)
                 || whole_serves(
-                    state,
-                    task_id,
-                    buffer_ref,
-                    plan.gva,
-                    plan.size,
-                    offset,
-                    extent_cap,
+                    state, task_id, buffer_ref, plan.gva, plan.size, offset, extent_cap,
                 )
                 || state
                     .bound_buffers
@@ -866,11 +884,7 @@ fn commit_buffer_plan(
             {
                 return Err(BufferInvalid::UpperRung);
             }
-            if state
-                .host_writes
-                .wrote_any_since(*host_epoch, gpas)
-                .wrote()
-            {
+            if state.host_writes.wrote_any_since(*host_epoch, gpas).wrote() {
                 crate::runtime::drain::note_store_route("pass_stage_buf_invalid_host_write");
                 return Err(BufferInvalid::UpperRung);
             }
@@ -1027,7 +1041,9 @@ pub(super) fn ask_buffer(
         return Ask::Serial;
     }
     prefetch::with_last_frame(|frame| {
-        ask_frame_exact_or_rail(frame, state, task_id, buffer_ref, resource, offset, extent_cap, m)
+        ask_frame_exact_or_rail(
+            frame, state, task_id, buffer_ref, resource, offset, extent_cap, m,
+        )
     })
     .unwrap_or(Ask::Serial)
 }
@@ -1084,7 +1100,11 @@ fn ask_frame_exact_or_rail(
         };
     }
     // The reference's rail plan, answering this bind if its offset fits.
-    if let Some(slug) = frame.buffer_rails.get(&(task_id, buffer_ref)).map(|p| p.rail_slug()) {
+    if let Some(slug) = frame
+        .buffer_rails
+        .get(&(task_id, buffer_ref))
+        .map(|p| p.rail_slug())
+    {
         let outcome = {
             let plan = frame
                 .buffer_rails
@@ -1280,7 +1300,8 @@ pub(super) fn shadow_compare_buffer(
                 crate::backend::vulkan::engine::BufferContent::GuestRuns(a),
                 crate::backend::vulkan::engine::BufferContent::GuestRuns(b),
             ) => {
-                let same_runs = std::sync::Arc::ptr_eq(&a.runs, &b.runs) || a.runs[..] == b.runs[..];
+                let same_runs =
+                    std::sync::Arc::ptr_eq(&a.runs, &b.runs) || a.runs[..] == b.runs[..];
                 if same_runs
                     && a.source_offset == b.source_offset
                     && a.total_len == b.total_len
@@ -1389,8 +1410,8 @@ pub(super) fn bail_route(bail: BufferBail) -> &'static str {
 mod tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
-    use crate::runtime::host::FakeHost;
     use crate::runtime::drain::census::store_route_count;
+    use crate::runtime::host::FakeHost;
 
     /// One `(buffer_ref, allocation_size)` pair the fixture builds a buffer
     /// object for; the allocation sits at GVA `0x4000` (task page 4).
@@ -1433,19 +1454,27 @@ mod tests {
             bdesc[0..8].copy_from_slice(&size.to_le_bytes());
             st32(&mut bdesc[8..], handle);
             let desc_gva = 0x200u64 + 0x40 * n as u64;
-            assert!(
-                gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, &bdesc, PAGE_SHIFT_X86)
-                    .is_ok()
-            );
+            assert!(gva_mem::write_task_gva(
+                &mut host,
+                &state.tasks[1],
+                desc_gva,
+                &bdesc,
+                PAGE_SHIFT_X86
+            )
+            .is_ok());
             let list_off = list_object_entry_offset(buffer_ref, 64).unwrap();
             let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
             st32(&mut list_entry, packed);
             list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-            assert!(
-                gva_mem::write_task_gva(&mut host, &state.tasks[1], list_off, &list_entry, PAGE_SHIFT_X86)
-                    .is_ok()
-            );
+            assert!(gva_mem::write_task_gva(
+                &mut host,
+                &state.tasks[1],
+                list_off,
+                &list_entry,
+                PAGE_SHIFT_X86
+            )
+            .is_ok());
         }
         (state, host)
     }
@@ -1519,15 +1548,21 @@ mod tests {
             let _prime = load_buffer_content_serial(state, host, 1, 7, Some(&res), 0, true, None)
                 .expect("the serial ladder retains the whole runs");
         }
-        let plan = plan_buffer_rails(&planned_state, &mut planned_host, 1, 7, resource.clone(), 0, None)
-            .expect("a retained whole rail plans");
+        let plan = plan_buffer_rails(
+            &planned_state,
+            &mut planned_host,
+            1,
+            7,
+            resource.clone(),
+            0,
+            None,
+        )
+        .expect("a retained whole rail plans");
         assert!(
             matches!(plan.rail, BufferRail::Whole { .. }),
             "the primed whole runs answer the rail"
         );
-        let _mode = super::super::pass_prep::test_mode(
-            super::super::pass_prep::PassPrepMode::On,
-        );
+        let _mode = super::super::pass_prep::test_mode(super::super::pass_prep::PassPrepMode::On);
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans([((1, 7), plan)], [], None);
         let before_hit = store_route_count("pass_prep_buf_hit_whole");
@@ -1572,12 +1607,12 @@ mod tests {
     fn a_retirement_between_plan_and_commit_falls_back() {
         let (mut state, mut host) = buffer_fixture(&[(7, 0x8000)]);
         let resource = buffer_resource(&state, &host, 7);
-        let _prime = load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
-            .expect("prime");
-        let plan = plan_buffer_rails(&state, &mut host, 1, 7, resource.clone(), 0, None).expect("plans");
-        let _mode = super::super::pass_prep::test_mode(
-            super::super::pass_prep::PassPrepMode::On,
-        );
+        let _prime =
+            load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
+                .expect("prime");
+        let plan =
+            plan_buffer_rails(&state, &mut host, 1, 7, resource.clone(), 0, None).expect("plans");
+        let _mode = super::super::pass_prep::test_mode(super::super::pass_prep::PassPrepMode::On);
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans([((1, 7), plan)], [], None);
         // The guest unmaps a page overlapping the allocation: the retirement
@@ -1588,7 +1623,8 @@ mod tests {
         assert!(matches!(served, Ask::Serial));
         assert_eq!(delta("pass_prep_buf_invalid_registry", before), 1);
         // And the fallback serves: the serial ladder answers for the bind.
-        let serial = load_buffer_content(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None);
+        let serial =
+            load_buffer_content(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None);
         assert!(serial.is_some(), "the serial ladder still serves the bind");
     }
 
@@ -1632,18 +1668,25 @@ mod tests {
     fn a_repeated_bind_serves_the_plan_twice() {
         let (mut state, mut host) = buffer_fixture(&[(7, 0x8000)]);
         let resource = buffer_resource(&state, &host, 7);
-        let _prime = load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
-            .expect("prime");
-        let plan = plan_buffer_rails(&state, &mut host, 1, 7, resource.clone(), 0, None).expect("plans");
-        let _mode = super::super::pass_prep::test_mode(
-            super::super::pass_prep::PassPrepMode::On,
-        );
+        let _prime =
+            load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
+                .expect("prime");
+        let plan =
+            plan_buffer_rails(&state, &mut host, 1, 7, resource.clone(), 0, None).expect("plans");
+        let _mode = super::super::pass_prep::test_mode(super::super::pass_prep::PassPrepMode::On);
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans([((1, 7), plan)], [], None);
         let shape_before = registry_shape(&state);
         let before_hit = store_route_count("pass_prep_buf_hit");
         let first = ask_buffer(&mut state, 1, 7, Some(resource.as_ref()), 0x40, None);
-        let second = ask_buffer(&mut state, 1, 7, Some(resource.as_ref()), 0x80, Some(0x1000));
+        let second = ask_buffer(
+            &mut state,
+            1,
+            7,
+            Some(resource.as_ref()),
+            0x80,
+            Some(0x1000),
+        );
         let (Ask::Serve(a), Ask::Serve(b)) = (first, second) else {
             panic!("both binds serve from the one rail plan");
         };
@@ -1697,9 +1740,7 @@ mod tests {
             matches!(plan.rail, BufferRail::Whole { .. }),
             "the retained whole runs answer the index bind"
         );
-        let _mode = super::super::pass_prep::test_mode(
-            super::super::pass_prep::PassPrepMode::On,
-        );
+        let _mode = super::super::pass_prep::test_mode(super::super::pass_prep::PassPrepMode::On);
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans(
             [],
@@ -1711,8 +1752,9 @@ mod tests {
         let Ask::Serve(content) = served else {
             panic!("the index plan serves");
         };
-        let serial = load_index_content_reason_serial(&mut serial_state, &mut serial_host, 1, &planned_info)
-            .expect("the serial ladder serves the same bind");
+        let serial =
+            load_index_content_reason_serial(&mut serial_state, &mut serial_host, 1, &planned_info)
+                .expect("the serial ladder serves the same bind");
         assert!(contents_agree(&content, &serial));
         assert_eq!(
             registry_shape(&planned_state),
@@ -1745,9 +1787,7 @@ mod tests {
         };
         let key = latch_store_target(&c0).expect("the walk would run");
         let plan = plan_store_pages(&state, &host, 1, key).expect("the walk resolves pages");
-        let _mode = super::super::pass_prep::test_mode(
-            super::super::pass_prep::PassPrepMode::On,
-        );
+        let _mode = super::super::pass_prep::test_mode(super::super::pass_prep::PassPrepMode::On);
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans([], [], Some(plan));
         let before = store_route_count("pass_prep_buf_store_hit");
@@ -1775,13 +1815,13 @@ mod tests {
     fn a_rail_plan_falls_past_a_past_end_offset() {
         let (mut state, mut host) = buffer_fixture(&[(7, 0x8000)]);
         let resource = buffer_resource(&state, &host, 7);
-        let _prime = load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
-            .expect("prime");
-        let plan = plan_buffer_rails(&state, &mut host, 1, 7, resource.clone(), 0, None).expect("plans");
+        let _prime =
+            load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
+                .expect("prime");
+        let plan =
+            plan_buffer_rails(&state, &mut host, 1, 7, resource.clone(), 0, None).expect("plans");
         assert!(matches!(plan.rail, BufferRail::Whole { .. }));
-        let _mode = super::super::pass_prep::test_mode(
-            super::super::pass_prep::PassPrepMode::On,
-        );
+        let _mode = super::super::pass_prep::test_mode(super::super::pass_prep::PassPrepMode::On);
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans([((1, 7), plan)], [], None);
         // A bind the rail covers still serves.

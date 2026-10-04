@@ -62,7 +62,8 @@ pub(crate) struct PassPlans {
     pub(super) buffer_rails: HashMap<(u32, u32), super::buffer_plan::BufferContentPlan>,
     /// TEMP (lab, PASS_PREP step 3): exact plans (held entry, walked window)
     /// under `(task, reference, offset, cap)`.
-    pub(super) buffer_exacts: HashMap<super::buffer_plan::BufferExactKey, super::buffer_plan::BufferContentPlan>,
+    pub(super) buffer_exacts:
+        HashMap<super::buffer_plan::BufferExactKey, super::buffer_plan::BufferContentPlan>,
     /// TEMP (lab, PASS_PREP step 3): the pass's Store page walk, when planned.
     pub(super) store_pages: Option<super::buffer_plan::StorePagesPlan>,
 }
@@ -103,13 +104,15 @@ impl Drop for PrefetchGuard {
 
 /// Push an empty plans frame for this stream and return the guard that pops it.
 pub(super) fn push_empty_frame() -> PrefetchGuard {
-    STACK.with(|stack| stack.borrow_mut().push(PassPlans {
-        map: HashMap::new(),
-        consumed: Vec::new(),
-        buffer_rails: HashMap::new(),
-        buffer_exacts: HashMap::new(),
-        store_pages: None,
-    }));
+    STACK.with(|stack| {
+        stack.borrow_mut().push(PassPlans {
+            map: HashMap::new(),
+            consumed: Vec::new(),
+            buffer_rails: HashMap::new(),
+            buffer_exacts: HashMap::new(),
+            store_pages: None,
+        })
+    });
     PrefetchGuard { pushed: true }
 }
 
@@ -307,7 +310,14 @@ pub(crate) fn prefetch_stream<'a>(
     // chunk limit unchanged (PassPrep supersedes this path while it is on).
     let memo_budget = std::sync::atomic::AtomicU64::new(sample_plan::memo_fill_chunk_limit());
     let scoped = pool.scope(state, &items, |st, env, (texture_ref, resource)| {
-        plan_item(st, env, task_id, *texture_ref, resource.clone(), &memo_budget)
+        plan_item(
+            st,
+            env,
+            task_id,
+            *texture_ref,
+            resource.clone(),
+            &memo_budget,
+        )
     });
     crate::runtime::drain::note_store_route("par_prefetch_stream");
     crate::runtime::drain::note_store_route_n("par_fork_us", scoped.fork_us);
@@ -330,13 +340,15 @@ pub(crate) fn prefetch_stream<'a>(
             Err(_) => crate::runtime::drain::note_store_route("par_prefetch_panic"),
         }
     }
-    STACK.with(|stack| stack.borrow_mut().push(PassPlans {
-        map: plans,
-        consumed: Vec::new(),
-        buffer_rails: HashMap::new(),
-        buffer_exacts: HashMap::new(),
-        store_pages: None,
-    }));
+    STACK.with(|stack| {
+        stack.borrow_mut().push(PassPlans {
+            map: plans,
+            consumed: Vec::new(),
+            buffer_rails: HashMap::new(),
+            buffer_exacts: HashMap::new(),
+            store_pages: None,
+        })
+    });
     PrefetchGuard { pushed: true }
 }
 
@@ -478,7 +490,13 @@ pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
             Some(StreamPlan::MapperRef(plan)) => {
                 let apply = mode == PrefetchMode::On;
                 match sample_plan::commit_mapper_ref_plan(
-                    state, host, plan, task_id, texture_ref, resource, apply,
+                    state,
+                    host,
+                    plan,
+                    task_id,
+                    texture_ref,
+                    resource,
+                    apply,
                 ) {
                     Ok((served, repeat)) if apply => {
                         crate::runtime::drain::note_store_route("par_prefetch_hit_mapper_ref");
@@ -505,7 +523,13 @@ pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
             Some(StreamPlan::Memo(plan)) => {
                 let apply = mode == PrefetchMode::On;
                 match sample_plan::commit_memo_plan(
-                    state, host, plan, task_id, texture_ref, resource, apply,
+                    state,
+                    host,
+                    plan,
+                    task_id,
+                    texture_ref,
+                    resource,
+                    apply,
                 ) {
                     Ok((served, repeat)) if apply => {
                         crate::runtime::drain::note_store_route("par_prefetch_hit_memo");
@@ -632,12 +656,7 @@ pub(crate) fn shadow_compare(
 /// census route: e.g. `par_shadow_variant_runs_vs_target` — the plan served
 /// `GuestRuns`, the serial ladder a resident `Target` (the readiness-flip
 /// class the fs2s1 boot hit).
-fn variant_pair_route(
-    pair: (
-        &SampledSourceRequest,
-        &SampledSourceRequest,
-    ),
-) -> &'static str {
+fn variant_pair_route(pair: (&SampledSourceRequest, &SampledSourceRequest)) -> &'static str {
     let (planned, serial) = pair;
     match (variant_name(planned), variant_name(serial)) {
         ("target", "runs") => "par_shadow_variant_target_vs_runs",

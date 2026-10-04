@@ -51,8 +51,7 @@
 use std::sync::Mutex;
 
 /// The pool population the arenas are sized for; see [`population`].
-static POPULATION: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(1);
+static POPULATION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 /// TEMP (lab): `REIMS_VGPU_LAB_PASS_STAGE`, read once per process.
 pub(crate) fn enabled() -> bool {
@@ -75,8 +74,7 @@ pub(crate) fn enabled() -> bool {
 }
 
 #[cfg(test)]
-static TEST_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static TEST_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Force the flag for the lifetime of the returned guard (tests only).
 #[cfg(test)]
@@ -420,7 +418,10 @@ mod tests {
         let ring = StagingRing::new(CHUNK, 1);
         let window = ring.alloc(64, 4).expect("room");
         assert!(ring.retain(window), "the first submission records a read");
-        assert!(ring.retain(window), "and the batch it joined records one too");
+        assert!(
+            ring.retain(window),
+            "and the batch it joined records one too"
+        );
         ring.release(window); // the fact's own reference dies at the frame pop
         ring.release(window); // the first submission retires
         assert_eq!(ring.in_flight(), 1, "the second submission still reads it");
@@ -574,8 +575,7 @@ mod tests {
                                 let chunk = &mut live[window.chunk as usize];
                                 for &(start, end) in chunk.iter() {
                                     assert!(
-                                        window.offset + window.len <= start
-                                            || window.offset >= end,
+                                        window.offset + window.len <= start || window.offset >= end,
                                         "new {}..{} overlaps live {start}..{end}",
                                         window.offset,
                                         window.offset + window.len
@@ -613,9 +613,8 @@ mod tests {
                     _ => {
                         // A reference drops: the fact's or a submission's.
                         // Only handles that still hold one may drop it.
-                        let held: Vec<usize> = (0..handles.len())
-                            .filter(|&i| handles[i].1 > 0)
-                            .collect();
+                        let held: Vec<usize> =
+                            (0..handles.len()).filter(|&i| handles[i].1 > 0).collect();
                         if !held.is_empty() {
                             let at = held[rng.below(held.len() as u64) as usize];
                             let (window, refs) = handles[at];

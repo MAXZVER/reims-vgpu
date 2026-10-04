@@ -26,9 +26,9 @@ pub(crate) use sample_plan::{plan_sampled_source, SampleBail, SampleInvalid, Sam
 mod prefetch;
 pub(crate) use prefetch::prefetch_stream;
 mod pass_prep;
-pub(crate) use pass_prep::{pass_prep_mode, DrawTables, PassPrep, PassPrepMode};
 #[cfg(test)]
 pub(crate) use pass_prep::test_mode;
+pub(crate) use pass_prep::{pass_prep_mode, DrawTables, PassPrep, PassPrepMode};
 // TEMP (lab, PASS_PREP step 3): the buffer-bind and Store-page plans.
 mod buffer_plan;
 // TEMP (lab, PASS_STAGE, design 8.4): the worker-staging planners and the
@@ -153,7 +153,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 out = refuse_after_deferred_failure(out);
             }
         }
-    } else if !req.chain_resident_established && crate::backend::vulkan::engine::deferred_draws_pending() {
+    } else if !req.chain_resident_established
+        && crate::backend::vulkan::engine::deferred_draws_pending()
+    {
         if let Some(failure) = crate::backend::vulkan::engine::settle_deferred_draws() {
             crate::backend::vulkan::engine::report_deferred_failure(&failure);
             // Found here because this record left before it reached the engine
@@ -6348,8 +6350,16 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     if let buffer_plan::Ask::Serve(content) = asked {
         return Some(content);
     }
-    let answer =
-        load_buffer_content_serial(state, host, task_id, buffer_ref, resource, offset, allow_zero_copy, extent_cap);
+    let answer = load_buffer_content_serial(
+        state,
+        host,
+        task_id,
+        buffer_ref,
+        resource,
+        offset,
+        allow_zero_copy,
+        extent_cap,
+    );
     if was_shadow {
         buffer_plan::shadow_compare_buffer(buffer_ref, offset, true, answer.as_ref());
     }
@@ -13637,13 +13647,19 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
                         let hits = om
                             .page_entries
                             .iter()
-                            .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, shift))
+                            .filter_map(|&e| {
+                                crate::protocol::iosurface_pages::entry_gpa_shift(e, shift)
+                            })
                             .filter(|g| gpas.contains(g))
                             .count();
                         if hits > 0 {
                             shared.push(format!(
                                 "mid{other}:{hits}:{}x{}:mapped={}:mapgen={}:tok={}",
-                                om.width, om.height, om.mapped, om.map_generation, om.guest_write_token
+                                om.width,
+                                om.height,
+                                om.mapped,
+                                om.map_generation,
+                                om.guest_write_token
                             ));
                         }
                     }
@@ -13655,7 +13671,9 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
                     // Does the cached page list still name the surface's memory?
                     // A silent re-point (no packet) leaves the old PFNs in hand,
                     // and their new owner's stores read as this surface's.
-                    let walk = match crate::runtime::mapper::backing_pages_witness(state, &*host, mapping_id) {
+                    let walk = match crate::runtime::mapper::backing_pages_witness(
+                        state, &*host, mapping_id,
+                    ) {
                         crate::runtime::mapper::BackingWitness::Verified => "verified",
                         crate::runtime::mapper::BackingWitness::Drifted => "drifted",
                         crate::runtime::mapper::BackingWitness::Unwitnessed(why) => why,
@@ -18522,9 +18540,7 @@ mod lab_memo_stamp {
 
     fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            std::env::var("REIMS_VGPU_LAB_MEMO_STAMP").is_ok_and(|v| v == "on")
-        })
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_MEMO_STAMP").is_ok_and(|v| v == "on"))
     }
 
     fn mapping_gpas(state: &DeviceState, mid: u32) -> Option<Vec<u64>> {

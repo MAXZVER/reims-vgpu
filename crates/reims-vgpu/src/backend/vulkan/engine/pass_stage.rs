@@ -155,10 +155,7 @@ pub(crate) fn arenas() -> Option<Arc<[WorkerArena]>> {
 /// The arena of pool member `worker` (helpers `0..workers`, the coordinator
 /// last) out of a borrowed set. See
 /// [`crate::runtime::par::staging::population`].
-pub(crate) fn arena_of<'a>(
-    arenas: &'a Arc<[WorkerArena]>,
-    worker: u16,
-) -> Option<&'a WorkerArena> {
+pub(crate) fn arena_of<'a>(arenas: &'a Arc<[WorkerArena]>, worker: u16) -> Option<&'a WorkerArena> {
     arenas.get(usize::from(worker))
 }
 
@@ -248,7 +245,8 @@ unsafe fn create_arena(
         return Err(e);
     }
     let mapped = match unsafe {
-        ctx.device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        ctx.device
+            .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
     } {
         Ok(ptr) => ptr as *mut u8,
         Err(e) => {
@@ -448,7 +446,10 @@ pub(crate) fn note_census() {
             note_store_route_n("pass_stage_copies", now.allocated - before.allocated);
         }
         if now.allocated_bytes > before.allocated_bytes {
-            note_store_route_n("pass_stage_bytes", now.allocated_bytes - before.allocated_bytes);
+            note_store_route_n(
+                "pass_stage_bytes",
+                now.allocated_bytes - before.allocated_bytes,
+            );
         }
         if now.refusals > before.refusals {
             note_store_route_n("pass_stage_arena_full_n", now.refusals - before.refusals);

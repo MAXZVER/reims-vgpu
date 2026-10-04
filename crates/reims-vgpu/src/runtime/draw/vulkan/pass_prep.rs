@@ -52,7 +52,12 @@ fn lab_prep_sync() -> bool {
         return false;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("REIMS_VGPU_LAB_PREP_SYNC").as_deref(), Ok("on")))
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("REIMS_VGPU_LAB_PREP_SYNC").as_deref(),
+            Ok("on")
+        )
+    })
 }
 
 /// Which way the pass preparation runs. `REIMS_VGPU_LAB_PASS_PREP`, read once;
@@ -130,7 +135,11 @@ impl Drop for TestModeGuard {
 pub(crate) fn chunk() -> usize {
     static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CHUNK.get_or_init(|| {
-        parse_chunk(std::env::var("REIMS_VGPU_LAB_PASS_PREP_CHUNK").ok().as_deref())
+        parse_chunk(
+            std::env::var("REIMS_VGPU_LAB_PASS_PREP_CHUNK")
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
@@ -164,7 +173,9 @@ impl DrawTables<'_> {
     /// The draw's buffer binds, vertex stage first (the order the drain's
     /// bind loop reads them in).
     fn buffers(&self) -> impl Iterator<Item = &BufferBind> + '_ {
-        self.vertex_buffers.iter().chain(self.fragment_buffers.iter())
+        self.vertex_buffers
+            .iter()
+            .chain(self.fragment_buffers.iter())
     }
 }
 
@@ -198,9 +209,7 @@ enum PrepItem {
     },
     /// TEMP (lab, PASS_PREP step 3): the pass's Store page walk, for the key
     /// the drain latched from the pass's colour-0.
-    StorePages {
-        key: buffer_plan::StoreTargetKey,
-    },
+    StorePages { key: buffer_plan::StoreTargetKey },
 }
 
 /// What one planned item produced.
@@ -416,7 +425,10 @@ impl<'a> PassPrep<'a> {
                 .collect();
             if !tokens.is_empty() {
                 let _span = crate::runtime::chain_phase::CostSpan::new("lab_prep_sync_us");
-                crate::runtime::drain::note_store_route_n("lab_prep_sync_tokens", tokens.len() as u64);
+                crate::runtime::drain::note_store_route_n(
+                    "lab_prep_sync_tokens",
+                    tokens.len() as u64,
+                );
                 host.guest_write_sync_many(&tokens);
             }
         }
@@ -431,8 +443,7 @@ impl<'a> PassPrep<'a> {
         let task_id = self.task_id;
         // The chunk's memo-fill budget (design 8.2: a byte limit per portion),
         // spent by whichever workers plan memo fills inside this scope.
-        let memo_budget =
-            std::sync::atomic::AtomicU64::new(sample_plan::memo_fill_chunk_limit());
+        let memo_budget = std::sync::atomic::AtomicU64::new(sample_plan::memo_fill_chunk_limit());
         let scoped = pool.scope(state, &items, |st, env, item| {
             let mut host = env.host();
             // TEMP (lab, PASS_STAGE): the job's own arena, when the rail may
@@ -533,7 +544,9 @@ impl<'a> PassPrep<'a> {
                     self.planned_buffers.insert(*buffer_ref);
                     match result {
                         Ok(PrepOutcome::Buffer(Ok(plan))) => {
-                            crate::runtime::drain::note_store_route(buffer_plan::planned_route(&plan));
+                            crate::runtime::drain::note_store_route(buffer_plan::planned_route(
+                                &plan,
+                            ));
                             // TEMP (lab, PASS_STAGE): a staged plan answers one
                             // exact bind; the rails answer every bind of the
                             // reference.
@@ -556,7 +569,9 @@ impl<'a> PassPrep<'a> {
                     self.planned_indexes.insert(*key);
                     match result {
                         Ok(PrepOutcome::Buffer(Ok(plan))) => {
-                            crate::runtime::drain::note_store_route(buffer_plan::planned_route(&plan));
+                            crate::runtime::drain::note_store_route(buffer_plan::planned_route(
+                                &plan,
+                            ));
                             buffer_exacts.push((*key, plan));
                         }
                         Ok(PrepOutcome::Buffer(Err(bail))) => {
@@ -608,7 +623,9 @@ mod tests {
     /// [`pooled_state`] around a table the caller completes — the buffer
     /// fixtures add a `read_gpa` over a leaked host, so a pool job's
     /// `WorkerHost` reads the same guest memory the drain's host serves.
-    fn pooled_state_over_table(fill: impl FnOnce(&mut crate::qemu::host_ops::ReimsVgpuHostOps)) -> DeviceState {
+    fn pooled_state_over_table(
+        fill: impl FnOnce(&mut crate::qemu::host_ops::ReimsVgpuHostOps),
+    ) -> DeviceState {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut table = crate::qemu::host_ops::ReimsVgpuHostOps::null();
         unsafe extern "C" fn nothing(_ctx: *mut std::os::raw::c_void) {}
@@ -666,7 +683,8 @@ mod tests {
             table.map_pages_stable = 1;
             table.read_gpa = Some(shim_read_gpa);
             table.ctx = host as *mut FakeHost as *mut std::os::raw::c_void;
-        });        let mut state = state;
+        });
+        let mut state = state;
         state.define_task(1, 0x1000, 2);
         assert!(state.set_object_list(1, 0, 64));
         for (n, &(buffer_ref, size)) in specs.iter().enumerate() {
@@ -675,19 +693,27 @@ mod tests {
             bdesc[0..8].copy_from_slice(&size.to_le_bytes());
             st32(&mut bdesc[8..], handle);
             let desc_gva = 0x200u64 + 0x40 * n as u64;
-            assert!(
-                gva_mem::write_task_gva(host, &state.tasks[1], desc_gva, &bdesc, PAGE_SHIFT_X86)
-                    .is_ok()
-            );
+            assert!(gva_mem::write_task_gva(
+                host,
+                &state.tasks[1],
+                desc_gva,
+                &bdesc,
+                PAGE_SHIFT_X86
+            )
+            .is_ok());
             let list_off = list_object_entry_offset(buffer_ref, 64).unwrap();
             let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
             st32(&mut list_entry, packed);
             list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-            assert!(
-                gva_mem::write_task_gva(host, &state.tasks[1], list_off, &list_entry, PAGE_SHIFT_X86)
-                    .is_ok()
-            );
+            assert!(gva_mem::write_task_gva(
+                host,
+                &state.tasks[1],
+                list_off,
+                &list_entry,
+                PAGE_SHIFT_X86
+            )
+            .is_ok());
         }
         state
     }
@@ -769,12 +795,18 @@ mod tests {
             (&mut serial_state, &mut *serial_host),
         ] {
             for &(buffer_ref, _) in &specs {
-                let resource = crate::runtime::objects::resolve_resource(
-                    &*state, &*host, 1, buffer_ref,
-                )
-                .expect("fixture resource");
+                let resource =
+                    crate::runtime::objects::resolve_resource(&*state, &*host, 1, buffer_ref)
+                        .expect("fixture resource");
                 let _prime = load_buffer_content_serial(
-                    state, host, 1, buffer_ref, Some(&resource), 0, true, None,
+                    state,
+                    host,
+                    1,
+                    buffer_ref,
+                    Some(&resource),
+                    0,
+                    true,
+                    None,
                 )
                 .expect("the prime constructs the packed alias");
             }
@@ -789,10 +821,8 @@ mod tests {
                         index: 0,
                         buffer_ref,
                         resource: Some(
-                            crate::runtime::objects::resolve_resource(
-                                state, host, 1, buffer_ref,
-                            )
-                            .expect("bind resource"),
+                            crate::runtime::objects::resolve_resource(state, host, 1, buffer_ref)
+                                .expect("bind resource"),
                         ),
                         offset: 0x40 * which as u64,
                         attribute_stride: None,
@@ -877,11 +907,17 @@ mod tests {
         let (mut state, host) = pooled_buffer_fixture(&specs);
         // Prime the aliases the chunk-0 items plan.
         for &(buffer_ref, _) in &specs[..2] {
-            let resource =
-                crate::runtime::objects::resolve_resource(&state, &*host, 1, buffer_ref)
-                    .expect("fixture resource");
+            let resource = crate::runtime::objects::resolve_resource(&state, &*host, 1, buffer_ref)
+                .expect("fixture resource");
             let _prime = load_buffer_content_serial(
-                &mut state, &mut *host, 1, buffer_ref, Some(&resource), 0, true, None,
+                &mut state,
+                &mut *host,
+                1,
+                buffer_ref,
+                Some(&resource),
+                0,
+                true,
+                None,
             )
             .expect("prime");
         }
@@ -1121,9 +1157,8 @@ mod tests {
         // memo entry itself); the serial arm primes itself on its own first
         // bind of each.
         for &memo_ref in &refs[5..] {
-            let resource =
-                objects::resolve_resource(&planned_state, &planned_host, 1, memo_ref)
-                    .expect("memo resource");
+            let resource = objects::resolve_resource(&planned_state, &planned_host, 1, memo_ref)
+                .expect("memo resource");
             let _prime = resolve_sampled_source(
                 &mut planned_state,
                 &mut planned_host,
@@ -1141,9 +1176,8 @@ mod tests {
         for di in 0..pattern.len() {
             prep.ahead(&planned_state, &crate::runtime::host::FakeHost::new(), di);
             let texture_ref = refs[pattern[di] as usize];
-            let resource =
-                objects::resolve_resource(&planned_state, &planned_host, 1, texture_ref)
-                    .expect("resource");
+            let resource = objects::resolve_resource(&planned_state, &planned_host, 1, texture_ref)
+                .expect("resource");
             let served = prefetch::prefetched_source(
                 &mut planned_state,
                 &mut planned_host,
@@ -1172,8 +1206,16 @@ mod tests {
                         ) => {
                             assert!(Arc::ptr_eq(&a, &b) || a[..] == b[..]);
                             assert_eq!(
-                                (aid.as_ref().map(|i| i.key), al.layout(), std::mem::discriminant(&ao)),
-                                (bid.as_ref().map(|i| i.key), bl.layout(), std::mem::discriminant(&bo)),
+                                (
+                                    aid.as_ref().map(|i| i.key),
+                                    al.layout(),
+                                    std::mem::discriminant(&ao)
+                                ),
+                                (
+                                    bid.as_ref().map(|i| i.key),
+                                    bl.layout(),
+                                    std::mem::discriminant(&bo)
+                                ),
                                 "ref {texture_ref} di {di}"
                             );
                         }
@@ -1204,13 +1246,13 @@ mod tests {
                 4,
                 3,
             );
-            let s = crate::runtime::surface_cache::get_shared_with_gen(
-                &serial_state,
-                surface_id,
-                4,
-                3,
+            let s =
+                crate::runtime::surface_cache::get_shared_with_gen(&serial_state, surface_id, 4, 3);
+            assert_eq!(
+                p.map(|(_, g)| g),
+                s.map(|(_, g)| g),
+                "cache gen {surface_id}"
             );
-            assert_eq!(p.map(|(_, g)| g), s.map(|(_, g)| g), "cache gen {surface_id}");
             let pm = planned_state.mappings.get(&surface_id).unwrap();
             let sm = serial_state.mappings.get(&surface_id).unwrap();
             assert_eq!(
@@ -1225,7 +1267,14 @@ mod tests {
             let p = planned_state.mapper_ref_texture_memo.peek(&key);
             let s = serial_state.mapper_ref_texture_memo.peek(&key);
             let shape = |m: Option<&crate::model::GuestLinearMemo>| {
-                m.map(|m| (m.native.clone(), m.rgba[..].to_vec(), m.generation, m.layout))
+                m.map(|m| {
+                    (
+                        m.native.clone(),
+                        m.rgba[..].to_vec(),
+                        m.generation,
+                        m.layout,
+                    )
+                })
             };
             assert_eq!(shape(p), shape(s), "memo state {surface_id} #{n}");
             assert!(p.is_some(), "the memo rung filled {surface_id}");
@@ -1319,7 +1368,8 @@ mod tests {
             _ => panic!("a moved mapping falls back to the serial ladder"),
         }
         // And the fallback serves: the serial ladder answers for the bind.
-        let serial = resolve_sampled_source(&mut state, &mut host, 1, texture_ref, Some(resource), true);
+        let serial =
+            resolve_sampled_source(&mut state, &mut host, 1, texture_ref, Some(resource), true);
         assert!(serial.is_some(), "the serial ladder still serves the bind");
         drop(prep);
     }
@@ -1717,52 +1767,87 @@ mod tests {
         );
     }
 
-/// TEMP (lab, PASS_STAGE): the staged buffer arm end to end. A cold,
-/// never-primed reference (every zero-copy rail refuses on this host) plans
-/// into a worker arena window, the commit serves `BufferContent::Staged`
-/// whose bytes are the serial ladder's `Bytes`, the census names both halves,
-/// and the frame's pop releases the window.
-#[test]
-fn a_cold_bind_stages_the_serial_bytes() {
-    let _stage = crate::runtime::par::staging::test_enable(true);
-    let _mode = test_mode(PassPrepMode::On);
-    crate::backend::vulkan::engine::pass_stage::install_test_arenas(1, 64 * 1024, 2);
-    // Sub-floor references (4 KiB against the 16 KiB zero-copy floor): the
-    // one population whose serial answer is provably the CPU read. Two of
-    // them, so the chunk's item list is worth a fork.
-    let specs = [(7u32, 0x1000u64), (8, 0x1000)];
-    let (mut planned_state, planned_host) = pooled_buffer_fixture(&specs);
-    let (mut serial_state, serial_host) = pooled_buffer_fixture(&specs);
-    // The binds: each draw names both refs at offset 0, so each ref's one
-    // staged window serves every draw.
-    let make_binds = |state: &DeviceState, host: &FakeHost| -> Vec<Vec<BufferBind>> {
-        [7u32, 8]
+    /// TEMP (lab, PASS_STAGE): the staged buffer arm end to end. A cold,
+    /// never-primed reference (every zero-copy rail refuses on this host) plans
+    /// into a worker arena window, the commit serves `BufferContent::Staged`
+    /// whose bytes are the serial ladder's `Bytes`, the census names both halves,
+    /// and the frame's pop releases the window.
+    #[test]
+    fn a_cold_bind_stages_the_serial_bytes() {
+        let _stage = crate::runtime::par::staging::test_enable(true);
+        let _mode = test_mode(PassPrepMode::On);
+        crate::backend::vulkan::engine::pass_stage::install_test_arenas(1, 64 * 1024, 2);
+        // Sub-floor references (4 KiB against the 16 KiB zero-copy floor): the
+        // one population whose serial answer is provably the CPU read. Two of
+        // them, so the chunk's item list is worth a fork.
+        let specs = [(7u32, 0x1000u64), (8, 0x1000)];
+        let (mut planned_state, planned_host) = pooled_buffer_fixture(&specs);
+        let (mut serial_state, serial_host) = pooled_buffer_fixture(&specs);
+        // The binds: each draw names both refs at offset 0, so each ref's one
+        // staged window serves every draw.
+        let make_binds = |state: &DeviceState, host: &FakeHost| -> Vec<Vec<BufferBind>> {
+            [7u32, 8]
+                .iter()
+                .map(|&buffer_ref| {
+                    vec![BufferBind {
+                        index: 0,
+                        buffer_ref,
+                        resource: Some(
+                            crate::runtime::objects::resolve_resource(state, host, 1, buffer_ref)
+                                .expect("bind resource"),
+                        ),
+                        offset: 0,
+                        attribute_stride: None,
+                    }]
+                })
+                .collect()
+        };
+        let planned_binds = make_binds(&planned_state, &*planned_host);
+        let serial_binds = make_binds(&serial_state, &*serial_host);
+        // The serial arm first: no priming, so the ladder falls to its CPU read.
+        let mut serial_host = serial_host;
+        let serial_answers: Vec<_> = serial_binds
             .iter()
-            .map(|&buffer_ref| {
-                vec![BufferBind {
-                    index: 0,
-                    buffer_ref,
-                    resource: Some(
-                        crate::runtime::objects::resolve_resource(state, host, 1, buffer_ref)
-                            .expect("bind resource"),
-                    ),
-                    offset: 0,
-                    attribute_stride: None,
-                }]
+            .map(|one| {
+                let bind = one.first().expect("one bind per draw");
+                load_buffer_content(
+                    &mut serial_state,
+                    &mut *serial_host,
+                    1,
+                    bind.buffer_ref,
+                    bind.resource.as_deref(),
+                    bind.offset,
+                    true,
+                    None,
+                )
+                .expect("the serial ladder serves")
             })
-            .collect()
-    };
-    let planned_binds = make_binds(&planned_state, &*planned_host);
-    let serial_binds = make_binds(&serial_state, &*serial_host);
-    // The serial arm first: no priming, so the ladder falls to its CPU read.
-    let mut serial_host = serial_host;
-    let serial_answers: Vec<_> = serial_binds
-        .iter()
-        .map(|one| {
-            let bind = one.first().expect("one bind per draw");
-            load_buffer_content(
-                &mut serial_state,
-                &mut *serial_host,
+            .collect();
+        for answer in &serial_answers {
+            assert!(
+            matches!(answer, crate::backend::vulkan::engine::BufferContent::Bytes(_)),
+            "the fixture's host refuses every zero-copy rail, so the serial arm reads CPU bytes"
+        );
+        }
+        let tables: Vec<DrawTables<'_>> = planned_binds
+            .iter()
+            .map(|one| DrawTables {
+                fragment: &[],
+                vertex: &[],
+                vertex_buffers: one.as_slice(),
+                fragment_buffers: &[],
+                indexed: None,
+            })
+            .collect();
+        let before_planned = store_route_count("pass_prep_buf_planned_staged");
+        let before_hit = store_route_count("pass_prep_buf_hit_staged");
+        let mut prep = PassPrep::open_with_chunk(&planned_state, 1, tables, 4).expect("opens");
+        for di in 0..2 {
+            prep.ahead(&planned_state, &FakeHost::new(), di);
+            let bind = planned_binds[di].first().expect("one bind per draw");
+            let served = load_buffer_content(
+                &mut planned_state,
+                &mut *planned_host,
                 1,
                 bind.buffer_ref,
                 bind.resource.as_deref(),
@@ -1770,72 +1855,41 @@ fn a_cold_bind_stages_the_serial_bytes() {
                 true,
                 None,
             )
-            .expect("the serial ladder serves")
-        })
-        .collect();
-    for answer in &serial_answers {
-        assert!(
-            matches!(answer, crate::backend::vulkan::engine::BufferContent::Bytes(_)),
-            "the fixture's host refuses every zero-copy rail, so the serial arm reads CPU bytes"
-        );
-    }
-    let tables: Vec<DrawTables<'_>> = planned_binds
-        .iter()
-        .map(|one| DrawTables {
-            fragment: &[],
-            vertex: &[],
-            vertex_buffers: one.as_slice(),
-            fragment_buffers: &[],
-            indexed: None,
-        })
-        .collect();
-    let before_planned = store_route_count("pass_prep_buf_planned_staged");
-    let before_hit = store_route_count("pass_prep_buf_hit_staged");
-    let mut prep = PassPrep::open_with_chunk(&planned_state, 1, tables, 4).expect("opens");
-    for di in 0..2 {
-        prep.ahead(&planned_state, &FakeHost::new(), di);
-        let bind = planned_binds[di].first().expect("one bind per draw");
-        let served = load_buffer_content(
-            &mut planned_state,
-            &mut *planned_host,
-            1,
-            bind.buffer_ref,
-            bind.resource.as_deref(),
-            bind.offset,
-            true,
-            None,
-        )
-        .expect("the planned arm serves");
-        match &served {
-            crate::backend::vulkan::engine::BufferContent::Staged(slice) => {
-                // SAFETY: the fact is alive for this borrow.
-                let staged = unsafe { slice.bytes() };
-                match &serial_answers[di] {
-                    crate::backend::vulkan::engine::BufferContent::Bytes(b) => {
-                        assert_eq!(staged, &b[..], "draw {di}: the staged bytes are the serial ones");
+            .expect("the planned arm serves");
+            match &served {
+                crate::backend::vulkan::engine::BufferContent::Staged(slice) => {
+                    // SAFETY: the fact is alive for this borrow.
+                    let staged = unsafe { slice.bytes() };
+                    match &serial_answers[di] {
+                        crate::backend::vulkan::engine::BufferContent::Bytes(b) => {
+                            assert_eq!(
+                                staged,
+                                &b[..],
+                                "draw {di}: the staged bytes are the serial ones"
+                            );
+                        }
+                        other => panic!("draw {di}: serial answered {other:?}"),
                     }
-                    other => panic!("draw {di}: serial answered {other:?}"),
                 }
+                other => panic!("draw {di}: the staged arm serves, got {other:?}"),
             }
-            other => panic!("draw {di}: the staged arm serves, got {other:?}"),
         }
+        assert!(delta("pass_prep_buf_planned_staged", before_planned) >= 1);
+        assert!(delta("pass_prep_buf_hit_staged", before_hit) >= 1);
+        // The frame still holds the staged plan (it serves every draw); its pop
+        // is what releases the window.
+        let arenas = crate::backend::vulkan::engine::pass_stage::arenas().expect("installed");
+        assert!(arenas[0].ring.in_flight() >= 1, "the plan holds its window");
+        drop(prep);
+        assert_eq!(
+            arenas[0].ring.in_flight(),
+            0,
+            "the frame's pop releases every staged window"
+        );
+        drop(
+            crate::backend::vulkan::engine::pass_stage::take_test_arenas()
+                .expect("the test arenas are still installed"),
+        );
+        let _ = &mut planned_state;
     }
-    assert!(delta("pass_prep_buf_planned_staged", before_planned) >= 1);
-    assert!(delta("pass_prep_buf_hit_staged", before_hit) >= 1);
-    // The frame still holds the staged plan (it serves every draw); its pop
-    // is what releases the window.
-    let arenas = crate::backend::vulkan::engine::pass_stage::arenas().expect("installed");
-    assert!(arenas[0].ring.in_flight() >= 1, "the plan holds its window");
-    drop(prep);
-    assert_eq!(
-        arenas[0].ring.in_flight(),
-        0,
-        "the frame's pop releases every staged window"
-    );
-    drop(
-        crate::backend::vulkan::engine::pass_stage::take_test_arenas()
-            .expect("the test arenas are still installed"),
-    );
-    let _ = &mut planned_state;
-}
 }

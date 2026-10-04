@@ -26,7 +26,6 @@
 //! writeback that landed in the window invalidates the plan and the serial
 //! ladder runs, exactly as it would have.
 
-
 use crate::backend::vulkan::engine::pass_stage::{StagedSlice, WorkerArena};
 
 /// What one pool job stages through: its own thread's arena.
@@ -205,7 +204,12 @@ pub(crate) fn arm_seed_stage(resources: &mut crate::backend::vulkan::engine::Dra
     let four_byte = resources
         .color_attachment
         .map(|a| a.format())
-        .or_else(|| resources.target_identity.as_ref().map(|id| id.resident_format()))
+        .or_else(|| {
+            resources
+                .target_identity
+                .as_ref()
+                .map(|id| id.resident_format())
+        })
         .and_then(crate::backend::vulkan::translate::pixel::texel_layout_of)
         .is_some_and(|layout| layout.is_four_byte_color());
     if !four_byte {
@@ -223,12 +227,13 @@ pub(crate) fn arm_seed_stage(resources: &mut crate::backend::vulkan::engine::Dra
     let _ = arenas;
     // The engine's own exchange predicate, spelled from the same two facts it
     // reads: the seed's order against the attachment's.
-    let swap_rb =
-        matches!(resources.target_seed_order, crate::backend::vulkan::engine::SeedOrder::Bgra8)
-            != resources
-                .target_identity
-                .as_ref()
-                .is_some_and(|id| id.is_bgra());
+    let swap_rb = matches!(
+        resources.target_seed_order,
+        crate::backend::vulkan::engine::SeedOrder::Bgra8
+    ) != resources
+        .target_identity
+        .as_ref()
+        .is_some_and(|id| id.is_bgra());
     let cell = std::sync::Arc::new(SeedStageCell::new(std::sync::Arc::clone(bytes), swap_rb));
     resources.target_seed_stage = Some(std::sync::Arc::clone(&cell));
     PENDING_SEEDS.with(|pending| pending.borrow_mut().push(cell));
@@ -236,7 +241,8 @@ pub(crate) fn arm_seed_stage(resources: &mut crate::backend::vulkan::engine::Dra
 
 /// Take the armed seed cells (the caller filters the spent ones); the next
 /// chunk's scope turns each into a staging job.
-pub(crate) fn take_pending_seeds() -> Vec<std::sync::Arc<crate::backend::vulkan::engine::pass_stage::SeedStageCell>> {
+pub(crate) fn take_pending_seeds(
+) -> Vec<std::sync::Arc<crate::backend::vulkan::engine::pass_stage::SeedStageCell>> {
     PENDING_SEEDS.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
 }
 
@@ -342,7 +348,10 @@ mod tests {
         ];
         let slice = stager.stage_runs(&runs, 4, 12).expect("room");
         // SAFETY: alive for the borrow.
-        assert_eq!(unsafe { slice.bytes() }, &(4u8..16u8).collect::<Vec<_>>()[..]);
+        assert_eq!(
+            unsafe { slice.bytes() },
+            &(4u8..16u8).collect::<Vec<_>>()[..]
+        );
         // A window the runs underfill: bytes 4..32 cover 28; asking for 34
         // zeroes the last six (the 4-byte arena alignment may pad the ask, so
         // the compare is over the requested prefix).
@@ -375,9 +384,13 @@ mod tests {
         drop(served);
         drop(cell);
         drop(slice);
-        assert_eq!(crate::backend::vulkan::engine::pass_stage::arenas().expect("installed")[0]
-            .ring
-            .in_flight(), 0, "everything released");
+        assert_eq!(
+            crate::backend::vulkan::engine::pass_stage::arenas().expect("installed")[0]
+                .ring
+                .in_flight(),
+            0,
+            "everything released"
+        );
     }
 
     #[test]

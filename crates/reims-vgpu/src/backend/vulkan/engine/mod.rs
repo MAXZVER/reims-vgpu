@@ -90,10 +90,9 @@ pub use types::{
     PrimitiveTopology, SampledByteOrigin, SampledContentIdentity, SampledImageResource,
     SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
     SeedOrder, StagedSampled, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
-    StorageImageFormat,
-    TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource,
-    VertexStepFunction, ViewportResource, VisibilityResultMode, WindowPresentSource,
-    COLOR_INPUT_BINDING,
+    StorageImageFormat, TargetIdentity, TargetKeyDivergence, VertexAttributeFormat,
+    VertexAttributeResource, VertexStepFunction, ViewportResource, VisibilityResultMode,
+    WindowPresentSource, COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
@@ -2572,8 +2571,12 @@ fn lab_present_note(identity: &TargetIdentity) {
     *last = Some(identity.clone());
     let key = match identity {
         TargetIdentity::Surface { id, generation, .. } => format!("s{id}.{generation}"),
-        TargetIdentity::Texture { ref_, generation, .. } => format!("r{ref_}.{generation}"),
-        TargetIdentity::Gva { gva, generation, .. } => format!("g{gva:x}.{generation}"),
+        TargetIdentity::Texture {
+            ref_, generation, ..
+        } => format!("r{ref_}.{generation}"),
+        TargetIdentity::Gva {
+            gva, generation, ..
+        } => format!("g{gva:x}.{generation}"),
         TargetIdentity::Anonymous { slot } => format!("a{slot}"),
     };
     crate::observe::fail(format!(
@@ -4241,7 +4244,9 @@ pub fn read_target_changed_pages_with(
 ) -> Result<Option<ChangedPages>, DrawError> {
     match read_target_changed_pages_inner(identity, mapping_id, key, force, between, false)? {
         Some(CompareOutcome::Ready(changed)) => Ok(Some(changed)),
-        Some(CompareOutcome::Deferred(_)) => unreachable!("a synchronous compare is never deferred"),
+        Some(CompareOutcome::Deferred(_)) => {
+            unreachable!("a synchronous compare is never deferred")
+        }
         None => Ok(None),
     }
 }
@@ -4626,295 +4631,312 @@ fn read_target_changed_pages_inner(
     ];
     drop(lab_span);
     let submitted = unsafe {
-        page_diff_submit(ctx, pools, counters, between, |cb| {
-            let d = &ctx.device;
-            let push_image: &[u8] =
-                std::slice::from_raw_parts(push_image.as_ptr().cast::<u8>(), 16);
-            if image_route {
-                // TEMP (lab, `REIMS_VGPU_LAB_PAY_FLAGS_DEV`): the host's marks
-                // into the kernel's device-local flags. The barrier orders the
-                // copy after every earlier use of that buffer (submission order
-                // spans the previous payment's kernel and copy-back).
-                let flags_bytes = [vk::BufferCopy::default().size(pages * 4)];
-                if let Some(fd) = flags_dev_b {
-                    let before_fill = [vk::MemoryBarrier::default()
-                        .src_access_mask(
-                            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                        )
-                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)];
+        page_diff_submit(
+            ctx,
+            pools,
+            counters,
+            between,
+            |cb| {
+                let d = &ctx.device;
+                let push_image: &[u8] =
+                    std::slice::from_raw_parts(push_image.as_ptr().cast::<u8>(), 16);
+                if image_route {
+                    // TEMP (lab, `REIMS_VGPU_LAB_PAY_FLAGS_DEV`): the host's marks
+                    // into the kernel's device-local flags. The barrier orders the
+                    // copy after every earlier use of that buffer (submission order
+                    // spans the previous payment's kernel and copy-back).
+                    let flags_bytes = [vk::BufferCopy::default().size(pages * 4)];
+                    if let Some(fd) = flags_dev_b {
+                        let before_fill = [vk::MemoryBarrier::default()
+                            .src_access_mask(
+                                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                            )
+                            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)];
+                        d.cmd_pipeline_barrier(
+                            cb,
+                            vk::PipelineStageFlags::ALL_COMMANDS,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &before_fill,
+                            &[],
+                            &[],
+                        );
+                        d.cmd_copy_buffer(cb, flags_b, fd, &flags_bytes);
+                        // Its own barrier rather than a term of the image barrier
+                        // below, which may carry a feedback-loop dependency flag.
+                        let flags_filled = [vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                            .dst_access_mask(
+                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            )];
+                        d.cmd_pipeline_barrier(
+                            cb,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &flags_filled,
+                            &[],
+                            &[],
+                        );
+                    }
+                    // Sampled in GENERAL (valid for any usage), then put back in the
+                    // transfer-read layout the registry records below, so the next
+                    // barrier over this resident names the access it actually has.
+                    let to_shader = [vk::ImageMemoryBarrier::default()
+                        .src_access_mask(RESIDENT_READ_SRC_ACCESS)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .old_layout(snap.layout)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .image(snap.image)
+                        .subresource_range(color_subresource_range())];
                     d.cmd_pipeline_barrier(
                         cb,
                         vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        &before_fill,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        feedback_transition_dependency(snap.layout),
                         &[],
+                        &[],
+                        &to_shader,
+                    );
+                    d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pl);
+                    d.cmd_bind_descriptor_sets(
+                        cb,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pl_layout,
+                        0,
+                        &[set],
                         &[],
                     );
-                    d.cmd_copy_buffer(cb, flags_b, fd, &flags_bytes);
-                    // Its own barrier rather than a term of the image barrier
-                    // below, which may carry a feedback-loop dependency flag.
-                    let flags_filled = [vk::MemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                        .dst_access_mask(
-                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                        )];
+                    d.cmd_push_constants(
+                        cb,
+                        pl_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        push_image,
+                    );
+                    lab_dispatch_pages(d, cb, pages as u32, band_ranges.as_deref());
+                    if let Some((hl, hp, hs)) = verify_cmd {
+                        // TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH=verify`): the hash
+                        // compare of the same image, ordered after the `prev`
+                        // compare's writes to `out` (the same bytes for a page both
+                        // flag).
+                        let ordered = [vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(
+                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            )];
+                        d.cmd_pipeline_barrier(
+                            cb,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &ordered,
+                            &[],
+                            &[],
+                        );
+                        // The same band as the `prev` compare's: both kernels are
+                        // page-per-workgroup, so each is dispatched over the same
+                        // ranges and a page outside them is compared by neither.
+                        lab_dispatch_hash(
+                            d,
+                            cb,
+                            (hl, hp, hs),
+                            push_image,
+                            pages as u32,
+                            band_ranges.as_deref(),
+                        );
+                    }
+                    let back = [vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(read_access.layout())
+                        .image(snap.image)
+                        .subresource_range(color_subresource_range())];
+                    // TEMP (lab, `REIMS_VGPU_LAB_PAY_FLAGS_DEV`): the kernel's flag
+                    // writes made visible to the copy back below.
+                    let flags_done = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+                    let flags_done: &[vk::MemoryBarrier<'_>] = if flags_dev_b.is_some() {
+                        &flags_done
+                    } else {
+                        &[]
+                    };
                     d.cmd_pipeline_barrier(
                         cb,
-                        vk::PipelineStageFlags::TRANSFER,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
                         vk::DependencyFlags::empty(),
-                        &flags_filled,
+                        flags_done,
+                        &[],
+                        &back,
+                    );
+                    let (host_src_stage, host_src_access) = match flags_dev_b {
+                        Some(fd) => {
+                            d.cmd_copy_buffer(cb, fd, flags_b, &flags_bytes);
+                            (
+                                vk::PipelineStageFlags::COMPUTE_SHADER
+                                    | vk::PipelineStageFlags::TRANSFER,
+                                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                            )
+                        }
+                        None => (
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::AccessFlags::SHADER_WRITE,
+                        ),
+                    };
+                    let to_host = [vk::MemoryBarrier::default()
+                        .src_access_mask(host_src_access)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                    d.cmd_pipeline_barrier(
+                        cb,
+                        host_src_stage,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &to_host,
                         &[],
                         &[],
                     );
+                    return;
                 }
-                // Sampled in GENERAL (valid for any usage), then put back in the
-                // transfer-read layout the registry records below, so the next
-                // barrier over this resident names the access it actually has.
-                let to_shader = [vk::ImageMemoryBarrier::default()
+                let to_src = [vk::ImageMemoryBarrier::default()
                     .src_access_mask(RESIDENT_READ_SRC_ACCESS)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                     .old_layout(snap.layout)
-                    .new_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(read_access.layout())
                     .image(snap.image)
                     .subresource_range(color_subresource_range())];
                 d.cmd_pipeline_barrier(
                     cb,
                     vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
                     feedback_transition_dependency(snap.layout),
                     &[],
                     &[],
-                    &to_shader,
+                    &to_src,
                 );
-                d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pl);
-                d.cmd_bind_descriptor_sets(
-                    cb,
-                    vk::PipelineBindPoint::COMPUTE,
-                    pl_layout,
-                    0,
-                    &[set],
-                    &[],
-                );
-                d.cmd_push_constants(cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, push_image);
-                lab_dispatch_pages(d, cb, pages as u32, band_ranges.as_deref());
-                if let Some((hl, hp, hs)) = verify_cmd {
-                    // TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH=verify`): the hash
-                    // compare of the same image, ordered after the `prev`
-                    // compare's writes to `out` (the same bytes for a page both
-                    // flag).
+                let region = [vk::BufferImageCopy::default()
+                    .image_subresource(color_subresource_layers())
+                    .image_extent(vk::Extent3D {
+                        width: w,
+                        height: h,
+                        depth: 1,
+                    })];
+                d.cmd_copy_image_to_buffer(cb, snap.image, read_access.layout(), cur_b, &region);
+                let after_copy = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::TRANSFER_READ
+                            | vk::AccessFlags::SHADER_READ
+                            | vk::AccessFlags::SHADER_WRITE,
+                    )];
+                if fresh {
+                    // The whole frame goes to the guest, and the shadow becomes it.
+                    d.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &after_copy,
+                        &[],
+                        &[],
+                    );
+                    let whole = [vk::BufferCopy::default().size(frame_bytes)];
+                    d.cmd_copy_buffer(cb, cur_b, prev_b, &whole);
+                    d.cmd_copy_buffer(cb, cur_b, out_b, &whole);
+                } else {
+                    if !one_trip {
+                        d.cmd_fill_buffer(cb, flags_b, 0, pages * 4, 0);
+                    }
+                    d.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &after_copy,
+                        &[],
+                        &[],
+                    );
+                    d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pl);
+                    d.cmd_bind_descriptor_sets(
+                        cb,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pl_layout,
+                        0,
+                        &[set],
+                        &[],
+                    );
+                    let push = [pages as u32, page_diff::WORDS_PER_PAGE];
+                    let bytes: &[u8] = std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 8);
+                    d.cmd_push_constants(cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+                    d.cmd_dispatch(cb, pages as u32, 1, 1);
+                }
+                if let Some(cmd) = verify_cmd {
+                    // TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH=verify`): the hash compare
+                    // beside the frame copy, sampling the image in `GENERAL` after
+                    // the copy read it and after every write to `out` above, then
+                    // putting it back in the transfer-read layout recorded below.
+                    let to_shader = [vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .old_layout(read_access.layout())
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .image(snap.image)
+                        .subresource_range(color_subresource_range())];
                     let ordered = [vk::MemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .src_access_mask(
+                            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                        )
                         .dst_access_mask(
                             vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
                         )];
                     d.cmd_pipeline_barrier(
                         cb,
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::DependencyFlags::empty(),
                         &ordered,
                         &[],
-                        &[],
+                        &to_shader,
                     );
-                    // The same band as the `prev` compare's: both kernels are
-                    // page-per-workgroup, so each is dispatched over the same
-                    // ranges and a page outside them is compared by neither.
-                    lab_dispatch_hash(
-                        d,
+                    // Beside a frame copy, so not narrowed: the `prev` compare of
+                    // this route (or the copy that seeds it) takes every page.
+                    lab_dispatch_hash(d, cb, cmd, push_image, pages as u32, None);
+                    let back = [vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(read_access.layout())
+                        .image(snap.image)
+                        .subresource_range(color_subresource_range())];
+                    d.cmd_pipeline_barrier(
                         cb,
-                        (hl, hp, hs),
-                        push_image,
-                        pages as u32,
-                        band_ranges.as_deref(),
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &back,
                     );
                 }
-                let back = [vk::ImageMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(read_access.layout())
-                    .image(snap.image)
-                    .subresource_range(color_subresource_range())];
-                // TEMP (lab, `REIMS_VGPU_LAB_PAY_FLAGS_DEV`): the kernel's flag
-                // writes made visible to the copy back below.
-                let flags_done = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
-                let flags_done: &[vk::MemoryBarrier<'_>] = if flags_dev_b.is_some() {
-                    &flags_done
-                } else {
-                    &[]
-                };
-                d.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    flags_done,
-                    &[],
-                    &back,
-                );
-                let (host_src_stage, host_src_access) = match flags_dev_b {
-                    Some(fd) => {
-                        d.cmd_copy_buffer(cb, fd, flags_b, &flags_bytes);
-                        (
-                            vk::PipelineStageFlags::COMPUTE_SHADER
-                                | vk::PipelineStageFlags::TRANSFER,
-                            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                        )
-                    }
-                    None => (
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
-                        vk::AccessFlags::SHADER_WRITE,
-                    ),
-                };
                 let to_host = [vk::MemoryBarrier::default()
-                    .src_access_mask(host_src_access)
-                    .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                    .src_access_mask(
+                        vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                    )
+                    .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::TRANSFER_READ)];
                 d.cmd_pipeline_barrier(
                     cb,
-                    host_src_stage,
-                    vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
                     &to_host,
                     &[],
                     &[],
                 );
-                return;
-            }
-            let to_src = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(RESIDENT_READ_SRC_ACCESS)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(snap.layout)
-                .new_layout(read_access.layout())
-                .image(snap.image)
-                .subresource_range(color_subresource_range())];
-            d.cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                feedback_transition_dependency(snap.layout),
-                &[],
-                &[],
-                &to_src,
-            );
-            let region = [vk::BufferImageCopy::default()
-                .image_subresource(color_subresource_layers())
-                .image_extent(vk::Extent3D {
-                    width: w,
-                    height: h,
-                    depth: 1,
-                })];
-            d.cmd_copy_image_to_buffer(cb, snap.image, read_access.layout(), cur_b, &region);
-            let after_copy = [vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::TRANSFER_READ
-                        | vk::AccessFlags::SHADER_READ
-                        | vk::AccessFlags::SHADER_WRITE,
-                )];
-            if fresh {
-                // The whole frame goes to the guest, and the shadow becomes it.
-                d.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &after_copy,
-                    &[],
-                    &[],
-                );
-                let whole = [vk::BufferCopy::default().size(frame_bytes)];
-                d.cmd_copy_buffer(cb, cur_b, prev_b, &whole);
-                d.cmd_copy_buffer(cb, cur_b, out_b, &whole);
-            } else {
-                if !one_trip {
-                    d.cmd_fill_buffer(cb, flags_b, 0, pages * 4, 0);
-                }
-                d.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &after_copy,
-                    &[],
-                    &[],
-                );
-                d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pl);
-                d.cmd_bind_descriptor_sets(
-                    cb,
-                    vk::PipelineBindPoint::COMPUTE,
-                    pl_layout,
-                    0,
-                    &[set],
-                    &[],
-                );
-                let push = [pages as u32, page_diff::WORDS_PER_PAGE];
-                let bytes: &[u8] = std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 8);
-                d.cmd_push_constants(cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
-                d.cmd_dispatch(cb, pages as u32, 1, 1);
-            }
-            if let Some(cmd) = verify_cmd {
-                // TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH=verify`): the hash compare
-                // beside the frame copy, sampling the image in `GENERAL` after
-                // the copy read it and after every write to `out` above, then
-                // putting it back in the transfer-read layout recorded below.
-                let to_shader = [vk::ImageMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .old_layout(read_access.layout())
-                    .new_layout(vk::ImageLayout::GENERAL)
-                    .image(snap.image)
-                    .subresource_range(color_subresource_range())];
-                let ordered = [vk::MemoryBarrier::default()
-                    .src_access_mask(
-                        vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                    )
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
-                d.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &ordered,
-                    &[],
-                    &to_shader,
-                );
-                // Beside a frame copy, so not narrowed: the `prev` compare of
-                // this route (or the copy that seeds it) takes every page.
-                lab_dispatch_hash(d, cb, cmd, push_image, pages as u32, None);
-                let back = [vk::ImageMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(read_access.layout())
-                    .image(snap.image)
-                    .subresource_range(color_subresource_range())];
-                d.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &back,
-                );
-            }
-            let to_host = [vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::TRANSFER_READ)];
-            d.cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &to_host,
-                &[],
-                &[],
-            );
-        }, !defer)
+            },
+            !defer,
+        )
     };
     // TEMP (lab, `REIMS_VGPU_LAB_PAY_BAND`): the shadow now equals the resident
     // as it was recorded when the compare ran, so no row differs from it — and
@@ -4973,7 +4995,11 @@ unsafe fn finish_compare_locked(
     let (pages, frame_bytes, full, one_trip) = (t.pages, t.frame_bytes, t.full, t.one_trip);
     let (band_mode, band, w, h, read_access) = (t.band_mode, t.band, t.w, t.h, t.read_access);
     let flags = st.flags.as_ref().expect("ensured");
-    let hash_flags = if t.verify { st.hash_flags.as_ref() } else { None };
+    let hash_flags = if t.verify {
+        st.hash_flags.as_ref()
+    } else {
+        None
+    };
     let out = st.out.as_ref().expect("ensured");
     let (cur_b, out_b) = (st.cur.as_ref().expect("ensured").buffer, out.buffer);
     let _lab_post = crate::runtime::chain_phase::CostSpan::new("lab_pd_post_us"); // TEMP (lab)
