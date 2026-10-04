@@ -2590,6 +2590,16 @@ impl RectStride {
 /// `src` and `dst` must be valid for `n` bytes and not overlap.
 unsafe fn write_guest_bytes(src: *const u8, dst: *mut u8, n: usize) {
     crate::backend::settle_deferred_draws_for_guest_write();
+    unsafe { write_guest_bytes_raw(src, dst, n) }
+}
+
+/// [`write_guest_bytes`] without the recorder settle, for a thread that is not
+/// the drain (TEMP lab PAY_DEFER's landing copy): the drain settled before it
+/// handed the copy over.
+///
+/// # Safety
+/// As [`write_guest_bytes`].
+pub(crate) unsafe fn write_guest_bytes_raw(src: *const u8, dst: *mut u8, n: usize) {
     // TEMP lab A/B: REIMS_LAB_STREAM_WRITE=off takes the plain copy.
     static STREAM: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
         std::env::var("REIMS_LAB_STREAM_WRITE").map_or(true, |v| v != "off")

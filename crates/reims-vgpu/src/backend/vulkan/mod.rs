@@ -572,6 +572,21 @@ impl Backend for VulkanBackend {
             .is_none_or(|d| d.ready())
     }
 
+    fn advance_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        pending: &mut Box<dyn std::any::Any + Send + Sync>,
+    ) -> Option<bool> {
+        let d = pending.downcast_mut::<crate::runtime::render_writeback::vulkan::DeferredStore>()?;
+        let identity = d.identity.clone();
+        let paid = crate::runtime::render_writeback::vulkan::advance_render_frame(state, host, d)?;
+        if !paid {
+            engine::note_resident_content_copied_out(&identity);
+        }
+        Some(paid)
+    }
+
     fn land_surface_writeback<M: HostMemory + HostOps>(
         &self,
         state: &mut DeviceState,

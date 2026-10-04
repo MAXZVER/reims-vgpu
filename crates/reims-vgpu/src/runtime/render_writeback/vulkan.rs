@@ -516,10 +516,12 @@ fn land_changed_pages<M: HostMemory + HostOps>(
 
 /// TEMP (lab PAY_DEFER): a presented frame's changed-pages payment whose compare
 /// is on the GPU and whose landing waits for a later call (see
-/// `writeback_debt::pay_deferred`). It holds no host pointer and no vouch: the
-/// answer is read, vouched and landed by [`land_render_frame`].
+/// `writeback_debt::pay_deferred`). It holds no vouch: the answer is read and
+/// vouched when the compare is done, and its bytes are copied into the guest's
+/// pages by the landing thread while the drain goes on (`Stage::Copying`); the
+/// payment's bookkeeping runs once that copy is in.
 pub struct DeferredStore {
-    ticket: crate::backend::vulkan::engine::CompareTicket,
+    stage: Stage,
     pub(crate) identity: crate::backend::vulkan::engine::TargetIdentity,
     mapping_id: u32,
     width: u32,
@@ -529,10 +531,119 @@ pub struct DeferredStore {
     started: std::time::Instant,
 }
 
+enum Stage {
+    /// The compare is submitted.
+    Compare(crate::backend::vulkan::engine::CompareTicket),
+    /// The changed pages are being copied into the guest's pages.
+    Copying(LandJob),
+    /// Consumed.
+    Taken,
+}
+
 impl DeferredStore {
-    /// Whether the compare has finished on the GPU (landing would not wait).
+    /// Whether the next step would not wait: the compare has finished on the
+    /// GPU, or the landing copy is in.
     pub(crate) fn ready(&self) -> bool {
-        crate::backend::vulkan::engine::target_compare_done(&self.ticket)
+        match &self.stage {
+            Stage::Compare(ticket) => crate::backend::vulkan::engine::target_compare_done(ticket),
+            Stage::Copying(job) => job.done(),
+            Stage::Taken => true,
+        }
+    }
+}
+
+/// TEMP (lab PAY_DEFER): one landing copy on the landing thread — the selected
+/// runs of a compare's frame-shaped answer into the mapping's packed guest view.
+/// Dropping one waits for its copy: a landing abandoned half-way must not keep
+/// writing guest pages behind the drain's back.
+struct LandJob {
+    done: std::sync::Arc<LandDone>,
+    /// Mapping-linear `[lo, hi)` runs copied, for the footprint marks.
+    runs: Vec<(u64, u64)>,
+    frame_len: usize,
+    pages: usize,
+    full: bool,
+}
+
+#[derive(Default)]
+struct LandDone {
+    flag: std::sync::atomic::AtomicBool,
+    lock: std::sync::Mutex<()>,
+    cv: std::sync::Condvar,
+}
+
+/// `(dst, src, n)`: raw addresses, valid until the job is waited for — the
+/// destination is a packed guest view the drain keeps (a map-family command
+/// lands the payment first), the source the page-diff answer buffer no compare
+/// reuses before the payment lands.
+type LandSpans = Vec<(usize, usize, usize)>;
+
+impl LandJob {
+    fn done(&self) -> bool {
+        self.done.flag.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn wait(&self) {
+        if self.done() {
+            return;
+        }
+        let _span = crate::runtime::chain_phase::CostSpan::new("lab_pay_defer_copy_wait_us");
+        let mut g = self.done.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !self.done() {
+            g = self.done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Hand `spans` to the landing thread (started on first use).
+    fn spawn(spans: LandSpans, runs: Vec<(u64, u64)>, frame_len: usize, pages: usize, full: bool) -> Self {
+        use std::sync::{mpsc, Mutex, OnceLock};
+        static TX: OnceLock<Mutex<mpsc::Sender<(LandSpans, std::sync::Arc<LandDone>)>>> =
+            OnceLock::new();
+        let done = std::sync::Arc::new(LandDone::default());
+        let tx = TX.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<(LandSpans, std::sync::Arc<LandDone>)>();
+            std::thread::Builder::new()
+                .name("reims-land".into())
+                .spawn(move || {
+                    while let Ok((spans, done)) = rx.recv() {
+                        for (dst, src, n) in spans {
+                            // SAFETY: see `LandSpans`; the ranges were bounds-checked
+                            // against the view and the answer buffer by the drain.
+                            unsafe {
+                                crate::runtime::mapper::write_guest_bytes_raw(
+                                    src as *const u8,
+                                    dst as *mut u8,
+                                    n,
+                                )
+                            };
+                        }
+                        let _g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+                        done.flag.store(true, std::sync::atomic::Ordering::Release);
+                        done.cv.notify_all();
+                    }
+                })
+                .expect("spawn the landing thread");
+            Mutex::new(tx)
+        });
+        let sent = tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send((spans, done.clone()));
+        if let Err(mpsc::SendError((spans, _))) = sent {
+            // No landing thread: copy here, so the job is as done as it would be.
+            for (dst, src, n) in spans {
+                // SAFETY: as on the landing thread.
+                unsafe { crate::runtime::mapper::write_guest_bytes_raw(src as *const u8, dst as *mut u8, n) };
+            }
+            done.flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Self { done, runs, frame_len, pages, full }
+    }
+}
+
+impl Drop for LandJob {
+    fn drop(&mut self) {
+        self.wait();
     }
 }
 
@@ -665,7 +776,7 @@ fn begin_changed_pages<M: HostMemory + HostOps>(
         }
     };
     Some(DeferredStore {
-        ticket,
+        stage: Stage::Compare(ticket),
         identity: identity.clone(),
         mapping_id,
         width,
@@ -676,59 +787,210 @@ fn begin_changed_pages<M: HostMemory + HostOps>(
     })
 }
 
-/// TEMP (lab PAY_DEFER): wait a [`DeferredStore`]'s compare and land it as the
-/// synchronous changed-pages payment would have. Pages that drifted since the
-/// submit, or a compare that cannot be read any more, forget the shadow and land
-/// the whole frame instead — the synchronous payment's own fallbacks.
+/// TEMP (lab PAY_DEFER): take a [`DeferredStore`] as far as it goes without
+/// waiting — the compare's answer read, vouched and handed to the landing
+/// thread once the GPU is done; the bookkeeping once the copy is in. `Some` is
+/// [`store_render_frame`]'s answer when the payment finished.
+pub fn advance_render_frame<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    d: &mut DeferredStore,
+) -> Option<bool> {
+    step_render_frame(state, host, d, false)
+}
+
+/// TEMP (lab PAY_DEFER): finish a [`DeferredStore`], waiting for what it still
+/// waits on.
 pub fn land_render_frame<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    d: DeferredStore,
+    mut d: DeferredStore,
 ) -> bool {
-    let DeferredStore {
-        ticket,
-        identity,
-        mapping_id,
-        width,
-        height,
-        base_off,
-        gen_now,
-        started,
-    } = d;
+    step_render_frame(state, host, &mut d, true).unwrap_or(false)
+}
+
+fn step_render_frame<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    d: &mut DeferredStore,
+    block: bool,
+) -> Option<bool> {
+    loop {
+        match std::mem::replace(&mut d.stage, Stage::Taken) {
+            Stage::Compare(ticket) => {
+                if !block && !crate::backend::vulkan::engine::target_compare_done(&ticket) {
+                    d.stage = Stage::Compare(ticket);
+                    return None;
+                }
+                match begin_landing(state, host, d, ticket) {
+                    Ok(paid) => return Some(paid),
+                    Err(job) => {
+                        d.stage = Stage::Copying(job);
+                        if !block {
+                            return None;
+                        }
+                    }
+                }
+            }
+            Stage::Copying(job) => {
+                if !block && !job.done() {
+                    d.stage = Stage::Copying(job);
+                    return None;
+                }
+                job.wait();
+                return Some(complete_landing(state, d, job));
+            }
+            Stage::Taken => return Some(false),
+        }
+    }
+}
+
+/// The compare is done: read its answer and either hand the copy to the landing
+/// thread (`Err`, the payment goes on) or finish the payment here (`Ok`: the
+/// synchronous landing, or the whole-frame fallbacks of the synchronous payment).
+fn begin_landing<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    d: &DeferredStore,
+    ticket: crate::backend::vulkan::engine::CompareTicket,
+) -> Result<bool, LandJob> {
     let changed = match crate::backend::vulkan::engine::finish_target_compare(&ticket) {
         Ok(changed) => changed,
         Err(e) => {
             crate::observe::Emit::decline("pay_diff_failed", &e)
-                .field("mapping", mapping_id)
-                .fail_once(u64::from(mapping_id));
+                .field("mapping", d.mapping_id)
+                .fail_once(u64::from(d.mapping_id));
             None
         }
     };
     drop(ticket);
-    let landed = changed.and_then(|changed| {
-        match crate::runtime::mapper::vouch_mapping_pages_verdict(state, host, mapping_id).1 {
-            Some(vouched) => land_changed_pages(
-                state, host, mapping_id, &identity, width, height, base_off, gen_now, started,
-                changed, vouched,
-            ),
-            None => {
-                crate::runtime::drain::note_store_route("lab_pay_defer_vouch_refused");
-                crate::backend::vulkan::engine::page_diff_forget(mapping_id);
-                None
-            }
-        }
-    });
-    match landed {
+    let Some(changed) = changed else {
+        return Ok(whole_frame(state, host, d));
+    };
+    let Some(vouched) = crate::runtime::mapper::vouch_mapping_pages_verdict(state, host, d.mapping_id).1
+    else {
+        crate::runtime::drain::note_store_route("lab_pay_defer_vouch_refused");
+        return Ok(whole_frame(state, host, d));
+    };
+    if let Some(job) = start_landing_copy(state, host, d, &changed, &vouched) {
+        return Err(job);
+    }
+    match land_changed_pages(
+        state, host, d.mapping_id, &d.identity, d.width, d.height, d.base_off, d.gen_now, d.started,
+        changed, vouched,
+    ) {
         Some(done) => {
             crate::runtime::drain::note_store_route("lab_pay_defer_landed");
-            done
+            Ok(done)
         }
-        None => {
-            crate::runtime::drain::note_store_route("lab_pay_defer_whole");
-            crate::backend::vulkan::engine::page_diff_forget(mapping_id);
-            store_render_frame(state, host, mapping_id, &identity, width, height)
+        None => Ok(whole_frame(state, host, d)),
+    }
+}
+
+/// The synchronous payment's last resort: forget the shadow and land the frame
+/// the resident holds now, whole.
+fn whole_frame<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, d: &DeferredStore) -> bool {
+    crate::runtime::drain::note_store_route("lab_pay_defer_whole");
+    crate::backend::vulkan::engine::page_diff_forget(d.mapping_id);
+    store_render_frame(state, host, d.mapping_id, &d.identity, d.width, d.height)
+}
+
+/// [`land_changed_pages`]' write — `write_mapping_bytes_only`'s prologue, then
+/// the selected runs through the mapping's packed guest view — with the copy on
+/// the landing thread. `None` when there is no packed view covering the frame
+/// (or nothing to copy): the caller lands synchronously.
+fn start_landing_copy<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    d: &DeferredStore,
+    changed: &crate::backend::vulkan::engine::ChangedPages,
+    vouched: &crate::runtime::mapper::PagesVouched,
+) -> Option<LandJob> {
+    let page = 4096u64;
+    let mapping_id = d.mapping_id;
+    let base_off = d.base_off;
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &p in &changed.pages {
+        let lo = u64::from(p) * page;
+        let hi = (lo + page).min(changed.frame_bytes);
+        match runs.last_mut() {
+            Some(last) if last.1 == base_off + lo => last.1 = base_off + hi,
+            _ => runs.push((base_off + lo, base_off + hi)),
         }
     }
+    if runs.is_empty() {
+        return None;
+    }
+    let need_end = base_off + changed.frame_bytes;
+    // `write_mapping_bytes_only`'s prologue, in its order.
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
+        crate::runtime::render_writeback::SettleSite::MappingBytesWrite,
+    );
+    state.invalidate_storage_residency_window(mapping_id, base_off, need_end);
+    if !vouched.covers(state, mapping_id) {
+        return None; // the synchronous landing reports it
+    }
+    let (ptr, view_len) = crate::runtime::mapper::ensure_contig_view(state, host, mapping_id)?;
+    if (view_len as u64) < need_end {
+        return None;
+    }
+    // `copy_mapping_runs`' host-write note, before any byte moves.
+    state.note_host_wrote_mapping_selected(mapping_id, &runs, base_off, need_end);
+    // A draw the recorder still holds may read these pages.
+    crate::backend::settle_deferred_draws_for_guest_write();
+    let spans: LandSpans = runs
+        .iter()
+        .map(|&(lo, hi)| {
+            (
+                ptr + lo as usize,
+                changed.frame_ptr as usize + (lo - base_off) as usize,
+                (hi - lo) as usize,
+            )
+        })
+        .collect();
+    crate::runtime::drain::note_store_route("lab_pay_defer_copy_async");
+    Some(LandJob::spawn(
+        spans,
+        runs,
+        changed.frame_bytes as usize,
+        changed.pages.len(),
+        changed.full,
+    ))
+}
+
+/// The landing copy is in: [`land_changed_pages`]' bookkeeping.
+fn complete_landing(state: &mut DeviceState, d: &DeferredStore, job: LandJob) -> bool {
+    let mapping_id = d.mapping_id;
+    for &(lo, hi) in &job.runs {
+        crate::runtime::mapper::note_mapping_write_footprint(state, mapping_id, lo, hi - lo);
+    }
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.guest_bytes_seq = m.guest_bytes_seq.wrapping_add(1);
+    }
+    crate::runtime::drain::note_store_route(if job.full { "pay_diff_full" } else { "pay_diff_pages" });
+    crate::runtime::drain::note_store_route_n("pay_diff_pages_landed", job.pages as u64);
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.pay_diff_gen = d.gen_now.unwrap_or(0);
+    }
+    state.invalidate_storage_residency_window(
+        mapping_id,
+        d.base_off,
+        d.base_off + job.frame_len as u64,
+    );
+    let _ = state.mark_mapping_written(mapping_id);
+    if let Some(m) = state.mappings.get(&mapping_id) {
+        crate::backend::vulkan::engine::page_diff_set_key(
+            mapping_id,
+            (m.map_generation, d.width, d.height, m.guest_bytes_seq),
+        );
+    }
+    finish(state, mapping_id, &d.identity, job.frame_len, d.started, false);
+    crate::runtime::drain::note_store_route("lab_pay_defer_landed");
+    drop(job);
+    true
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_PAY_SPLIT=off` vouches the mapping's pages before

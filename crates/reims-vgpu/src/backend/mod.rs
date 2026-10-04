@@ -1062,6 +1062,17 @@ pub(crate) trait Backend: Copy {
         true
     }
 
+    /// TEMP (lab PAY_DEFER): take a deferred payment as far as it goes without
+    /// waiting; `Some` (as [`Self::pay_surface_writeback`] answers) once it is done.
+    fn advance_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _pending: &mut Box<dyn std::any::Any + Send + Sync>,
+    ) -> Option<bool> {
+        Some(false)
+    }
+
     /// TEMP (lab PAY_DEFER): land what [`Self::begin_surface_writeback`] deferred;
     /// `false` as for [`Self::pay_surface_writeback`].
     fn land_surface_writeback<M: HostMemory + HostOps>(
@@ -1946,6 +1957,20 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.surface_writeback_ready(pending),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.surface_writeback_ready(pending),
+        }
+    }
+
+    fn advance_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        pending: &mut Box<dyn std::any::Any + Send + Sync>,
+    ) -> Option<bool> {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => b.advance_surface_writeback(state, host, pending),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.advance_surface_writeback(state, host, pending),
         }
     }
 
