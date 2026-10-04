@@ -2797,6 +2797,21 @@ fn lab_dag_run(ingress: u64, domain: u32, opcode: u16, us: u64) {
     ));
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_PACKET_SCOPE=on` (meaningful with the shim's
+/// `REIMS_VGPU_LAB_DIRTY_HOLE=tail`): a child packet that waits on no stamp runs
+/// with its own channel's scope — its reads owe only the stores ordered before
+/// its own publication, which the channel's epoch covers (a doorbell's, or the
+/// one the shim opened for a tail no doorbell covered) — instead of every
+/// channel's newest. A packet with a stamp wait keeps `All`: the stores another
+/// channel's work made it depend on came before a doorbell of that channel.
+/// Under `All` a service channel's doorbell (ch2-ch5 ring as often as ch1, and
+/// are drained ahead of each exec packet) made every set stale again for the
+/// draw packets that followed.
+fn lab_packet_scope() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PACKET_SCOPE").is_ok_and(|v| v == "on"))
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_HOLD_PRESENT_STAMP=1` holds the completion words
 /// a DisplaySwap releases until the settle loop has run everything else it
 /// could, and counts what ran meanwhile (`lab_hold_*`): the work a payment that
@@ -3169,6 +3184,18 @@ fn run_parked_packet<H: HostMemory + HostOps>(
         state.draining_mask |= bit;
         let started = std::time::Instant::now();
         let lab_prev_act = lab_act(0x100 | u32::from(work.packet().opcode));
+        if lab_packet_scope() {
+            host.note_work_scope(if work.packet().stamp_waits.is_empty() {
+                crate::runtime::host::WorkScope::Channel(domain)
+            } else {
+                crate::runtime::host::WorkScope::All
+            });
+            note_store_route(if work.packet().stamp_waits.is_empty() {
+                "lab_packet_scope_channel"
+            } else {
+                "lab_packet_scope_all"
+            });
+        }
         let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
         lab_act(lab_prev_act);
         census::note_drain_proc(work.packet().opcode, started.elapsed().as_nanos() as u64);
