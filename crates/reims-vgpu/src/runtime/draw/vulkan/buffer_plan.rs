@@ -92,6 +92,9 @@ pub(crate) enum BufferBail {
     /// The bind's offset is past the end of the allocation: the serial rail
     /// notes `zc_buffer_offset_past_end` and reads on the CPU.
     OffsetPastEnd,
+    /// TEMP (lab, PASS_STAGE): a writeback debt stands over the bind's
+    /// allocation; the serial CPU read's settle is the drain's.
+    OwedStage,
 }
 
 /// Why a plan was dropped at commit. The serial ladder serves the bind.
@@ -141,6 +144,19 @@ enum BufferRail {
         /// `zc_buffer_extent_narrowed` pair the serial walk notes.
         narrowed: Option<u64>,
     },
+    /// TEMP (lab, PASS_STAGE, design §8.4): the window the serial ladder
+    /// would have CPU-read, staged into a worker arena instead. The commit
+    /// serves [`crate::backend::vulkan::engine::BufferContent::Staged`] and
+    /// the engine binds the window — the read and the staging memcpy both ran
+    /// on the worker.
+    Staged {
+        staged: crate::backend::vulkan::engine::pass_stage::StagedSlice,
+        /// `host_writes`' epoch at the worker's read; a device write into the
+        /// window since is a race the serial read's settle would have closed.
+        host_epoch: u64,
+        /// The window's guest pages, for that check.
+        gpas: std::sync::Arc<Vec<u64>>,
+    },
 }
 
 /// A planned buffer bind: the warm rail that answers it, the reads the answer
@@ -163,6 +179,22 @@ pub(crate) struct BufferContentPlan {
 }
 
 impl BufferContentPlan {
+    /// TEMP (lab, PASS_STAGE): whether this plan answers one exact bind (and
+    /// so merges under its key) rather than every bind of the reference.
+    pub(super) fn is_exact(&self) -> bool {
+        self.exact.is_some()
+    }
+
+    /// TEMP (lab, PASS_STAGE): the exact bind's key halves. `0`/`None` on a
+    /// rail plan, which the caller does not ask.
+    pub(super) fn exact_offset(&self) -> u64 {
+        self.exact.map_or(0, |(offset, _)| offset)
+    }
+
+    pub(super) fn exact_cap(&self) -> Option<u64> {
+        self.exact.and_then(|(_, cap)| cap)
+    }
+
     /// The hit route family's split for this plan's rail.
     fn rail_slug(&self) -> &'static str {
         match self.rail {
@@ -170,6 +202,7 @@ impl BufferContentPlan {
             BufferRail::Whole { .. } => "pass_prep_buf_hit_whole",
             BufferRail::Held { .. } => "pass_prep_buf_hit_held",
             BufferRail::Walked { .. } => "pass_prep_buf_hit_walked",
+            BufferRail::Staged { .. } => "pass_prep_buf_hit_staged",
         }
     }
 }
@@ -182,6 +215,7 @@ pub(super) fn planned_route(plan: &BufferContentPlan) -> &'static str {
         BufferRail::Whole { .. } => "pass_prep_buf_planned_whole",
         BufferRail::Held { .. } => "pass_prep_buf_planned_held",
         BufferRail::Walked { .. } => "pass_prep_buf_planned_walked",
+        BufferRail::Staged { .. } => "pass_prep_buf_planned_staged",
     }
 }
 
@@ -280,8 +314,18 @@ pub(super) fn plan_buffer_rails<M: HostMemory + HostOps>(
     task_id: u32,
     buffer_ref: u32,
     resource: std::sync::Arc<crate::model::TaskResource>,
+    first_offset: u64,
+    stager: Option<&super::pass_stage::Stager>,
 ) -> Result<BufferContentPlan, BufferBail> {
-    plan_from_backing(state, host, task_id, buffer_ref, resource, None)
+    plan_from_backing(
+        state,
+        host,
+        task_id,
+        buffer_ref,
+        resource,
+        Some((first_offset, None)),
+        stager,
+    )
 }
 
 /// Plan an indexed draw's index-buffer bind: the one buffer bind whose extent
@@ -292,6 +336,7 @@ pub(super) fn plan_index_content<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     info: &IndexedDrawInfo,
+    stager: Option<&super::pass_stage::Stager>,
 ) -> Result<BufferContentPlan, BufferBail> {
     if info.index_buffer_ref == 0 {
         return Err(BufferBail::NullRef);
@@ -309,6 +354,7 @@ pub(super) fn plan_index_content<M: HostMemory + HostOps>(
         info.index_buffer_ref,
         resource,
         Some((info.index_buffer_offset, Some(need as u64))),
+        stager,
     )
 }
 
@@ -330,6 +376,7 @@ fn plan_from_backing<M: HostMemory + HostOps>(
     buffer_ref: u32,
     resource: std::sync::Arc<crate::model::TaskResource>,
     bind: Option<(u64, Option<u64>)>,
+    stager: Option<&super::pass_stage::Stager>,
 ) -> Result<BufferContentPlan, BufferBail> {
     if buffer_ref == 0 {
         return Err(BufferBail::NullRef);
@@ -344,10 +391,27 @@ fn plan_from_backing<M: HostMemory + HostOps>(
     // past it without mutating — so the plan does too. Anything else (no
     // entry, mismatched geometry) is a construction the drain would run.
     match state.bound_buffers.packed(task_id, buffer_ref) {
-        None => return Err(BufferBail::ColdPacked),
-        Some(
-            crate::runtime::bound_buffers::PackedBufferResolution::Unavailable { gva: bg, size: bs },
-        ) => {
+        // TEMP (lab, PASS_STAGE): a never-primed reference stages where the
+        // floor already refused the zero-copy rail (see `stage_or_bail`);
+        // floor-clearing cold refs stay the drain's constructions.
+        None => {
+            return stage_or_bail(
+                state,
+                host,
+                stager,
+                task_id,
+                buffer_ref,
+                &resource,
+                gva,
+                size,
+                bind,
+                BufferBail::ColdPacked,
+            )
+        }
+        Some(crate::runtime::bound_buffers::PackedBufferResolution::Unavailable {
+            gva: bg,
+            size: bs,
+        }) => {
             if *bg != gva || *bs != size {
                 return Err(BufferBail::ColdPacked);
             }
@@ -380,6 +444,8 @@ fn plan_from_backing<M: HostMemory + HostOps>(
             // ladder too; the exact arms below decide it.
         }
     }
+    // The staged arm below answers from the bind's own window, so it needs
+    // the offset exactly as the serial CPU read would take it.
     let Some((offset, cap)) = bind else {
         // A cap-free plan covers the whole-allocation rail, warm only: a cold
         // or mismatched entry is the drain's walk and insert.
@@ -468,12 +534,47 @@ fn plan_from_backing<M: HostMemory + HostOps>(
     let narrowed = (span < full).then(|| full - span);
     let (gpas, runs) = match task_gva_guest_run_window(state, host, task_id, gva + offset, span) {
         Ok(w) => w,
-        Err(_) => return Err(BufferBail::ColdWindow),
+        Err(_) => {
+            // The walk refused read-only; on the sub-floor population the
+            // serial ladder was CPU-reading anyway.
+            return stage_or_bail(
+                state,
+                host,
+                stager,
+                task_id,
+                buffer_ref,
+                &resource,
+                gva,
+                size,
+                bind,
+                BufferBail::ColdWindow,
+            );
+        }
     };
     let page = state.page_size();
     let pages = guest_page_window(host, &gpas, page, (gva + offset) % page, span);
     if !window_binds_zero_copy(pages.is_none(), gather_eligible) {
-        return Err(BufferBail::BelowFloor);
+        // The sub-floor refusal the serial ladder takes to its CPU read —
+        // and the one place that read is *provable*: the floor refuses
+        // zero-copy outright (`gather_span_if_eligible` gates on it before
+        // any construction), so the staged arm answers a bind the serial
+        // ladder certainly reads on the CPU. Every cold exit above this one
+        // leaves the plan bailing: the serial ladder may still CONSTRUCT a
+        // rail there (the packed alias, the whole-runs walk), and a staged
+        // window answering past a construction the commit cannot see warm is
+        // the upper-rung hazard, not a saving.
+        return stage_or_bail(
+            state,
+            host,
+            stager,
+            task_id,
+            buffer_ref,
+            &resource,
+            gva,
+            size,
+            bind,
+            BufferBail::BelowFloor,
+        );
     }
     Ok(BufferContentPlan {
         task_id,
@@ -492,6 +593,116 @@ fn plan_from_backing<M: HostMemory + HostOps>(
                 pages,
             },
             narrowed,
+        },
+    })
+}
+
+/// TEMP (lab, PASS_STAGE): the last rung of the planner — where every
+/// zero-copy rail has refused and the serial ladder would fall to its CPU
+/// read, stage that read's bytes into the worker's arena instead.
+///
+/// The plan predicts the serial answer exactly where it is built: the read
+/// window (`offset..offset+span`, the cap applied as the serial read applies
+/// it), the debt gates the serial read's settle would clear (any debt is a
+/// bail — the payment is the drain's, H7), and the pages + host-write epoch
+/// for the commit's race check. A refusal of any kind — no stager (the rail
+/// off, `shadow`, or the arenas not yet created), a debt, an unreadable
+/// window, an arena exhaustion — returns the bail the planner would have
+/// returned, and the serial ladder serves the bind unchanged.
+#[allow(clippy::too_many_arguments)]
+fn stage_or_bail<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &mut M,
+    stager: Option<&super::pass_stage::Stager>,
+    task_id: u32,
+    buffer_ref: u32,
+    resource: &std::sync::Arc<crate::model::TaskResource>,
+    gva: u64,
+    size: u64,
+    bind: Option<(u64, Option<u64>)>,
+    bail: BufferBail,
+) -> Result<BufferContentPlan, BufferBail> {
+    let Some(stager) = stager else {
+        return Err(bail);
+    };
+    let Some((offset, cap)) = bind else {
+        // A bind with no offset the planner could name; the serial ladder
+        // resolves it with the bind in hand.
+        return Err(bail);
+    };
+    if offset >= size {
+        return Err(BufferBail::OffsetPastEnd);
+    }
+    let full = size - offset;
+    let span = cap.map_or(full, |c| full.min(c));
+    // The honest population: a window the zero-copy floor already refused
+    // (`gather_span_if_eligible` gates on the floor before any construction),
+    // so the serial ladder's answer is provably its CPU read. A floor-clearing
+    // window may still be constructed into a rail the commit cannot see warm —
+    // that is the upper-rung hazard, and the bail keeps it the drain's.
+    if full >= ZERO_COPY_BUFFER_MIN_BYTES {
+        return Err(bail);
+    }
+    let want = crate::runtime::draw::host_alloc_len(span).filter(|n| *n > 0);
+    let Some(want) = want else {
+        return Err(bail);
+    };
+    // The plan never pays (H7): the serial CPU read settles the bind's debt
+    // before it reads, so any debt standing is the drain's to clear.
+    if crate::runtime::writeback_debt::owes_texture(state, task_id, buffer_ref)
+        || state
+            .pending_writebacks
+            .owes_gva_overlapping(task_id, gva, size)
+    {
+        crate::runtime::drain::note_store_route("pass_stage_buf_bail_owed");
+        return Err(BufferBail::OwedStage);
+    }
+    let read_gva = gva + offset;
+    let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        read_gva,
+        span,
+        state.page_shift,
+    );
+    if gpas.is_empty() {
+        return Err(bail);
+    }
+    let host_epoch = state.host_writes.epoch();
+    let mut bytes = vec![0u8; want];
+    if crate::runtime::gva_mem::read_task_gva_by_id(
+        host,
+        &state.tasks,
+        task_id,
+        read_gva,
+        &mut bytes,
+        state.page_shift,
+    )
+    .is_err()
+    {
+        return Err(bail);
+    }
+    let Some(staged) = stager.stage_bytes(&bytes) else {
+        crate::runtime::drain::note_store_route("pass_stage_buf_arena_full");
+        return Err(bail);
+    };
+    crate::runtime::drain::note_store_route_n("pass_stage_buf_bytes", staged.window.len);
+    Ok(BufferContentPlan {
+        task_id,
+        buffer_ref,
+        resource: std::sync::Arc::clone(resource),
+        gva,
+        size,
+        generation: state.bound_buffers.generation(),
+        // The staged window answers exactly the bind it was read for; a cap
+        // the plan did not know narrows nothing (the bytes are a superset the
+        // commit accepts).
+        exact: Some((offset, cap)),
+        rail: BufferRail::Staged {
+            staged,
+            host_epoch,
+            gpas: std::sync::Arc::new(gpas),
         },
     })
 }
@@ -517,7 +728,16 @@ fn commit_buffer_plan(
         return Err(BufferInvalid::Key);
     }
     if let Some((planned_offset, planned_cap)) = plan.exact {
-        if (planned_offset, planned_cap) != (offset, extent_cap) {
+        // TEMP (lab, PASS_STAGE): a staged window read cap-free is a superset
+        // of every narrowed cap the reflection may state — the bytes the
+        // serial read would have returned, plus the tail it would have cut.
+        // The bind it answers is the same; only the bound length widens, so
+        // the key admits it rather than spending the plan.
+        let staged_superset =
+            matches!(plan.rail, BufferRail::Staged { .. }) && planned_cap.is_none();
+        let key_matches = (planned_offset, planned_cap) == (offset, extent_cap)
+            || (staged_superset && planned_offset == offset);
+        if !key_matches {
             return Err(BufferInvalid::Key);
         }
     }
@@ -579,13 +799,7 @@ fn commit_buffer_plan(
         BufferRail::Held { bound } => {
             if packed_serves(state, task_id, buffer_ref, plan.gva, plan.size, offset)
                 || whole_serves(
-                    state,
-                    task_id,
-                    buffer_ref,
-                    plan.gva,
-                    plan.size,
-                    offset,
-                    extent_cap,
+                    state, task_id, buffer_ref, plan.gva, plan.size, offset, extent_cap,
                 )
             {
                 return Err(BufferInvalid::UpperRung);
@@ -607,13 +821,7 @@ fn commit_buffer_plan(
         BufferRail::Walked { bound, narrowed } => {
             if packed_serves(state, task_id, buffer_ref, plan.gva, plan.size, offset)
                 || whole_serves(
-                    state,
-                    task_id,
-                    buffer_ref,
-                    plan.gva,
-                    plan.size,
-                    offset,
-                    extent_cap,
+                    state, task_id, buffer_ref, plan.gva, plan.size, offset, extent_cap,
                 )
             {
                 return Err(BufferInvalid::UpperRung);
@@ -621,7 +829,10 @@ fn commit_buffer_plan(
             // A serial walk may have landed an entry at this key while the
             // plan waited (an earlier bind of the same draw fell back); the
             // hold is idempotent only against its own bytes.
-            if let Some(held) = state.bound_buffers.get(task_id, buffer_ref, offset, extent_cap) {
+            if let Some(held) = state
+                .bound_buffers
+                .get(task_id, buffer_ref, offset, extent_cap)
+            {
                 if !std::sync::Arc::ptr_eq(&held.runs, &bound.runs) {
                     return Err(BufferInvalid::Held);
                 }
@@ -653,6 +864,34 @@ fn commit_buffer_plan(
                 .land(state);
             }
             Ok(Some(bound_buffer_content(bound)))
+        }
+        // TEMP (lab, PASS_STAGE): the staged window serves the bind it was
+        // read for, provided nothing above it would answer now and no device
+        // write reached its pages between the worker's read and this commit.
+        BufferRail::Staged {
+            staged,
+            host_epoch,
+            gpas,
+        } => {
+            if packed_serves(state, task_id, buffer_ref, plan.gva, plan.size, offset)
+                || whole_serves(
+                    state, task_id, buffer_ref, plan.gva, plan.size, offset, extent_cap,
+                )
+                || state
+                    .bound_buffers
+                    .get(task_id, buffer_ref, offset, extent_cap)
+                    .is_some()
+            {
+                return Err(BufferInvalid::UpperRung);
+            }
+            if state.host_writes.wrote_any_since(*host_epoch, gpas).wrote() {
+                crate::runtime::drain::note_store_route("pass_stage_buf_invalid_host_write");
+                return Err(BufferInvalid::UpperRung);
+            }
+            note("cpu_buffer_staged");
+            Ok(Some(crate::backend::vulkan::engine::BufferContent::Staged(
+                staged.clone(),
+            )))
         }
     }
 }
@@ -802,7 +1041,9 @@ pub(super) fn ask_buffer(
         return Ask::Serial;
     }
     prefetch::with_last_frame(|frame| {
-        ask_frame_exact_or_rail(frame, state, task_id, buffer_ref, resource, offset, extent_cap, m)
+        ask_frame_exact_or_rail(
+            frame, state, task_id, buffer_ref, resource, offset, extent_cap, m,
+        )
     })
     .unwrap_or(Ask::Serial)
 }
@@ -821,7 +1062,23 @@ fn ask_frame_exact_or_rail(
 ) -> Ask<crate::backend::vulkan::engine::BufferContent> {
     let apply = m == super::pass_prep::PassPrepMode::On;
     // The exact plan for this very bind; a miss is not spent, just absent.
+    // TEMP (lab, PASS_STAGE): a staged plan read cap-free is keyed under
+    // `None` — the worker could not know the reflection's cap — and answers
+    // the narrowed bind from its superset window, so the miss with a cap
+    // retries the cap-free key before falling to the rails.
     let exact_key = (task_id, buffer_ref, offset, extent_cap);
+    let exact_key = if frame.buffer_exacts.contains_key(&exact_key) {
+        exact_key
+    } else if extent_cap.is_some()
+        && frame
+            .buffer_exacts
+            .get(&(task_id, buffer_ref, offset, None))
+            .is_some_and(|plan| matches!(plan.rail, BufferRail::Staged { .. }))
+    {
+        (task_id, buffer_ref, offset, None)
+    } else {
+        exact_key
+    };
     if frame.buffer_exacts.contains_key(&exact_key) {
         let (slug, outcome) = {
             let plan = frame.buffer_exacts.get(&exact_key).expect("just checked");
@@ -843,7 +1100,11 @@ fn ask_frame_exact_or_rail(
         };
     }
     // The reference's rail plan, answering this bind if its offset fits.
-    if let Some(slug) = frame.buffer_rails.get(&(task_id, buffer_ref)).map(|p| p.rail_slug()) {
+    if let Some(slug) = frame
+        .buffer_rails
+        .get(&(task_id, buffer_ref))
+        .map(|p| p.rail_slug())
+    {
         let outcome = {
             let plan = frame
                 .buffer_rails
@@ -1039,7 +1300,8 @@ pub(super) fn shadow_compare_buffer(
                 crate::backend::vulkan::engine::BufferContent::GuestRuns(a),
                 crate::backend::vulkan::engine::BufferContent::GuestRuns(b),
             ) => {
-                let same_runs = std::sync::Arc::ptr_eq(&a.runs, &b.runs) || a.runs[..] == b.runs[..];
+                let same_runs =
+                    std::sync::Arc::ptr_eq(&a.runs, &b.runs) || a.runs[..] == b.runs[..];
                 if same_runs
                     && a.source_offset == b.source_offset
                     && a.total_len == b.total_len
@@ -1081,6 +1343,8 @@ fn content_variant(c: &crate::backend::vulkan::engine::BufferContent) -> &'stati
     match c {
         crate::backend::vulkan::engine::BufferContent::GuestRuns(_) => "runs",
         crate::backend::vulkan::engine::BufferContent::Bytes(_) => "bytes",
+        // TEMP (lab, PASS_STAGE): the staged rail the plan serves.
+        crate::backend::vulkan::engine::BufferContent::Staged(_) => "staged",
     }
 }
 
@@ -1138,6 +1402,7 @@ pub(super) fn bail_route(bail: BufferBail) -> &'static str {
         BufferBail::ColdWindow => "pass_prep_buf_bail_cold_window",
         BufferBail::BelowFloor => "pass_prep_buf_bail_below_floor",
         BufferBail::OffsetPastEnd => "pass_prep_buf_bail_offset_past_end",
+        BufferBail::OwedStage => "pass_prep_buf_bail_owed_stage",
     }
 }
 
@@ -1145,8 +1410,8 @@ pub(super) fn bail_route(bail: BufferBail) -> &'static str {
 mod tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
-    use crate::runtime::host::FakeHost;
     use crate::runtime::drain::census::store_route_count;
+    use crate::runtime::host::FakeHost;
 
     /// One `(buffer_ref, allocation_size)` pair the fixture builds a buffer
     /// object for; the allocation sits at GVA `0x4000` (task page 4).
@@ -1189,19 +1454,27 @@ mod tests {
             bdesc[0..8].copy_from_slice(&size.to_le_bytes());
             st32(&mut bdesc[8..], handle);
             let desc_gva = 0x200u64 + 0x40 * n as u64;
-            assert!(
-                gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, &bdesc, PAGE_SHIFT_X86)
-                    .is_ok()
-            );
+            assert!(gva_mem::write_task_gva(
+                &mut host,
+                &state.tasks[1],
+                desc_gva,
+                &bdesc,
+                PAGE_SHIFT_X86
+            )
+            .is_ok());
             let list_off = list_object_entry_offset(buffer_ref, 64).unwrap();
             let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
             st32(&mut list_entry, packed);
             list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-            assert!(
-                gva_mem::write_task_gva(&mut host, &state.tasks[1], list_off, &list_entry, PAGE_SHIFT_X86)
-                    .is_ok()
-            );
+            assert!(gva_mem::write_task_gva(
+                &mut host,
+                &state.tasks[1],
+                list_off,
+                &list_entry,
+                PAGE_SHIFT_X86
+            )
+            .is_ok());
         }
         (state, host)
     }
@@ -1275,15 +1548,21 @@ mod tests {
             let _prime = load_buffer_content_serial(state, host, 1, 7, Some(&res), 0, true, None)
                 .expect("the serial ladder retains the whole runs");
         }
-        let plan = plan_buffer_rails(&planned_state, &mut planned_host, 1, 7, resource.clone())
-            .expect("a retained whole rail plans");
+        let plan = plan_buffer_rails(
+            &planned_state,
+            &mut planned_host,
+            1,
+            7,
+            resource.clone(),
+            0,
+            None,
+        )
+        .expect("a retained whole rail plans");
         assert!(
             matches!(plan.rail, BufferRail::Whole { .. }),
             "the primed whole runs answer the rail"
         );
-        let _mode = super::super::pass_prep::test_mode(
-            super::super::pass_prep::PassPrepMode::On,
-        );
+        let _mode = super::super::pass_prep::test_mode(super::super::pass_prep::PassPrepMode::On);
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans([((1, 7), plan)], [], None);
         let before_hit = store_route_count("pass_prep_buf_hit_whole");
@@ -1328,12 +1607,12 @@ mod tests {
     fn a_retirement_between_plan_and_commit_falls_back() {
         let (mut state, mut host) = buffer_fixture(&[(7, 0x8000)]);
         let resource = buffer_resource(&state, &host, 7);
-        let _prime = load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
-            .expect("prime");
-        let plan = plan_buffer_rails(&state, &mut host, 1, 7, resource.clone()).expect("plans");
-        let _mode = super::super::pass_prep::test_mode(
-            super::super::pass_prep::PassPrepMode::On,
-        );
+        let _prime =
+            load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
+                .expect("prime");
+        let plan =
+            plan_buffer_rails(&state, &mut host, 1, 7, resource.clone(), 0, None).expect("plans");
+        let _mode = super::super::pass_prep::test_mode(super::super::pass_prep::PassPrepMode::On);
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans([((1, 7), plan)], [], None);
         // The guest unmaps a page overlapping the allocation: the retirement
@@ -1344,7 +1623,8 @@ mod tests {
         assert!(matches!(served, Ask::Serial));
         assert_eq!(delta("pass_prep_buf_invalid_registry", before), 1);
         // And the fallback serves: the serial ladder answers for the bind.
-        let serial = load_buffer_content(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None);
+        let serial =
+            load_buffer_content(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None);
         assert!(serial.is_some(), "the serial ladder still serves the bind");
     }
 
@@ -1358,7 +1638,7 @@ mod tests {
         let res8 = buffer_resource(&state, &host, 8);
         // Nothing retained: every construction is the drain's.
         assert_eq!(
-            plan_buffer_rails(&state, &mut host, 1, 7, res7.clone()).err(),
+            plan_buffer_rails(&state, &mut host, 1, 7, res7.clone(), 0, None).err(),
             Some(BufferBail::ColdPacked)
         );
         // A matching Unavailable answer stands (the construction refused once);
@@ -1373,7 +1653,7 @@ mod tests {
             },
         );
         assert_eq!(
-            plan_buffer_rails(&state, &mut host, 1, 8, res8).err(),
+            plan_buffer_rails(&state, &mut host, 1, 8, res8, 0, None).err(),
             Some(BufferBail::ColdWhole)
         );
         // And the serial ladder serves the cold bind unchanged, constructing
@@ -1388,18 +1668,25 @@ mod tests {
     fn a_repeated_bind_serves_the_plan_twice() {
         let (mut state, mut host) = buffer_fixture(&[(7, 0x8000)]);
         let resource = buffer_resource(&state, &host, 7);
-        let _prime = load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
-            .expect("prime");
-        let plan = plan_buffer_rails(&state, &mut host, 1, 7, resource.clone()).expect("plans");
-        let _mode = super::super::pass_prep::test_mode(
-            super::super::pass_prep::PassPrepMode::On,
-        );
+        let _prime =
+            load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
+                .expect("prime");
+        let plan =
+            plan_buffer_rails(&state, &mut host, 1, 7, resource.clone(), 0, None).expect("plans");
+        let _mode = super::super::pass_prep::test_mode(super::super::pass_prep::PassPrepMode::On);
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans([((1, 7), plan)], [], None);
         let shape_before = registry_shape(&state);
         let before_hit = store_route_count("pass_prep_buf_hit");
         let first = ask_buffer(&mut state, 1, 7, Some(resource.as_ref()), 0x40, None);
-        let second = ask_buffer(&mut state, 1, 7, Some(resource.as_ref()), 0x80, Some(0x1000));
+        let second = ask_buffer(
+            &mut state,
+            1,
+            7,
+            Some(resource.as_ref()),
+            0x80,
+            Some(0x1000),
+        );
         let (Ask::Serve(a), Ask::Serve(b)) = (first, second) else {
             panic!("both binds serve from the one rail plan");
         };
@@ -1447,15 +1734,13 @@ mod tests {
                 .expect("the prime retains the whole runs");
         }
         let planned_info = info(0x100);
-        let plan = plan_index_content(&planned_state, &mut planned_host, 1, &planned_info)
+        let plan = plan_index_content(&planned_state, &mut planned_host, 1, &planned_info, None)
             .expect("the index bind plans");
         assert!(
             matches!(plan.rail, BufferRail::Whole { .. }),
             "the retained whole runs answer the index bind"
         );
-        let _mode = super::super::pass_prep::test_mode(
-            super::super::pass_prep::PassPrepMode::On,
-        );
+        let _mode = super::super::pass_prep::test_mode(super::super::pass_prep::PassPrepMode::On);
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans(
             [],
@@ -1467,8 +1752,9 @@ mod tests {
         let Ask::Serve(content) = served else {
             panic!("the index plan serves");
         };
-        let serial = load_index_content_reason_serial(&mut serial_state, &mut serial_host, 1, &planned_info)
-            .expect("the serial ladder serves the same bind");
+        let serial =
+            load_index_content_reason_serial(&mut serial_state, &mut serial_host, 1, &planned_info)
+                .expect("the serial ladder serves the same bind");
         assert!(contents_agree(&content, &serial));
         assert_eq!(
             registry_shape(&planned_state),
@@ -1501,9 +1787,7 @@ mod tests {
         };
         let key = latch_store_target(&c0).expect("the walk would run");
         let plan = plan_store_pages(&state, &host, 1, key).expect("the walk resolves pages");
-        let _mode = super::super::pass_prep::test_mode(
-            super::super::pass_prep::PassPrepMode::On,
-        );
+        let _mode = super::super::pass_prep::test_mode(super::super::pass_prep::PassPrepMode::On);
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans([], [], Some(plan));
         let before = store_route_count("pass_prep_buf_store_hit");
@@ -1531,13 +1815,13 @@ mod tests {
     fn a_rail_plan_falls_past_a_past_end_offset() {
         let (mut state, mut host) = buffer_fixture(&[(7, 0x8000)]);
         let resource = buffer_resource(&state, &host, 7);
-        let _prime = load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
-            .expect("prime");
-        let plan = plan_buffer_rails(&state, &mut host, 1, 7, resource.clone()).expect("plans");
+        let _prime =
+            load_buffer_content_serial(&mut state, &mut host, 1, 7, Some(&resource), 0, true, None)
+                .expect("prime");
+        let plan =
+            plan_buffer_rails(&state, &mut host, 1, 7, resource.clone(), 0, None).expect("plans");
         assert!(matches!(plan.rail, BufferRail::Whole { .. }));
-        let _mode = super::super::pass_prep::test_mode(
-            super::super::pass_prep::PassPrepMode::On,
-        );
+        let _mode = super::super::pass_prep::test_mode(super::super::pass_prep::PassPrepMode::On);
         let _frame = prefetch::push_empty_frame();
         merge_buffer_plans([((1, 7), plan)], [], None);
         // A bind the rail covers still serves.

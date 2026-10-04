@@ -199,6 +199,12 @@ pub(crate) struct ResourcePools {
     staging_free: HashMap<u64, Vec<BufferSlot>>,
     /// In-use staging slots returned after submit/wait.
     staging_live: Vec<BufferSlot>,
+    /// TEMP (lab, PASS_STAGE): worker-arena windows the command buffer now
+    /// recording reads — one reference each, sealed with the entry and
+    /// released at its retire, exactly the lifetime `staging_live` gives a
+    /// pooled slot. A window may appear here that an earlier entry of an open
+    /// batch already sealed: the joiner takes its own reference.
+    staged_reads: Vec<StagedRead>,
     /// Size-bucketed free DEVICE_LOCAL buffers the draw-time guest gather
     /// assembles scattered windows into, and the in-use ones the ring returns
     /// after submit/wait.
@@ -1444,6 +1450,16 @@ pub(crate) struct PendingGpuCleanup {
     unpin_residents: Vec<TargetIdentity>,
     /// The same, in the compute-storage registry.
     unpin_compute_residents: Vec<crate::model::ComputeStorageResidencyKey>,
+    /// TEMP (lab, PASS_STAGE): worker-arena windows this submission reads,
+    /// each with the reference its record took. The retire that drains this
+    /// cleanup releases them — the arena's own "timeline".
+    staged: Vec<StagedRead>,
+}
+
+/// TEMP (lab, PASS_STAGE): one worker-arena window a sealed submission reads.
+pub(crate) struct StagedRead {
+    ring: std::sync::Arc<crate::runtime::par::staging::StagingRing>,
+    window: crate::runtime::par::staging::StagingWindow,
 }
 
 /// What one sealed entry hands back: the cleanup its ring slot owes once the
@@ -3360,6 +3376,9 @@ fn batch_max_draws(topology: crate::backend::vulkan::caps::memory_topology::Memo
 pub(crate) enum CbBindOwner {
     Bytes(std::sync::Arc<Vec<u8>>),
     Runs(std::sync::Arc<Vec<super::types::GuestRun>>),
+    /// TEMP (lab, PASS_STAGE): the ring a staged window belongs to, keeping
+    /// the key's address unique exactly as the `Arc`s above do.
+    Staged(std::sync::Arc<crate::runtime::par::staging::StagingRing>),
 }
 
 /// One bind's identity, inseparable from the allocation that identity names.
@@ -3392,6 +3411,13 @@ impl CbBind {
                 key: Self::key_of(content),
                 owner: CbBindOwner::Runs(std::sync::Arc::clone(&src.runs)),
             },
+            // TEMP (lab, PASS_STAGE): the owner is the release handle — the
+            // ring the window was carved from, which outlives the window's
+            // facts the same way an `Arc<Vec<u8>>` outlives its bytes.
+            super::types::BufferContent::Staged(slice) => Self {
+                key: Self::key_of(content),
+                owner: CbBindOwner::Staged(std::sync::Arc::clone(&slice.ring)),
+            },
         }
     }
 
@@ -3418,6 +3444,14 @@ impl CbBind {
                 std::sync::Arc::as_ptr(&src.runs) as *const () as usize,
                 src.source_offset,
                 src.total_len,
+            ),
+            // TEMP (lab, PASS_STAGE): the ring's address plus the window's
+            // packed position — the chunk rides the offset field's high bits,
+            // which a chunk's own size bound keeps clear of its offsets.
+            super::types::BufferContent::Staged(slice) => (
+                std::sync::Arc::as_ptr(&slice.ring) as *const () as usize,
+                slice.window.packed_position(),
+                slice.window.len,
             ),
         }
     }
@@ -3684,6 +3718,10 @@ pub mod sampled_working_set;
 mod submission_and_buffers;
 /// The lease's own extent travels with its pointer; see [`ReadbackLease`].
 pub(crate) use submission_and_buffers::ReadbackLease;
+/// TEMP (lab, PASS_STAGE): the usage every pooled slot carries, which the
+/// worker arenas' buffers must carry too (a staged window may bind as
+/// anything a slot binds as).
+pub(crate) use submission_and_buffers::POOL_SLOT_USAGE;
 mod teardown;
 
 #[cfg(test)]

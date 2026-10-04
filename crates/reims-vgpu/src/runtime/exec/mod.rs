@@ -5979,6 +5979,13 @@ fn finish_stream<M: HostMemory + HostOps>(
         {
             count_deferred_failure_after_the_loop(out);
         }
+        // TEMP (lab, PASS_STAGE): the seed cells this stream armed and no
+        // later chunk offered to a scope. Every request is settled above, so
+        // every cell is spent; this only clears the thread-local.
+        #[cfg(feature = "backend-vulkan")]
+        if crate::backend::selected().rail() == crate::backend::Rail::Vulkan {
+            crate::runtime::draw::vulkan::pass_stage::sweep_pending_seeds();
+        }
         fin.enter(crate::runtime::drain::FinishPhase::Tail);
         write_visibility_results(state, host, task_id, acc, &visibility_counts);
         // Encode never landed Stores (NoMetal stubs, missing MTLB/pipeline, or

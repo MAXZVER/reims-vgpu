@@ -657,7 +657,8 @@ impl TaskResource {
     /// Make the next hit due, as if the interval had elapsed.
     #[cfg(test)]
     pub fn age_reexamination(&self) {
-        self.reexamined_us.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.reexamined_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Resolve this resource's immutable construction descriptor once.
@@ -4814,10 +4815,7 @@ impl DeviceState {
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
         let waiters = if super::lab_pipeline_shadow::enabled() {
-            self.session
-                .lock()
-                .expect("session")
-                .pipeline_waiters(id)
+            self.session.lock().expect("session").pipeline_waiters(id)
         } else {
             Vec::new()
         };
@@ -4842,9 +4840,10 @@ impl DeviceState {
             let real: Vec<reims_vgpu_core::pipeline::Lease> = leases
                 .iter()
                 .map(|&lease| {
-                    session
-                        .pipelines_ref()
-                        .peek(reims_vgpu_core::pipeline::PipelineId::shared(lease), generation)
+                    session.pipelines_ref().peek(
+                        reims_vgpu_core::pipeline::PipelineId::shared(lease),
+                        generation,
+                    )
                 })
                 .collect();
             (generation, real)
@@ -5418,7 +5417,11 @@ impl DeviceState {
 
     /// TEMP (lab, access precision): whether the model holds this name over
     /// bytes of its own.
-    pub fn name_owns_bytes(&self, task_id: u32, name: reims_vgpu_core::identity::ResourceId) -> bool {
+    pub fn name_owns_bytes(
+        &self,
+        task_id: u32,
+        name: reims_vgpu_core::identity::ResourceId,
+    ) -> bool {
         self.lifecycle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -6361,10 +6364,9 @@ impl DeviceState {
                 continue;
             }
             for index in (lo >> shift)..=((hi - 1) >> shift) {
-                match entries
-                    .get(index as usize)
-                    .and_then(|&entry| crate::protocol::iosurface_pages::entry_gpa_shift(entry, shift))
-                {
+                match entries.get(index as usize).and_then(|&entry| {
+                    crate::protocol::iosurface_pages::entry_gpa_shift(entry, shift)
+                }) {
                     Some(gpa) => pages.push(gpa),
                     None => {
                         self.host_writes.note_unknown();
@@ -6406,6 +6408,11 @@ impl DeviceState {
     /// Give this state the pool its bound device created. Called once, at
     /// device creation, before any guest work exists.
     pub fn install_par_pool(&mut self, pool: Arc<crate::runtime::par::Pool>) {
+        // TEMP (lab, PASS_STAGE): the pool's population sizes the staging
+        // arenas the engine creates on first need (design §8.4) — one arena
+        // per pool member, the coordinator included. Stated here because the
+        // engine never sees the pool itself, only its members' ids.
+        crate::runtime::par::staging::set_population(pool.workers() + 1);
         self.par = Some(pool);
     }
 
@@ -7122,7 +7129,10 @@ mod device_access_tests {
             assert!(state.advance_pipeline(1, pipeline, PipelineState::Compiling));
             assert!(state.ready_pipeline(1, pipeline));
             assert!(state.pipeline_is_ready(1, pipeline));
-            assert!(!state.pipeline_is_ready(3, pipeline), "task 3 has not built");
+            assert!(
+                !state.pipeline_is_ready(3, pipeline),
+                "task 3 has not built"
+            );
             assert_eq!(state.pipeline_state(3, pipeline), Some("declared"));
 
             // Task 1 deletes its pipeline; task 3's is untouched.
@@ -7655,7 +7665,9 @@ mod fail_vocabulary_tests {
         // Bytes 100..page+1 of the mapping: its pages 0 and 1.
         state.note_host_wrote_mapping_selected(3, &[(100, page + 1)], 0, 4 * page);
         assert_eq!(
-            state.host_writes.wrote_any_since(before, &[30 << shift, 40 << shift]),
+            state
+                .host_writes
+                .wrote_any_since(before, &[30 << shift, 40 << shift]),
             HostWriteVerdict::Quiet,
             "pages the selection never touched were not written"
         );
@@ -7741,10 +7753,13 @@ mod pipeline_door_tests {
         // A different slot is a different pipeline; a different generation of
         // the same slot is too, which is the whole reason the name carries one.
         assert!(state.declare_pipeline(TASK, name(10)));
-        assert!(state.declare_pipeline(TASK, ResourceId {
-            slot: ObjectListRef(9),
-            generation: SlotGeneration(2),
-        }));
+        assert!(state.declare_pipeline(
+            TASK,
+            ResourceId {
+                slot: ObjectListRef(9),
+                generation: SlotGeneration(2),
+            }
+        ));
         assert_eq!(state.pipeline_census().declared, 3);
 
         assert_eq!(
@@ -7843,7 +7858,8 @@ mod pipeline_door_tests {
         assert!(
             state
                 .refuse_pipeline(
-                    TASK, name(9),
+                    TASK,
+                    name(9),
                     RefusalReason::TranslationFailed("vertex_translate")
                 )
                 .took,

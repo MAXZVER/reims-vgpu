@@ -26,15 +26,18 @@ pub(crate) use sample_plan::{plan_sampled_source, SampleBail, SampleInvalid, Sam
 mod prefetch;
 pub(crate) use prefetch::prefetch_stream;
 mod pass_prep;
-pub(crate) use pass_prep::{pass_prep_mode, DrawTables, PassPrep, PassPrepMode};
 #[cfg(test)]
 pub(crate) use pass_prep::test_mode;
+pub(crate) use pass_prep::{pass_prep_mode, DrawTables, PassPrep, PassPrepMode};
 // TEMP (lab, PASS_PREP step 3): the buffer-bind and Store-page plans.
 mod buffer_plan;
 mod pass_inv;
 pub(crate) use pass_inv::{pass_inv_mode, PassInvariants};
 #[cfg(test)]
 pub(crate) use pass_inv::test_mode as pass_inv_test_mode;
+// TEMP (lab, PASS_STAGE, design 8.4): the worker-staging planners and the
+// deferred-draw seed cells.
+pub(crate) mod pass_stage;
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
@@ -154,7 +157,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 out = refuse_after_deferred_failure(out);
             }
         }
-    } else if !req.chain_resident_established && crate::backend::vulkan::engine::deferred_draws_pending() {
+    } else if !req.chain_resident_established
+        && crate::backend::vulkan::engine::deferred_draws_pending()
+    {
         if let Some(failure) = crate::backend::vulkan::engine::settle_deferred_draws() {
             crate::backend::vulkan::engine::report_deferred_failure(&failure);
             // Found here because this record left before it reached the engine
@@ -1031,6 +1036,25 @@ pub(super) enum SampledSourceRequest {
         crate::runtime::gather_witness::GatherVouch,
         pixel_format::SwizzlePlan,
     ),
+    /// TEMP (lab, PASS_STAGE, design 8.4): a [`Self::GuestRuns`] bind whose
+    /// window a pool worker pre-gathered into its arena. Every field is the
+    /// guest-runs bind's own; the engine resolves it through the same ladder
+    /// (cache elision, import) and only the CPU-gather arm differs, reading
+    /// the window instead of gathering.
+    Staged(Box<StagedSampledRequest>),
+}
+
+/// The guest-runs request a [`SampledSourceRequest::Staged`] bind stands for,
+/// plus the worker's window holding its bytes.
+pub(super) struct StagedSampledRequest {
+    pub(super) src: crate::backend::vulkan::engine::GuestRunSource,
+    pub(super) native: TexelLayout,
+    pub(super) format: ash::vk::Format,
+    pub(super) planes: u32,
+    pub(super) identity: Option<LinearSampleIdentity>,
+    pub(super) vouch: crate::runtime::gather_witness::GatherVouch,
+    pub(super) components: pixel_format::SwizzlePlan,
+    pub(super) staged: crate::backend::vulkan::engine::pass_stage::StagedSlice,
 }
 
 /// Producer identity + generation for CPU-sourced sampled bytes, so that equal
@@ -1576,6 +1600,14 @@ fn lab_cover_tex(
             g.runs
                 .first()
                 .map(|r| format!("{:?}", r).chars().take(60).collect::<String>())
+        ),
+        // TEMP (lab, PASS_STAGE): the staged rail's bytes sit in a worker
+        // arena; the note names the window, never the bytes.
+        crate::backend::vulkan::engine::SampledSource::Staged(staged) => format!(
+            "staged(runs={} len={} window={:?})",
+            staged.src.runs.len(),
+            staged.src.total_len,
+            staged.staged.window
         ),
     };
     crate::observe::fail(format!(
@@ -2582,6 +2614,8 @@ fn lab_resolve_census(ns: u64, loaded: Option<&(u32, u32, u32, SampledSourceRequ
                 SampledSourceRequest::Bytes(..) => 0,
                 SampledSourceRequest::Target(..) => 1,
                 SampledSourceRequest::GuestRuns(..) => 2,
+                // TEMP (lab, PASS_STAGE): with the runs rail it stands for.
+                SampledSourceRequest::Staged(..) => 2,
             },
             *w <= 64 && *h <= 64,
         ),
@@ -6007,6 +6041,9 @@ fn lab_note_bind_bytes(
     let (bytes, runs) = match content {
         BufferContent::GuestRuns(src) => (src.total_len, true),
         BufferContent::Bytes(b) => (b.len() as u64, false),
+        // TEMP (lab, PASS_STAGE): the staged window's bytes, counted with the
+        // bytes rail they replace.
+        BufferContent::Staged(slice) => (slice.window.len, false),
     };
     let (n, b) = match (stage, capped, runs) {
         ("vtx", true, true) => ("lab_bb_vtx_capped_runs", "lab_bb_vtx_capped_runs_b"),
@@ -6317,8 +6354,16 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     if let buffer_plan::Ask::Serve(content) = asked {
         return Some(content);
     }
-    let answer =
-        load_buffer_content_serial(state, host, task_id, buffer_ref, resource, offset, allow_zero_copy, extent_cap);
+    let answer = load_buffer_content_serial(
+        state,
+        host,
+        task_id,
+        buffer_ref,
+        resource,
+        offset,
+        allow_zero_copy,
+        extent_cap,
+    );
     if was_shadow {
         buffer_plan::shadow_compare_buffer(buffer_ref, offset, true, answer.as_ref());
     }
@@ -10465,6 +10510,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 SampledSourceRequest::Bytes(..) => "bytes",
                                 SampledSourceRequest::Target(..) => "target",
                                 SampledSourceRequest::GuestRuns(..) => "guest_runs",
+                                // TEMP (lab, PASS_STAGE): with the runs rail.
+                                SampledSourceRequest::Staged(..) => "guest_runs",
                             };
                             note_sampled_ref_backing(
                                 state,
@@ -10578,6 +10625,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         source_planes = planes;
                         bytes_identity = identity;
                         crate::backend::vulkan::engine::SampledSource::GuestRuns(src, vouch)
+                    }
+                    // TEMP (lab, PASS_STAGE): the staged twin of the arm
+                    // above, carrying the same facts to the engine beside the
+                    // window that holds the bytes.
+                    SampledSourceRequest::Staged(staged) => {
+                        sampled_vk_format = staged.format;
+                        sampled_components = staged.components;
+                        source_planes = staged.planes;
+                        bytes_identity = staged.identity;
+                        crate::backend::vulkan::engine::SampledSource::Staged(
+                            crate::backend::vulkan::engine::StagedSampled {
+                                src: staged.src,
+                                vouch: staged.vouch,
+                                staged: staged.staged,
+                            },
+                        )
                     }
                 };
                 let array_element = reflected_descriptor
@@ -12408,6 +12471,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     crate::backend::vulkan::engine::SampledSource::Bytes(_) => 1,
                     crate::backend::vulkan::engine::SampledSource::Target(_) => 2,
                     crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => 3,
+                    // TEMP (lab, PASS_STAGE): the staged rail beside the
+                    // guest-runs one it stands for.
+                    crate::backend::vulkan::engine::SampledSource::Staged(..) => 4,
                 },
                 format: image.format.as_raw() as u32,
                 width: image.width,
@@ -12639,6 +12705,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             && resources.skip_readback
             && !resources.record_guest_store
         {
+            // TEMP (lab, PASS_STAGE, design 8.4): arm the seed staging while
+            // the request sits in the FIFO a later chunk's scope races.
+            pass_stage::arm_seed_stage(&mut resources);
             crate::backend::vulkan::engine::submit_deferred_draw(
                 state,
                 resources,
@@ -12671,6 +12740,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             && !resources.record_guest_store
         {
             if let Some(identity) = gva_resident_store.clone() {
+                // TEMP (lab, PASS_STAGE): the GVA-store defer arm, same as the
+                // chain arm above.
+                pass_stage::arm_seed_stage(&mut resources);
                 crate::backend::vulkan::engine::submit_deferred_draw(
                     state,
                     resources,
@@ -13685,13 +13757,19 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
                         let hits = om
                             .page_entries
                             .iter()
-                            .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, shift))
+                            .filter_map(|&e| {
+                                crate::protocol::iosurface_pages::entry_gpa_shift(e, shift)
+                            })
                             .filter(|g| gpas.contains(g))
                             .count();
                         if hits > 0 {
                             shared.push(format!(
                                 "mid{other}:{hits}:{}x{}:mapped={}:mapgen={}:tok={}",
-                                om.width, om.height, om.mapped, om.map_generation, om.guest_write_token
+                                om.width,
+                                om.height,
+                                om.mapped,
+                                om.map_generation,
+                                om.guest_write_token
                             ));
                         }
                     }
@@ -13703,7 +13781,9 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
                     // Does the cached page list still name the surface's memory?
                     // A silent re-point (no packet) leaves the old PFNs in hand,
                     // and their new owner's stores read as this surface's.
-                    let walk = match crate::runtime::mapper::backing_pages_witness(state, &*host, mapping_id) {
+                    let walk = match crate::runtime::mapper::backing_pages_witness(
+                        state, &*host, mapping_id,
+                    ) {
                         crate::runtime::mapper::BackingWitness::Verified => "verified",
                         crate::runtime::mapper::BackingWitness::Drifted => "drifted",
                         crate::runtime::mapper::BackingWitness::Unwitnessed(why) => why,
@@ -18576,9 +18656,7 @@ mod lab_memo_stamp {
 
     fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            std::env::var("REIMS_VGPU_LAB_MEMO_STAMP").is_ok_and(|v| v == "on")
-        })
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_MEMO_STAMP").is_ok_and(|v| v == "on"))
     }
 
     fn mapping_gpas(state: &DeviceState, mid: u32) -> Option<Vec<u64>> {

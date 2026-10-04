@@ -695,6 +695,23 @@ unsafe fn stage_buffer_content(
             drop(_s);
             BoundBuffer::from(slot)
         }
+        // TEMP (lab, PASS_STAGE): the bytes are already in a worker arena,
+        // host-coherent and usage-complete (`POOL_SLOT_USAGE`). Bind the
+        // window and record nothing else — the acquire and the memcpy this
+        // arm's siblings pay are what the worker already paid.
+        BufferContent::Staged(slice) => {
+            if !pools.note_staged_read(std::sync::Arc::clone(&slice.ring), slice.window) {
+                // The ring was rebuilt behind a device loss; the serial path
+                // is the only honest answer for this bind.
+                return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedDraw));
+            }
+            crate::runtime::drain::note_store_route("pass_stage_bind_hit");
+            crate::runtime::drain::note_store_route_n("pass_stage_bind_bytes", slice.window.len);
+            BoundBuffer {
+                buffer: slice.buffer,
+                offset: slice.window.offset,
+            }
+        }
         BufferContent::GuestRuns(src) => {
             // The bytes are already in memory the device can address. Bind them.
             //
@@ -1038,6 +1055,12 @@ enum GuestTexels {
     /// at the offset they sit at. Always available, which is why the import is
     /// allowed to decline for any reason at all.
     Scratch(BufferSlot),
+    /// TEMP (lab, PASS_STAGE, design §8.4): a pool worker packed the texels
+    /// into its arena at plan time. The same copy the scratch arm's CPU
+    /// gather would have produced, minus the recorder's memcpy; `offset` is
+    /// where the window sits inside the arena's buffer, the one bound
+    /// `GuestTexels` arm whose offset is not zero or an import's.
+    Staged(super::pass_stage::StagedSlice),
 }
 
 impl GuestTexels {
@@ -1045,6 +1068,7 @@ impl GuestTexels {
         match self {
             Self::Imported { buffer, .. } => *buffer,
             Self::Gathered(slot) | Self::Scratch(slot) => slot.buffer,
+            Self::Staged(slice) => slice.buffer,
         }
     }
 
@@ -1054,6 +1078,37 @@ impl GuestTexels {
             // Both start at the beginning of a pooled slot the window was
             // assembled into, so the first texel is byte zero.
             Self::Gathered(_) | Self::Scratch(_) => 0,
+            // A carved window sits wherever the arena's bump pointer was.
+            Self::Staged(slice) => slice.window.offset,
+        }
+    }
+}
+
+/// Where a CPU Load seed's bytes sit, once staged.
+///
+/// TEMP (lab, PASS_STAGE, design §8.4): the pooled slot is the serial answer;
+/// the staged window is what a pool worker filled while the request sat in
+/// the recorder FIFO, R/B exchange already folded in. Both feed the same
+/// buffer→image copy, which is why the accessor pair is the whole type.
+enum SeedSource {
+    Slot(BufferSlot),
+    Staged(std::sync::Arc<super::pass_stage::StagedSlice>),
+}
+
+impl SeedSource {
+    fn buffer(&self) -> vk::Buffer {
+        match self {
+            Self::Slot(slot) => slot.buffer,
+            Self::Staged(slice) => slice.buffer,
+        }
+    }
+
+    /// Where the seed's first byte sits in [`Self::buffer`]: a pooled slot
+    /// starts at zero, a carved window wherever the arena's bump pointer was.
+    fn offset(&self) -> u64 {
+        match self {
+            Self::Slot(_) => 0,
+            Self::Staged(slice) => slice.window.offset,
         }
     }
 }
@@ -1663,7 +1718,11 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         }
         if req.sampled_images.iter().any(|img| match &img.source {
             SampledSource::Target(identity) => identity == seed_identity,
-            SampledSource::Bytes(_) | SampledSource::GuestRuns(..) => false,
+            // A staged bind stands for a guest-runs source: no target, no
+            // alias of the seed.
+            SampledSource::Bytes(_) | SampledSource::GuestRuns(..) | SampledSource::Staged(_) => {
+                false
+            }
         }) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SeedAlsoSampled,
@@ -1926,6 +1985,8 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         };
         match &image.source {
+            // A staged bind's length is its window's, checked where the
+            // window was carved.
             SampledSource::Bytes(bytes) if bytes.len() != expected => {
                 return Err(DrawError::DrawValidation(
                     DrawValidationDecline::SampledBytesLength {
@@ -1968,85 +2029,13 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             }
             SampledSource::Bytes(_) => {}
             SampledSource::GuestRuns(src, _) => {
-                // A cube's face ordering is not carried by this source. Arrays
-                // and volumes are ordinary consecutive image planes and the
-                // copy below consumes all of them.
-                if image.kind.is_cube() {
-                    return Err(DrawError::Unsupported(
-                        super::reason::DrawReason::GuestRunSampledNot2d {
-                            binding: image.binding,
-                        },
-                    ));
-                }
-                // Every count below is in units of the image's storage grid —
-                // rows of blocks and bytes per block — which for an
-                // uncompressed format is exactly the texel arithmetic this
-                // always was (a 1x1 block whose bytes are the bytes-per-texel).
-                // `bufferRowLength` stays Vulkan's unit, texels: the stride in
-                // bytes is `(row_length / block.width) * block.bytes`, and a
-                // row length that does not divide into whole blocks cannot
-                // describe a compressed row at all, so it refuses as a stride
-                // defect rather than rounding into a shifted image.
-                let texel = block.bytes as usize;
-                let planes = image.layers as usize;
-                let storage_rows = block.block_rows(image.height) as usize;
-                let tight_row = block.blocks_across(image.width) as usize * texel;
-                if storage_rows == 0 || tight_row == 0 {
-                    return Err(DrawError::DrawValidation(
-                        DrawValidationDecline::SampledZeroGeometry {
-                            binding: image.binding,
-                            width: image.width,
-                            height: image.height,
-                            layers: image.layers,
-                        },
-                    ));
-                }
-                let run_expected = if src.row_length_texels == 0 {
-                    expected
-                } else {
-                    if !src.row_length_texels.is_multiple_of(block.width) {
-                        return Err(DrawError::DrawValidation(
-                            DrawValidationDecline::GuestSampleRowStride {
-                                binding: image.binding,
-                                stride: src.row_length_texels as usize,
-                                tight_row,
-                            },
-                        ));
-                    }
-                    let stride = (src.row_length_texels / block.width) as usize * texel;
-                    if stride < tight_row {
-                        return Err(DrawError::DrawValidation(
-                            DrawValidationDecline::GuestSampleRowStride {
-                                binding: image.binding,
-                                stride,
-                                tight_row,
-                            },
-                        ));
-                    }
-                    (planes - 1) * storage_rows * stride + (storage_rows - 1) * stride + tight_row
-                };
-                if src.total_len as usize != run_expected {
-                    return Err(DrawError::DrawValidation(
-                        DrawValidationDecline::GuestSampleLength {
-                            binding: image.binding,
-                            actual: src.total_len,
-                            expected: run_expected,
-                        },
-                    ));
-                }
-                let sum: u64 = src.runs.iter().map(|r| r.len()).sum();
-                let covered = src.source_offset.checked_add(src.total_len);
-                if src.total_len == 0 || src.runs.is_empty() || covered.is_none_or(|end| end > sum)
-                {
-                    return Err(DrawError::DrawValidation(
-                        DrawValidationDecline::GuestSampleCoverage {
-                            binding: image.binding,
-                            covered: sum,
-                            declared: src.total_len,
-                            runs: src.runs.len(),
-                        },
-                    ));
-                }
+                validate_guest_runs_shape(image, src, block, expected)?;
+            }
+            // TEMP (lab, PASS_STAGE): a staged bind validates exactly as the
+            // guest-runs source it stands for — its bytes sit in a worker
+            // arena, its geometry is the source's.
+            SampledSource::Staged(staged) => {
+                validate_guest_runs_shape(image, &staged.src, block, expected)?;
             }
         }
         if image.descriptor_count == 0 || image.array_element >= image.descriptor_count {
@@ -2365,6 +2354,51 @@ fn batch_depth_disabled() -> bool {
     })
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_MRT_BATCH=on`): MRT draws may append to the open
+/// batch (design §8.4's MRT half). Off — the default — is byte-for-byte the
+/// old refusal.
+///
+/// **Why the term existed.** The batching this ladder gates was built as
+/// same-target chaining: "a successor whose work folds into the open CB
+/// (LoadFromTarget — no CPU/GPU seed, not sampling its own target, same
+/// identity/geometry/format)". An MRT draw's pass shape is none of that, so
+/// it was refused outright — before mixed targets were allowed
+/// (`BATCH_MIXED_TARGETS`), before ad-hoc framebuffers became cached, and
+/// before the pass-echo machinery generalized continuation. Of the stated
+/// reasons, only pass-continuation shape is left, and that is governed where
+/// it always was: `keep_pass_open` below now forces an MRT draw's pass
+/// closed, so a joining MRT draw records its own barriers and its own pass
+/// instance inside the batch's command buffer — the same shape any
+/// target-switching joiner already has.
+///
+/// What the rung costs on transitions is `submit` 7.6 µs/draw (§1.3):
+/// `nojoin_mrt` fired ~1 000/s against ~1 300 joins/s, and every firing is
+/// its own `vkQueueSubmit` and fence.
+fn lab_mrt_batch() -> bool {
+    #[cfg(test)]
+    {
+        // Tests drive both arms through their own door; 2 means "no
+        // override", the environment's latched answer.
+        match TEST_MRT_BATCH.load(Ordering::Relaxed) {
+            0 => return false,
+            1 => return true,
+            _ => {}
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("REIMS_VGPU_LAB_MRT_BATCH").as_deref(),
+            Ok("on")
+        )
+    })
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_MRT_BATCH`, tests): 0 = off, 1 = on, 2 = no
+/// override. See [`lab_mrt_batch`].
+#[cfg(test)]
+static TEST_MRT_BATCH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
 /// The `depth_barred` term, as the draw path computes it.
 ///
 /// A function rather than an expression at the one call site so a test can reach
@@ -2449,7 +2483,13 @@ impl JoinTerms {
     const LADDER: [JoinRefusal; 12] = [
         (|t| t.force_loss, JoinScope::Draw, "nojoin_force_loss"),
         (|t| t.quirk, JoinScope::Draw, "nojoin_quirk"),
-        (|t| t.is_mrt, JoinScope::Draw, "nojoin_mrt"),
+        // TEMP (lab, `REIMS_VGPU_LAB_MRT_BATCH`): the rung reads the flag so
+        // the census population it names is the live one; see `lab_mrt_batch`.
+        (
+            |t| t.is_mrt && !lab_mrt_batch(),
+            JoinScope::Draw,
+            "nojoin_mrt",
+        ),
         (|t| t.depth_barred, JoinScope::Draw, "nojoin_depth"),
         (|t| t.reads_back, JoinScope::Draw, "nojoin_reads_back"),
         (|t| t.has_query, JoinScope::Draw, "nojoin_query"),
@@ -2484,6 +2524,261 @@ impl JoinTerms {
             .find(|(refuses, _, _)| refuses(self))
             .map(|(_, _, name)| *name)
     }
+}
+
+/// TEMP (lab, PASS_STAGE): the guest-runs sampled ladder, shared verbatim by
+/// the plain bind and the staged one — `staged` carries the worker's window
+/// for the single branch the serial path CPU-gathers (`write_staging_from_runs`),
+/// where the staged bind instead records the copy from the ready buffer.
+///
+/// Extracted from `execute_draw_inner`'s match arm when the staged variant
+/// needed the same ladder; `continue` became `return`, and every other line is
+/// the arm as it stood.
+#[allow(clippy::too_many_arguments)]
+unsafe fn sample_guest_runs(
+    ctx: &super::context::DeviceContext,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    phase: &mut super::draw_phase::DrawTimer,
+    resource: &super::types::SampledImageResource,
+    src: &super::types::GuestRunSource,
+    vouch: crate::runtime::gather_witness::GatherVouch,
+    staged: Option<super::pass_stage::StagedSlice>,
+    sampled: &mut Vec<PreparedSampled>,
+    guest_gathers: &mut Vec<PendingGuestGather>,
+) -> Result<(), DrawError> {
+    if let Some(direct) = src.direct_image.as_ref() {
+        if let Some(bound) = unsafe {
+            pools.acquire_guest_sampled(
+                ctx,
+                SampledKey::of(resource),
+                direct.backing,
+                std::sync::Arc::clone(&direct.import),
+                direct.owner.clone(),
+                counters,
+            )?
+        } {
+            crate::runtime::drain::note_store_route("sampled_direct_bound");
+            crate::runtime::drain::note_store_route(match direct.origin {
+                super::SampledByteOrigin::LinearTexture => "sampled_direct_linear",
+                super::SampledByteOrigin::SurfaceGuestFallback => {
+                    "sampled_direct_mapper_ref_texture"
+                }
+                super::SampledByteOrigin::SerializedSurfaceView => "sampled_direct_ref_texture",
+                _ => "sampled_direct_other",
+            });
+            sampled.push(PreparedSampled::GuestDirect {
+                binding: resource.binding,
+                array_element: resource.array_element,
+                image: bound.image,
+                view: bound.view,
+                key: bound.key,
+                initialized: bound.initialized,
+            });
+            return Ok(());
+        }
+    }
+    // A copy-backed producer vouches for its identity only when
+    // both halves of the guest-write witness say the window's bytes cannot have
+    // moved since the gather that filled the retained image: no
+    // guest store into the pages, and no write by this device
+    // either. So the retained image is bound with nothing read and
+    // nothing compared — which is the whole point, since reading
+    // the bytes to compare them is the cost being removed. A
+    // declined direct image carries no identity, so this lookup
+    // misses without touching the copied-content ledger.
+    if let Some(image) =
+        pools.find_gathered_sampled(SampledKey::of(resource), resource.identity, counters)
+    {
+        counters.note_sampled_gather_skipped(src.total_len);
+        sampled.push(PreparedSampled::Cached {
+            binding: resource.binding,
+            array_element: resource.array_element,
+            image,
+        });
+        return Ok(());
+    }
+    // The elision did not fire, and the two reasons it can fail want
+    // opposite fixes: no vouch to spend, or a vouch with nothing
+    // left to spend it on. Taken here because this is the only point
+    // holding both the witness's answer and the cache's.
+    //
+    // The witness's answer is `vouch`; the identity names the
+    // content it judged. A direct source that reached this point
+    // was declined by the backend and carries neither copied
+    // content nor a vouchable identity, so `Fresh` correctly names
+    // the required conservative gather.
+    counters.note_sampled_gather_unskipped(vouch);
+    let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
+    // Everything from here to the end of this arm moves bytes;
+    // everything above it in `AcquireSampled` decides which image
+    // to move them into. The split is what separates "the driver
+    // made 21 objects" from "the CPU copied 8.9 MB", and those are
+    // the two candidates for a cold sampled bind. The phase is
+    // re-entered per texture, which is correct — `enter`
+    // accumulates, so a draw binding several gathers charges each
+    // half of each bind to its own bar.
+    phase.enter(super::draw_phase::Phase::SampledUpload);
+    // First ask whether the bytes have to move at all. The RAMBlock
+    // import is a buffer the copy can name, so where this device
+    // can make one this arm moves nothing on the CPU and the
+    // `memcpy` below never runs.
+    //
+    // The import is over guest RAM, which the GPU can write as well
+    // as read. What keeps the copy inside the guest's own bytes is
+    // the `GuestRef` in `src.pages`: it is range-checked against its
+    // RAMBlock at construction and there is no other way to name a
+    // byte in one.
+    let source = match unsafe {
+        import_sampled_guest_window(ctx, pools, counters, src, &mut *guest_gathers)?
+    } {
+        Some(imported) => {
+            // The read is now the command buffer's, at execute time.
+            // `write_stamp` quiesces before telling the guest these
+            // pages are free, which is what keeps that legal.
+            pools.note_guest_read_recorded();
+            counters.note_sampled_guest_import(src.total_len);
+            imported
+        }
+        None => {
+            // TEMP (lab, PASS_STAGE): the worker's window holds exactly the
+            // bytes `write_staging_from_runs` would have gathered, read from
+            // the same runs at plan time — the copy the serial arm pays here
+            // is the one §8.4 moves off the recorder. The import above is
+            // tried first for the same reason it always was: an import moves
+            // nothing at all.
+            if let Some(slice) = staged.as_ref() {
+                if !pools.note_staged_read(std::sync::Arc::clone(&slice.ring), slice.window) {
+                    return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedDraw));
+                }
+                crate::runtime::drain::note_store_route("pass_stage_sampled_hit");
+                crate::runtime::drain::note_store_route_n(
+                    "pass_stage_sampled_bytes",
+                    src.total_len,
+                );
+                counters.note_sampled_gather(src.total_len);
+                GuestTexels::Staged(slice.clone())
+            } else {
+                let scratch = pools.acquire_staging(ctx, src.total_len, counters)?;
+                pools.write_staging_from_runs(
+                    ctx,
+                    &scratch,
+                    &src.runs,
+                    src.source_offset,
+                    src.total_len,
+                )?;
+                // The only arm of this loop that moves bytes, and until
+                // now the only one that reported nothing — which is what
+                // let the whole of `acquire_sampled` sit unattributed.
+                counters.note_sampled_gather(src.total_len);
+                GuestTexels::Scratch(scratch)
+            }
+        }
+    };
+    sampled.push(PreparedSampled::GuestGather {
+        binding: resource.binding,
+        array_element: resource.array_element,
+        image: img,
+        source,
+        row_length_texels: src.row_length_texels,
+        volume: resource.kind.is_volume(),
+        layers: resource.layers,
+        gathered_len: src.total_len as usize,
+    });
+    // Back to the deciding half for the next texture in the loop.
+    phase.enter(super::draw_phase::Phase::AcquireSampled);
+    Ok(())
+}
+
+/// The guest-runs shape checks, shared by the plain bind and the staged one
+/// that stands for it (TEMP lab, PASS_STAGE): a cube's face ordering, the
+/// storage-grid arithmetic of `bufferRowLength`, and the runs' coverage of
+/// the declared window.
+fn validate_guest_runs_shape(
+    image: &super::types::SampledImageResource,
+    src: &super::types::GuestRunSource,
+    block: reims_vgpu_core::extent::BlockGeometry,
+    expected: usize,
+) -> Result<(), DrawError> {
+    // A cube's face ordering is not carried by this source. Arrays
+    // and volumes are ordinary consecutive image planes and the
+    // copy below consumes all of them.
+    if image.kind.is_cube() {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::GuestRunSampledNot2d {
+                binding: image.binding,
+            },
+        ));
+    }
+    // Every count below is in units of the image's storage grid —
+    // rows of blocks and bytes per block — which for an
+    // uncompressed format is exactly the texel arithmetic this
+    // always was (a 1x1 block whose bytes are the bytes-per-texel).
+    // `bufferRowLength` stays Vulkan's unit, texels: the stride in
+    // bytes is `(row_length / block.width) * block.bytes`, and a
+    // row length that does not divide into whole blocks cannot
+    // describe a compressed row at all, so it refuses as a stride
+    // defect rather than rounding into a shifted image.
+    let texel = block.bytes as usize;
+    let planes = image.layers as usize;
+    let storage_rows = block.block_rows(image.height) as usize;
+    let tight_row = block.blocks_across(image.width) as usize * texel;
+    if storage_rows == 0 || tight_row == 0 {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::SampledZeroGeometry {
+                binding: image.binding,
+                width: image.width,
+                height: image.height,
+                layers: image.layers,
+            },
+        ));
+    }
+    let run_expected = if src.row_length_texels == 0 {
+        expected
+    } else {
+        if !src.row_length_texels.is_multiple_of(block.width) {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::GuestSampleRowStride {
+                    binding: image.binding,
+                    stride: src.row_length_texels as usize,
+                    tight_row,
+                },
+            ));
+        }
+        let stride = (src.row_length_texels / block.width) as usize * texel;
+        if stride < tight_row {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::GuestSampleRowStride {
+                    binding: image.binding,
+                    stride,
+                    tight_row,
+                },
+            ));
+        }
+        (planes - 1) * storage_rows * stride + (storage_rows - 1) * stride + tight_row
+    };
+    if src.total_len as usize != run_expected {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::GuestSampleLength {
+                binding: image.binding,
+                actual: src.total_len,
+                expected: run_expected,
+            },
+        ));
+    }
+    let sum: u64 = src.runs.iter().map(|r| r.len()).sum();
+    let covered = src.source_offset.checked_add(src.total_len);
+    if src.total_len == 0 || src.runs.is_empty() || covered.is_none_or(|end| end > sum) {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::GuestSampleCoverage {
+                binding: image.binding,
+                covered: sum,
+                declared: src.total_len,
+                runs: src.runs.len(),
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn draw_has_no_invocations(req: &DrawRequest) -> bool {
@@ -2956,6 +3251,17 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     let batch_eligible = terms.batch_eligible();
     let no_join = terms.refusal();
+    // TEMP (lab, `REIMS_VGPU_LAB_MRT_BATCH`): the pair the A/B reads.
+    // `before` is the population the old ladder refused as `nojoin_mrt` (the
+    // two rungs above it not firing); `after` is the same population the live
+    // ladder still refuses, for any reason. Equal while the flag is off; the
+    // gap is the submits the step removed.
+    if is_mrt && !force_loss && !ctx.caps.quirks.no_deferred_draw_batching {
+        crate::runtime::drain::note_store_route("pass_stage_mrt_nojoin_before");
+        if no_join.is_some() {
+            crate::runtime::drain::note_store_route("pass_stage_mrt_nojoin_after");
+        }
+    }
     // The join arm splits by self-alias, and the two must sum to the joins.
     // `nojoin_samples_own_target` was 29.7 % of all draws and is the population
     // this ladder stopped refusing; without a name of its own on the way *in*,
@@ -3689,28 +3995,51 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.write_staging(ctx, &slot, &wide)?;
         }
         counters.note_seed_upload(wide.len() as u64);
-        Some(slot)
+        Some(SeedSource::Slot(slot))
     } else if let Some(rgba8) = seed_bytes {
-        let slot = {
-            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-            pools.acquire_staging(ctx, rgba8.len() as u64, counters)?
-        };
-        // Vulkan buffer→image copies do not perform format conversion, so the
-        // staged bytes must already be in the attachment's physical order —
-        // otherwise partial draws preserve an exact R/B-exchanged seed outside
-        // their damaged geometry. The attachment is BGRA when `output_bgra`; the
-        // seed states its own order. Exchange exactly when they disagree, inside
-        // the copy that has to happen anyway.
-        if matches!(req.target_seed_order, SeedOrder::Bgra8) != output_bgra {
-            let _s = stage_phase::Span::moving(stage_phase::Part::Swap, rgba8.len() as u64);
-            pools.write_staging_swap_rb(ctx, &slot, rgba8)?;
+        // TEMP (lab, PASS_STAGE, design §8.4): a worker may have staged this
+        // seed — R/B exchange folded into its memcpy — while the request sat
+        // in the recorder FIFO. The cell is spent either way, so a late
+        // worker's window is released by its own completion.
+        let staged = req
+            .target_seed_stage
+            .as_ref()
+            .and_then(|cell| cell.take_staged());
+        if let Some(slice) = staged {
+            if !pools.note_staged_read(std::sync::Arc::clone(&slice.ring), slice.window) {
+                return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedDraw));
+            }
+            crate::runtime::drain::note_store_route("pass_stage_seed_hit");
+            crate::runtime::drain::note_store_route_n("pass_stage_seed_bytes", slice.window.len);
+            counters.note_seed_upload(slice.window.len);
+            Some(SeedSource::Staged(std::sync::Arc::new(slice)))
         } else {
-            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, rgba8.len() as u64);
-            pools.write_staging(ctx, &slot, rgba8)?;
+            let slot = {
+                let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+                pools.acquire_staging(ctx, rgba8.len() as u64, counters)?
+            };
+            // Vulkan buffer→image copies do not perform format conversion, so the
+            // staged bytes must already be in the attachment's physical order —
+            // otherwise partial draws preserve an exact R/B-exchanged seed outside
+            // their damaged geometry. The attachment is BGRA when `output_bgra`; the
+            // seed states its own order. Exchange exactly when they disagree, inside
+            // the copy that has to happen anyway.
+            if matches!(req.target_seed_order, SeedOrder::Bgra8) != output_bgra {
+                let _s = stage_phase::Span::moving(stage_phase::Part::Swap, rgba8.len() as u64);
+                pools.write_staging_swap_rb(ctx, &slot, rgba8)?;
+            } else {
+                let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, rgba8.len() as u64);
+                pools.write_staging(ctx, &slot, rgba8)?;
+            }
+            counters.note_seed_upload(rgba8.len() as u64);
+            Some(SeedSource::Slot(slot))
         }
-        counters.note_seed_upload(rgba8.len() as u64);
-        Some(slot)
     } else {
+        // No seed: spend the cell anyway if one somehow rides along, so its
+        // window is not stranded behind a `Pending` nobody will take.
+        if let Some(cell) = req.target_seed_stage.as_ref() {
+            cell.take_staged();
+        }
         None
     };
     // A secondary MRT attachment is bound + rendered as attachment N of an
@@ -4257,132 +4586,36 @@ pub(crate) unsafe fn execute_draw_inner(
                     .sampled_gpu_binds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            SampledSource::GuestRuns(src, vouch) => {
-                if let Some(direct) = src.direct_image.as_ref() {
-                    if let Some(bound) = unsafe {
-                        pools.acquire_guest_sampled(
-                            ctx,
-                            SampledKey::of(resource),
-                            direct.backing,
-                            std::sync::Arc::clone(&direct.import),
-                            direct.owner.clone(),
-                            counters,
-                        )?
-                    } {
-                        crate::runtime::drain::note_store_route("sampled_direct_bound");
-                        crate::runtime::drain::note_store_route(match direct.origin {
-                            super::SampledByteOrigin::LinearTexture => "sampled_direct_linear",
-                            super::SampledByteOrigin::SurfaceGuestFallback => {
-                                "sampled_direct_mapper_ref_texture"
-                            }
-                            super::SampledByteOrigin::SerializedSurfaceView => {
-                                "sampled_direct_ref_texture"
-                            }
-                            _ => "sampled_direct_other",
-                        });
-                        sampled.push(PreparedSampled::GuestDirect {
-                            binding: resource.binding,
-                            array_element: resource.array_element,
-                            image: bound.image,
-                            view: bound.view,
-                            key: bound.key,
-                            initialized: bound.initialized,
-                        });
-                        continue;
-                    }
-                }
-                // A copy-backed producer vouches for its identity only when
-                // both halves of the guest-write witness say the window's bytes cannot have
-                // moved since the gather that filled the retained image: no
-                // guest store into the pages, and no write by this device
-                // either. So the retained image is bound with nothing read and
-                // nothing compared — which is the whole point, since reading
-                // the bytes to compare them is the cost being removed. A
-                // declined direct image carries no identity, so this lookup
-                // misses without touching the copied-content ledger.
-                if let Some(image) = pools.find_gathered_sampled(
-                    SampledKey::of(resource),
-                    resource.identity,
+            // TEMP (lab, PASS_STAGE): a staged guest-runs bind is its
+            // guest-runs ladder verbatim, with the worker's window riding
+            // along for the one arm the serial path CPU-gathers.
+            SampledSource::Staged(staged) => {
+                sample_guest_runs(
+                    ctx,
+                    pools,
                     counters,
-                ) {
-                    counters.note_sampled_gather_skipped(src.total_len);
-                    sampled.push(PreparedSampled::Cached {
-                        binding: resource.binding,
-                        array_element: resource.array_element,
-                        image,
-                    });
-                    continue;
-                }
-                // The elision did not fire, and the two reasons it can fail want
-                // opposite fixes: no vouch to spend, or a vouch with nothing
-                // left to spend it on. Taken here because this is the only point
-                // holding both the witness's answer and the cache's.
-                //
-                // The witness's answer is `vouch`; the identity names the
-                // content it judged. A direct source that reached this point
-                // was declined by the backend and carries neither copied
-                // content nor a vouchable identity, so `Fresh` correctly names
-                // the required conservative gather.
-                counters.note_sampled_gather_unskipped(*vouch);
-                let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
-                // Everything from here to the end of this arm moves bytes;
-                // everything above it in `AcquireSampled` decides which image
-                // to move them into. The split is what separates "the driver
-                // made 21 objects" from "the CPU copied 8.9 MB", and those are
-                // the two candidates for a cold sampled bind. The phase is
-                // re-entered per texture, which is correct — `enter`
-                // accumulates, so a draw binding several gathers charges each
-                // half of each bind to its own bar.
-                phase.enter(super::draw_phase::Phase::SampledUpload);
-                // First ask whether the bytes have to move at all. The RAMBlock
-                // import is a buffer the copy can name, so where this device
-                // can make one this arm moves nothing on the CPU and the
-                // `memcpy` below never runs.
-                //
-                // The import is over guest RAM, which the GPU can write as well
-                // as read. What keeps the copy inside the guest's own bytes is
-                // the `GuestRef` in `src.pages`: it is range-checked against its
-                // RAMBlock at construction and there is no other way to name a
-                // byte in one.
-                let source = match unsafe {
-                    import_sampled_guest_window(ctx, pools, counters, src, &mut guest_gathers)?
-                } {
-                    Some(imported) => {
-                        // The read is now the command buffer's, at execute time.
-                        // `write_stamp` quiesces before telling the guest these
-                        // pages are free, which is what keeps that legal.
-                        pools.note_guest_read_recorded();
-                        counters.note_sampled_guest_import(src.total_len);
-                        imported
-                    }
-                    None => {
-                        let scratch = pools.acquire_staging(ctx, src.total_len, counters)?;
-                        pools.write_staging_from_runs(
-                            ctx,
-                            &scratch,
-                            &src.runs,
-                            src.source_offset,
-                            src.total_len,
-                        )?;
-                        // The only arm of this loop that moves bytes, and until
-                        // now the only one that reported nothing — which is what
-                        // let the whole of `acquire_sampled` sit unattributed.
-                        counters.note_sampled_gather(src.total_len);
-                        GuestTexels::Scratch(scratch)
-                    }
-                };
-                sampled.push(PreparedSampled::GuestGather {
-                    binding: resource.binding,
-                    array_element: resource.array_element,
-                    image: img,
-                    source,
-                    row_length_texels: src.row_length_texels,
-                    volume: resource.kind.is_volume(),
-                    layers: resource.layers,
-                    gathered_len: src.total_len as usize,
-                });
-                // Back to the deciding half for the next texture in the loop.
-                phase.enter(super::draw_phase::Phase::AcquireSampled);
+                    &mut phase,
+                    resource,
+                    &staged.src,
+                    staged.vouch,
+                    Some(staged.staged.clone()),
+                    &mut sampled,
+                    &mut guest_gathers,
+                )?;
+            }
+            SampledSource::GuestRuns(src, vouch) => {
+                sample_guest_runs(
+                    ctx,
+                    pools,
+                    counters,
+                    &mut phase,
+                    resource,
+                    src,
+                    *vouch,
+                    None,
+                    &mut sampled,
+                    &mut guest_gathers,
+                )?;
             }
         }
     }
@@ -4737,7 +4970,11 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &barrier,
         );
+        // TEMP (lab, PASS_STAGE): a staged seed names a window inside a
+        // worker arena rather than a pooled slot, so the copy carries its
+        // offset; everything around it is the copy the serial arm records.
         let copy = [vk::BufferImageCopy::default()
+            .buffer_offset(seed.offset())
             .image_subresource(super::color_subresource_layers())
             .image_extent(vk::Extent3D {
                 width: req.width,
@@ -4746,7 +4983,7 @@ pub(crate) unsafe fn execute_draw_inner(
             })];
         ctx.device.cmd_copy_buffer_to_image(
             cb,
-            seed.buffer,
+            seed.buffer(),
             target_image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             &copy,
@@ -5655,7 +5892,12 @@ pub(crate) unsafe fn execute_draw_inner(
     let keep_pass_open = req.render_pass_continues
         && batch_eligible
         && !pass_churn_probe_enabled()
-        && !layout_churn_probe_enabled();
+        && !layout_churn_probe_enabled()
+        // TEMP (lab, `REIMS_VGPU_LAB_MRT_BATCH`): a joining MRT draw closes
+        // its own pass. The continuation machinery is shape-agnostic, but
+        // this step claims only the submit the batch shares — the pass-held
+        // population for MRT is measured (`passheld_*`) before it is taken.
+        && !(is_mrt && lab_mrt_batch());
     if keep_pass_open {
         crate::runtime::drain::note_store_route("pass_left_open");
     } else {
@@ -6988,6 +7230,20 @@ mod tests {
         );
     }
 
+    /// Sets [`TEST_MRT_BATCH`] for the guard's life (tests).
+    struct MrtBatchOverride(u8);
+    impl MrtBatchOverride {
+        fn new(v: u8) -> Self {
+            TEST_MRT_BATCH.store(v, Ordering::Relaxed);
+            Self(v)
+        }
+    }
+    impl Drop for MrtBatchOverride {
+        fn drop(&mut self) {
+            TEST_MRT_BATCH.store(2, Ordering::Relaxed);
+        }
+    }
+
     /// Build a `JoinTerms` from a bitmask, one bit per ladder rung in order.
     fn join_terms(bits: u32) -> JoinTerms {
         let b = |i: usize| bits & (1 << i) != 0;
@@ -7025,6 +7281,20 @@ mod tests {
             assert!(seen.insert(*name), "two rungs share the census name {name}");
         }
         assert_eq!(join_terms(0).refusal(), None, "no term set is a join");
+
+        // TEMP (lab, `REIMS_VGPU_LAB_MRT_BATCH`): the rung reads the flag.
+        // Off (the default), an MRT draw with no other term refuses with the
+        // name it always had; on, it joins -- the `vkQueueSubmit` and fence
+        // it used to pay alone (submit 7.6 us/draw on transitions) become
+        // the batch's to share.
+        let _arm_on = MrtBatchOverride::new(1);
+        let mrt_alone = join_terms(1 << 2);
+        assert!(mrt_alone.batch_eligible(), "with the arm on, MRT joins");
+        assert_eq!(mrt_alone.refusal(), None);
+        // And a rung above it still refuses first.
+        assert_eq!(join_terms(1 << 1).refusal(), Some("nojoin_quirk"));
+        let _arm_off = MrtBatchOverride::new(0);
+        assert_eq!(join_terms(1 << 2).refusal(), Some("nojoin_mrt"));
     }
 
     /// A depth attachment on its own must not stop a draw deferring its submit.

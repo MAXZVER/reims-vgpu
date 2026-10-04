@@ -886,6 +886,10 @@ pub(crate) struct RefViewPlan {
     gpas: std::sync::Arc<Vec<u64>>,
     runs: std::sync::Arc<Vec<crate::backend::vulkan::engine::GuestRun>>,
     gather: crate::runtime::gather_witness::PlannedGather,
+    /// TEMP (lab, PASS_STAGE, design 8.4): the plan's gather window, staged
+    /// into a worker arena by [`attach_staged`]; the serve wraps it and the
+    /// engine's CPU-gather arm reads the window instead of gathering.
+    staged: Option<crate::backend::vulkan::engine::pass_stage::StagedSlice>,
 }
 
 /// Plan the zero-copy bind of a ref-texture view that needs materializing.
@@ -964,7 +968,62 @@ pub(crate) fn plan_ref_view_zero_copy<M: HostMemory + HostOps>(
         gpas,
         runs,
         gather,
+        staged: None,
     })
+}
+
+/// TEMP (lab, PASS_STAGE, design 8.4): wrap a guest-runs serve whose window a
+/// worker staged, as the staged request the engine resolves like the
+/// guest-runs bind it stands for. `unreachable` on any other variant because
+/// every caller built the guest-runs tuple on the line above.
+fn wrap_staged(
+    request: SampledSourceRequest,
+    staged: &crate::backend::vulkan::engine::pass_stage::StagedSlice,
+) -> SampledSourceRequest {
+    let SampledSourceRequest::GuestRuns(src, native, format, planes, identity, vouch, components) =
+        request
+    else {
+        unreachable!("a staged wrap is applied to a guest-runs serve");
+    };
+    SampledSourceRequest::Staged(Box::new(super::StagedSampledRequest {
+        src,
+        native,
+        format,
+        planes,
+        identity,
+        vouch,
+        components,
+        staged: staged.clone(),
+    }))
+}
+
+/// TEMP (lab, PASS_STAGE, design 8.4): stage the gather window of a
+/// guest-runs plan into the worker's arena -- the copy the engine's
+/// CPU-gather arm (`write_staging_from_runs`) would have paid, moved to the
+/// planning thread. Plans without a gather window are untouched; an arena
+/// refusal leaves the plan as it was (the serial gather serves).
+pub(crate) fn attach_staged(
+    plan: &mut super::prefetch::StreamPlan,
+    stager: &super::pass_stage::Stager,
+) {
+    let attached = match plan {
+        super::prefetch::StreamPlan::RefView(p) => stager
+            .stage_runs(&p.runs, 0, p.plane.span)
+            .map(|staged| p.staged = Some(staged))
+            .is_some(),
+        super::prefetch::StreamPlan::Linear(p) => stager
+            .stage_runs(&p.packed_runs, p.layout_offset, p.span)
+            .map(|staged| p.staged = Some(staged))
+            .is_some(),
+        super::prefetch::StreamPlan::MapperRef(p) => stager
+            .stage_runs(&p.runs, 0, p.span)
+            .map(|staged| p.staged = Some(staged))
+            .is_some(),
+        _ => false,
+    };
+    if attached {
+        crate::runtime::drain::note_store_route("pass_stage_sampled_planned");
+    }
 }
 
 /// Re-check a ref-view plan at the point the serial rail would run, and with
@@ -984,13 +1043,7 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
     texture_ref: u32,
     resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
     apply: bool,
-) -> Result<
-    (
-        (u32, u32, u32, SampledSourceRequest),
-        Option<RefViewPlan>,
-    ),
-    SampleInvalid,
-> {
+) -> Result<((u32, u32, u32, SampledSourceRequest), Option<RefViewPlan>), SampleInvalid> {
     if plan.task_id != task_id || plan.texture_ref != texture_ref {
         return Err(SampleInvalid::Key);
     }
@@ -1049,8 +1102,14 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
             ),
         )
     };
+    // TEMP (lab, PASS_STAGE): the staged window, on every arm the closure
+    // below serves.
+    let wrap = |served: (u32, u32, u32, SampledSourceRequest)| match plan.staged.as_ref() {
+        Some(st) => (served.0, served.1, served.2, wrap_staged(served.3, st)),
+        None => served,
+    };
     if !apply {
-        return Ok((source(None, plan.gather.predicted()), None));
+        return Ok((wrap(source(None, plan.gather.predicted())), None));
     }
     // What the serial rail notes before it decides how to carry the plane.
     if let Some(bpp) = crate::protocol::pixel_format::bytes_per_pixel(view.pixel_format) {
@@ -1096,7 +1155,7 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
     let pages = guest_page_window(host, &plan.gpas, page, base_off % page, span);
     let mut next = plan.clone();
     next.gather = repeat;
-    Ok((source(pages, outcome), Some(next)))
+    Ok((wrap(source(pages, outcome)), Some(next)))
 }
 
 /// Whether the GVA-resident rung that sits above the linear zero-copy rail
@@ -1154,9 +1213,9 @@ fn linear_resident_rung_above_may_serve<M: HostMemory + HostOps>(
     };
     // An unpaid Store over this window makes the resident authoritative; the
     // serial rung's answer then turns on readiness alone.
-    if crate::backend::vulkan::gva_window(&identity)
-        .is_some_and(|window| crate::runtime::writeback_debt::gva_resident_authoritative(state, window))
-    {
+    if crate::backend::vulkan::gva_window(&identity).is_some_and(|window| {
+        crate::runtime::writeback_debt::gva_resident_authoritative(state, window)
+    }) {
         return true;
     }
     let Some(witness_key) = crate::backend::vulkan::gva_witness_key(&identity) else {
@@ -1212,6 +1271,8 @@ pub(crate) struct LinearPlan {
     gather: Option<crate::runtime::gather_witness::PlannedGather>,
     witness_gpas: Vec<u64>,
     witness_run: Option<crate::backend::vulkan::engine::GuestRun>,
+    /// TEMP (lab, PASS_STAGE, design 8.4): see [`RefViewPlan::staged`].
+    staged: Option<crate::backend::vulkan::engine::pass_stage::StagedSlice>,
 }
 
 /// Plan the linear zero-copy bind of one texture ref from state this call only
@@ -1240,7 +1301,9 @@ pub(crate) fn plan_linear_zero_copy<M: HostMemory + HostOps>(
     };
     // The same format gates the serial rail applies, quiet here so the serial
     // rail's decline routes are noted by the serial rail that takes them.
-    let declared_format = tex.declared_pixel_format().ok_or(SampleBail::ZeroCopyDeclined)?;
+    let declared_format = tex
+        .declared_pixel_format()
+        .ok_or(SampleBail::ZeroCopyDeclined)?;
     let (native, sampled_vk_format, native_components) =
         match translate::pixel::sampled_pixels(declared_format) {
             Ok((layout, _decline, components))
@@ -1353,6 +1416,7 @@ pub(crate) fn plan_linear_zero_copy<M: HostMemory + HostOps>(
             gather: None,
             witness_gpas: Vec::new(),
             witness_run: None,
+            staged: None,
         });
     }
     // The multi-plane gather arm, over the import's own coordinates exactly as
@@ -1372,7 +1436,12 @@ pub(crate) fn plan_linear_zero_copy<M: HostMemory + HostOps>(
         .div_ceil(page as usize);
     let witness_gpas = packed
         .gpas
-        .get(first_page..first_page.checked_add(page_count).ok_or(SampleBail::ColdPacked)?)
+        .get(
+            first_page
+                ..first_page
+                    .checked_add(page_count)
+                    .ok_or(SampleBail::ColdPacked)?,
+        )
         .ok_or(SampleBail::ColdPacked)?
         .to_vec();
     let witness_run = crate::backend::vulkan::engine::GuestRun::in_mapping(
@@ -1419,6 +1488,7 @@ pub(crate) fn plan_linear_zero_copy<M: HostMemory + HostOps>(
         gather: Some(gather),
         witness_gpas,
         witness_run: Some(witness_run),
+        staged: None,
     })
 }
 
@@ -1440,10 +1510,9 @@ impl LinearPlan {
                 self.sampled_vk_format,
                 self.planes,
                 outcome.map(|seen| LinearSampleIdentity::from(seen.identity)),
-                outcome.map_or(
-                    crate::runtime::gather_witness::GatherVouch::Fresh,
-                    |seen| seen.vouch,
-                ),
+                outcome.map_or(crate::runtime::gather_witness::GatherVouch::Fresh, |seen| {
+                    seen.vouch
+                }),
                 self.native_components,
             ),
         )
@@ -1469,13 +1538,7 @@ pub(crate) fn commit_linear_plan<M: HostMemory + HostOps>(
     resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
     may_bind_resident: bool,
     apply: bool,
-) -> Result<
-    (
-        (u32, u32, u32, SampledSourceRequest),
-        Option<LinearPlan>,
-    ),
-    SampleInvalid,
-> {
+) -> Result<((u32, u32, u32, SampledSourceRequest), Option<LinearPlan>), SampleInvalid> {
     if plan.task_id != task_id
         || plan.texture_ref != texture_ref
         || plan.may_bind_resident != may_bind_resident
@@ -1488,9 +1551,11 @@ pub(crate) fn commit_linear_plan<M: HostMemory + HostOps>(
     // The predicates the plan refused through, repeated: a debt armed since the
     // plan is the drain's to pay, on the serial rail.
     if crate::runtime::writeback_debt::owes_texture(state, task_id, texture_ref)
-        || state
-            .pending_writebacks
-            .owes_gva_overlapping(task_id, plan.allocation.gva, plan.allocation.size)
+        || state.pending_writebacks.owes_gva_overlapping(
+            task_id,
+            plan.allocation.gva,
+            plan.allocation.size,
+        )
     {
         return Err(SampleInvalid::Debt);
     }
@@ -1518,7 +1583,12 @@ pub(crate) fn commit_linear_plan<M: HostMemory + HostOps>(
     }
     let packed = state
         .bound_buffers
-        .packed_available(task_id, texture_ref, plan.allocation.gva, plan.allocation.size)
+        .packed_available(
+            task_id,
+            texture_ref,
+            plan.allocation.gva,
+            plan.allocation.size,
+        )
         .ok_or(SampleInvalid::Packed)?;
     if plan.packed_head != packed.head
         || !std::sync::Arc::ptr_eq(&plan.packed_runs, &packed.runs)
@@ -1528,7 +1598,10 @@ pub(crate) fn commit_linear_plan<M: HostMemory + HostOps>(
     }
     // Cloned out before the witness commit takes `state` mutably: the serve
     // below names the same allocation the identity check just proved.
-    let (packed_runs, packed_pages) = (std::sync::Arc::clone(&packed.runs), std::sync::Arc::clone(&packed.pages));
+    let (packed_runs, packed_pages) = (
+        std::sync::Arc::clone(&packed.runs),
+        std::sync::Arc::clone(&packed.pages),
+    );
     let guest_runs = crate::backend::vulkan::engine::GuestRunSource {
         runs: packed_runs,
         source_offset: plan.layout_offset,
@@ -1558,25 +1631,44 @@ pub(crate) fn commit_linear_plan<M: HostMemory + HostOps>(
         let SampledSourceRequest::GuestRuns(source, ..) = request else {
             return Err(SampleInvalid::Packed);
         };
-        return Ok((plan.source(source, None), apply.then(|| plan.clone())));
+        // TEMP (lab, PASS_STAGE): the staged window, when one was attached.
+        let served = plan.source(source, None);
+        return Ok((wrap_linear(plan, served), apply.then(|| plan.clone())));
     }
     let gather = plan.gather.as_ref().expect("checked above");
     let run = plan.witness_run.expect("the gather arm carries its run");
     if !apply {
-        return Ok((plan.source(guest_runs, Some(gather.predicted())), None));
+        return Ok((
+            wrap_linear(plan, plan.source(guest_runs, Some(gather.predicted()))),
+            None,
+        ));
     }
-    let (outcome, repeat) =
-        crate::runtime::gather_witness::commit_gather_repeatable(
-            state,
-            &*host,
-            gather,
-            &plan.witness_gpas,
-            std::slice::from_ref(&run),
-        )
-        .ok_or(SampleInvalid::Witness)?;
+    let (outcome, repeat) = crate::runtime::gather_witness::commit_gather_repeatable(
+        state,
+        &*host,
+        gather,
+        &plan.witness_gpas,
+        std::slice::from_ref(&run),
+    )
+    .ok_or(SampleInvalid::Witness)?;
     let mut next = plan.clone();
     next.gather = Some(repeat);
-    Ok((plan.source(guest_runs, Some(outcome)), Some(next)))
+    Ok((
+        wrap_linear(plan, plan.source(guest_runs, Some(outcome))),
+        Some(next),
+    ))
+}
+
+/// TEMP (lab, PASS_STAGE): a linear plan's serve, wrapped with its staged
+/// window when one was attached (see [`attach_staged`]).
+fn wrap_linear(
+    plan: &LinearPlan,
+    served: (u32, u32, u32, SampledSourceRequest),
+) -> (u32, u32, u32, SampledSourceRequest) {
+    match plan.staged.as_ref() {
+        Some(st) => (served.0, served.1, served.2, wrap_staged(served.3, st)),
+        None => served,
+    }
 }
 
 /// The surface id a sampled ref names, by the same classification
@@ -1614,11 +1706,7 @@ fn sampled_surface_of(
 /// `ensure_contig_view_with_pages` orders the two). Everything else — no view
 /// yet, a view with no import, an import the alignment gate would rebuild — is
 /// the serial rail's to resolve, so the plan declines.
-fn mapper_direct_rung_above_may_serve<M: HostOps>(
-    state: &DeviceState,
-    host: &M,
-    mid: u32,
-) -> bool {
+fn mapper_direct_rung_above_may_serve<M: HostOps>(state: &DeviceState, host: &M, mid: u32) -> bool {
     if !host.map_pages_stable() {
         return false;
     }
@@ -1663,6 +1751,8 @@ pub(crate) struct MapperRefPlan {
     gpas: std::sync::Arc<Vec<u64>>,
     runs: std::sync::Arc<Vec<crate::backend::vulkan::engine::GuestRun>>,
     gather: crate::runtime::gather_witness::PlannedGather,
+    /// TEMP (lab, PASS_STAGE, design 8.4): see [`RefViewPlan::staged`].
+    staged: Option<crate::backend::vulkan::engine::pass_stage::StagedSlice>,
 }
 
 /// Plan the mapper-ref zero-copy bind of one sampled ref. Every point where
@@ -1703,10 +1793,9 @@ pub(crate) fn plan_mapper_ref_zero_copy<M: HostMemory + HostOps>(
         .ok()
         .ok_or(SampleBail::ZeroCopyDeclined)?
         .vk;
-    let (base_off, bpr_u32, _) = crate::runtime::mapping_write::mapper_ref_texture_sample_window(
-        m, w, h, format,
-    )
-    .ok_or(SampleBail::ZeroCopyDeclined)?;
+    let (base_off, bpr_u32, _) =
+        crate::runtime::mapping_write::mapper_ref_texture_sample_window(m, w, h, format)
+            .ok_or(SampleBail::ZeroCopyDeclined)?;
     let bpr = u64::from(bpr_u32);
     let (span, row_length_texels) =
         strided_window_extent(w, h, native.bytes_per_texel() as u64, bpr)
@@ -1727,9 +1816,8 @@ pub(crate) fn plan_mapper_ref_zero_copy<M: HostMemory + HostOps>(
     }
     let window_key = crate::runtime::mapper::mapping_window_key_readonly(state, mid)
         .ok_or(SampleBail::ColdWindow)?;
-    let (gpas, runs) =
-        crate::runtime::mapper::mapping_window_cached(state, mid, base_off, span)
-            .ok_or(SampleBail::ColdWindow)?;
+    let (gpas, runs) = crate::runtime::mapper::mapping_window_cached(state, mid, base_off, span)
+        .ok_or(SampleBail::ColdWindow)?;
     if !guest_run_alias_available(host) {
         return Err(SampleBail::ZeroCopyDeclined);
     }
@@ -1763,6 +1851,7 @@ pub(crate) fn plan_mapper_ref_zero_copy<M: HostMemory + HostOps>(
         gpas,
         runs,
         gather,
+        staged: None,
     })
 }
 
@@ -1844,13 +1933,7 @@ pub(crate) fn commit_mapper_ref_plan<M: HostMemory + HostOps>(
     texture_ref: u32,
     resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
     apply: bool,
-) -> Result<
-    (
-        (u32, u32, u32, SampledSourceRequest),
-        Option<MapperRefPlan>,
-    ),
-    SampleInvalid,
-> {
+) -> Result<((u32, u32, u32, SampledSourceRequest), Option<MapperRefPlan>), SampleInvalid> {
     if plan.task_id != task_id || plan.texture_ref != texture_ref {
         return Err(SampleInvalid::Key);
     }
@@ -1859,7 +1942,11 @@ pub(crate) fn commit_mapper_ref_plan<M: HostMemory + HostOps>(
     }
     let mid = plan.mid;
     let row_holds = state.mappings.get(&mid).is_some_and(|m| {
-        m.mapped && !m.page_entries.is_empty() && m.has_geom && m.width == plan.w && m.height == plan.h
+        m.mapped
+            && !m.page_entries.is_empty()
+            && m.has_geom
+            && m.width == plan.w
+            && m.height == plan.h
     });
     let window_holds = state.mappings.get(&mid).and_then(|m| {
         let format = if m.format != 0 {
@@ -1867,13 +1954,8 @@ pub(crate) fn commit_mapper_ref_plan<M: HostMemory + HostOps>(
         } else {
             pixel_format::MTL_FORMAT_BGRA8_UNORM
         };
-        crate::runtime::mapping_write::mapper_ref_texture_sample_window(
-            m,
-            plan.w,
-            plan.h,
-            format,
-        )
-        .map(|(base_off, bpr, _)| (base_off, u64::from(bpr)))
+        crate::runtime::mapping_write::mapper_ref_texture_sample_window(m, plan.w, plan.h, format)
+            .map(|(base_off, bpr, _)| (base_off, u64::from(bpr)))
     });
     if !row_holds
         || window_holds != Some((plan.base_off, plan.bpr))
@@ -1893,14 +1975,19 @@ pub(crate) fn commit_mapper_ref_plan<M: HostMemory + HostOps>(
     if surface_resident_appeared(&*state, &plan.resource, mid, plan.w, plan.h) {
         return Err(SampleInvalid::UpperRung);
     }
-    let cached = crate::runtime::mapper::mapping_window_cached(state, mid, plan.base_off, plan.span);
+    let cached =
+        crate::runtime::mapper::mapping_window_cached(state, mid, plan.base_off, plan.span);
     if !cached.is_some_and(|(gpas, runs)| {
         std::sync::Arc::ptr_eq(&gpas, &plan.gpas) && std::sync::Arc::ptr_eq(&runs, &plan.runs)
     }) {
         return Err(SampleInvalid::Window);
     }
     if !apply {
-        return Ok((plan.source(None, plan.gather.predicted()), None));
+        // TEMP (lab, PASS_STAGE): the staged window, when one was attached.
+        return Ok((
+            wrap_mapper(plan, plan.source(None, plan.gather.predicted())),
+            None,
+        ));
     }
     crate::runtime::drain::note_store_route("t11rung_zero_copy");
     let (outcome, repeat) = crate::runtime::gather_witness::commit_gather_repeatable(
@@ -1912,16 +1999,22 @@ pub(crate) fn commit_mapper_ref_plan<M: HostMemory + HostOps>(
     )
     .ok_or(SampleInvalid::Witness)?;
     let page = state.page_size();
-    let pages = guest_page_window(
-        host,
-        &plan.gpas,
-        page,
-        plan.base_off % page,
-        plan.span,
-    );
+    let pages = guest_page_window(host, &plan.gpas, page, plan.base_off % page, plan.span);
     let mut next = plan.clone();
     next.gather = repeat;
-    Ok((plan.source(pages, outcome), Some(next)))
+    Ok((wrap_mapper(plan, plan.source(pages, outcome)), Some(next)))
+}
+
+/// TEMP (lab, PASS_STAGE): a mapper-ref plan's serve, wrapped with its staged
+/// window when one was attached (see [`attach_staged`]).
+fn wrap_mapper(
+    plan: &MapperRefPlan,
+    served: (u32, u32, u32, SampledSourceRequest),
+) -> (u32, u32, u32, SampledSourceRequest) {
+    match plan.staged.as_ref() {
+        Some(st) => (served.0, served.1, served.2, wrap_staged(served.3, st)),
+        None => served,
+    }
 }
 
 /// TEMP (lab, step 2): the memo-fill byte budget one planning chunk may spend,
@@ -2055,9 +2148,8 @@ pub(crate) fn plan_mapper_ref_memo<M: HostMemory + HostOps>(
     if w == 0 || h == 0 {
         return Err(SampleBail::NoGeometry);
     }
-    let sample_fmt =
-        effective_view_sample_format(pixel_format::MTL_FORMAT_BGRA8_UNORM, None)
-            .ok_or(SampleBail::ZeroCopyDeclined)?;
+    let sample_fmt = effective_view_sample_format(pixel_format::MTL_FORMAT_BGRA8_UNORM, None)
+        .ok_or(SampleBail::ZeroCopyDeclined)?;
     let stride = w.saturating_mul(4);
     // The serial scratch's own sizing: `host_alloc_len(stride × h)`, which the
     // memo's stored `native` is — the compare is over exactly these bytes.
@@ -2072,18 +2164,13 @@ pub(crate) fn plan_mapper_ref_memo<M: HostMemory + HostOps>(
     // The probe's span is the *window* (page-rounded), not the rect: the runs
     // cover it while the compare covers the scratch.
     let (base_off, bpr, window_span, tight) =
-        memo_read_window(state, mid, w, h, stride, scratch_len)
-            .ok_or(SampleBail::ColdWindow)?;
+        memo_read_window(state, mid, w, h, stride, scratch_len).ok_or(SampleBail::ColdWindow)?;
     if crate::runtime::writeback_debt::owes_mapping(state, mid) {
         return Err(SampleBail::OwedFrame);
     }
-    let (gpas, runs) = crate::runtime::mapper::mapping_window_cached(
-        state,
-        mid,
-        base_off,
-        window_span,
-    )
-    .ok_or(SampleBail::ColdWindow)?;
+    let (gpas, runs) =
+        crate::runtime::mapper::mapping_window_cached(state, mid, base_off, window_span)
+            .ok_or(SampleBail::ColdWindow)?;
     // The serial reader settles before it reads; a plan may only ask that
     // nothing it would wait for is outstanding over exactly these pages.
     if crate::runtime::gather_witness::writes_pending_over(&gpas) {
@@ -2144,11 +2231,7 @@ pub(crate) fn plan_mapper_ref_memo<M: HostMemory + HostOps>(
     }
     // A device write that raced the read invalidates it; the serial settle
     // would have waited it out.
-    if state
-        .host_writes
-        .wrote_any_since(host_epoch, &gpas)
-        .wrote()
-    {
+    if state.host_writes.wrote_any_since(host_epoch, &gpas).wrote() {
         return Err(SampleBail::ColdWindow);
     }
     let reads = MemoReads::of(state, mid).ok_or(SampleBail::ColdBacking)?;
@@ -2225,10 +2308,7 @@ pub(crate) fn plan_mapper_ref_memo<M: HostMemory + HostOps>(
 }
 
 /// Charge `bytes` against the chunk's fill budget, answering what remains.
-fn take_memo_budget(
-    budget: &std::sync::atomic::AtomicU64,
-    bytes: u64,
-) -> Result<u64, u64> {
+fn take_memo_budget(budget: &std::sync::atomic::AtomicU64, bytes: u64) -> Result<u64, u64> {
     budget.fetch_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
@@ -2266,7 +2346,9 @@ impl MemoPlan {
         identity: Option<LinearSampleIdentity>,
     ) -> (u32, u32, u32, SampledSourceRequest) {
         let rgba = match &self.serve {
-            MemoServe::Hit { rgba, .. } | MemoServe::Fill { rgba, .. } => std::sync::Arc::clone(rgba),
+            MemoServe::Hit { rgba, .. } | MemoServe::Fill { rgba, .. } => {
+                std::sync::Arc::clone(rgba)
+            }
         };
         let layout = match &self.serve {
             MemoServe::Hit { layout, .. } | MemoServe::Fill { layout, .. } => *layout,
@@ -2286,7 +2368,12 @@ impl MemoPlan {
 
     /// The hit-shaped plan over a fill this commit inserted: what the next
     /// bind of the ref serves if nothing moves.
-    fn hit_like(&self, rgba: std::sync::Arc<Vec<u8>>, generation: u64, layout: TexelLayout) -> Self {
+    fn hit_like(
+        &self,
+        rgba: std::sync::Arc<Vec<u8>>,
+        generation: u64,
+        layout: TexelLayout,
+    ) -> Self {
         Self {
             task_id: self.task_id,
             texture_ref: self.texture_ref,
@@ -2330,13 +2417,7 @@ pub(crate) fn commit_memo_plan<M: HostMemory + HostOps>(
     texture_ref: u32,
     resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
     apply: bool,
-) -> Result<
-    (
-        (u32, u32, u32, SampledSourceRequest),
-        Option<MemoPlan>,
-    ),
-    SampleInvalid,
-> {
+) -> Result<((u32, u32, u32, SampledSourceRequest), Option<MemoPlan>), SampleInvalid> {
     if plan.task_id != task_id || plan.texture_ref != texture_ref {
         return Err(SampleInvalid::Key);
     }
@@ -2359,7 +2440,8 @@ pub(crate) fn commit_memo_plan<M: HostMemory + HostOps>(
     if surface_resident_appeared(&*state, &plan.resource, plan.mid, plan.w, plan.h) {
         return Err(SampleInvalid::UpperRung);
     }
-    let cached = crate::runtime::mapper::mapping_window_cached(state, plan.mid, plan.base_off, plan.span);
+    let cached =
+        crate::runtime::mapper::mapping_window_cached(state, plan.mid, plan.base_off, plan.span);
     if !cached.is_some_and(|(gpas, runs)| {
         std::sync::Arc::ptr_eq(&gpas, &plan.gpas) && std::sync::Arc::ptr_eq(&runs, &plan.runs)
     }) {
@@ -3194,13 +3276,11 @@ mod tests {
     fn linear_fixture() -> (DeviceState, FakeHost, u32) {
         use crate::protocol::endian::{st16, st32, st64};
         use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-        use crate::runtime::bound_buffers::{
-            BoundBuffers, PackedBuffer, PackedBufferResolution,
-        };
+        use crate::runtime::bound_buffers::{BoundBuffers, PackedBuffer, PackedBufferResolution};
         use crate::runtime::decode::resource::{
-            list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE,
-            TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
-            TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE,
+            list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
+            OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT,
+            TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
         };
         use crate::runtime::gva_mem;
 
@@ -3237,7 +3317,10 @@ mod tests {
         st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], bpr);
         st32(&mut desc[TEXTURE_DESC_WIDTH..], w);
         st32(&mut desc[TEXTURE_DESC_HEIGHT..], h);
-        st16(&mut desc[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
+        st16(
+            &mut desc[TEXTURE_DESC_PIXEL_FORMAT..],
+            MTL_FORMAT_BGRA8_UNORM,
+        );
         let desc_gva = 0x1000u64;
         assert!(gva_mem::write_task_gva(
             &mut host,
@@ -3265,12 +3348,16 @@ mod tests {
 
         // The allocation's pages, mapped in the task table (slots 32..36) and
         // the host, so a copied-fallback walk would resolve them too.
-        let gpas: Vec<u64> = (0..4u64).map(|i| ((handle + i as u32) as u64) << PAGE_SHIFT_X86).collect();
+        let gpas: Vec<u64> = (0..4u64)
+            .map(|i| ((handle + i as u32) as u64) << PAGE_SHIFT_X86)
+            .collect();
         for (i, &gpa) in gpas.iter().enumerate() {
             host.map_range(gpa, 0x1000, 0x50 + i as u8);
             let mut pte = [0u8; 4];
             st32(&mut pte, (gpa >> PAGE_SHIFT_X86) as u32);
-            assert!(host.write_gpa(root_gpa + ((handle + i as u32) as u64) * 4, &pte).is_ok());
+            assert!(host
+                .write_gpa(root_gpa + ((handle + i as u32) as u64) * 4, &pte)
+                .is_ok());
         }
 
         // The warm packed allocation: what `ensure_packed_resource` would have
@@ -3278,10 +3365,8 @@ mod tests {
         // serial rail takes without resolving anything.
         let base = 0x7f00_0000_0000usize;
         let import = std::sync::Arc::new(
-            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-                base, 0x8000, 0x1000,
-            )
-            .expect("aligned allocation"),
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(base, 0x8000, 0x1000)
+                .expect("aligned allocation"),
         );
         let run = crate::runtime::guest_ram::GuestRun::in_mapping(base, 0x8000, 0, span)
             .expect("the run covers the allocation");
@@ -3353,9 +3438,17 @@ mod tests {
         let mut plan = plan_linear_zero_copy(&a, &a_host, 1, texture_ref, ra.clone(), false)
             .unwrap_or_else(|bail| panic!("a warm linear texture plans, got {bail:?}"));
         for _ in 0..2 {
-            let (planned, repeat) =
-                commit_linear_plan(&mut a, &mut a_host, &plan, 1, texture_ref, Some(&ra), false, true)
-                    .expect("nothing moved since the plan");
+            let (planned, repeat) = commit_linear_plan(
+                &mut a,
+                &mut a_host,
+                &plan,
+                1,
+                texture_ref,
+                Some(&ra),
+                false,
+                true,
+            )
+            .expect("nothing moved since the plan");
             let serial = resolve_sampled_source(
                 &mut b,
                 &mut b_host,
@@ -3422,18 +3515,20 @@ mod tests {
             .expect("no debt when planned");
         arm(&mut b);
         assert_eq!(
-            commit_linear_plan(&mut b, &mut b_host, &plan, 1, texture_ref, Some(&rb), false, true)
-                .err(),
+            commit_linear_plan(
+                &mut b,
+                &mut b_host,
+                &plan,
+                1,
+                texture_ref,
+                Some(&rb),
+                false,
+                true
+            )
+            .err(),
             Some(SampleInvalid::Debt)
         );
-        let serial = resolve_sampled_source(
-            &mut b,
-            &mut b_host,
-            1,
-            texture_ref,
-            Some(rb),
-            false,
-        );
+        let serial = resolve_sampled_source(&mut b, &mut b_host, 1, texture_ref, Some(rb), false);
         assert!(serial.is_some(), "the serial rail pays the debt and serves");
     }
 
@@ -3466,7 +3561,10 @@ mod tests {
         // And the serial rail still serves the bind, by resolving the
         // allocation itself.
         let serial = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra), false);
-        assert!(serial.is_some(), "the serial rail resolves what the plan refuses");
+        assert!(
+            serial.is_some(),
+            "the serial rail resolves what the plan refuses"
+        );
     }
 
     /// A mapper-ref surface above the gather floor (128x128 BGRA8 = 64 KiB,
@@ -3494,11 +3592,7 @@ mod tests {
             .collect();
         // The mapping's own token: the memo rung's plan rests on its lagged
         // generation, and the zero-copy witness arms its own.
-        let _ = crate::runtime::mapper::ensure_guest_write_token(
-            &mut state,
-            &mut host,
-            surface_id,
-        );
+        let _ = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, surface_id);
         (state, host, texture_ref, surface_id)
     }
 
@@ -3515,28 +3609,23 @@ mod tests {
             resource(&b, &b_host, texture_ref),
         );
         // One serial bind on each arm primes the window and the witness.
-        let first_a = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra.clone()), true)
-            .expect("the fixture's first bind serves the zero-copy rung");
-        let first_b = resolve_sampled_source(&mut b, &mut b_host, 1, texture_ref, Some(rb.clone()), true)
-            .expect("the serial arm primes identically");
+        let first_a =
+            resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra.clone()), true)
+                .expect("the fixture's first bind serves the zero-copy rung");
+        let first_b =
+            resolve_sampled_source(&mut b, &mut b_host, 1, texture_ref, Some(rb.clone()), true)
+                .expect("the serial arm primes identically");
         assert_eq!(runs_shape(&first_a), runs_shape(&first_b));
 
-        let mut plan =
-            plan_mapper_ref_zero_copy(&a, &a_host, 1, texture_ref, ra.clone())
-                .unwrap_or_else(|bail| panic!("a warm mapper-ref window plans, got {bail:?}"));
+        let mut plan = plan_mapper_ref_zero_copy(&a, &a_host, 1, texture_ref, ra.clone())
+            .unwrap_or_else(|bail| panic!("a warm mapper-ref window plans, got {bail:?}"));
         for _ in 0..3 {
             let (planned, repeat) =
                 commit_mapper_ref_plan(&mut a, &mut a_host, &plan, 1, texture_ref, Some(&ra), true)
                     .expect("nothing moved since the plan");
-            let serial = resolve_sampled_source(
-                &mut b,
-                &mut b_host,
-                1,
-                texture_ref,
-                Some(rb.clone()),
-                true,
-            )
-            .expect("the serial rail keeps serving the rung");
+            let serial =
+                resolve_sampled_source(&mut b, &mut b_host, 1, texture_ref, Some(rb.clone()), true)
+                    .expect("the serial rail keeps serving the rung");
             assert_eq!(runs_shape(&planned), runs_shape(&serial));
             plan = repeat.expect("the repeat serves the next bind");
         }
@@ -3614,10 +3703,12 @@ mod tests {
         // Tokens, then one serial bind on each arm to prime the memo.
         let _ = crate::runtime::mapper::ensure_guest_write_token(&mut a, &mut a_host, sid);
         let _ = crate::runtime::mapper::ensure_guest_write_token(&mut b, &mut b_host, sid);
-        let first_a = resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra.clone()), true)
-            .expect("the memo rung serves the fixture");
-        let first_b = resolve_sampled_source(&mut b, &mut b_host, 1, texture_ref, Some(rb.clone()), true)
-            .expect("the serial arm fills its memo identically");
+        let first_a =
+            resolve_sampled_source(&mut a, &mut a_host, 1, texture_ref, Some(ra.clone()), true)
+                .expect("the memo rung serves the fixture");
+        let first_b =
+            resolve_sampled_source(&mut b, &mut b_host, 1, texture_ref, Some(rb.clone()), true)
+                .expect("the serial arm fills its memo identically");
         let bytes_of = |s: &(u32, u32, u32, SampledSourceRequest)| match &s.3 {
             SampledSourceRequest::Bytes(bytes, identity, fmt, _) => (
                 bytes.to_vec(),
@@ -3635,15 +3726,9 @@ mod tests {
             let (planned, repeat) =
                 commit_memo_plan(&mut a, &mut a_host, &plan, 1, texture_ref, Some(&ra), true)
                     .expect("nothing moved since the plan");
-            let serial = resolve_sampled_source(
-                &mut b,
-                &mut b_host,
-                1,
-                texture_ref,
-                Some(rb.clone()),
-                true,
-            )
-            .expect("the serial memo keeps serving");
+            let serial =
+                resolve_sampled_source(&mut b, &mut b_host, 1, texture_ref, Some(rb.clone()), true)
+                    .expect("the serial memo keeps serving");
             assert_eq!(bytes_of(&planned), bytes_of(&serial));
             plan = repeat.expect("the hit serves the next bind");
         }
@@ -3781,8 +3866,7 @@ mod tests {
             &std::sync::atomic::AtomicU64::new(memo_fill_chunk_limit()),
         )
         .expect("the primed memo plans");
-        let identity =
-            crate::backend::vulkan::present_identity::surface_identity(&b, sid, 60, 64);
+        let identity = crate::backend::vulkan::present_identity::surface_identity(&b, sid, 60, 64);
         resource_lease::seed_warm_lease_for_test(
             &rb,
             &identity,

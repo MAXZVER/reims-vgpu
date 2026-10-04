@@ -61,7 +61,7 @@ pub(crate) struct ReadbackLease {
 /// buffer is created once for a lifetime the guest owns. These are host-visible
 /// pool slots, and widening a pool slot's usage is a change to what memory the
 /// driver will place it in — a measurement nobody has taken.
-const POOL_SLOT_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+pub(crate) const POOL_SLOT_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
     vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
         | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
         | vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
@@ -269,6 +269,7 @@ impl ResourcePools {
         Self {
             staging_free: HashMap::new(),
             staging_live: Vec::new(),
+            staged_reads: Vec::new(),
             gather_free: HashMap::new(),
             gather_live: Vec::new(),
             cb_bound_buffers: std::collections::HashMap::new(),
@@ -1711,9 +1712,27 @@ impl ResourcePools {
                 storage_images: std::mem::take(&mut self.storage_image_live),
                 unpin_residents: std::mem::take(&mut self.guest_write_pins_live),
                 unpin_compute_residents: std::mem::take(&mut self.compute_write_pins_live),
+                staged: std::mem::take(&mut self.staged_reads),
             },
             admissions,
         }
+    }
+
+    /// TEMP (lab, PASS_STAGE): a draw is recording a read of a worker-arena
+    /// window. Takes the submission's reference now and parks it on the entry
+    /// the seal will hand to the retiring slot; a draw that never reaches the
+    /// seal (a recoverable refusal) leaves the reference here for the next
+    /// seal or the recycle, the same way its staging slots are left.
+    pub(crate) fn note_staged_read(
+        &mut self,
+        ring: std::sync::Arc<crate::runtime::par::staging::StagingRing>,
+        window: crate::runtime::par::staging::StagingWindow,
+    ) -> bool {
+        if !ring.retain(window) {
+            return false;
+        }
+        self.staged_reads.push(StagedRead { ring, window });
+        true
     }
 
     /// Park the sealed cleanup on the current slot and give the content cache
@@ -3265,6 +3284,11 @@ impl ResourcePools {
                 );
             }
         }
+        // TEMP (lab, PASS_STAGE): the fence that signalled this retire is
+        // exactly what makes reusing these windows' bytes safe.
+        for read in pending.staged.drain(..) {
+            read.ring.release(read.window);
+        }
     }
 
     fn bucket(size: u64) -> u64 {
@@ -3698,6 +3722,12 @@ impl ResourcePools {
 
     pub(crate) fn recycle_staging(&mut self) {
         self.forget_cb_bound_buffers("bindmap_clear_recycle", "bindmap_clear_recycle_entries");
+        // TEMP (lab, PASS_STAGE): a recycled entry (device loss, a draw that
+        // never sealed) releases its arena windows here rather than at a
+        // retire that will not come.
+        for read in self.staged_reads.drain(..) {
+            read.ring.release(read.window);
+        }
         for slot in self.staging_live.drain(..) {
             let bucket = Self::bucket(slot.size);
             self.staging_free.entry(bucket).or_default().push(slot);
@@ -6379,6 +6409,7 @@ mod recycle_tests {
                 dsets: Vec::new(),
                 scatter_dsets: Vec::new(),
                 staging: Vec::new(),
+                staged: Vec::new(),
                 gather: Vec::new(),
                 readback: Vec::new(),
                 sampled: Vec::new(),
