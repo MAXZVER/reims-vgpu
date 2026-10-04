@@ -31,6 +31,10 @@ pub(crate) use pass_prep::{pass_prep_mode, DrawTables, PassPrep, PassPrepMode};
 pub(crate) use pass_prep::test_mode;
 // TEMP (lab, PASS_PREP step 3): the buffer-bind and Store-page plans.
 mod buffer_plan;
+mod pass_inv;
+pub(crate) use pass_inv::{pass_inv_mode, PassInvariants};
+#[cfg(test)]
+pub(crate) use pass_inv::test_mode as pass_inv_test_mode;
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
@@ -346,7 +350,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 ));
             }
             Ok(M2vDrawSpan::ResidentChain) => {
-                if let Some(identity) = render_chain_identity(state, req) {
+                if let Some(identity) = pass_inv::chain_identity(state, req) {
                     lab_dump_draw(req, &identity, "chain");
                     lab_pick_draw(req, &identity, "chain");
                 }
@@ -9473,7 +9477,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     // it, and once: the pinned Store identity, the cross-pass Load identity and
     // the deferred window's stored copy are all keyed on this value, and two
     // walks of one address across a submit are two answers.
-    req.gva_alloc_gen = gva_alloc_generation(state, host, req);
+    //
+    // TEMP (lab, PASS_INVARIANTS): the attachment set is fixed for the pass,
+    // so records 2+ reuse draw 0's answer (guarded, with the serial walk as
+    // the fallback) instead of re-walking the page set per record.
+    req.gva_alloc_gen = pass_inv::gva_alloc_gen(state, host, req);
     // One call for the pipeline descriptor and both translated shaders. It is
     // memoized on the three objects' list entries — see
     // `crate::backend::vulkan::pipeline_resolve` for what that identity is and what it
@@ -10301,7 +10309,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 // Colour 0 is the chain's own resident; a secondary is
                                 // named exactly as the pass that drew into it named it.
                                 let identity = if slot == 0 {
-                                    render_chain_identity(state, req)
+                                    pass_inv::chain_identity(state, req)
                                 } else {
                                     color.zip(format).and_then(|(color, format)| {
                                         secondary_attachment_identity(
@@ -11070,12 +11078,28 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // name that new generation rather than the one paired with the retired
         // alias.
         let span_backing = crate::runtime::chain_phase::CostSpan::new("seedx_backing_us");
-        let mapper_ref_texture_guest_backing =
-            mapper_ref_texture_guest_target_backing(state, host, req);
+        // TEMP (lab, PASS_INVARIANTS): records 2+ reuse draw 0's backing and
+        // store identity (guarded; the serial resolution is the fallback).
+        let mapper_ref_texture_guest_backing = pass_inv::guest_backing(state, host, req);
         let mapper_ref_texture_resident_target =
-            mapper_ref_texture_store_identity(state, req, writeback_guest);
+            pass_inv::store_identity(state, req, writeback_guest);
         drop(span_backing);
-        if req.chain_from_resident && render_chain_identity(state, req).is_some() {
+        // TEMP (lab, PASS_INVARIANTS): draw 0's commit records the pass
+        // invariants once, for the exec chain loop to harvest into the
+        // attachment template. The point is canonical on purpose — after the
+        // backing's `ensure_contig_view` revalidation, which is the one step
+        // inside a draw that can advance the mapping's generation — so the
+        // identities record the incarnation the serial sites below this call
+        // read, never a pre-revalidation one paired with a retired alias.
+        if pass_inv_mode() && req.pass_invariants.is_none() {
+            req.pass_invariants = Some(pass_inv::record_from_commit(
+                state,
+                req,
+                mapper_ref_texture_guest_backing.clone(),
+            ));
+            crate::runtime::drain::note_store_route("pass_inv_computed_once");
+        }
+        if req.chain_from_resident && pass_inv::chain_identity(state, req).is_some() {
             // The serialized chain names the resident it intends to load;
             // existence and readiness are engine state and are validated
             // atomically with target acquisition by `execute_draw_request`.
@@ -11279,6 +11303,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         }
         drop(span_currency);
         let _span_provide = crate::runtime::chain_phase::CostSpan::new("seedx_provide_us");
+        // TEMP (lab, PASS_INVARIANTS): the colour0 RT-provenance seed is
+        // lifted out of the request for this block — a move, so the provision
+        // below can take it without cloning a whole frame — and handed back
+        // whenever it was not consumed. Off mode always hands it back before
+        // anyone looks, so the field's state is exactly what the serial path
+        // left; on mode drops it once moved into `target_rgba8`, and the
+        // `color0_seed_consumed` flag keeps the one admission that reads the
+        // field's meaning (the guest-backing assignment below) answering what
+        // the record *arrived with*.
+        let mut color0_seed = req
+            .colors
+            .first_mut()
+            .and_then(|c| c.target_seed_rgba.take());
+        let mut color0_seed_consumed = false;
         if let Some(c0) = req.colors.first() {
             // Out of contract is DontCare here, same as on the Metal arm, and
             // it says so through the same helper — this arm used to take an
@@ -11374,12 +11412,34 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         seed_door = "gva_guest_seed";
                         crate::runtime::drain::note_store_route("gva_guest_seed_native");
                         target_guest_seed = Some(seed);
-                    } else if let Some(seed) = c0.target_seed_rgba.as_ref() {
+                    } else if color0_seed.is_some() {
                         seed_door = "color_seed";
-                        if seed.len() == (w as usize) * (h as usize) * 4 {
+                        if color0_seed
+                            .as_ref()
+                            .is_some_and(|seed| seed.len() == (w as usize) * (h as usize) * 4)
+                        {
                             // seed_color_load selected this by RT provenance.
                             // Black/transparent bytes are valid attachment data.
-                            target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
+                            //
+                            // TEMP (lab, PASS_INVARIANTS): on mode moves the
+                            // frame; off mode keeps the clone, so the two
+                            // differ only in the bytes' journey, never in the
+                            // answer either branch produces.
+                            if pass_inv_mode() {
+                                target_rgba8 = color0_seed.take().map(std::sync::Arc::new);
+                                color0_seed_consumed = target_rgba8.is_some();
+                                if let Some(bytes) = target_rgba8.as_ref() {
+                                    crate::runtime::drain::note_store_route("pass_inv_seed_moved");
+                                    crate::runtime::drain::note_store_route_n(
+                                        "pass_inv_seed_moved_bytes",
+                                        bytes.len() as u64,
+                                    );
+                                }
+                            } else {
+                                target_rgba8 = color0_seed
+                                    .as_ref()
+                                    .map(|seed| std::sync::Arc::new(seed.clone()));
+                            }
                         }
                     } else if c0.mapping_id != 0 {
                         seed_door = "mapping";
@@ -11388,7 +11448,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // own the packet's final guest writeback. The Store-only
                         // identity below is deliberately narrower and would
                         // misclassify that record as a pooled RGBA target here.
-                        let target_format = mapper_ref_texture_render_identity(state, req)
+                        let target_format = pass_inv::render_identity(state, req)
                             .as_ref()
                             .map(|identity| identity.resident_format())
                             .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
@@ -11475,6 +11535,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         );
                     }
                 }
+            }
+        }
+        // TEMP (lab, PASS_INVARIANTS): hand the lifted seed back when the
+        // provision did not consume it — off mode always, on mode when the
+        // length gate declined it — so the field the guest-backing admission
+        // below reads carries the record's own arrival state rather than the
+        // provision's residue.
+        if !color0_seed_consumed {
+            if let Some(c0) = req.colors.first_mut() {
+                c0.target_seed_rgba = color0_seed.take();
             }
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
@@ -11738,7 +11808,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // caller derive a second one. See `M2vDrawSpan::ResidentSurfaceStore`.
         let mut gva_resident_store: Option<crate::backend::vulkan::engine::TargetIdentity> = None;
         if req.chain_from_resident || (store_is_store && !writeback_guest) {
-            if let Some(identity) = render_chain_identity(state, req) {
+            if let Some(identity) = pass_inv::chain_identity(state, req) {
                 resources.target_identity = Some(identity);
                 if store_is_store && !writeback_guest {
                     resources.skip_readback = true;
@@ -11856,7 +11926,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // resolved from. A GVA or render-chain namespace may legitimately own
         // this draw's primary attachment instead, in which case handing it the
         // surface allocation would bind two unrelated resources together.
-        if resources.target_identity == mapper_ref_texture_render_identity(state, req) {
+        if resources.target_identity == pass_inv::render_identity(state, req) {
             resources.guest_target_memory = mapper_ref_texture_guest_backing;
             resources.load_guest_target_backing = resources.guest_target_memory.is_some()
                 && req.colors.first().is_some_and(|color| {
@@ -11866,7 +11936,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // attachment starts at a colour nothing asked for.
                     reims_vgpu_protocol::pass_action::LoadAction::from_declared(color.load_action)
                         .preserves_prior_contents()
+                        // TEMP (lab, PASS_INVARIANTS): the field read is
+                        // compensated for the moved seed — the admission asks
+                        // what the record *arrived with*, not what remains
+                        // after the provision consumed it.
                         && color.target_seed_rgba.is_none()
+                        && !color0_seed_consumed
                 });
         }
         // Mapper-ref-texture Load used to have a GPU rail here — ~170 lines of front-frame
@@ -13118,7 +13193,9 @@ pub(super) fn mapper_ref_texture_load_currency_query(
     if !mapper_ref_texture_load_is_a_seed_candidate(c0) {
         return None;
     }
-    let identity = mapper_ref_texture_render_identity(state, req)?;
+    // TEMP (lab, PASS_INVARIANTS): the identity half is a pass invariant; the
+    // epoch beside it stays per-record, being the very thing currency asks.
+    let identity = pass_inv::render_identity(state, req)?;
     let mapping_epoch = state
         .mappings
         .get(&c0.mapping_id)
@@ -14080,7 +14157,13 @@ fn stamp_mapper_ref_texture_resident<M: HostMemory + HostOps>(
     writeback_guest: bool,
     epoch: u32,
 ) {
-    if let Some(identity) = mapper_ref_texture_store_identity(state, req, writeback_guest) {
+    // TEMP (lab, PASS_INVARIANTS): the stamp names the same slot the pass's
+    // records rendered into — the hoisted identity under the writeback gate,
+    // falling back to the serial call when the guard trips, which keeps the
+    // stamped generation agreeing with the registry exactly as the fresh call
+    // did (the draw-registered-vs-store-asked divergence the span carries its
+    // identity to avoid, `M2vDrawSpan::ResidentSurfaceStore`'s doc).
+    if let Some(identity) = pass_inv::store_identity(state, req, writeback_guest) {
         crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
         // Both callers reach here only on a route that has already put these
         // pixels outside the image — the synchronous one through `write_bgra8`

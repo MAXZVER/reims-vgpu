@@ -674,6 +674,16 @@ pub struct DrawEncodeRequest {
     /// 0 means "no allocation named": color0 is not a GVA target, or the span
     /// does not fully walk. Vulkan rail only; the Metal arm never reads it.
     pub gva_alloc_gen: u64,
+    /// TEMP (lab, `REIMS_VGPU_LAB_PASS_INVARIANTS`): the pass invariants draw
+    /// 0's Vulkan commit recorded once (design 2026-10-03 §6 C3). An out-field
+    /// on draw 0 — the exec chain loop harvests it into the attachment
+    /// template, and every record after the first clones it from there. The
+    /// reuse sites guard on the request key and the mapping generation and
+    /// fall back to the serial recompute; `None` (off mode, the Metal arm,
+    /// any request that never reached draw 0's seed phase) leaves every
+    /// identity call exactly where it was.
+    #[cfg(feature = "backend-vulkan")]
+    pub pass_invariants: Option<crate::runtime::draw::vulkan::PassInvariants>,
 }
 
 /// Fire `reason` once per `(pipeline_ref, slug)` so a recurring degradation

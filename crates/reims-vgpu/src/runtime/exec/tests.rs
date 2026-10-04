@@ -8947,3 +8947,142 @@ fn pass_prep_on_and_off_report_the_same_counters() {
         on.2
     );
 }
+
+/// TEMP (lab, PASS_INVARIANTS): `finish_stream` with the pass invariants on
+/// and off reports the same `ExecResult` counters, and the pass census stays
+/// untouched. The fixture is a two-draw pass over a resolvable backing render
+/// target with no pipeline for its draws, so the commit of draw 0 refuses
+/// before the seed phase — the one point the record lives after — which is
+/// exactly the shape that must stay byte-for-byte serial: nothing recorded,
+/// nothing harvested, nothing reused. (The reuse side of the parity is the
+/// `pass_inv` module's own tests: every guarded helper answers what the
+/// serial call answers, on fixtures where the record exists.)
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn pass_invariants_on_and_off_report_the_same_counters() {
+    use crate::runtime::draw::vulkan::pass_inv_test_mode;
+
+    fn fixture() -> (DeviceState, FakeHost, StreamAccum) {
+        use crate::protocol::endian::{st32, st64};
+        use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::runtime::objects::{self, OBJECT_TYPE_BACKING};
+        use crate::runtime::render_pass::ColorAttachment;
+
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        state.page_shift = PAGE_SHIFT_X86;
+        // Surface pages at pfn 0x40 (one 4K page covers 16x16).
+        let page = 0x40u64 << PAGE_SHIFT_X86;
+        host.map_range(page, 0x2000, 0);
+        // Task directory so object-list GVA reads work.
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data_gpa = 4u64 << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        host.map_range(data_gpa, 0x200, 0);
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        let _ = host.write_gpa(dir_gpa, &d);
+        st32(&mut d[..4], 4);
+        let _ = host.write_gpa(root_gpa, &d[..4]);
+        st32(&mut d[..4], 0x40);
+        let _ = host.write_gpa(root_gpa + 0x40 * 4, &d[..4]);
+        state.define_task(1, 0x1000, 2);
+        assert!(state.set_object_list(1, 0, 8));
+        // The render target: a resolvable backing at surface 5 (the shape of
+        // `nometal_draw_falls_back_to_backing_clear`), so `mrt_draw_request`
+        // answers and the loop reaches the encode.
+        let mut entry = [0u8; 12];
+        st32(&mut entry, (OBJECT_TYPE_BACKING as u32) | (0x30u32 << 8));
+        entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + 5 * 12, &entry);
+        let mut desc = vec![0u8; 0x30];
+        st64(&mut desc[0..], 0x1000);
+        st32(&mut desc[8..], 0x40);
+        st32(&mut desc[0xc..], 0x4247_5241);
+        desc[0x10] = 1;
+        st32(&mut desc[0x18..], 16);
+        st32(&mut desc[0x1c..], 16);
+        st32(&mut desc[0x20..], 64);
+        let _ = host.write_gpa(data_gpa + 0x80, &desc);
+        assert!(objects::resolve_backing(&mut state, &host, 5));
+
+        let att = ColorAttachment {
+            texture_ref: 5,
+            resolve_texture_ref: 0,
+            level: 0,
+            slice: 0,
+            depth_plane: 0,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: MTL_STORE_ACTION_STORE,
+            clear_color: [0.0, 1.0, 0.0, 1.0],
+        };
+        let mut acc = StreamAccum::default();
+        acc.saw_draw = true;
+        acc.color_slots.push((0, att));
+        // Two draws against a pipeline the object list does not carry, so
+        // draw 0's commit refuses before the seed phase and the pass ends
+        // where the serial path ends it.
+        for _ in 0..2u32 {
+            acc.draws.push(PendingDraw {
+                pipeline_ref: 7,
+                draw: DrawArgs {
+                    vertex_count: 3,
+                    instance_count: 1,
+                    primitive_type: 3,
+                    first_vertex: 0,
+                    base_instance: 0,
+                },
+                ..Default::default()
+            });
+        }
+        (state, host, acc)
+    }
+
+    fn counters(out: &ExecResult) -> (u32, u32, u32) {
+        (
+            out.render_attachment_resolves,
+            out.metal_draws_ok,
+            out.metal_draws_fail,
+        )
+    }
+
+    fn pass_inv_census() -> [u64; 4] {
+        use crate::runtime::drain::census::store_route_count;
+        [
+            store_route_count("pass_inv_computed_once"),
+            store_route_count("pass_inv_reused_n"),
+            store_route_count("pass_inv_recomputed_fallback"),
+            store_route_count("pass_inv_seed_moved"),
+        ]
+    }
+
+    let before = pass_inv_census();
+    let off = {
+        let _mode = pass_inv_test_mode(false);
+        let (mut state, mut host, acc) = fixture();
+        let mut out = ExecResult::default();
+        finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+        counters(&out)
+    };
+    let on = {
+        let _mode = pass_inv_test_mode(true);
+        let (mut state, mut host, acc) = fixture();
+        let mut out = ExecResult::default();
+        finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+        counters(&out)
+    };
+    assert_eq!(off, on, "PASS_INVARIANTS on and off report the same counters");
+    // The loop really reached the encode: one attachment resolve, one refused
+    // draw (the second is dropped by the break the first one takes).
+    assert_eq!(on.0, 1, "the fixture resolved its render target");
+    assert_eq!(on.2, 1, "the fixture's draw 0 refused at the pipeline");
+    // Nothing recorded, so nothing moved or fell back, in either arm.
+    assert_eq!(
+        pass_inv_census(),
+        before,
+        "a pass that never reaches its seed phase must not touch the pass census"
+    );
+}

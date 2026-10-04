@@ -5700,7 +5700,7 @@ fn finish_stream<M: HostMemory + HostOps>(
         // change per record. Keep a seedless template so records 2+ do not
         // re-walk the same guest object list/page tables (or clone a full-frame
         // GVA LOAD seed). The resident target itself preserves record order.
-        let attachment_template = first_req.as_ref().map(render_pass_attachment_template);
+        let mut attachment_template = first_req.as_ref().map(render_pass_attachment_template);
         // TEMP (lab, PASS_PREP step 3): latch the pass's colour-0 for the
         // Store page walk, now that the template exists (`ahead(0)` ran
         // before it, so the walk rides the next chunk's scope). A pass small
@@ -5808,6 +5808,19 @@ fn finish_stream<M: HostMemory + HostOps>(
                     do_writeback,
                     force_full_store,
                 );
+                // TEMP (lab, PASS_INVARIANTS): draw 0's commit recorded the
+                // pass invariants; move them into the attachment template the
+                // records after it clone from (design 2026-10-03 §6 C3). A
+                // no-op unless the Vulkan commit recorded one — off mode never
+                // does — and inert for every record but the first.
+                #[cfg(feature = "backend-vulkan")]
+                if di == 0 {
+                    if let (Some(template), Some(inv)) =
+                        (attachment_template.as_mut(), req.pass_invariants.take())
+                    {
+                        template.pass_invariants = Some(inv);
+                    }
+                }
                 fin.enter(crate::runtime::drain::FinishPhase::Result);
                 // TEMP (lab, S5a): the record before this one was handed to the
                 // recorder thread and counted drawn; its engine half failed and
