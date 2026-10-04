@@ -8688,3 +8688,60 @@ fn a_linear_texture_is_zero_only_when_every_texel_is() {
         Some(false)
     );
 }
+
+/// TEMP (lab, CLEAR_ROW): a row repeated by `FrameRows::Repeat` lands the same
+/// guest bytes as a whole frame of that row through the RGBA8 arm — padding
+/// untouched in both — which is what lets a solid clear skip the frame-sized
+/// image and its per-row conversion.
+#[test]
+fn a_repeated_row_lands_what_a_frame_of_that_row_lands() {
+    use crate::protocol::pixel_format::{Rgba8ToRow, MTL_FORMAT_BGRA8_UNORM};
+    use crate::runtime::gva_mem::{define_task_pages_arm64e, read_task_gva_by_id};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+    let (w, h, bpr) = (3u32, 4u32, 16u32);
+    let (a, b) = (8u64 << PAGE_SHIFT_ARM64E, 9u64 << PAGE_SHIFT_ARM64E);
+    for gva in [a, b] {
+        write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &vec![0xcc; (bpr * h) as usize]);
+    }
+    let rgba_row: Vec<u8> = [10u8, 20, 30, 40].repeat(w as usize);
+    let frame = rgba_row.repeat(h as usize);
+    write_gva_frame_within(
+        &mut state,
+        &mut host,
+        1,
+        a,
+        w,
+        h,
+        bpr,
+        MTL_FORMAT_BGRA8_UNORM,
+        FrameRows::Rgba8(&frame),
+        None,
+    )
+    .expect("frame write");
+    let mut native = vec![0u8; (w * 4) as usize];
+    assert!(Rgba8ToRow::for_format(MTL_FORMAT_BGRA8_UNORM)
+        .expect("BGRA8 converts")
+        .convert(&rgba_row, w, &mut native));
+    write_gva_frame_within(
+        &mut state,
+        &mut host,
+        1,
+        b,
+        w,
+        h,
+        bpr,
+        MTL_FORMAT_BGRA8_UNORM,
+        FrameRows::Repeat(&native),
+        None,
+    )
+    .expect("repeated-row write");
+    let (mut ga, mut gb) = (vec![0u8; (bpr * h) as usize], vec![0u8; (bpr * h) as usize]);
+    read_task_gva_by_id(&host, &state.tasks, 1, a, &mut ga, PAGE_SHIFT_ARM64E).expect("read a");
+    read_task_gva_by_id(&host, &state.tasks, 1, b, &mut gb, PAGE_SHIFT_ARM64E).expect("read b");
+    assert_eq!(ga, gb, "the repeated row lands what the frame lands");
+    assert_eq!(&gb[12..16], &[0xcc; 4], "row padding is not the texture's to clear");
+    assert_eq!(&gb[0..4], &native[0..4]);
+}

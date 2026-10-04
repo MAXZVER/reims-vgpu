@@ -3080,21 +3080,37 @@ pub(crate) enum FrameRows<'a> {
     /// writer below still has to name it.
     #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
     Native(&'a [u8]),
+    /// TEMP (lab, CLEAR_ROW): one row of the destination's texel, written to
+    /// every row — a solid clear, which needs neither a frame of identical rows
+    /// nor a conversion per row (hq035: apply_clear was 11.7 % of the drain in
+    /// full-screen transitions, two thirds of it converting the same colour).
+    Repeat(&'a [u8]),
 }
 
 impl<'a> FrameRows<'a> {
     fn bytes(&self) -> &'a [u8] {
         match *self {
-            Self::Rgba8(b) | Self::Native(b) => b,
+            Self::Rgba8(b) | Self::Native(b) | Self::Repeat(b) => b,
         }
     }
 
     /// Bytes one source row occupies, which is the destination's tight row for
-    /// the native arm and always four bytes a texel for the RGBA8 one.
+    /// the native and repeated arms and always four bytes a texel for the RGBA8
+    /// one.
     fn source_row_bytes(&self, width: u32, tight: u32) -> usize {
         match self {
             Self::Rgba8(_) => (width as usize).saturating_mul(RGBA8_BPP as usize),
-            Self::Native(_) => tight as usize,
+            Self::Native(_) | Self::Repeat(_) => tight as usize,
+        }
+    }
+
+    /// Bytes the frame must hold: every row, or the one repeated row.
+    fn source_len(&self, width: u32, tight: u32, height: u32) -> usize {
+        match self {
+            Self::Repeat(_) => tight as usize,
+            _ => self
+                .source_row_bytes(width, tight)
+                .saturating_mul(height as usize),
         }
     }
 }
@@ -3171,7 +3187,7 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
     }
     let src = frame.bytes();
     let src_stride = frame.source_row_bytes(width, tight);
-    let need = src_stride.saturating_mul(height as usize);
+    let need = frame.source_len(width, tight, height);
     if src.len() < need {
         return Err(MemError::BadArgs);
     }
@@ -3182,7 +3198,7 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
     // reads.
     let mut row = match frame {
         FrameRows::Rgba8(_) => vec![0u8; tight as usize],
-        FrameRows::Native(_) => Vec::new(),
+        FrameRows::Native(_) | FrameRows::Repeat(_) => Vec::new(),
     };
     // One parse for both arms below — the mapped-span walk and the fragmented
     // per-row one convert the same frame at the same format. A `Native` frame
@@ -3212,6 +3228,7 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
                     &row
                 }
                 FrameRows::Native(native) => &native[at..at + src_stride],
+                FrameRows::Repeat(one) => &one[..src_stride],
             };
             let off = y.saturating_mul(bpr as usize);
             if off + out_row.len() > avail {
@@ -3253,6 +3270,7 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
                 &row
             }
             FrameRows::Native(native) => &native[at..at + src_stride],
+            FrameRows::Repeat(one) => &one[..src_stride],
         };
         let row_off = (y as u64).saturating_mul(bpr as u64);
         for (from, to) in

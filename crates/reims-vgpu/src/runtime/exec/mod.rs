@@ -6670,7 +6670,13 @@ fn apply_clear<M: HostMemory + HostOps>(
     // Format and clear representation are one contract decision. Continuous
     // colour keeps the semantic RGBA8 carrier the existing converters consume;
     // integer targets carry their own texels, where `1` remains the integer 1.
-    let Some(clear) = lab_cached_clear_image(c0.format, c0.width, c0.height, &att.clear_color)
+    // TEMP (lab, CLEAR_ROW): a GVA target takes one destination row, converted
+    // once and written to every row, instead of a frame-sized solid image
+    // converted row by row (hq035: 11.7 % of the drain in full-screen
+    // transitions). `REIMS_VGPU_LAB_CLEAR_ROW=off` restores the frame.
+    let one_row = c0.target_gva != 0 && clear_row_mode();
+    let image_height = if one_row { 1 } else { c0.height };
+    let Some(clear) = lab_cached_clear_image(c0.format, c0.width, image_height, &att.clear_color)
     else {
         note_clear_dropped(
             "target_clear_image_unrepresentable",
@@ -6680,9 +6686,29 @@ fn apply_clear<M: HostMemory + HostOps>(
         return false;
     };
     if c0.target_gva != 0 {
-        let frame = match clear.encoding() {
-            ClearImageEncoding::Rgba8 => draw::FrameRows::Rgba8(clear.pixels()),
-            ClearImageEncoding::Native => draw::FrameRows::Native(clear.pixels()),
+        let mut converted = Vec::new();
+        let frame = match (one_row, clear.encoding()) {
+            (false, ClearImageEncoding::Rgba8) => draw::FrameRows::Rgba8(clear.pixels()),
+            (false, ClearImageEncoding::Native) => draw::FrameRows::Native(clear.pixels()),
+            (true, ClearImageEncoding::Native) => draw::FrameRows::Repeat(clear.pixels()),
+            (true, ClearImageEncoding::Rgba8) => {
+                let converts =
+                    pixel_format::tight_row_bytes(c0.width, c0.format).is_some_and(|tight| {
+                        converted.resize(tight as usize, 0);
+                        pixel_format::Rgba8ToRow::for_format(c0.format).is_some_and(|rail| {
+                            rail.convert(clear.pixels(), c0.width, &mut converted)
+                        })
+                    });
+                if !converts {
+                    note_clear_dropped(
+                        "target_clear_row_unconvertible",
+                        att.texture_ref,
+                        "the clear colour has no row in the target's texel",
+                    );
+                    return false;
+                }
+                draw::FrameRows::Repeat(&converted)
+            }
         };
         // The clear replaces whatever a lazy Store still owes these pages; left
         // standing, that debt keeps its resident authoritative and the next
@@ -6755,6 +6781,12 @@ fn apply_clear<M: HostMemory + HostOps>(
 /// `fin_prelude_clear` 535 streams, 1.0 s), and the same new-size surfaces are
 /// cleared again and again. Two entries: the image is the pass result and
 /// immutable, so sharing it changes nothing a writer sees.
+/// TEMP (lab, CLEAR_ROW): see `apply_clear`. On unless `REIMS_VGPU_LAB_CLEAR_ROW=off`.
+fn clear_row_mode() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CLEAR_ROW").map_or(true, |v| v != "off"))
+}
+
 fn lab_cached_clear_image(
     format: u16,
     width: u32,
