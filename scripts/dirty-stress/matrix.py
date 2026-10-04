@@ -70,6 +70,8 @@ cfgs = [
     ('pstamp + exact3, named', dict(NAMED, **EXACT3, **{G + 'DIRTY_PSTAMP': 'on'}), '0'),
     ('DEFAULTS + pstamp: real ring protocol + hole=tail', dict(NAMED, **RING, **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_PSTAMP': 'on'}), '0'),
     ('DEFAULTS + pstamp + ticket_batch 2 + wp nopause + wp_hole: ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_HOLE': 'on', G + 'DIRTY_TICKET_BATCH': '2', G + 'DIRTY_PSTAMP': 'on'}), '0'),
+    ('fg split min 4 (named model)', dict(NAMED, **{G + 'DIRTY_FG_SPLIT_MIN': '4'}), '0'),
+    ('DEFAULTS + fg split min 4: real ring protocol + hole=tail', dict(NAMED, **RING, **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_FG_SPLIT_MIN': '4'}), '0'),
     ('packet scope, ring + hole=tail', dict(NAMED, **RING, STRESS_PACKET_SCOPE='1', **{G + 'DIRTY_HOLE': 'tail'}), '0'),
     ('packet scope + chan prefetch, ring + hole=tail', dict(NAMED, **RING, STRESS_PACKET_SCOPE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_CHAN_PREFETCH': 'on'}), '0'),
     ('CONTROL: packet scope without hole=tail, ring', dict(NAMED, **RING, STRESS_PACKET_SCOPE='1'), '>0'),
@@ -78,6 +80,11 @@ cfgs = [
     ('wp nopause + wp_hole, every set (min 1), 1 clean sync', dict(WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_HOLE': 'on', G + 'DIRTY_WP_MIN': '1', G + 'DIRTY_WP_STREAK': '1'}), '0'),
     ('DEFAULTS + wp nopause + wp_hole: ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_HOLE': 'on'}), '0'),
     ('DEFAULTS + wp nopause + wp_hole, settle_skip=off: ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_HOLE': 'on', G + 'DIRTY_SETTLE_SKIP': 'off'}), '0'),
+    ('hash: every set hashed', {G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on'}, '0'),
+    ('hash: cost model, named + exact3', dict(NAMED, **EXACT3, **{G + 'DIRTY_HASH': 'on'}), '0'),
+    ('hash: every set + wp nopause, ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on'}), '0'),
+    ('hash: every set, small max (mixed), ring + hole=tail', dict(NAMED, **RING, **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on', G + 'DIRTY_HASH_MAX': '64'}), '0'),
+    ('CONTROL hash: drain reads lagged', {'STRESS_DRAIN_LAGGED': '1', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on'}, '>0'),
 ]
 ORIGINAL = {G + 'DIRTY_STEAL': 'off', G + 'GEN_LOCKFREE': 'off', G + 'EPOCH_NAMED': 'off', G + 'DIRTY_HOLE': 'off'}
 KEYS = ('steals', 'steal_same', 'steal_late', 'memo_hit', 'memo_fresh', 'memo_diff', 'memo_bad', 'unnamed_skipped',

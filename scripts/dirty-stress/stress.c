@@ -44,6 +44,7 @@ void (*memory_dirty_log_flush_hook)(void);
 static MemoryRegion fake_mr;
 static uint8_t hv_dirty[NPAGES];
 static uint64_t wseq[NPAGES];          /* last write's sequence number per page */
+static uint8_t *fake_ram;              /* guest RAM bytes: each write leaves its sequence in its page */
 static uint64_t gseq;
 static QemuMutex glock;                /* the guest's big lock: a write and a snapshot are atomic */
 static volatile int stop_flag;
@@ -178,6 +179,7 @@ static void *mainloop_thread(void *arg)
 }
 
 ram_addr_t memory_region_get_ram_addr(const MemoryRegion *mr) { (void)mr; return 0; }
+void *memory_region_get_ram_ptr(const MemoryRegion *mr) { (void)mr; return fake_ram; }
 void memory_region_ref(MemoryRegion *mr) { (void)mr; }
 void memory_region_unref(MemoryRegion *mr) { (void)mr; }
 void memory_region_set_log(MemoryRegion *mr, bool log, unsigned client) { (void)mr; (void)log; (void)client; }
@@ -342,6 +344,8 @@ static void do_write(uint32_t *st, int hot)
         qatomic_inc(&n_wp_faults);
     }
     wseq[pg] = ++gseq;
+    /* The content moves with every write (lab DIRTY_HASH reads bytes, not bits). */
+    qatomic_set((uint64_t *)(fake_ram + pg * PAGE + (gseq % (PAGE / 8)) * 8), gseq);
     qatomic_set(&hv_dirty[pg], 1);
 }
 
@@ -713,6 +717,7 @@ int main(int argc, char **argv)
     const char *e;
 
     rcu_register_thread();
+    fake_ram = g_malloc0(NPAGES * PAGE);
     qemu_mutex_init(&glock);
     qemu_mutex_init(&set_lock);
     qemu_mutex_init(&pk_lock);
