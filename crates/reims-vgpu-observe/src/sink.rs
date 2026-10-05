@@ -493,9 +493,17 @@ mod writer {
             let now = super::elapsed_ms();
             if super::writer_beat_due(last_beat_ms, now) {
                 if let Some(w) = fail.as_mut() {
+                    // `unix_ms` pairs this line's `t=` with the host's wall clock, so
+                    // a guest-side trace (dtrace's walltimestamp) can be laid over the
+                    // device's lines to the millisecond; the last `t=` in the file
+                    // was up to a beat and a half stale for that.
+                    let unix_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis());
                     let _ = writeln!(
                         w,
-                        "OFF log_writer wrote={wrote_since_beat} queued={} beat_ms={} t={now}",
+                        "OFF log_writer wrote={wrote_since_beat} queued={} beat_ms={} \
+                         unix_ms={unix_ms} t={now}",
                         QUEUED.load(Ordering::Relaxed),
                         now.saturating_sub(last_beat_ms),
                     );
