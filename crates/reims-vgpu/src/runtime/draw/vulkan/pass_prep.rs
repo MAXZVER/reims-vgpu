@@ -293,6 +293,11 @@ enum PrepItem {
     SeedStage {
         cell: std::sync::Arc<crate::backend::vulkan::engine::pass_stage::SeedStageCell>,
     },
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): a proven repeat plan (one a
+    /// commit served a bind from) whose gather window the eager attach
+    /// skipped as speculative — stage the window here, on this chunk's
+    /// worker, and hand the staged twin to the merge.
+    Restage { key: (u32, u32), plan: StreamPlan },
     /// TEMP (lab, PASS_PREP step 3): an indexed draw's index bind, planned
     /// under its exact `(ref, offset, need)` key.
     Index {
@@ -310,6 +315,10 @@ enum PrepOutcome {
     Buffer(Result<buffer_plan::BufferContentPlan, buffer_plan::BufferBail>),
     /// The Store walk resolves pages or not; `None` is no plan, not a bail.
     Store(Option<buffer_plan::StorePagesPlan>),
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): a restage job's staged twin of
+    /// its item's plan — `None` when no window was carved (the entry stays as
+    /// it was and the serial gather keeps serving its binds).
+    Restage(Option<((u32, u32), StreamPlan)>),
 }
 
 /// Draw-ahead preparation of one render pass. Lives for the draw loop; the
@@ -689,6 +698,19 @@ impl<'a> PassPrep<'a> {
             }
         }
         crate::runtime::drain::note_store_route_n("pass_stage_seed_armed", seed_jobs);
+        // TEMP (lab, PASS_STAGE, STAGED_PROVEN): the repeats a commit proved
+        // since the last chunk — their windows are pool work now, the copy the
+        // eager attach no longer pays for an unproven plan. Taken only while
+        // the staging rail runs; with the rule off no plan is ever left
+        // proven-but-unstaged, so the off arm collects nothing.
+        if crate::runtime::par::staging::staged_proven()
+            && crate::runtime::par::staging::enabled()
+            && pass_prep_mode() == PassPrepMode::On
+        {
+            for (key, plan) in prefetch::restageable_plans() {
+                items.push(PrepItem::Restage { key, plan });
+            }
+        }
         self.offered = end;
         if items.len() < 2 {
             // As with the stream prefetch: one ref gains nothing from the
@@ -791,6 +813,20 @@ impl<'a> PassPrep<'a> {
                         pass_stage::stage_seed_job(stager, cell);
                     }
                     PrepOutcome::Store(None)
+                }
+                PrepItem::Restage { key, plan } => {
+                    // TEMP (lab, PASS_STAGE, STAGED_PROVEN): the proven
+                    // repeat's window, copied into this worker's arena. The
+                    // twin (not the item) is staged: the scope hands items by
+                    // shared reference, and the merge below is what replaces
+                    // the frame's entry — sound because a scope's fork-join
+                    // freezes the frame, so the entry the twin replaces is
+                    // exactly the plan this item was cloned from.
+                    let mut twin = plan.clone();
+                    if let Some(stager) = stager.as_ref() {
+                        sample_plan::attach_staged(&mut twin, stager);
+                    }
+                    PrepOutcome::Restage(twin.has_staged_window().then_some((*key, twin)))
                 }
             }
         });
@@ -937,6 +973,15 @@ impl<'a> PassPrep<'a> {
                 }
                 PrepItem::SeedStage { .. } => {
                     // The job's own census routes said what it did.
+                }
+                PrepItem::Restage { .. } => {
+                    // TEMP (lab, PASS_STAGE, STAGED_PROVEN): the staged twin
+                    // replaces the frame's entry (an identical plan plus its
+                    // window); a refusal leaves the entry and its binds on the
+                    // serial gather, retried by the next chunk that offers it.
+                    if let Ok(PrepOutcome::Restage(Some(staged))) = result {
+                        plans.push(staged);
+                    }
                 }
             }
         }
@@ -2028,6 +2073,492 @@ mod tests {
             "the repeated view plan serves the second bind"
         );
         assert_eq!(delta("par_prefetch_hit_ref_view", before_hit), 2);
+        drop(prep);
+    }
+
+    /// Fill the view fixture's 32 mapping pages with a per-page pattern.
+    /// The pages start at `map_range`'s flat 0x33 fill, which would make a
+    /// wrong-window copy hard to tell from a right one; a per-page pattern
+    /// names the page a byte came from, so the staged/serial compares below
+    /// are deterministic *and* diagnostic.
+    fn fill_view_pages(host: &mut FakeHost) {
+        let page = 1u64 << PAGE_SHIFT_X86;
+        for i in 0..32u64 {
+            let gpa = 0x5000_0000 + 2 * i * page;
+            let fill = vec![((i * 7 + 1) % 251) as u8; page as usize];
+            assert!(host.write_gpa(gpa, &fill).is_ok());
+        }
+    }
+
+    /// The serial CPU gather over a guest-runs answer — the bytes
+    /// `write_staging_from_runs` (and a staged window) must reproduce.
+    fn gathered_bytes(src: &crate::backend::vulkan::engine::GuestRunSource) -> Vec<u8> {
+        let mut out = vec![0u8; src.total_len as usize];
+        let mut off = 0usize;
+        let mut skip = src.source_offset;
+        for run in src.runs.iter() {
+            if off >= out.len() {
+                break;
+            }
+            if skip >= run.len() {
+                skip -= run.len();
+                continue;
+            }
+            let within = skip as usize;
+            skip = 0;
+            let available = (run.len() as usize).saturating_sub(within);
+            let n = available.min(out.len() - off);
+            // SAFETY: the run's host pointer is the fixture's stable host
+            // range, valid for the test's life.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (run.host_ptr() as *const u8).add(within),
+                    out.as_mut_ptr().add(off),
+                    n,
+                );
+            }
+            off += n;
+        }
+        out
+    }
+
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): the rule, end to end on the
+    /// ref-view rail. The FIRST bind of a key serves the plain guest-runs
+    /// request — no window was copied for a plan that may die unbound, and
+    /// the engine gathers serially exactly as it did before the rail existed.
+    /// The commit proves the plan; the next chunk's restage job copies the
+    /// window on the worker (a pool item beside the chunk's own planning);
+    /// and every later bind of the key serves the staged request, whose bytes
+    /// are the serial gather and whose guest-runs fields are the serial
+    /// answer's own. The frame's pop releases the one window.
+    #[test]
+    fn a_repeat_plan_stages_but_the_first_bind_stays_serial() {
+        let _stage = crate::runtime::par::staging::test_enable(true);
+        let _proven = crate::runtime::par::staging::test_staged_proven(true);
+        let _mode = test_mode(PassPrepMode::On);
+        // The run memo is process-global and keyed by GPAs alone; without a
+        // clear it would hand this test an earlier test's runs — host pointers
+        // into a fixture that has already been dropped.
+        run_memo_clear_for_test();
+        // The view's window is 256x128 BGRA8 = 128 KiB: chunk the arena to
+        // 256 KiB so the one window fits.
+        crate::backend::vulkan::engine::pass_stage::install_test_arenas(1, 256 * 1024, 2);
+        let (mut state, mut host, view_ref, _) = view_fixture();
+        fill_view_pages(&mut host);
+        let view_resource = objects::resolve_resource(&state, &host, 1, view_ref).expect("view");
+        // Arm the witness and fill the window cache, as a first serial bind
+        // does; from here the ref-view rung plans.
+        let _arm = resolve_sampled_source(
+            &mut state,
+            &mut host,
+            1,
+            view_ref,
+            Some(view_resource.clone()),
+            true,
+        )
+        .expect("arm the witness");
+        // The serial twin: same fixture, same arm, and its next answer is the
+        // ladder the staged window must reproduce.
+        let (mut serial_state, mut serial_host, _, _) = view_fixture();
+        fill_view_pages(&mut serial_host);
+        let serial_resource =
+            objects::resolve_resource(&serial_state, &serial_host, 1, view_ref).expect("view");
+        let _serial_arm = resolve_sampled_source(
+            &mut serial_state,
+            &mut serial_host,
+            1,
+            view_ref,
+            Some(serial_resource.clone()),
+            true,
+        )
+        .expect("arm the serial twin");
+        let serial = resolve_sampled_source(
+            &mut serial_state,
+            &mut serial_host,
+            1,
+            view_ref,
+            Some(serial_resource),
+            true,
+        )
+        .expect("the serial ladder serves");
+        let serial_src = match &serial.3 {
+            SampledSourceRequest::GuestRuns(src, ..) => src,
+            _ => panic!("the armed view serves guest runs on the serial ladder"),
+        };
+        let serial_bytes = gathered_bytes(serial_src);
+        // Two cache refs beside the view so the chunks that matter fork.
+        add_cache_ref(&mut state, &mut host, 7, 99, 0x2000, 0);
+        add_cache_ref(&mut state, &mut host, 8, 91, 0x2100, 5);
+        let bind_for = |texture_ref: u32, state: &DeviceState, host: &FakeHost| -> TextureBind {
+            TextureBind {
+                index: 0,
+                texture_ref,
+                resource: Some(
+                    objects::resolve_resource(state, host, 1, texture_ref).expect("bind resource"),
+                ),
+            }
+        };
+        // V = the view ref; C/C2 = the cache refs. Chunk 2 carries C2 beside
+        // the view's restage; chunk 4 carries nothing new.
+        let pattern = [0u32, 1, 0, 2, 0, 0];
+        let per_draw: Vec<Vec<TextureBind>> = pattern
+            .iter()
+            .map(|&which| {
+                let texture_ref = match which {
+                    0 => view_ref,
+                    1 => 7,
+                    _ => 8,
+                };
+                vec![bind_for(texture_ref, &state, &host)]
+            })
+            .collect();
+        let tables: Vec<DrawTables<'_>> = tables_of(&per_draw);
+        let before_skip = store_route_count("pass_stage_sampled_skipped_speculative");
+        let before_skip_b = store_route_count("pass_stage_sampled_skipped_bytes");
+        let before_staged = store_route_count("pass_stage_sampled_staged_proven");
+        let before_planned = store_route_count("pass_stage_sampled_planned");
+        let mut prep = PassPrep::open_with_chunk(&state, 1, tables, 2).expect("opens");
+        // Chunk 0 (draws 0..2): the view plans FRESH, so nothing is copied —
+        // the skip the rule exists to make, measured in windows and bytes.
+        prep.ahead(&state, &FakeHost::new(), 0);
+        assert!(delta("pass_stage_sampled_skipped_speculative", before_skip) >= 1);
+        assert!(
+            delta("pass_stage_sampled_skipped_bytes", before_skip_b) >= 128 * 1024,
+            "the view's 128 KiB window was not copied"
+        );
+        assert_eq!(
+            delta("pass_stage_sampled_staged_proven", before_staged),
+            0,
+            "no window yet: nothing is proven"
+        );
+        // Draw 0 binds the view: the plan serves, and the serve is the plain
+        // guest-runs request — the first bind stays serial at the engine.
+        let first = prefetch::prefetched_source(
+            &mut state,
+            &mut host,
+            1,
+            view_ref,
+            Some(&view_resource),
+            true,
+        );
+        match first {
+            prefetch::Prefetched::Serve((_, _, _, SampledSourceRequest::GuestRuns(src, ..))) => {
+                assert!(
+                    Arc::ptr_eq(&src.runs, &serial_src.runs) || src.runs[..] == serial_src.runs[..],
+                    "the first bind is the serial ladder's own guest-runs serve"
+                );
+                assert_eq!(src.total_len, serial_src.total_len);
+            }
+            other => panic!("unexpected serve variant"),
+        }
+        // Chunk 2 (draws 2..4): C2 is new beside the view's proven repeat —
+        // the restage job stages the repeat's window on the pool.
+        prep.ahead(&state, &FakeHost::new(), 2);
+        assert!(
+            delta("pass_stage_sampled_staged_proven", before_staged) >= 1,
+            "the repeat's window was staged on the chunk's worker"
+        );
+        assert!(delta("pass_stage_sampled_planned", before_planned) >= 1);
+        // Draw 2 binds the view again: the staged request, byte-equal to the
+        // serial gather and field-equal to the serial answer's own source.
+        let second = prefetch::prefetched_source(
+            &mut state,
+            &mut host,
+            1,
+            view_ref,
+            Some(&view_resource),
+            true,
+        );
+        match second {
+            prefetch::Prefetched::Serve((_, _, _, SampledSourceRequest::Staged(req))) => {
+                // SAFETY: the fact is alive for this borrow.
+                let staged = unsafe { req.staged.bytes() };
+                assert_eq!(
+                    staged,
+                    &serial_bytes[..],
+                    "the staged window is the serial CPU gather"
+                );
+                assert!(
+                    Arc::ptr_eq(&req.src.runs, &serial_src.runs)
+                        || req.src.runs[..] == serial_src.runs[..]
+                );
+                assert_eq!(
+                    (
+                        req.src.source_offset,
+                        req.src.total_len,
+                        req.src.row_length_texels
+                    ),
+                    (
+                        serial_src.source_offset,
+                        serial_src.total_len,
+                        serial_src.row_length_texels
+                    )
+                );
+            }
+            other => panic!("unexpected serve variant"),
+        }
+        // Chunk 4 (draws 4..6): nothing new and nothing to restage (the
+        // repeat carries its window now); the later binds keep serving it.
+        prep.ahead(&state, &FakeHost::new(), 4);
+        match prefetch::prefetched_source(
+            &mut state,
+            &mut host,
+            1,
+            view_ref,
+            Some(&view_resource),
+            true,
+        ) {
+            // The repeat's clone carries the window: the later binds of the
+            // key serve staged too (the value dies with this statement, so
+            // the window's one reference is the frame's own below).
+            prefetch::Prefetched::Serve((_, _, _, SampledSourceRequest::Staged(_))) => {}
+            _ => panic!("the repeat carries its window to the later binds"),
+        }
+        // The frame holds the one window; its pop is what releases it.
+        let arenas = crate::backend::vulkan::engine::pass_stage::arenas().expect("installed");
+        assert!(arenas[0].ring.in_flight() >= 1);
+        drop(prep);
+        assert_eq!(
+            arenas[0].ring.in_flight(),
+            0,
+            "the frame's pop releases the staged window"
+        );
+        drop(
+            crate::backend::vulkan::engine::pass_stage::take_test_arenas()
+                .expect("the test arenas are still installed"),
+        );
+    }
+
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): the A/B arm. With the rule off
+    /// the eager attach returns: the FIRST bind's plan is already staged at
+    /// its chunk, the first bind serves the staged window, and no
+    /// speculative-skip census fires — the behaviour the queues compare
+    /// against.
+    #[test]
+    fn staged_proven_off_restores_the_eager_first_bind() {
+        let _stage = crate::runtime::par::staging::test_enable(true);
+        let _proven = crate::runtime::par::staging::test_staged_proven(false);
+        let _mode = test_mode(PassPrepMode::On);
+        // The run memo is process-global and keyed by GPAs alone; without a
+        // clear it would hand this test an earlier test's runs — host pointers
+        // into a fixture that has already been dropped.
+        run_memo_clear_for_test();
+        crate::backend::vulkan::engine::pass_stage::install_test_arenas(1, 256 * 1024, 2);
+        let (mut state, mut host, view_ref, _) = view_fixture();
+        fill_view_pages(&mut host);
+        let view_resource = objects::resolve_resource(&state, &host, 1, view_ref).expect("view");
+        let _arm = resolve_sampled_source(
+            &mut state,
+            &mut host,
+            1,
+            view_ref,
+            Some(view_resource.clone()),
+            true,
+        )
+        .expect("arm the witness");
+        let (mut serial_state, mut serial_host, _, _) = view_fixture();
+        fill_view_pages(&mut serial_host);
+        let serial_resource =
+            objects::resolve_resource(&serial_state, &serial_host, 1, view_ref).expect("view");
+        let _serial_arm = resolve_sampled_source(
+            &mut serial_state,
+            &mut serial_host,
+            1,
+            view_ref,
+            Some(serial_resource.clone()),
+            true,
+        )
+        .expect("arm the serial twin");
+        let serial = resolve_sampled_source(
+            &mut serial_state,
+            &mut serial_host,
+            1,
+            view_ref,
+            Some(serial_resource),
+            true,
+        )
+        .expect("the serial ladder serves");
+        let serial_src = match &serial.3 {
+            SampledSourceRequest::GuestRuns(src, ..) => src,
+            _ => panic!("the armed view serves guest runs on the serial ladder"),
+        };
+        let serial_bytes = gathered_bytes(serial_src);
+        add_cache_ref(&mut state, &mut host, 7, 99, 0x2000, 0);
+        let bind_for = |texture_ref: u32, state: &DeviceState, host: &FakeHost| -> TextureBind {
+            TextureBind {
+                index: 0,
+                texture_ref,
+                resource: Some(
+                    objects::resolve_resource(state, host, 1, texture_ref).expect("bind resource"),
+                ),
+            }
+        };
+        let view_bind = bind_for(view_ref, &state, &host);
+        let cache_bind = bind_for(7, &state, &host);
+        let per_draw = vec![vec![view_bind.clone()], vec![cache_bind]];
+        let tables: Vec<DrawTables<'_>> = tables_of(&per_draw);
+        let before_planned = store_route_count("pass_stage_sampled_planned");
+        let before_skip = store_route_count("pass_stage_sampled_skipped_speculative");
+        let before_staged = store_route_count("pass_stage_sampled_staged_proven");
+        let mut prep = PassPrep::open_with_chunk(&state, 1, tables, 2).expect("opens");
+        prep.ahead(&state, &FakeHost::new(), 0);
+        assert!(delta("pass_stage_sampled_planned", before_planned) >= 1);
+        assert_eq!(
+            delta("pass_stage_sampled_skipped_speculative", before_skip),
+            0
+        );
+        // The first bind is already the staged window — the eager rail.
+        let first = prefetch::prefetched_source(
+            &mut state,
+            &mut host,
+            1,
+            view_ref,
+            Some(&view_resource),
+            true,
+        );
+        match first {
+            prefetch::Prefetched::Serve((_, _, _, SampledSourceRequest::Staged(req))) => {
+                // SAFETY: the fact is alive for this borrow.
+                let staged = unsafe { req.staged.bytes() };
+                assert_eq!(
+                    staged,
+                    &serial_bytes[..],
+                    "the eager window is the serial CPU gather"
+                );
+            }
+            other => panic!("unexpected serve variant"),
+        }
+        assert_eq!(delta("pass_stage_sampled_staged_proven", before_staged), 0);
+        drop(prep);
+        drop(
+            crate::backend::vulkan::engine::pass_stage::take_test_arenas()
+                .expect("the test arenas are still installed"),
+        );
+    }
+
+    /// TEMP (lab, PASS_STAGE): the rail's own gate. `REIMS_VGPU_LAB_PASS_STAGE`
+    /// off attaches nothing anywhere: the first bind and the repeat both serve
+    /// the plain guest-runs request — the serial ladder's own answer, field
+    /// for field — and no `pass_stage_sampled_*` census moves.
+    #[test]
+    fn pass_stage_off_keeps_the_sampled_binds_serial() {
+        let _stage = crate::runtime::par::staging::test_enable(false);
+        let _mode = test_mode(PassPrepMode::On);
+        // The run memo is process-global and keyed by GPAs alone; without a
+        // clear it would hand this test an earlier test's runs — host pointers
+        // into a fixture that has already been dropped.
+        run_memo_clear_for_test();
+        let (mut state, mut host, view_ref, _) = view_fixture();
+        fill_view_pages(&mut host);
+        let view_resource = objects::resolve_resource(&state, &host, 1, view_ref).expect("view");
+        let _arm = resolve_sampled_source(
+            &mut state,
+            &mut host,
+            1,
+            view_ref,
+            Some(view_resource.clone()),
+            true,
+        )
+        .expect("arm the witness");
+        let (mut serial_state, mut serial_host, _, _) = view_fixture();
+        fill_view_pages(&mut serial_host);
+        let serial_resource =
+            objects::resolve_resource(&serial_state, &serial_host, 1, view_ref).expect("view");
+        let _serial_arm = resolve_sampled_source(
+            &mut serial_state,
+            &mut serial_host,
+            1,
+            view_ref,
+            Some(serial_resource.clone()),
+            true,
+        )
+        .expect("arm the serial twin");
+        let serial = resolve_sampled_source(
+            &mut serial_state,
+            &mut serial_host,
+            1,
+            view_ref,
+            Some(serial_resource),
+            true,
+        )
+        .expect("the serial ladder serves");
+        let serial_src = match &serial.3 {
+            SampledSourceRequest::GuestRuns(src, ..) => src,
+            _ => panic!("the armed view serves guest runs on the serial ladder"),
+        };
+        add_cache_ref(&mut state, &mut host, 7, 99, 0x2000, 0);
+        add_cache_ref(&mut state, &mut host, 8, 91, 0x2100, 5);
+        let bind_for = |texture_ref: u32, state: &DeviceState, host: &FakeHost| -> TextureBind {
+            TextureBind {
+                index: 0,
+                texture_ref,
+                resource: Some(
+                    objects::resolve_resource(state, host, 1, texture_ref).expect("bind resource"),
+                ),
+            }
+        };
+        let pattern = [0u32, 1, 0, 2];
+        let per_draw: Vec<Vec<TextureBind>> = pattern
+            .iter()
+            .map(|&which| {
+                let texture_ref = match which {
+                    0 => view_ref,
+                    1 => 7,
+                    _ => 8,
+                };
+                vec![bind_for(texture_ref, &state, &host)]
+            })
+            .collect();
+        let tables: Vec<DrawTables<'_>> = tables_of(&per_draw);
+        let before_planned = store_route_count("pass_stage_sampled_planned");
+        let before_skip = store_route_count("pass_stage_sampled_skipped_speculative");
+        let before_staged = store_route_count("pass_stage_sampled_staged_proven");
+        let mut prep = PassPrep::open_with_chunk(&state, 1, tables, 2).expect("opens");
+        prep.ahead(&state, &FakeHost::new(), 0);
+        let first = prefetch::prefetched_source(
+            &mut state,
+            &mut host,
+            1,
+            view_ref,
+            Some(&view_resource),
+            true,
+        );
+        match first {
+            prefetch::Prefetched::Serve((_, _, _, SampledSourceRequest::GuestRuns(src, ..))) => {
+                assert!(
+                    Arc::ptr_eq(&src.runs, &serial_src.runs) || src.runs[..] == serial_src.runs[..]
+                );
+                assert_eq!(
+                    (src.source_offset, src.total_len, src.row_length_texels),
+                    (
+                        serial_src.source_offset,
+                        serial_src.total_len,
+                        serial_src.row_length_texels
+                    ),
+                    "the rail-off bind is the serial ladder's own serve"
+                );
+            }
+            other => panic!("unexpected serve variant"),
+        }
+        prep.ahead(&state, &FakeHost::new(), 2);
+        let second = prefetch::prefetched_source(
+            &mut state,
+            &mut host,
+            1,
+            view_ref,
+            Some(&view_resource),
+            true,
+        );
+        assert!(matches!(
+            second,
+            prefetch::Prefetched::Serve((_, _, _, SampledSourceRequest::GuestRuns(..)))
+        ));
+        assert_eq!(delta("pass_stage_sampled_planned", before_planned), 0);
+        assert_eq!(
+            delta("pass_stage_sampled_skipped_speculative", before_skip),
+            0
+        );
+        assert_eq!(delta("pass_stage_sampled_staged_proven", before_staged), 0);
         drop(prep);
     }
 

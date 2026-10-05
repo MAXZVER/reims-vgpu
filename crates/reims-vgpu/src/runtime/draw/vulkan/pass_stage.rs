@@ -8,8 +8,11 @@
 //!
 //! * **bind bytes** — the CPU read + staging the serial buffer ladder pays
 //!   when every zero-copy rail refuses ([`buffer_plan`]'s staged arm);
-//! * **sampled gathers** — `write_staging_from_runs`'s window, staged beside
-//!   the guest-runs plan that would pay it ([`sample_plan`]'s attach);
+//! * **sampled gathers** — `write_staging_from_runs`'s window, staged for the
+//!   guest-runs plan that would pay it ([`sample_plan`]'s attach) — but only
+//!   once a commit has *proven* the plan (`STAGED_PROVEN`): the repeat that
+//!   survived a bind is restaged by the next chunk, while a fresh plan's
+//!   window stayed unbound with 99.4 % of the eager copies;
 //! * **seeds** — the R/B exchange and staging of a CPU load seed, staged
 //!   while the request sits in the recorder FIFO ([`arm_seed_stage`] and the
 //!   seed jobs `PassPrep::ahead` feeds).

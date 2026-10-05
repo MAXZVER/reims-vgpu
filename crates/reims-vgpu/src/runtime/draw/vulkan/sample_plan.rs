@@ -435,6 +435,7 @@ struct SampleReads {
 }
 
 /// What a planned bind serves.
+#[derive(Clone)]
 enum PlannedServe {
     Target(TargetIdentity),
     HostCache(std::sync::Arc<Vec<u8>>),
@@ -442,6 +443,7 @@ enum PlannedServe {
 
 /// A planned sampled-source bind: the serve a top rung chose, the reads it rests
 /// on, and the census routes it owes.
+#[derive(Clone)]
 pub(crate) struct SamplePlan {
     task_id: u32,
     texture_ref: u32,
@@ -886,6 +888,12 @@ pub(crate) struct RefViewPlan {
     gpas: std::sync::Arc<Vec<u64>>,
     runs: std::sync::Arc<Vec<crate::backend::vulkan::engine::GuestRun>>,
     gather: crate::runtime::gather_witness::PlannedGather,
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): whether a commit has proven this
+    /// plan by serving a bind from it — set on the repeat [`commit_ref_view_plan`]
+    /// hands back, because surviving one bind is the evidence the next binds of
+    /// the key will read a window worth copying ([`attach_staged`] gates on it;
+    /// a fresh plan's window died unbound with 99.4 % of the eager copies).
+    proven: bool,
     /// TEMP (lab, PASS_STAGE, design 8.4): the plan's gather window, staged
     /// into a worker arena by [`attach_staged`]; the serve wraps it and the
     /// engine's CPU-gather arm reads the window instead of gathering.
@@ -968,8 +976,24 @@ pub(crate) fn plan_ref_view_zero_copy<M: HostMemory + HostOps>(
         gpas,
         runs,
         gather,
+        proven: false,
         staged: None,
     })
+}
+
+impl RefViewPlan {
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): a commit proved this plan and no
+    /// worker has staged its window yet — the restage job's selection, and the
+    /// one plan shape [`attach_staged`] will copy under the default rule.
+    pub(crate) fn staging_pending(&self) -> bool {
+        self.proven && self.staged.is_none()
+    }
+
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): whether a worker's window is
+    /// attached — the restage job's success test.
+    pub(crate) fn has_staged_window(&self) -> bool {
+        self.staged.is_some()
+    }
 }
 
 /// TEMP (lab, PASS_STAGE, design 8.4): wrap a guest-runs serve whose window a
@@ -997,15 +1021,57 @@ fn wrap_staged(
     }))
 }
 
+/// TEMP (lab, PASS_STAGE, STAGED_PROVEN): the gather window a plan would
+/// stage, for the skipped-copy census; `None` on the plans staging never
+/// touches (the surface ladder's own answers, the memo's bytes).
+fn staged_window_span(plan: &super::prefetch::StreamPlan) -> Option<u64> {
+    match plan {
+        super::prefetch::StreamPlan::RefView(p) => Some(p.plane.span),
+        super::prefetch::StreamPlan::Linear(p) => Some(p.span),
+        super::prefetch::StreamPlan::MapperRef(p) => Some(p.span),
+        _ => None,
+    }
+}
+
 /// TEMP (lab, PASS_STAGE, design 8.4): stage the gather window of a
 /// guest-runs plan into the worker's arena -- the copy the engine's
 /// CPU-gather arm (`write_staging_from_runs`) would have paid, moved to the
 /// planning thread. Plans without a gather window are untouched; an arena
 /// refusal leaves the plan as it was (the serial gather serves).
+///
+/// TEMP (lab, STAGED_PROVEN): under the default rule the window is copied
+/// only for a **proven** plan — the repeat a commit handed back after serving
+/// one bind, offered here by the next chunk's restage job. A fresh plan's
+/// copy was speculation that died with the plan: over the cssscrollglassv
+/// window 99.4 % of staged windows were never read (planned 9582, hit 54,
+/// 121 GB of copies), because the witness churn a chunk of draws produces
+/// invalidates the plan between its planning and its bind. A first bind loses
+/// nothing by the gate: unstaged, its commit serves the plain guest-runs
+/// request and the engine gathers serially, exactly as it did before the
+/// staging rail existed. `REIMS_VGPU_LAB_STAGED_PROVEN=off` restores the
+/// eager attach of every plan.
 pub(crate) fn attach_staged(
     plan: &mut super::prefetch::StreamPlan,
     stager: &super::pass_stage::Stager,
 ) {
+    if crate::runtime::par::staging::staged_proven() {
+        let speculative = match plan {
+            super::prefetch::StreamPlan::RefView(p) => !p.proven,
+            super::prefetch::StreamPlan::Linear(p) => !p.proven,
+            super::prefetch::StreamPlan::MapperRef(p) => !p.proven,
+            _ => false,
+        };
+        if speculative {
+            crate::runtime::drain::note_store_route("pass_stage_sampled_skipped_speculative");
+            if let Some(span) = staged_window_span(plan) {
+                // The direct measurement of the bytes this rule did not copy:
+                // skipped windows x their span, against the arena census's
+                // allocated_bytes for what it did.
+                crate::runtime::drain::note_store_route_n("pass_stage_sampled_skipped_bytes", span);
+            }
+            return;
+        }
+    }
     let attached = match plan {
         super::prefetch::StreamPlan::RefView(p) => stager
             .stage_runs(&p.runs, 0, p.plane.span)
@@ -1023,6 +1089,9 @@ pub(crate) fn attach_staged(
     };
     if attached {
         crate::runtime::drain::note_store_route("pass_stage_sampled_planned");
+        if crate::runtime::par::staging::staged_proven() {
+            crate::runtime::drain::note_store_route("pass_stage_sampled_staged_proven");
+        }
     }
 }
 
@@ -1155,6 +1224,9 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
     let pages = guest_page_window(host, &plan.gpas, page, base_off % page, span);
     let mut next = plan.clone();
     next.gather = repeat;
+    // TEMP (lab, STAGED_PROVEN): the repeat survived this commit, so its
+    // window is the one worth staging (the restage job this hands to).
+    next.proven = true;
     Ok((wrap(source(pages, outcome)), Some(next)))
 }
 
@@ -1271,6 +1343,8 @@ pub(crate) struct LinearPlan {
     gather: Option<crate::runtime::gather_witness::PlannedGather>,
     witness_gpas: Vec<u64>,
     witness_run: Option<crate::backend::vulkan::engine::GuestRun>,
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): see [`RefViewPlan::proven`].
+    proven: bool,
     /// TEMP (lab, PASS_STAGE, design 8.4): see [`RefViewPlan::staged`].
     staged: Option<crate::backend::vulkan::engine::pass_stage::StagedSlice>,
 }
@@ -1416,6 +1490,7 @@ pub(crate) fn plan_linear_zero_copy<M: HostMemory + HostOps>(
             gather: None,
             witness_gpas: Vec::new(),
             witness_run: None,
+            proven: false,
             staged: None,
         });
     }
@@ -1488,6 +1563,7 @@ pub(crate) fn plan_linear_zero_copy<M: HostMemory + HostOps>(
         gather: Some(gather),
         witness_gpas,
         witness_run: Some(witness_run),
+        proven: false,
         staged: None,
     })
 }
@@ -1516,6 +1592,17 @@ impl LinearPlan {
                 self.native_components,
             ),
         )
+    }
+
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): see [`RefViewPlan::staging_pending`].
+    pub(crate) fn staging_pending(&self) -> bool {
+        self.proven && self.staged.is_none()
+    }
+
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): see
+    /// [`RefViewPlan::has_staged_window`].
+    pub(crate) fn has_staged_window(&self) -> bool {
+        self.staged.is_some()
     }
 }
 
@@ -1633,7 +1720,12 @@ pub(crate) fn commit_linear_plan<M: HostMemory + HostOps>(
         };
         // TEMP (lab, PASS_STAGE): the staged window, when one was attached.
         let served = plan.source(source, None);
-        return Ok((wrap_linear(plan, served), apply.then(|| plan.clone())));
+        // TEMP (lab, STAGED_PROVEN): the direct arm moved nothing, and this
+        // commit served the bind — the plan it hands back is proven (its
+        // window, once a worker stages it, serves every later bind).
+        let mut next = plan.clone();
+        next.proven = true;
+        return Ok((wrap_linear(plan, served), apply.then_some(next)));
     }
     let gather = plan.gather.as_ref().expect("checked above");
     let run = plan.witness_run.expect("the gather arm carries its run");
@@ -1653,6 +1745,8 @@ pub(crate) fn commit_linear_plan<M: HostMemory + HostOps>(
     .ok_or(SampleInvalid::Witness)?;
     let mut next = plan.clone();
     next.gather = Some(repeat);
+    // TEMP (lab, STAGED_PROVEN): see [`commit_ref_view_plan`].
+    next.proven = true;
     Ok((
         wrap_linear(plan, plan.source(guest_runs, Some(outcome))),
         Some(next),
@@ -1751,6 +1845,8 @@ pub(crate) struct MapperRefPlan {
     gpas: std::sync::Arc<Vec<u64>>,
     runs: std::sync::Arc<Vec<crate::backend::vulkan::engine::GuestRun>>,
     gather: crate::runtime::gather_witness::PlannedGather,
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): see [`RefViewPlan::proven`].
+    proven: bool,
     /// TEMP (lab, PASS_STAGE, design 8.4): see [`RefViewPlan::staged`].
     staged: Option<crate::backend::vulkan::engine::pass_stage::StagedSlice>,
 }
@@ -1851,6 +1947,7 @@ pub(crate) fn plan_mapper_ref_zero_copy<M: HostMemory + HostOps>(
         gpas,
         runs,
         gather,
+        proven: false,
         staged: None,
     })
 }
@@ -1882,6 +1979,17 @@ impl MapperRefPlan {
                 pixel_format::swizzle_identity(),
             ),
         )
+    }
+
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): see [`RefViewPlan::staging_pending`].
+    pub(crate) fn staging_pending(&self) -> bool {
+        self.proven && self.staged.is_none()
+    }
+
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): see
+    /// [`RefViewPlan::has_staged_window`].
+    pub(crate) fn has_staged_window(&self) -> bool {
+        self.staged.is_some()
     }
 }
 
@@ -2002,6 +2110,8 @@ pub(crate) fn commit_mapper_ref_plan<M: HostMemory + HostOps>(
     let pages = guest_page_window(host, &plan.gpas, page, plan.base_off % page, plan.span);
     let mut next = plan.clone();
     next.gather = repeat;
+    // TEMP (lab, STAGED_PROVEN): see [`commit_ref_view_plan`].
+    next.proven = true;
     Ok((wrap_mapper(plan, plan.source(pages, outcome)), Some(next)))
 }
 
@@ -2072,6 +2182,7 @@ impl MemoReads {
 /// What a planned memo bind serves: the entry the plan proved unchanged (a
 /// hit, serving the memo's `Arc` and identity), or the entry the plan built
 /// from the rows it read (a fill, inserted at commit).
+#[derive(Clone)]
 enum MemoServe {
     Hit {
         rgba: std::sync::Arc<Vec<u8>>,
@@ -2106,6 +2217,7 @@ enum MemoServe {
 /// epoch taken before the read. A guest write the plan's own compare did not
 /// see is bounded by the mapping token's lagged generation, re-checked at
 /// commit — the same plan/commit standard every gather plan rests on (H5).
+#[derive(Clone)]
 pub(crate) struct MemoPlan {
     task_id: u32,
     texture_ref: u32,
