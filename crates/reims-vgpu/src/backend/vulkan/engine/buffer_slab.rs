@@ -382,6 +382,9 @@ impl BufferSlabPool {
         let align = req.alignment.max(1);
 
         if size > BUFFER_SLAB_SIZE {
+            if let Some(token) = self.lab_reuse_dedicated_spare(mem_type, size, align) {
+                return Ok(token);
+            }
             return self.new_block(ctx, size, mem_type, align, size, true, false, counters);
         }
 
@@ -576,9 +579,90 @@ impl BufferSlabPool {
         // crossing a block boundary does several times a minute, and freeing on
         // it costs a full block allocation to cross back. Returning shared
         // blocks is settled maintenance's job ([`Self::trim_empty_blocks`]).
-        if empty && dedicated {
+        if empty && dedicated && !self.lab_keep_dedicated_spare(device, idx) {
             self.free_block(device, idx);
         }
+    }
+
+    /// TEMP (lab, `REIMS_VGPU_LAB_DEDICATED_SPARE=on`): one emptied dedicated
+    /// block per pool is kept as a spare for the next oversized carve.
+    ///
+    /// Every full-screen transition stages one frame-sized guest texture (ts0a,
+    /// Intel: 4935x1895 BGRA, 37 MB, into a 64 MiB carve) - past
+    /// [`BUFFER_SLAB_SIZE`], so a dedicated block allocated, mapped, written
+    /// cold and freed again once per transition: 40 such blocks a run, each
+    /// with a 14-44 ms drain tranche of 23-97 draws around it (`staging_write_slow
+    /// kind=bytes us=27006` for the 37 MB). The spare turns the next one into a
+    /// carve from mapped, already-touched memory. The largest emptied block is
+    /// the one kept; the pool's other empties still free. Settled idle leaves
+    /// it alone (it is not a shared-class spare), teardown frees it. Latched;
+    /// off under test.
+    fn lab_dedicated_spare_on() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = !cfg!(test)
+                && std::env::var("REIMS_VGPU_LAB_DEDICATED_SPARE").is_ok_and(|v| v == "on");
+            crate::observe::off(format!("lab_dedicated_spare on={on}"));
+            on
+        })
+    }
+
+    /// TEMP (lab DEDICATED_SPARE): whether the emptied dedicated block `idx`
+    /// stays as the pool's spare (freeing a smaller spare it replaces).
+    unsafe fn lab_keep_dedicated_spare(&mut self, device: &ash::Device, idx: usize) -> bool {
+        if !Self::lab_dedicated_spare_on() {
+            return false;
+        }
+        let size = |b: &SlabBlock| b.plan.size();
+        let mine = match self.blocks[idx].as_ref() {
+            Some(b) => size(b),
+            None => return false,
+        };
+        let other = self.blocks.iter().enumerate().find_map(|(i, s)| match s {
+            Some(b) if i != idx && b.dedicated && !b.poisoned && b.plan.is_empty() => Some((i, size(b))),
+            _ => None,
+        });
+        match other {
+            Some((_, theirs)) if theirs >= mine => false,
+            Some((j, _)) => {
+                self.free_block(device, j);
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// TEMP (lab DEDICATED_SPARE): carve an oversized request from the pool's
+    /// empty dedicated spare when it fits.
+    fn lab_reuse_dedicated_spare(
+        &mut self,
+        mem_type: u32,
+        size: u64,
+        align: u64,
+    ) -> Option<BufferSlabToken> {
+        if !Self::lab_dedicated_spare_on() {
+            return None;
+        }
+        let i = self.blocks.iter().position(|s| {
+            matches!(s, Some(b) if b.dedicated && !b.poisoned && b.mem_type == mem_type
+                && b.plan.is_empty() && b.plan.size() >= size)
+        })?;
+        let offset = self.blocks[i].as_mut()?.plan.carve(size, align)?;
+        if !self.check_block(i) {
+            return None;
+        }
+        let b = self.blocks[i].as_ref()?;
+        self.sub_allocs += 1;
+        crate::runtime::drain::note_store_route("lab_dedicated_spare_reused");
+        Some(BufferSlabToken {
+            block: i as u32,
+            offset,
+            size,
+            kind: self.kind,
+            memory: b.memory,
+            mapped: b.base + offset as usize,
+        })
     }
 
     /// Validate a token's block and range without touching Vulkan state.
