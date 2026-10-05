@@ -1829,6 +1829,105 @@ fn a_preserve_seed_serves_an_eight_bit_gva_window() {
     crate::runtime::guest_ram_map::reset();
 }
 
+/// TEMP (lab, PRESERVE_SEED, iter 4): when the attachment is pooled RGBA — the
+/// case that refused every eight-bit window in n244 — the door must fall
+/// through to a byte read of the same rows, served in the window's own channel
+/// order with the order flag that lets the uploader's staging exchange do the
+/// swap. One swap, declared once.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_preserve_seed_serves_gva_bytes_when_the_attachment_is_rgba() {
+    crate::runtime::guest_ram_map::reset();
+    use crate::model::PAGE_SHIFT_ARM64E;
+    use crate::protocol::pixel_format as pf;
+    use crate::runtime::host::HostMemory;
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    crate::runtime::gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 4);
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+    // define_task_pages_arm64e maps GVA page i to PFN 4+i: the window at GVA
+    // page 1 lives at GPA page 5. Two 16-byte BGRA rows, 64-byte stride,
+    // channels distinct so a swap or a double swap would show.
+    let row0: [u8; 16] = [10, 20, 30, 255, 11, 21, 31, 255, 12, 22, 32, 255, 13, 23, 33, 255];
+    let row1: [u8; 16] = [40, 50, 60, 255, 41, 51, 61, 255, 42, 52, 62, 255, 43, 53, 63, 255];
+    let gpa = 5u64 << PAGE_SHIFT_ARM64E;
+    host.write_gpa(gpa, &row0).expect("row 0 lands");
+    host.write_gpa(gpa + 64, &row1).expect("row 1 lands");
+
+    let c0 = ColorRtRequest {
+        slot: 0,
+        texture_ref: 0,
+        mapping_id: 0,
+        target_gva: page,
+        width: 4,
+        height: 2,
+        row_stride: 64,
+        format: pf::MTL_FORMAT_BGRA8_UNORM,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        ..Default::default()
+    };
+    let seed = try_preserve_seed_from_guest_window(
+        &mut state,
+        &mut host,
+        1,
+        &c0,
+        ash::vk::Format::R8G8B8A8_UNORM,
+    )
+    .expect("a pooled-RGBA attachment still gets the window's bytes");
+    let MapperRefTextureLoadSeed::Host(bytes, order) = seed else {
+        panic!("the byte fallback serves host bytes");
+    };
+    assert_eq!(order, crate::backend::vulkan::engine::SeedOrder::Bgra8);
+    let mut want = Vec::with_capacity(32);
+    want.extend_from_slice(&row0);
+    want.extend_from_slice(&row1);
+    assert_eq!(
+        bytes.as_slice(),
+        want.as_slice(),
+        "the seed carries the window's own BGRA bytes, unswapped — the \
+         SeedOrder flag names the swap once, for the uploader"
+    );
+    crate::runtime::guest_ram_map::reset();
+}
+
+/// TEMP (lab, PRESERVE_SEED, iter 4): every refusal names its reason, because
+/// n244's zero-serve run has to become a distribution, not a mystery.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_preserve_seed_refusal_names_its_reason() {
+    use crate::runtime::drain::store_route_count;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let c0 = ColorRtRequest {
+        slot: 0,
+        texture_ref: 0,
+        mapping_id: 999,
+        target_gva: 0,
+        width: 64,
+        height: 8,
+        format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        ..Default::default()
+    };
+    let before = store_route_count("preserve_seed_fb_unresolved");
+    assert!(
+        try_preserve_seed_from_guest_window(
+            &mut state,
+            &mut host,
+            1,
+            &c0,
+            ash::vk::Format::B8G8R8A8_UNORM,
+        )
+        .is_none()
+    );
+    assert!(
+        store_route_count("preserve_seed_fb_unresolved") > before,
+        "a mapping that cannot resolve is the named refusal, not a silent one"
+    );
+}
+
 /// The verdict must keep its refusals apart, because two rails now report it.
 ///
 /// [`mapper_ref_texture_guest_wrote_since_store`] collapses everything that is not `Clean`

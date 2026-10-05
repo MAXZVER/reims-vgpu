@@ -13890,8 +13890,24 @@ pub(super) fn preserve_seed_on() -> bool {
 }
 
 /// Serve the guest's own window bytes as a colour-0 LOAD seed. `None` is the
-/// counted fallback — the context cannot read this window, and today's
-/// behaviour stands.
+/// counted fallback — every refusal names its reason under `preserve_seed_fb_*`,
+/// because n244 measured the door reached 16.7k times a boot with zero serves,
+/// and the next field run has to say which condition owned the population.
+///
+/// Iteration-4 corrections over the first cut:
+///
+/// - the mapping arm now **resolves the surface first**
+///   ([`mapper::ensure_resolved_for_scanout`], the same step every serial door
+///   takes). The unseeded population is dominated by first-use surfaces whose
+///   mapping exists but whose page list has not been walked yet — reading live
+///   state without resolving refused exactly those, which was the point.
+/// - the GVA arm no longer stops at the native-run seed: a pooled GVA
+///   attachment is `R8G8B8A8` (`RESIDENT_RGBA_FORMAT`) while the window's
+///   native layout is `B8G8R8A8`, so the format equality refused *every*
+///   eight-bit window. The arm now falls through to a byte read of the
+///   window's rows through the task page table, served as semantic RGBA8
+///   (`SeedOrder::Rgba8`) or scanout order (`SeedOrder::Bgra8`) per the
+///   window's own layout — the uploader's order flag does the rest.
 pub(super) fn try_preserve_seed_from_guest_window<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -13901,26 +13917,74 @@ pub(super) fn try_preserve_seed_from_guest_window<M: HostMemory + HostOps>(
 ) -> Option<MapperRefTextureLoadSeed> {
     use crate::backend::vulkan::engine::SeedOrder;
     if c0.mapping_id == 0 {
-        // A GVA target: the generic window seed, at the request's own geometry
-        // and stride.
-        return try_gva_target_guest_seed(state, host, task_id, c0, target_format)
-            .map(MapperRefTextureLoadSeed::Guest);
+        // A GVA target: the native window seed first (at the request's own
+        // geometry and stride), and where the attachment's format refuses it —
+        // the pooled-RGBA case — the same window read as bytes and stated in
+        // its own channel order.
+        if let Some(seed) = try_gva_target_guest_seed(state, host, task_id, c0, target_format) {
+            return Some(MapperRefTextureLoadSeed::Guest(seed));
+        }
+        // The order flag is self-describing and relative to the attachment:
+        // BGRA window bytes are declared `SeedOrder::Bgra8` and the uploader's
+        // staging exchange performs the swap for an RGBA-order attachment. A
+        // manual swap here would convert twice.
+        let layout = pixel_format::store_texel_order(c0.format)?;
+        let order = match layout {
+            pixel_format::TexelLayout::Rgba8 => SeedOrder::Rgba8,
+            pixel_format::TexelLayout::Bgra8 => SeedOrder::Bgra8,
+            _ => {
+                crate::runtime::drain::note_store_route("preserve_seed_fb_gva_layout");
+                return None;
+            }
+        };
+        let tight = c0.width.checked_mul(RGBA8_BPP)?;
+        let task = state.tasks.get(task_id)?;
+        let mut raw = vec![0u8; tight as usize * c0.height as usize];
+        let mut row = vec![0u8; tight as usize];
+        for y in 0..c0.height {
+            let gva = c0.target_gva + u64::from(y) * u64::from(c0.row_stride);
+            if crate::runtime::gva_mem::read_task_gva(
+                host,
+                task,
+                gva,
+                &mut row,
+                state.page_shift,
+            )
+            .is_err()
+            {
+                crate::runtime::drain::note_store_route("preserve_seed_fb_gva_read");
+                return None;
+            }
+            raw[y as usize * tight as usize..(y as usize + 1) * tight as usize]
+                .copy_from_slice(&row);
+        }
+        return Some(MapperRefTextureLoadSeed::Host(std::sync::Arc::new(raw), order));
     }
-    // A mapping target: eight-bit scanout order only — the seed carrier below
-    // spells BGRA8, and inventing a conversion for every other format is a
-    // product decision this prototype does not make.
+    // A mapping target: resolve first — the same step every serial door takes,
+    // and the one the first cut skipped while the population was dominated by
+    // first-use surfaces.
+    if !crate::runtime::mapper::ensure_resolved_for_scanout(state, host, c0.mapping_id) {
+        crate::runtime::drain::note_store_route("preserve_seed_fb_unresolved");
+        return None;
+    }
+    // Eight-bit scanout order only — the seed carrier below spells BGRA8, and
+    // inventing a conversion for every other format is a product decision this
+    // prototype does not make.
     let window = {
         let Some(m) = state.mappings.get(&c0.mapping_id) else {
+            crate::runtime::drain::note_store_route("preserve_seed_fb_no_mapping");
             return None;
         };
-        if !m.mapped
-            || m.page_entries.is_empty()
-            || !matches!(
-                m.format,
-                0 | crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
-                    | crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
-            )
-        {
+        if !m.mapped || m.page_entries.is_empty() {
+            crate::runtime::drain::note_store_route("preserve_seed_fb_no_pages");
+            return None;
+        }
+        if !matches!(
+            m.format,
+            0 | crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
+                | crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
+        ) {
+            crate::runtime::drain::note_store_route("preserve_seed_fb_format");
             return None;
         }
         crate::runtime::mapping_write::mapper_ref_texture_sample_window(
@@ -13929,8 +13993,14 @@ pub(super) fn try_preserve_seed_from_guest_window<M: HostMemory + HostOps>(
             c0.height,
             crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
         )
-    }?;
-    let (base_off, bpr, span_end) = window;
+    };
+    let (base_off, bpr, span_end) = match window {
+        Some(w) => w,
+        None => {
+            crate::runtime::drain::note_store_route("preserve_seed_fb_no_window");
+            return None;
+        }
+    };
     let tight = c0.width.checked_mul(RGBA8_BPP)?;
     let mut raw = vec![0u8; tight as usize * c0.height as usize];
     let read = crate::runtime::mapping_write::read_rect_raw_at(
@@ -13953,6 +14023,7 @@ pub(super) fn try_preserve_seed_from_guest_window<M: HostMemory + HostOps>(
         tight,
     );
     if !read {
+        crate::runtime::drain::note_store_route("preserve_seed_fb_read");
         return None;
     }
     Some(MapperRefTextureLoadSeed::Host(
