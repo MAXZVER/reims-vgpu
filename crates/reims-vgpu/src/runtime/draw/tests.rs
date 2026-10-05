@@ -8745,3 +8745,264 @@ fn a_repeated_row_lands_what_a_frame_of_that_row_lands() {
     assert_eq!(&gb[12..16], &[0xcc; 4], "row padding is not the texture's to clear");
     assert_eq!(&gb[0..4], &native[0..4]);
 }
+
+/// TEMP (lab, PAR_CLEAR): the worker-pool arm of a clear-sized frame fill
+/// ([`write_gva_frame_within_par_in`]) lands exactly the bytes the serial
+/// writer lands, on the geometry the threshold was set for — whole frames
+/// whose rows and span are not page multiples, so job boundaries cut pages
+/// mid-flight and the padding between tight rows is nobody's to write.
+mod par_clear {
+    use super::*;
+    use crate::model::PAGE_SHIFT_ARM64E;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::gva_mem::define_task_pages_arm64e;
+    use crate::runtime::host::FakeHost;
+    use std::sync::Arc;
+
+    /// The data pages live at PFN 4 under one big host range, so the frame's
+    /// packed span gets the direct alias view on every platform (a per-page
+    /// fixture provisions one range a page, and a multi-page `map_pages` then
+    /// cannot alias it whole).
+    const DATA_BASE_PFN: u32 = 4;
+    /// GVA page 1, not 0: `write_gva_frame_within*` refuses a zero GVA.
+    const GVA_PAGE: u64 = 1;
+
+    unsafe extern "C" fn attach(_ctx: *mut std::os::raw::c_void) {}
+    unsafe extern "C" fn detach(_ctx: *mut std::os::raw::c_void) {}
+
+    fn pool(workers: usize) -> Arc<crate::runtime::par::Pool> {
+        let mut table = crate::qemu::host_ops::ReimsVgpuHostOps::null();
+        table.thread_attach = Some(attach);
+        table.thread_detach = Some(detach);
+        let settings = crate::runtime::par::Settings {
+            workers,
+            worker_spin: std::time::Duration::ZERO,
+            join_spin: std::time::Duration::from_micros(50),
+        };
+        Arc::new(
+            crate::runtime::par::Pool::new(&table, &settings).expect("the attach pair is offered"),
+        )
+    }
+
+    /// Task 1 with `pages` data pages at PFN 4 inside one pre-filled host
+    /// range, so the marker byte the untouched bytes carry is the same in both
+    /// arms of a comparison and the packed span aliases directly.
+    fn fixture(pages: u32, with_pool: bool) -> (DeviceState, FakeHost) {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let range_len = (pages as usize) << PAGE_SHIFT_ARM64E;
+        host.map_range((DATA_BASE_PFN as u64) << PAGE_SHIFT_ARM64E, range_len, 0xee);
+        define_task_pages_arm64e(&mut host, &mut state, DATA_BASE_PFN, pages);
+        // `define_task_pages_arm64e`'s per-page `map_range` calls zero their
+        // page inside the big range; put the marker back over all of it.
+        host.map_range((DATA_BASE_PFN as u64) << PAGE_SHIFT_ARM64E, range_len, 0xee);
+        if with_pool {
+            state.install_par_pool(pool(3));
+        }
+        (state, host)
+    }
+
+    fn ram(host: &FakeHost, pages: u32) -> Vec<u8> {
+        let mut out = vec![0u8; (pages as usize) << PAGE_SHIFT_ARM64E];
+        host.read_gpa((DATA_BASE_PFN as u64) << PAGE_SHIFT_ARM64E, &mut out)
+            .expect("the fixture's range");
+        out
+    }
+
+    /// A geometry past the threshold whose rows, span and job boundaries are
+    /// all non-page-multiple: width 641 BGRA8 (tight 2564), bpr 2568 with 4
+    /// bytes of padding, 820 rows = 2 102 480 fill bytes over a 2 105 760-byte
+    /// span — 128.5 pages, so jobs (~103 rows each) cut pages and the last
+    /// row's tail is not the range's end.
+    const W: u32 = 641;
+    const H: u32 = 820;
+    const BPR: u32 = 2568;
+    /// Pages the fixture must define for the span at GVA page 1.
+    const PAGES: u32 = 131;
+
+    /// Land the same clear through both arms and return the two RAM images.
+    fn land_both(frame: FrameRows<'_>) -> (Vec<u8>, Vec<u8>) {
+        let gva = GVA_PAGE << PAGE_SHIFT_ARM64E;
+        // The pooled arm borrows the frame; the serial arm takes it, so the
+        // borrow has to happen first.
+        let (mut p_state, mut p_host) = fixture(PAGES, true);
+        let answer = write_gva_frame_within_par_in(
+            true,
+            &mut p_state,
+            &mut p_host,
+            1,
+            gva,
+            W,
+            H,
+            BPR,
+            MTL_FORMAT_BGRA8_UNORM,
+            &frame,
+        );
+        assert_eq!(
+            answer,
+            Some(Ok(())),
+            "the pooled arm must take a fill this size"
+        );
+        let (mut s_state, mut s_host) = fixture(PAGES, false);
+        write_gva_frame_within(
+            &mut s_state,
+            &mut s_host,
+            1,
+            gva,
+            W,
+            H,
+            BPR,
+            MTL_FORMAT_BGRA8_UNORM,
+            frame,
+            None,
+        )
+        .expect("the serial writer lands its fixture");
+        (ram(&s_host, PAGES), ram(&p_host, PAGES))
+    }
+
+    /// One patterned destination row, as CLEAR_ROW's cached conversion would
+    /// hand it: already the destination's texel.
+    fn native_row() -> Vec<u8> {
+        (0..W as usize * 4).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// A frame of differing RGBA8 rows, as the CLEAR_ROW=off arm fills with.
+    fn rgba_frame() -> Vec<u8> {
+        (0..H as usize)
+            .flat_map(|y| {
+                (0..W as usize)
+                    .flat_map(move |x| [(x * 7 + y * 13) as u8, x as u8, (y * 5) as u8, 0xff])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pooled_repeated_row_lands_the_serial_bytes() {
+        use crate::runtime::drain::store_route_count;
+        let row = native_row();
+        let (clears, jobs) = (
+            store_route_count("par_clear_n"),
+            store_route_count("par_jobs"),
+        );
+        let (serial, pooled) = land_both(FrameRows::Repeat(&row));
+        assert_eq!(serial, pooled, "the two arms landed different bytes");
+        // The fill did something, and the padding stayed the marker's.
+        assert!(pooled.iter().any(|&b| b != 0xee));
+        let gva_off = GVA_PAGE as usize * (1 << PAGE_SHIFT_ARM64E);
+        for y in 0..H as usize {
+            let row_at = gva_off + y * BPR as usize;
+            assert_eq!(
+                &pooled[row_at + W as usize * 4..row_at + BPR as usize],
+                &[0xee; 4],
+                "row {y}'s padding is not the clear's to write"
+            );
+        }
+        // The pool arm ran, and it ran as jobs: one pooled clear noting its
+        // own census, and a scope of ~103-row jobs (8 for this geometry) —
+        // the serial fallback notes none of these.
+        assert_eq!(
+            store_route_count("par_clear_n") - clears,
+            1,
+            "the pooled clear is counted once"
+        );
+        assert!(
+            store_route_count("par_jobs") - jobs >= 8,
+            "the fill forked as at least the 8 jobs this geometry makes"
+        );
+    }
+
+    #[test]
+    fn a_pooled_converting_frame_lands_the_serial_bytes() {
+        let frame = rgba_frame();
+        let (serial, pooled) = land_both(FrameRows::Rgba8(&frame));
+        assert_eq!(serial, pooled, "the two arms landed different bytes");
+        assert!(pooled.iter().any(|&b| b != 0xee));
+    }
+
+    #[test]
+    fn a_native_frame_lands_the_serial_bytes_too() {
+        // One whole native frame: the third encoding a clear can carry.
+        let frame: Vec<u8> = native_row().repeat(H as usize);
+        let (serial, pooled) = land_both(FrameRows::Native(&frame));
+        assert_eq!(serial, pooled);
+    }
+
+    #[test]
+    fn a_small_clear_stays_on_the_caller() {
+        let gva = GVA_PAGE << PAGE_SHIFT_ARM64E;
+        // 512x511 BGRA8 = 1 045 504 fill bytes, half the threshold.
+        let (w, h, bpr) = (512u32, 511u32, 2048u32);
+        let (mut state, mut host) = fixture(70, true);
+        let row = vec![0x5au8; (w * 4) as usize];
+        assert_eq!(
+            write_gva_frame_within_par_in(
+                true,
+                &mut state,
+                &mut host,
+                1,
+                gva,
+                w,
+                h,
+                bpr,
+                MTL_FORMAT_BGRA8_UNORM,
+                &FrameRows::Repeat(&row),
+            ),
+            None,
+            "a fill below the threshold is not worth a fork"
+        );
+        assert!(
+            crate::runtime::drain::store_route_count("par_clear_small") >= 1,
+            "the missed threshold is counted, not silent"
+        );
+    }
+
+    #[test]
+    fn a_clear_at_the_threshold_goes_to_the_pool() {
+        let gva = GVA_PAGE << PAGE_SHIFT_ARM64E;
+        // 512x1024 BGRA8 = 2 097 152 fill bytes, exactly the threshold.
+        let (w, h, bpr) = (512u32, 1024u32, 2048u32);
+        let (mut state, mut host) = fixture(130, true);
+        let row = vec![0xa5u8; (w * 4) as usize];
+        assert_eq!(
+            write_gva_frame_within_par_in(
+                true,
+                &mut state,
+                &mut host,
+                1,
+                gva,
+                w,
+                h,
+                bpr,
+                MTL_FORMAT_BGRA8_UNORM,
+                &FrameRows::Repeat(&row),
+            ),
+            Some(Ok(())),
+            "the threshold is inclusive: a whole-frame clear this size forks"
+        );
+    }
+
+    #[test]
+    fn the_switch_off_hands_the_write_back() {
+        let gva = GVA_PAGE << PAGE_SHIFT_ARM64E;
+        let (mut state, mut host) = fixture(PAGES, true);
+        let row = native_row();
+        assert_eq!(
+            write_gva_frame_within_par_in(
+                false,
+                &mut state,
+                &mut host,
+                1,
+                gva,
+                W,
+                H,
+                BPR,
+                MTL_FORMAT_BGRA8_UNORM,
+                &FrameRows::Repeat(&row),
+            ),
+            None,
+            "`REIMS_VGPU_LAB_PAR_CLEAR` off (the default) keeps every byte on the caller"
+        );
+        // And nothing was written through the pool arm's own view.
+        assert!(ram(&host, PAGES).iter().all(|&b| b == 0xee));
+    }
+}

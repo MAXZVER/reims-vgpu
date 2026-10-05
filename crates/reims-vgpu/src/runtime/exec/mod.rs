@@ -6725,7 +6725,15 @@ fn apply_clear<M: HostMemory + HostOps>(
             c0.target_gva,
             u64::from(c0.row_stride).saturating_mul(u64::from(c0.height)),
         );
-        let ok = draw::write_gva_frame_within(
+        // TEMP (lab, PAR_CLEAR): a full-frame clear is pure byte work — map the
+        // target's span, fill it — and it is the largest single item in
+        // `fin_prelude_clear` (fp9b fullscreen transitions: 1513 calls x 367 µs
+        // = 555 ms of drain). Above the fill threshold the row loop goes to the
+        // pool's helpers by row ranges (design §8.7 / C6), executing whatever
+        // colour CLEAR_ROW / the encoding chose without re-deciding anything.
+        // Everything else — small clears, a fragmented span, no pool, the
+        // switch off — keeps today's serial writer, byte for byte.
+        let ok = match draw::write_gva_frame_within_par(
             state,
             host,
             task_id,
@@ -6734,10 +6742,23 @@ fn apply_clear<M: HostMemory + HostOps>(
             c0.height,
             c0.row_stride,
             c0.format,
-            frame,
-            None,
-        )
-        .is_ok();
+            &frame,
+        ) {
+            Some(res) => res.is_ok(),
+            None => draw::write_gva_frame_within(
+                state,
+                host,
+                task_id,
+                c0.target_gva,
+                c0.width,
+                c0.height,
+                c0.row_stride,
+                c0.format,
+                frame,
+                None,
+            )
+            .is_ok(),
+        };
         if ok {
             crate::runtime::surface_cache::forget_gva_copies(
                 state,
