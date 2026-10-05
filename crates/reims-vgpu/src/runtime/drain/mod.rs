@@ -7755,6 +7755,90 @@ fn note_unimplemented(
     state.record_fail_once(ev, u64::from(packet.opcode));
 }
 
+/// TEMP (lab): how long a rung child ring whose domain no channel definition
+/// has opened yet is left unread, waiting for the root ring that carries the
+/// definition; past it the ring is read as before (and its packets refused).
+const UNDEFINED_CHILD_HOLD_US: u64 = 500_000;
+
+/// TEMP (lab): per channel, when [`hold_undefined_child`] started holding its
+/// ring (µs on the crate clock); 0 none; `u64::MAX` gave up until it opens.
+static UNDEFINED_CHILD_HELD: [std::sync::atomic::AtomicU64; MAX_CHANNELS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MAX_CHANNELS];
+
+/// TEMP (lab): the channels [`hold_undefined_child`] holds now.
+/// [`fold_rung_child_doorbells`] adds them to every pass's pending set, which a
+/// refill would otherwise drop for a channel it has already served.
+static UNDEFINED_CHILD_MASK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// TEMP (lab, `REIMS_VGPU_LAB_HOLD_UNDEFINED`, on unless `=off`): leave a rung
+/// child ring unread while its domain is not open yet.
+///
+/// The guest defines a channel on the root ring and then rings the child's own
+/// doorbell, which is lock-free; a child rung while a pass runs is served by
+/// that pass's refill (or by the control-ring preempt), and the root ring with
+/// the definition only at the next pass. The child's first packet was then
+/// refused as `ChannelNotOpen` and its work dropped: on the home rig the
+/// display ring's first packet (ch5 opcode 0x1, the display's shared-state
+/// setup) went that way in 3 of ~12 boots (hq046 wp0a, hq048 pt1a, hq049 pa0a,
+/// `child_doorbell_refill=1` in the first window) — WindowServer ran, the
+/// display never came online, no frame was ever presented. Held, the bit stays
+/// pending and the root ring is asked for first, so the next pass reads the
+/// definition before the packet. A domain still undefined after
+/// [`UNDEFINED_CHILD_HOLD_US`] is read as before.
+fn hold_undefined_child<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    channel_id: u32,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Off under `cargo test` unless asked for: the fixtures drive rings on
+    // domains they never define and assert the refusal.
+    let on = *ON.get_or_init(|| match std::env::var("REIMS_VGPU_LAB_HOLD_UNDEFINED") {
+        Ok(v) => v != "off",
+        Err(_) => !cfg!(test),
+    });
+    let Some(held) = UNDEFINED_CHILD_HELD.get(channel_id as usize) else {
+        return false;
+    };
+    if !on {
+        return false;
+    }
+    let bit = 1u32 << channel_id;
+    if state.child_domain_open(channel_id) {
+        held.store(0, Relaxed);
+        UNDEFINED_CHILD_MASK.fetch_and(!bit, Relaxed);
+        return false;
+    }
+    let now = crate::observe::elapsed_us().max(1);
+    let since = held.load(Relaxed);
+    if since == u64::MAX {
+        return false;
+    }
+    if since == 0 {
+        held.store(now, Relaxed);
+        if crate::observe::first_sight("child_undefined_held", u64::from(channel_id)) {
+            crate::observe::fail(format!(
+                "child_undefined_held ch={channel_id} (rung before any channel definition \
+                 opened it; its ring is left unread and the root ring asked for first, \
+                 up to {} ms)",
+                UNDEFINED_CHILD_HOLD_US / 1000
+            ));
+        }
+    } else if now.saturating_sub(since) >= UNDEFINED_CHILD_HOLD_US {
+        held.store(u64::MAX, Relaxed);
+        UNDEFINED_CHILD_MASK.fetch_and(!bit, Relaxed);
+        note_store_route("child_undefined_hold_expired");
+        return false;
+    }
+    note_store_route("child_undefined_held");
+    UNDEFINED_CHILD_MASK.fetch_or(bit, Relaxed);
+    state.pending.child_mask |= bit;
+    state.pending.main_drain = true;
+    host.schedule_bh();
+    true
+}
+
 /// Drain one child channel.
 pub fn drain_child_fifo<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -7770,6 +7854,9 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     let Some(regs_off) = child_reg_block_offset(channel_id) else {
         return;
     };
+    if hold_undefined_child(state, host, channel_id) {
+        return;
+    }
     let setup_started = std::time::Instant::now();
     let regs_gpa = state.pfn_gpa(state.gfx.root_page) + regs_off;
     // Where the shim's doorbell for this channel reads the tail before it opens
@@ -9287,7 +9374,8 @@ pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
     let rung = state
         .gfx
         .child_doorbell_rung
-        .swap(0, std::sync::atomic::Ordering::AcqRel);
+        .swap(0, std::sync::atomic::Ordering::AcqRel)
+        | UNDEFINED_CHILD_MASK.load(std::sync::atomic::Ordering::Relaxed);
     if rung == 0 {
         return;
     }
