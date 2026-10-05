@@ -78,6 +78,9 @@ pub fn enabled() -> bool {
 /// window their counters on the same process-monotonic clock that stamps every
 /// line — no second time base to reconcile against `t=`.
 pub fn elapsed_ms() -> u128 {
+    if let Some(ns) = fast_clock::elapsed_ns() {
+        return u128::from(ns / 1_000_000);
+    }
     T0.get_or_init(std::time::Instant::now)
         .elapsed()
         .as_millis()
@@ -90,12 +93,121 @@ pub fn elapsed_ms() -> u128 {
 /// pace something the guest measures need this one; `t=` stamps stay in
 /// milliseconds so line-class censuses keep working.
 pub fn elapsed_us() -> u64 {
+    if let Some(ns) = fast_clock::elapsed_ns() {
+        return ns / 1000;
+    }
     T0.get_or_init(std::time::Instant::now)
         .elapsed()
         .as_micros() as u64
 }
 
 static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// TEMP (lab, `REIMS_VGPU_LAB_FAST_CLOCK=on`): the process clock read from the
+/// time-stamp counter instead of `Instant`.
+///
+/// `Instant::now().elapsed().as_micros()` is a QueryPerformanceCounter call and
+/// a 128-bit `Duration` division per read, and the drain's lab telemetry reads
+/// this clock hundreds of thousands of times a second: in Intel full-screen
+/// transitions `now`, `elapsed` and `RtlQueryPerformanceCounter` held ~10 % of
+/// the drain thread's samples (p004), ~3 % in windowed glass. Here a read is
+/// one `rdtsc`, a 64x64 multiply and a shift, against a tick rate measured
+/// once against `Instant` over the first 200 ms (reads before that take the
+/// `Instant` path, and the first fast read continues from it). Invariant,
+/// synchronized TSCs are what both lab hosts have; anywhere else, or with the
+/// switch unset, nothing changes.
+mod fast_clock {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::{Acquire, Relaxed, Release}};
+
+    /// 0 undecided, 1 off, 2 calibrating, 3 on, 4 one thread finishing the calibration.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    static TSC0: AtomicU64 = AtomicU64::new(0);
+    /// Nanoseconds per tick, fixed point with 32 fraction bits.
+    static MULT: AtomicU64 = AtomicU64::new(0);
+    /// `T0`-relative nanoseconds at `TSC0`.
+    static NS0: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn tsc() -> u64 {
+        // SAFETY: `rdtsc` has no preconditions on x86_64.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub(super) fn elapsed_ns() -> Option<u64> {
+        match STATE.load(Acquire) {
+            3 => {
+                let ticks = tsc().saturating_sub(TSC0.load(Relaxed));
+                let ns = ((u128::from(ticks) * u128::from(MULT.load(Relaxed))) >> 32) as u64;
+                Some(NS0.load(Relaxed) + ns)
+            }
+            1 | 4 => None,
+            _ => calibrate(),
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline]
+    pub(super) fn elapsed_ns() -> Option<u64> {
+        None
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[cold]
+    fn calibrate() -> Option<u64> {
+        let t0 = super::T0.get_or_init(std::time::Instant::now);
+        if STATE.load(Relaxed) == 0 {
+            let on = !cfg!(test)
+                && std::env::var("REIMS_VGPU_LAB_FAST_CLOCK").is_ok_and(|v| v == "on");
+            if !on {
+                STATE.store(1, Relaxed);
+                return None;
+            }
+            if STATE.compare_exchange(0, 4, Relaxed, Relaxed).is_ok() {
+                NS0.store(t0.elapsed().as_nanos() as u64, Relaxed);
+                TSC0.store(tsc(), Relaxed);
+                STATE.store(2, Release);
+            }
+            return None;
+        }
+        if STATE.load(Acquire) != 2 {
+            return None;
+        }
+        let ns0 = NS0.load(Relaxed);
+        let tsc0 = TSC0.load(Relaxed);
+        // The Instant read and the counter read back to back; the pair with the
+        // shortest gap of three, so a preemption between them is not measured.
+        let mut best = (u64::MAX, 0u64, 0u64);
+        for _ in 0..3 {
+            let a = tsc();
+            let ns = t0.elapsed().as_nanos() as u64;
+            let b = tsc();
+            if b - a < best.0 {
+                best = (b - a, ns, a + (b - a) / 2);
+            }
+        }
+        let (_, ns, at) = best;
+        if ns < ns0 + 200_000_000 || at <= tsc0 {
+            return None;
+        }
+        if STATE.compare_exchange(2, 4, Acquire, Relaxed).is_err() {
+            return None;
+        }
+        let mult = ((u128::from(ns - ns0) << 32) / u128::from(at - tsc0)) as u64;
+        if mult == 0 {
+            STATE.store(1, Release);
+            return None;
+        }
+        MULT.store(mult, Relaxed);
+        // Continue from the calibration point exactly: the base is moved to it.
+        NS0.store(ns, Relaxed);
+        TSC0.store(at, Relaxed);
+        STATE.store(3, Release);
+        None
+    }
+}
 
 /// Sink paths. Test runs write per-process files instead of the product
 /// `/tmp/reims-vgpu-fail.log`: `cargo test` runs on the same machine as live product
