@@ -130,3 +130,29 @@ pub(crate) fn on_efficiency_core() -> bool {
     let cpu = unsafe { GetCurrentProcessorNumber() } as usize;
     table().get(cpu).copied().unwrap_or(false)
 }
+
+/// TEMP (lab, `REIMS_VGPU_LAB_DEVICE_PRIO=on`): the calling device thread runs at above-normal priority, ahead of
+/// the vCPU threads. With 24 vCPUs on a 28-thread host the device's helpers (the parallel pool, the recorder, the
+/// submit and stamp threads) compete with the guest for cores, and n217's heavy-glass profile had the drain
+/// waiting on them for a quarter of its time (pool joins 8.8 %, dirty-sync workers 6 %, deferred-draw settles
+/// 9 %). The drain alone at above normal (HIQOS) was neutral at 8 vCPUs (2026-10-01/02).
+pub(crate) fn device_thread_priority(who: &str) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DEVICE_PRIO").is_ok_and(|v| v == "on")) {
+        return;
+    }
+    extern "system" {
+        fn SetThreadPriority(h: *mut core::ffi::c_void, p: i32) -> i32;
+    }
+    /// THREAD_PRIORITY_ABOVE_NORMAL.
+    const ABOVE_NORMAL: i32 = 1;
+    // SAFETY: the pseudo handle of the calling thread.
+    if unsafe { SetThreadPriority(GetCurrentThread(), ABOVE_NORMAL) } != 0
+        && crate::observe::first_sight(
+            "lab_device_prio",
+            who.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b))),
+        )
+    {
+        crate::observe::off(format!("lab_device_prio {who}"));
+    }
+}

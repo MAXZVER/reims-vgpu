@@ -391,7 +391,10 @@ impl StampCompletion {
         let thread_device = device.clone();
         let join = std::thread::Builder::new()
             .name("reims-vgpu-stamp".into())
-            .spawn(move || run(&thread_device, semaphore, &thread_shared))
+            .spawn(move || {
+                crate::lab_cores::device_thread_priority("stamp");
+                run(&thread_device, semaphore, &thread_shared)
+            })
             .map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
         Ok(Self {
             shared,

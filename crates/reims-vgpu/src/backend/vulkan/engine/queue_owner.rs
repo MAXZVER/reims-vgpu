@@ -130,6 +130,7 @@ impl QueueOwner {
         let join = std::thread::Builder::new()
             .name("reims-vgpu-submit".into())
             .spawn(move || {
+                crate::lab_cores::device_thread_priority("submit");
                 run(
                     &thread_device,
                     queue,

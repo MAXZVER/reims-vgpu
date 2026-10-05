@@ -364,6 +364,7 @@ impl Handoff {
         apply_thread_priority(priority);
         #[cfg(windows)]
         crate::lab_cores::pin_to_performance_cores(self.name);
+        crate::lab_cores::device_thread_priority(self.name);
         if std::ptr::eq(self, &DRAW) {
             mark_recorder_thread();
             #[cfg(windows)]
