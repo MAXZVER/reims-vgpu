@@ -117,6 +117,9 @@ fn lab_debt_hard_cap() -> usize {
 /// image alive, so the room is bounded, and the hard cap is four times further.
 /// Latched; off under test.
 fn lab_trim_settle() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("TRIM_SETTLE") {
+        return on;
+    }
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -1112,6 +1115,11 @@ pub fn pay_cpu_shared_mapping<M: HostMemory + HostOps>(
 /// animation the ledger would reach its hard cap and evict inside draws.)
 /// Latched.
 fn lab_pay_settle_us() -> u64 {
+    if let Some(ms) =
+        crate::runtime::lab_live::value("PAY_SETTLE_MS").and_then(|v| v.parse::<u64>().ok())
+    {
+        return ms.min(5000) * 1000;
+    }
     use std::sync::OnceLock;
     static US: OnceLock<u64> = OnceLock::new();
     *US.get_or_init(|| {
