@@ -88,7 +88,9 @@ fn lab_debt_trim() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("REIMS_VGPU_LAB_DEBT_TRIM").map_or(true, |v| v != "off");
+        // Off under test: the ledger's own tests pin the synchronous bound.
+        let on = !cfg!(test)
+            && std::env::var("REIMS_VGPU_LAB_DEBT_TRIM").map_or(true, |v| v != "off");
         crate::observe::off(format!("lab_debt_trim on={on}"));
         on
     })
@@ -103,9 +105,31 @@ fn lab_debt_hard_cap() -> usize {
     }
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_TRIM_SETTLE=on`): the trim follows PAY_SETTLE.
+///
+/// With pay-after-stamp held back while the screen moves, the presented frames'
+/// debts reach the trim instead, and it paid up to 16 of them at a tranche end
+/// on the drain: in fc0a's Safari transitions the display channel's doorbell
+/// rang during a trim 30 times and waited 18 ms each, WindowServer waiting on
+/// that swap. While frames are being presented the ledger may grow to twice
+/// its bound and is paid one debt a tranche end past that; once the screen
+/// settles the trim pays back to the bound as before. An unpaid debt keeps its
+/// image alive, so the room is bounded, and the hard cap is four times further.
+/// Latched; off under test.
+fn lab_trim_settle() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = !cfg!(test)
+            && std::env::var("REIMS_VGPU_LAB_TRIM_SETTLE").is_ok_and(|v| v == "on");
+        crate::observe::off(format!("lab_trim_settle on={on}"));
+        on
+    })
+}
+
 /// TEMP (lab): pay the oldest surface debts down to [`lab_max_debts`] at a
 /// tranche end, at most 16 at a time, yielding (up to 8 tranche ends in a row)
-/// while a doorbell is already rung. See [`lab_debt_trim`].
+/// while a doorbell is already rung. See [`lab_debt_trim`], [`lab_trim_settle`].
 pub fn lab_trim_debts<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -121,12 +145,19 @@ pub fn lab_trim_debts<M: HostMemory + HostOps>(
         YIELDS.store(0, Relaxed);
         return;
     }
+    // TEMP (lab TRIM_SETTLE): while the screen moves, room up to twice the bound
+    // and one payment a tranche end past it.
+    let moving = lab_trim_settle() && lab_pay_settling();
+    if moving && state.pending_writebacks.debts.len() <= cap * 2 {
+        crate::runtime::drain::note_store_route("wbdebt_trim_settle_wait");
+        return;
+    }
     if guest_waiting && YIELDS.fetch_add(1, Relaxed) < 8 {
         crate::runtime::drain::note_store_route("wbdebt_trim_yielded");
         return;
     }
     YIELDS.store(0, Relaxed);
-    for _ in 0..16 {
+    for _ in 0..if moving { 1 } else { 16 } {
         if state.pending_writebacks.debts.len() <= cap {
             break;
         }
@@ -1063,8 +1094,10 @@ pub fn pay_cpu_shared_mapping<M: HostMemory + HostOps>(
     }
 }
 
-/// TEMP (lab, `REIMS_VGPU_LAB_PAY_SETTLE_MS=N`, 0 = off): no coherence work while
-/// the screen moves. A presented frame is left owed (`pay_cpu_shared_mapping`)
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_SETTLE_MS=N`, 250 by default since hq052, 0 = off):
+/// no coherence work while the screen moves. hq052 (AMD, x2 interleaved): Finder
+/// transitions 43 / 52 frames a burst against 31 / 39, Safari and windowed glass
+/// unchanged (per-burst max gaps alike apart from the first burst after the scene). A presented frame is left owed (`pay_cpu_shared_mapping`)
 /// on every frame of an animation and [`lab_pay_after_stamp`] paid it after the
 /// stamp, on the drain while the guest builds its next frame: on Intel ~2.2 ms of a 16.7 ms
 /// full-screen transition frame (vp24), and with no payment at all
@@ -1085,7 +1118,8 @@ fn lab_pay_settle_us() -> u64 {
         let ms = std::env::var("REIMS_VGPU_LAB_PAY_SETTLE_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .map_or(0, |v| v.min(5000));
+            // Off under test: the unit tests pin the pay-after-stamp ledger as it was.
+            .map_or(if cfg!(test) { 0 } else { 250 }, |v| v.min(5000));
         crate::observe::off(format!("lab_pay_settle ms={ms}"));
         ms * 1000
     })

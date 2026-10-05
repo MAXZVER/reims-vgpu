@@ -98,6 +98,12 @@ cfgs = [
     ('wp calm=off: wp nopause, ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_CALM': 'off'}), '0'),
     ('wp calm=off: wp nopause + wp_hole, ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_HOLE': 'on', G + 'DIRTY_WP_CALM': 'off'}), '0'),
     ('wp calm, real age floor: wp nopause, ring + hole=tail', dict(NAMED, **RING, **{k: v for k, v in WP.items() if k != G + 'DIRTY_WP_AGE_MS'}, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on'}), '0'),
+    # TEMP lab DIRTY_WP_MERGE (on by default): merged give-backs and whole-set fault give-backs; the merge marks only the
+    # runs, which holds under the measured WHPX remap (RW->RW keeps its bits, the stress default). The CONTROL drops them.
+    ('wp merge (hv keeps RW->RW): wp nopause', dict(WP, STRESS_WP_NOPAUSE='1', STRESS_HV_KEEP_RW='1', **{G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_MERGE': 'on'}), '0'),
+    ('wp merge gap 1 (hv keeps RW->RW): every set, 1 clean sync', dict(WP, STRESS_WP_NOPAUSE='1', STRESS_HV_KEEP_RW='1', **{G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_MERGE': 'on', G + 'DIRTY_WP_MERGE_GAP': '1', G + 'DIRTY_WP_MIN': '1', G + 'DIRTY_WP_STREAK': '1'}), '0'),
+    ('DEFAULTS + wp merge (hv keeps RW->RW): ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', STRESS_HV_KEEP_RW='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_MERGE': 'on'}), '0'),
+    ('CONTROL: wp merge with the worst-case hv (RW->RW drops)', dict(WP, STRESS_WP_NOPAUSE='1', STRESS_HV_KEEP_RW='0', **{G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_MERGE': 'on', G + 'DIRTY_WP_MIN': '1', G + 'DIRTY_WP_STREAK': '1'}), '?'),
 ]
 ORIGINAL = {G + 'DIRTY_STEAL': 'off', G + 'GEN_LOCKFREE': 'off', G + 'EPOCH_NAMED': 'off', G + 'DIRTY_HOLE': 'off'}
 KEYS = ('steals', 'steal_same', 'steal_late', 'memo_hit', 'memo_fresh', 'memo_diff', 'memo_bad', 'unnamed_skipped',

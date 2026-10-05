@@ -71,12 +71,16 @@ static uint32_t rnd(uint32_t *st)
  * query is exact. Writers are the "vCPUs": a store into a read-only page first goes to the fault hook,
  * which must make it writable; pause_all_vcpus waits for every store in flight and holds new ones.
  * STRESS_WP_NOPAUSE=1 is the control: pausing does nothing, so protects race the writers.
+ * STRESS_HV_KEEP_RW (1 by default) models what WHPX measurably does (scratchpad whpover.c: Intel 2026-10-01,
+ * AMD 2026-10-05): a writable remap over a page that is already writable keeps its dirty bit; only RW->RO
+ * drops it. =0 is the worst case, every remap dropping (DIRTY_WP_MERGE then loses its gap pages' bits).
  */
 bool (*whpx_wp_fault_hook)(uint64_t gpa);
 void (*whpx_wp_invalidate_hook)(void);
 static uint8_t hv_ro[NPAGES];
 static uint64_t n_wp_faults, n_wp_remaps;
 static int cfg_wp_nopause;
+static int cfg_hv_keep_rw;     /* STRESS_HV_KEEP_RW */
 static int cfg_packet_scope;   /* STRESS_PACKET_SCOPE: the drain scopes each packet to its channel */
 static QemuMutex vg_lock;
 static QemuCond vg_cond;
@@ -87,7 +91,9 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
     uint64_t pg;
 
     for (pg = gpa / PAGE; pg < (gpa + size) / PAGE && pg < NPAGES; pg++) {
-        qatomic_set(&hv_dirty[pg], 0);
+        if (!(cfg_hv_keep_rw && writable && !qatomic_read(&hv_ro[pg]))) {
+            qatomic_set(&hv_dirty[pg], 0);
+        }
         qatomic_set(&hv_ro[pg], !writable);
     }
     qatomic_inc(&n_wp_remaps);
@@ -747,6 +753,7 @@ int main(int argc, char **argv)
     cfg_hole_us = (e = getenv("STRESS_HOLE_US")) ? atoi(e) : 40;
     nsets = (e = getenv("STRESS_SETS")) ? MIN(atoi(e), MAXSETS) : 16;
     cfg_wp_nopause = (e = getenv("STRESS_WP_NOPAUSE")) ? atoi(e) : 0;
+    cfg_hv_keep_rw = (e = getenv("STRESS_HV_KEEP_RW")) ? atoi(e) : 1;
     cfg_packet_scope = (e = getenv("STRESS_PACKET_SCOPE")) ? atoi(e) : 0;
     qemu_mutex_init(&vg_lock);
     qemu_cond_init(&vg_cond);
