@@ -3471,16 +3471,25 @@ impl CbBind {
 
 /// 128-bit content fingerprint for the sampled cache.
 ///
-/// The sampled cache matches an incoming blob to a retained VkImage by this
-/// fingerprint alone — it no longer keeps a byte copy to `memcmp` against, so
-/// the width must make an accidental collision (different content, identical
-/// digest, identical geometry/format key) astronomically unlikely: at 128 bits
-/// the birthday bound across the 64-entry cache is ~2^-116, far below the host
-/// GPU's own soft-error rate. Two independently salted `DefaultHasher`
-/// (SipHash-1-3) passes over the *warm* source bytes are still strictly cheaper
-/// than the old one-hash-plus-cold-full-frame-`memcmp` (which pulled the
-/// retained 8 MiB copy back through DRAM on every hit).
+/// A bucket, not an identity: a fingerprint match only proposes the candidate,
+/// and the retained bytes decide the hit (`find_cached_sampled`) and the
+/// duplicate (`admit_sampled_entry`), so a collision costs a compare and can
+/// never serve the wrong image. What matters here is speed — every sampled
+/// upload the identity path misses is hashed whole, on the recorder or the
+/// drain. Two salted `DefaultHasher` (SipHash-1-3) passes ran at ~0.6 GB/s:
+/// tens of microseconds an icon, milliseconds a frame-sized texture, and p012's
+/// Finder transitions had the drain waiting on a full recorder queue for a
+/// quarter of its draw time. Four xxh64-style lanes run several times faster.
+/// TEMP (lab, `REIMS_VGPU_LAB_SAMPLED_FASTHASH=off`): the SipHash pair, for the
+/// A/B.
 fn sampled_content_hash(bytes: &[u8]) -> u128 {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fast = *FAST.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_SAMPLED_FASTHASH").as_deref() != Ok("off")
+    });
+    if fast {
+        return sampled_content_hash_lanes(bytes);
+    }
     let mut lo = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut lo);
     let mut hi = std::collections::hash_map::DefaultHasher::new();
@@ -3489,6 +3498,71 @@ fn sampled_content_hash(bytes: &[u8]) -> u128 {
     hi.write_u64(0x9e37_79b9_7f4a_7c15);
     bytes.hash(&mut hi);
     ((hi.finish() as u128) << 64) | lo.finish() as u128
+}
+
+/// [`sampled_content_hash`]'s fast arm: four multiply-rotate lanes over 32-byte
+/// stripes (the xxh64 round and primes), the tail folded into a fifth, and two
+/// differently mixed finalizations for the two halves.
+fn sampled_content_hash_lanes(bytes: &[u8]) -> u128 {
+    const P1: u64 = 0x9E37_79B1_85EB_CA87;
+    const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const P3: u64 = 0x1656_67B1_9E37_79F9;
+    const P4: u64 = 0x85EB_CA77_C2B2_AE63;
+    #[inline(always)]
+    fn round(acc: u64, lane: u64) -> u64 {
+        acc.wrapping_add(lane.wrapping_mul(P2))
+            .rotate_left(31)
+            .wrapping_mul(P1)
+    }
+    #[inline(always)]
+    fn avalanche(mut h: u64) -> u64 {
+        h ^= h >> 33;
+        h = h.wrapping_mul(P2);
+        h ^= h >> 29;
+        h = h.wrapping_mul(P3);
+        h ^ (h >> 32)
+    }
+    #[inline(always)]
+    fn word(c: &[u8]) -> u64 {
+        u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
+    }
+    let mut acc = [P1.wrapping_add(P2), P2, 0, 0u64.wrapping_sub(P1)];
+    let mut stripes = bytes.chunks_exact(32);
+    for s in &mut stripes {
+        acc[0] = round(acc[0], word(&s[0..8]));
+        acc[1] = round(acc[1], word(&s[8..16]));
+        acc[2] = round(acc[2], word(&s[16..24]));
+        acc[3] = round(acc[3], word(&s[24..32]));
+    }
+    let rest = stripes.remainder();
+    let mut words = rest.chunks_exact(8);
+    let mut tail = P4;
+    for w in &mut words {
+        tail = round(tail, word(w));
+    }
+    let mut last = 0u64;
+    for (i, &b) in words.remainder().iter().enumerate() {
+        last |= u64::from(b) << (8 * i);
+    }
+    tail = round(tail ^ rest.len() as u64, last);
+    let len = bytes.len() as u64;
+    let lo = avalanche(
+        acc[0].rotate_left(1)
+            ^ acc[1].rotate_left(7)
+            ^ acc[2].rotate_left(12)
+            ^ acc[3].rotate_left(18)
+            ^ tail
+            ^ len,
+    );
+    let hi = avalanche(
+        acc[3].wrapping_mul(P3)
+            ^ acc[2].rotate_left(23)
+            ^ acc[1].wrapping_mul(P4)
+            ^ acc[0].rotate_left(41)
+            ^ tail.rotate_left(17)
+            ^ len.wrapping_mul(P1),
+    );
+    (u128::from(hi) << 64) | u128::from(lo)
 }
 
 /// Which pool asked for a `vkAllocateMemory`.
