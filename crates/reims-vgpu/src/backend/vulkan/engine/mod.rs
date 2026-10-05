@@ -2691,7 +2691,7 @@ pub fn prepare_window_resident_present(
     if scanout_snapshot_on() {
         if let Some(ctx) = owner.ctx.as_ref() {
             if let Some(snapshot) = unsafe {
-                snapshot_window_source(ctx, pools, decision.resolved, identity)
+                snapshot_window_source(ctx, pools, counters, decision.resolved, identity)
             } {
                 crate::runtime::drain::note_store_route("scanout_snapshot_n");
                 let mut decision = decision;
@@ -2717,12 +2717,8 @@ fn scanout_snapshot_on() -> bool {
 struct WindowSnapshotImage {
     image: ash::vk::Image,
     memory: ash::vk::DeviceMemory,
-    cmd_pool: ash::vk::CommandPool,
-    cmd: ash::vk::CommandBuffer,
-    fence: ash::vk::Fence,
     width: u32,
     height: u32,
-    first: bool,
 }
 
 fn window_snapshot() -> &'static std::sync::Mutex<Option<WindowSnapshotImage>> {
@@ -2742,27 +2738,27 @@ fn window_snapshot() -> &'static std::sync::Mutex<Option<WindowSnapshotImage>> {
 unsafe fn snapshot_window_source(
     ctx: &context::DeviceContext,
     pools: &mut pools::ResourcePools,
+    counters: &EngineCounters,
     resolved: pools::ResolvedResident,
     identity: &TargetIdentity,
 ) -> Option<pools::ResolvedResident> {
     use ash::vk::ImageLayout;
-    // The readback rails' discipline (see `read_target_inner`): the copy drives
-    // the resident's barriers FROM the registry's tracked access, LEAVES it in
-    // the transfer-read state the copy ends in, and SAYS SO through
-    // `registry_note_access` — which moves the window epoch, and the
-    // presenter's epoch check + re-resolve are built for exactly that (the
-    // pay-after-stamp readback does this every present). The first cut of this
-    // prototype restored the old access without telling the registry, so its
-    // layout transitions collided with the presenter's concurrent blits on the
-    // same image — invalid transitions, and n247 wedged the queue after three
-    // publishes. Every wait here is bounded; on any timeout the caller serves
-    // the live resident and counts `scanout_snapshot_stall_n` — the drain can
-    // no longer be held hostage by this knob.
+    // Iteration 7: the submission goes through the engine's own doors —
+    // append to the open draw batch when one is recording, else
+    // `begin_entry`/`submit_queue_work`/`seal_entry`, the exact sequence
+    // `copy_image_level0_to_host` uses. The first two cuts submitted a private
+    // command buffer straight to `ctx.queue()`, bypassing the queue owner that
+    // serializes this host's submissions: n247/n249 both wedged the drain
+    // right after the publish's own batch machinery met a submission it did
+    // not make (scanout_snapshot_n=3 = the boot's extent ladder; the device's
+    // own vbl loop ran on for minutes while the drain never returned).
+    // There is no fence to wait on at all now: queue order alone orders the
+    // copy ahead of every later presenter blit, and the ring the entry rides
+    // is the one the engine already retires by the thousand per boot.
     let format = identity.resident_format();
     let mut guard = window_snapshot().lock().unwrap_or_else(|e| e.into_inner());
-    // Extent change: the old objects are retired by leaking (a TEMP prototype;
-    // counted), because `device_wait_idle` under the engine lock is the wedge
-    // shape this iteration exists to remove.
+    // Extent change: the old image is retired by leaking (a TEMP prototype;
+    // counted) — no queue interaction on the change path at all.
     let needs = guard
         .as_ref()
         .map_or(true, |s| s.width != resolved.width || s.height != resolved.height);
@@ -2818,82 +2814,36 @@ unsafe fn snapshot_window_source(
             }
             return None;
         }
-        let cmd_pool = unsafe {
-            ctx.device.create_command_pool(
-                &ash::vk::CommandPoolCreateInfo::default()
-                    .flags(ash::vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                None,
-            )
-        }
-        .ok()?;
-        let cmd = unsafe {
-            ctx.device.allocate_command_buffers(
-                &ash::vk::CommandBufferAllocateInfo::default()
-                    .command_pool(cmd_pool)
-                    .level(ash::vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .ok()
-        .and_then(|mut cmds| cmds.pop())?;
-        // Signalled: the first re-record must not wait on a never-submitted fence.
-        let fence = unsafe {
-            ctx.device.create_fence(
-                &ash::vk::FenceCreateInfo::default()
-                    .flags(ash::vk::FenceCreateFlags::SIGNALED),
-                None,
-            )
-        }
-        .ok()?;
         *guard = Some(WindowSnapshotImage {
             image,
             memory,
-            cmd_pool,
-            cmd,
-            fence,
             width: resolved.width,
             height: resolved.height,
-            first: true,
         });
     }
-    let s = guard.as_mut()?;
-    if !s.first {
-        // Bounded: 5 ms slices, 200 ms ceiling — a 5K copy is ~1-2 ms of GPU;
-        // anything past the ceiling is a stall the caller survives by serving
-        // the live resident, named in the census rather than wedging the drain.
-        let mut waited = 0u64;
-        loop {
-            match unsafe { ctx.device.wait_for_fences(&[s.fence], true, 5_000_000) } {
-                Ok(_) => break,
-                Err(ash::vk::Result::TIMEOUT) => {
-                    waited += 5;
-                    if waited >= 200 {
-                        crate::runtime::drain::note_store_route("scanout_snapshot_stall_n");
-                        return None;
-                    }
-                }
-                Err(_) => return None,
-            }
-        }
-        if unsafe { ctx.device.reset_fences(&[s.fence]) }.is_err() {
-            return None;
-        }
+    let s = guard.as_ref()?;
+
+    // The engine's own submission doors, in the readback rail's exact order.
+    let ops = target_readback_ops();
+    let appended = pools.batch_open_recording();
+    let own_cb = appended.is_none();
+    let (cb, fence) = match appended {
+        Some(pair) => pair,
+        None => pools.begin_entry(ctx, counters).ok()?,
+    };
+    let _ = &fence; // sealed below for the own-cb path; the appended path rides the batch's
+    if own_cb {
+        unsafe {
+            pools
+                .begin_slot_recording(ctx, cb, gpu_span::Kind::Readback, ops.reset_cb, ops.begin_cb)
+                .ok()?
+        };
     }
-    let device = &ctx.device;
-    unsafe { device.reset_command_buffer(s.cmd, ash::vk::CommandBufferResetFlags::empty()) }
-        .ok()?;
-    unsafe {
-        device.begin_command_buffer(
-            s.cmd,
-            &ash::vk::CommandBufferBeginInfo::default()
-                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )
-    }
-    .ok()?;
+    unsafe { pools.close_open_pass(&ctx.device, cb) };
     let (src_stage, src_access) = resolved.access.source_scope();
     let src_layout = resolved.access.layout();
     // The resident's resting state after the copy — the same spelling the
-    // readback rails leave and record.
+    // readback rails leave and record (`registry_note_access` below).
     let rest_access = pools::ResidentAccess::transfer_read(resolved.guest_imported);
     let rest_layout = rest_access.layout();
     let subresource = ash::vk::ImageSubresourceRange {
@@ -2913,14 +2863,10 @@ unsafe fn snapshot_window_source(
             .src_access_mask(sa)
             .dst_access_mask(da)
     };
-    let snap_old = if s.first {
-        ImageLayout::UNDEFINED
-    } else {
-        ImageLayout::TRANSFER_SRC_OPTIMAL
-    };
+    let device = &ctx.device;
     unsafe {
         device.cmd_pipeline_barrier(
-            s.cmd,
+            cb,
             src_stage,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::DependencyFlags::empty(),
@@ -2935,7 +2881,7 @@ unsafe fn snapshot_window_source(
             )],
         );
         device.cmd_pipeline_barrier(
-            s.cmd,
+            cb,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::DependencyFlags::empty(),
@@ -2943,14 +2889,14 @@ unsafe fn snapshot_window_source(
             &[],
             &[barrier(
                 s.image,
-                snap_old,
+                ImageLayout::UNDEFINED,
                 ImageLayout::TRANSFER_DST_OPTIMAL,
                 ash::vk::AccessFlags::TRANSFER_WRITE,
                 ash::vk::AccessFlags::TRANSFER_WRITE,
             )],
         );
         device.cmd_copy_image(
-            s.cmd,
+            cb,
             resolved.image,
             ImageLayout::TRANSFER_SRC_OPTIMAL,
             s.image,
@@ -2975,7 +2921,7 @@ unsafe fn snapshot_window_source(
         // The resident rests in the transfer-read state, exactly as the
         // readback rails leave it...
         device.cmd_pipeline_barrier(
-            s.cmd,
+            cb,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::DependencyFlags::empty(),
@@ -2990,9 +2936,11 @@ unsafe fn snapshot_window_source(
             )],
         );
         // ...and the snapshot leaves as a transfer source, its copy published
-        // to every later transfer reader by this barrier.
+        // to every later transfer reader by this barrier. First use only:
+        // after this the image rests in TRANSFER_SRC_OPTIMAL, and the next
+        // copy's in-barrier is a no-op layout pair.
         device.cmd_pipeline_barrier(
-            s.cmd,
+            cb,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::DependencyFlags::empty(),
@@ -3006,18 +2954,26 @@ unsafe fn snapshot_window_source(
                 ash::vk::AccessFlags::TRANSFER_READ,
             )],
         );
-        device.end_command_buffer(s.cmd).ok()?;
     }
-    let cmds = [s.cmd];
-    let submit = ash::vk::SubmitInfo::default().command_buffers(&cmds);
-    if unsafe { device.queue_submit(ctx.queue(), &[submit], s.fence) }.is_err() {
-        return None;
+    if own_cb {
+        unsafe {
+            pools.gpu_span_seal_current(ctx, cb);
+            device
+                .end_command_buffer(cb)
+                .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))
+                .ok()?;
+            let cbs = [cb];
+            ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
+                .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))
+                .ok()?;
+            let sealed = pools.seal_entry(Vec::new(), Vec::new());
+            pools.finish_entry_async(&ctx.device, sealed);
+        }
     }
-    // Say what the copy left the resident in: the registry is the one source of
-    // truth for its layout, the epoch moves as it does for every readback, and
-    // the presenter's epoch check + re-resolve are built for exactly this.
+    // Say what the copy left the resident in: the registry is the one source
+    // of truth for its layout, the epoch moves as it does for every readback,
+    // and the presenter's epoch check + re-resolve are built for exactly this.
     pools.registry_note_access(identity, rest_access);
-    s.first = false;
     Some(pools::ResolvedResident {
         image: s.image,
         // "read" is the layout's own spelling for "sitting in
