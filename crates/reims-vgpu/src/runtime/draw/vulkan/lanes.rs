@@ -32,12 +32,34 @@
 //!
 //! # The lifetime
 //!
-//! One lane at a time, bounded: the most recently *admitted* EXEC of a task
-//! other than the one currently executing. An offer for the running task
-//! never evicts a cross-task lane (that is precisely the compositor-behind-
-//! Safari case); a newer EXEC of the lane's own task supersedes it; the lane
-//! is dropped when its task's packet has executed. The backlog is capped, so
-//! a task that never runs pins at most [`LANE_REF_CAP`] `Arc<TaskResource>`s.
+//! One lane *per task*, bounded to [`LANE_TASK_CAP`] tasks, chosen at take
+//! time rather than offer time. The n235 A/B is why: the drain admits and
+//! runs one packet at a time (`admit_and_park` then `settle_model_work`, per
+//! packet), so a single "newest offer" lane always held the task that was
+//! about to run — the very task `take_backlog` must skip — and
+//! `lanes_planned_n` never moved off zero while `lanes_retired_run` tracked
+//! `lanes_offer` one for one. With a lane per task, the first admitted
+//! cross-task EXEC survives beside the runner's own lane, and a scope of
+//! task A's pass plans task B's binds out of B's lane.
+//!
+//! The offer itself carries no resources and touches no guest memory: it
+//! scans the retained bind arenas (in-memory) and parks the raw refs. The
+//! `Arc<TaskResource>` each item needs is resolved at *take* time, on the
+//! drain, inside [`take_backlog`] — the same construction the owning task's
+//! walk would perform moments later (memoized in `task_resources`), so the
+//! work moves earlier by one pass rather than being added, and it is paid
+//! only for items that actually plan. n235's second lesson: resolving at
+//! offer time cost ~750k constructions a boot (every admitted EXEC, most
+//! lanes never planned) and took the windowed-glass scene from 193 to
+//! 95-135 Hz.
+//!
+//! A newer EXEC of a task supersedes that task's lane, and the oldest lane
+//! is evicted at the cap; a lane is **not** dropped when a packet of its
+//! task runs — retirement-by-task would conflate packets (a task with two
+//! queued EXECs holds its *newest* refs, and the older packet's run would
+//! destroy the newer one's plans), and every surviving plan still passes the
+//! serve-time validation a fresh one would. Offers for the task currently
+//! executing are ignored — its own chunks plan its refs.
 //!
 //! Unset (or `1`) is byte-for-byte today's path: no lane exists, no scope
 //! grows an item, no ask consults a store that is always empty.
@@ -61,6 +83,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// length), so this is a fence against a pathological packet, not a working
 /// set the lane expects to fill.
 const LANE_REF_CAP: usize = 64;
+
+/// The most tasks with lanes at once. Two is the measured transition shape
+/// (the app's render task and the compositor's); four leaves room for a
+/// compute or blit task beside them without the store growing with the
+/// guest's task count.
+const LANE_TASK_CAP: usize = 4;
 
 /// TEMP (lab): `REIMS_VGPU_LAB_DRAIN_LANES` — `2` opens the lane, unset and
 /// every other value are today's path. Latched, with a test override that
@@ -104,30 +132,24 @@ impl Drop for TestForceGuard {
     }
 }
 
-/// One backlog entry: the reference and the resource the drain resolved for
-/// it at offer time. The `Arc` is the identity the bind's validation will
-/// `ptr_eq` against when the lane's task runs — resolved on the drain, where
-/// construction is legal, exactly the way a PassPrep item carries its
-/// resource rather than letting a worker construct one.
-struct LaneRef {
-    texture_ref: u32,
-    resource: std::sync::Arc<crate::model::TaskResource>,
-}
-
-/// The lane itself: one task's not-yet-run EXEC, its unplanned backlog and
-/// the plans A's scopes have filled in.
+/// One task's lane: the unplanned refs of its most recently admitted EXEC,
+/// and the plans other tasks' scopes have filled in for them. The task is
+/// the slot's key, not a field — every rule below is "which task's lane",
+/// asked once.
 struct Lane {
-    task_id: u32,
-    backlog: VecDeque<LaneRef>,
+    backlog: VecDeque<u32>,
     planned: HashMap<u32, StreamPlan>,
 }
 
 thread_local! {
-    /// The one lane. Drain-thread state, like the pass-frame `STACK` it feeds:
-    /// every device entry point runs under the device lock on one thread.
-    static LANE: RefCell<Option<Lane>> = const { RefCell::new(None) };
+    /// The lanes, in first-offer order (the eviction order, and the take
+    /// order — an earlier-admitted task runs first). Drain-thread state, like
+    /// the pass-frame `STACK` it feeds: every device entry point runs under
+    /// the device lock on one thread.
+    static LANES: RefCell<Vec<(u32, Lane)>> = const { RefCell::new(Vec::new()) };
     /// The task whose EXEC the drain is inside right now, for the offer rule
-    /// (an offer for the running task never evicts a cross-task lane).
+    /// (an offer for the running task never installs: its own chunks plan
+    /// its refs).
     static RUNNING_TASK: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
@@ -145,20 +167,20 @@ fn note_discarded(n: u64) {
 /// Called on the drain at admission, where `arrived.submission` and the
 /// resolved work are both in hand and the move into `ParkedWork` has not
 /// happened yet. The scan reads the model's own bind arenas — the same data
-/// the runtime walk will bind one packet later — and resolves each distinct
-/// reference through [`crate::runtime::objects::resolve_resource`], which is
-/// the construction the walk's first bind of the reference would perform
-/// anyway. A reference that does not resolve is not offered: it has no
-/// identity to plan against.
+/// the runtime walk will bind one packet later — and parks the raw refs.
+/// **Nothing else happens here**: no guest reads, no resource construction,
+/// no model writes. n235 measured the earlier shape — resolve-at-offer, one
+/// construction per distinct ref per admitted EXEC — at ~750k constructions
+/// a boot, most for lanes that never planned, and it halved the windowed
+/// glass's frame rate. The `Arc<TaskResource>` identity an item needs is
+/// resolved at take time instead, inside [`take_backlog`], only for items
+/// that are about to plan.
 ///
-/// The replacement rules (see the module doc): the running task's packets
-/// never become the lane; a newer EXEC of the lane's own task supersedes it
-/// (its binds are the next ones that matter for that task); anything else
-/// leaves the lane alone — an older admitted cross-task packet runs first,
-/// and evicting it for a newer sibling would plan for the wrong next.
-pub(crate) fn offer_exec<M: crate::runtime::host::HostMemory>(
+/// The slot rules: the running task's packets never install (its own chunks
+/// plan its refs); a newer EXEC of a task supersedes that task's lane; the
+/// oldest lane is evicted at [`LANE_TASK_CAP`].
+pub(crate) fn offer_exec(
     state: &DeviceState,
-    host: &M,
     task_id: u32,
     work: &reims_vgpu_core::exec::ExecWork,
 ) {
@@ -168,6 +190,10 @@ pub(crate) fn offer_exec<M: crate::runtime::host::HostMemory>(
         return;
     }
     if crate::backend::selected().rail() != crate::backend::Rail::Vulkan {
+        return;
+    }
+    if state.par().is_none() {
+        // No pool, no scopes, no lane work ever.
         return;
     }
     let running = RUNNING_TASK.with(Cell::get);
@@ -202,44 +228,29 @@ pub(crate) fn offer_exec<M: crate::runtime::host::HostMemory>(
         }
     }
     refs.truncate(LANE_REF_CAP);
-    let mut backlog = VecDeque::with_capacity(refs.len());
-    for texture_ref in refs {
-        if let Ok(resource) =
-            crate::runtime::objects::resolve_resource(state, host, task_id, texture_ref)
-        {
-            backlog.push_back(LaneRef {
-                texture_ref,
-                resource,
-            });
-        }
-    }
     crate::runtime::drain::note_store_route("lanes_offer");
-    crate::runtime::drain::note_store_route_n("lanes_offer_n", backlog.len() as u64);
-    LANE.with(|lane| {
-        let mut lane = lane.borrow_mut();
-        match lane.as_mut() {
-            Some(current) if current.task_id != task_id => {
-                // An older cross-task lane runs first; the newer sibling
-                // waits for it to clear.
-                crate::runtime::drain::note_store_route("lanes_offer_shadowed");
-                return;
-            }
-            Some(current) => {
-                note_discarded(current.planned.len() as u64);
-                *current = Lane {
-                    task_id,
-                    backlog,
-                    planned: HashMap::new(),
-                };
-            }
-            None => {
-                *lane = Some(Lane {
-                    task_id,
-                    backlog,
-                    planned: HashMap::new(),
-                });
-            }
+    crate::runtime::drain::note_store_route_n("lanes_offer_n", refs.len() as u64);
+    let backlog: VecDeque<u32> = refs.into();
+    LANES.with(|lanes| {
+        let mut lanes = lanes.borrow_mut();
+        if let Some(slot) = lanes.iter_mut().find(|(t, _)| *t == task_id) {
+            let superseded = std::mem::take(&mut slot.1.planned);
+            note_discarded(superseded.len() as u64);
+            slot.1.backlog = backlog;
+            return;
         }
+        if lanes.len() >= LANE_TASK_CAP {
+            let (_, evicted) = lanes.remove(0);
+            note_discarded(evicted.planned.len() as u64);
+            crate::runtime::drain::note_store_route("lanes_evicted");
+        }
+        lanes.push((
+            task_id,
+            Lane {
+                backlog,
+                planned: HashMap::new(),
+            },
+        ));
     });
 }
 
@@ -252,67 +263,87 @@ pub(crate) fn note_exec_started(task_id: u32) {
     RUNNING_TASK.with(|t| t.set(Some(task_id)));
 }
 
-/// The drain left a retained EXEC of `task_id`. Clears the running marker and
-/// drops the lane when it was that task's — its packet has run, so whatever
-/// the lane still holds will never be asked for by this packet again.
-pub(crate) fn note_exec_finished(task_id: u32) {
+/// The drain left a retained EXEC of `task_id`. Clears the running marker —
+/// and nothing else.
+///
+/// Iteration 1 retired the task's lane here; iteration 2 does not, because
+/// retirement-by-task conflates *packets*: a task with two queued EXECs (the
+/// transition shape — the compositor parks several) has its lane holding the
+/// *newest* packet's refs, and the *older* packet's run would have destroyed
+/// the plans the drain made for the newer one. The lane outlives any one
+/// packet and is retired the honest ways instead: superseded by the task's
+/// next offer (packet granularity), evicted at the cap, or invalidated at
+/// serve. Memory is bounded by [`LANE_TASK_CAP`] lanes of [`LANE_REF_CAP`]
+/// plans, and every surviving plan still passes the serve-time validation a
+/// fresh one would.
+pub(crate) fn note_exec_finished(_task_id: u32) {
     if !lanes_on() {
         return;
     }
     RUNNING_TASK.with(|t| t.set(None));
-    LANE.with(|lane| {
-        let mut lane = lane.borrow_mut();
-        if lane.as_ref().is_some_and(|l| l.task_id == task_id) {
-            if let Some(current) = lane.take() {
-                note_discarded(current.planned.len() as u64);
-            }
-            crate::runtime::drain::note_store_route("lanes_retired_run");
-        }
-    });
 }
 
-/// Take up to `budget` backlog entries for a scope of `skip_task`'s pass.
+/// Take up to `budget` items for a scope of `skip_task`'s pass, resolving
+/// each taken ref's `Arc<TaskResource>` here, on the drain.
 ///
-/// `skip_task` is the task whose PassPrep is about to fork: its own refs are
-/// that pass's chunks' job (planning them here would duplicate the in-pass
-/// work), so a lane for the same task declines. The taken entries leave the
-/// backlog — they will either come back as a plan through [`store_plan`] or
-/// be counted as a bail, never be retaken by a later chunk.
-pub(super) fn take_backlog(
+/// The lane is chosen at take time — the earliest-offered lane whose task is
+/// neither `skip_task`'s (its own refs are that pass's chunks' job; planning
+/// them here would duplicate the in-pass work) nor out of backlog. That
+/// choice is the n235 fix's heart: with the lane chosen at offer time the
+/// store always held the task about to run, and nothing ever planned.
+///
+/// Resolution failures drop the ref (a descriptor the guest has since
+/// rewritten has no identity to plan against; the owning walk re-reads it
+/// when the packet runs). The taken entries leave the backlog — they will
+/// either come back as a plan through [`store_plan`] or be counted as a
+/// bail, never be retaken by a later chunk.
+pub(super) fn take_backlog<M: crate::runtime::host::HostMemory>(
+    state: &DeviceState,
+    host: &M,
     budget: usize,
     skip_task: u32,
 ) -> Vec<(u32, u32, std::sync::Arc<crate::model::TaskResource>)> {
     if !lanes_on() {
         return Vec::new();
     }
-    LANE.with(|lane| {
-        let mut lane = lane.borrow_mut();
-        let Some(current) = lane.as_mut() else {
-            return Vec::new();
-        };
-        if current.task_id == skip_task || current.backlog.is_empty() {
-            return Vec::new();
+    let Some((task_id, refs)) = LANES.with(|lanes| {
+        let mut lanes = lanes.borrow_mut();
+        let slot = lanes.iter_mut().find(|(t, lane)| {
+            *t != skip_task && !lane.backlog.is_empty()
+        })?;
+        let take = budget.min(slot.1.backlog.len());
+        let refs: Vec<u32> = slot.1.backlog.drain(..take).collect();
+        Some((slot.0, refs))
+    }) else {
+        return Vec::new();
+    };
+    // The resource identity each item will `ptr_eq` against at serve time.
+    // This is the construction the owning task's walk performs moments later
+    // anyway (memoized in `task_resources`), moved ahead by one pass; paid
+    // only for refs that are about to plan, which is what the offer-time
+    // version got wrong.
+    let mut items = Vec::with_capacity(refs.len());
+    for texture_ref in refs {
+        if let Ok(resource) =
+            crate::runtime::objects::resolve_resource(state, host, task_id, texture_ref)
+        {
+            items.push((task_id, texture_ref, resource));
+        } else {
+            crate::runtime::drain::note_store_route("lanes_unresolved");
         }
-        let take = budget.min(current.backlog.len());
-        current
-            .backlog
-            .drain(..take)
-            .map(|entry| (current.task_id, entry.texture_ref, entry.resource))
-            .collect()
-    })
+    }
+    items
 }
 
 /// Store a plan a scope filled for the lane. A plan that arrives for a lane
 /// that no longer exists (superseded while the scope ran) is discarded and
 /// counted, which is the honest answer: nobody will ask for it.
 pub(super) fn store_plan(task_id: u32, texture_ref: u32, plan: StreamPlan) {
-    LANE.with(|lane| {
-        let mut lane = lane.borrow_mut();
-        if let Some(current) = lane.as_mut() {
-            if current.task_id == task_id {
-                current.planned.insert(texture_ref, plan);
-                return;
-            }
+    LANES.with(|lanes| {
+        let mut lanes = lanes.borrow_mut();
+        if let Some((_, lane)) = lanes.iter_mut().find(|(t, _)| *t == task_id) {
+            lane.planned.insert(texture_ref, plan);
+            return;
         }
         note_discarded(1);
     });
@@ -326,31 +357,28 @@ pub(super) fn take_plan(key: &(u32, u32)) -> Option<StreamPlan> {
     if !lanes_on() {
         return None;
     }
-    LANE.with(|lane| {
-        let mut lane = lane.borrow_mut();
-        let current = lane.as_mut()?;
-        if current.task_id != key.0 {
-            return None;
-        }
-        current.planned.remove(&key.1)
+    LANES.with(|lanes| {
+        let mut lanes = lanes.borrow_mut();
+        let (_, lane) = lanes.iter_mut().find(|(t, _)| *t == key.0)?;
+        lane.planned.remove(&key.1)
     })
 }
 
-/// Take every plan the lane holds for `task_id` (the `PassPrep::open`
-/// hand-off), as `(texture_ref, plan)` pairs. `None` when the lane is another
-/// task's or holds nothing; the lane keeps its remaining backlog either way,
-/// so late plans still arrive for the frame-miss fill.
+/// Take every plan the task's lane holds (the `PassPrep::open` hand-off), as
+/// `(texture_ref, plan)` pairs. `None` when the task has no lane or the lane
+/// holds nothing; the lane keeps its remaining backlog either way, so late
+/// plans still arrive for the frame-miss fill.
 pub(super) fn take_plans_for(task_id: u32) -> Option<Vec<(u32, StreamPlan)>> {
     if !lanes_on() {
         return None;
     }
-    LANE.with(|lane| {
-        let mut lane = lane.borrow_mut();
-        let current = lane.as_mut()?;
-        if current.task_id != task_id || current.planned.is_empty() {
+    LANES.with(|lanes| {
+        let mut lanes = lanes.borrow_mut();
+        let (_, lane) = lanes.iter_mut().find(|(t, _)| *t == task_id)?;
+        if lane.planned.is_empty() {
             return None;
         }
-        Some(std::mem::take(&mut current.planned).into_iter().collect())
+        Some(std::mem::take(&mut lane.planned).into_iter().collect())
     })
 }
 
@@ -571,23 +599,31 @@ mod tests {
         }
     }
 
-    /// The whole lane, end to end: task A's pass plans task B's refs inside
-    /// A's own chunk scope, and B's frame-less bind (a single-draw pass never
-    /// opens a `PassPrep`) serves the serial ladder's own answer for the same
-    /// state.
+    /// The whole lane, end to end, **in the n235 admission order**: A's EXEC
+    /// is offered first, B's second (the drain admits and runs one packet at
+    /// a time, so B is admitted while A's lane already stands — the shape the
+    /// single-lane store got wrong, planning nothing). A's pass then plans
+    /// B's refs inside A's own chunk scope, and B's frame-less bind (a
+    /// single-draw pass never opens a `PassPrep`) serves the serial ladder's
+    /// own answer for the same state.
     #[test]
     fn a_lane_plans_in_another_tasks_scope_and_serves_the_serial_answer() {
         let _force = test_force();
         let _mode = super::super::pass_prep::test_mode(PassPrepMode::On);
         let (mut planned_state, mut planned_host) = two_task_state();
         let (mut serial_state, mut serial_host) = two_task_state();
-        // B's admitted EXEC offers the lane (task 2, refs 2 and 3).
-        let work = exec_work_with_binds(&[2, 3]);
+        // The admission order of the drain: A (task 1) offered, then B (task
+        // 2, refs 2 and 3) offered beside it — B's lane must survive A's
+        // offer, not be shadowed by it.
+        let a_work = exec_work_with_binds(&[2]);
+        let b_work = exec_work_with_binds(&[2, 3]);
         let before_offer = store_route_count("lanes_offer");
-        offer_exec(&planned_state, &planned_host, 2, &work);
-        assert_eq!(delta("lanes_offer", before_offer), 1);
+        offer_exec(&planned_state, 1, &a_work);
+        offer_exec(&planned_state, 2, &b_work);
+        assert_eq!(delta("lanes_offer", before_offer), 2);
         // A's pass: four draws binding A's own ref (2) — the scope that will
-        // carry the lane's items beside them.
+        // carry the lane's items beside them. The take resolves B's items
+        // through this host, which is why the real fixture host is passed.
         let a_binds: Vec<Vec<TextureBind>> = (0..4)
             .map(|_| vec![bind_for(&planned_state, &planned_host, 1, 2)])
             .collect();
@@ -605,11 +641,11 @@ mod tests {
         let mut prep =
             super::super::pass_prep::PassPrep::open_with_chunk(&planned_state, 1, tables, 4)
                 .expect("A's pass opens");
-        prep.ahead(&planned_state, &FakeHost::new(), 0);
+        prep.ahead(&planned_state, &planned_host, 0);
         assert_eq!(
             delta("lanes_planned_n", before_planned),
             2,
-            "both of B's refs planned inside A's chunk-0 scope"
+            "both of B's refs planned inside A's chunk-0 scope, with A offered first"
         );
         drop(prep);
         // B's bind, with no frame on the stack (its pass is single-draw):
@@ -711,7 +747,8 @@ mod tests {
         let _force = test_force();
         let _mode = super::super::pass_prep::test_mode(PassPrepMode::On);
         let (mut state, mut host) = two_task_state();
-        offer_exec(&state, &host, 2, &exec_work_with_binds(&[2, 3]));
+        offer_exec(&state, 1, &exec_work_with_binds(&[2]));
+        offer_exec(&state, 2, &exec_work_with_binds(&[2, 3]));
         let a_binds: Vec<Vec<TextureBind>> = (0..4)
             .map(|_| vec![bind_for(&state, &host, 1, 2)])
             .collect();
@@ -727,7 +764,7 @@ mod tests {
             .collect();
         let mut prep = super::super::pass_prep::PassPrep::open_with_chunk(&state, 1, tables, 4)
             .expect("A's pass opens");
-        prep.ahead(&state, &FakeHost::new(), 0);
+        prep.ahead(&state, &host, 0);
         drop(prep);
         // The guest rewires B's surface 81 between the plan and the ask.
         state.mappings.get_mut(&81u32).unwrap().map_generation += 1;
@@ -751,11 +788,11 @@ mod tests {
         let (mut state, mut host) = two_task_state();
         let work = exec_work_with_binds(&[2, 3]);
         let before_offer = store_route_count("lanes_offer");
-        offer_exec(&state, &host, 2, &work);
+        offer_exec(&state, 2, &work);
         assert_eq!(delta("lanes_offer", before_offer), 0);
         assert!(take_plan(&(2, 2)).is_none());
         assert!(take_plans_for(2).is_none());
-        assert!(take_backlog(8, 1).is_empty());
+        assert!(take_backlog(&state, &host, 8, 1).is_empty());
         let a_binds: Vec<Vec<TextureBind>> = (0..4)
             .map(|_| vec![bind_for(&state, &host, 1, 2)])
             .collect();
@@ -772,7 +809,7 @@ mod tests {
         let before_planned = store_route_count("lanes_planned_n");
         let mut prep = super::super::pass_prep::PassPrep::open_with_chunk(&state, 1, tables, 4)
             .expect("A's pass opens");
-        prep.ahead(&state, &FakeHost::new(), 0);
+        prep.ahead(&state, &host, 0);
         assert_eq!(delta("lanes_planned_n", before_planned), 0);
         drop(prep);
         let resource = objects::resolve_resource(&state, &host, 2, 2).expect("B's resource");
@@ -781,51 +818,75 @@ mod tests {
         assert!(matches!(served, prefetch::Prefetched::Serial));
     }
 
-    /// The offer rules: the running task never evicts a cross-task lane (the
-    /// fc0a/n68 case — WindowServer admitted behind draining Safari), a newer
-    /// EXEC of the lane's own task supersedes it, and the lane retires when
-    /// its task's packet has run.
+    /// The slot rules, in the multi-lane store: every task keeps its own lane
+    /// (the n235 fix — a cross-task offer installs beside the runner's, it is
+    /// never shadowed); a newer EXEC of a task supersedes that task's lane; a
+    /// packet's run does NOT retire its task's lane (a later queued packet of
+    /// the same task still owns it); the running task's own offers never
+    /// install; the cap evicts the oldest.
     #[test]
-    fn the_offer_rules_keep_the_cross_task_lane() {
+    fn the_slot_rules_keep_one_lane_per_task() {
         let _force = test_force();
         let _mode = super::super::pass_prep::test_mode(PassPrepMode::On);
-        let (mut state, mut host) = two_task_state();
-        // B (task 2) is admitted while nothing runs: it becomes the lane.
-        offer_exec(&state, &host, 2, &exec_work_with_binds(&[2, 3]));
-        // A (task 1) starts draining.
+        let (state, host) = two_task_state();
+        // The drain's admission order: A (task 1) first, then B (task 2) —
+        // both lanes stand, which is what the single-lane store refused.
+        offer_exec(&state, 1, &exec_work_with_binds(&[2]));
+        offer_exec(&state, 2, &exec_work_with_binds(&[2, 3]));
+        // A runs: A's own lane is skipped, B's is taken.
         note_exec_started(1);
-        // Safari's next EXEC (task 1) is admitted mid-drain: it must NOT
-        // evict B's lane.
-        let before_shadowed = store_route_count("lanes_offer_shadowed");
-        offer_exec(&state, &host, 1, &exec_work_with_binds(&[2]));
-        assert_eq!(delta("lanes_offer_shadowed", before_shadowed), 0);
-        // The backlog is still B's (a scope of A's pass takes it).
-        let backlog = take_backlog(8, 1);
-        assert_eq!(backlog.len(), 2, "B's backlog survived A's mid-drain offer");
-        assert_eq!(backlog[0].0, 2);
-        // A newer EXEC of B supersedes the lane's packet: same task, fresh
-        // backlog (the taken entries do not come back).
-        offer_exec(&state, &host, 2, &exec_work_with_binds(&[3]));
-        let backlog = take_backlog(8, 1);
-        assert_eq!(
-            backlog.len(),
-            1,
-            "the newer same-task offer replaced the lane"
+        let backlog = take_backlog(&state, &host, 8, 1);
+        assert_eq!(backlog.len(), 2, "B's backlog, taken from A's scope");
+        assert_eq!(backlog[0].0, 2, "the items are B's (task 2)");
+        // Safari's next EXEC (task 1) is admitted mid-drain: the running
+        // task's offer never installs, and A's taken entries do not come
+        // back — but B's lane stands untouched.
+        offer_exec(&state, 1, &exec_work_with_binds(&[2]));
+        let backlog = take_backlog(&state, &host, 8, 1);
+        assert!(
+            backlog.is_empty(),
+            "A's taken entries do not come back and A never re-installed"
         );
-        // B runs: the lane retires with it.
+        // A's lane is drained once here, so every take below names its lane.
         note_exec_finished(1);
+        let a_items = take_backlog(&state, &host, 8, 2);
+        assert_eq!(a_items.len(), 1, "A's own lane held A's one ref");
+        assert_eq!(a_items[0].0, 1);
+        // A newer EXEC of B supersedes B's lane: fresh backlog.
+        offer_exec(&state, 2, &exec_work_with_binds(&[3]));
+        // B's packet runs: the lane SURVIVES it (a later queued packet of B
+        // still owns what it holds) — the take after the run still finds
+        // B's refs, drained only by a take.
         note_exec_started(2);
         note_exec_finished(2);
-        assert!(
-            take_backlog(8, 1).is_empty(),
-            "the lane is retired after its task ran"
+        let backlog = take_backlog(&state, &host, 8, 1);
+        assert_eq!(backlog.len(), 1, "the lane survives its task's run");
+        assert_eq!(backlog[0].0, 2);
+        // And the next same-task offer supersedes it.
+        offer_exec(&state, 2, &exec_work_with_binds(&[2, 3]));
+        let backlog = take_backlog(&state, &host, 8, 1);
+        assert_eq!(backlog.len(), 2, "the next same-task offer superseded it");
+        // The cap: four tasks fill the store, the fifth evicts the oldest
+        // (tasks 3-5 have no fixture page tables, so only task 2's lane can
+        // resolve items — enough to prove the cap fired and a survivor
+        // stands; the "oldest first" order is the Vec's own).
+        offer_exec(&state, 3, &exec_work_with_binds(&[2]));
+        offer_exec(&state, 4, &exec_work_with_binds(&[2]));
+        let before_evicted = store_route_count("lanes_evicted");
+        offer_exec(&state, 5, &exec_work_with_binds(&[2]));
+        assert_eq!(delta("lanes_evicted", before_evicted), 1);
+        // Task 2's lane survived (it replaces in place, not as a new install
+        // that would have evicted again) and still serves items.
+        offer_exec(&state, 2, &exec_work_with_binds(&[2, 3]));
+        assert_eq!(
+            delta("lanes_evicted", before_evicted),
+            1,
+            "the replace evicted nothing"
         );
-        // And a lane-less offer for the still-running task never installs.
-        note_exec_started(1);
-        offer_exec(&state, &host, 1, &exec_work_with_binds(&[2]));
-        assert!(
-            take_backlog(8, 2).is_empty(),
-            "the running task does not become a lane"
+        let backlog = take_backlog(&state, &host, 8, 5);
+        assert_eq!(
+            backlog[0].0, 2,
+            "task 2's lane survived the eviction and still serves items"
         );
     }
 
@@ -837,7 +898,8 @@ mod tests {
         let _force = test_force();
         let _mode = super::super::pass_prep::test_mode(PassPrepMode::On);
         let (mut state, mut host) = two_task_state();
-        offer_exec(&state, &host, 2, &exec_work_with_binds(&[2, 3]));
+        offer_exec(&state, 1, &exec_work_with_binds(&[2]));
+        offer_exec(&state, 2, &exec_work_with_binds(&[2, 3]));
         // A's scope plans B's refs.
         let a_binds: Vec<Vec<TextureBind>> = (0..4)
             .map(|_| vec![bind_for(&state, &host, 1, 2)])
@@ -854,7 +916,7 @@ mod tests {
             .collect();
         let mut prep_a = super::super::pass_prep::PassPrep::open_with_chunk(&state, 1, tables, 4)
             .expect("A's pass opens");
-        prep_a.ahead(&state, &FakeHost::new(), 0);
+        prep_a.ahead(&state, &host, 0);
         drop(prep_a);
         // B's own pass opens (two draws binding ref 2): the lane hands its
         // plans over, and B's chunk finds nothing left to plan for them.
@@ -880,7 +942,7 @@ mod tests {
             2,
             "both plans handed to the frame"
         );
-        prep_b.ahead(&state, &FakeHost::new(), 0);
+        prep_b.ahead(&state, &host, 0);
         assert_eq!(
             delta("par_prefetch_planned", before_prefetch),
             0,

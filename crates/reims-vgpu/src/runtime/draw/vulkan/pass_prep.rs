@@ -627,7 +627,11 @@ impl<'a> PassPrep<'a> {
     /// The scope is fork-join, so this call is the drain's share of the
     /// planning and its wait for the helpers' — during which the recorder runs
     /// the draws the loop already submitted, which is the whole point.
-    pub(crate) fn ahead<H: crate::runtime::host::HostOps>(
+    ///
+    /// TEMP (lab, DRAIN_LANES): `HostMemory` beside `HostOps` because the
+    /// lane's take resolves its items' resources through this host, on the
+    /// drain, before the scope forks.
+    pub(crate) fn ahead<H: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
         &mut self,
         state: &DeviceState,
         host: &H,
@@ -723,11 +727,13 @@ impl<'a> PassPrep<'a> {
         // rides this chunk's scope — the other task's refs plan beside this
         // pass's, inside the same fork-join (the one window a worker may
         // share `&DeviceState`; no new aliasing), bounded by the chunk size.
-        // Lane items count toward the fork gate below: they are pool work
-        // exactly as this pass's items are. Not staged: a lane plan outlives
-        // the job that would own the arena, so the gather arms CPU-stage at
-        // the engine as they always did.
-        let lane_items = super::lanes::take_backlog(self.chunk, self.task_id);
+        // The take resolves the items' resources here, on the drain, through
+        // this host — the construction the owning task's walk would pay
+        // moments later anyway. Lane items count toward the fork gate below:
+        // they are pool work exactly as this pass's items are. Not staged: a
+        // lane plan outlives the job that would own the arena, so the gather
+        // arms CPU-stage at the engine as they always did.
+        let lane_items = super::lanes::take_backlog(state, host, self.chunk, self.task_id);
         let lane_n = lane_items.len() as u64;
         for (task_id, texture_ref, resource) in lane_items {
             items.push(PrepItem::LaneSample {
