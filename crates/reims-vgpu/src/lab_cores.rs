@@ -39,6 +39,37 @@ pub(crate) fn pin_to_performance_cores(who: &str) {
     }
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_DEVICE_CCD=N`): the calling device thread prefers
+/// the logical processors that share last-level cache `N` - one CCD of the home
+/// rig's Ryzen 9 7950X (two CCDs of 8 cores, an L3 each). There a draw's encode
+/// cost 88 us against 36 on Intel's single-die i7 over a whole run (hq057
+/// finish_phase), and the draw sub-phases account for ~25 of the 88: the drain,
+/// its recorder and the parallel pool hand work to each other for every draw,
+/// and a hand-off between CCDs crosses the die-to-die link. The drain and the
+/// other QEMU-side device threads take the same CCD (reims_vgpu_lab_device_prio).
+/// A CPU-set selection is a preference the scheduler keeps. Latched.
+pub(crate) fn pin_device_ccd(who: &str) {
+    static CCD: OnceLock<Option<u8>> = OnceLock::new();
+    let Some(ccd) = *CCD.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_DEVICE_CCD").ok().and_then(|v| v.trim().parse::<u8>().ok())
+    }) else {
+        return;
+    };
+    let ids: Vec<u32> = cpu_set_records().iter().filter(|r| r.3 == ccd).map(|r| r.0).collect();
+    if ids.is_empty() {
+        return;
+    }
+    // SAFETY: the pseudo handle of this thread and a slice of `ids.len()` ids.
+    if unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), ids.as_ptr(), ids.len() as u32) } != 0
+        && crate::observe::first_sight(
+            "lab_device_ccd",
+            who.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b))),
+        )
+    {
+        crate::observe::off(format!("lab_device_ccd {who} ccd={ccd} sets={}", ids.len()));
+    }
+}
+
 /// CPU-set ids of the most performant efficiency class (group 0).
 fn performance_cpu_set_ids() -> Vec<u32> {
     let recs = cpu_set_records();
@@ -46,8 +77,9 @@ fn performance_cpu_set_ids() -> Vec<u32> {
     recs.iter().filter(|r| r.2 == max_class).map(|r| r.0).collect()
 }
 
-/// (cpu-set id, logical processor, efficiency class) per group-0 CPU set.
-fn cpu_set_records() -> Vec<(u32, usize, u8)> {
+/// (cpu-set id, logical processor, efficiency class, last-level cache index) per
+/// group-0 CPU set.
+fn cpu_set_records() -> Vec<(u32, usize, u8, u8)> {
     let mut need = 0u32;
     // SAFETY: a size query (null buffer, zero length).
     unsafe { GetSystemCpuSetInformation(core::ptr::null_mut(), 0, &mut need, core::ptr::null_mut(), 0) };
@@ -69,7 +101,7 @@ fn cpu_set_records() -> Vec<(u32, usize, u8)> {
         let id = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
         let group = u16::from_le_bytes(buf[off + 12..off + 14].try_into().unwrap());
         if group == 0 {
-            recs.push((id, buf[off + 14] as usize, buf[off + 18]));
+            recs.push((id, buf[off + 14] as usize, buf[off + 18], buf[off + 16]));
         }
         off += size;
     }
@@ -137,6 +169,7 @@ pub(crate) fn on_efficiency_core() -> bool {
 /// waiting on them for a quarter of its time (pool joins 8.8 %, dirty-sync workers 6 %, deferred-draw settles
 /// 9 %). The drain alone at above normal (HIQOS) was neutral at 8 vCPUs (2026-10-01/02).
 pub(crate) fn device_thread_priority(who: &str) {
+    pin_device_ccd(who);
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DEVICE_PRIO").is_ok_and(|v| v == "on")) {
         return;
