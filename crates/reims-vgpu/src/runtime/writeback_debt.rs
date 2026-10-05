@@ -168,9 +168,37 @@ pub fn lab_trim_debts<M: HostMemory + HostOps>(
             break;
         };
         if let Some(debt) = state.pending_writebacks.take(mapping_id) {
+            if lab_trim_defer() && lab_pay_defer() {
+                // TEMP (lab TRIM_DEFER): begun here, landed by the next tranche end.
+                pay_deferred(state, host, mapping_id, debt, "wbdebt_paid_trimmed");
+                break;
+            }
             pay(state, host, mapping_id, debt, "wbdebt_paid_trimmed");
         }
     }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_TRIM_DEFER=on`, live through `REIMS_VGPU_LAB_LIVE_FILE`):
+/// the trim begins one deferred payment a tranche end ([`pay_deferred`], the
+/// PAY_DEFER rail pay-after-stamp already takes) instead of paying up to 16 in
+/// place. A trim payment waited on the GPU readback and wrote the frame into
+/// guest pages on the drain: the display channel's doorbell rang during a trim
+/// 13-35 times a transition window and waited 11-22 ms each (fc0a, ts0a Intel;
+/// up0a AMD 33 x 22 ms). Begun at one tranche end, the payment lands at the
+/// next, by when the readback is done; the ledger still drains at the
+/// heartbeat's ~250 tranche ends a second. Off under test.
+fn lab_trim_defer() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("TRIM_DEFER") {
+        return on;
+    }
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = !cfg!(test)
+            && std::env::var("REIMS_VGPU_LAB_TRIM_DEFER").is_ok_and(|v| v == "on");
+        crate::observe::off(format!("lab_trim_defer on={on}"));
+        on
+    })
 }
 
 /// A synthetic resident target, for tests that arm a debt without a device.
