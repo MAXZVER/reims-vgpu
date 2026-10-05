@@ -88,7 +88,9 @@ fn lab_debt_trim() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("REIMS_VGPU_LAB_DEBT_TRIM").map_or(true, |v| v != "off");
+        // Off under test: the ledger's own tests pin the synchronous bound.
+        let on = !cfg!(test)
+            && std::env::var("REIMS_VGPU_LAB_DEBT_TRIM").map_or(true, |v| v != "off");
         crate::observe::off(format!("lab_debt_trim on={on}"));
         on
     })
@@ -1063,8 +1065,10 @@ pub fn pay_cpu_shared_mapping<M: HostMemory + HostOps>(
     }
 }
 
-/// TEMP (lab, `REIMS_VGPU_LAB_PAY_SETTLE_MS=N`, 0 = off): no coherence work while
-/// the screen moves. A presented frame is left owed (`pay_cpu_shared_mapping`)
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_SETTLE_MS=N`, 250 by default since hq052, 0 = off):
+/// no coherence work while the screen moves. hq052 (AMD, x2 interleaved): Finder
+/// transitions 43 / 52 frames a burst against 31 / 39, Safari and windowed glass
+/// unchanged (per-burst max gaps alike apart from the first burst after the scene). A presented frame is left owed (`pay_cpu_shared_mapping`)
 /// on every frame of an animation and [`lab_pay_after_stamp`] paid it after the
 /// stamp, on the drain while the guest builds its next frame: on Intel ~2.2 ms of a 16.7 ms
 /// full-screen transition frame (vp24), and with no payment at all
@@ -1085,7 +1089,8 @@ fn lab_pay_settle_us() -> u64 {
         let ms = std::env::var("REIMS_VGPU_LAB_PAY_SETTLE_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .map_or(0, |v| v.min(5000));
+            // Off under test: the unit tests pin the pay-after-stamp ledger as it was.
+            .map_or(if cfg!(test) { 0 } else { 250 }, |v| v.min(5000));
         crate::observe::off(format!("lab_pay_settle ms={ms}"));
         ms * 1000
     })
