@@ -69,17 +69,17 @@ pub(crate) fn enabled() -> bool {
     #[cfg(not(test))]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        // On by default again (`=off` restores the plain rail). n223's loss
-        // (windowed glass 88.6 / 158.9 Hz on against 196.0 / 193.4 off) was
-        // the eager attach copying every fresh plan's window (143 GB in 32 s);
-        // with the STAGED_PROVEN gate (n231, Intel, cssscrollglassv) the copies
-        // fall to 55-181 MB and Hz holds parity (176.4 / 192.1 against
-        // 187.3 / 191.6). Flipped for the merged candidate (Mish 2026-10-05:
-        // "merge everything into the final version"); p009 re-checks it.
+        // Opt-in (`=on`). n223: the plain rail beat it (windowed glass 196.0 /
+        // 193.4 Hz off against 88.6 / 158.9 on). n231 (STAGED_PROVEN gate, before
+        // the artifact fixes were defaults) held Hz parity with 55-181 MB of
+        // copies, so it was flipped on for the merged candidate; p009 (Intel,
+        // a8385e94, merged defaults) put it back: the gate passed 8820 proven
+        // windows a boot (n231: 147), 4-5.6 GB of copies a second in the glass
+        // scene, glass 139.2 Hz against 161.7 with the rail off (p9ca/p9sa).
         *ON.get_or_init(|| {
-            !matches!(
+            matches!(
                 std::env::var("REIMS_VGPU_LAB_PASS_STAGE").as_deref(),
-                Ok("off")
+                Ok("on")
             )
         })
     }
