@@ -1571,6 +1571,123 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
     );
 }
 
+/// TEMP (lab, OVERLAY_GUARD): the post-read verdict over synthetic
+/// observations — every combination the site can be handed, so the drop policy
+/// itself is pinned independently of any host.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn overlay_guard_verdict_passes_quiet_and_drops_movement() {
+    use crate::model::GuestWriteObservation;
+    let obs = |token: u64, map_generation: u32, gen_: u64| GuestWriteObservation {
+        token,
+        map_generation,
+        gen_,
+        stated: 0,
+    };
+    // No baseline was ever taken: the adoption was already unwitnessed, and a
+    // guard that dropped on its own absence would disable the rail outright.
+    assert!(!overlay_guard_verdict(&obs(0, 1, 0), &obs(9, 2, 5)).dropped());
+    // Quiet: same token, same page list, same generation.
+    assert!(!overlay_guard_verdict(&obs(7, 3, 11), &obs(7, 3, 11)).dropped());
+    // The generation moved: a write was observed during the read.
+    assert!(overlay_guard_verdict(&obs(7, 3, 11), &obs(7, 3, 12)).dropped());
+    // The token was rebuilt under the adoption — a different page list.
+    assert!(overlay_guard_verdict(&obs(7, 3, 11), &obs(8, 3, 11)).dropped());
+    // The page list churned without the token id changing.
+    assert!(overlay_guard_verdict(&obs(7, 3, 11), &obs(7, 4, 11)).dropped());
+    // The host cannot answer right now (an unarmed read answers 0): that is
+    // not evidence of movement, and dropping on it would refuse every adoption
+    // whose token sits between syncs.
+    assert!(!overlay_guard_verdict(&obs(7, 3, 11), &obs(7, 3, 0)).dropped());
+}
+
+/// TEMP (lab, OVERLAY_GUARD): the flow the guard exists for, over the fake
+/// host. A guest memset→fill pair straddling the overlay's read window must
+/// make the site drop the adoption — pre-fill zeros are never adopted — and
+/// the dropped stamp must leave the write visible to the next verdict, which
+/// is the one-frame-bounded heal.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn overlay_guard_drops_an_adoption_the_guest_moved_during() {
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::runtime::host::HostOps;
+    use crate::runtime::mapper::observe_current_guest_write_gen;
+
+    let entry_for =
+        |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page = state.page_size();
+    assert!(state.map_surface(7));
+    let gpas = [0x40 * page, 0x91 * page];
+    {
+        let m = state.mappings.get_mut(&7).expect("mapped above");
+        m.page_entries = gpas.iter().map(|g| entry_for(*g)).collect();
+    }
+    let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7)
+        .expect("FakeHost observes guest writes");
+    // The list-time observation: whatever generation the pages sit at. The
+    // stamp beside it is the one a Store would have committed, so the verdict
+    // machinery below answers about the guest rather than about its own
+    // startup.
+    let seen = observe_current_guest_write_gen(&state, &host, 7);
+    assert_eq!(seen.token, token, "a live token must be observed");
+    assert_ne!(seen.gen_, 0, "an armed token has a generation");
+    state.mappings.get_mut(&7).unwrap().guest_write_gen_at_store = seen.gen_;
+
+    // A quiet read window: nothing moved between the evidence and the check,
+    // so the adoption proceeds.
+    let now = observe_current_guest_write_gen(&state, &host, 7);
+    assert!(!overlay_guard_verdict(&seen, &now).dropped());
+
+    // The guest's fill lands inside the read window. The bytes the read
+    // captured are the intermediate state; the guard must refuse them.
+    host.guest_wrote_page(gpas[1]);
+    let now = observe_current_guest_write_gen(&state, &host, 7);
+    let verdict = overlay_guard_verdict(&seen, &now);
+    assert!(
+        verdict.dropped(),
+        "a write observed during the read must drop the adoption, never adopt \
+         its pre-fill bytes"
+    );
+    assert_eq!(verdict.slug(), "overlay_guard_drop_gen_moved");
+
+    // A re-read after the fill quiesces is quiet against its own evidence —
+    // the retry the seed rail takes would adopt the post-fill bytes.
+    let after_fill = observe_current_guest_write_gen(&state, &host, 7);
+    assert!(!overlay_guard_verdict(&after_fill, &after_fill).dropped());
+
+    // And the dropped stamp keeps the write visible: the next verdict still
+    // refuses the resident, so the heal is one frame and not a latch.
+    assert_eq!(
+        mapping_guest_write_verdict(&state, &host, 7),
+        GuestWriteVerdict::Wrote,
+        "the drop stamped nothing, so the guest's fill must still be owed"
+    );
+
+    // Page-list churn under a live token id: the ranges were listed against
+    // pages this surface may no longer own, so the adoption drops even though
+    // the generation itself did not move.
+    state.mappings.get_mut(&7).unwrap().map_generation += 1;
+    let churned = observe_current_guest_write_gen(&state, &host, 7);
+    assert!(
+        overlay_guard_verdict(&seen, &churned).dropped(),
+        "a token answered for a different page list than the one listed"
+    );
+}
+
+/// TEMP (lab, OVERLAY_GUARD): the gate is off unless the lab asks for it, so
+/// the default build's overlay and seed rails run byte-identical to before.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn overlay_guard_is_off_by_default() {
+    std::env::remove_var("REIMS_VGPU_LAB_OVERLAY_GUARD");
+    // The latch is a `OnceLock`, so this test reads the process's first
+    // answer; the suite never sets the variable, so that answer is "off".
+    assert!(!overlay_guard_on());
+}
+
 /// The verdict must keep its refusals apart, because two rails now report it.
 ///
 /// [`mapper_ref_texture_guest_wrote_since_store`] collapses everything that is not `Clean`

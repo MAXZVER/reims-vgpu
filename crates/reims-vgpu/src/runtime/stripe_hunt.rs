@@ -108,6 +108,9 @@ struct Hunt {
     reopen: u32,
     /// Resident re-create/resample/evict events.
     recreate: u32,
+    /// TEMP (lab, OVERLAY_GUARD): adoptions the post-read guard dropped — the
+    /// suspected stripe mechanism caught in the act, one per drop.
+    guard_drop: u32,
 }
 
 impl Hunt {
@@ -133,6 +136,7 @@ impl Hunt {
             overlay_more: 0,
             reopen: 0,
             recreate: 0,
+            guard_drop: 0,
         }
     }
 
@@ -261,6 +265,10 @@ impl Hunt {
         self.recreate += 1;
     }
 
+    fn note_guard_drop(&mut self) {
+        self.guard_drop += 1;
+    }
+
     /// Render the per-present line and reset every delta. The reset is the
     /// emit: what follows is the next window's account, whatever order the
     /// hooks ran in.
@@ -290,7 +298,7 @@ impl Hunt {
              elide={} elide_px={} provided={} \
              skip={} skip_kb={} gather={} \
              overlay={} overlay_rows=[{}] overlay_rows_more={} \
-             reopen={} recreate={} t={}",
+             reopen={} recreate={} guard_drop={} t={}",
             self.dc_px,
             self.clear_px,
             self.unseeded,
@@ -309,6 +317,7 @@ impl Hunt {
             self.overlay_more,
             self.reopen,
             self.recreate,
+            self.guard_drop,
             crate::observe::elapsed_us() / 1000,
         );
         *self = Hunt::default();
@@ -416,6 +425,19 @@ pub fn note_recreate() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .note_recreate();
+}
+
+/// Hook (lab, OVERLAY_GUARD): an overlay adoption was dropped because the
+/// guest-write witness moved during its read — the suspected stripe mechanism
+/// caught in the act, named on the present it preceded.
+pub fn note_guard_drop() {
+    if !on() {
+        return;
+    }
+    window()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .note_guard_drop();
 }
 
 /// Hook: the drain presented `mid` at `w`x`h`. Emits the window's line on the

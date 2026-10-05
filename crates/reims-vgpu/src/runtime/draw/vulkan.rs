@@ -4489,12 +4489,22 @@ fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
     let cached = (!guest_replaced)
         .then(|| crate::runtime::surface_cache::get_shared(state, mapping_id, w, h))
         .flatten();
-    let served = if let Some(bgra) = cached {
-        Some((
-            MapperRefTextureLoadSeed::Host(bgra, SeedOrder::Bgra8),
-            MapperRefTextureSeedRung::Cache,
-        ))
-    } else {
+    // TEMP (lab, OVERLAY_GUARD): the guest rungs below read the surface's own
+    // pages — the mapping door that served the artifact second's three seeds.
+    // Their evidence (`surface_currency` above, and the pending observation the
+    // caller took before it) predates the read, so a guest store landing inside
+    // the read is adopted as its intermediate bytes and only the *next*
+    // verdict notices. The guard re-observes after the read; on movement it
+    // re-reads once — a dropped seed would leave the pass the unseeded
+    // partial-preserving arm, which is a worse defect than any tear — and
+    // counts a race when the guest is still moving after the retry.
+    let guard = overlay_guard_on();
+    let guard_pre = guard
+        .then(|| {
+            crate::runtime::mapper::observe_current_guest_write_gen(state, host, mapping_id)
+        })
+        .unwrap_or_default();
+    let guest_page_rungs = |state: &mut DeviceState, host: &mut M| {
         try_mapper_ref_texture_target_guest_seed(state, host, mapping_id, w, h, target_format)
             .map(|seed| {
                 (
@@ -4517,6 +4527,36 @@ fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
                     })
             })
     };
+    let mut served = if let Some(bgra) = cached {
+        Some((
+            MapperRefTextureLoadSeed::Host(bgra, SeedOrder::Bgra8),
+            MapperRefTextureSeedRung::Cache,
+        ))
+    } else {
+        guest_page_rungs(state, host)
+    };
+    if guard && served.as_ref().is_some_and(|(_, rung)| *rung == MapperRefTextureSeedRung::GuestPages)
+    {
+        let now =
+            crate::runtime::mapper::observe_current_guest_write_gen(state, host, mapping_id);
+        if overlay_guard_verdict(&guard_pre, &now).dropped() {
+            crate::runtime::drain::note_store_route("overlay_guard_seed_retried_n");
+            served = guest_page_rungs(state, host);
+            let after =
+                crate::runtime::mapper::observe_current_guest_write_gen(state, host, mapping_id);
+            // Still moving after one retry: the guest is writing continuously
+            // (a scroll), and serving the latest read is the best any device
+            // can do. The stamp the Store commits is the pre-read observation
+            // either way, so the next verdict re-seeds — bounded to one frame.
+            crate::runtime::drain::note_store_route(if after.gen_ != now.gen_ {
+                "overlay_guard_seed_race_n"
+            } else {
+                "overlay_guard_seed_passed_n"
+            });
+        } else {
+            crate::runtime::drain::note_store_route("overlay_guard_seed_passed_n");
+        }
+    }
     note_mapper_ref_texture_load_seed(state, mapping_id, w, h, served.as_ref().map(|s| s.1));
     served.map(|(seed, _)| seed)
 }
@@ -13650,14 +13690,106 @@ fn note_guest_cpu_shared(state: &mut DeviceState, mapping_id: u32) {
     ));
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_OVERLAY_GUARD=on`, default off): re-validate the
+/// guest-write witness **after** a guest-page read has completed, at the two
+/// rails that adopt guest bytes into something presented — the resident overlay
+/// and the mapping LOAD seed.
+///
+/// # The hole this guards
+///
+/// Both rails take their coherence evidence *before* they read: the overlay
+/// lists ranges against an observation taken at list time
+/// (`narrow_to_window`, `surface_currency.rs`), the seed is resolved under a
+/// `pending_guest_write_obs` taken at the seed block's top — and then each
+/// reads the guest's pages at its own later moment, with nothing in between.
+/// A guest store that lands inside that gap (a memset→fill pair straddling
+/// the read) is adopted as the *intermediate* bytes: rows read as zeros, drawn
+/// over, presented once, and only the *next* verdict's generation comparison
+/// reveals the tear — one presented frame too late. That is the stripe
+/// artifact's shape (`lab/journal/2026-10-05-stripe-hunt.md`, Iteration 2).
+///
+/// The re-check is meaningful because [`crate::runtime::host::HostOps::guest_write_gen`]
+/// is an idempotent generation whose reads sync their own set: a post-read
+/// read that still returns the list-time generation is evidence no *observed*
+/// write landed during the read. A write whose sync has not landed by the
+/// check is invisible to it — the guard narrows the window, it cannot close it.
+///
+/// Off by default and changes nothing when off. On, the overlay **drops** the
+/// adoption (no GPU copy, no stamp — the caller falls back to the seed rail)
+/// and the seed **re-reads once** (a dropped LOAD seed would leave the
+/// unseeded partial-preserving arm, which is worse than any tear), with the
+/// census split so an A/B prices both the correctness events and the cost:
+/// `overlay_guard_passed_n` / `overlay_guard_dropped_n` / `_dropped_bytes`
+/// on the overlay, `overlay_guard_seed_passed_n` / `_retried_n` / `_race_n`
+/// on the seed.
+pub(super) fn overlay_guard_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_OVERLAY_GUARD").as_deref() == Ok("on"))
+}
+
+/// What the post-read witness re-check said. `seen` is the observation the
+/// adoption's evidence was taken against; `now` is a fresh observation taken
+/// after the read completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OverlayGuardVerdict {
+    /// Nothing observed moved between the two observations (or no baseline was
+    /// ever taken, or the host cannot answer now). Proceed.
+    Passed,
+    /// The token or its page list changed under the adoption — the ranges were
+    /// listed against pages this surface may no longer own.
+    DroppedTokenChanged,
+    /// The generation moved: the host observed a guest write land between the
+    /// evidence and the check, so the bytes just read may be the guest's
+    /// intermediate state.
+    DroppedGenMoved,
+}
+
+impl OverlayGuardVerdict {
+    pub(super) fn dropped(self) -> bool {
+        !matches!(self, Self::Passed)
+    }
+
+    pub(super) fn slug(self) -> &'static str {
+        match self {
+            Self::Passed => "overlay_guard_passed_n",
+            Self::DroppedTokenChanged => "overlay_guard_drop_token_changed",
+            Self::DroppedGenMoved => "overlay_guard_drop_gen_moved",
+        }
+    }
+}
+
+pub(super) fn overlay_guard_verdict(
+    seen: &crate::model::GuestWriteObservation,
+    now: &crate::model::GuestWriteObservation,
+) -> OverlayGuardVerdict {
+    // No baseline (the mapping had no live token when the evidence was taken):
+    // the adoption was already under the witness's "assume written" regime, and
+    // a guard that dropped on its own absence would disable the rail outright.
+    if seen.token == 0 {
+        return OverlayGuardVerdict::Passed;
+    }
+    if now.token != seen.token || now.map_generation != seen.map_generation {
+        return OverlayGuardVerdict::DroppedTokenChanged;
+    }
+    // The host cannot say right now (an unarmed read answers 0). That is not
+    // evidence of movement; dropping on it would refuse every adoption whose
+    // token is between syncs.
+    if now.gen_ == 0 {
+        return OverlayGuardVerdict::Passed;
+    }
+    if now.gen_ != seen.gen_ {
+        return OverlayGuardVerdict::DroppedGenMoved;
+    }
+    OverlayGuardVerdict::Passed
+}
+
 /// Whether [`overlay_guest_writes_onto_resident`] may run, as
 /// [`crate::config::RESIDENT_OVERLAY`] narrows it. Latched: the answer must not
 /// change between two binds of one surface.
 fn resident_overlay_allowed() -> bool {
     static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ALLOWED.get_or_init(|| {
-        let narrowed = matches!(
-            crate::config::read(crate::config::RESIDENT_OVERLAY).0,
+        let narrowed = matches!(            crate::config::read(crate::config::RESIDENT_OVERLAY).0,
             crate::config::Switch::Off
         );
         if narrowed {
@@ -13783,6 +13915,32 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
         ) {
             crate::runtime::drain::note_store_route("resident_overlay_read_failed");
             return false;
+        }
+    }
+    // TEMP (lab, OVERLAY_GUARD): the read is complete — now ask the witness
+    // whether the guest moved during it. The ranges and the stamp below were
+    // both taken against `guest_owned.seen` at list time; bytes read since are
+    // whatever the guest's pages held at the moment of each `read` call, and a
+    // store that landed between the list and here would have been adopted as
+    // its intermediate state. A dropped adoption overlays and stamps nothing:
+    // the caller refuses the reconcile and takes the seed rail instead, and
+    // the stamp's absence leaves the write visible to the next verdict.
+    if overlay_guard_on() {
+        let now = crate::runtime::mapper::observe_current_guest_write_gen(state, host, mapping_id);
+        match overlay_guard_verdict(&guest_owned.seen, &now) {
+            OverlayGuardVerdict::Passed => {
+                crate::runtime::drain::note_store_route("overlay_guard_passed_n");
+            }
+            dropped => {
+                crate::runtime::drain::note_store_route("overlay_guard_dropped_n");
+                crate::runtime::drain::note_store_route_n(
+                    "overlay_guard_dropped_bytes",
+                    bytes.len() as u64,
+                );
+                crate::runtime::drain::note_store_route(dropped.slug());
+                crate::runtime::stripe_hunt::note_guard_drop();
+                return false;
+            }
         }
     }
     // TEMP lab diagnostic: what the overlay is about to lay down.
