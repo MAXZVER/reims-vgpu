@@ -103,8 +103,12 @@ pub fn elapsed_us() -> u64 {
 
 static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
-/// TEMP (lab, `REIMS_VGPU_LAB_FAST_CLOCK=on`): the process clock read from the
-/// time-stamp counter instead of `Instant`.
+/// TEMP (lab, `REIMS_VGPU_LAB_FAST_CLOCK`, on by default since p005; `=off`
+/// restores `Instant`): the process clock read from the time-stamp counter.
+///
+/// p005 (Intel, x2 interleaved): Safari transitions 42 / 46 frames a burst
+/// against 38 / 38 without it, Finder max gap 191 / 179 ms against 212 / 196,
+/// windowed glass unchanged within its scene mode.
 ///
 /// `Instant::now().elapsed().as_micros()` is a QueryPerformanceCounter call and
 /// a 128-bit `Duration` division per read, and the drain's lab telemetry reads
@@ -114,8 +118,8 @@ static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 /// one `rdtsc`, a 64x64 multiply and a shift, against a tick rate measured
 /// once against `Instant` over the first 200 ms (reads before that take the
 /// `Instant` path, and the first fast read continues from it). Invariant,
-/// synchronized TSCs are what both lab hosts have; anywhere else, or with the
-/// switch unset, nothing changes.
+/// synchronized TSCs are what both lab hosts have; off x86_64, in tests, or
+/// with the switch `=off`, nothing changes.
 mod fast_clock {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::{Acquire, Relaxed, Release}};
 
@@ -160,7 +164,7 @@ mod fast_clock {
         let t0 = super::T0.get_or_init(std::time::Instant::now);
         if STATE.load(Relaxed) == 0 {
             let on = !cfg!(test)
-                && std::env::var("REIMS_VGPU_LAB_FAST_CLOCK").is_ok_and(|v| v == "on");
+                && !std::env::var("REIMS_VGPU_LAB_FAST_CLOCK").is_ok_and(|v| v == "off");
             if !on {
                 STATE.store(1, Relaxed);
                 return None;
