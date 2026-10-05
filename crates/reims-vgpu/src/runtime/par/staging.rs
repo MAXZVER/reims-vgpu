@@ -69,16 +69,17 @@ pub(crate) fn enabled() -> bool {
     #[cfg(not(test))]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        // Opt-in again (`=on`). n213/n214's "+20-23 % glass" compared light
-        // PASS_STAGE boots with heavy default ones (drawsps: 65-67 against
-        // 107-110 draws a frame). With the scene modes pinned (n223, Intel,
-        // interleaved x2) the default rail beats it: windowed glass 196.0 /
-        // 193.4 Hz off against 88.6 / 158.9 on, full screen 141.2 / 136.8
-        // against 141.7 / 138.8, transitions >25 ms 9-10 % against 14 %.
+        // On by default again (`=off` restores the plain rail). n223's loss
+        // (windowed glass 88.6 / 158.9 Hz on against 196.0 / 193.4 off) was
+        // the eager attach copying every fresh plan's window (143 GB in 32 s);
+        // with the STAGED_PROVEN gate (n231, Intel, cssscrollglassv) the copies
+        // fall to 55-181 MB and Hz holds parity (176.4 / 192.1 against
+        // 187.3 / 191.6). Flipped for the merged candidate (Mish 2026-10-05:
+        // "merge everything into the final version"); p009 re-checks it.
         *ON.get_or_init(|| {
-            matches!(
+            !matches!(
                 std::env::var("REIMS_VGPU_LAB_PASS_STAGE").as_deref(),
-                Ok("on")
+                Ok("off")
             )
         })
     }
