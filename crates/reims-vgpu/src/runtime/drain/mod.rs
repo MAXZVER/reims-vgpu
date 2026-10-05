@@ -6197,6 +6197,82 @@ fn observe_range_coverage<H: HostMemory + HostOps>(
     }
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_LAND_REACH=on` — see [`deferred_landing_disjoint`].
+/// Latched; off in unit tests.
+fn lab_land_reach() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(
+            std::env::var("REIMS_VGPU_LAB_LAND_REACH").as_deref(),
+            Ok("on")
+        );
+        crate::observe::off(format!("lab_land_reach on={on}"));
+        on
+    })
+}
+
+/// TEMP (lab LAND_REACH): whether the begun payment's pages are provably apart
+/// from the pages this lifecycle command releases — an `UnmapMemory` span, or a
+/// `DeleteIOSurfaceBacking2` mapping other than the payment's own — so the
+/// landing can wait for the tranche end (`land_deferred_if_ready`) instead of
+/// the command, and the guest blocked on its stamp, waiting on the GPU compare
+/// and the copy. The landing exists so that no page moves under it; pages that
+/// are not its own do not. Full-screen transitions (pa2, the Finder phase):
+/// this landing was 12 % of the drain, 10 % of it a fence wait, on the stamps
+/// WindowServer waits for. Anything this cannot decide reads as not apart.
+fn deferred_landing_disjoint<H: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &H,
+    packet: &Packet,
+    family: MapFamily,
+) -> bool {
+    let Some(target) = crate::runtime::writeback_debt::deferred_mapping(state) else {
+        // Nothing owed: the landing is a no-op either way.
+        return false;
+    };
+    let released: Vec<u64> = match family {
+        MapFamily::UnmapMemory => {
+            let Ok(cmd) = crate::protocol::fifo::decode_map_memory(&packet.payload) else {
+                return false;
+            };
+            crate::runtime::gva_mem::task_gva_page_gpa_set(
+                host,
+                &state.tasks,
+                cmd.task_id,
+                cmd.gva,
+                cmd.length,
+                state.page_shift,
+            )
+            .into_iter()
+            .collect()
+        }
+        MapFamily::DeleteIOSurfaceBacking2 => {
+            let Ok(cmd) = crate::protocol::fifo::decode_delete_backing(&packet.payload) else {
+                return false;
+            };
+            if cmd.object_id == target {
+                return false;
+            }
+            match state.mapping_reach_pages(cmd.object_id) {
+                Some(pages) => pages,
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+    if released.is_empty() {
+        return false;
+    }
+    let Some(owed) = state.mapping_reach_pages(target) else {
+        return false;
+    };
+    let owed: std::collections::HashSet<u64> = owed.into_iter().collect();
+    !released.iter().any(|gpa| owed.contains(gpa))
+}
+
 /// The shared body of the six lifecycle commands named by [`MapFamily`].
 fn apply_map_family<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -6211,7 +6287,11 @@ fn apply_map_family<H: HostMemory + HostOps>(
     // (`settle_released_span`, `settle_released_mapping`). Waiting on every map for
     // the landing was 36 % of this function on full-screen transitions (n185 fsz0).
     if family != MapFamily::MapMemory2 || crate::runtime::writeback_debt::lab_map_land_all() {
-        crate::runtime::writeback_debt::land_deferred(state, host);
+        if lab_land_reach() && deferred_landing_disjoint(state, &*host, packet, family) {
+            note_store_route("lab_land_reach_skipped");
+        } else {
+            crate::runtime::writeback_debt::land_deferred(state, host);
+        }
     }
     // TEMP (lab): translations cached this tranche may name the pages moved.
     crate::runtime::gva_mem::lab_tlb::new_epoch();
@@ -9436,6 +9516,36 @@ pub(crate) fn lab_preempt_between_streams<H: HostMemory + HostOps>(
     lab_preempt_control(state, host);
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_PREEMPT_RECORD=on`): serve the control channels
+/// between the records of a running render stream too, at most every 0.5 ms.
+///
+/// A stream of one EXEC can hold thousands of records (the Finder full-screen
+/// bursts: 7.5k draws in one 250 ms tranche), and the control packets
+/// WindowServer submits and then waits on synchronously (n225 DTrace: 725 ms of
+/// `waitForStamp` after deleteHostResourceID / releaseFromGPUPageTable /
+/// commitIntoGPUPageTable over 12 transitions) sit behind it: slow stamps while
+/// an EXEC ran — ch2 65 (worst 76 ms), ch5 248 (worst 435 ms). Between two
+/// records nothing the next one needs is borrowed from the device state (PassPrep
+/// re-asks it, its plans revalidate at use), the engine flushes an open batch on
+/// any consumer path, and the nested drain still defers every EXEC it releases,
+/// so only control packets the model finds independent run.
+pub(crate) fn lab_preempt_between_records<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+) {
+    if !lab_chan::preempt_record_on() || lab_chan::in_preempt() {
+        return;
+    }
+    let now = crate::observe::elapsed_us();
+    let last = lab_chan::INNER_LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < 500 {
+        return;
+    }
+    lab_chan::INNER_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    note_store_route("lab_preempt_record_check");
+    lab_preempt_control(state, host);
+}
+
 /// TEMP (lab): what the drain worker is doing now, for `slow=` in
 /// `lab_stamp_lat` — 0 idle, 1 guest work, 2 early publish, 3 pay-after-stamp,
 /// 4 debt trim, 5 tail submit, 6 window publish, 7 post sweeps, 0x1XX running
@@ -9529,6 +9639,20 @@ mod lab_chan {
     pub(super) fn preempt_inner_on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PREEMPT_INNER").is_ok_and(|v| v == "on"))
+    }
+
+    /// TEMP (lab): `REIMS_VGPU_LAB_PREEMPT_RECORD=on` — see
+    /// [`super::lab_preempt_between_records`]. Latched; off in unit tests.
+    pub(super) fn preempt_record_on() -> bool {
+        if cfg!(test) {
+            return false;
+        }
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var("REIMS_VGPU_LAB_PREEMPT_RECORD").is_ok_and(|v| v == "on");
+            crate::observe::off(format!("lab_preempt_record on={on}"));
+            on
+        })
     }
 
     pub(super) fn preempt_display() -> bool {

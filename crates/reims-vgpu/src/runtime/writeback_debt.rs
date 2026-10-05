@@ -2521,6 +2521,17 @@ fn pay_deferred<M: HostMemory + HostOps>(
 /// unless the mapping it was for moved on meanwhile (gone, re-mapped, or the
 /// guest declared its own copy newer), which drops it as [`pay`] would have
 /// refused it.
+/// TEMP (lab LAND_REACH): the mapping the begun payment will land in, when one
+/// is owed.
+pub fn deferred_mapping(state: &DeviceState) -> Option<u32> {
+    state
+        .pending_writebacks
+        .deferred
+        .0
+        .as_ref()
+        .map(|d| d.mapping_id)
+}
+
 pub fn land_deferred<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
     let Some(d) = state.pending_writebacks.deferred.0.take() else {
         return;

@@ -5724,6 +5724,11 @@ fn finish_stream<M: HostMemory + HostOps>(
         }
         fin.enter(crate::runtime::drain::FinishPhase::Prelude);
         for (di, pd) in draw_list.iter().enumerate() {
+            // TEMP (lab, `REIMS_VGPU_LAB_PREEMPT_RECORD=on`): the control rings,
+            // between this stream's records (rate-limited inside).
+            if di > 0 {
+                crate::runtime::drain::lab_preempt_between_records(state, host);
+            }
             // TEMP (lab, PASS_PREP): at the top of each record, plan the binds
             // of the chunk this record opens (a no-op inside one already
             // offered) while the recorder encodes the previous chunk.

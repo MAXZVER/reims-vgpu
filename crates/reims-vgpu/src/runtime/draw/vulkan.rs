@@ -149,7 +149,21 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     let leave_store_job = req.lab_left_store_job
         && !lab_recorder_store_join()
         && crate::backend::vulkan::engine::recorder_depth() > 1;
-    if leave_store_job && crate::backend::vulkan::engine::deferred_draws_pending() {
+    // TEMP (lab, `REIMS_VGPU_LAB_EXIT_JOIN=off`): a record that left without
+    // deferring (it drew nothing, or its preparation refused) takes only a
+    // failure already found too, instead of waiting for every draw still out.
+    // This exit was the drain's main explicit join (n224 glass: 2664/s, 45 ms/s,
+    // 17 us each); the wait is only for attributing a deferred failure, and every
+    // door into engine state still waits for the recorder — the A/B says whether
+    // the wait leaves or just moves to the next door (recorder join_* sites).
+    let leave_exit = !req.chain_resident_established
+        && !lab_recorder_exit_join()
+        && crate::backend::vulkan::engine::recorder_depth() > 1;
+    if (leave_store_job || leave_exit) && crate::backend::vulkan::engine::deferred_draws_pending()
+    {
+        if leave_exit && !leave_store_job {
+            crate::runtime::drain::note_store_route("lab_exit_join_left");
+        }
         if let Some(failure) = crate::backend::vulkan::engine::take_deferred_failure() {
             crate::backend::vulkan::engine::report_deferred_failure(&failure);
             if !req.deferred_failure_of_previous {
@@ -1413,6 +1427,18 @@ fn lab_recorder_store_join() -> bool {
     *ON.get_or_init(|| {
         let on = std::env::var("REIMS_VGPU_LAB_RECORDER_STORE_JOIN").map_or(true, |v| v != "off");
         crate::observe::off(format!("recorder_store_join on={on}"));
+        on
+    })
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_EXIT_JOIN=off` — a record that did not defer takes
+/// only a failure already found at its exit (see `encode_draw_chain`). On
+/// (waiting) by default until measured. Latched.
+fn lab_recorder_exit_join() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_EXIT_JOIN").map_or(true, |v| v != "off");
+        crate::observe::off(format!("recorder_exit_join on={on}"));
         on
     })
 }

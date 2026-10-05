@@ -60,7 +60,12 @@ fn lab_prep_sync() -> bool {
     })
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_SYNC_AHEAD=on` — see [`PassPrep::sync_ahead`].
+/// TEMP (lab): `REIMS_VGPU_LAB_SYNC_AHEAD` — see [`PassPrep::sync_ahead`]. On by
+/// default (interleaved x2 on both hosts, scene modes pinned: AMD hq043 windowed
+/// glass 161.7 / 148.9 Hz against 135.5 / 142.1 and full screen 138.9 / 126.7
+/// against 117.3 / 121.7; Intel n224 188.9 / 194.3 against 188.0 / 185.6 and
+/// 150.2 / 146.1 against 131.9 / 150.1; PassPrep helper work -30-48 %,
+/// foreground hashing -30-50 %); `=off` restores syncing on the items alone.
 /// Latched; off in unit tests (the test hosts have no workers to hand sets to).
 fn lab_sync_ahead() -> bool {
     if cfg!(test) {
@@ -68,9 +73,9 @@ fn lab_sync_ahead() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = matches!(
+        let on = !matches!(
             std::env::var("REIMS_VGPU_LAB_SYNC_AHEAD").as_deref(),
-            Ok("on")
+            Ok("off")
         );
         crate::observe::off(format!("lab_sync_ahead on={on}"));
         on
