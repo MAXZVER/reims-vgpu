@@ -143,6 +143,9 @@ pub mod spirv_bind;
 mod spirv_layout;
 /// How wide a translated vertex shader's stage-in reads are, per `Location`.
 pub mod spirv_vertex_input;
+/// TEMP (lab, `REIMS_VGPU_LAB_STRIPE_HUNT=on`): per-present accounting for the
+/// one-frame black-row artifact class. Measure-only; default off.
+pub mod stripe_hunt;
 /// Host surface cache (Linux/Vulkan discrete-GPU present, kb §8.5).
 pub mod surface_cache;
 /// Whether a host-side copy of a mapper-ref-texture surface's pixels is still

@@ -1379,6 +1379,12 @@ pub(crate) fn commit_gather<M: crate::runtime::host::HostOps>(
         note_store_route(route);
     }
     note_observation(&plan.seen, plan.key, plan.span);
+    // TEMP (lab, STRIPE_HUNT): the planned-commit twin of `note_gather`'s hook,
+    // so a drain-planned bind is counted under the same per-present columns.
+    crate::runtime::stripe_hunt::note_gather_bind(
+        plan.seen.vouch == GatherVouch::Vouched,
+        plan.span,
+    );
     Some(GatherOutcome {
         identity: GatheredIdentity {
             key: plan.key.content_key(),
@@ -1563,6 +1569,10 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_ng_observe_us"); // TEMP (lab)
     let seen = observe(&mut state.gather_witness, host, key, window, counts, fresh);
     drop(lab_span);
+    // TEMP (lab, STRIPE_HUNT): the witness answered — a vouch serves the
+    // retained image without reading a byte (the false-quiet population), a
+    // refusal spends the generation and gathers.
+    crate::runtime::stripe_hunt::note_gather_bind(seen.vouch == GatherVouch::Vouched, span);
 
     // Score the guest's stated account against the hypervisor's inferred one,
     // and both against the content audit. Nothing branches on the stated channel

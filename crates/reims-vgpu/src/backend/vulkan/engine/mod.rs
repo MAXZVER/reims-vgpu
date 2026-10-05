@@ -509,6 +509,9 @@ impl TailReopenBand {
     }
 
     fn count(self, counters: &EngineCounters) {
+        // TEMP (lab, STRIPE_HUNT): a flush-then-reopen between two presents is
+        // where a clear/covers-draw pair can split across the presented frame.
+        crate::runtime::stripe_hunt::note_reopen();
         let counter = match self {
             Self::Le100Us => &counters.batch_tail_reopen_le100us,
             Self::Le1Ms => &counters.batch_tail_reopen_le1ms,

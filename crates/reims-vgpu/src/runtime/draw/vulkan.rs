@@ -11375,6 +11375,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 if resident_current {
                     chain_load_from_target = true;
                     crate::runtime::drain::note_store_route("mapper_ref_texture_seed_elided");
+                    // TEMP (lab, STRIPE_HUNT): the elide answered — the
+                    // resident carried this LOAD without a seed.
+                    crate::runtime::stripe_hunt::note_seed_gate(
+                        true,
+                        u64::from(w) * u64::from(h),
+                    );
                     if backing
                         == Some(
                             crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation,
@@ -11387,6 +11393,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     note_mapper_ref_texture_elision_extent(w, h);
                 } else {
                     crate::runtime::drain::note_store_route("mapper_ref_texture_seed_provided");
+                    // TEMP (lab, STRIPE_HUNT): the elide refused and a seed is
+                    // about to be read — the torn-adoption window.
+                    crate::runtime::stripe_hunt::note_seed_gate(false, 0);
                     // Separated from the epoch's refusal so a boot can say which
                     // half refused. The two answer different questions and a
                     // single counter would hide a rail that never fires.
@@ -11452,6 +11461,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             let (declared_n, declared_area) = declared.census_routes();
             crate::runtime::drain::note_store_route(declared_n);
             crate::runtime::drain::note_store_route_n(declared_area, declared_px);
+            // TEMP (lab, STRIPE_HUNT): the declared population, per present —
+            // what the pass asked its attachment's prior contents for.
+            crate::runtime::stripe_hunt::note_load_declared(
+                matches!(declared, LoadAction::DontCare),
+                matches!(declared, LoadAction::Clear),
+                declared_px,
+            );
             // Load and DontCare share every arm below, and that sharing is the
             // contract rather than a shortcut. `MTLLoadActionDontCare` says the
             // prior contents are *undefined*, and undefined permits any
@@ -11816,6 +11832,37 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     .first()
                     .is_some_and(|c| c.mapping_id != 0 || c.target_gva != 0),
             );
+            // TEMP (lab, STRIPE_HUNT): the census's defect arm — a pass that
+            // promised its prior contents and has neither a seed nor the
+            // resident to keep them with. Its y-ranges and its mapping, per
+            // present, so a stripe frame can be read against the rows it lost.
+            // Same inputs as the census call above — including its definition
+            // of "partial", which is where the loss lives — and the arithmetic
+            // mirrors `draw_partial_preserving_unseeded_lost_texels`.
+            if !scissor.covers(w, h)
+                && preserving_partial_route(
+                    req.colors.first().map(|c| c.load_action),
+                    target_rgba8.is_some() || target_guest_seed.is_some() || zero_seed_cleared,
+                    chain_load_from_target,
+                ) == Some("draw_partial_preserving_unseeded")
+                && req
+                    .colors
+                    .first()
+                    .is_some_and(|c| c.mapping_id != 0 || c.target_gva != 0)
+            {
+                let lost = (u64::from(w) * u64::from(h)).saturating_sub(
+                    u64::from(scissor.width.min(w))
+                        .saturating_mul(u64::from(scissor.height.min(h))),
+                );
+                crate::runtime::stripe_hunt::note_unseeded_partial(
+                    scissor.y,
+                    scissor.height,
+                    w,
+                    h,
+                    lost,
+                    req.colors.first().map_or(0, |c| c.mapping_id),
+                );
+            }
         }
         // The mode is the guest's raw `MTLVisibilityResultMode`; the engine
         // takes the translated arm, and an ordinal outside the enum refuses the
@@ -13701,6 +13748,10 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
         });
         staged += window_end - window_start;
     }
+    // TEMP (lab, STRIPE_HUNT): the rows this adoption is about to lay over the
+    // resident, taken from the ranges before any of them is read — a seed fill
+    // from a window whose dirty epoch moved is the signature this names.
+    crate::runtime::stripe_hunt::note_overlay(&guest_owned.ranges, base_off, pitch);
     if crate::runtime::writeback_debt::fb_copy_replay_enabled() {
         if let Some(landed) = replay_framebuffer_copy(
             state,
