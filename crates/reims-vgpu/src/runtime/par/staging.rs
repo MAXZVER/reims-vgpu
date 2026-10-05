@@ -64,13 +64,16 @@ pub(crate) fn enabled() -> bool {
     #[cfg(not(test))]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        // On by default (n213+n214: glass +20-23 % Hz and late2 halved at 48 MiB
-        // chunks, transitions equal-or-better, stripes 0); `=off` restores the
-        // recorder-side staging.
+        // Opt-in again (`=on`). n213/n214's "+20-23 % glass" compared light
+        // PASS_STAGE boots with heavy default ones (drawsps: 65-67 against
+        // 107-110 draws a frame). With the scene modes pinned (n223, Intel,
+        // interleaved x2) the default rail beats it: windowed glass 196.0 /
+        // 193.4 Hz off against 88.6 / 158.9 on, full screen 141.2 / 136.8
+        // against 141.7 / 138.8, transitions >25 ms 9-10 % against 14 %.
         *ON.get_or_init(|| {
-            !matches!(
+            matches!(
                 std::env::var("REIMS_VGPU_LAB_PASS_STAGE").as_deref(),
-                Ok("off")
+                Ok("on")
             )
         })
     }
