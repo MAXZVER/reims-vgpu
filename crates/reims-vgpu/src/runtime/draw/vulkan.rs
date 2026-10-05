@@ -200,6 +200,7 @@ pub(crate) fn prewake_recorder_for_stream(records: usize) {
 /// outlive the stream that handed it over: the next stream may be another task's,
 /// and its first draw must not find this one's failure. Returns whether a failure
 /// was found, which the loop then counts (the draw was reported drawn).
+#[track_caller]
 pub(crate) fn settle_deferred_draws_at_stream_end() -> bool {
     if !crate::backend::vulkan::engine::deferred_draws_pending() {
         return false;

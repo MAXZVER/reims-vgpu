@@ -1653,6 +1653,7 @@ pub fn submit_deferred_draw(
 /// TEMP (lab, S5a): wait for the in-flight deferred draw, if any, and take its
 /// failure. A panic in the job is re-raised here, where the synchronous path
 /// would have raised it.
+#[track_caller]
 pub fn take_deferred_failure() -> Option<DeferredFailure> {
     // Lab RECORDER_DEPTH > 1: the join before the next draw does not wait.
     let taken = if recorder::depth() > 1 {
@@ -1685,7 +1686,10 @@ pub(crate) fn settle_for_guest_write() {
 }
 
 /// TEMP (lab, S5a): leave nothing in flight. The failure, if the job had one,
-/// is returned for the caller to report.
+/// is returned for the caller to report. Tracks its caller, so the recorder's
+/// per-site join census names the tranche end, the record exit and the stream
+/// end apart instead of this one line.
+#[track_caller]
 pub fn settle_deferred_draws() -> Option<DeferredFailure> {
     deferred_failure_of(recorder::DRAW.take(recorder::JoinSite::Explicit))
 }

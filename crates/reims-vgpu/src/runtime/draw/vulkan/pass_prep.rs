@@ -784,6 +784,9 @@ mod tests {
     /// registry is left where the serial ladder leaves it.
     #[test]
     fn chunked_buffer_binds_equal_serial() {
+        // Staging is on by default now; this test pins the non-staged rails it
+        // was written against (the staged twin is a_cold_bind_stages...).
+        let _no_stage = crate::runtime::par::staging::test_enable(false);
         let _mode = test_mode(PassPrepMode::On);
         let specs = [(7u32, 0x8000u64), (8, 0x8000)];
         let (mut planned_state, planned_host) = pooled_buffer_fixture(&specs);
@@ -1805,7 +1808,10 @@ mod tests {
         let planned_binds = make_binds(&planned_state, &*planned_host);
         let serial_binds = make_binds(&serial_state, &*serial_host);
         // The serial arm first: no priming, so the ladder falls to its CPU read.
+        // The serial reference answers must be the ladder's own Bytes, so the
+        // (default-on) staging rail is held off for this arm only.
         let mut serial_host = serial_host;
+        let _serial_no_stage = crate::runtime::par::staging::test_enable(false);
         let serial_answers: Vec<_> = serial_binds
             .iter()
             .map(|one| {

@@ -64,10 +64,13 @@ pub(crate) fn enabled() -> bool {
     #[cfg(not(test))]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // On by default (n213+n214: glass +20-23 % Hz and late2 halved at 48 MiB
+        // chunks, transitions equal-or-better, stripes 0); `=off` restores the
+        // recorder-side staging.
         *ON.get_or_init(|| {
-            matches!(
+            !matches!(
                 std::env::var("REIMS_VGPU_LAB_PASS_STAGE").as_deref(),
-                Ok("on")
+                Ok("off")
             )
         })
     }
@@ -103,7 +106,9 @@ pub(crate) fn chunk_bytes() -> u64 {
         let kb = std::env::var("REIMS_VGPU_LAB_PASS_STAGE_CHUNK_KB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(8192)
+            // 48 MiB: the 5K colour seed is 44 MB and refused to fit 8 MiB
+            // (n207: arena_full 1.1 GB a boot bypassing the rail).
+            .unwrap_or(49152)
             .max(64);
         kb.saturating_mul(1024)
     })
