@@ -991,9 +991,12 @@ pub fn display_refresh_hz() -> u32 {
 }
 
 /// TEMP (lab, n107): the refresh [`display_refresh_hz`] defaults to outside
-/// tests. Not 480: the guest offers no 5120x2160 mode at 480 Hz and comes up at
-/// 1920x1080 on the 5K panel (hq067, system_profiler) - hq062's "480 against 240"
-/// compared 1080p against 5K, not two refresh rates.
+/// tests. Every mode is offered at any refresh (hq068: 5120x2160 at 300..480),
+/// but the guest saves its chosen mode with the refresh and boots into it only at
+/// that refresh; at another one it stays in the 1920x1080 boot mode. The guest's
+/// saved mode is 5120x2160 @240, so a different default would boot every VM at
+/// 1080p - hq062's "480 against 240" compared 1080p against 5K, not two refresh
+/// rates. A lab arm at another refresh switches to 5K for its session first.
 const LAB_DEFAULT_REFRESH_HZ: u32 = 240;
 pub const DISPLAY_PRODUCT_NAME: &[u8] = b"QEMU display\0";
 /// How many unacked ONLINE pulses this device sends before it stops.
