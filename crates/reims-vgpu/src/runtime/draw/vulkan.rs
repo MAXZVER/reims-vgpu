@@ -4161,7 +4161,7 @@ enum MapperRefTextureSeedRung {
 
 /// A mapper-ref-texture attachment's prior contents, kept in the representation of the
 /// freshest rung that supplied them.
-enum MapperRefTextureLoadSeed {
+pub(super) enum MapperRefTextureLoadSeed {
     /// Host-owned bytes from the render cache, or the universal converted
     /// fallback when the native guest-page view cannot be described.
     Host(
@@ -11652,6 +11652,62 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // independently driven x86/Vulkan boots: 1 558, 395 and 295
                     // colour LOAD seed resolutions, and 0 serves plus 0 misses
                     // at that door in every one.
+                    //
+                    // TEMP (lab, PRESERVE_SEED): the last door, and only on the
+                    // arm that loses content — a partial scissor over a
+                    // guest-backed target that no door served. The complement
+                    // is the guest's own window bytes; serving them keeps the
+                    // election at Preserve where it would otherwise key "no
+                    // seed" and leave undefined rows (og12: 6 unseeded
+                    // preserves, 49 746 px, striped). A full-coverage scissor
+                    // redraws everything and needs no complement, so the door
+                    // stays shut for it — a whole-window upload there is cost
+                    // with no repair.
+                    if preserve_seed_on()
+                        && target_rgba8.is_none()
+                        && target_guest_seed.is_none()
+                        && !zero_seed_cleared
+                        && (c0.mapping_id != 0 || c0.target_gva != 0)
+                        && req.scissors.first().is_some_and(|s| !s.covers(w, h))
+                    {
+                        let preserve_format = pass_inv::render_identity(state, req)
+                            .as_ref()
+                            .map(|identity| identity.resident_format())
+                            .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
+                        match try_preserve_seed_from_guest_window(
+                            state,
+                            host,
+                            req.task_id,
+                            c0,
+                            preserve_format,
+                        ) {
+                            Some(MapperRefTextureLoadSeed::Host(bytes, order)) => {
+                                target_rgba8 = Some(bytes);
+                                seed_order = order;
+                                crate::runtime::drain::note_store_route("preserve_seed_n");
+                                crate::runtime::drain::note_store_route_n(
+                                    "preserve_seed_px",
+                                    u64::from(w) * u64::from(h),
+                                );
+                            }
+                            Some(MapperRefTextureLoadSeed::Guest(seed)) => {
+                                target_guest_seed = Some(seed);
+                                crate::runtime::drain::note_store_route("preserve_seed_n");
+                                crate::runtime::drain::note_store_route_n(
+                                    "preserve_seed_px",
+                                    u64::from(w) * u64::from(h),
+                                );
+                            }
+                            None => {
+                                // The context cannot read this window: today's
+                                // behaviour stands, and the residual is visible
+                                // rather than folded into the served count.
+                                crate::runtime::drain::note_store_route(
+                                    "preserve_seed_fallback_n",
+                                );
+                            }
+                        }
+                    }
                     // What this pass declares for a full-screen compositor
                     // plane, recorded where the load action has been resolved
                     // rather than where it was decoded — the request builder
@@ -11902,6 +11958,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     lost,
                     req.colors.first().map_or(0, |c| c.mapping_id),
                 );
+            }
+            // TEMP (lab, STRIPE_HUNT, iter 3): the white-row family's
+            // CPU-visible member — a partial-scissor pass the guest declared
+            // CLEAR, with a white clear colour. If the cover lands late or
+            // short, the uncleared-then-repainted gap reads white; the
+            // recycled-white-image member of the same family is GPU-side and
+            // only the frame scanners see it.
+            if !scissor.covers(w, h)
+                && req.colors.first().is_some_and(|c| {
+                    c.load_action == MTL_LOAD_ACTION_CLEAR
+                        && c.clear_color.iter().all(|v| *v >= 0.98)
+                })
+            {
+                crate::runtime::stripe_hunt::note_clear_partial_white(u64::from(w) * u64::from(h));
             }
         }
         // The mode is the guest's raw `MTLVisibilityResultMode`; the engine
@@ -13781,6 +13851,114 @@ pub(super) fn overlay_guard_verdict(
         return OverlayGuardVerdict::DroppedGenMoved;
     }
     OverlayGuardVerdict::Passed
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESERVE_SEED=on`, default off): the last door of
+/// the colour-0 LOAD seed block — family 1's repair.
+///
+/// # What it repairs
+///
+/// The unseeded partial-preserving arm (`draw_partial_preserving_unseeded`, the
+/// census's own "defect arm"): a pass whose declared load preserves, whose
+/// scissor covers only its damage, and for which no door served — no resident
+/// (`chain_load_from_target` false), no provenance seed, and the mapping door's
+/// rungs declined (geometry equality, format, an unmapped window, or the
+/// `color_seed` door shadowing the mapping door with a length-mismatched seed).
+/// Every texel outside the scissor then holds undefined content, and og12
+/// (guard-on boot 12) convicted this arm live: six unseeded preserves, 49 746
+/// lost px at the stripe present, zero overlay/seed activity.
+///
+/// The repair is that the preserved complement is not actually lost — a
+/// **guest-backed** target's prior content is the guest's own window bytes, and
+/// they can be served as the seed. This door reads them:
+///
+/// - a GVA target takes the generic native window seed
+///   ([`try_gva_target_guest_seed`]) — eligible here for eight-bit colour too,
+///   since the restriction at the serial door exists to keep eight-bit seeds on
+///   the colour rung, not because the bytes are wrong;
+/// - a mapping target takes a strided sub-window read at the *requested*
+///   geometry ([`mapping_write::read_rect_raw_at`]), which is exactly the read
+///   the strict door's `mapping.width == w` equality refuses.
+///
+/// Like every guest-page read, it can catch a mid-update window (family 2's
+/// tear); it cannot be worse than the zeros it replaces, and the Store's stamp
+/// is the block's own pre-read observation either way, so the next verdict
+/// still re-seeds after a guest write.
+pub(super) fn preserve_seed_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PRESERVE_SEED").as_deref() == Ok("on"))
+}
+
+/// Serve the guest's own window bytes as a colour-0 LOAD seed. `None` is the
+/// counted fallback — the context cannot read this window, and today's
+/// behaviour stands.
+pub(super) fn try_preserve_seed_from_guest_window<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c0: &ColorRtRequest,
+    target_format: ash::vk::Format,
+) -> Option<MapperRefTextureLoadSeed> {
+    use crate::backend::vulkan::engine::SeedOrder;
+    if c0.mapping_id == 0 {
+        // A GVA target: the generic window seed, at the request's own geometry
+        // and stride.
+        return try_gva_target_guest_seed(state, host, task_id, c0, target_format)
+            .map(MapperRefTextureLoadSeed::Guest);
+    }
+    // A mapping target: eight-bit scanout order only — the seed carrier below
+    // spells BGRA8, and inventing a conversion for every other format is a
+    // product decision this prototype does not make.
+    let window = {
+        let Some(m) = state.mappings.get(&c0.mapping_id) else {
+            return None;
+        };
+        if !m.mapped
+            || m.page_entries.is_empty()
+            || !matches!(
+                m.format,
+                0 | crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
+                    | crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
+            )
+        {
+            return None;
+        }
+        crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+            m,
+            c0.width,
+            c0.height,
+            crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        )
+    }?;
+    let (base_off, bpr, span_end) = window;
+    let tight = c0.width.checked_mul(RGBA8_BPP)?;
+    let mut raw = vec![0u8; tight as usize * c0.height as usize];
+    let read = crate::runtime::mapping_write::read_rect_raw_at(
+        state,
+        host,
+        c0.mapping_id,
+        crate::runtime::mapping_write::SurfaceWindow {
+            base_off,
+            bpr,
+            span_end,
+            bpp: RGBA8_BPP,
+        },
+        crate::runtime::mapping_write::Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: c0.width,
+            height: c0.height,
+        },
+        &mut raw,
+        tight,
+    );
+    if !read {
+        return None;
+    }
+    Some(MapperRefTextureLoadSeed::Host(
+        std::sync::Arc::new(raw),
+        SeedOrder::Bgra8,
+    ))
 }
 
 /// Whether [`overlay_guest_writes_onto_resident`] may run, as

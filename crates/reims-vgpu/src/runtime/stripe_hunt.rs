@@ -77,6 +77,14 @@ struct Hunt {
     dc_px: u64,
     /// Declared Clear px on colour-0.
     clear_px: u64,
+    /// TEMP (iter 3, white stripes): px of **partial-scissor CLEAR passes
+    /// whose clear colour is white** — the only CPU-visible member of the
+    /// white-row family (a guest clear + a cover that lands late leaves the
+    /// cleared rows white). The other white source — a recycled image whose
+    /// stale rows were a white surface, read by an unseeded preserve — lives
+    /// GPU-side and cannot be seen here without a content probe the census
+    /// rules forbid; the frame scanners own that half.
+    clear_white_px: u64,
     /// Partial preserving-unseeded draws on guest-backed targets.
     unseeded: u32,
     /// Texels those draws left holding undefined content (attachment minus
@@ -120,6 +128,7 @@ impl Hunt {
         Self {
             dc_px: 0,
             clear_px: 0,
+            clear_white_px: 0,
             unseeded: 0,
             unseeded_lost_px: 0,
             unseeded_rows: Vec::new(),
@@ -190,9 +199,11 @@ impl Hunt {
     }
 
     /// One partial preserving-unseeded draw on a guest-backed target. Only
-    /// display-sized targets (width >= 512) are recorded: the artifact is a
-    /// display layer, and the ambient population of tiny scratch targets would
-    /// bury it (702 events that second, 6.8 M texels, mostly small).
+    /// targets at least 256 px wide are recorded: the artifact is a display
+    /// layer, and the ambient population of tiny scratch targets would bury it
+    /// (702 events that second, 6.8 M texels, mostly small). 256, not 512 —
+    /// og12's convicted strip was 486 px wide, and a threshold above the
+    /// artifact's own width hid exactly the target the line exists to name.
     fn note_unseeded_partial(
         &mut self,
         scissor_y: u32,
@@ -204,7 +215,7 @@ impl Hunt {
     ) {
         self.unseeded += 1;
         self.unseeded_lost_px += lost_px;
-        if target_w >= 512 {
+        if target_w >= 256 {
             let s = scissor_y.min(target_h);
             let e = (scissor_y.saturating_add(scissor_h)).min(target_h);
             Self::push_range(&mut self.unseeded_rows, &mut self.unseeded_more, s, e);
@@ -223,6 +234,13 @@ impl Hunt {
         if clear {
             self.clear_px += px;
         }
+    }
+
+    /// A partial-scissor pass declared CLEAR with a white clear colour. The
+    /// px are the whole attachment's: the cover's share is the scissor union's,
+    /// which the census already names.
+    fn note_clear_partial_white(&mut self, px: u64) {
+        self.clear_white_px += px;
     }
 
     /// The mapper-ref seed gate answered: an elision with its covered px, or a
@@ -293,7 +311,7 @@ impl Hunt {
             }
         };
         let line = format!(
-            "stripe_hunt present mid={mid} {w}x{h} dc_px={} clear_px={} \
+            "stripe_hunt present mid={mid} {w}x{h} dc_px={} clear_px={} clear_white_px={} \
              unseeded={} lost_px={} rows=[{}] rows_more={} mids=[{}] \
              elide={} elide_px={} provided={} \
              skip={} skip_kb={} gather={} \
@@ -301,6 +319,7 @@ impl Hunt {
              reopen={} recreate={} guard_drop={} t={}",
             self.dc_px,
             self.clear_px,
+            self.clear_white_px,
             self.unseeded,
             self.unseeded_lost_px,
             fmt_ranges(&self.unseeded_rows),
@@ -343,6 +362,18 @@ pub fn note_load_declared(dontcare: bool, clear: bool, px: u64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .note_load_declared(dontcare, clear, px);
+}
+
+/// Hook (iter 3, white stripes): a partial-scissor pass declared CLEAR with a
+/// white clear colour — the CPU-visible half of the white-row family.
+pub fn note_clear_partial_white(px: u64) {
+    if !on() {
+        return;
+    }
+    window()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .note_clear_partial_white(px);
 }
 
 /// Hook: a partial draw whose declared load preserves found no seed and no
@@ -491,6 +522,11 @@ mod tests {
         assert_eq!(h.unseeded, 1);
         assert_eq!(h.unseeded_lost_px, 3584);
         assert!(h.unseeded_rows.is_empty());
+        // A 486-px-wide layer — og12's convicted strip — is named: the
+        // threshold must sit below the artifact's own width or the line
+        // hides exactly the target it exists to name.
+        h.note_unseeded_partial(10, 29, 486, 238, 100_000, 91);
+        assert_eq!(h.unseeded_rows, vec![(10, 39)]);
     }
 
     #[test]
@@ -513,6 +549,7 @@ mod tests {
         let mut h = hunt();
         h.note_load_declared(true, false, 1_000);
         h.note_load_declared(false, true, 2_000);
+        h.note_clear_partial_white(3_000);
         h.note_unseeded_partial(466, 238, 970, 476, 430_000, 91);
         h.note_seed_gate(true, 11_010_000);
         h.note_seed_gate(false, 0);
@@ -525,6 +562,7 @@ mod tests {
         let line = h.take_present_line(1, 5120, 2160);
         assert!(line.contains("mid=1 5120x2160"), "{line}");
         assert!(line.contains("dc_px=1000 clear_px=2000"), "{line}");
+        assert!(line.contains("clear_white_px=3000"), "{line}");
         assert!(line.contains("unseeded=1 lost_px=430000"), "{line}");
         // The scissor reaches past the target and is clamped to its height.
         assert!(line.contains("rows=[466-476]"), "{line}");
