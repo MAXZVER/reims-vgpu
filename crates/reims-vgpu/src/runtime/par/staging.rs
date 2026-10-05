@@ -93,7 +93,9 @@ pub(crate) fn enabled() -> bool {
 /// `pass_stage_sampled_planned=9582` against `hit=54`, `pass_stage_bytes=121 GB`
 /// of copies no engine arm ever read). `=off` restores the eager attach for
 /// A/B inside the staging rail; the rail's own gate stays
-/// `REIMS_VGPU_LAB_PASS_STAGE`.
+/// `REIMS_VGPU_LAB_PASS_STAGE`. Live (phases inside one boot) through
+/// `REIMS_VGPU_LAB_LIVE_FILE` — the rule is a per-plan decision, so a phase
+/// boundary costs nothing.
 pub(crate) fn staged_proven() -> bool {
     // Unit tests pin their arm through their own door (the rule-off tests
     // must keep the eager rail the old tests were written against).
@@ -103,6 +105,9 @@ pub(crate) fn staged_proven() -> bool {
     }
     #[cfg(not(test))]
     {
+        if let Some(on) = crate::runtime::lab_live::on("STAGED_PROVEN") {
+            return on;
+        }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| {
             !matches!(
