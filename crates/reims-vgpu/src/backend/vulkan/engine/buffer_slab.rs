@@ -598,6 +598,9 @@ impl BufferSlabPool {
     /// it alone (it is not a shared-class spare), teardown frees it. Latched;
     /// off under test.
     fn lab_dedicated_spare_on() -> bool {
+        if let Some(on) = crate::runtime::lab_live::on("DEDICATED_SPARE") {
+            return on;
+        }
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {

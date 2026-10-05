@@ -52,6 +52,8 @@ pub mod gpa_map;
 /// The last few pieces of work handed to the GPU, so a host GPU hang can name
 /// what it was running instead of only that a fence stopped signalling.
 pub mod gpu_hang_trail;
+/// TEMP (lab): switches that follow a host-written file, for A/B phases inside one boot.
+pub(crate) mod lab_live;
 /// The bound on every GPU reference to guest RAM — one import per RAMBlock,
 /// and the only type that can name a byte inside one.
 ///
