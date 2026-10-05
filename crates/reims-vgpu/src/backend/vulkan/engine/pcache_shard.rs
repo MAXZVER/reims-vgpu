@@ -105,9 +105,13 @@ const SHARD_MAX_WARM_BYTES: usize = 2 * 1024 * 1024;
 /// Default total warm-set bound across all shard files. The monolithic path's
 /// 8 MiB had to sit under one boot's working set or every boot went cold; the
 /// shard bound only has to sit under the *LRU-hot* set, because overflow now
-/// trims cold shards instead of discarding the file. 32 MiB is ~3.5 Tahoe
-/// working sets.
-const SHARD_TOTAL_WARM_BYTES: usize = 32 * 1024 * 1024;
+/// trims cold shards instead of discarding the file. 128 MiB since 2026-10-05:
+/// the home rig (AMD) settled at 37 MB and trimmed every boot at the old 32
+/// (one 1.25 s compile on a first Finder transition); at 128 it holds
+/// trimmed=0 with 0-2 compiles over 100 ms (Opus hq057/hq058), while Intel
+/// pays nothing for the headroom (32.4 MB warm, trimmed=0 at either cap,
+/// compile totals and Hz identical across the cap arms — ZCode n234).
+const SHARD_TOTAL_WARM_BYTES: usize = 128 * 1024 * 1024;
 
 /// TEMP (lab): `REIMS_VGPU_LAB_PCACHE_SHARD=off` restores the byte-for-byte
 /// monolithic path. On by default (n200: per-boot compile 752/683 ms with the
