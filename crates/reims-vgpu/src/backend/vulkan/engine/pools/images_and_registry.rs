@@ -1110,6 +1110,11 @@ impl ResourcePools {
         why: ResidentReclaim,
         counters: &EngineCounters,
     ) -> Option<ResidentTargetSlot> {
+        // TEMP (lab, STRIPE_HUNT): a resident leaving the registry is the fresh
+        // zero-image population a later unseeded pass reads — count it per
+        // present, whatever the removal reason, because every arm of `why`
+        // produces one.
+        crate::runtime::stripe_hunt::note_recreate();
         let old = self.unregister_resident(identity, why)?;
         self.dispose_owed_framebuffer(&ctx.device, old.owed_framebuffer());
         for (_, view) in &old.alternate_views {

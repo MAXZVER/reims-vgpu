@@ -1571,6 +1571,363 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
     );
 }
 
+/// TEMP (lab, OVERLAY_GUARD): the post-read verdict over synthetic
+/// observations — every combination the site can be handed, so the drop policy
+/// itself is pinned independently of any host.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn overlay_guard_verdict_passes_quiet_and_drops_movement() {
+    use crate::model::GuestWriteObservation;
+    let obs = |token: u64, map_generation: u32, gen_: u64| GuestWriteObservation {
+        token,
+        map_generation,
+        gen_,
+        stated: 0,
+    };
+    // No baseline was ever taken: the adoption was already unwitnessed, and a
+    // guard that dropped on its own absence would disable the rail outright.
+    assert!(!overlay_guard_verdict(&obs(0, 1, 0), &obs(9, 2, 5)).dropped());
+    // Quiet: same token, same page list, same generation.
+    assert!(!overlay_guard_verdict(&obs(7, 3, 11), &obs(7, 3, 11)).dropped());
+    // The generation moved: a write was observed during the read.
+    assert!(overlay_guard_verdict(&obs(7, 3, 11), &obs(7, 3, 12)).dropped());
+    // The token was rebuilt under the adoption — a different page list.
+    assert!(overlay_guard_verdict(&obs(7, 3, 11), &obs(8, 3, 11)).dropped());
+    // The page list churned without the token id changing.
+    assert!(overlay_guard_verdict(&obs(7, 3, 11), &obs(7, 4, 11)).dropped());
+    // The host cannot answer right now (an unarmed read answers 0): that is
+    // not evidence of movement, and dropping on it would refuse every adoption
+    // whose token sits between syncs.
+    assert!(!overlay_guard_verdict(&obs(7, 3, 11), &obs(7, 3, 0)).dropped());
+}
+
+/// TEMP (lab, OVERLAY_GUARD): the flow the guard exists for, over the fake
+/// host. A guest memset→fill pair straddling the overlay's read window must
+/// make the site drop the adoption — pre-fill zeros are never adopted — and
+/// the dropped stamp must leave the write visible to the next verdict, which
+/// is the one-frame-bounded heal.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn overlay_guard_drops_an_adoption_the_guest_moved_during() {
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::runtime::host::HostOps;
+    use crate::runtime::mapper::observe_current_guest_write_gen;
+
+    let entry_for =
+        |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page = state.page_size();
+    assert!(state.map_surface(7));
+    let gpas = [0x40 * page, 0x91 * page];
+    {
+        let m = state.mappings.get_mut(&7).expect("mapped above");
+        m.page_entries = gpas.iter().map(|g| entry_for(*g)).collect();
+    }
+    let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7)
+        .expect("FakeHost observes guest writes");
+    // The list-time observation: whatever generation the pages sit at. The
+    // stamp beside it is the one a Store would have committed, so the verdict
+    // machinery below answers about the guest rather than about its own
+    // startup.
+    let seen = observe_current_guest_write_gen(&state, &host, 7);
+    assert_eq!(seen.token, token, "a live token must be observed");
+    assert_ne!(seen.gen_, 0, "an armed token has a generation");
+    state.mappings.get_mut(&7).unwrap().guest_write_gen_at_store = seen.gen_;
+
+    // A quiet read window: nothing moved between the evidence and the check,
+    // so the adoption proceeds.
+    let now = observe_current_guest_write_gen(&state, &host, 7);
+    assert!(!overlay_guard_verdict(&seen, &now).dropped());
+
+    // The guest's fill lands inside the read window. The bytes the read
+    // captured are the intermediate state; the guard must refuse them.
+    host.guest_wrote_page(gpas[1]);
+    let now = observe_current_guest_write_gen(&state, &host, 7);
+    let verdict = overlay_guard_verdict(&seen, &now);
+    assert!(
+        verdict.dropped(),
+        "a write observed during the read must drop the adoption, never adopt \
+         its pre-fill bytes"
+    );
+    assert_eq!(verdict.slug(), "overlay_guard_drop_gen_moved");
+
+    // A re-read after the fill quiesces is quiet against its own evidence —
+    // the retry the seed rail takes would adopt the post-fill bytes.
+    let after_fill = observe_current_guest_write_gen(&state, &host, 7);
+    assert!(!overlay_guard_verdict(&after_fill, &after_fill).dropped());
+
+    // And the dropped stamp keeps the write visible: the next verdict still
+    // refuses the resident, so the heal is one frame and not a latch.
+    assert_eq!(
+        mapping_guest_write_verdict(&state, &host, 7),
+        GuestWriteVerdict::Wrote,
+        "the drop stamped nothing, so the guest's fill must still be owed"
+    );
+
+    // Page-list churn under a live token id: the ranges were listed against
+    // pages this surface may no longer own, so the adoption drops even though
+    // the generation itself did not move.
+    state.mappings.get_mut(&7).unwrap().map_generation += 1;
+    let churned = observe_current_guest_write_gen(&state, &host, 7);
+    assert!(
+        overlay_guard_verdict(&seen, &churned).dropped(),
+        "a token answered for a different page list than the one listed"
+    );
+}
+
+/// TEMP (lab, OVERLAY_GUARD): the gate is off unless the lab asks for it, so
+/// the default build's overlay and seed rails run byte-identical to before.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn overlay_guard_is_off_by_default() {
+    std::env::remove_var("REIMS_VGPU_LAB_OVERLAY_GUARD");
+    // The latch is a `OnceLock`, so this test reads the process's first
+    // answer; the suite never sets the variable, so that answer is "off".
+    assert!(!overlay_guard_on());
+}
+
+/// TEMP (lab, PRESERVE_SEED): the gate is off unless the lab asks for it, so
+/// the default build's unseeded partial-preserving arm runs unchanged.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn preserve_seed_is_off_by_default() {
+    std::env::remove_var("REIMS_VGPU_LAB_PRESERVE_SEED");
+    assert!(!preserve_seed_on());
+}
+
+/// TEMP (lab, PRESERVE_SEED): a mapping target whose requested geometry is a
+/// sub-window of the mapping — the exact read the strict door's
+/// `mapping.width == w` equality refuses — must seed the guest's own window
+/// bytes at the requested geometry, so the pass preserves the guest's content
+/// outside its damage scissor instead of undefined rows.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_preserve_seed_reads_the_mapping_window_the_strict_door_refuses() {
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format as pf;
+    use crate::runtime::host::HostMemory;
+
+    let entry_for =
+        |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page = state.page_size();
+    assert!(state.map_surface(7));
+    // Two contiguous pages of guest storage for a surface whose mapping
+    // geometry (64x64) is wider than the requested window (48x32).
+    let gpas = [0x40 * page, 0x41 * page];
+    {
+        let m = state.mappings.get_mut(&7).expect("mapped above");
+        m.page_entries = gpas.iter().map(|g| entry_for(*g)).collect();
+        m.has_geom = true;
+        m.width = 64;
+        m.height = 64;
+        m.format = pf::MTL_FORMAT_BGRA8_UNORM;
+    }
+    // Fill every byte of both pages with a non-zero pattern keyed to the
+    // offset, so whatever stride the packed window estimate chose, the read's
+    // expectation is computable from the same window call.
+    let mut pattern = vec![0u8; 2 * page as usize];
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(7) | 0x80;
+    }
+    host.write_gpa(gpas[0], &pattern).expect("fake pages take writes");
+
+    let c0 = ColorRtRequest {
+        slot: 0,
+        texture_ref: 0,
+        mapping_id: 7,
+        target_gva: 0,
+        width: 48,
+        height: 32,
+        format: pf::MTL_FORMAT_BGRA8_UNORM,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        ..Default::default()
+    };
+    let seed = try_preserve_seed_from_guest_window(
+        &mut state,
+        &mut host,
+        1,
+        &c0,
+        ash::vk::Format::B8G8R8A8_UNORM,
+    )
+    .expect("the guest owns this window's bytes; the last door must serve them");
+    let MapperRefTextureLoadSeed::Host(bytes, order) = seed else {
+        panic!("a BGRA8 mapping window serves host bytes");
+    };
+    assert_eq!(order, crate::backend::vulkan::engine::SeedOrder::Bgra8);
+    // The tight 48x32 BGRA8 window, row by row out of the strided guest
+    // pages — the guest's own bytes, not zeros.
+    let (base_off, bpr, _span_end) = crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+        state.mappings.get(&7).unwrap(),
+        48,
+        32,
+        pf::MTL_FORMAT_BGRA8_UNORM,
+    )
+    .expect("the packed estimate resolves a window");
+    let tight = 48 * 4;
+    assert_eq!(bytes.len(), tight * 32);
+    for y in 0..32u64 {
+        let off = (base_off + y * u64::from(bpr)) as usize;
+        let expected = &pattern[off..off + tight];
+        let got = &bytes[y as usize * tight..(y as usize + 1) * tight];
+        assert_eq!(
+            got, expected,
+            "row {y} of the seed must be the guest's own bytes at the window stride"
+        );
+        assert!(
+            !got.iter().all(|b| *b == got[0]),
+            "row {y} must carry the offset-keyed pattern, not a constant or zero fill"
+        );
+    }
+}
+
+/// TEMP (lab, PRESERVE_SEED): an eight-bit GVA target is eligible for the
+/// native window seed at the last door — the restriction at the serial door
+/// keeps eight-bit seeds on the colour rung, and the preserved complement has
+/// no colour rung to wait for.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_preserve_seed_serves_an_eight_bit_gva_window() {
+    crate::runtime::guest_ram_map::reset();
+    use crate::model::PAGE_SHIFT_ARM64E;
+    use crate::protocol::pixel_format as pf;
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    crate::runtime::gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 4);
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+    let c0 = ColorRtRequest {
+        slot: 0,
+        texture_ref: 0,
+        mapping_id: 0,
+        target_gva: page, // GVA page 1
+        width: 4,
+        height: 2,
+        row_stride: 64,
+        format: pf::MTL_FORMAT_BGRA8_UNORM,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        ..Default::default()
+    };
+    let want = ash::vk::Format::B8G8R8A8_UNORM;
+    let seed = try_preserve_seed_from_guest_window(&mut state, &mut host, 1, &c0, want)
+        .expect("an eight-bit GVA window seeds natively at the last door");
+    let MapperRefTextureLoadSeed::Guest(seed) = seed else {
+        panic!("a GVA window serves guest runs");
+    };
+    assert_eq!(seed.format, want);
+    assert_eq!(
+        seed.source.total_len,
+        64 + 4 * 4,
+        "one full 64-byte row plus the tight last row"
+    );
+    assert_eq!(seed.source.row_length_texels, 16, "a 64-byte row is 16 texels");
+    crate::runtime::guest_ram_map::reset();
+}
+
+/// TEMP (lab, PRESERVE_SEED, iter 4): when the attachment is pooled RGBA — the
+/// case that refused every eight-bit window in n244 — the door must fall
+/// through to a byte read of the same rows, served in the window's own channel
+/// order with the order flag that lets the uploader's staging exchange do the
+/// swap. One swap, declared once.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_preserve_seed_serves_gva_bytes_when_the_attachment_is_rgba() {
+    crate::runtime::guest_ram_map::reset();
+    use crate::model::PAGE_SHIFT_ARM64E;
+    use crate::protocol::pixel_format as pf;
+    use crate::runtime::host::HostMemory;
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    crate::runtime::gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 4);
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+    // define_task_pages_arm64e maps GVA page i to PFN 4+i: the window at GVA
+    // page 1 lives at GPA page 5. Two 16-byte BGRA rows, 64-byte stride,
+    // channels distinct so a swap or a double swap would show.
+    let row0: [u8; 16] = [10, 20, 30, 255, 11, 21, 31, 255, 12, 22, 32, 255, 13, 23, 33, 255];
+    let row1: [u8; 16] = [40, 50, 60, 255, 41, 51, 61, 255, 42, 52, 62, 255, 43, 53, 63, 255];
+    let gpa = 5u64 << PAGE_SHIFT_ARM64E;
+    host.write_gpa(gpa, &row0).expect("row 0 lands");
+    host.write_gpa(gpa + 64, &row1).expect("row 1 lands");
+
+    let c0 = ColorRtRequest {
+        slot: 0,
+        texture_ref: 0,
+        mapping_id: 0,
+        target_gva: page,
+        width: 4,
+        height: 2,
+        row_stride: 64,
+        format: pf::MTL_FORMAT_BGRA8_UNORM,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        ..Default::default()
+    };
+    let seed = try_preserve_seed_from_guest_window(
+        &mut state,
+        &mut host,
+        1,
+        &c0,
+        ash::vk::Format::R8G8B8A8_UNORM,
+    )
+    .expect("a pooled-RGBA attachment still gets the window's bytes");
+    let MapperRefTextureLoadSeed::Host(bytes, order) = seed else {
+        panic!("the byte fallback serves host bytes");
+    };
+    assert_eq!(order, crate::backend::vulkan::engine::SeedOrder::Bgra8);
+    let mut want = Vec::with_capacity(32);
+    want.extend_from_slice(&row0);
+    want.extend_from_slice(&row1);
+    assert_eq!(
+        bytes.as_slice(),
+        want.as_slice(),
+        "the seed carries the window's own BGRA bytes, unswapped — the \
+         SeedOrder flag names the swap once, for the uploader"
+    );
+    crate::runtime::guest_ram_map::reset();
+}
+
+/// TEMP (lab, PRESERVE_SEED, iter 4): every refusal names its reason, because
+/// n244's zero-serve run has to become a distribution, not a mystery.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_preserve_seed_refusal_names_its_reason() {
+    use crate::runtime::drain::store_route_count;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let c0 = ColorRtRequest {
+        slot: 0,
+        texture_ref: 0,
+        mapping_id: 999,
+        target_gva: 0,
+        width: 64,
+        height: 8,
+        format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        ..Default::default()
+    };
+    let before = store_route_count("preserve_seed_fb_unresolved");
+    assert!(
+        try_preserve_seed_from_guest_window(
+            &mut state,
+            &mut host,
+            1,
+            &c0,
+            ash::vk::Format::B8G8R8A8_UNORM,
+        )
+        .is_none()
+    );
+    assert!(
+        store_route_count("preserve_seed_fb_unresolved") > before,
+        "a mapping that cannot resolve is the named refusal, not a silent one"
+    );
+}
+
 /// The verdict must keep its refusals apart, because two rails now report it.
 ///
 /// [`mapper_ref_texture_guest_wrote_since_store`] collapses everything that is not `Clean`

@@ -509,6 +509,9 @@ impl TailReopenBand {
     }
 
     fn count(self, counters: &EngineCounters) {
+        // TEMP (lab, STRIPE_HUNT): a flush-then-reopen between two presents is
+        // where a clear/covers-draw pair can split across the presented frame.
+        crate::runtime::stripe_hunt::note_reopen();
         let counter = match self {
             Self::Le100Us => &counters.batch_tail_reopen_le100us,
             Self::Le1Ms => &counters.batch_tail_reopen_le1ms,
@@ -2670,7 +2673,351 @@ pub fn prepare_window_resident_present(
             return Err("winpub_batch_flush_failed");
         }
     }
-    resident_present_decision(pools, identity, width, height)
+    let decision = resident_present_decision(pools, identity, width, height)?;
+    // TEMP (lab, `REIMS_VGPU_LAB_SCANOUT_SNAPSHOT=on`, default off): hand the
+    // presenter the last PRESENT-COMMITTED content, not the live resident. The
+    // publish above pins an identity and an epoch but hands the presenter the
+    // resident's own `VkImage`; the presenter re-blits that image at every host
+    // vblank, so a guest that re-renders the displayed buffer (N-buffer
+    // recycling) has its intermediate state — a white clear whose refill is one
+    // submission later — sampled straight onto the screen. That is the white
+    // stripe family: pure (255,255,255) rows for one host frame, matching
+    // neither neighbour frame, invisible to every drain-side census (n245: 6/8
+    // boots striped with `unseeded=0 lost_px=0 clear_white_px=0 overlay=0
+    // gather=0 recreate=0`). The snapshot is one queue-ordered device copy per
+    // publish — submitted here, after the batch flush the transaction already
+    // paid, on the same queue the presenter's blit takes, so the blit can only
+    // ever read the publish's own frame.
+    if scanout_snapshot_on() {
+        if let Some(ctx) = owner.ctx.as_ref() {
+            if let Some(snapshot) = unsafe {
+                snapshot_window_source(ctx, pools, counters, decision.resolved, identity)
+            } {
+                crate::runtime::drain::note_store_route("scanout_snapshot_n");
+                let mut decision = decision;
+                decision.resolved = snapshot;
+                return Ok(decision);
+            }
+        }
+        crate::runtime::drain::note_store_route("scanout_live_n");
+    }
+    Ok(decision)
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_SCANOUT_SNAPSHOT=on`): see the call site above.
+fn scanout_snapshot_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("REIMS_VGPU_LAB_SCANOUT_SNAPSHOT").as_deref(), Ok("off")))
+}
+
+/// The window snapshot's device objects. One per process — one engine device,
+/// one host window (the same standing the presenter itself rests on). A
+/// TEMP-lab prototype: it is not torn down on device recreation; an A/B boot
+/// that recreates the device leaks one image, and the journal says so.
+struct WindowSnapshotImage {
+    image: ash::vk::Image,
+    memory: ash::vk::DeviceMemory,
+    width: u32,
+    height: u32,
+}
+
+fn window_snapshot() -> &'static std::sync::Mutex<Option<WindowSnapshotImage>> {
+    static SNAPSHOT: std::sync::Mutex<Option<WindowSnapshotImage>> = std::sync::Mutex::new(None);
+    &SNAPSHOT
+}
+
+/// Copy the presented resident into the snapshot image and answer the
+/// resolution the presenter should blit instead of the live resident.
+///
+/// Queue discipline: the copy is submitted on the engine queue, after every
+/// submission the publish's batch flush already made, and the presenter's blit
+/// is submitted on that same queue (`context::submit_present_transaction`), so
+/// submission order alone hands the blit the publish's own frame — no fence is
+/// waited here. The fence exists only to make the previous copy complete before
+/// this one re-records the command buffer.
+unsafe fn snapshot_window_source(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &EngineCounters,
+    resolved: pools::ResolvedResident,
+    identity: &TargetIdentity,
+) -> Option<pools::ResolvedResident> {
+    use ash::vk::ImageLayout;
+    // Iteration 7: the submission goes through the engine's own doors —
+    // append to the open draw batch when one is recording, else
+    // `begin_entry`/`submit_queue_work`/`seal_entry`, the exact sequence
+    // `copy_image_level0_to_host` uses. The first two cuts submitted a private
+    // command buffer straight to `ctx.queue()`, bypassing the queue owner that
+    // serializes this host's submissions: n247/n249 both wedged the drain
+    // right after the publish's own batch machinery met a submission it did
+    // not make (scanout_snapshot_n=3 = the boot's extent ladder; the device's
+    // own vbl loop ran on for minutes while the drain never returned).
+    // There is no fence to wait on at all now: queue order alone orders the
+    // copy ahead of every later presenter blit, and the ring the entry rides
+    // is the one the engine already retires by the thousand per boot.
+    let format = identity.resident_format();
+    let mut guard = window_snapshot().lock().unwrap_or_else(|e| e.into_inner());
+    // Extent change: the old image is retired by leaking (a TEMP prototype;
+    // counted) — no queue interaction on the change path at all.
+    let needs = guard
+        .as_ref()
+        .map_or(true, |s| s.width != resolved.width || s.height != resolved.height);
+    if needs {
+        if guard.is_some() {
+            crate::runtime::drain::note_store_route("scanout_snapshot_recreate_n");
+        }
+        *guard = None;
+    }
+    if guard.is_none() {
+        let image = unsafe {
+            ctx.device.create_image(
+                &ash::vk::ImageCreateInfo::default()
+                    .image_type(ash::vk::ImageType::TYPE_2D)
+                    .format(format)
+                    .extent(ash::vk::Extent3D {
+                        width: resolved.width,
+                        height: resolved.height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(ash::vk::SampleCountFlags::TYPE_1)
+                    .tiling(ash::vk::ImageTiling::OPTIMAL)
+                    .usage(
+                        ash::vk::ImageUsageFlags::TRANSFER_DST
+                            | ash::vk::ImageUsageFlags::TRANSFER_SRC,
+                    )
+                    .initial_layout(ImageLayout::UNDEFINED),
+                None,
+            )
+        }
+        .ok()?;
+        let req = unsafe { ctx.device.get_image_memory_requirements(image) };
+        let mt = ctx.memory_type_for(
+            req.memory_type_bits,
+            req.size,
+            reims_vgpu_vulkan::memory::MemoryClass::DeviceLocal,
+        )?;
+        let memory = unsafe {
+            ctx.device.allocate_memory(
+                &ash::vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(mt),
+                None,
+            )
+        }
+        .ok()?;
+        if unsafe { ctx.device.bind_image_memory(image, memory, 0) }.is_err() {
+            unsafe {
+                ctx.device.free_memory(memory, None);
+                ctx.device.destroy_image(image, None);
+            }
+            return None;
+        }
+        *guard = Some(WindowSnapshotImage {
+            image,
+            memory,
+            width: resolved.width,
+            height: resolved.height,
+        });
+    }
+    let s = guard.as_ref()?;
+
+    // The engine's own submission doors, in the readback rail's exact order.
+    let ops = target_readback_ops();
+    let appended = pools.batch_open_recording();
+    let own_cb = appended.is_none();
+    let (cb, fence) = match appended {
+        Some(pair) => pair,
+        None => pools.begin_entry(ctx, counters).ok()?,
+    };
+    let _ = &fence; // sealed below for the own-cb path; the appended path rides the batch's
+    if own_cb {
+        unsafe {
+            pools
+                .begin_slot_recording(ctx, cb, gpu_span::Kind::Readback, ops.reset_cb, ops.begin_cb)
+                .ok()?
+        };
+    }
+    unsafe { pools.close_open_pass(&ctx.device, cb) };
+    let (src_stage, src_access) = resolved.access.source_scope();
+    let src_layout = resolved.access.layout();
+    // The resident's resting state after the copy — the same spelling the
+    // readback rails leave and record (`registry_note_access` below).
+    let rest_access = pools::ResidentAccess::transfer_read(resolved.guest_imported);
+    let rest_layout = rest_access.layout();
+    let subresource = ash::vk::ImageSubresourceRange {
+        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+        level_count: 1,
+        layer_count: 1,
+        ..Default::default()
+    };
+    let barrier = |image, old, new, sa, da| {
+        ash::vk::ImageMemoryBarrier::default()
+            .image(image)
+            .subresource_range(subresource)
+            .old_layout(old)
+            .new_layout(new)
+            .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+            .src_access_mask(sa)
+            .dst_access_mask(da)
+    };
+    let device = &ctx.device;
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cb,
+            src_stage,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier(
+                resolved.image,
+                src_layout,
+                ImageLayout::TRANSFER_SRC_OPTIMAL,
+                src_access,
+                ash::vk::AccessFlags::TRANSFER_READ,
+            )],
+        );
+        device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier(
+                s.image,
+                ImageLayout::UNDEFINED,
+                ImageLayout::TRANSFER_DST_OPTIMAL,
+                ash::vk::AccessFlags::TRANSFER_WRITE,
+                ash::vk::AccessFlags::TRANSFER_WRITE,
+            )],
+        );
+        device.cmd_copy_image(
+            cb,
+            resolved.image,
+            ImageLayout::TRANSFER_SRC_OPTIMAL,
+            s.image,
+            ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[ash::vk::ImageCopy::default()
+                .src_subresource(ash::vk::ImageSubresourceLayers {
+                    aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                    layer_count: 1,
+                    ..Default::default()
+                })
+                .dst_subresource(ash::vk::ImageSubresourceLayers {
+                    aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                    layer_count: 1,
+                    ..Default::default()
+                })
+                .extent(ash::vk::Extent3D {
+                    width: resolved.width,
+                    height: resolved.height,
+                    depth: 1,
+                })],
+        );
+        // The resident rests in the transfer-read state, exactly as the
+        // readback rails leave it...
+        device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier(
+                resolved.image,
+                ImageLayout::TRANSFER_SRC_OPTIMAL,
+                rest_layout,
+                ash::vk::AccessFlags::TRANSFER_READ,
+                ash::vk::AccessFlags::TRANSFER_READ,
+            )],
+        );
+        // ...and the snapshot leaves as a transfer source, its copy published
+        // to every later transfer reader by this barrier. First use only:
+        // after this the image rests in TRANSFER_SRC_OPTIMAL, and the next
+        // copy's in-barrier is a no-op layout pair.
+        device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier(
+                s.image,
+                ImageLayout::TRANSFER_DST_OPTIMAL,
+                ImageLayout::TRANSFER_SRC_OPTIMAL,
+                ash::vk::AccessFlags::TRANSFER_WRITE,
+                ash::vk::AccessFlags::TRANSFER_READ,
+            )],
+        );
+    }
+    if own_cb {
+        unsafe {
+            pools.gpu_span_seal_current(ctx, cb);
+            device
+                .end_command_buffer(cb)
+                .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))
+                .ok()?;
+            let cbs = [cb];
+            ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
+                .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))
+                .ok()?;
+            let sealed = pools.seal_entry(Vec::new(), Vec::new());
+            pools.finish_entry_async(&ctx.device, sealed);
+        }
+    }
+    // Say what the copy left the resident in: the registry is the one source
+    // of truth for its layout, the epoch moves as it does for every readback,
+    // and the presenter's epoch check + re-resolve are built for exactly this.
+    pools.registry_note_access(identity, rest_access);
+    Some(pools::ResolvedResident {
+        image: s.image,
+        // "read" is the layout's own spelling for "sitting in
+        // TRANSFER_SRC_OPTIMAL after a transfer write was made visible" — the
+        // barrier above published the write, so the blit's from-scope is sound.
+        access: pools::ResidentAccess::TransferRead(ImageLayout::TRANSFER_SRC_OPTIMAL),
+        width: resolved.width,
+        height: resolved.height,
+        guest_imported: false,
+    })
+}
+
+#[cfg(all(test, feature = "host-window"))]
+mod scanout_snapshot_tests {
+    /// The invariant the GPU copy buys, in the only form a unit test can hold:
+    /// what the presenter reads is the last publish-committed content, never
+    /// the live source's current state. The GPU path itself is queue-ordered
+    /// and compile-checked; its correctness argument is the journal's §9.2.
+    #[test]
+    fn a_snapshot_reader_never_sees_the_live_source_flip() {
+        // The publish commits a frame; the guest then flips the live source to
+        // a white mid-state asynchronously, exactly the tear the window used
+        // to sample. The presenter's read stays the committed frame.
+        let committed: [u8; 4] = [10, 20, 30, 255];
+        let mut snapshot = committed;
+        let mut live = committed;
+        let publish = |snapshot: &mut [u8; 4], live: &[u8; 4]| *snapshot = *live;
+        let present = |snapshot: &[u8; 4]| *snapshot;
+        publish(&mut snapshot, &live);
+        // The white clear lands, refill does not.
+        live = [255, 255, 255, 255];
+        assert_ne!(present(&snapshot), live);
+        assert_eq!(present(&snapshot), committed);
+        // The refill lands and the guest presents again: the next read moves.
+        live = committed;
+        publish(&mut snapshot, &live);
+        assert_eq!(present(&snapshot), committed);
+    }
+
+    #[test]
+    fn scanout_snapshot_is_off_by_default() {
+        std::env::remove_var("REIMS_VGPU_LAB_SCANOUT_SNAPSHOT");
+        assert!(!super::scanout_snapshot_on());
+    }
 }
 
 /// This rail's name for a resident render target, as the layers above it carry

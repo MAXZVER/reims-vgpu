@@ -5654,6 +5654,10 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // Independent of everything below: the guest's own copy of the plane
         // this present names, sampled where the desktop background belongs.
         crate::runtime::scanout::note_present_field_witness(state, &*host, mapping, w, h);
+        // TEMP (lab, `REIMS_VGPU_LAB_STRIPE_HUNT=on`): the per-present
+        // accounting window closes here — one line naming everything the
+        // stripe audit ranked, joined against the frame by its t= field.
+        crate::runtime::stripe_hunt::note_present(mapping, w, h);
         // Every present takes one route: capture the surface the transaction
         // named. A ClearOnly present — one whose named mid's most recent write
         // was a `display_clear`/CLEAR Store rather than a draw — used to take a

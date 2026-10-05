@@ -4161,7 +4161,7 @@ enum MapperRefTextureSeedRung {
 
 /// A mapper-ref-texture attachment's prior contents, kept in the representation of the
 /// freshest rung that supplied them.
-enum MapperRefTextureLoadSeed {
+pub(super) enum MapperRefTextureLoadSeed {
     /// Host-owned bytes from the render cache, or the universal converted
     /// fallback when the native guest-page view cannot be described.
     Host(
@@ -4489,12 +4489,22 @@ fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
     let cached = (!guest_replaced)
         .then(|| crate::runtime::surface_cache::get_shared(state, mapping_id, w, h))
         .flatten();
-    let served = if let Some(bgra) = cached {
-        Some((
-            MapperRefTextureLoadSeed::Host(bgra, SeedOrder::Bgra8),
-            MapperRefTextureSeedRung::Cache,
-        ))
-    } else {
+    // TEMP (lab, OVERLAY_GUARD): the guest rungs below read the surface's own
+    // pages — the mapping door that served the artifact second's three seeds.
+    // Their evidence (`surface_currency` above, and the pending observation the
+    // caller took before it) predates the read, so a guest store landing inside
+    // the read is adopted as its intermediate bytes and only the *next*
+    // verdict notices. The guard re-observes after the read; on movement it
+    // re-reads once — a dropped seed would leave the pass the unseeded
+    // partial-preserving arm, which is a worse defect than any tear — and
+    // counts a race when the guest is still moving after the retry.
+    let guard = overlay_guard_on();
+    let guard_pre = guard
+        .then(|| {
+            crate::runtime::mapper::observe_current_guest_write_gen(state, host, mapping_id)
+        })
+        .unwrap_or_default();
+    let guest_page_rungs = |state: &mut DeviceState, host: &mut M| {
         try_mapper_ref_texture_target_guest_seed(state, host, mapping_id, w, h, target_format)
             .map(|seed| {
                 (
@@ -4517,6 +4527,36 @@ fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
                     })
             })
     };
+    let mut served = if let Some(bgra) = cached {
+        Some((
+            MapperRefTextureLoadSeed::Host(bgra, SeedOrder::Bgra8),
+            MapperRefTextureSeedRung::Cache,
+        ))
+    } else {
+        guest_page_rungs(state, host)
+    };
+    if guard && served.as_ref().is_some_and(|(_, rung)| *rung == MapperRefTextureSeedRung::GuestPages)
+    {
+        let now =
+            crate::runtime::mapper::observe_current_guest_write_gen(state, host, mapping_id);
+        if overlay_guard_verdict(&guard_pre, &now).dropped() {
+            crate::runtime::drain::note_store_route("overlay_guard_seed_retried_n");
+            served = guest_page_rungs(state, host);
+            let after =
+                crate::runtime::mapper::observe_current_guest_write_gen(state, host, mapping_id);
+            // Still moving after one retry: the guest is writing continuously
+            // (a scroll), and serving the latest read is the best any device
+            // can do. The stamp the Store commits is the pre-read observation
+            // either way, so the next verdict re-seeds — bounded to one frame.
+            crate::runtime::drain::note_store_route(if after.gen_ != now.gen_ {
+                "overlay_guard_seed_race_n"
+            } else {
+                "overlay_guard_seed_passed_n"
+            });
+        } else {
+            crate::runtime::drain::note_store_route("overlay_guard_seed_passed_n");
+        }
+    }
     note_mapper_ref_texture_load_seed(state, mapping_id, w, h, served.as_ref().map(|s| s.1));
     served.map(|(seed, _)| seed)
 }
@@ -11375,6 +11415,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 if resident_current {
                     chain_load_from_target = true;
                     crate::runtime::drain::note_store_route("mapper_ref_texture_seed_elided");
+                    // TEMP (lab, STRIPE_HUNT): the elide answered — the
+                    // resident carried this LOAD without a seed.
+                    crate::runtime::stripe_hunt::note_seed_gate(
+                        true,
+                        u64::from(w) * u64::from(h),
+                    );
                     if backing
                         == Some(
                             crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation,
@@ -11387,6 +11433,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     note_mapper_ref_texture_elision_extent(w, h);
                 } else {
                     crate::runtime::drain::note_store_route("mapper_ref_texture_seed_provided");
+                    // TEMP (lab, STRIPE_HUNT): the elide refused and a seed is
+                    // about to be read — the torn-adoption window.
+                    crate::runtime::stripe_hunt::note_seed_gate(false, 0);
                     // Separated from the epoch's refusal so a boot can say which
                     // half refused. The two answer different questions and a
                     // single counter would hide a rail that never fires.
@@ -11452,6 +11501,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             let (declared_n, declared_area) = declared.census_routes();
             crate::runtime::drain::note_store_route(declared_n);
             crate::runtime::drain::note_store_route_n(declared_area, declared_px);
+            // TEMP (lab, STRIPE_HUNT): the declared population, per present —
+            // what the pass asked its attachment's prior contents for.
+            crate::runtime::stripe_hunt::note_load_declared(
+                matches!(declared, LoadAction::DontCare),
+                matches!(declared, LoadAction::Clear),
+                declared_px,
+            );
             // Load and DontCare share every arm below, and that sharing is the
             // contract rather than a shortcut. `MTLLoadActionDontCare` says the
             // prior contents are *undefined*, and undefined permits any
@@ -11596,6 +11652,62 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // independently driven x86/Vulkan boots: 1 558, 395 and 295
                     // colour LOAD seed resolutions, and 0 serves plus 0 misses
                     // at that door in every one.
+                    //
+                    // TEMP (lab, PRESERVE_SEED): the last door, and only on the
+                    // arm that loses content — a partial scissor over a
+                    // guest-backed target that no door served. The complement
+                    // is the guest's own window bytes; serving them keeps the
+                    // election at Preserve where it would otherwise key "no
+                    // seed" and leave undefined rows (og12: 6 unseeded
+                    // preserves, 49 746 px, striped). A full-coverage scissor
+                    // redraws everything and needs no complement, so the door
+                    // stays shut for it — a whole-window upload there is cost
+                    // with no repair.
+                    if preserve_seed_on()
+                        && target_rgba8.is_none()
+                        && target_guest_seed.is_none()
+                        && !zero_seed_cleared
+                        && (c0.mapping_id != 0 || c0.target_gva != 0)
+                        && req.scissors.first().is_some_and(|s| !s.covers(w, h))
+                    {
+                        let preserve_format = pass_inv::render_identity(state, req)
+                            .as_ref()
+                            .map(|identity| identity.resident_format())
+                            .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
+                        match try_preserve_seed_from_guest_window(
+                            state,
+                            host,
+                            req.task_id,
+                            c0,
+                            preserve_format,
+                        ) {
+                            Some(MapperRefTextureLoadSeed::Host(bytes, order)) => {
+                                target_rgba8 = Some(bytes);
+                                seed_order = order;
+                                crate::runtime::drain::note_store_route("preserve_seed_n");
+                                crate::runtime::drain::note_store_route_n(
+                                    "preserve_seed_px",
+                                    u64::from(w) * u64::from(h),
+                                );
+                            }
+                            Some(MapperRefTextureLoadSeed::Guest(seed)) => {
+                                target_guest_seed = Some(seed);
+                                crate::runtime::drain::note_store_route("preserve_seed_n");
+                                crate::runtime::drain::note_store_route_n(
+                                    "preserve_seed_px",
+                                    u64::from(w) * u64::from(h),
+                                );
+                            }
+                            None => {
+                                // The context cannot read this window: today's
+                                // behaviour stands, and the residual is visible
+                                // rather than folded into the served count.
+                                crate::runtime::drain::note_store_route(
+                                    "preserve_seed_fallback_n",
+                                );
+                            }
+                        }
+                    }
                     // What this pass declares for a full-screen compositor
                     // plane, recorded where the load action has been resolved
                     // rather than where it was decoded — the request builder
@@ -11816,6 +11928,51 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     .first()
                     .is_some_and(|c| c.mapping_id != 0 || c.target_gva != 0),
             );
+            // TEMP (lab, STRIPE_HUNT): the census's defect arm — a pass that
+            // promised its prior contents and has neither a seed nor the
+            // resident to keep them with. Its y-ranges and its mapping, per
+            // present, so a stripe frame can be read against the rows it lost.
+            // Same inputs as the census call above — including its definition
+            // of "partial", which is where the loss lives — and the arithmetic
+            // mirrors `draw_partial_preserving_unseeded_lost_texels`.
+            if !scissor.covers(w, h)
+                && preserving_partial_route(
+                    req.colors.first().map(|c| c.load_action),
+                    target_rgba8.is_some() || target_guest_seed.is_some() || zero_seed_cleared,
+                    chain_load_from_target,
+                ) == Some("draw_partial_preserving_unseeded")
+                && req
+                    .colors
+                    .first()
+                    .is_some_and(|c| c.mapping_id != 0 || c.target_gva != 0)
+            {
+                let lost = (u64::from(w) * u64::from(h)).saturating_sub(
+                    u64::from(scissor.width.min(w))
+                        .saturating_mul(u64::from(scissor.height.min(h))),
+                );
+                crate::runtime::stripe_hunt::note_unseeded_partial(
+                    scissor.y,
+                    scissor.height,
+                    w,
+                    h,
+                    lost,
+                    req.colors.first().map_or(0, |c| c.mapping_id),
+                );
+            }
+            // TEMP (lab, STRIPE_HUNT, iter 3): the white-row family's
+            // CPU-visible member — a partial-scissor pass the guest declared
+            // CLEAR, with a white clear colour. If the cover lands late or
+            // short, the uncleared-then-repainted gap reads white; the
+            // recycled-white-image member of the same family is GPU-side and
+            // only the frame scanners see it.
+            if !scissor.covers(w, h)
+                && req.colors.first().is_some_and(|c| {
+                    c.load_action == MTL_LOAD_ACTION_CLEAR
+                        && c.clear_color.iter().all(|v| *v >= 0.98)
+                })
+            {
+                crate::runtime::stripe_hunt::note_clear_partial_white(u64::from(w) * u64::from(h));
+            }
         }
         // The mode is the guest's raw `MTLVisibilityResultMode`; the engine
         // takes the translated arm, and an ordinal outside the enum refuses the
@@ -13603,14 +13760,285 @@ fn note_guest_cpu_shared(state: &mut DeviceState, mapping_id: u32) {
     ));
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_OVERLAY_GUARD=on`, default off): re-validate the
+/// guest-write witness **after** a guest-page read has completed, at the two
+/// rails that adopt guest bytes into something presented — the resident overlay
+/// and the mapping LOAD seed.
+///
+/// # The hole this guards
+///
+/// Both rails take their coherence evidence *before* they read: the overlay
+/// lists ranges against an observation taken at list time
+/// (`narrow_to_window`, `surface_currency.rs`), the seed is resolved under a
+/// `pending_guest_write_obs` taken at the seed block's top — and then each
+/// reads the guest's pages at its own later moment, with nothing in between.
+/// A guest store that lands inside that gap (a memset→fill pair straddling
+/// the read) is adopted as the *intermediate* bytes: rows read as zeros, drawn
+/// over, presented once, and only the *next* verdict's generation comparison
+/// reveals the tear — one presented frame too late. That is the stripe
+/// artifact's shape (`lab/journal/2026-10-05-stripe-hunt.md`, Iteration 2).
+///
+/// The re-check is meaningful because [`crate::runtime::host::HostOps::guest_write_gen`]
+/// is an idempotent generation whose reads sync their own set: a post-read
+/// read that still returns the list-time generation is evidence no *observed*
+/// write landed during the read. A write whose sync has not landed by the
+/// check is invisible to it — the guard narrows the window, it cannot close it.
+///
+/// Off by default and changes nothing when off. On, the overlay **drops** the
+/// adoption (no GPU copy, no stamp — the caller falls back to the seed rail)
+/// and the seed **re-reads once** (a dropped LOAD seed would leave the
+/// unseeded partial-preserving arm, which is worse than any tear), with the
+/// census split so an A/B prices both the correctness events and the cost:
+/// `overlay_guard_passed_n` / `overlay_guard_dropped_n` / `_dropped_bytes`
+/// on the overlay, `overlay_guard_seed_passed_n` / `_retried_n` / `_race_n`
+/// on the seed.
+pub(super) fn overlay_guard_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("REIMS_VGPU_LAB_OVERLAY_GUARD").as_deref(), Ok("off")))
+}
+
+/// What the post-read witness re-check said. `seen` is the observation the
+/// adoption's evidence was taken against; `now` is a fresh observation taken
+/// after the read completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OverlayGuardVerdict {
+    /// Nothing observed moved between the two observations (or no baseline was
+    /// ever taken, or the host cannot answer now). Proceed.
+    Passed,
+    /// The token or its page list changed under the adoption — the ranges were
+    /// listed against pages this surface may no longer own.
+    DroppedTokenChanged,
+    /// The generation moved: the host observed a guest write land between the
+    /// evidence and the check, so the bytes just read may be the guest's
+    /// intermediate state.
+    DroppedGenMoved,
+}
+
+impl OverlayGuardVerdict {
+    pub(super) fn dropped(self) -> bool {
+        !matches!(self, Self::Passed)
+    }
+
+    pub(super) fn slug(self) -> &'static str {
+        match self {
+            Self::Passed => "overlay_guard_passed_n",
+            Self::DroppedTokenChanged => "overlay_guard_drop_token_changed",
+            Self::DroppedGenMoved => "overlay_guard_drop_gen_moved",
+        }
+    }
+}
+
+pub(super) fn overlay_guard_verdict(
+    seen: &crate::model::GuestWriteObservation,
+    now: &crate::model::GuestWriteObservation,
+) -> OverlayGuardVerdict {
+    // No baseline (the mapping had no live token when the evidence was taken):
+    // the adoption was already under the witness's "assume written" regime, and
+    // a guard that dropped on its own absence would disable the rail outright.
+    if seen.token == 0 {
+        return OverlayGuardVerdict::Passed;
+    }
+    if now.token != seen.token || now.map_generation != seen.map_generation {
+        return OverlayGuardVerdict::DroppedTokenChanged;
+    }
+    // The host cannot say right now (an unarmed read answers 0). That is not
+    // evidence of movement; dropping on it would refuse every adoption whose
+    // token is between syncs.
+    if now.gen_ == 0 {
+        return OverlayGuardVerdict::Passed;
+    }
+    if now.gen_ != seen.gen_ {
+        return OverlayGuardVerdict::DroppedGenMoved;
+    }
+    OverlayGuardVerdict::Passed
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESERVE_SEED=on`, default off): the last door of
+/// the colour-0 LOAD seed block — family 1's repair.
+///
+/// # What it repairs
+///
+/// The unseeded partial-preserving arm (`draw_partial_preserving_unseeded`, the
+/// census's own "defect arm"): a pass whose declared load preserves, whose
+/// scissor covers only its damage, and for which no door served — no resident
+/// (`chain_load_from_target` false), no provenance seed, and the mapping door's
+/// rungs declined (geometry equality, format, an unmapped window, or the
+/// `color_seed` door shadowing the mapping door with a length-mismatched seed).
+/// Every texel outside the scissor then holds undefined content, and og12
+/// (guard-on boot 12) convicted this arm live: six unseeded preserves, 49 746
+/// lost px at the stripe present, zero overlay/seed activity.
+///
+/// The repair is that the preserved complement is not actually lost — a
+/// **guest-backed** target's prior content is the guest's own window bytes, and
+/// they can be served as the seed. This door reads them:
+///
+/// - a GVA target takes the generic native window seed
+///   ([`try_gva_target_guest_seed`]) — eligible here for eight-bit colour too,
+///   since the restriction at the serial door exists to keep eight-bit seeds on
+///   the colour rung, not because the bytes are wrong;
+/// - a mapping target takes a strided sub-window read at the *requested*
+///   geometry ([`mapping_write::read_rect_raw_at`]), which is exactly the read
+///   the strict door's `mapping.width == w` equality refuses.
+///
+/// Like every guest-page read, it can catch a mid-update window (family 2's
+/// tear); it cannot be worse than the zeros it replaces, and the Store's stamp
+/// is the block's own pre-read observation either way, so the next verdict
+/// still re-seeds after a guest write.
+pub(super) fn preserve_seed_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("REIMS_VGPU_LAB_PRESERVE_SEED").as_deref(), Ok("off")))
+}
+
+/// Serve the guest's own window bytes as a colour-0 LOAD seed. `None` is the
+/// counted fallback — every refusal names its reason under `preserve_seed_fb_*`,
+/// because n244 measured the door reached 16.7k times a boot with zero serves,
+/// and the next field run has to say which condition owned the population.
+///
+/// Iteration-4 corrections over the first cut:
+///
+/// - the mapping arm now **resolves the surface first**
+///   ([`mapper::ensure_resolved_for_scanout`], the same step every serial door
+///   takes). The unseeded population is dominated by first-use surfaces whose
+///   mapping exists but whose page list has not been walked yet — reading live
+///   state without resolving refused exactly those, which was the point.
+/// - the GVA arm no longer stops at the native-run seed: a pooled GVA
+///   attachment is `R8G8B8A8` (`RESIDENT_RGBA_FORMAT`) while the window's
+///   native layout is `B8G8R8A8`, so the format equality refused *every*
+///   eight-bit window. The arm now falls through to a byte read of the
+///   window's rows through the task page table, served as semantic RGBA8
+///   (`SeedOrder::Rgba8`) or scanout order (`SeedOrder::Bgra8`) per the
+///   window's own layout — the uploader's order flag does the rest.
+pub(super) fn try_preserve_seed_from_guest_window<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c0: &ColorRtRequest,
+    target_format: ash::vk::Format,
+) -> Option<MapperRefTextureLoadSeed> {
+    use crate::backend::vulkan::engine::SeedOrder;
+    if c0.mapping_id == 0 {
+        // A GVA target: the native window seed first (at the request's own
+        // geometry and stride), and where the attachment's format refuses it —
+        // the pooled-RGBA case — the same window read as bytes and stated in
+        // its own channel order.
+        if let Some(seed) = try_gva_target_guest_seed(state, host, task_id, c0, target_format) {
+            return Some(MapperRefTextureLoadSeed::Guest(seed));
+        }
+        // The order flag is self-describing and relative to the attachment:
+        // BGRA window bytes are declared `SeedOrder::Bgra8` and the uploader's
+        // staging exchange performs the swap for an RGBA-order attachment. A
+        // manual swap here would convert twice.
+        let layout = pixel_format::store_texel_order(c0.format)?;
+        let order = match layout {
+            pixel_format::TexelLayout::Rgba8 => SeedOrder::Rgba8,
+            pixel_format::TexelLayout::Bgra8 => SeedOrder::Bgra8,
+            _ => {
+                crate::runtime::drain::note_store_route("preserve_seed_fb_gva_layout");
+                return None;
+            }
+        };
+        let tight = c0.width.checked_mul(RGBA8_BPP)?;
+        let task = state.tasks.get(task_id)?;
+        let mut raw = vec![0u8; tight as usize * c0.height as usize];
+        let mut row = vec![0u8; tight as usize];
+        for y in 0..c0.height {
+            let gva = c0.target_gva + u64::from(y) * u64::from(c0.row_stride);
+            if crate::runtime::gva_mem::read_task_gva(
+                host,
+                task,
+                gva,
+                &mut row,
+                state.page_shift,
+            )
+            .is_err()
+            {
+                crate::runtime::drain::note_store_route("preserve_seed_fb_gva_read");
+                return None;
+            }
+            raw[y as usize * tight as usize..(y as usize + 1) * tight as usize]
+                .copy_from_slice(&row);
+        }
+        return Some(MapperRefTextureLoadSeed::Host(std::sync::Arc::new(raw), order));
+    }
+    // A mapping target: resolve first — the same step every serial door takes,
+    // and the one the first cut skipped while the population was dominated by
+    // first-use surfaces.
+    if !crate::runtime::mapper::ensure_resolved_for_scanout(state, host, c0.mapping_id) {
+        crate::runtime::drain::note_store_route("preserve_seed_fb_unresolved");
+        return None;
+    }
+    // Eight-bit scanout order only — the seed carrier below spells BGRA8, and
+    // inventing a conversion for every other format is a product decision this
+    // prototype does not make.
+    let window = {
+        let Some(m) = state.mappings.get(&c0.mapping_id) else {
+            crate::runtime::drain::note_store_route("preserve_seed_fb_no_mapping");
+            return None;
+        };
+        if !m.mapped || m.page_entries.is_empty() {
+            crate::runtime::drain::note_store_route("preserve_seed_fb_no_pages");
+            return None;
+        }
+        if !matches!(
+            m.format,
+            0 | crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
+                | crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
+        ) {
+            crate::runtime::drain::note_store_route("preserve_seed_fb_format");
+            return None;
+        }
+        crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+            m,
+            c0.width,
+            c0.height,
+            crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        )
+    };
+    let (base_off, bpr, span_end) = match window {
+        Some(w) => w,
+        None => {
+            crate::runtime::drain::note_store_route("preserve_seed_fb_no_window");
+            return None;
+        }
+    };
+    let tight = c0.width.checked_mul(RGBA8_BPP)?;
+    let mut raw = vec![0u8; tight as usize * c0.height as usize];
+    let read = crate::runtime::mapping_write::read_rect_raw_at(
+        state,
+        host,
+        c0.mapping_id,
+        crate::runtime::mapping_write::SurfaceWindow {
+            base_off,
+            bpr,
+            span_end,
+            bpp: RGBA8_BPP,
+        },
+        crate::runtime::mapping_write::Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: c0.width,
+            height: c0.height,
+        },
+        &mut raw,
+        tight,
+    );
+    if !read {
+        crate::runtime::drain::note_store_route("preserve_seed_fb_read");
+        return None;
+    }
+    Some(MapperRefTextureLoadSeed::Host(
+        std::sync::Arc::new(raw),
+        SeedOrder::Bgra8,
+    ))
+}
+
 /// Whether [`overlay_guest_writes_onto_resident`] may run, as
 /// [`crate::config::RESIDENT_OVERLAY`] narrows it. Latched: the answer must not
 /// change between two binds of one surface.
 fn resident_overlay_allowed() -> bool {
     static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ALLOWED.get_or_init(|| {
-        let narrowed = matches!(
-            crate::config::read(crate::config::RESIDENT_OVERLAY).0,
+        let narrowed = matches!(            crate::config::read(crate::config::RESIDENT_OVERLAY).0,
             crate::config::Switch::Off
         );
         if narrowed {
@@ -13701,6 +14129,10 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
         });
         staged += window_end - window_start;
     }
+    // TEMP (lab, STRIPE_HUNT): the rows this adoption is about to lay over the
+    // resident, taken from the ranges before any of them is read — a seed fill
+    // from a window whose dirty epoch moved is the signature this names.
+    crate::runtime::stripe_hunt::note_overlay(&guest_owned.ranges, base_off, pitch);
     if crate::runtime::writeback_debt::fb_copy_replay_enabled() {
         if let Some(landed) = replay_framebuffer_copy(
             state,
@@ -13732,6 +14164,32 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
         ) {
             crate::runtime::drain::note_store_route("resident_overlay_read_failed");
             return false;
+        }
+    }
+    // TEMP (lab, OVERLAY_GUARD): the read is complete — now ask the witness
+    // whether the guest moved during it. The ranges and the stamp below were
+    // both taken against `guest_owned.seen` at list time; bytes read since are
+    // whatever the guest's pages held at the moment of each `read` call, and a
+    // store that landed between the list and here would have been adopted as
+    // its intermediate state. A dropped adoption overlays and stamps nothing:
+    // the caller refuses the reconcile and takes the seed rail instead, and
+    // the stamp's absence leaves the write visible to the next verdict.
+    if overlay_guard_on() {
+        let now = crate::runtime::mapper::observe_current_guest_write_gen(state, host, mapping_id);
+        match overlay_guard_verdict(&guest_owned.seen, &now) {
+            OverlayGuardVerdict::Passed => {
+                crate::runtime::drain::note_store_route("overlay_guard_passed_n");
+            }
+            dropped => {
+                crate::runtime::drain::note_store_route("overlay_guard_dropped_n");
+                crate::runtime::drain::note_store_route_n(
+                    "overlay_guard_dropped_bytes",
+                    bytes.len() as u64,
+                );
+                crate::runtime::drain::note_store_route(dropped.slug());
+                crate::runtime::stripe_hunt::note_guard_drop();
+                return false;
+            }
         }
     }
     // TEMP lab diagnostic: what the overlay is about to lay down.
