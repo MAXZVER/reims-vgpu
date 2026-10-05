@@ -1831,10 +1831,14 @@ mod tests {
             .collect();
         for answer in &serial_answers {
             assert!(
-            matches!(answer, crate::backend::vulkan::engine::BufferContent::Bytes(_)),
-            "the fixture's host refuses every zero-copy rail, so the serial arm reads CPU bytes"
-        );
+                matches!(answer, crate::backend::vulkan::engine::BufferContent::Bytes(_)),
+                "the fixture's host refuses every zero-copy rail, so the serial arm reads CPU bytes"
+            );
         }
+        // The serial comparison is done; the planned arm stages again (the
+        // guard's Drop leaves the flag down, so raise it back).
+        drop(_serial_no_stage);
+        let _stage_again = crate::runtime::par::staging::test_enable(true);
         let tables: Vec<DrawTables<'_>> = planned_binds
             .iter()
             .map(|one| DrawTables {

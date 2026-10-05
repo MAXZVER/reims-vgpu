@@ -1536,6 +1536,9 @@ mod tests {
     /// the same contract one boot later, where the caps exist.
     #[test]
     fn a_whole_rail_plan_commits_to_the_serial_answer() {
+        // Rail plans, not staging: hold the (default-on) staging rail off
+        // so the leftover test arenas of the staging test cannot serve here.
+        let _no_stage = crate::runtime::par::staging::test_enable(false);
         let (mut planned_state, mut planned_host) = buffer_fixture(&[(7, 0x8000)]);
         let (mut serial_state, mut serial_host) = buffer_fixture(&[(7, 0x8000)]);
         let resource = buffer_resource(&planned_state, &planned_host, 7);
@@ -1715,6 +1718,9 @@ mod tests {
     /// pool-only shape, reached where the run memo answers a worker's walk.
     #[test]
     fn an_index_plan_commits_to_the_serial_answer() {
+        // Rail plans, not staging: hold the (default-on) staging rail off
+        // so the leftover test arenas of the staging test cannot serve here.
+        let _no_stage = crate::runtime::par::staging::test_enable(false);
         let (mut planned_state, mut planned_host) = buffer_fixture(&[(7, 0x8000)]);
         let (mut serial_state, mut serial_host) = buffer_fixture(&[(7, 0x8000)]);
         let info = |offset: u64| IndexedDrawInfo {
@@ -1813,6 +1819,9 @@ mod tests {
     /// instead of a unit-tested one.)
     #[test]
     fn a_rail_plan_falls_past_a_past_end_offset() {
+        // Rail plans, not staging: hold the (default-on) staging rail off
+        // so the leftover test arenas of the staging test cannot serve here.
+        let _no_stage = crate::runtime::par::staging::test_enable(false);
         let (mut state, mut host) = buffer_fixture(&[(7, 0x8000)]);
         let resource = buffer_resource(&state, &host, 7);
         let _prime =
