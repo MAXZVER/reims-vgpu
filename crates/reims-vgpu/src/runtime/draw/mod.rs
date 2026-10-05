@@ -3294,6 +3294,280 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
     Ok(())
 }
 
+/// TEMP (lab): [`write_gva_frame_within_par`] takes a clear-sized frame fill
+/// off the drain thread and onto the device's worker pool when
+/// `REIMS_VGPU_LAB_PAR_CLEAR=on`. Off (unset or any other value) by default
+/// until the A/B — the same switch shape PAR_LAND shipped with, inverted,
+/// because this one is new rather than a lift of an existing loop. Latched.
+fn lab_par_clear() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PAR_CLEAR").map_or(false, |v| v == "on"))
+}
+
+/// Fill bytes below which a clear stays on the caller: a fork-join round trip
+/// is ~10 µs (PAR_LAND's measurement), which one thread spends filling well
+/// under a megabyte — 2 MiB leaves headroom for the small clears that dominate
+/// the count while taking every full-frame one (5K BGRA8 is ~56 MB, design
+/// §8.7 / C6: `fin_prelude_clear` 1513 calls x 367 µs = 555 ms of drain).
+const PAR_CLEAR_MIN_BYTES: u64 = 2 * 1024 * 1024;
+/// Bytes one job fills: large enough that the per-job overhead is noise
+/// against the fill, small enough that one frame spreads over every helper.
+/// PAR_LAND settled on the same number for its copy spans.
+const PAR_CLEAR_JOB_BYTES: usize = 256 * 1024;
+
+/// One pooled fill: everything a job needs to land its rows and nothing else.
+///
+/// The row loop of [`write_gva_frame_within_skipping`]'s mapped-span arm, with
+/// the caller's borrowed state stripped down to the two things a worker may
+/// touch — the mapped destination pointer and the immutable source rows. No
+/// `DeviceState`, no skip list: a clear writes whole rows (its callers pass
+/// `skip = &[]`), and the decision that produced the bytes was taken on the
+/// drain before the fork and is not the worker's to re-examine.
+struct ClearFill<'a> {
+    /// First byte of the frame inside the span the caller mapped.
+    dst: *mut u8,
+    /// Writable bytes at `dst`.
+    avail: usize,
+    /// Destination row stride (`bpr`).
+    bpr: usize,
+    /// Tight destination row (`tight`).
+    tight: usize,
+    /// Source row bytes in `frame`.
+    src_stride: usize,
+    /// Texels in a row, for the RGBA8 conversion.
+    width: u32,
+    /// The frame's source rows.
+    frame: &'a FrameRows<'a>,
+    /// The RGBA8 -> destination rail, parsed once; `None` unless the frame is
+    /// [`FrameRows::Rgba8`].
+    rail: Option<pixel_format::Rgba8ToRow>,
+}
+
+// SAFETY: `dst` points into a guest-RAM span the caller mapped before the
+// scope and unmaps only after it has joined; each job's row range writes
+// `[y*bpr, y*bpr+tight)` for its own `y`s, disjoint from every other job's
+// because `tight <= bpr`; the frame is shared immutable.
+unsafe impl Send for ClearFill<'_> {}
+unsafe impl Sync for ClearFill<'_> {}
+
+impl ClearFill<'_> {
+    /// Land rows `[start, end)` of the frame, exactly as the serial writer's
+    /// mapped-span arm lands them: convert the source row (RGBA8 arm — a
+    /// scratch this call owns, one per worker, never shared), bounds-check the
+    /// destination row, copy. Row padding is not the clear's to write and is
+    /// not touched.
+    fn fill_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+    ) -> Result<(), crate::runtime::host::MemError> {
+        use crate::runtime::host::MemError;
+        let mut scratch: Vec<u8> = if self.rail.is_some() {
+            vec![0u8; self.tight]
+        } else {
+            Vec::new()
+        };
+        for y in rows {
+            let at = y.saturating_mul(self.src_stride);
+            let out_row: &[u8] = match self.frame {
+                FrameRows::Rgba8(rgba) => {
+                    let Some(rail) = self.rail else {
+                        return Err(MemError::BadArgs);
+                    };
+                    if !rail.convert(&rgba[at..at + self.src_stride], self.width, &mut scratch) {
+                        return Err(MemError::BadArgs);
+                    }
+                    &scratch
+                }
+                FrameRows::Native(native) => &native[at..at + self.src_stride],
+                FrameRows::Repeat(one) => &one[..self.src_stride],
+            };
+            let off = y.saturating_mul(self.bpr);
+            if off + out_row.len() > self.avail {
+                return Err(MemError::RunOutOfRange);
+            }
+            // SAFETY: `off + len <= avail` was checked above, and the span
+            // stays mapped until the caller unmaps it after the scope joins.
+            unsafe {
+                std::ptr::copy_nonoverlapping(out_row.as_ptr(), self.dst.add(off), out_row.len());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`write_gva_frame_within`] with the fill of a clear-sized frame spread over
+/// the device's worker pool (TEMP lab, PAR_CLEAR; design §8.7 / C6).
+///
+/// Same bytes, same bounds checks, same footprint — the span is mapped by the
+/// same `map_fresh_span_within` the serial writer's fast arm uses (so the
+/// footprint mark and the host-wrote record happen identically), and each job
+/// runs the serial row loop's body for a disjoint range of rows. Only how many
+/// threads move the bytes changes; the clear's own decisions (which target,
+/// which colour, one row or a frame — ZERO_SEED / CLEAR_ROW's calls) were taken
+/// by the caller before this and are executed, not re-taken.
+///
+/// `Some(result)` — the fill ran on this rail, and `result` is what the serial
+/// writer would have answered for the same arguments. `None` hands the write
+/// back to the serial writer untouched: the switch is off, the arguments are
+/// ones the serial writer answers with its own named error (so it must be the
+/// one to answer), the fill is below `PAR_CLEAR_MIN_BYTES`, there is no pool,
+/// or the span is fragmented (no packed view, and per-row multi-import needs
+/// the caller's `&mut` state, which a worker may not hold).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors write_gva_frame_within's target GVA and row geometry"
+)]
+pub(crate) fn write_gva_frame_within_par<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    frame: &FrameRows<'_>,
+) -> Option<Result<(), crate::runtime::host::MemError>> {
+    write_gva_frame_within_par_in(
+        lab_par_clear(),
+        state,
+        host,
+        task_id,
+        gva,
+        width,
+        height,
+        bpr,
+        format,
+        frame,
+    )
+}
+
+/// [`write_gva_frame_within_par`] with the switch given by the caller, so a
+/// test can state the arm it is testing.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors write_gva_frame_within's target GVA and row geometry"
+)]
+fn write_gva_frame_within_par_in<M: HostMemory + HostOps>(
+    enabled: bool,
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    frame: &FrameRows<'_>,
+) -> Option<Result<(), crate::runtime::host::MemError>> {
+    use crate::runtime::host::MemError;
+    if !enabled {
+        return None;
+    }
+    // Every argument the serial writer refuses is left to the serial writer:
+    // its refusal is the answer today's caller sees, and duplicating it here
+    // would only fork the two answers apart.
+    if gva == 0 || width == 0 || height == 0 || bpr == 0 {
+        return None;
+    }
+    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
+        return None;
+    };
+    if bpr < tight {
+        return None;
+    }
+    let src = frame.bytes();
+    let src_stride = frame.source_row_bytes(width, tight);
+    if src.len() < frame.source_len(width, tight, height) {
+        return None;
+    }
+    let fill_bytes = (height as u64).saturating_mul(u64::from(tight));
+    if fill_bytes < PAR_CLEAR_MIN_BYTES {
+        crate::runtime::drain::note_store_route("par_clear_small");
+        return None;
+    }
+    let rail = match frame {
+        FrameRows::Rgba8(_) => Some(pixel_format::Rgba8ToRow::for_format(format)?),
+        FrameRows::Native(_) | FrameRows::Repeat(_) => None,
+    };
+    if !state.par().is_some_and(|pool| pool.workers() > 0) {
+        return None;
+    }
+    // TEMP (lab, S5a): the pool's workers write guest pages, and the engine's
+    // settles only join on the drain thread. A draw the recorder still holds
+    // may read these pages, so the drain settles it here, before it forks —
+    // the same rule `mapper::par_land_write` states for its pooled landing.
+    crate::backend::settle_deferred_draws_for_guest_write();
+    let span = (height as u64).saturating_mul(u64::from(bpr));
+    let started = std::time::Instant::now();
+    let Some(span_map) =
+        crate::runtime::gva_view::map_fresh_span_within(state, host, task_id, gva, span, None)
+    else {
+        crate::runtime::drain::note_store_route("par_clear_serial_span");
+        return None;
+    };
+    let Some(pool) = state.par().filter(|pool| pool.workers() > 0) else {
+        // Cannot happen (checked above; the pool is never uninstalled), kept
+        // so the mapped span is released on every path.
+        crate::runtime::gva_view::unmap_fresh_span(host, span_map);
+        return None;
+    };
+    let fill = ClearFill {
+        dst: span_map.ptr,
+        avail: span_map.avail,
+        bpr: bpr as usize,
+        tight: tight as usize,
+        src_stride: src_stride as usize,
+        width,
+        frame,
+        rail,
+    };
+    // Row ranges of ~`PAR_CLEAR_JOB_BYTES` each, in row order: the same split
+    // PAR_LAND makes of its spans, so a 5K frame (~56 MB) lands as ~220 jobs
+    // across every helper while a small-but-over-threshold fill still forks.
+    let mut jobs: Vec<std::ops::Range<usize>> = Vec::new();
+    let (mut start, mut bytes) = (0usize, 0usize);
+    for y in 0..height as usize {
+        bytes += tight as usize;
+        if bytes >= PAR_CLEAR_JOB_BYTES {
+            jobs.push(start..y + 1);
+            (start, bytes) = (y + 1, 0);
+        }
+    }
+    if start < height as usize {
+        jobs.push(start..height as usize);
+    }
+    let done = pool.scope(&(), &jobs, |_, _, job: &std::ops::Range<usize>| {
+        fill.fill_rows(job.clone())
+    });
+    let mut answer = Ok(());
+    for (job, outcome) in jobs.iter().zip(&done.results) {
+        match outcome {
+            Ok(res) => answer = *res,
+            // A job that panicked may have stopped part way; its rows are
+            // filled again here, which lands the same bytes — a fill is
+            // idempotent. PAR_LAND lands its failed spans the same way.
+            Err(_panic) => answer = fill.fill_rows(job.clone()),
+        }
+        if answer.is_err() {
+            break;
+        }
+    }
+    crate::runtime::gva_view::unmap_fresh_span(host, span_map);
+    crate::runtime::drain::note_store_route("par_clear_n");
+    crate::runtime::drain::note_store_route_n("par_clear_bytes", fill_bytes);
+    crate::runtime::drain::note_store_route_us(
+        "par_clear_us",
+        started.elapsed().as_micros() as u64,
+    );
+    crate::runtime::drain::note_store_route(if done.serial {
+        "par_clear_serial_scope"
+    } else {
+        "par_clear"
+    });
+    Some(answer)
+}
+
 /// Store only the Metal scissor rect of a full-size tight RGBA8 buffer to GVA,
 /// bounded to the pages the Store's target resolved to before the GPU ran.
 /// Packed contig view when possible; else multi-import each rect row.
