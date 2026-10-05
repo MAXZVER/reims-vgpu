@@ -76,17 +76,34 @@ pub fn read_task_gva<M: HostMemory>(
         return Err(MemError::NoTaskDirectory);
     }
     let geom = geometry_for_page_shift(page_shift).ok_or(MemError::UnsupportedPageShift)?;
-    // TEMP (lab): a read inside one page whose translation this tranche already
-    // walked is one guest-physical read.
+    // TEMP (lab): a read whose pages' translations this tranche already walked
+    // is one guest-physical read per page. Spans of up to `TLB_SPAN_PAGES`
+    // pages: p012 (Intel, Finder transitions) had the span walk at 6.8 % of the
+    // busy drain, two thirds of it under this function — multi-page reads of
+    // the same lists and descriptors, which the single-page rule always walked.
     let page_mask = (1u64 << page_shift) - 1;
-    let single_page = (gva & page_mask) + buf.len() as u64 <= page_mask + 1;
-    let tlb = single_page && lab_tlb::enabled();
+    let first_page = gva >> page_shift;
+    let pages = (((gva & page_mask) + buf.len() as u64 + page_mask) >> page_shift) as usize;
+    let tlb = pages <= lab_tlb::span_pages() && lab_tlb::enabled();
     if tlb {
-        if let Some(base) = lab_tlb::get(task.directory_pfn, gva >> page_shift) {
-            return host.read_gpa(base + (gva & page_mask), buf);
+        let mut bases = [0u64; lab_tlb::TLB_SPAN_PAGES];
+        let hit = (0..pages).all(|i| {
+            lab_tlb::get(task.directory_pfn, first_page + i as u64).is_some_and(|b| {
+                bases[i] = b;
+                true
+            })
+        });
+        if hit {
+            let mut done = 0usize;
+            for (i, base) in bases.iter().take(pages).enumerate() {
+                let in_page = if i == 0 { gva & page_mask } else { 0 };
+                let n = (buf.len() - done).min((page_mask + 1 - in_page) as usize);
+                host.read_gpa(base + in_page, &mut buf[done..done + n])?;
+                done += n;
+            }
+            return Ok(());
         }
     }
-    let mut first_gpa: Option<u64> = None;
     let reader = HostPhys(host);
     let gr_task = Task {
         active: true,
@@ -99,8 +116,10 @@ pub fn read_task_gva<M: HostMemory>(
     // shared and the write needs it exclusively.
     let mut result: Result<(), MemError> = Ok(());
     visit_span_chunks(&reader, geom, &gr_task, gva, buf.len(), &mut |chunk| {
-        if first_gpa.is_none() {
-            first_gpa = Some(chunk.gpa);
+        // A chunk never crosses its page, so each one is one page's translation.
+        if tlb {
+            let at = gva + chunk.offset as u64;
+            lab_tlb::put(task.directory_pfn, at >> page_shift, chunk.gpa - (at & page_mask));
         }
         match host.read_gpa(chunk.gpa, &mut buf[chunk.range()]) {
             Ok(()) => true,
@@ -114,11 +133,6 @@ pub fn read_task_gva<M: HostMemory>(
         }
     })
     .map_err(span_refusal_error)?;
-    if tlb && result.is_ok() {
-        if let Some(gpa) = first_gpa {
-            lab_tlb::put(task.directory_pfn, gva >> page_shift, gpa - (gva & page_mask));
-        }
-    }
     result
 }
 
@@ -137,6 +151,22 @@ pub(crate) mod lab_tlb {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
     const SLOTS: usize = 256;
+    /// The longest read (in pages) served from or filled into the cache; longer
+    /// spans walk, so one large read cannot evict the cache's working set.
+    pub(super) const TLB_SPAN_PAGES: usize = 16;
+
+    /// TEMP (lab, `REIMS_VGPU_LAB_GVA_TLB_SPAN=off`): 1 restores the single-page
+    /// rule, for the A/B of the span rule.
+    pub(super) fn span_pages() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            if std::env::var("REIMS_VGPU_LAB_GVA_TLB_SPAN").as_deref() == Ok("off") {
+                1
+            } else {
+                TLB_SPAN_PAGES
+            }
+        })
+    }
     static EPOCH: AtomicU64 = AtomicU64::new(1);
 
     #[derive(Clone, Copy)]
