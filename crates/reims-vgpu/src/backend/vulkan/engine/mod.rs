@@ -2690,9 +2690,9 @@ pub fn prepare_window_resident_present(
     // ever read the publish's own frame.
     if scanout_snapshot_on() {
         if let Some(ctx) = owner.ctx.as_ref() {
-            if let Some(snapshot) =
-                unsafe { snapshot_window_source(ctx, decision.resolved, identity) }
-            {
+            if let Some(snapshot) = unsafe {
+                snapshot_window_source(ctx, pools, decision.resolved, identity)
+            } {
                 crate::runtime::drain::note_store_route("scanout_snapshot_n");
                 let mut decision = decision;
                 decision.resolved = snapshot;
@@ -2741,27 +2741,38 @@ fn window_snapshot() -> &'static std::sync::Mutex<Option<WindowSnapshotImage>> {
 /// this one re-records the command buffer.
 unsafe fn snapshot_window_source(
     ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
     resolved: pools::ResolvedResident,
     identity: &TargetIdentity,
 ) -> Option<pools::ResolvedResident> {
     use ash::vk::ImageLayout;
+    // The readback rails' discipline (see `read_target_inner`): the copy drives
+    // the resident's barriers FROM the registry's tracked access, LEAVES it in
+    // the transfer-read state the copy ends in, and SAYS SO through
+    // `registry_note_access` — which moves the window epoch, and the
+    // presenter's epoch check + re-resolve are built for exactly that (the
+    // pay-after-stamp readback does this every present). The first cut of this
+    // prototype restored the old access without telling the registry, so its
+    // layout transitions collided with the presenter's concurrent blits on the
+    // same image — invalid transitions, and n247 wedged the queue after three
+    // publishes. Every wait here is bounded; on any timeout the caller serves
+    // the live resident and counts `scanout_snapshot_stall_n` — the drain can
+    // no longer be held hostage by this knob.
     let format = identity.resident_format();
     let mut guard = window_snapshot().lock().unwrap_or_else(|e| e.into_inner());
-    // Recreate on extent or format change; the old objects die with the change.
+    // Extent change: the old objects are retired by leaking (a TEMP prototype;
+    // counted), because `device_wait_idle` under the engine lock is the wedge
+    // shape this iteration exists to remove.
     let needs = guard
         .as_ref()
         .map_or(true, |s| s.width != resolved.width || s.height != resolved.height);
     if needs {
-        let old = guard.take();
-        if let Some(old) = old {
-            unsafe {
-                ctx.device.device_wait_idle().ok()?;
-                ctx.device.destroy_image(old.image, None);
-                ctx.device.free_memory(old.memory, None);
-                ctx.device.destroy_command_pool(old.cmd_pool, None);
-                ctx.device.destroy_fence(old.fence, None);
-            }
+        if guard.is_some() {
+            crate::runtime::drain::note_store_route("scanout_snapshot_recreate_n");
         }
+        *guard = None;
+    }
+    if guard.is_none() {
         let image = unsafe {
             ctx.device.create_image(
                 &ash::vk::ImageCreateInfo::default()
@@ -2776,7 +2787,10 @@ unsafe fn snapshot_window_source(
                     .array_layers(1)
                     .samples(ash::vk::SampleCountFlags::TYPE_1)
                     .tiling(ash::vk::ImageTiling::OPTIMAL)
-                    .usage(ash::vk::ImageUsageFlags::TRANSFER_DST | ash::vk::ImageUsageFlags::TRANSFER_SRC)
+                    .usage(
+                        ash::vk::ImageUsageFlags::TRANSFER_DST
+                            | ash::vk::ImageUsageFlags::TRANSFER_SRC,
+                    )
                     .initial_layout(ImageLayout::UNDEFINED),
                 None,
             )
@@ -2825,7 +2839,8 @@ unsafe fn snapshot_window_source(
         // Signalled: the first re-record must not wait on a never-submitted fence.
         let fence = unsafe {
             ctx.device.create_fence(
-                &ash::vk::FenceCreateInfo::default().flags(ash::vk::FenceCreateFlags::SIGNALED),
+                &ash::vk::FenceCreateInfo::default()
+                    .flags(ash::vk::FenceCreateFlags::SIGNALED),
                 None,
             )
         }
@@ -2843,8 +2858,22 @@ unsafe fn snapshot_window_source(
     }
     let s = guard.as_mut()?;
     if !s.first {
-        if unsafe { ctx.device.wait_for_fences(&[s.fence], true, u64::MAX) }.is_err() {
-            return None;
+        // Bounded: 5 ms slices, 200 ms ceiling — a 5K copy is ~1-2 ms of GPU;
+        // anything past the ceiling is a stall the caller survives by serving
+        // the live resident, named in the census rather than wedging the drain.
+        let mut waited = 0u64;
+        loop {
+            match unsafe { ctx.device.wait_for_fences(&[s.fence], true, 5_000_000) } {
+                Ok(_) => break,
+                Err(ash::vk::Result::TIMEOUT) => {
+                    waited += 5;
+                    if waited >= 200 {
+                        crate::runtime::drain::note_store_route("scanout_snapshot_stall_n");
+                        return None;
+                    }
+                }
+                Err(_) => return None,
+            }
         }
         if unsafe { ctx.device.reset_fences(&[s.fence]) }.is_err() {
             return None;
@@ -2863,14 +2892,16 @@ unsafe fn snapshot_window_source(
     .ok()?;
     let (src_stage, src_access) = resolved.access.source_scope();
     let src_layout = resolved.access.layout();
+    // The resident's resting state after the copy — the same spelling the
+    // readback rails leave and record.
+    let rest_access = pools::ResidentAccess::transfer_read(resolved.guest_imported);
+    let rest_layout = rest_access.layout();
     let subresource = ash::vk::ImageSubresourceRange {
         aspect_mask: ash::vk::ImageAspectFlags::COLOR,
         level_count: 1,
         layer_count: 1,
         ..Default::default()
     };
-    // Stage masks belong to the pipeline-barrier call; the image barrier
-    // carries layouts and access masks only.
     let barrier = |image, old, new, sa, da| {
         ash::vk::ImageMemoryBarrier::default()
             .image(image)
@@ -2882,9 +2913,11 @@ unsafe fn snapshot_window_source(
             .src_access_mask(sa)
             .dst_access_mask(da)
     };
-    // 1. The presented resident becomes a transfer source, and returns to its
-    //    tracked state after the copy — the registry's access spelling must
-    //    stay true for every later reader.
+    let snap_old = if s.first {
+        ImageLayout::UNDEFINED
+    } else {
+        ImageLayout::TRANSFER_SRC_OPTIMAL
+    };
     unsafe {
         device.cmd_pipeline_barrier(
             s.cmd,
@@ -2901,14 +2934,6 @@ unsafe fn snapshot_window_source(
                 ash::vk::AccessFlags::TRANSFER_READ,
             )],
         );
-    }
-    let snap_old = if s.first {
-        ImageLayout::UNDEFINED
-    } else {
-        ImageLayout::TRANSFER_SRC_OPTIMAL
-    };
-    // 2. The snapshot takes the copy.
-    unsafe {
         device.cmd_pipeline_barrier(
             s.cmd,
             ash::vk::PipelineStageFlags::TRANSFER,
@@ -2947,28 +2972,25 @@ unsafe fn snapshot_window_source(
                     depth: 1,
                 })],
         );
-    }
-    // 3. The resident returns to the state the registry says it is in.
-    unsafe {
+        // The resident rests in the transfer-read state, exactly as the
+        // readback rails leave it...
         device.cmd_pipeline_barrier(
             s.cmd,
             ash::vk::PipelineStageFlags::TRANSFER,
-            src_stage,
+            ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::DependencyFlags::empty(),
             &[],
             &[],
             &[barrier(
                 resolved.image,
                 ImageLayout::TRANSFER_SRC_OPTIMAL,
-                src_layout,
+                rest_layout,
                 ash::vk::AccessFlags::TRANSFER_READ,
-                src_access,
+                ash::vk::AccessFlags::TRANSFER_READ,
             )],
         );
-        // 4. The snapshot leaves as a transfer source, and this barrier —
-        //    TRANSFER_WRITE -> TRANSFER_READ — is the one that publishes the
-        //    copy to every later transfer reader, including the presenter's
-        //    blit with its weaker-from barrier.
+        // ...and the snapshot leaves as a transfer source, its copy published
+        // to every later transfer reader by this barrier.
         device.cmd_pipeline_barrier(
             s.cmd,
             ash::vk::PipelineStageFlags::TRANSFER,
@@ -2991,6 +3013,10 @@ unsafe fn snapshot_window_source(
     if unsafe { device.queue_submit(ctx.queue(), &[submit], s.fence) }.is_err() {
         return None;
     }
+    // Say what the copy left the resident in: the registry is the one source of
+    // truth for its layout, the epoch moves as it does for every readback, and
+    // the presenter's epoch check + re-resolve are built for exactly this.
+    pools.registry_note_access(identity, rest_access);
     s.first = false;
     Some(pools::ResolvedResident {
         image: s.image,
