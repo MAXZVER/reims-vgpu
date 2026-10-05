@@ -82,6 +82,76 @@ fn lab_sync_ahead() -> bool {
     })
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_PACKED_WARM=on`, off by default): close the
+/// `cold_packed` bail class — the planner's largest refusal family over the
+/// fp9b transition window (`par_prefetch_bail_cold_packed`, 21.9k a window).
+///
+/// By code the class is not a construction the worker could have made: a
+/// worker *cannot* construct — `ensure_packed_resource` needs
+/// `host.map_pages`, which [`crate::qemu::host_ops::WorkerHost`] refuses, and
+/// `insert_packed`, a write the plan-only contract forbids. The cost is the
+/// bail's *stickiness*: `ahead` held every bailed ref in `planned` for the
+/// whole pass ("the ladder below it would refuse the same way on the next
+/// chunk") — true for every bail except a cold one whose registry entry does
+/// not exist at all, because the drain's serial bind CONSTRUCTS that entry
+/// (the packed alias, the whole-allocation walk) inside the same pass. So two
+/// pieces, both read-only for the planner and legal for the drain:
+///
+/// * the **warm-up cork** ([`PassPrep::warm_packed`]): once per pass, on the
+///   drain, before the first chunk forks, construct the packed aliases (and
+///   the whole runs a refused alias falls to) of the first chunk's cold
+///   references — the same constructions the first serial bind would run one
+///   record later, moved ahead of the fork so chunk 0 plans onto a warm rail
+///   instead of bailing;
+/// * the **requeue**: a `ColdPacked`/`ColdWhole` bail over a registry with NO
+///   entry for the reference is not held sticky — the next chunk replans it
+///   (one retry per pass), after the drain's serial binds have constructed
+///   the entry. A held entry (a refused construction, a mismatched geometry)
+///   keeps the bail final exactly as before: the serial ladder mutates
+///   nothing there, so the next chunk would refuse the same way.
+///
+/// Off is byte-for-byte the old path: the warm-up does nothing, no bail is
+/// requeued, no `packed_warm_*` route fires.
+pub(super) fn packed_warm() -> bool {
+    // Unit tests drive the knob through their own door; the process default
+    // stays off so an unrelated test never warms or requeues.
+    #[cfg(test)]
+    {
+        return TEST_PACKED_WARM.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            matches!(
+                std::env::var("REIMS_VGPU_LAB_PACKED_WARM").as_deref(),
+                Ok("on")
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+static TEST_PACKED_WARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Force the flag for the lifetime of the returned guard (tests only).
+#[cfg(test)]
+pub(super) fn test_packed_warm(on: bool) -> PackedWarmGuard {
+    TEST_PACKED_WARM.store(on, std::sync::atomic::Ordering::Relaxed);
+    PackedWarmGuard
+}
+
+/// Restores the test flag. Never outlives its guard's frame.
+#[cfg(test)]
+pub(super) struct PackedWarmGuard;
+
+#[cfg(test)]
+impl Drop for PackedWarmGuard {
+    fn drop(&mut self) {
+        TEST_PACKED_WARM.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Which way the pass preparation runs. `REIMS_VGPU_LAB_PASS_PREP`, read once;
 /// supersedes `REIMS_VGPU_LAB_PAR_PREFETCH` while not `off`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,6 +329,15 @@ pub(crate) struct PassPrep<'a> {
     /// TEMP (lab, PASS_PREP step 3): index binds this pass holds an exact
     /// plan or a bail for, under the bind's own key.
     planned_indexes: HashSet<buffer_plan::BufferExactKey>,
+    /// TEMP (lab, PACKED_WARM): sampled refs whose cold bail was requeued for
+    /// one retry (see [`packed_warm`]) — the retry budget, one per pass.
+    requeued_samples: HashSet<u32>,
+    /// TEMP (lab, PACKED_WARM): buffer refs whose cold bail was requeued for
+    /// one retry.
+    requeued_buffers: HashSet<u32>,
+    /// TEMP (lab, PACKED_WARM): index binds whose cold bail was requeued for
+    /// one retry, under the bind's own key.
+    requeued_indexes: HashSet<buffer_plan::BufferExactKey>,
     /// TEMP (lab, PASS_PREP step 3): the pass's colour-0 as the drain latched
     /// it once the attachment template existed, and whether a scope has taken
     /// the Store walk yet.
@@ -310,6 +389,9 @@ impl<'a> PassPrep<'a> {
             planned: HashSet::new(),
             planned_buffers: HashSet::new(),
             planned_indexes: HashSet::new(),
+            requeued_samples: HashSet::new(),
+            requeued_buffers: HashSet::new(),
+            requeued_indexes: HashSet::new(),
             store_target: None,
             store_pages_planned: false,
             synced_ahead: false,
@@ -325,6 +407,145 @@ impl<'a> PassPrep<'a> {
     /// once per pass, and the drain does it in the time the store takes.
     pub(crate) fn note_store_target(&mut self, c0: &ColorRtRequest) {
         self.store_target = buffer_plan::latch_store_target(c0);
+    }
+
+    /// TEMP (lab, PACKED_WARM): the warm-up cork — see [`packed_warm`].
+    ///
+    /// Once per pass, on the drain thread (writes are legal here and only
+    /// here), before the first chunk's scope forks: for every distinct
+    /// reference the first chunk binds whose registry entry does not exist at
+    /// all, run the construction the first serial bind of that reference would
+    /// run one record later — `ensure_packed_resource` for the buffer and
+    /// linear-texture families, and `ensure_whole_runs` where the packed alias
+    /// refuses and the bind's window is gather-eligible (the serial ladder's
+    /// own next step). The constructions are the same ones the drain pays
+    /// either way; moving them ahead of the fork means chunk 0 plans onto a
+    /// warm rail instead of bailing `cold_packed` sticky for the pass.
+    ///
+    /// The sampled family is pre-gated by its own planner —
+    /// [`sample_plan::plan_linear_zero_copy`] runs read-only here and only
+    /// where it answers `ColdPacked` does the warm-up construct — so a
+    /// reference the resident rung or a debt would answer never pays an alias
+    /// it will not use. The buffer family needs no such gate: the serial
+    /// buffer ladder constructs unconditionally ahead of its rails.
+    pub(crate) fn warm_packed<
+        M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
+    >(
+        &mut self,
+        state: &mut DeviceState,
+        host: &mut M,
+    ) {
+        if !packed_warm() || pass_prep_mode() != PassPrepMode::On {
+            // `shadow` applies nothing — the warm-up's constructions are a
+            // serving-mode optimization, and a shadow boot must stay
+            // byte-for-byte the knob-off one it is compared against.
+            return;
+        }
+        let task_id = self.task_id;
+        let end = self.chunk.min(self.tables.len());
+        let mut warmed = 0u64;
+        // The buffer family: vertex/fragment binds plus the indexed draw's
+        // index bind, deduplicated by reference. `first_offset` is the first
+        // bind of the chunk that named the reference — the window the serial
+        // ladder's whole-arm eligibility would be decided against.
+        let mut seen_buffers = HashSet::new();
+        for table in &self.tables[..end] {
+            for bind in table.buffers() {
+                if seen_buffers.insert(bind.buffer_ref) {
+                    warmed += u64::from(warm_buffer_ref(
+                        state,
+                        host,
+                        task_id,
+                        bind.buffer_ref,
+                        bind.resource.as_ref(),
+                        bind.offset,
+                    ));
+                }
+            }
+            if let Some(info) = table.indexed {
+                if seen_buffers.insert(info.index_buffer_ref) {
+                    let resource = crate::runtime::objects::resolve_resource(
+                        state,
+                        host,
+                        task_id,
+                        info.index_buffer_ref,
+                    )
+                    .ok();
+                    warmed += u64::from(warm_buffer_ref(
+                        state,
+                        host,
+                        task_id,
+                        info.index_buffer_ref,
+                        resource.as_ref(),
+                        info.index_buffer_offset,
+                    ));
+                }
+            }
+        }
+        // The sampled family: linear textures only — the one sampled shape
+        // whose planner ends in a packed probe (`plan_linear_zero_copy`'s
+        // `packed_available` miss). The planner call is read-only and answers
+        // through the same gates the chunk's item will meet, so the warm-up
+        // constructs exactly where that item would have bailed no-entry cold.
+        let mut seen_samples = HashSet::new();
+        for table in &self.tables[..end] {
+            for bind in table.fragment.iter().chain(table.vertex.iter()) {
+                if bind.texture_ref == 0 || !seen_samples.insert(bind.texture_ref) {
+                    continue;
+                }
+                let Some(resource) = bind.resource.clone() else {
+                    continue;
+                };
+                if !matches!(
+                    sample_plan::plan_linear_zero_copy(
+                        state,
+                        host,
+                        task_id,
+                        bind.texture_ref,
+                        resource.clone(),
+                        true,
+                    ),
+                    Err(SampleBail::ColdPacked)
+                ) {
+                    continue;
+                }
+                if state
+                    .bound_buffers
+                    .packed(task_id, bind.texture_ref)
+                    .is_some()
+                {
+                    // A held entry (a refused construction, a mismatched
+                    // geometry) — final for this geometry, the drain's own.
+                    continue;
+                }
+                let allocation = match resource.decoded() {
+                    Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => tex
+                        .allocation_base_gva(state.page_shift)
+                        .filter(|_| tex.allocation_size != 0)
+                        .map(|gva| BufferBacking {
+                            gva,
+                            size: tex.allocation_size,
+                        }),
+                    _ => None,
+                };
+                let Some(backing) = allocation else {
+                    continue;
+                };
+                warmed += 1;
+                ensure_packed_resource(
+                    state,
+                    host,
+                    task_id,
+                    bind.texture_ref,
+                    &backing,
+                    PackedResourceRail::LinearSample,
+                );
+            }
+        }
+        if warmed > 0 {
+            crate::runtime::drain::note_store_route("packed_warm_open");
+            crate::runtime::drain::note_store_route_n("packed_warm_refs", warmed);
+        }
     }
 
     /// TEMP (lab, `REIMS_VGPU_LAB_SYNC_AHEAD=on`): hand the write-tracking sets of
@@ -594,11 +815,34 @@ impl<'a> PassPrep<'a> {
             // would refuse the same way on the next chunk, so it is not asked
             // again. A consumed ref-view plan leaves `planned` through the
             // consumed list, not here.
+            //
+            // TEMP (lab, PACKED_WARM): one bail is not final — a cold one over
+            // a registry with NO entry for the reference (see [`packed_warm`]):
+            // the drain's serial bind constructs that entry inside this pass,
+            // so the ref is requeued for one retry on the next chunk instead
+            // of held sticky. A held entry (a refused construction, a mismatched
+            // geometry) keeps the bail final: the serial ladder mutates nothing
+            // there and the next chunk would refuse the same way.
             match item {
                 PrepItem::Sample { texture_ref, .. } => {
-                    self.planned.insert(*texture_ref);
+                    let requeue = packed_warm()
+                        && matches!(
+                            &result,
+                            Ok(PrepOutcome::Sample(Err(SampleBail::ColdPacked)))
+                        )
+                        && state.bound_buffers.packed(task_id, *texture_ref).is_none()
+                        && !self.requeued_samples.contains(texture_ref);
+                    if requeue {
+                        self.requeued_samples.insert(*texture_ref);
+                        crate::runtime::drain::note_store_route("packed_warm_requeue");
+                    } else {
+                        self.planned.insert(*texture_ref);
+                    }
                     match result {
                         Ok(PrepOutcome::Sample(Ok(plan))) => {
+                            if self.requeued_samples.remove(texture_ref) {
+                                crate::runtime::drain::note_store_route("packed_warm_hit");
+                            }
                             crate::runtime::drain::note_store_route(match plan {
                                 StreamPlan::Surface(_) => "par_prefetch_planned",
                                 StreamPlan::RefView(_) => "par_prefetch_planned_ref_view",
@@ -615,9 +859,25 @@ impl<'a> PassPrep<'a> {
                     }
                 }
                 PrepItem::Buffer { buffer_ref, .. } => {
-                    self.planned_buffers.insert(*buffer_ref);
+                    let bail = match &result {
+                        Ok(PrepOutcome::Buffer(Err(bail))) => Some(*bail),
+                        _ => None,
+                    };
+                    if packed_warm()
+                        && bail
+                            .is_some_and(|b| buffer_bail_requeues(state, task_id, *buffer_ref, b))
+                        && !self.requeued_buffers.contains(buffer_ref)
+                    {
+                        self.requeued_buffers.insert(*buffer_ref);
+                        crate::runtime::drain::note_store_route("packed_warm_requeue");
+                    } else {
+                        self.planned_buffers.insert(*buffer_ref);
+                    }
                     match result {
                         Ok(PrepOutcome::Buffer(Ok(plan))) => {
+                            if self.requeued_buffers.remove(buffer_ref) {
+                                crate::runtime::drain::note_store_route("packed_warm_hit");
+                            }
                             crate::runtime::drain::note_store_route(buffer_plan::planned_route(
                                 &plan,
                             ));
@@ -640,9 +900,24 @@ impl<'a> PassPrep<'a> {
                     }
                 }
                 PrepItem::Index { key, .. } => {
-                    self.planned_indexes.insert(*key);
+                    let bail = match &result {
+                        Ok(PrepOutcome::Buffer(Err(bail))) => Some(*bail),
+                        _ => None,
+                    };
+                    if packed_warm()
+                        && bail.is_some_and(|b| buffer_bail_requeues(state, task_id, key.1, b))
+                        && !self.requeued_indexes.contains(key)
+                    {
+                        self.requeued_indexes.insert(*key);
+                        crate::runtime::drain::note_store_route("packed_warm_requeue");
+                    } else {
+                        self.planned_indexes.insert(*key);
+                    }
                     match result {
                         Ok(PrepOutcome::Buffer(Ok(plan))) => {
+                            if self.requeued_indexes.remove(key) {
+                                crate::runtime::drain::note_store_route("packed_warm_hit");
+                            }
                             crate::runtime::drain::note_store_route(buffer_plan::planned_route(
                                 &plan,
                             ));
@@ -668,6 +943,78 @@ impl<'a> PassPrep<'a> {
         prefetch::merge_into_frame(plans);
         buffer_plan::merge_buffer_plans(buffer_rails, buffer_exacts, store_plan);
     }
+}
+
+/// TEMP (lab, PACKED_WARM): whether a buffer-arm bail is the retryable cold —
+/// the registry holds NO entry at all for the rail that bailed, so the drain's
+/// serial bind constructs that entry (the packed alias, the whole-allocation
+/// walk) inside this pass and the next chunk's replan can hit it. A held entry
+/// — a refused construction under the same retirement rules, or a mismatched
+/// geometry — makes the bail final exactly as before this knob existed: the
+/// serial ladder mutates nothing there.
+fn buffer_bail_requeues(
+    state: &DeviceState,
+    task_id: u32,
+    buffer_ref: u32,
+    bail: buffer_plan::BufferBail,
+) -> bool {
+    match bail {
+        buffer_plan::BufferBail::ColdPacked => {
+            state.bound_buffers.packed(task_id, buffer_ref).is_none()
+        }
+        buffer_plan::BufferBail::ColdWhole => {
+            state.bound_buffers.whole(task_id, buffer_ref).is_none()
+        }
+        _ => false,
+    }
+}
+
+/// TEMP (lab, PACKED_WARM): one buffer reference's warm-up — the construction
+/// the first serial bind of the reference would run one record later, moved
+/// ahead of the first chunk's fork. `first_offset` is that first bind's
+/// offset, the window the whole-arm's gather eligibility is decided against.
+///
+/// Nothing happens where an entry already stands (warm, or a held negative the
+/// drain answers without mutating) or where the backing does not resolve —
+/// both are exactly the states the serial ladder leaves alone.
+fn warm_buffer_ref<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    buffer_ref: u32,
+    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
+    first_offset: u64,
+) -> bool {
+    if buffer_ref == 0 {
+        return false;
+    }
+    if state.bound_buffers.packed(task_id, buffer_ref).is_some() {
+        return false;
+    }
+    let Some(resource) = resource else {
+        return false;
+    };
+    let Ok((gva, size)) =
+        crate::runtime::objects::resolve_buffer_span_from_resource(state, resource)
+    else {
+        return false;
+    };
+    let backing = BufferBacking { gva, size };
+    let made = ensure_packed_resource(
+        state,
+        host,
+        task_id,
+        buffer_ref,
+        &backing,
+        PackedResourceRail::Buffer,
+    );
+    if !made && first_offset < size && gather_span_if_eligible(size - first_offset, None).is_some()
+    {
+        // The serial ladder's own next step under a refused alias: walk the
+        // whole allocation once and hold its runs.
+        ensure_whole_runs(state, host, task_id, buffer_ref, gva, size);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -828,6 +1175,139 @@ mod tests {
         let host: &'static mut FakeHost = Box::leak(Box::new(buffer_host()));
         let state = pooled_buffer_state(&mut *host, specs);
         (state, host)
+    }
+
+    /// TEMP (lab, PACKED_WARM): the linear-texture twin of
+    /// [`pooled_buffer_fixture`] — a pooled device whose workers read the
+    /// leaked host, with one OBJECT_TYPE_TEXTURE (`texture_ref` 2, a 64x64
+    /// BGRA8 level at task GVA `0x20_000`, four pages) whose packed entry is
+    /// deliberately NOT pre-warmed. [`warm_packed_entry`] stands in for the
+    /// construction a capable host's drain would land at the first serial
+    /// bind; this host's own `ensure_packed_resource` refuses (no import
+    /// caps), which is exactly why the entry is inserted by hand.
+    fn pooled_linear_fixture() -> (DeviceState, &'static mut FakeHost) {
+        use crate::protocol::endian::{st16, st32, st64};
+        use crate::runtime::decode::resource::{
+            list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
+            OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT,
+            TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
+        };
+        use crate::runtime::gva_mem;
+
+        let mut leaked = buffer_host();
+        // The worker's shim table carries no `write_gen`, so a witness token
+        // would answer differently on the pool and the drain; unobservable
+        // writes keep every witness unarmed and both views identical (the
+        // `view_fixture` rule).
+        leaked.guest_writes_unobservable = true;
+        let host: &'static mut FakeHost = Box::leak(Box::new(leaked));
+        let mut state = pooled_state_over_table(|table| {
+            table.map_pages_stable = 1;
+            table.read_gpa = Some(shim_read_gpa);
+            table.ctx = host as *mut FakeHost as *mut std::os::raw::c_void;
+        });
+        state.define_task(1, 0x1000, 2);
+        assert!(state.set_object_list(1, 0, 32));
+        let (texture_ref, handle, w, h, bpr) = (2u32, 32u32, 64u32, 64u32, 256u32);
+        let span = u64::from(bpr) * u64::from(h);
+        let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
+        st64(&mut desc[LINEAR_DESC_SIZE..], span);
+        st32(&mut desc[LINEAR_DESC_HANDLE..], handle);
+        st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], bpr);
+        st32(&mut desc[TEXTURE_DESC_WIDTH..], w);
+        st32(&mut desc[TEXTURE_DESC_HEIGHT..], h);
+        // RG16_UINT: an integer texel layout, so the sampled-layout gate the
+        // planner asks answers from the table (`is_integer` short-circuits)
+        // and no pool worker ever reaches for the engine lock a planning
+        // thread must not take — and no test creates a Vulkan device just to
+        // publish capabilities that would change what every later fixture's
+        // packed construction refuses.
+        st16(
+            &mut desc[TEXTURE_DESC_PIXEL_FORMAT..],
+            reims_vgpu_protocol::pixel_format::MTL_FORMAT_RG16_UINT,
+        );
+        assert!(gva_mem::write_task_gva(
+            &mut *host,
+            &state.tasks[1],
+            0x1000,
+            &desc,
+            PAGE_SHIFT_X86
+        )
+        .is_ok());
+        let list_off = list_object_entry_offset(texture_ref, 32).unwrap();
+        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut list_entry,
+            (OBJECT_TYPE_TEXTURE as u32) | ((TEXTURE_DESC_BASE_LEN as u32) << 8),
+        );
+        list_entry[4..12].copy_from_slice(&0x1000u64.to_le_bytes());
+        assert!(gva_mem::write_task_gva(
+            &mut *host,
+            &state.tasks[1],
+            list_off,
+            &list_entry,
+            PAGE_SHIFT_X86
+        )
+        .is_ok());
+        (state, host)
+    }
+
+    /// TEMP (lab, PACKED_WARM): the warm packed allocation for
+    /// [`pooled_linear_fixture`]'s texture — the same shape sample_plan's
+    /// `linear_fixture` retains, over the fixture's own host allocation, so
+    /// both the plan's commit and the serial rail's warm lookup answer from
+    /// one retained identity.
+    fn warm_packed_entry(state: &mut DeviceState) {
+        use crate::runtime::bound_buffers::{PackedBuffer, PackedBufferResolution};
+        let (texture_ref, handle, span) = (2u32, 32u32, 0x4000u64);
+        let base = 0x7f00_0000_0000usize;
+        let import = std::sync::Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(base, 0x8000, 0x1000)
+                .expect("aligned allocation"),
+        );
+        let run =
+            crate::runtime::guest_ram::GuestRun::in_mapping(base, 0x8000, 0, span).expect("run");
+        let gpas: Vec<u64> = (0..4u64)
+            .map(|i| (handle as u64 + i) << PAGE_SHIFT_X86)
+            .collect();
+        state.bound_buffers.insert_packed(
+            1,
+            texture_ref,
+            PackedBufferResolution::Available(PackedBuffer {
+                gva: u64::from(handle) << PAGE_SHIFT_X86,
+                size: span,
+                head: 0,
+                import,
+                gpas: std::sync::Arc::new(gpas),
+                runs: std::sync::Arc::new(vec![run]),
+                pages: std::sync::Arc::new(Vec::new()),
+            }),
+        );
+    }
+
+    /// TEMP (lab, PACKED_WARM): declare the texture's GVA plane — the state a
+    /// freshly stored, now-sampled surface carries, and the one state in which
+    /// the linear planner walks past its resident-rung guard to the packed
+    /// probe (an undeclared GVA answers the guard conservatively, the
+    /// `upper_rung` class this knob must not touch).
+    ///
+    /// The witness itself stays unarmed (the fixture's
+    /// `guest_writes_unobservable`): the worker's shim table carries no
+    /// `write_gen`, so a tracked token would answer `Unreadable` on the pool
+    /// and `Quiet` on the drain — the split `view_fixture` avoids the same
+    /// way. An unarmed witness answers `NoMapping` on both, which the guard
+    /// reads as "the resident rung cannot serve" and walks past.
+    fn declare_gva_plane(state: &mut DeviceState) {
+        let gpas: Vec<u64> = (48u64..52).map(|p| p << PAGE_SHIFT_X86).collect();
+        let _generation = state.pending_writebacks.ensure_gva_resource(
+            crate::runtime::writeback_debt::GvaResourceKey {
+                task_id: 1,
+                texture_ref: 2,
+            },
+            0x20_000,
+            0x4000,
+            Some(gpas),
+        );
     }
 
     /// Two `BufferContent`s agree structurally — the arms resolve
@@ -1905,7 +2385,10 @@ mod tests {
             .collect();
         for answer in &serial_answers {
             assert!(
-                matches!(answer, crate::backend::vulkan::engine::BufferContent::Bytes(_)),
+                matches!(
+                    answer,
+                    crate::backend::vulkan::engine::BufferContent::Bytes(_)
+                ),
                 "the fixture's host refuses every zero-copy rail, so the serial arm reads CPU bytes"
             );
         }
@@ -1975,5 +2458,397 @@ mod tests {
                 .expect("the test arenas are still installed"),
         );
         let _ = &mut planned_state;
+    }
+
+    /// TEMP (lab, PACKED_WARM): the sample side's cold_packed class, closed.
+    /// A cold linear texture bails `ColdPacked` in chunk 0 — and with the knob
+    /// on that bail is *requeued*, not held sticky: once the entry stands (the
+    /// construction the drain's first serial bind lands; inserted by hand
+    /// because this host's own construction refuses), the next chunk replans
+    /// the ref, the replan hits, and the bind serves the serial ladder's
+    /// answer for the same state. A retirement between the replan and the ask
+    /// drops the plan (`par_prefetch_invalid_packed`) and the ask falls back
+    /// to the serial ladder.
+    #[test]
+    fn a_cold_packed_ref_requeues_and_replans_to_the_serial_answer() {
+        let _warm = test_packed_warm(true);
+        let _mode = test_mode(PassPrepMode::On);
+        let (mut planned_state, planned_host) = pooled_linear_fixture();
+        let (mut serial_state, serial_host) = pooled_linear_fixture();
+        // The freshly-stored state both arms plan against: the plane declared,
+        // the witness unarmed (the shape the worker's shim and the drain's
+        // host answer identically for) — everything but the packed entry,
+        // which is the cold this test exists to close.
+        declare_gva_plane(&mut planned_state);
+        declare_gva_plane(&mut serial_state);
+        // The warm entry both arms will answer from: the planned arm gets it
+        // after chunk 0 (the drain's serial construction, stood in for — this
+        // host's `ensure_packed_resource` refuses where a capable host's
+        // constructs), the serial arm before its one bind.
+        warm_packed_entry(&mut serial_state);
+        // Two cache refs beside the texture, so every chunk that matters
+        // carries two items and forks: chunk 0 plans the texture and the
+        // first cache ref; chunk 1 replans the texture beside the second.
+        add_cache_ref(&mut planned_state, &mut *planned_host, 7, 99, 0x2000, 0);
+        add_cache_ref(&mut planned_state, &mut *planned_host, 8, 91, 0x2100, 5);
+        // L = the linear texture (ref 2); C/C2 = the cache refs.
+        let pattern = [0u32, 1, 0, 2, 0, 1];
+        let bind_for = |which: u32, state: &DeviceState, host: &FakeHost| -> TextureBind {
+            let texture_ref = match which {
+                0 => 2,
+                other => 6 + other, // 1 -> 7, 2 -> 8
+            };
+            TextureBind {
+                index: 0,
+                texture_ref,
+                resource: Some(
+                    objects::resolve_resource(state, host, 1, texture_ref).expect("bind resource"),
+                ),
+            }
+        };
+        let planned_binds: Vec<Vec<TextureBind>> = pattern
+            .iter()
+            .map(|&which| vec![bind_for(which, &planned_state, &*planned_host)])
+            .collect();
+        let tables: Vec<DrawTables<'_>> = planned_binds
+            .iter()
+            .map(|one| DrawTables {
+                fragment: one.as_slice(),
+                vertex: &[],
+                vertex_buffers: &[],
+                fragment_buffers: &[],
+                indexed: None,
+            })
+            .collect();
+        let before_requeue = store_route_count("packed_warm_requeue");
+        let before_cold = store_route_count("par_prefetch_bail_cold_packed");
+        let mut prep = PassPrep::open_with_chunk(&planned_state, 1, tables, 2).expect("opens");
+        // Chunk 0 (draws 0..2): the texture bails cold (no packed entry) — and
+        // is requeued rather than held sticky.
+        prep.ahead(&planned_state, &FakeHost::new(), 0);
+        assert_eq!(delta("par_prefetch_bail_cold_packed", before_cold), 1);
+        assert_eq!(delta("packed_warm_requeue", before_requeue), 1);
+        // The drain's first serial binds of the pass run here; the entry they
+        // would construct stands from this point on.
+        warm_packed_entry(&mut planned_state);
+        // Chunk 1 (draws 2..4): the requeued texture replans — onto the now
+        // warm rail, so the replan is a hit.
+        let before_hit = store_route_count("packed_warm_hit");
+        let before_planned = store_route_count("par_prefetch_planned_linear");
+        prep.ahead(&planned_state, &FakeHost::new(), 2);
+        assert_eq!(delta("packed_warm_hit", before_hit), 1);
+        assert_eq!(delta("par_prefetch_planned_linear", before_planned), 1);
+        // Draw 2 binds the texture: the plan serves, and the serve is the
+        // serial ladder's own answer for the same warm state.
+        let resource = objects::resolve_resource(&planned_state, &*planned_host, 1, 2)
+            .expect("texture resource");
+        let served = prefetch::prefetched_source(
+            &mut planned_state,
+            &mut *planned_host,
+            1,
+            2,
+            Some(&resource),
+            true,
+        );
+        let serial = resolve_sampled_source(
+            &mut serial_state,
+            &mut *serial_host,
+            1,
+            2,
+            Some(resource.clone()),
+            true,
+        )
+        .expect("the serial ladder serves the warm entry");
+        match (served, serial) {
+            (prefetch::Prefetched::Serve((pw, ph, _, psrc)), (sw, sh, _, ssrc)) => {
+                assert_eq!((pw, ph), (sw, sh), "the geometry agrees");
+                match (psrc, ssrc) {
+                    (
+                        SampledSourceRequest::GuestRuns(p, playout, _, pplanes, _, _, _),
+                        SampledSourceRequest::GuestRuns(s, slayout, _, splanes, _, _, _),
+                    ) => {
+                        assert!(Arc::ptr_eq(&p.runs, &s.runs) || p.runs[..] == s.runs[..]);
+                        assert_eq!(p.source_offset, s.source_offset);
+                        assert_eq!(p.total_len, s.total_len);
+                        assert_eq!(p.row_length_texels, s.row_length_texels);
+                        assert_eq!((playout, pplanes), (slayout, splanes));
+                    }
+                    (planned_src, _serial_src) => panic!(
+                        "both arms serve guest runs, got a different variant ({})",
+                        match planned_src {
+                            SampledSourceRequest::GuestRuns(..) => "runs",
+                            SampledSourceRequest::Target(..) => "target",
+                            SampledSourceRequest::Bytes(..) => "bytes",
+                            SampledSourceRequest::Staged(..) => "staged",
+                        }
+                    ),
+                }
+            }
+            (other, _) => panic!(
+                "the replanned texture serves, got shadow={}",
+                matches!(other, prefetch::Prefetched::Shadow(_))
+            ),
+        }
+        // A retirement between the replan and the ask drops the plan: the
+        // packed entry the plan borrowed is gone, the ask falls back, and the
+        // serial ladder owns the bind again.
+        assert!(planned_state.retire_bound_buffers_in_range(1, 0x20_000, 0x1000) >= 0);
+        let before_invalid = store_route_count("par_prefetch_invalid_packed");
+        let fell_back = prefetch::prefetched_source(
+            &mut planned_state,
+            &mut *planned_host,
+            1,
+            2,
+            Some(&resource),
+            true,
+        );
+        assert!(matches!(fell_back, prefetch::Prefetched::Serial));
+        assert_eq!(delta("par_prefetch_invalid_packed", before_invalid), 1);
+        drop(prep);
+    }
+
+    /// TEMP (lab, PACKED_WARM): the warm-up cork, buffer side. The drain warms
+    /// the first chunk's cold references before the chunk forks — the packed
+    /// alias this host refuses becomes a held negative, and the whole runs the
+    /// serial ladder would walk land right there — so chunk 0 plans the whole
+    /// rail instead of bailing `cold_packed` sticky, the binds serve from the
+    /// plan, and the registry ends where the serial ladder leaves it.
+    #[test]
+    fn warm_packed_corks_the_first_chunks_cold_binds() {
+        let _no_stage = crate::runtime::par::staging::test_enable(false);
+        let _warm = test_packed_warm(true);
+        let _mode = test_mode(PassPrepMode::On);
+        let specs = [(7u32, 0x8000u64), (8, 0x8000)];
+        let (mut planned_state, planned_host) = pooled_buffer_fixture(&specs);
+        let (mut serial_state, serial_host) = pooled_buffer_fixture(&specs);
+        let make_binds = |state: &DeviceState, host: &FakeHost| -> Vec<Vec<BufferBind>> {
+            [7u32, 8, 7, 8, 7, 8]
+                .iter()
+                .map(|&buffer_ref| {
+                    vec![BufferBind {
+                        index: 0,
+                        buffer_ref,
+                        resource: Some(
+                            crate::runtime::objects::resolve_resource(state, host, 1, buffer_ref)
+                                .expect("bind resource"),
+                        ),
+                        offset: 0x40,
+                        attribute_stride: None,
+                    }]
+                })
+                .collect()
+        };
+        let planned_binds = make_binds(&planned_state, &*planned_host);
+        let serial_binds = make_binds(&serial_state, &*serial_host);
+        let tables: Vec<DrawTables<'_>> = planned_binds
+            .iter()
+            .map(|one| DrawTables {
+                fragment: &[],
+                vertex: &[],
+                vertex_buffers: one.as_slice(),
+                fragment_buffers: &[],
+                indexed: None,
+            })
+            .collect();
+        let mut prep = PassPrep::open_with_chunk(&planned_state, 1, tables, 4).expect("opens");
+        let before_refs = store_route_count("packed_warm_refs");
+        let before_cold = store_route_count("pass_prep_buf_bail_cold_packed");
+        let before_whole = store_route_count("pass_prep_buf_bail_cold_whole");
+        // The cork: the drain constructs before the fork.
+        prep.warm_packed(&mut planned_state, &mut *planned_host);
+        assert!(delta("packed_warm_refs", before_refs) >= 1);
+        assert!(
+            planned_state.bound_buffers.whole(1, 7).is_some()
+                && planned_state.bound_buffers.whole(1, 8).is_some(),
+            "the refused packed alias fell to the whole runs the serial ladder would walk"
+        );
+        // Chunk 0 plans onto the warm rail — no cold bail at all.
+        let before_planned = store_route_count("pass_prep_buf_planned_whole");
+        prep.ahead(&planned_state, &FakeHost::new(), 0);
+        assert_eq!(delta("pass_prep_buf_bail_cold_packed", before_cold), 0);
+        assert_eq!(delta("pass_prep_buf_bail_cold_whole", before_whole), 0);
+        assert!(delta("pass_prep_buf_planned_whole", before_planned) >= 1);
+        // The binds serve from the plans and answer what the serial ladder
+        // answers for the same binds.
+        let serial_answers: Vec<_> = serial_binds
+            .iter()
+            .map(|one| {
+                let bind = one.first().expect("one bind per draw");
+                load_buffer_content(
+                    &mut serial_state,
+                    &mut *serial_host,
+                    1,
+                    bind.buffer_ref,
+                    bind.resource.as_deref(),
+                    bind.offset,
+                    true,
+                    None,
+                )
+                .expect("the serial ladder serves")
+            })
+            .collect();
+        for (di, one) in planned_binds.iter().enumerate() {
+            let bind = one.first().expect("one bind per draw");
+            let served = load_buffer_content(
+                &mut planned_state,
+                &mut *planned_host,
+                1,
+                bind.buffer_ref,
+                bind.resource.as_deref(),
+                bind.offset,
+                true,
+                None,
+            )
+            .expect("the planned arm serves");
+            assert!(
+                contents_agree(&served, &serial_answers[di]),
+                "draw {di} ref {} agrees with the serial ladder",
+                bind.buffer_ref
+            );
+        }
+        drop(prep);
+        assert_eq!(
+            planned_state.bound_buffers.shape(),
+            serial_state.bound_buffers.shape(),
+            "the warm-up leaves the registry where the serial ladder does"
+        );
+    }
+
+    /// TEMP (lab, PACKED_WARM): the requeue, buffer side, and the knob-off
+    /// control. Without the warm-up, a cold reference bails in chunk 0 — with
+    /// the knob on the bail is requeued, the drain's serial binds construct
+    /// the entry (the packed refusal plus the whole walk this host can do),
+    /// and the next chunk's replan hits. With the knob off the very same bail
+    /// stays sticky for the pass: no requeue, no replan, byte-for-byte the
+    /// old path.
+    #[test]
+    fn a_cold_buffer_bail_requeues_once_and_the_knob_off_keeps_it_sticky() {
+        let _no_stage = crate::runtime::par::staging::test_enable(false);
+        let _mode = test_mode(PassPrepMode::On);
+        let specs = [(7u32, 0x8000u64), (8, 0x8000)];
+        let (mut state, host) = pooled_buffer_fixture(&specs);
+        let make_binds = |state: &DeviceState, host: &FakeHost| -> Vec<Vec<BufferBind>> {
+            [7u32, 8, 7, 8, 7, 8]
+                .iter()
+                .map(|&buffer_ref| {
+                    vec![BufferBind {
+                        index: 0,
+                        buffer_ref,
+                        resource: Some(
+                            crate::runtime::objects::resolve_resource(state, host, 1, buffer_ref)
+                                .expect("bind resource"),
+                        ),
+                        offset: 0x40,
+                        attribute_stride: None,
+                    }]
+                })
+                .collect()
+        };
+        let binds = make_binds(&state, &*host);
+        let tables: Vec<DrawTables<'_>> = binds
+            .iter()
+            .map(|one| DrawTables {
+                fragment: &[],
+                vertex: &[],
+                vertex_buffers: one.as_slice(),
+                fragment_buffers: &[],
+                indexed: None,
+            })
+            .collect();
+        // -- The knob off: the bail is sticky, byte-for-byte the old path.
+        {
+            let _off = test_packed_warm(false);
+            let before_cold = store_route_count("pass_prep_buf_bail_cold_packed");
+            let before_warm = store_route_count("packed_warm_refs");
+            let mut prep = PassPrep::open_with_chunk(&state, 1, tables, 4).expect("opens");
+            prep.warm_packed(&mut state, &mut *host);
+            assert_eq!(delta("packed_warm_refs", before_warm), 0);
+            prep.ahead(&state, &FakeHost::new(), 0);
+            assert_eq!(delta("pass_prep_buf_bail_cold_packed", before_cold), 2);
+            // The drain's serial binds warm the registry (this host refuses
+            // the packed alias and walks the whole runs).
+            for one in binds.iter().take(4) {
+                let bind = one.first().expect("one bind per draw");
+                let _ = load_buffer_content(
+                    &mut state,
+                    &mut *host,
+                    1,
+                    bind.buffer_ref,
+                    bind.resource.as_deref(),
+                    bind.offset,
+                    true,
+                    None,
+                )
+                .expect("the serial ladder serves");
+            }
+            // The next chunk does not replan the bailed refs: sticky.
+            let before_planned = store_route_count("pass_prep_buf_planned_whole");
+            let before_requeue = store_route_count("packed_warm_requeue");
+            prep.ahead(&state, &FakeHost::new(), 4);
+            assert_eq!(delta("pass_prep_buf_planned_whole", before_planned), 0);
+            assert_eq!(delta("packed_warm_requeue", before_requeue), 0);
+            drop(prep);
+        }
+        // -- The knob on, no warm-up (the later-chunk cold a cork cannot
+        //    reach): the bail requeues, the drain's binds warm the registry,
+        //    and the next chunk's replan hits.
+        {
+            let _on = test_packed_warm(true);
+            let (mut state, host) = pooled_buffer_fixture(&specs);
+            let binds = make_binds(&state, &*host);
+            let tables: Vec<DrawTables<'_>> = binds
+                .iter()
+                .map(|one| DrawTables {
+                    fragment: &[],
+                    vertex: &[],
+                    vertex_buffers: one.as_slice(),
+                    fragment_buffers: &[],
+                    indexed: None,
+                })
+                .collect();
+            let before_requeue = store_route_count("packed_warm_requeue");
+            let mut prep = PassPrep::open_with_chunk(&state, 1, tables, 4).expect("opens");
+            prep.ahead(&state, &FakeHost::new(), 0);
+            assert_eq!(delta("packed_warm_requeue", before_requeue), 2);
+            for one in binds.iter().take(4) {
+                let bind = one.first().expect("one bind per draw");
+                let _ = load_buffer_content(
+                    &mut state,
+                    &mut *host,
+                    1,
+                    bind.buffer_ref,
+                    bind.resource.as_deref(),
+                    bind.offset,
+                    true,
+                    None,
+                )
+                .expect("the serial ladder serves");
+            }
+            let before_hit = store_route_count("packed_warm_hit");
+            let before_planned = store_route_count("pass_prep_buf_planned_whole");
+            prep.ahead(&state, &FakeHost::new(), 4);
+            assert_eq!(delta("pass_prep_buf_planned_whole", before_planned), 2);
+            assert_eq!(delta("packed_warm_hit", before_hit), 2);
+            // And the requeued plan serves the later binds.
+            let bind = binds[4].first().expect("one bind per draw");
+            let before_served = store_route_count("pass_prep_buf_hit_whole");
+            let served = load_buffer_content(
+                &mut state,
+                &mut *host,
+                1,
+                bind.buffer_ref,
+                bind.resource.as_deref(),
+                bind.offset,
+                true,
+                None,
+            )
+            .expect("the replanned rail serves");
+            assert!(matches!(
+                served,
+                crate::backend::vulkan::engine::BufferContent::GuestRuns(_)
+            ));
+            assert_eq!(delta("pass_prep_buf_hit_whole", before_served), 1);
+            drop(prep);
+        }
     }
 }

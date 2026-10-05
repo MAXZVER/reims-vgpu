@@ -5674,8 +5674,13 @@ fn finish_stream<M: HostMemory + HostOps>(
         // TEMP (lab, PASS_PREP): the first chunk's scope runs here, before the
         // first record's request is built, so its fork overlaps the recorder's
         // wake and the plans are on the frame by the time draw 0 encodes.
+        // TEMP (lab, PACKED_WARM): before that fork, the drain warms the first
+        // chunk's cold packed entries (a write only the drain may make), so
+        // the chunk plans onto warm rails instead of bailing cold_packed
+        // sticky for the pass. No-op with the knob off.
         #[cfg(feature = "backend-vulkan")]
         if let Some(p) = pass_prep.as_mut() {
+            p.warm_packed(state, host);
             p.ahead(&*state, &*host, 0);
         }
         // TEMP (lab, PASS_PREP): the first record's request materialization and
