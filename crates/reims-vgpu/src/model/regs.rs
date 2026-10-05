@@ -974,8 +974,7 @@ pub const DISPLAY_REFRESH_HZ: u32 = 120;
 /// visible as drain idle time; a higher lab refresh lets the frame rate itself
 /// show how fast the device can go.
 ///
-/// TEMP (lab, n107; hq062): 480 by default outside tests (240 before hq062, 120
-/// before n107). WindowServer
+/// TEMP (lab, n107): 240 by default outside tests (120 before n107). WindowServer
 /// drops a fullscreen animation to half the advertised rate when it misses its
 /// deadline, and at 120 that half is the 60 Hz regime boots fell into; at 240 the
 /// fallback is 120. n107 (x3 interleaved): transitions 996/1043 frames, >25 ms
@@ -991,14 +990,11 @@ pub fn display_refresh_hz() -> u32 {
     })
 }
 
-/// TEMP (lab, n107, hq062): the refresh [`display_refresh_hz`] defaults to
-/// outside tests. 480 since hq062 (AMD, a boot an arm, x2): full-screen
-/// transitions 68 / 63 frames a burst in Safari against 39 / 46 at 240, Finder
-/// 54 / 49 against 33 / 31, Finder's largest gap 58 / 52 ms against 177 / 119,
-/// and WindowServer wiring ~0.7M pages a run against ~1.6M - the finer the grid
-/// WindowServer schedules a full-screen animation on, the less one missed
-/// deadline costs it. `=240` restores the previous default.
-const LAB_DEFAULT_REFRESH_HZ: u32 = 480;
+/// TEMP (lab, n107): the refresh [`display_refresh_hz`] defaults to outside
+/// tests. Not 480: the guest offers no 5120x2160 mode at 480 Hz and comes up at
+/// 1920x1080 on the 5K panel (hq067, system_profiler) - hq062's "480 against 240"
+/// compared 1080p against 5K, not two refresh rates.
+const LAB_DEFAULT_REFRESH_HZ: u32 = 240;
 pub const DISPLAY_PRODUCT_NAME: &[u8] = b"QEMU display\0";
 /// How many unacked ONLINE pulses this device sends before it stops.
 ///
