@@ -416,6 +416,13 @@ impl<'a> PassPrep<'a> {
         // lane already holds. A plan the lane fills later (its backlog can
         // outlive this open) reaches the frame through the miss-fill in
         // `prefetched_source` instead.
+        //
+        // TEMP (lab, DRAIN_LANES 3): the refs a lane *attempted and bailed
+        // on* seed `planned` too (n241: upper_rung is the lane's second
+        // largest bail family, and the planner must keep refusing it — an
+        // upper rung is state the serial rail resolves itself). This pass's
+        // chunks skip re-attempting what refused one pass ago; the seed is
+        // one-shot, so an epoch whose state has changed tries again fresh.
         if super::lanes::lanes_on() {
             if let Some(plans) = super::lanes::take_plans_for(task_id) {
                 crate::runtime::drain::note_store_route("lanes_handoff_open");
@@ -424,6 +431,11 @@ impl<'a> PassPrep<'a> {
                     opened.planned.insert(texture_ref);
                     prefetch::merge_into_frame([((task_id, texture_ref), plan)]);
                 }
+            }
+            let bailed = super::lanes::take_bailed_for(task_id);
+            if !bailed.is_empty() {
+                crate::runtime::drain::note_store_route_n("lanes_seed_n", bailed.len() as u64);
+                opened.planned.extend(bailed);
             }
         }
         Some(opened)
@@ -1025,10 +1037,12 @@ impl<'a> PassPrep<'a> {
                 // TEMP (lab, DRAIN_LANES): the lane's results go to the lane
                 // store, not this pass's frame — the frame dies with the pass
                 // and the lane's task has not opened its own yet. A bail is
-                // final for the lane's packet (one pass over the backlog,
-                // unlike the chunks' replan cycles), so it is counted in the
-                // lane's own namespace and the serial ladder owns the bind
-                // when the packet runs.
+                // counted in the lane's own namespace and recorded on the
+                // lane (`note_bail`): the owning pass's open will seed its
+                // `planned` from it (skip the re-attempt), and a cold bail
+                // joins the set the task's next offer warms on the drain
+                // (the PACKED_WARM requeue shape, n241's dominant bail
+                // family).
                 PrepItem::LaneSample {
                     task_id: lane_task,
                     texture_ref,
@@ -1041,6 +1055,7 @@ impl<'a> PassPrep<'a> {
                     Ok(PrepOutcome::Sample(Err(bail))) => {
                         crate::runtime::drain::note_store_route(super::lanes::bail_route(bail));
                         crate::runtime::drain::note_store_route_n("lanes_bail_n", 1);
+                        super::lanes::note_bail(*lane_task, *texture_ref, bail);
                     }
                     _ => crate::runtime::drain::note_store_route("lanes_panic"),
                 },

@@ -53,13 +53,31 @@
 //! lanes never planned) and took the windowed-glass scene from 193 to
 //! 95-135 Hz.
 //!
-//! A newer EXEC of a task supersedes that task's lane, and the oldest lane
-//! is evicted at the cap; a lane is **not** dropped when a packet of its
-//! task runs — retirement-by-task would conflate packets (a task with two
-//! queued EXECs holds its *newest* refs, and the older packet's run would
-//! destroy the newer one's plans), and every surviving plan still passes the
-//! serve-time validation a fresh one would. Offers for the task currently
-//! executing are ignored — its own chunks plan its refs.
+//! A newer EXEC of a task supersedes only that lane's **backlog** — the
+//! plans, bails and cold marks survive the supersede (n241: 946/977 of the
+//! ~970 plans died exactly there, one packet old and still valid by
+//! validation; a task binds largely the same refs packet over packet). The
+//! oldest lane is evicted at the cap; a lane is **not** dropped when a
+//! packet of its task runs — retirement-by-task would conflate packets (a
+//! task with two queued EXECs holds its *newest* refs, and the older
+//! packet's run would destroy the newer one's plans). Offers for the task
+//! currently executing are ignored — its own chunks plan its refs.
+//!
+//! # Bails and the cold warm-up (n241's coverage lesson)
+//!
+//! n241's lane bails were dominated by `cold_packed` (1412-1435) and
+//! `upper_rung` (401-479). `upper_rung` the planner must keep refusing (an
+//! upper rung is state the serial rail resolves itself; predicting it is the
+//! readiness-flip class), so those refs are only marked `bailed` and the
+//! owning pass's open seeds its `planned` from them — its chunks skip
+//! re-attempting what refused one pass ago. `cold_packed` is different: the
+//! missing packed alias is *construction work* the drain may legally do
+//! (the PACKED_WARM cork's own move), so a cold-bailed ref is marked `cold`
+//! and the next offer of its task warms it on the drain —
+//! [`warm_cold_refs`] runs `ensure_packed_resource` before the lane's
+//! backlog is rebuilt, one attempt per ref per lane epoch, and a construction
+//! that lands also clears the bail so a later take replans onto the warm
+//! rail.
 //!
 //! Unset (or `1`) is byte-for-byte today's path: no lane exists, no scope
 //! grows an item, no ask consults a store that is always empty.
@@ -133,12 +151,19 @@ impl Drop for TestForceGuard {
 }
 
 /// One task's lane: the unplanned refs of its most recently admitted EXEC,
-/// and the plans other tasks' scopes have filled in for them. The task is
-/// the slot's key, not a field — every rule below is "which task's lane",
-/// asked once.
+/// the plans other tasks' scopes have filled in for them, the refs those
+/// scopes attempted and bailed on, and the cold subset of those bails (see
+/// the module doc). The task is the slot's key, not a field — every rule
+/// below is "which task's lane", asked once.
 struct Lane {
     backlog: VecDeque<u32>,
     planned: HashMap<u32, StreamPlan>,
+    /// Refs a scope attempted and the ladder refused. Survives supersedes;
+    /// taken (one-shot) by the owning pass's open to seed its `planned`.
+    bailed: HashSet<u32>,
+    /// The `ColdPacked` subset of [`Self::bailed`]: refs whose missing packed
+    /// alias is construction work the next offer's warm-up will attempt.
+    cold: HashSet<u32>,
 }
 
 thread_local! {
@@ -177,13 +202,15 @@ fn note_discarded(n: u64) {
 /// that are about to plan.
 ///
 /// The slot rules: the running task's packets never install (its own chunks
-/// plan its refs); a newer EXEC of a task supersedes that task's lane; the
+/// plan its refs); a newer EXEC of a task supersedes that lane's *backlog*
+/// only — plans, bails and cold marks survive (n241: nearly every plan died
+/// on the supersede, one packet old and still valid by validation); the
 /// oldest lane is evicted at [`LANE_TASK_CAP`].
-pub(crate) fn offer_exec(
-    state: &DeviceState,
-    task_id: u32,
-    work: &reims_vgpu_core::exec::ExecWork,
-) {
+///
+/// `refs` is the packet's scanned bind inventory (the caller owns the scan
+/// so the arrival-declare knob can share it); refs already planned or bailed
+/// stay out of the fresh backlog — they are done, not waiting.
+pub(crate) fn offer_exec(state: &DeviceState, task_id: u32, refs: &[u32]) {
     if !lanes_on() || pass_prep_mode() == PassPrepMode::Off {
         // No scopes will ever drain a backlog while PassPrep is off, and no
         // ask will consult a store; the scan would be pure cost.
@@ -201,42 +228,20 @@ pub(crate) fn offer_exec(
         // The running task plans itself, in its own chunks.
         return;
     }
-    // The bind inventory: every distinct reference the render records bind.
-    // Compute encoders are skipped — their textures do not walk the render
-    // pass tables this lane plans for. A span that names no window of the
-    // arena (a resolver this lane does not model) contributes nothing rather
-    // than panicking: the lane is an accelerator, and a packet it cannot
-    // inventory plans serially exactly as it always did.
-    let mut seen = HashSet::new();
-    let mut refs: Vec<u32> = Vec::new();
-    for record in work.records() {
-        if let reims_vgpu_core::exec::ResolvedOperation::Render(
-            reims_vgpu_core::render::RenderOp::BindTextures { entries, .. },
-        ) = &record.op
-        {
-            let Some(bindings) = work.arenas.object_bindings.get(entries.range()) else {
-                continue;
-            };
-            for binding in bindings {
-                if let Some(object) = binding.object {
-                    let texture_ref = object.slot.0;
-                    if texture_ref != 0 && seen.insert(texture_ref) {
-                        refs.push(texture_ref);
-                    }
-                }
-            }
-        }
-    }
-    refs.truncate(LANE_REF_CAP);
+    // The scanner caps at its own constant; this is the lane's own fence,
+    // so the bound below (`LANE_TASK_CAP` lanes of `LANE_REF_CAP` plans)
+    // holds whatever the caller hands in.
+    let refs = &refs[..refs.len().min(LANE_REF_CAP)];
     crate::runtime::drain::note_store_route("lanes_offer");
     crate::runtime::drain::note_store_route_n("lanes_offer_n", refs.len() as u64);
-    let backlog: VecDeque<u32> = refs.into();
     LANES.with(|lanes| {
         let mut lanes = lanes.borrow_mut();
         if let Some(slot) = lanes.iter_mut().find(|(t, _)| *t == task_id) {
-            let superseded = std::mem::take(&mut slot.1.planned);
-            note_discarded(superseded.len() as u64);
-            slot.1.backlog = backlog;
+            slot.1.backlog = refs
+                .iter()
+                .copied()
+                .filter(|r| !slot.1.planned.contains_key(r) && !slot.1.bailed.contains(r))
+                .collect();
             return;
         }
         if lanes.len() >= LANE_TASK_CAP {
@@ -247,11 +252,118 @@ pub(crate) fn offer_exec(
         lanes.push((
             task_id,
             Lane {
-                backlog,
+                backlog: refs.iter().copied().collect(),
                 planned: HashMap::new(),
+                bailed: HashSet::new(),
+                cold: HashSet::new(),
             },
         ));
     });
+}
+
+/// Record one lane bail: the ref joins the lane's `bailed` set (the owning
+/// pass's open will seed its `planned` from it, skipping a re-attempt that
+/// would refuse the same way), and a `ColdPacked` bail additionally joins
+/// `cold` for the next offer's warm-up.
+pub(super) fn note_bail(task_id: u32, texture_ref: u32, bail: SampleBail) {
+    LANES.with(|lanes| {
+        let mut lanes = lanes.borrow_mut();
+        let Some((_, lane)) = lanes.iter_mut().find(|(t, _)| *t == task_id) else {
+            return;
+        };
+        lane.bailed.insert(texture_ref);
+        if matches!(bail, SampleBail::ColdPacked) {
+            lane.cold.insert(texture_ref);
+        }
+    });
+}
+
+/// Warm the task's cold-bailed refs on the drain, at its next offer.
+///
+/// The PACKED_WARM cork's move at lane granularity: a `ColdPacked` bail
+/// names construction work (the packed alias the serial bind would make),
+/// and construction is legal here — this is the drain, before the lane's
+/// backlog is rebuilt, so a construction that lands also clears the bail and
+/// the ref re-enters a future backlog to be replanned onto the warm rail.
+/// One attempt per ref per lane epoch either way: a construction that
+/// refuses is a held negative the next attempt would meet again.
+pub(crate) fn warm_cold_refs<
+    M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
+>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+) {
+    if !lanes_on() {
+        return;
+    }
+    // Drained first: cold is one-shot by construction, whatever the attempt
+    // answers.
+    let cold: Vec<u32> = LANES.with(|lanes| {
+        let mut lanes = lanes.borrow_mut();
+        match lanes.iter_mut().find(|(t, _)| *t == task_id) {
+            Some((_, lane)) => std::mem::take(&mut lane.cold).into_iter().collect(),
+            None => Vec::new(),
+        }
+    });
+    for texture_ref in cold {
+        crate::runtime::drain::note_store_route("lanes_warm");
+        let Ok(resource) =
+            crate::runtime::objects::resolve_resource(&*state, &*host, task_id, texture_ref)
+        else {
+            continue;
+        };
+        // The linear-sample backing, exactly the in-pass cork's shape: the
+        // allocation the descriptor names, as one packed window.
+        let allocation = match resource.decoded() {
+            Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => tex
+                .allocation_base_gva(state.page_shift)
+                .filter(|_| tex.allocation_size != 0)
+                .map(|gva| BufferBacking {
+                    gva,
+                    size: tex.allocation_size,
+                }),
+            _ => None,
+        };
+        let Some(backing) = allocation else {
+            continue;
+        };
+        if ensure_packed_resource(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            &backing,
+            PackedResourceRail::LinearSample,
+        ) {
+            crate::runtime::drain::note_store_route("lanes_warm_made");
+            // The rail is warm: the bail is gone with the cold, and a future
+            // backlog replans the ref.
+            LANES.with(|lanes| {
+                if let Some((_, lane)) =
+                    lanes.borrow_mut().iter_mut().find(|(t, _)| *t == task_id)
+                {
+                    lane.bailed.remove(&texture_ref);
+                }
+            });
+        }
+    }
+}
+
+/// Take the lane's bailed refs (the `PassPrep::open` seed), one-shot: the
+/// owning pass's chunks skip re-attempting them, and the next epoch starts
+/// clean (a bail is a fact about the state it was measured against).
+pub(super) fn take_bailed_for(task_id: u32) -> HashSet<u32> {
+    if !lanes_on() {
+        return HashSet::new();
+    }
+    LANES.with(|lanes| {
+        let mut lanes = lanes.borrow_mut();
+        match lanes.iter_mut().find(|(t, _)| *t == task_id) {
+            Some((_, lane)) => std::mem::take(&mut lane.bailed),
+            None => HashSet::new(),
+        }
+    })
 }
 
 /// The drain entered a retained EXEC of `task_id`. Sets the running-task
@@ -420,51 +532,6 @@ mod tests {
         store_route_count(route).saturating_sub(before)
     }
 
-    /// An `ExecWork` whose one render segment binds `refs` as fragment
-    /// textures — the minimal shape of the model's resolved records the lane
-    /// feed scans (the arenas and spans are the real ones the walk fills).
-    fn exec_work_with_binds(refs: &[u32]) -> reims_vgpu_core::exec::ExecWork {
-        use reims_vgpu_core::bind::ObjectBinding;
-        use reims_vgpu_core::exec::{ExecWork, ResolvedOperation, ResolvedStream, StreamRecord};
-        use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
-        use reims_vgpu_core::render::{RenderOp, ShaderStage};
-        use reims_vgpu_core::stream::{SegmentBegin, SegmentKind, StreamPosition};
-        use reims_vgpu_core::sync::ResourceSpan;
-
-        let mut work = ExecWork::default();
-        let start = work.arenas.object_bindings.len() as u32;
-        for &texture_ref in refs {
-            work.arenas.object_bindings.push(ObjectBinding {
-                object: (texture_ref != 0).then_some(ResourceId {
-                    slot: ObjectListRef(texture_ref),
-                    generation: SlotGeneration(1),
-                }),
-                lod_clamps: None,
-            });
-        }
-        work.streams.push(ResolvedStream {
-            begin: SegmentBegin {
-                kind: SegmentKind::Render,
-                protection: None,
-            },
-            records: vec![StreamRecord {
-                at: StreamPosition {
-                    segment: 0,
-                    record: 0,
-                },
-                op: ResolvedOperation::Render(RenderOp::BindTextures {
-                    stage: ShaderStage::Fragment,
-                    first: 0,
-                    entries: ResourceSpan {
-                        start,
-                        len: refs.len() as u32,
-                    },
-                }),
-            }],
-        });
-        work
-    }
-
     /// A pooled device with two tasks: task 1 (the draining one, A) and task
     /// 2 (the lane's, B), each with a page-table directory/root pair and one
     /// host-cache texture ref. The zero-helper pool makes every scope run on
@@ -615,11 +682,9 @@ mod tests {
         // The admission order of the drain: A (task 1) offered, then B (task
         // 2, refs 2 and 3) offered beside it — B's lane must survive A's
         // offer, not be shadowed by it.
-        let a_work = exec_work_with_binds(&[2]);
-        let b_work = exec_work_with_binds(&[2, 3]);
         let before_offer = store_route_count("lanes_offer");
-        offer_exec(&planned_state, 1, &a_work);
-        offer_exec(&planned_state, 2, &b_work);
+        offer_exec(&planned_state, 1, &[2]);
+        offer_exec(&planned_state, 2, &[2, 3]);
         assert_eq!(delta("lanes_offer", before_offer), 2);
         // A's pass: four draws binding A's own ref (2) — the scope that will
         // carry the lane's items beside them. The take resolves B's items
@@ -747,8 +812,8 @@ mod tests {
         let _force = test_force();
         let _mode = super::super::pass_prep::test_mode(PassPrepMode::On);
         let (mut state, mut host) = two_task_state();
-        offer_exec(&state, 1, &exec_work_with_binds(&[2]));
-        offer_exec(&state, 2, &exec_work_with_binds(&[2, 3]));
+        offer_exec(&state, 1, &[2]);
+        offer_exec(&state, 2, &[2, 3]);
         let a_binds: Vec<Vec<TextureBind>> = (0..4)
             .map(|_| vec![bind_for(&state, &host, 1, 2)])
             .collect();
@@ -786,9 +851,8 @@ mod tests {
     fn the_gate_off_is_the_old_path() {
         let _mode = super::super::pass_prep::test_mode(PassPrepMode::On);
         let (mut state, mut host) = two_task_state();
-        let work = exec_work_with_binds(&[2, 3]);
         let before_offer = store_route_count("lanes_offer");
-        offer_exec(&state, 2, &work);
+        offer_exec(&state, 2, &[2, 3]);
         assert_eq!(delta("lanes_offer", before_offer), 0);
         assert!(take_plan(&(2, 2)).is_none());
         assert!(take_plans_for(2).is_none());
@@ -831,8 +895,8 @@ mod tests {
         let (state, host) = two_task_state();
         // The drain's admission order: A (task 1) first, then B (task 2) —
         // both lanes stand, which is what the single-lane store refused.
-        offer_exec(&state, 1, &exec_work_with_binds(&[2]));
-        offer_exec(&state, 2, &exec_work_with_binds(&[2, 3]));
+        offer_exec(&state, 1, &[2]);
+        offer_exec(&state, 2, &[2, 3]);
         // A runs: A's own lane is skipped, B's is taken.
         note_exec_started(1);
         let backlog = take_backlog(&state, &host, 8, 1);
@@ -841,7 +905,7 @@ mod tests {
         // Safari's next EXEC (task 1) is admitted mid-drain: the running
         // task's offer never installs, and A's taken entries do not come
         // back — but B's lane stands untouched.
-        offer_exec(&state, 1, &exec_work_with_binds(&[2]));
+        offer_exec(&state, 1, &[2]);
         let backlog = take_backlog(&state, &host, 8, 1);
         assert!(
             backlog.is_empty(),
@@ -853,7 +917,7 @@ mod tests {
         assert_eq!(a_items.len(), 1, "A's own lane held A's one ref");
         assert_eq!(a_items[0].0, 1);
         // A newer EXEC of B supersedes B's lane: fresh backlog.
-        offer_exec(&state, 2, &exec_work_with_binds(&[3]));
+        offer_exec(&state, 2, &[3]);
         // B's packet runs: the lane SURVIVES it (a later queued packet of B
         // still owns what it holds) — the take after the run still finds
         // B's refs, drained only by a take.
@@ -863,21 +927,21 @@ mod tests {
         assert_eq!(backlog.len(), 1, "the lane survives its task's run");
         assert_eq!(backlog[0].0, 2);
         // And the next same-task offer supersedes it.
-        offer_exec(&state, 2, &exec_work_with_binds(&[2, 3]));
+        offer_exec(&state, 2, &[2, 3]);
         let backlog = take_backlog(&state, &host, 8, 1);
         assert_eq!(backlog.len(), 2, "the next same-task offer superseded it");
         // The cap: four tasks fill the store, the fifth evicts the oldest
         // (tasks 3-5 have no fixture page tables, so only task 2's lane can
         // resolve items — enough to prove the cap fired and a survivor
         // stands; the "oldest first" order is the Vec's own).
-        offer_exec(&state, 3, &exec_work_with_binds(&[2]));
-        offer_exec(&state, 4, &exec_work_with_binds(&[2]));
+        offer_exec(&state, 3, &[2]);
+        offer_exec(&state, 4, &[2]);
         let before_evicted = store_route_count("lanes_evicted");
-        offer_exec(&state, 5, &exec_work_with_binds(&[2]));
+        offer_exec(&state, 5, &[2]);
         assert_eq!(delta("lanes_evicted", before_evicted), 1);
         // Task 2's lane survived (it replaces in place, not as a new install
         // that would have evicted again) and still serves items.
-        offer_exec(&state, 2, &exec_work_with_binds(&[2, 3]));
+        offer_exec(&state, 2, &[2, 3]);
         assert_eq!(
             delta("lanes_evicted", before_evicted),
             1,
@@ -898,8 +962,8 @@ mod tests {
         let _force = test_force();
         let _mode = super::super::pass_prep::test_mode(PassPrepMode::On);
         let (mut state, mut host) = two_task_state();
-        offer_exec(&state, 1, &exec_work_with_binds(&[2]));
-        offer_exec(&state, 2, &exec_work_with_binds(&[2, 3]));
+        offer_exec(&state, 1, &[2]);
+        offer_exec(&state, 2, &[2, 3]);
         // A's scope plans B's refs.
         let a_binds: Vec<Vec<TextureBind>> = (0..4)
             .map(|_| vec![bind_for(&state, &host, 1, 2)])
@@ -956,6 +1020,137 @@ mod tests {
             matches!(served, prefetch::Prefetched::Serve(_)),
             "the adopted frame plan serves B's bind"
         );
+        drop(prep_b);
+    }
+
+    /// The n241 funnel fix: a supersede (the task's next offer) replaces only
+    /// the backlog — the plans, bails and cold marks survive it, one packet
+    /// old and still valid by validation, and the fresh backlog excludes the
+    /// refs that are already done.
+    #[test]
+    fn a_supersede_keeps_plans_and_bails() {
+        let _force = test_force();
+        let _mode = super::super::pass_prep::test_mode(PassPrepMode::On);
+        let (state, host) = two_task_state();
+        offer_exec(&state, 1, &[2]);
+        offer_exec(&state, 2, &[2, 3]);
+        // A's scope plans both of B's refs.
+        let a_binds: Vec<Vec<TextureBind>> = (0..4)
+            .map(|_| vec![bind_for(&state, &host, 1, 2)])
+            .collect();
+        let tables: Vec<super::super::DrawTables<'_>> = a_binds
+            .iter()
+            .map(|one| super::super::DrawTables {
+                fragment: one.as_slice(),
+                vertex: &[],
+                vertex_buffers: &[],
+                fragment_buffers: &[],
+                indexed: None,
+            })
+            .collect();
+        let mut prep_a = super::super::pass_prep::PassPrep::open_with_chunk(&state, 1, tables, 4)
+            .expect("A's pass opens");
+        prep_a.ahead(&state, &host, 0);
+        drop(prep_a);
+        // One of B's refs bails (recorded), then B's next packet is offered —
+        // the supersede. Iteration 2 discarded the plan here.
+        note_bail(2, 3, SampleBail::UpperRung);
+        let before_discarded = store_route_count("lanes_discarded_n");
+        offer_exec(&state, 2, &[2, 3]);
+        assert_eq!(delta("lanes_discarded_n", before_discarded), 0);
+        // The plans survived: B's open adopts them.
+        let plans = take_plans_for(2).expect("the plans survived the supersede");
+        assert_eq!(plans.len(), 2);
+        // The bails survived too — one-shot at the owning pass's open.
+        let bailed = take_bailed_for(2);
+        assert_eq!(bailed.len(), 1);
+        assert!(bailed.contains(&3));
+        assert!(
+            take_bailed_for(2).is_empty(),
+            "the bailed seed is one-shot"
+        );
+        // And the fresh backlog excludes the done refs: nothing left to take.
+        let backlog = take_backlog(&state, &host, 8, 1);
+        assert!(
+            backlog.is_empty(),
+            "planned and bailed refs stay out of the fresh backlog"
+        );
+    }
+
+    /// The cold warm-up: a `ColdPacked` bail joins the lane's cold set, and
+    /// the task's next offer warms it once on the drain — this host's
+    /// construction refuses (no import caps), which is the held negative the
+    /// PACKED_WARM reasoning keeps final, so the ref is not re-warmed and the
+    /// bail stays for the owning pass's seed.
+    #[test]
+    fn a_cold_bail_warms_once_at_the_next_offer() {
+        let _force = test_force();
+        let _mode = super::super::pass_prep::test_mode(PassPrepMode::On);
+        let (mut state, mut host) = two_task_state();
+        offer_exec(&state, 2, &[2, 3]);
+        note_bail(2, 2, SampleBail::ColdPacked);
+        note_bail(2, 3, SampleBail::UpperRung);
+        let before_warm = store_route_count("lanes_warm");
+        let before_made = store_route_count("lanes_warm_made");
+        warm_cold_refs(&mut state, &mut host, 2);
+        // Only the cold ref is warm work; the rung bail never was.
+        assert_eq!(delta("lanes_warm", before_warm), 1);
+        // This host's packed construction refuses, so nothing was made and
+        // the bail survives for the owning pass's seed.
+        assert_eq!(delta("lanes_warm_made", before_made), 0);
+        let bailed = take_bailed_for(2);
+        assert_eq!(bailed.len(), 2, "both bails still seed the owning pass");
+        // One attempt per ref per epoch: a second warm does nothing.
+        warm_cold_refs(&mut state, &mut host, 2);
+        assert_eq!(delta("lanes_warm", before_warm), 1);
+        // And a task with no lane is a no-op.
+        warm_cold_refs(&mut state, &mut host, 7);
+        assert_eq!(delta("lanes_warm", before_warm), 1);
+    }
+
+    /// The owning pass's open seeds its `planned` from the lane's bails: the
+    /// pass's own chunk does not re-attempt what a lane scope refused one
+    /// pass ago (n241's upper_rung family — the planner must keep refusing
+    /// it, so the saving is the skipped attempt, not a serve).
+    #[test]
+    fn the_opening_pass_seeds_from_the_lanes_bails() {
+        let _force = test_force();
+        let _mode = super::super::pass_prep::test_mode(PassPrepMode::On);
+        let (mut state, mut host) = two_task_state();
+        offer_exec(&state, 2, &[2, 3]);
+        note_bail(2, 2, SampleBail::UpperRung);
+        // B's pass opens (two draws binding the bailed ref): the seed puts
+        // the ref in `planned`, so the chunk does not attempt it.
+        let b_binds: Vec<Vec<TextureBind>> = (0..2)
+            .map(|_| vec![bind_for(&state, &host, 2, 2)])
+            .collect();
+        let b_tables: Vec<super::super::DrawTables<'_>> = b_binds
+            .iter()
+            .map(|one| super::super::DrawTables {
+                fragment: one.as_slice(),
+                vertex: &[],
+                vertex_buffers: &[],
+                fragment_buffers: &[],
+                indexed: None,
+            })
+            .collect();
+        let before_seed = store_route_count("lanes_seed_n");
+        let before_prefetch = store_route_count("par_prefetch_planned");
+        let mut prep_b = super::super::pass_prep::PassPrep::open_with_chunk(&state, 2, b_tables, 2)
+            .expect("B's pass opens");
+        assert_eq!(delta("lanes_seed_n", before_seed), 1);
+        prep_b.ahead(&state, &host, 0);
+        assert_eq!(
+            delta("par_prefetch_planned", before_prefetch),
+            0,
+            "the bailed ref was not re-attempted by B's own chunk"
+        );
+        // The bind still serves — through the serial ladder, as a bail always
+        // meant.
+        let resource = objects::resolve_resource(&state, &host, 2, 2).expect("B's resource");
+        let served =
+            prefetch::prefetched_source(&mut state, &mut host, 2, 2, Some(&resource), true);
+        assert!(matches!(served, prefetch::Prefetched::Serial));
         drop(prep_b);
     }
 }
