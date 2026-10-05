@@ -674,6 +674,14 @@ pub trait HostOps {
     /// host without it does nothing and each read syncs its own set.
     fn guest_write_sync_many(&self, _tokens: &[u64]) {}
 
+    /// TEMP (lab, `REIMS_VGPU_LAB_SYNC_AHEAD`): hand the tracked sets of
+    /// `tokens` to the host's own workers to bring up to date now, and return
+    /// without waiting, so the [`Self::guest_write_gen`] reads a pass makes
+    /// later find them synced instead of syncing (or waiting on a sync) on
+    /// the reader. A hint with no answer: a host without workers does nothing,
+    /// and a read that arrives before a worker syncs as it always did.
+    fn guest_write_sync_ahead(&self, _tokens: &[u64]) {}
+
     /// TEMP (lab, `REIMS_VGPU_LAB_ASYNC_BASELINE`): start the
     /// [`Self::guest_write_gen`] read of `token` on another thread and return
     /// its answer to come. `None` when this host has no such thread — read

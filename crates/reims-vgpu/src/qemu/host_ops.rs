@@ -164,6 +164,10 @@ pub struct ReimsVgpuHostOps {
     /// query; see the ABI header.
     pub guest_write_sync_many:
         Option<unsafe extern "C" fn(ctx: *mut c_void, tokens: *const u64, count: usize)>,
+    /// TEMP lab SYNC_AHEAD: queue the named tracked sets for the tracker's
+    /// workers to sync now, without waiting; see the ABI header.
+    pub guest_write_sync_ahead:
+        Option<unsafe extern "C" fn(ctx: *mut c_void, tokens: *const u64, count: usize)>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -283,6 +287,7 @@ impl ReimsVgpuHostOps {
             thread_detach: None,
             note_ring_tail: None,
             guest_write_sync_many: None,
+            guest_write_sync_ahead: None,
         }
     }
 }
@@ -1062,6 +1067,17 @@ impl HostOps for QemuHost<'_> {
         if let Some(f) = self.ops.guest_write_sync_many {
             // SAFETY: QEMU owns ctx; the slice outlives the call, which copies
             // nothing it keeps.
+            unsafe { f(self.ops.ctx, tokens.as_ptr(), tokens.len()) }
+        }
+    }
+
+    fn guest_write_sync_ahead(&self, tokens: &[u64]) {
+        if tokens.is_empty() {
+            return;
+        }
+        if let Some(f) = self.ops.guest_write_sync_ahead {
+            // SAFETY: QEMU owns ctx; the call copies the tokens it queues before
+            // returning and keeps no pointer into the slice.
             unsafe { f(self.ops.ctx, tokens.as_ptr(), tokens.len()) }
         }
     }

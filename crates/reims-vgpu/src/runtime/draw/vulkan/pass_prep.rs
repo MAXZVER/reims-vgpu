@@ -60,6 +60,23 @@ fn lab_prep_sync() -> bool {
     })
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_SYNC_AHEAD=on` — see [`PassPrep::sync_ahead`].
+/// Latched; off in unit tests (the test hosts have no workers to hand sets to).
+fn lab_sync_ahead() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(
+            std::env::var("REIMS_VGPU_LAB_SYNC_AHEAD").as_deref(),
+            Ok("on")
+        );
+        crate::observe::off(format!("lab_sync_ahead on={on}"));
+        on
+    })
+}
+
 /// Which way the pass preparation runs. `REIMS_VGPU_LAB_PASS_PREP`, read once;
 /// supersedes `REIMS_VGPU_LAB_PAR_PREFETCH` while not `off`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +259,9 @@ pub(crate) struct PassPrep<'a> {
     /// the Store walk yet.
     store_target: Option<buffer_plan::StoreTargetKey>,
     store_pages_planned: bool,
+    /// TEMP (lab, SYNC_AHEAD): the pass's later chunks have been handed to the
+    /// host's sync workers.
+    synced_ahead: bool,
     _frame: PrefetchGuard,
 }
 
@@ -287,6 +307,7 @@ impl<'a> PassPrep<'a> {
             planned_indexes: HashSet::new(),
             store_target: None,
             store_pages_planned: false,
+            synced_ahead: false,
             _frame: prefetch::push_empty_frame(),
         })
     }
@@ -299,6 +320,48 @@ impl<'a> PassPrep<'a> {
     /// once per pass, and the drain does it in the time the store takes.
     pub(crate) fn note_store_target(&mut self, c0: &ColorRtRequest) {
         self.store_target = buffer_plan::latch_store_target(c0);
+    }
+
+    /// TEMP (lab, `REIMS_VGPU_LAB_SYNC_AHEAD=on`): hand the write-tracking sets of
+    /// every sampled source past the first chunk to the host's sync workers, once,
+    /// before the first chunk is planned — and do not wait for them.
+    ///
+    /// The planner's items are mostly that sync (pa2: 93 % of an item is the
+    /// tracker bringing the set up to date — a content hash of its pages or a
+    /// wait for another thread's), and an item runs it only when the drain is
+    /// already waiting for the chunk. The sync needs nothing but the token, so it
+    /// can start while the drain encodes the first chunk: the later chunks' items
+    /// then find their sets synced for the epoch this pass's packet was rung in
+    /// (one packet, one work epoch) and answer from the fast path. The first chunk
+    /// is left to the pool, which is about to plan it. A hint only: a set a worker
+    /// has not reached when its item runs is synced by the item, as before.
+    fn sync_ahead<H: crate::runtime::host::HostOps>(&self, state: &DeviceState, host: &H) {
+        if self.tables.len() <= self.chunk {
+            return;
+        }
+        let mut seen = HashSet::new();
+        let mut tokens = Vec::new();
+        for table in &self.tables[self.chunk..] {
+            for bind in table.fragment.iter().chain(table.vertex.iter()) {
+                if bind.texture_ref == 0 || !seen.insert(bind.texture_ref) {
+                    continue;
+                }
+                let Some(resource) = bind.resource.as_ref() else {
+                    continue;
+                };
+                if let Some(token) =
+                    sample_plan::plan_guest_write_token(state, bind.texture_ref, resource)
+                {
+                    tokens.push(token);
+                }
+            }
+        }
+        if tokens.is_empty() {
+            return;
+        }
+        crate::runtime::drain::note_store_route("lab_sync_ahead_passes");
+        crate::runtime::drain::note_store_route_n("lab_sync_ahead_tokens", tokens.len() as u64);
+        host.guest_write_sync_ahead(&tokens);
     }
 
     /// At the top of record `di`: when `di >= offered`, plan the new refs of
@@ -316,6 +379,12 @@ impl<'a> PassPrep<'a> {
     ) {
         if di < self.offered {
             return;
+        }
+        if !self.synced_ahead {
+            self.synced_ahead = true;
+            if lab_sync_ahead() {
+                self.sync_ahead(state, host);
+            }
         }
         // Refs whose ref-view plan a bind consumed since the last chunk are
         // planned again from the witness's new state (design H6).

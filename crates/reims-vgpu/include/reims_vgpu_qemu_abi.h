@@ -21,7 +21,10 @@
 extern "C" {
 #endif
 
-/* v26: ReimsVgpuHostOps.guest_write_sync_many — TEMP lab PREP_SYNC: bring the named tracked
+/* v27: ReimsVgpuHostOps.guest_write_sync_ahead — TEMP lab SYNC_AHEAD: queue the named tracked
+ *      sets for the dirty tracker's workers to bring up to date now, without waiting, so the
+ *      reads a pass makes later (its planned binds) find them synced. NULL: no such queue.
+ * v26: ReimsVgpuHostOps.guest_write_sync_many — TEMP lab PREP_SYNC: bring the named tracked
  *      sets up to date in one merged dirty-log query, so the reads that follow (a pass's planned
  *      binds) find them synced. NULL: each read syncs its own set, as before.
  * v25: ReimsVgpuHostOps.note_ring_tail and reims_vgpu_qemu_child_tail_gpa — a
@@ -125,7 +128,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 26u
+#define REIMS_VGPU_QEMU_ABI_VERSION 27u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -469,6 +472,12 @@ typedef struct ReimsVgpuHostOps {
      * are skipped. Safe from any thread. NULL: no merged sync.
      */
     void (*guest_write_sync_many)(void *ctx, const uint64_t *tokens, size_t count);
+    /*
+     * TEMP lab SYNC_AHEAD: hand the tracked sets of `count` tokens to the dirty tracker's workers
+     * to sync for the current epoch, and return at once. Unknown, synced or busy tokens are
+     * skipped; a read that arrives first syncs as before. Safe from any thread. NULL: no queue.
+     */
+    void (*guest_write_sync_ahead)(void *ctx, const uint64_t *tokens, size_t count);
 } ReimsVgpuHostOps;
 
 /*
