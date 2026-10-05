@@ -1076,6 +1076,26 @@ fn lab_pay_after_yield() -> bool {
     })
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_IDLE=on`): [`lab_pay_after_stamp`] pays only at
+/// a tranche end that finds the guest idle — no payment after
+/// [`LAB_PAY_AFTER_MAX_YIELDS`] yields in a row. A full-screen transition or an
+/// animated scene rings every tranche, so the eighth yield came within a frame
+/// or two: 0.5-0.6 payments of a ~27 MB presented frame a transition frame,
+/// 1.3-1.8 ms of the drain's landing and copy wait each frame (hq050, AMD).
+/// With no payment at all (`PAY_AFTER=off`) the windowed glass ran +6 % and
+/// Safari's transitions +25 % frames, Finder's the same. Idle tranche ends still
+/// pay, so the pages are fresh again once the screen settles, which is when a
+/// drag or a capture names them. Latched.
+fn lab_pay_idle() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_PAY_IDLE").is_ok_and(|v| v == "on");
+        crate::observe::off(format!("lab_pay_idle on={on}"));
+        on
+    })
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_PAY_AFTER=off` leaves a replayed presented frame
 /// owed until a reader names it. On by default: with no payment at all the
 /// framebuffer pages fall a whole frame behind, and the first named
@@ -1118,7 +1138,7 @@ pub fn lab_pay_after_stamp<M: HostMemory + HostOps>(
     }
     let mapping_id = LAB_PAY_AFTER_STAMP.swap(0, Relaxed);
     if mapping_id != 0 && guest_waiting && lab_pay_after_yield() {
-        if YIELDS.fetch_add(1, Relaxed) < LAB_PAY_AFTER_MAX_YIELDS {
+        if lab_pay_idle() || YIELDS.fetch_add(1, Relaxed) < LAB_PAY_AFTER_MAX_YIELDS {
             // A newer swap overwrites this; the older frame then stays owed to
             // whatever names it, as it would with no payment at all.
             let _ = LAB_PAY_AFTER_STAMP.compare_exchange(0, mapping_id, Relaxed, Relaxed);
