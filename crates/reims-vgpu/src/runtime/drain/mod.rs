@@ -2416,6 +2416,22 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // *as*, and a position holding one without the other could plan from bytes
     // its records never named. An exec packet has both; every other class has
     // neither.
+    //
+    // TEMP (lab, `REIMS_VGPU_LAB_DRAIN_LANES=2`): the lane feed, while both
+    // halves are still in hand — the admitted EXEC's bind inventory (out of
+    // the retained `ExecWork`, never the ring) becomes the plan-ahead
+    // candidate another task's chunk scopes will plan inside. See
+    // `draw::vulkan::lanes` for the offer rules and the fences; a no-op with
+    // the knob unset, and for every non-exec class (both halves absent).
+    #[cfg(feature = "backend-vulkan")]
+    if let (Some(submission), Some(work)) = (arrived.submission.as_ref(), resolved.as_ref()) {
+        crate::runtime::draw::vulkan::lanes::offer_exec(
+            &*state,
+            &*host,
+            submission.task_id(),
+            work,
+        );
+    }
     let work = match (arrived.submission, resolved) {
         (Some(submission), Some(resolved)) => crate::runtime::parked::ParkedWork::with_submission(
             fifo.domain().0,
@@ -3168,6 +3184,17 @@ fn run_parked_packet<H: HostMemory + HostOps>(
     domain: u32,
 ) {
     state.lab_pipeline_ran(ingress);
+    // TEMP (lab, `REIMS_VGPU_LAB_DRAIN_LANES=2`): the running-task marker the
+    // lane's offer rule consults — set while a retained EXEC's task executes
+    // (so its own later admissions never evict a cross-task lane), cleared
+    // with the lane when it is done. A no-op with the knob unset and for
+    // every non-exec position (no retained inputs).
+    #[cfg(feature = "backend-vulkan")]
+    let lab_lane_task = work.retained().map(|inputs| inputs.submission.task_id());
+    #[cfg(feature = "backend-vulkan")]
+    if let Some(task_id) = lab_lane_task {
+        crate::runtime::draw::vulkan::lanes::note_exec_started(task_id);
+    }
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
         process_root_packet(state, host, work.packet());
     } else {
@@ -3218,6 +3245,13 @@ fn run_parked_packet<H: HostMemory + HostOps>(
             state.draining_mask &= !bit;
         }
         state.draining_channel = prev_channel;
+    }
+    // TEMP (lab, DRAIN_LANES): the execution half is over — clear the
+    // running marker and retire the lane when this was its task's packet
+    // (whatever the lane still holds will never be asked for by it again).
+    #[cfg(feature = "backend-vulkan")]
+    if let Some(task_id) = lab_lane_task {
+        crate::runtime::draw::vulkan::lanes::note_exec_finished(task_id);
     }
     match state.complete_transaction(work.epoch(), ingress) {
         Ok(released) => {

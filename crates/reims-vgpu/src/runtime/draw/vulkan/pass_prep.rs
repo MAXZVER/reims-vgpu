@@ -278,6 +278,16 @@ enum PrepItem {
         texture_ref: u32,
         resource: std::sync::Arc<crate::model::TaskResource>,
     },
+    /// TEMP (lab, `REIMS_VGPU_LAB_DRAIN_LANES=2`): another task's bind, from
+    /// the plan-ahead lane's backlog — planned in this chunk's scope beside
+    /// the pass's own items (the one window a worker may share
+    /// `&DeviceState`), stored to the lane store after the join instead of
+    /// the frame. Carries its own task because it is not this pass's.
+    LaneSample {
+        task_id: u32,
+        texture_ref: u32,
+        resource: std::sync::Arc<crate::model::TaskResource>,
+    },
     /// TEMP (lab, PASS_PREP step 3): a buffer bind's warm rails. The offset
     /// is the first bind of the chunk that named the reference (PASS_STAGE:
     /// the staged arm reads one window, keyed by it).
@@ -381,7 +391,7 @@ impl<'a> PassPrep<'a> {
         // state it is handed.
         state.par()?;
         crate::runtime::drain::note_store_route("pass_prep_open");
-        Some(Self {
+        let mut opened = Self {
             task_id,
             tables,
             chunk,
@@ -396,7 +406,27 @@ impl<'a> PassPrep<'a> {
             store_pages_planned: false,
             synced_ahead: false,
             _frame: prefetch::push_empty_frame(),
-        })
+        };
+        // TEMP (lab, `REIMS_VGPU_LAB_DRAIN_LANES=2`): the lane hand-off. A
+        // lane planned this task's refs while another task drained; those
+        // plans become the new frame's first entries (the frame this open
+        // just pushed is the innermost — nested EXEC frames do not happen,
+        // the preemption drains serve control channels only), and `planned`
+        // seeds with them so this pass's own chunks do not replan what the
+        // lane already holds. A plan the lane fills later (its backlog can
+        // outlive this open) reaches the frame through the miss-fill in
+        // `prefetched_source` instead.
+        if super::lanes::lanes_on() {
+            if let Some(plans) = super::lanes::take_plans_for(task_id) {
+                crate::runtime::drain::note_store_route("lanes_handoff_open");
+                crate::runtime::drain::note_store_route_n("lanes_merged_n", plans.len() as u64);
+                for (texture_ref, plan) in plans {
+                    opened.planned.insert(texture_ref);
+                    prefetch::merge_into_frame([((task_id, texture_ref), plan)]);
+                }
+            }
+        }
+        Some(opened)
     }
 
     /// TEMP (lab, PASS_PREP step 3): latch the pass's colour-0 for the Store
@@ -689,6 +719,23 @@ impl<'a> PassPrep<'a> {
             }
         }
         crate::runtime::drain::note_store_route_n("pass_stage_seed_armed", seed_jobs);
+        // TEMP (lab, `REIMS_VGPU_LAB_DRAIN_LANES=2`): the lane's backlog
+        // rides this chunk's scope — the other task's refs plan beside this
+        // pass's, inside the same fork-join (the one window a worker may
+        // share `&DeviceState`; no new aliasing), bounded by the chunk size.
+        // Lane items count toward the fork gate below: they are pool work
+        // exactly as this pass's items are. Not staged: a lane plan outlives
+        // the job that would own the arena, so the gather arms CPU-stage at
+        // the engine as they always did.
+        let lane_items = super::lanes::take_backlog(self.chunk, self.task_id);
+        let lane_n = lane_items.len() as u64;
+        for (task_id, texture_ref, resource) in lane_items {
+            items.push(PrepItem::LaneSample {
+                task_id,
+                texture_ref,
+                resource,
+            });
+        }
         self.offered = end;
         if items.len() < 2 {
             // As with the stream prefetch: one ref gains nothing from the
@@ -739,6 +786,10 @@ impl<'a> PassPrep<'a> {
         // The chunk's memo-fill budget (design 8.2: a byte limit per portion),
         // spent by whichever workers plan memo fills inside this scope.
         let memo_budget = std::sync::atomic::AtomicU64::new(sample_plan::memo_fill_chunk_limit());
+        // TEMP (lab, DRAIN_LANES): the lane items' planning time, priced
+        // where it ran (worker or coordinator — the results are counted
+        // alike either way).
+        let lane_planned_us = std::sync::atomic::AtomicU64::new(0);
         let scoped = pool.scope(state, &items, |st, env, item| {
             let mut host = env.host();
             // TEMP (lab, PASS_STAGE): the job's own arena, when the rail may
@@ -765,6 +816,28 @@ impl<'a> PassPrep<'a> {
                             sample_plan::attach_staged(plan, stager);
                         }
                     }
+                    PrepOutcome::Sample(outcome)
+                }
+                // TEMP (lab, DRAIN_LANES): the lane's item — the same ladder,
+                // the other task's key, no staging (see the backlog take).
+                PrepItem::LaneSample {
+                    task_id,
+                    texture_ref,
+                    resource,
+                } => {
+                    let started = crate::lab_clock::LabInstant::now();
+                    let outcome = prefetch::plan_item(
+                        st,
+                        env,
+                        *task_id,
+                        *texture_ref,
+                        resource.clone(),
+                        &memo_budget,
+                    );
+                    lane_planned_us.fetch_add(
+                        started.elapsed().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     PrepOutcome::Sample(outcome)
                 }
                 PrepItem::Buffer {
@@ -797,6 +870,14 @@ impl<'a> PassPrep<'a> {
         crate::runtime::drain::note_store_route_n("pass_prep_fork_us", scoped.fork_us);
         crate::runtime::drain::note_store_route_n("pass_prep_wait_us", scoped.wait_us);
         crate::runtime::drain::note_store_route_n("pass_prep_helper_us", scoped.helper_busy_us);
+        // TEMP (lab, DRAIN_LANES): what the lane's items cost inside this
+        // chunk's scope, beside the pass's own census above.
+        if lane_n != 0 {
+            crate::runtime::drain::note_store_route_n(
+                "lanes_planned_us",
+                lane_planned_us.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
         // What the chunk's memo fills cost in bytes, against the budget above:
         // the memcpy this driver added to the pool, priced where it ran.
         crate::runtime::drain::note_store_route_n(
@@ -935,6 +1016,28 @@ impl<'a> PassPrep<'a> {
                         store_plan = Some(plan);
                     }
                 }
+                // TEMP (lab, DRAIN_LANES): the lane's results go to the lane
+                // store, not this pass's frame — the frame dies with the pass
+                // and the lane's task has not opened its own yet. A bail is
+                // final for the lane's packet (one pass over the backlog,
+                // unlike the chunks' replan cycles), so it is counted in the
+                // lane's own namespace and the serial ladder owns the bind
+                // when the packet runs.
+                PrepItem::LaneSample {
+                    task_id: lane_task,
+                    texture_ref,
+                    ..
+                } => match result {
+                    Ok(PrepOutcome::Sample(Ok(plan))) => {
+                        crate::runtime::drain::note_store_route_n("lanes_planned_n", 1);
+                        super::lanes::store_plan(*lane_task, *texture_ref, plan);
+                    }
+                    Ok(PrepOutcome::Sample(Err(bail))) => {
+                        crate::runtime::drain::note_store_route(super::lanes::bail_route(bail));
+                        crate::runtime::drain::note_store_route_n("lanes_bail_n", 1);
+                    }
+                    _ => crate::runtime::drain::note_store_route("lanes_panic"),
+                },
                 PrepItem::SeedStage { .. } => {
                     // The job's own census routes said what it did.
                 }

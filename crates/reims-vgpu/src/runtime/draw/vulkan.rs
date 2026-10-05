@@ -38,6 +38,12 @@ pub(crate) use pass_inv::test_mode as pass_inv_test_mode;
 // TEMP (lab, PASS_STAGE, design 8.4): the worker-staging planners and the
 // deferred-draw seed cells.
 pub(crate) mod pass_stage;
+// TEMP (lab, `REIMS_VGPU_LAB_DRAIN_LANES=2`): the plan-ahead lane — §9.5
+// stage 1 of the parallel-drain design (2026-10-05-parallel-drain-design.md),
+// a sibling of `pass_prep` that rides its chunk scopes with another task's
+// binds. `pub(crate) mod` because the drain feeds it at admission and retires
+// it at execution; everything between lives inside this tree.
+pub(crate) mod lanes;
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.

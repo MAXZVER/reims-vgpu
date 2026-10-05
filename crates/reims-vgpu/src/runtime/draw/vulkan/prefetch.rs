@@ -362,6 +362,31 @@ pub(crate) enum Prefetched {
     Serial,
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_DRAIN_LANES=2`): stage a transient lane-only
+/// frame for a bind whose pass pushed none — a single-draw pass opens no
+/// `PassPrep`, so its one ask would otherwise miss the frame machinery the
+/// lane's plans serve through. `None` when a frame already stands (the fill
+/// inside [`prefetched_source`] handles that case) or the lane holds nothing;
+/// the returned guard pops the frame when the ask is done, so the repeat a
+/// witness-moving commit hands back dies with it — correct, because a
+/// frame-less pass is a one-draw pass and has no later bind to serve.
+fn stage_lane_frame(task_id: u32, texture_ref: u32) -> Option<PrefetchGuard> {
+    if STACK.with(|stack| !stack.borrow().is_empty()) {
+        return None;
+    }
+    let key = (task_id, texture_ref);
+    let plan = super::lanes::take_plan(&key)?;
+    let guard = push_empty_frame();
+    STACK.with(|stack| {
+        if let Some(frame) = stack.borrow_mut().last_mut() {
+            frame.map.insert(key, plan);
+        }
+    });
+    crate::runtime::drain::note_store_route("lanes_merged");
+    crate::runtime::drain::note_store_route_n("lanes_merged_n", 1);
+    Some(guard)
+}
+
 /// The stream plan's answer for one bind, validated at the point the serial
 /// ladder would resolve it.
 pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
@@ -383,12 +408,30 @@ pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
     if mode == PrefetchMode::Off {
         return Prefetched::Serial;
     }
+    // TEMP (lab, DRAIN_LANES): the lane's plan for a frame-less ask stages a
+    // transient frame, so the validate/serve match below runs unchanged —
+    // the lane serves through exactly the path a chunk's plan does.
+    let _lane_frame = super::lanes::lanes_on()
+        .then(|| stage_lane_frame(task_id, texture_ref))
+        .flatten();
     STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         let Some(frame) = stack.last_mut() else {
             return Prefetched::Serial;
         };
         let key = (task_id, texture_ref);
+        // TEMP (lab, DRAIN_LANES): a frame miss consults the lane store
+        // before the serial ladder. The taken plan becomes this frame's entry,
+        // so the repeat machinery below owns it exactly as it owns a chunk's
+        // plan; an invalidated plan lands in the existing invalid routes and
+        // the serial ladder serves the bind unchanged.
+        if super::lanes::lanes_on() && !frame.map.contains_key(&key) {
+            if let Some(plan) = super::lanes::take_plan(&key) {
+                crate::runtime::drain::note_store_route("lanes_merged");
+                crate::runtime::drain::note_store_route_n("lanes_merged_n", 1);
+                frame.map.insert(key, plan);
+            }
+        }
         match frame.map.get(&key) {
             None => Prefetched::Serial,
             Some(StreamPlan::Surface(plan)) => {
