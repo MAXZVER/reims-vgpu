@@ -2155,6 +2155,134 @@ fn repoint_at_arrival<H: HostMemory + HostOps>(
 /// **Head advances whatever this returns**, which is the switch. A packet the
 /// model refuses is a packet that did not run, and the ring position it
 /// occupied is not the place to record that — the failure channel is.
+/// TEMP (lab, `REIMS_VGPU_LAB_ARRIVAL_DECLARE=on`, default off): declare an
+/// admitted EXEC's bind references into the ordering model at *arrival* —
+/// the early-declaration lever n235 isolated by accident (its iteration-1
+/// lane offer resolved every ref at admission, and fullscreen transition
+/// gaps halved with zero plans ever served: >12.5 ms 28-29 % vs 44-45 %,
+/// gap_med 5.4-5.5 vs 10.8-11.7 ms, confounded with the offer's Hz cost).
+/// This knob does only the declaration, without lanes, so a queue can A/B
+/// it alone.
+///
+/// What it does per ref: [`crate::runtime::objects::resolve_resource`], the
+/// construction the owning walk's first bind would perform — which declares
+/// the reference's lifecycle name/storage (`declare_object_name` →
+/// `DeviceState::declare_object`) and attaches storage under
+/// `access_exact`, changing what *subsequent* admissions' hazard graphs
+/// know (less conservative `DomainOnly`), beside moving the descriptor guest
+/// reads out of the EXEC critical section into arrival. Bounded: once per
+/// `(task, ref)` — the resources registry is the latch (a named, retained
+/// resource needs no second declaration) — and capped per packet by
+/// [`LANES_REF_CAP`]'s twin, [`ARRIVAL_REF_CAP`].
+fn arrival_declare<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    refs: &[u32],
+) {
+    for &texture_ref in refs {
+        if let Some(name) = state.object_name(task_id, texture_ref) {
+            if state.task_resources.get(task_id, name).is_some() {
+                note_store_route("arrival_declare_hit");
+                continue;
+            }
+        }
+        // A refusal is a declaration attempted against a reference that does
+        // not resolve (deleted between the walk and here, an unreadable
+        // descriptor) — counted, not fatal; the owning walk re-reads what it
+        // needs when the packet runs.
+        if crate::runtime::objects::resolve_resource(state, host, task_id, texture_ref).is_ok() {
+            note_store_route("arrival_declare_n");
+        } else {
+            note_store_route("arrival_declare_refused");
+        }
+    }
+}
+
+/// The per-packet cap of [`arrival_declare`]'s scan — the same fence the
+/// lanes' [`LANE_REF_CAP`] is: bounded by the command buffer's own bytes in
+/// a well-formed guest, a guard against a pathological one.
+const ARRIVAL_REF_CAP: usize = 64;
+
+/// TEMP (lab): `REIMS_VGPU_LAB_ARRIVAL_DECLARE` — `on` opens the knob, unset
+/// and every other value are today's path. Latched, with a test override
+/// that stands in front of the latch.
+fn arrival_declare_on() -> bool {
+    #[cfg(test)]
+    {
+        if TEST_ARRIVAL_DECLARE.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(
+            std::env::var("REIMS_VGPU_LAB_ARRIVAL_DECLARE").as_deref(),
+            Ok("on")
+        );
+        crate::observe::off(format!("lab_arrival_declare on={on}"));
+        on
+    })
+}
+
+#[cfg(test)]
+static TEST_ARRIVAL_DECLARE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force [`arrival_declare_on`] for the lifetime of the returned guard
+/// (tests only).
+#[cfg(test)]
+fn test_arrival_declare() -> TestArrivalDeclareGuard {
+    TEST_ARRIVAL_DECLARE.store(true, std::sync::atomic::Ordering::Relaxed);
+    TestArrivalDeclareGuard
+}
+
+/// Clears the [`test_arrival_declare`] override. Never outlives its guard's
+/// frame.
+#[cfg(test)]
+struct TestArrivalDeclareGuard;
+
+#[cfg(test)]
+impl Drop for TestArrivalDeclareGuard {
+    fn drop(&mut self) {
+        TEST_ARRIVAL_DECLARE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The distinct render texture refs an admitted EXEC's resolved records
+/// bind, capped — one scan shared by the lane feed and the
+/// arrival-declaration knob. Compute encoders are skipped (their textures
+/// do not walk the render pass tables the lane plans for); a span naming no
+/// window of the arena contributes nothing rather than panicking: both
+/// consumers are accelerators, and a packet this cannot inventory runs
+/// exactly as it always did.
+fn distinct_bind_refs(work: &reims_vgpu_core::exec::ExecWork) -> Vec<u32> {
+    let mut seen = std::collections::HashSet::new();
+    let mut refs: Vec<u32> = Vec::new();
+    for record in work.records() {
+        if let reims_vgpu_core::exec::ResolvedOperation::Render(
+            reims_vgpu_core::render::RenderOp::BindTextures { entries, .. },
+        ) = &record.op
+        {
+            let Some(bindings) = work.arenas.object_bindings.get(entries.range()) else {
+                continue;
+            };
+            for binding in bindings {
+                if let Some(object) = binding.object {
+                    let texture_ref = object.slot.0;
+                    if texture_ref != 0 && seen.insert(texture_ref) {
+                        refs.push(texture_ref);
+                        if refs.len() >= ARRIVAL_REF_CAP {
+                            return refs;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    refs
+}
+
 fn admit_and_park<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2416,6 +2544,34 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // *as*, and a position holding one without the other could plan from bytes
     // its records never named. An exec packet has both; every other class has
     // neither.
+    //
+    // TEMP (lab, `REIMS_VGPU_LAB_DRAIN_LANES=2` and
+    // `REIMS_VGPU_LAB_ARRIVAL_DECLARE=on`): one scan of the admitted EXEC's
+    // bind inventory (out of the retained `ExecWork`, never the ring) feeds
+    // both knobs — the lane feed (see `draw::vulkan::lanes` for the offer
+    // rules and fences; its warm-up runs first so a warmed cold ref re-enters
+    // the backlog this offer rebuilds) and the arrival-declaration pass
+    // (model-level, rail-agnostic). Both are no-ops with their knobs unset,
+    // and for every non-exec class (both halves absent); the scan itself
+    // runs only when at least one knob is on.
+    #[cfg(feature = "backend-vulkan")]
+    let lab_lanes_on = crate::runtime::draw::vulkan::lanes::lanes_on();
+    #[cfg(not(feature = "backend-vulkan"))]
+    let lab_lanes_on = false;
+    if lab_lanes_on || arrival_declare_on() {
+        if let (Some(submission), Some(work)) = (arrived.submission.as_ref(), resolved.as_ref()) {
+            let task_id = submission.task_id();
+            let refs = distinct_bind_refs(work);
+            #[cfg(feature = "backend-vulkan")]
+            if lab_lanes_on {
+                crate::runtime::draw::vulkan::lanes::warm_cold_refs(state, host, task_id);
+                crate::runtime::draw::vulkan::lanes::offer_exec(&*state, task_id, &refs);
+            }
+            if arrival_declare_on() {
+                arrival_declare(state, host, task_id, &refs);
+            }
+        }
+    }
     let work = match (arrived.submission, resolved) {
         (Some(submission), Some(resolved)) => crate::runtime::parked::ParkedWork::with_submission(
             fifo.domain().0,
@@ -3168,6 +3324,18 @@ fn run_parked_packet<H: HostMemory + HostOps>(
     domain: u32,
 ) {
     state.lab_pipeline_ran(ingress);
+    // TEMP (lab, `REIMS_VGPU_LAB_DRAIN_LANES=2`): the running-task marker the
+    // lane's offer rule consults — set while a retained EXEC's task executes
+    // (so its own later admissions never install over another task's lane),
+    // cleared when it is done; the lanes themselves are not retired here (a
+    // task's later queued packet still owns its lane). A no-op with the knob
+    // unset and for every non-exec position (no retained inputs).
+    #[cfg(feature = "backend-vulkan")]
+    let lab_lane_task = work.retained().map(|inputs| inputs.submission.task_id());
+    #[cfg(feature = "backend-vulkan")]
+    if let Some(task_id) = lab_lane_task {
+        crate::runtime::draw::vulkan::lanes::note_exec_started(task_id);
+    }
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
         process_root_packet(state, host, work.packet());
     } else {
@@ -3218,6 +3386,14 @@ fn run_parked_packet<H: HostMemory + HostOps>(
             state.draining_mask &= !bit;
         }
         state.draining_channel = prev_channel;
+    }
+    // TEMP (lab, DRAIN_LANES): the execution half is over — clear the
+    // running marker. The task's lane outlives the packet (a later queued
+    // packet of the same task still owns it) and is retired by its own
+    // supersede/evict/invalidation paths.
+    #[cfg(feature = "backend-vulkan")]
+    if let Some(task_id) = lab_lane_task {
+        crate::runtime::draw::vulkan::lanes::note_exec_finished(task_id);
     }
     match state.complete_transaction(work.epoch(), ingress) {
         Ok(released) => {
@@ -9529,6 +9705,214 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     // Unpin engine residents of linear cache entries dropped by task/object
     // deletes this drain, so they become LRU-evictable instead of leaking.
     crate::runtime::render_writeback::retire_linear_residents(state);
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_ARRIVAL_DECLARE=on`): the arrival-declaration
+/// knob's own tests — the knob is model-level (rail-agnostic), so these run
+/// without any backend selected.
+#[cfg(test)]
+mod arrival_declare_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    use crate::runtime::drain::census::store_route_count;
+    use crate::runtime::host::FakeHost;
+
+    fn delta(route: &str, before: u64) -> u64 {
+        store_route_count(route).saturating_sub(before)
+    }
+
+    /// One task (directory pfn 2, root pfn 3, task GVA pages 0..3 one-to-one
+    /// onto GPA pages 4..6) with one resolvable ref-texture ref (2) in its
+    /// object list.
+    fn task_with_ref() -> (DeviceState, FakeHost) {
+        use crate::protocol::endian::st32;
+        use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+        use crate::runtime::gva_mem;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let (dir_pfn, root_pfn) = (2u32, 3u32);
+        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_X86;
+        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        let mut dir = [0u8; 8];
+        st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+        st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
+        assert!(host.write_gpa(dir_gpa, &dir).is_ok());
+        for i in 0..3u32 {
+            let pfn = 4 + i;
+            host.map_range((pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
+            let mut pte = [0u8; 4];
+            st32(&mut pte, pfn);
+            assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+        }
+        state.define_task(1, 0x1000, dir_pfn);
+        assert!(state.set_object_list(1, 0, 32));
+        let built = reims_vgpu_wire::device_desc::RefTextureBuilder::new(71, 0, 0, 0)
+            .with_len(crate::runtime::objects::TYPE5_MIN_LEN);
+        assert!(
+            gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x1000, built.bytes(), PAGE_SHIFT_X86)
+                .is_ok()
+        );
+        let list_off = list_object_entry_offset(2, 32).unwrap();
+        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        let packed = (crate::runtime::objects::OBJECT_TYPE_REF_TEXTURE as u32)
+            | ((crate::runtime::objects::TYPE5_MIN_LEN as u32) << 8);
+        st32(&mut list_entry, packed);
+        list_entry[4..12].copy_from_slice(&0x1000u64.to_le_bytes());
+        assert!(
+            gva_mem::write_task_gva(&mut host, &state.tasks[1], list_off, &list_entry, PAGE_SHIFT_X86)
+                .is_ok()
+        );
+        (state, host)
+    }
+
+    /// The knob declares an admitted EXEC's bind refs at arrival — once: the
+    /// resources registry latches the second pass, and a ref that does not
+    /// resolve is counted refused, not fatal.
+    #[test]
+    fn the_knob_declares_each_ref_once_at_arrival() {
+        let _force = test_arrival_declare();
+        let (mut state, mut host) = task_with_ref();
+        let before_n = store_route_count("arrival_declare_n");
+        let before_hit = store_route_count("arrival_declare_hit");
+        arrival_declare(&mut state, &mut host, 1, &[2]);
+        assert_eq!(delta("arrival_declare_n", before_n), 1);
+        let first = state
+            .object_name(1, 2)
+            .and_then(|name| state.task_resources.get(1, name));
+        assert!(first.is_some(), "the ref is named and retained after arrival");
+        // The second arrival of the same ref is a hit, not a second
+        // construction — and the registry hands back the same resource.
+        arrival_declare(&mut state, &mut host, 1, &[2]);
+        assert_eq!(delta("arrival_declare_n", before_n), 1);
+        assert_eq!(delta("arrival_declare_hit", before_hit), 1);
+        let second = state
+            .object_name(1, 2)
+            .and_then(|name| state.task_resources.get(1, name));
+        assert!(std::sync::Arc::ptr_eq(
+            &first.expect("first"),
+            &second.expect("second")
+        ));
+        // A ref with no list entry is counted refused and declares nothing.
+        let before_refused = store_route_count("arrival_declare_refused");
+        arrival_declare(&mut state, &mut host, 1, &[9]);
+        assert_eq!(delta("arrival_declare_refused", before_refused), 1);
+        assert!(state.object_name(1, 9).is_none());
+    }
+
+    /// The knob off (the default) is today's path: nothing declares, nothing
+    /// counts.
+    #[test]
+    fn the_knob_off_declares_nothing() {
+        assert!(!arrival_declare_on(), "unset is off");
+        let (mut state, mut host) = task_with_ref();
+        let before_n = store_route_count("arrival_declare_n");
+        // The gate lives at the admit site; the fn itself is only reached
+        // through it — mirrored here by the same condition.
+        if arrival_declare_on() {
+            arrival_declare(&mut state, &mut host, 1, &[2]);
+        }
+        assert_eq!(delta("arrival_declare_n", before_n), 0);
+        assert!(state.object_name(1, 2).is_none());
+    }
+
+    /// An `ExecWork` whose one render segment binds `refs` as fragment
+    /// textures — the minimal shape of the model's resolved records the
+    /// shared scan reads (the arenas and spans are the real ones the walk
+    /// fills).
+    fn exec_work_with_binds(refs: &[u32]) -> reims_vgpu_core::exec::ExecWork {
+        use reims_vgpu_core::bind::ObjectBinding;
+        use reims_vgpu_core::exec::{
+            ExecWork, ResolvedOperation, ResolvedStream, StreamRecord,
+        };
+        use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
+        use reims_vgpu_core::render::{RenderOp, ShaderStage};
+        use reims_vgpu_core::stream::{SegmentBegin, SegmentKind};
+        use reims_vgpu_core::sync::ResourceSpan;
+
+        let mut work = ExecWork::default();
+        let start = work.arenas.object_bindings.len() as u32;
+        for &texture_ref in refs {
+            work.arenas.object_bindings.push(ObjectBinding {
+                object: (texture_ref != 0).then_some(ResourceId {
+                    slot: ObjectListRef(texture_ref),
+                    generation: SlotGeneration(1),
+                }),
+                lod_clamps: None,
+            });
+        }
+        work.streams.push(ResolvedStream {
+            begin: SegmentBegin {
+                kind: SegmentKind::Render,
+                protection: None,
+            },
+            records: vec![StreamRecord {
+                at: reims_vgpu_core::stream::StreamPosition {
+                    segment: 0,
+                    record: 0,
+                },
+                op: ResolvedOperation::Render(RenderOp::BindTextures {
+                    stage: ShaderStage::Fragment,
+                    first: 0,
+                    entries: ResourceSpan {
+                        start,
+                        len: refs.len() as u32,
+                    },
+                }),
+            }],
+        });
+        work
+    }
+
+    /// The shared scan reads the retained bind arenas and nothing else:
+    /// distinct non-zero render texture refs, in record order — and a
+    /// compute encoder's textures are not render pass binds, so they do not
+    /// count.
+    #[test]
+    fn the_scan_reads_the_retained_bind_arenas() {
+        let work = exec_work_with_binds(&[2, 0, 3, 2]);
+        assert_eq!(distinct_bind_refs(&work), vec![2, 3]);
+        // A compute bind beside the render one contributes nothing.
+        let mut with_compute = exec_work_with_binds(&[2]);
+        use reims_vgpu_core::bind::ObjectBinding;
+        use reims_vgpu_core::compute::ComputeOp;
+        use reims_vgpu_core::exec::{ResolvedOperation, StreamRecord, ResolvedStream};
+        use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
+        use reims_vgpu_core::stream::{SegmentBegin, SegmentKind, StreamPosition};
+        use reims_vgpu_core::sync::ResourceSpan;
+        let start = with_compute.arenas.object_bindings.len() as u32;
+        with_compute.arenas.object_bindings.push(ObjectBinding {
+            object: Some(ResourceId {
+                slot: ObjectListRef(9),
+                generation: SlotGeneration(1),
+            }),
+            lod_clamps: None,
+        });
+        with_compute.streams.push(ResolvedStream {
+            begin: SegmentBegin {
+                kind: SegmentKind::Compute,
+                protection: None,
+            },
+            records: vec![StreamRecord {
+                at: StreamPosition {
+                    segment: 1,
+                    record: 0,
+                },
+                op: ResolvedOperation::Compute(ComputeOp::BindTextures {
+                    first: 0,
+                    entries: ResourceSpan { start, len: 1 },
+                }),
+            }],
+        });
+        assert_eq!(
+            distinct_bind_refs(&with_compute),
+            vec![2],
+            "the compute segment's bind does not count"
+        );
+    }
 }
 
 #[cfg(test)]
