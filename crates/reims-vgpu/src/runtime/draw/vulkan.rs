@@ -13794,7 +13794,7 @@ fn note_guest_cpu_shared(state: &mut DeviceState, mapping_id: u32) {
 /// on the seed.
 pub(super) fn overlay_guard_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_OVERLAY_GUARD").as_deref() == Ok("on"))
+    *ON.get_or_init(|| !matches!(std::env::var("REIMS_VGPU_LAB_OVERLAY_GUARD").as_deref(), Ok("off")))
 }
 
 /// What the post-read witness re-check said. `seen` is the observation the
@@ -13886,7 +13886,7 @@ pub(super) fn overlay_guard_verdict(
 /// still re-seeds after a guest write.
 pub(super) fn preserve_seed_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PRESERVE_SEED").as_deref() == Ok("on"))
+    *ON.get_or_init(|| !matches!(std::env::var("REIMS_VGPU_LAB_PRESERVE_SEED").as_deref(), Ok("off")))
 }
 
 /// Serve the guest's own window bytes as a colour-0 LOAD seed. `None` is the

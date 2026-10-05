@@ -2707,7 +2707,7 @@ pub fn prepare_window_resident_present(
 /// TEMP (lab, `REIMS_VGPU_LAB_SCANOUT_SNAPSHOT=on`): see the call site above.
 fn scanout_snapshot_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SCANOUT_SNAPSHOT").as_deref() == Ok("on"))
+    *ON.get_or_init(|| !matches!(std::env::var("REIMS_VGPU_LAB_SCANOUT_SNAPSHOT").as_deref(), Ok("off")))
 }
 
 /// The window snapshot's device objects. One per process — one engine device,
