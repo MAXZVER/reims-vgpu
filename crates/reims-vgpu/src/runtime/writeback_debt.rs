@@ -1050,6 +1050,10 @@ pub fn pay_cpu_shared_mapping<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route("wbdebt_cpu_shared_left_for_replay");
             if lab_pay_after_stamp_enabled() {
                 LAB_PAY_AFTER_STAMP.store(mapping_id, std::sync::atomic::Ordering::Relaxed);
+                LAB_PAY_SETTLE_LAST_US.store(
+                    crate::observe::elapsed_us(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
         return;
@@ -1057,6 +1061,47 @@ pub fn pay_cpu_shared_mapping<M: HostMemory + HostOps>(
     if let Some(debt) = state.pending_writebacks.take(mapping_id) {
         pay(state, host, mapping_id, debt, "wbdebt_paid_cpu_shared");
     }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PAY_SETTLE_MS=N`, 0 = off): no coherence work while
+/// the screen moves. A presented frame is left owed (`pay_cpu_shared_mapping`)
+/// on every frame of an animation and [`lab_pay_after_stamp`] paid it after the
+/// stamp, on the drain while the guest builds its next frame: on Intel ~2.2 ms of a 16.7 ms
+/// full-screen transition frame (vp24), and with no payment at all
+/// (`PAY_AFTER=off`, hq050, AMD) Safari's transitions ran +25 % frames and the
+/// windowed glass +6 %. PAY_IDLE (pay only at tranche ends that find the guest
+/// idle) paid as often as before (p003: 7008 against 6974 a run) - the drain's
+/// 4 ms heartbeat ends idle tranches all through an animation. Here the payment
+/// waits until no frame has been presented for N ms; the heartbeat then pays the
+/// owed frame within a tick of the screen settling, so the pages are fresh before
+/// the next drag or capture names them. A reader that names a surface still pays
+/// it at once. (The ledger trim is left as it is: held back through a 30 s
+/// animation the ledger would reach its hard cap and evict inside draws.)
+/// Latched.
+fn lab_pay_settle_us() -> u64 {
+    use std::sync::OnceLock;
+    static US: OnceLock<u64> = OnceLock::new();
+    *US.get_or_init(|| {
+        let ms = std::env::var("REIMS_VGPU_LAB_PAY_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(0, |v| v.min(5000));
+        crate::observe::off(format!("lab_pay_settle ms={ms}"));
+        ms * 1000
+    })
+}
+
+/// TEMP (lab PAY_SETTLE): when the last presented frame was left owed.
+static LAB_PAY_SETTLE_LAST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// TEMP (lab PAY_SETTLE): whether the screen has presented within the settle
+/// interval (always false with the switch off).
+fn lab_pay_settling() -> bool {
+    let us = lab_pay_settle_us();
+    us > 0
+        && crate::observe::elapsed_us().saturating_sub(
+            LAB_PAY_SETTLE_LAST_US.load(std::sync::atomic::Ordering::Relaxed),
+        ) < us
 }
 
 /// TEMP (lab): the presented mapping whose frame [`lab_pay_after_stamp`] pays
@@ -1137,6 +1182,12 @@ pub fn lab_pay_after_stamp<M: HostMemory + HostOps>(
         land_deferred_if_ready(state, host);
     }
     let mapping_id = LAB_PAY_AFTER_STAMP.swap(0, Relaxed);
+    if mapping_id != 0 && lab_pay_settling() {
+        // TEMP (lab PAY_SETTLE): the screen still moves; the frame stays owed.
+        let _ = LAB_PAY_AFTER_STAMP.compare_exchange(0, mapping_id, Relaxed, Relaxed);
+        crate::runtime::drain::note_store_route("wbdebt_pay_settle_wait");
+        return;
+    }
     if mapping_id != 0 && guest_waiting && lab_pay_after_yield() {
         if lab_pay_idle() || YIELDS.fetch_add(1, Relaxed) < LAB_PAY_AFTER_MAX_YIELDS {
             // A newer swap overwrites this; the older frame then stays owed to
