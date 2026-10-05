@@ -5315,6 +5315,18 @@ fn run_memo() -> std::sync::MutexGuard<'static, RunMemo> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// TEMP (lab, tests): drop every remembered window. The memo is keyed by the
+/// window's GPAs alone, and different tests' fixtures map the same GPAs onto
+/// different `FakeHost` backings — a hit hands one test the runs (host
+/// pointers!) of a fixture another test has already dropped. Structure
+/// compares never dereference them; the PASS_STAGE byte compares do, and read
+/// freed memory for it. Each staging test clears the memo first so its runs
+/// are its own fixture's.
+#[cfg(test)]
+fn run_memo_clear_for_test() {
+    run_memo().entries.clear();
+}
+
 fn coalesce_pages_to_runs_uncached<M: HostOps>(
     host: &mut M,
     window: &[u64],

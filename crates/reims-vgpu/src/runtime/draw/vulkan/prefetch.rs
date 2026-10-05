@@ -74,6 +74,12 @@ thread_local! {
 }
 
 /// One planned bind of a stream.
+///
+/// TEMP (lab, PASS_STAGE, STAGED_PROVEN): `Clone` is the restage job's — a
+/// proven repeat is cloned onto the worker that stages its window, and the
+/// staged twin back into the frame's map (every field is an `Arc` or a
+/// scalar, so the clone moves no bytes).
+#[derive(Clone)]
 pub(crate) enum StreamPlan {
     /// A top rung of the surface ladder: a resident or the host cache.
     Surface(SamplePlan),
@@ -85,6 +91,32 @@ pub(crate) enum StreamPlan {
     MapperRef(sample_plan::MapperRefPlan),
     /// A mapper-ref surface's guest-memo bind (step 2).
     Memo(sample_plan::MemoPlan),
+}
+
+impl StreamPlan {
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): a gather plan a commit proved
+    /// (it survived a bind) whose window no worker has staged yet — the
+    /// restage job's selection. See [`sample_plan::attach_staged`] for why
+    /// these, and only these, are worth an arena window.
+    pub(super) fn wants_restage(&self) -> bool {
+        match self {
+            StreamPlan::RefView(p) => p.staging_pending(),
+            StreamPlan::Linear(p) => p.staging_pending(),
+            StreamPlan::MapperRef(p) => p.staging_pending(),
+            _ => false,
+        }
+    }
+
+    /// TEMP (lab, PASS_STAGE, STAGED_PROVEN): whether a worker's window is
+    /// attached — the restage job's success test.
+    pub(super) fn has_staged_window(&self) -> bool {
+        match self {
+            StreamPlan::RefView(p) => p.has_staged_window(),
+            StreamPlan::Linear(p) => p.has_staged_window(),
+            StreamPlan::MapperRef(p) => p.has_staged_window(),
+            _ => false,
+        }
+    }
 }
 
 /// Pops this stream's plans when the stream ends.
@@ -141,6 +173,27 @@ pub(super) fn take_consumed_refs() -> Vec<u32> {
             .borrow_mut()
             .last_mut()
             .map_or_else(Vec::new, |frame| std::mem::take(&mut frame.consumed))
+    })
+}
+
+/// TEMP (lab, PASS_STAGE, STAGED_PROVEN): the innermost frame's proven,
+/// still-unstaged gather plans — the repeats whose commits proved them on
+/// this thread and whose windows the eager attach no longer copies. Cloned
+/// out for the next chunk's restage jobs; the chunk's merge replaces the map
+/// entries the jobs answer for, which is sound because a scope's fork-join
+/// freezes the frame — no bind runs between this take and that merge.
+pub(super) fn restageable_plans() -> Vec<((u32, u32), StreamPlan)> {
+    STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let Some(frame) = stack.last_mut() else {
+            return Vec::new();
+        };
+        frame
+            .map
+            .iter()
+            .filter(|(_, plan)| plan.wants_restage())
+            .map(|(key, plan)| (*key, plan.clone()))
+            .collect()
     })
 }
 

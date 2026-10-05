@@ -47,6 +47,11 @@
 //! * `REIMS_VGPU_LAB_PASS_STAGE_CHUNK_KB=N` — chunk size in KiB (default 8192;
 //!   a 1080p RGBA8 seed is 8.1 MB and needs the next power of two).
 //! * `REIMS_VGPU_LAB_PASS_STAGE_CHUNKS=N` — chunks per arena (default 2).
+//! * `REIMS_VGPU_LAB_STAGED_PROVEN=off` — restores the eager sampled attach
+//!   (every plan's window copied at plan time) for A/B inside the rail; the
+//!   default copies a gather window only once a commit has proven the plan
+//!   (the repeat that survived a bind), because the eager copies died with
+//!   99.4 % of the plans they served.
 
 use std::sync::Mutex;
 
@@ -76,6 +81,62 @@ pub(crate) fn enabled() -> bool {
                 Ok("on")
             )
         })
+    }
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_STAGED_PROVEN`, on by default — the sampled
+/// staging rule: a gather window is copied only for a *proven* plan, the
+/// repeat a commit handed back after serving one bind (see
+/// [`crate::runtime::draw::vulkan::sample_plan::attach_staged`]). The eager
+/// attach copied every fresh plan's window at plan time, and 99.4 % of them
+/// died before any bind read them (cssscrollglassv, 32 s:
+/// `pass_stage_sampled_planned=9582` against `hit=54`, `pass_stage_bytes=121 GB`
+/// of copies no engine arm ever read). `=off` restores the eager attach for
+/// A/B inside the staging rail; the rail's own gate stays
+/// `REIMS_VGPU_LAB_PASS_STAGE`. Live (phases inside one boot) through
+/// `REIMS_VGPU_LAB_LIVE_FILE` — the rule is a per-plan decision, so a phase
+/// boundary costs nothing.
+pub(crate) fn staged_proven() -> bool {
+    // Unit tests pin their arm through their own door (the rule-off tests
+    // must keep the eager rail the old tests were written against).
+    #[cfg(test)]
+    {
+        return TEST_STAGED_PROVEN.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(test))]
+    {
+        if let Some(on) = crate::runtime::lab_live::on("STAGED_PROVEN") {
+            return on;
+        }
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            !matches!(
+                std::env::var("REIMS_VGPU_LAB_STAGED_PROVEN").as_deref(),
+                Ok("off")
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+static TEST_STAGED_PROVEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force the rule for the lifetime of the returned guard (tests only).
+#[cfg(test)]
+pub(crate) fn test_staged_proven(on: bool) -> StagedProvenGuard {
+    TEST_STAGED_PROVEN.store(on, std::sync::atomic::Ordering::Relaxed);
+    StagedProvenGuard
+}
+
+/// Restores the test rule. Never outlives its guard's frame.
+#[cfg(test)]
+pub(crate) struct StagedProvenGuard;
+
+#[cfg(test)]
+impl Drop for StagedProvenGuard {
+    fn drop(&mut self) {
+        TEST_STAGED_PROVEN.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
