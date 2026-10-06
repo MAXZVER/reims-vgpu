@@ -3167,6 +3167,41 @@ fn note_sampled_ref_backing(
     ));
 }
 
+/// The format a surface's resident is sampled through.
+///
+/// The identity's own format is the surface's store texel order, and for a
+/// surface with none (`store_texel_order` names only the four-byte colour
+/// orders) it falls back to the scanout format. A surface the guest declared
+/// in another texel size - the 4935x1895 `R8Unorm` mask the transitions use -
+/// is still rendered at its own format, so its resident holds R8 texels under
+/// an identity that says B8G8R8A8; sampling it through the identity's format
+/// asked for a four-byte view of a one-byte image
+/// (`VUID-VkImageViewCreateInfo-image-01761`, p055/p056 validation), a view
+/// that reads past the image. The surface's own format is what its texels are.
+pub(super) fn surface_sample_format(
+    state: &DeviceState,
+    mid: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) -> ash::vk::Format {
+    let own = identity.resident_format();
+    let Some(m) = state.mappings.get(&mid) else {
+        return own;
+    };
+    let declared = crate::runtime::mapping_write::mapping_store_format(m);
+    if pixel_format::store_texel_order(declared).is_some()
+        || pixel_format::bytes_per_pixel(declared).is_none_or(|bpp| bpp == 4)
+    {
+        return own;
+    }
+    match translate::pixel::translate(declared) {
+        Ok(p) => {
+            crate::runtime::drain::note_store_route("surface_sample_own_format");
+            p.vk
+        }
+        Err(_) => own,
+    }
+}
+
 pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3431,7 +3466,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 } = top;
                 match outcome {
                     sample_plan::TopOutcome::Direct | sample_plan::TopOutcome::Resident => {
-                        let format = resident_id.resident_format();
+                        let format = surface_sample_format(state, mid, &resident_id);
                         return Some((
                             w,
                             h,
@@ -3460,7 +3495,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                                     &resident_id,
                                     owned,
                                 ) {
-                                    let format = resident_id.resident_format();
+                                    let format = surface_sample_format(state, mid, &resident_id);
                                     return Some((
                                         w,
                                         h,

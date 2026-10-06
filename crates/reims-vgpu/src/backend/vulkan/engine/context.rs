@@ -1372,6 +1372,8 @@ impl DeviceContext {
         let mut en_image_robustness = features.enabled_image_robustness();
         // The translator's `discard_fragment()` capability (p054 validation).
         let mut en_demote = features.enabled_demote_to_helper();
+        // The translator's `VariablePointersStorageBuffer` (p056 validation).
+        let mut en_variable_pointers = features.enabled_variable_pointers();
         let mut en_attachment_feedback = features.enabled_attachment_feedback_loop_layout();
         let mut en_extended_dynamic_state = features.enabled_extended_dynamic_state();
         let mut en_extended_dynamic_state3 = features.enabled_extended_dynamic_state3();
@@ -1391,6 +1393,9 @@ impl DeviceContext {
         }
         if features.demote_to_helper.is_available() {
             dci = dci.push_next(&mut en_demote);
+        }
+        if features.variable_pointers_storage_buffer {
+            dci = dci.push_next(&mut en_variable_pointers);
         }
         if features.attachment_feedback_loop_layout {
             dci = dci.push_next(&mut en_attachment_feedback);

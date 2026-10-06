@@ -740,7 +740,7 @@ pub(super) fn take_sampled_plan(
     let (w, h, mid) = (plan.w, plan.h, plan.mid);
     match &plan.serve {
         PlannedServe::Target(identity) => {
-            let format = identity.resident_format();
+            let format = super::surface_sample_format(state, mid, identity);
             (
                 w,
                 h,

@@ -309,6 +309,12 @@ pub struct DeviceFeatures {
     /// the translator emits for Metal's `half` varyings
     /// (`VUID-RuntimeSpirv-storageInputOutput16-11162` in the p054 boot).
     pub storage_io16: bool,
+    /// `variablePointersStorageBuffer` (Vulkan 1.1 core,
+    /// `VkPhysicalDeviceVariablePointersFeatures`): the translator declares
+    /// `VariablePointersStorageBuffer` for modules that select between storage
+    /// buffer pointers, and p056 validation found it declared with the feature
+    /// off (`VUID-VkShaderModuleCreateInfo-pCode-08740`).
+    pub variable_pointers_storage_buffer: bool,
     pub storage8: bool,
     pub float16: bool,
     pub int8: bool,
@@ -683,6 +689,12 @@ impl DeviceFeatures {
             .storage_input_output16(self.storage_io16)
     }
 
+    /// `variablePointersStorageBuffer`, chained only where the device reported it.
+    pub fn enabled_variable_pointers(&self) -> vk::PhysicalDeviceVariablePointersFeatures<'static> {
+        vk::PhysicalDeviceVariablePointersFeatures::default()
+            .variable_pointers_storage_buffer(self.variable_pointers_storage_buffer)
+    }
+
     /// Whether the 16-bit storage struct belongs on the device chain at all.
     pub fn wants_16bit_storage(&self) -> bool {
         self.storage16 || self.storage_io16
@@ -741,6 +753,7 @@ impl DeviceFeatures {
             color_attachment,
             storage16,
             storage_io16,
+            variable_pointers_storage_buffer,
             storage8,
             float16,
             int8,
@@ -802,7 +815,7 @@ impl DeviceFeatures {
              storage_image_write_without_format={storage_image_write_without_format} \
              storage_image_read_without_format={storage_image_read_without_format} \
              bgra8_storage={bgra8_storage} no_linear_filter={} no_blendable_attachment={} \
-             storage16={storage16} storage_io16={storage_io16} storage8={storage8} float16={float16} int8={int8} \
+             storage16={storage16} storage_io16={storage_io16} variable_pointers_sb={variable_pointers_storage_buffer} storage8={storage8} float16={float16} int8={int8} \
              shader_output_viewport_index={shader_output_viewport_index} \
              timeline_semaphore={timeline_semaphore} \
              descriptor_binding_partially_bound={descriptor_binding_partially_bound} \
@@ -892,13 +905,15 @@ pub unsafe fn query(
     // The same reasoning: the EXT spelling answers on both rungs.
     let mut supported_demote =
         vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT::default();
+    let mut supported_variable_pointers = vk::PhysicalDeviceVariablePointersFeatures::default();
     let mut features2 = vk::PhysicalDeviceFeatures2::default()
         .push_next(&mut supported_16)
         .push_next(&mut supported_8)
         .push_next(&mut supported_f16i8)
         .push_next(&mut supported_vulkan12)
         .push_next(&mut supported_image_robustness)
-        .push_next(&mut supported_demote);
+        .push_next(&mut supported_demote)
+        .push_next(&mut supported_variable_pointers);
     unsafe { instance.get_physical_device_features2(pd, &mut features2) };
     let supported = features2.features;
     let props = unsafe { instance.get_physical_device_properties(pd) };
@@ -1125,6 +1140,9 @@ pub unsafe fn query(
         color_attachment,
         storage16: supported_16.storage_buffer16_bit_access == vk::TRUE,
         storage_io16: supported_16.storage_input_output16 == vk::TRUE,
+        variable_pointers_storage_buffer: supported_variable_pointers
+            .variable_pointers_storage_buffer
+            == vk::TRUE,
         storage8: supported_8.storage_buffer8_bit_access == vk::TRUE,
         float16: supported_f16i8.shader_float16 == vk::TRUE,
         int8: supported_f16i8.shader_int8 == vk::TRUE,
@@ -1143,6 +1161,7 @@ mod tests {
     fn all_supported() -> DeviceFeatures {
         DeviceFeatures {
             storage_io16: true,
+            variable_pointers_storage_buffer: true,
             demote_to_helper: DemoteToHelper::Core13,
             occlusion_query_precise: true,
             extended_dynamic_state: true,
