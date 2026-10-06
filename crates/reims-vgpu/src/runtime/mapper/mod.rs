@@ -3308,13 +3308,16 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
     ok
 }
 
-/// TEMP (lab, live `GW_REBASE=on|off`, off by default until its A/B): whether
-/// [`rebase_device_write`] tells the host about the device's own stores.
+/// TEMP (lab, live `GW_REBASE=on|off`, on unless `=off`): whether
+/// [`rebase_device_write`] tells the host about the device's own stores. On by
+/// default since p065 (Intel ABBA): the witness's false "guest wrote pixels"
+/// verdicts 359/333 -> 4/4 a phase, resident refusals 188/162 -> 3/4, speed
+/// unchanged, snapshots clean.
 fn lab_gw_rebase() -> bool {
     if cfg!(test) {
         return true;
     }
-    crate::runtime::lab_live::on("GW_REBASE").unwrap_or(false)
+    crate::runtime::lab_live::on("GW_REBASE").unwrap_or(true)
 }
 
 /// The device's own stores just landed in `[off, end)` of `mapping_id` (only

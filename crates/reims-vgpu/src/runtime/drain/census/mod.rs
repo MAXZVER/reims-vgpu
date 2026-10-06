@@ -3580,6 +3580,27 @@ pub fn note_store_route(route: &'static str) {
     note_store_route_n(route, 1);
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_ROUTES=off` stops counting store routes - the
+/// lab's census of which rung every bind, payment and seed took. Nothing reads
+/// the counts but the per-second `store_routes` line and the tests, and every
+/// draw makes dozens of calls (p062: 2.6-4 % of the drain in the heaviest
+/// frames), so a daily-use boot that nobody analyses can skip them. Latched;
+/// on in the lab and under test.
+fn route_census_on() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 on, 2 off
+    match STATE.load(Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = cfg!(test)
+                || std::env::var("REIMS_VGPU_LAB_ROUTES").map_or(true, |v| v != "off");
+            STATE.store(if on { 1 } else { 2 }, Relaxed);
+            on
+        }
+    }
+}
+
 /// Add `n` to a named count in the same per-second window as [`note_store_route`].
 ///
 /// For events that arrive in batches — one notify marking many cache entries —
@@ -3587,7 +3608,7 @@ pub fn note_store_route(route: &'static str) {
 /// path is a thread-local lookup and a relaxed atomic addition; the registry
 /// lock is taken only the first time one thread sees one route.
 pub fn note_store_route_n(route: &'static str, n: u64) {
-    if n == 0 {
+    if n == 0 || !route_census_on() {
         return;
     }
     if crate::runtime::cost_opts::on() {

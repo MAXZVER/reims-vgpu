@@ -3686,7 +3686,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // returns a content identity so the engine skips re-hash+upload;
                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
                 let memo_source = crate::runtime::draw::mapping_declared_format(state, mid, None);
-                if let Some((rgba, identity)) =
+                if let Some((rgba, identity, layout)) =
                     load_mapper_ref_texture_rgba_memoized(state, host, mid)
                 {
                     note_mapper_ref_texture_sample_rung("t11rung_guest_memo", guest_write);
@@ -3697,7 +3697,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         SampledSourceRequest::Bytes(
                             rgba,
                             Some(identity),
-                            SampledByteFormat::from_source(TexelLayout::Rgba8, memo_source),
+                            SampledByteFormat::from_source(layout, memo_source),
                             crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
                         ),
                     ));
@@ -4712,11 +4712,13 @@ fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
 /// bind re-reads the native plane window so a guest write is always observed;
 /// conversion, allocation, and — via the returned content identity — the
 /// engine upload are skipped when the bytes are unchanged.
-/// TEMP (lab): `REIMS_VGPU_LAB_RTV_GPU` (live `RTV_GPU=on|off`, off unless
-/// `=on`): a serialized view that must be materialized is copied out of its
+/// TEMP (lab): `REIMS_VGPU_LAB_RTV_GPU` (live `RTV_GPU=on|off`, on unless
+/// `=off`): a serialized view that must be materialized is copied out of its
 /// surface's current resident on the GPU ([`try_ref_texture_view_from_resident`])
 /// instead of paying the surface's debt, reading the pages back and converting
-/// them on the drain.
+/// them on the drain. On by default since p066 (Intel ABBA, GW_REBASE on): the
+/// transition mask's A8 view served from its R8 resident 39/36 times a phase,
+/// slow tranches 4.03/4.58 -> 4.00/4.02 s, snapshots clean.
 pub(crate) fn lab_rtv_gpu() -> bool {
     if cfg!(test) {
         return false;
@@ -4726,7 +4728,7 @@ pub(crate) fn lab_rtv_gpu() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = matches!(std::env::var("REIMS_VGPU_LAB_RTV_GPU").as_deref(), Ok("on"));
+        let on = !matches!(std::env::var("REIMS_VGPU_LAB_RTV_GPU").as_deref(), Ok("off"));
         crate::observe::off(format!("lab_rtv_gpu on={}", u8::from(on)));
         on
     })
@@ -20050,7 +20052,7 @@ mod lab_memo_stamp {
         host: &mut M,
         mid: u32,
         key: (u32, u32, u32),
-    ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    ) -> Option<(std::sync::Arc<Vec<u8>>, u64, TexelLayout)> {
         if !enabled() {
             return None;
         }
@@ -20074,15 +20076,29 @@ mod lab_memo_stamp {
             return None;
         }
         let memo = state.mapper_ref_texture_memo.peek(&key)?;
-        (memo.generation == generation).then(|| (memo.rgba.clone(), generation))
+        (memo.generation == generation).then(|| (memo.rgba.clone(), generation, memo.layout))
     }
+}
+
+/// TEMP (lab, live `MEMO_BGRA=on|off`, on unless `=off`): the guest-page memo
+/// rung of a mapper-ref-texture bind keeps the surface's own BGRA8 bytes and
+/// declares them `Bgra8`, as the host-cache rung beside it does
+/// ([`host_cache_request`]), instead of exchanging R and B into a second
+/// whole-frame buffer on the drain. p062: in the tranches that open a
+/// transition's animation and in its heaviest frames, this rung's convert was
+/// three quarters of its cost (a 4935x1895 surface is 37 MB a fill).
+pub(crate) fn lab_memo_bgra() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    crate::runtime::lab_live::on("MEMO_BGRA").unwrap_or(true)
 }
 
 fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mid: u32,
-) -> Option<(std::sync::Arc<Vec<u8>>, LinearSampleIdentity)> {
+) -> Option<(std::sync::Arc<Vec<u8>>, LinearSampleIdentity, TexelLayout)> {
     let (w, h) = {
         let m = state.mappings.get(&mid)?;
         if !m.has_geom || m.width == 0 || m.height == 0 {
@@ -20110,6 +20126,7 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
                 key: identity_key,
                 generation: hit.1,
             },
+            hit.2,
         ));
     }
     // Taken before the read, so a write landing during it moves past the stamp.
@@ -20139,8 +20156,12 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
     // `DeviceState::next_sampled_content_generation`, so a (key, generation)
     // pair is unique device-wide and content can never alias on a collision.
     let key = (mid, w, h);
+    let bgra = lab_memo_bgra();
+    let want_layout = if bgra { TexelLayout::Bgra8 } else { TexelLayout::Rgba8 };
     if let Some(m) = state.mapper_ref_texture_memo.get_touch(&key) {
-        if m.native == scratch {
+        // An entry filled under the other MEMO_BGRA setting holds the other
+        // byte order: a miss, refilled below.
+        if m.native == scratch && m.layout == want_layout {
             let rgba = m.rgba.clone();
             let generation = m.generation;
             state.mapper_ref_texture_memo_scratch = scratch;
@@ -20151,25 +20172,35 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
                     key: identity_key,
                     generation,
                 },
+                want_layout,
             ));
         }
     }
-    // First sight or the native bytes changed: convert BGRA→RGBA fresh.
-    let mut rgba = vec![0u8; span];
-    let converted = pixel_format::RowToRgba8::for_format(sample_fmt).is_some_and(|row_rail| {
-        (0..h as usize).all(|y| {
-            let off = y * (stride as usize);
-            row_rail.convert(
-                &scratch[off..off + (w as usize) * 4],
-                w,
-                &mut rgba[off..off + (w as usize) * 4],
-            )
-        })
-    });
-    if !converted {
-        state.mapper_ref_texture_memo_scratch = scratch;
-        return None;
-    }
+    let rgba = if bgra {
+        // First sight or the native bytes changed: the bytes as read, in the
+        // order the surface holds them.
+        crate::runtime::drain::note_store_route("t11_memo_bgra_fill");
+        scratch[..span].to_vec()
+    } else {
+        // First sight or the native bytes changed: convert BGRA→RGBA fresh.
+        let mut rgba = vec![0u8; span];
+        let converted =
+            pixel_format::RowToRgba8::for_format(sample_fmt).is_some_and(|row_rail| {
+                (0..h as usize).all(|y| {
+                    let off = y * (stride as usize);
+                    row_rail.convert(
+                        &scratch[off..off + (w as usize) * 4],
+                        w,
+                        &mut rgba[off..off + (w as usize) * 4],
+                    )
+                })
+            });
+        if !converted {
+            state.mapper_ref_texture_memo_scratch = scratch;
+            return None;
+        }
+        rgba
+    };
     let rgba = std::sync::Arc::new(rgba);
     let generation = state.next_sampled_content_generation();
     lab_memo_stamp::put(key, stamp, generation);
@@ -20179,10 +20210,9 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
         crate::model::GuestLinearMemo {
             native: scratch,
             rgba: rgba.clone(),
-            // This rail converts every format to RGBA8 unconditionally — the
-            // loop above is `convert_row_to_rgba8` with no native arm — so the
-            // layout is fixed rather than chosen.
-            layout: crate::protocol::pixel_format::TexelLayout::Rgba8,
+            // The surface's own BGRA8 order under MEMO_BGRA, else the RGBA8
+            // the convert above produced.
+            layout: want_layout,
             generation,
         },
         entry_bytes,
@@ -20193,6 +20223,7 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
             key: identity_key,
             generation,
         },
+        want_layout,
     ))
 }
 

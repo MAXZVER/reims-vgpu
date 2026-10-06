@@ -706,6 +706,79 @@ fn apply_thread_priority(_priority: Option<i32>) {}
 /// The process's recorder: draws only.
 pub(crate) static DRAW: Handoff = Handoff::new("reims-vgpu-recorder");
 
+/// TEMP (lab, live `RETAIN_FAST`): the resident identities the deferred draws
+/// still out will register or write - each job's colour targets and depth -
+/// counted, so a drain-side question about some *other* resident need not wait
+/// for them (see [`settle_unless_pending`]).
+static PENDING_TARGETS: Mutex<Vec<(super::types::TargetIdentity, u32)>> = Mutex::new(Vec::new());
+
+/// The targets one deferred draw writes, held from its submit to the end of its
+/// job (run, failed or panicked - the drop is the release).
+pub(crate) struct PendingTargets(Vec<super::types::TargetIdentity>);
+
+impl PendingTargets {
+    pub(crate) fn hold(targets: Vec<super::types::TargetIdentity>) -> Self {
+        if !targets.is_empty() {
+            let mut held = PENDING_TARGETS.lock();
+            for t in &targets {
+                match held.iter_mut().find(|(id, _)| id == t) {
+                    Some((_, n)) => *n += 1,
+                    None => held.push((t.clone(), 1)),
+                }
+            }
+        }
+        Self(targets)
+    }
+}
+
+impl Drop for PendingTargets {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        let mut held = PENDING_TARGETS.lock();
+        for t in &self.0 {
+            if let Some(i) = held.iter().position(|(id, _)| id == t) {
+                held[i].1 -= 1;
+                if held[i].1 == 0 {
+                    held.swap_remove(i);
+                }
+            }
+        }
+    }
+}
+
+/// TEMP (lab, live `RETAIN_FAST=on|off`, off by default until its A/B): whether
+/// a drain question about one resident ([`settle_unless_pending`]) skips the
+/// wait for deferred draws that do not write it.
+pub(crate) fn lab_retain_fast() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    crate::runtime::lab_live::on("RETAIN_FAST").unwrap_or(false)
+}
+
+/// The drain's settle before a question about `identity` alone: skipped when no
+/// deferred draw still out writes it, since only those can change what the
+/// registry answers for it (create, replace or ready its image). Every other
+/// door into engine state still settles. p062: the drain waited for the
+/// recorder 13-15 % of the tranches that open an animation and of its hitches,
+/// 45 % of that at `retain_resident_resource` and 16 % at
+/// `resident_content_backing` - for sampled surfaces the queued draws did not
+/// touch, while the recorder itself sat idle ~60 % of those windows.
+#[track_caller]
+pub(crate) fn settle_unless_pending(is_drain: bool, site: JoinSite, identity: &super::types::TargetIdentity) -> bool {
+    if is_drain && lab_retain_fast() && DRAW.in_flight() {
+        let pending = PENDING_TARGETS.lock().iter().any(|(id, _)| id == identity);
+        if !pending {
+            crate::runtime::drain::note_store_route("lab_retain_fast_skipped");
+            return false;
+        }
+    }
+    settle_if_drain(is_drain, site);
+    true
+}
+
 thread_local! {
     static IS_RECORDER_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

@@ -1633,10 +1633,20 @@ pub fn submit_deferred_draw(
         return;
     };
     let caches = recorder::AssertSend(caches as *const DeviceObjectCaches);
+    // TEMP (lab, RETAIN_FAST): what this draw writes, held until its job ends.
+    let writes = recorder::PendingTargets::hold(
+        req.target_identity
+            .iter()
+            .cloned()
+            .chain(req.secondary_targets.iter().map(|t| t.identity.clone()))
+            .chain(req.depth.as_ref().and_then(|d| d.identity.clone()))
+            .collect(),
+    );
     let req = recorder::AssertSend(req);
     // The job owns the request; the only borrow it carries is the caches'
     // address, valid until the drain settles it (see `recorder`'s module doc).
     let job: Box<dyn FnOnce() -> recorder::JobResult + Send> = Box::new(move || {
+        let _writes = writes;
         let caches = caches.into_inner();
         let req = req.into_inner();
         // SAFETY: `recorder`'s module doc -- the drain holds the device the
@@ -3143,7 +3153,19 @@ impl Drop for ResidentResourceLease {
 /// Allocation ownership is immutable for the returned lease. Mutable content
 /// readiness is still validated by draw execution on every use.
 pub fn retain_resident_resource(identity: &TargetIdentity) -> Option<ResidentResourceLease> {
-    let mut guard = lock_engine();
+    // TEMP (lab, RETAIN_FAST): `lock_engine`'s settle, narrowed to the deferred
+    // draws that write this resident.
+    debug_assert!(
+        !crate::runtime::par::planning(),
+        "a planning thread took the engine lock"
+    );
+    let site = calling_site();
+    recorder::settle_unless_pending(
+        site == EngineLockSite::Worker,
+        recorder::JoinSite::Lock,
+        identity,
+    );
+    let mut guard = lock_engine_at(site);
     let guest_imported = guard.pools.retain_resident_target(identity)?;
     Some(ResidentResourceLease {
         identity: identity.clone(),
@@ -3175,8 +3197,9 @@ fn classify_resident_content(content_ready: bool, guest_imported: bool) -> Resid
 /// ago — which is all a lock-held read ever was, the lock being released before
 /// the caller acts on it.
 pub fn resident_content_backing(identity: &TargetIdentity) -> ResidentContentBacking {
-    // TEMP (lab, S5a): a lock-free read of what a deferred draw publishes.
-    recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
+    // TEMP (lab, S5a): a lock-free read of what a deferred draw publishes -
+    // waited for only when one still out writes this resident (RETAIN_FAST).
+    recorder::settle_unless_pending(is_drain_thread(), recorder::JoinSite::Reader, identity);
     // TEMP (lab): `REIMS_VGPU_LAB_READINESS_LOCKED=1` answers from the registry
     // under the engine lock, as this function did before the table existed. An
     // A/B switch for the one behaviour change the table made on the serial path
@@ -8247,6 +8270,33 @@ fn readback_snapshot(
 }
 
 fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+    match read_target_keeping(identity, None)? {
+        TargetRead::Narrowed(rb) => Ok(rb),
+        // Unreachable with no layout to keep; answered rather than assumed.
+        TargetRead::Native(pixels, layout) => Ok(TargetReadback {
+            pixels,
+            texel: ReadbackTexel::Native(layout),
+        }),
+    }
+}
+
+/// What [`read_target_keeping`] read.
+pub enum TargetRead {
+    /// The resident's own texels, untouched: it held the layout the caller asked
+    /// to keep.
+    Native(Vec<u8>, crate::protocol::pixel_format::TexelLayout),
+    /// Anything else, as [`read_target`] hands it out.
+    Narrowed(TargetReadback),
+}
+
+/// TEMP (lab, NATIVE_PAY): [`read_target`], except that a resident holding
+/// texels of layout `keep` is handed back as its own bytes instead of being
+/// widened to RGBA8 - for a writeback into a mapping of that same layout, which
+/// can land them as they are. One readback either way.
+pub fn read_target_keeping(
+    identity: &TargetIdentity,
+    keep: Option<crate::protocol::pixel_format::TexelLayout>,
+) -> Result<TargetRead, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -8279,11 +8329,14 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         )?;
         pools.registry_note_access(identity, read_access);
         counters.note_target_read(rb_size, TargetReadDelivery::Host);
+        if keep == Some(layout) && !layout.is_four_byte_color() {
+            return Ok(TargetRead::Native(out, layout));
+        }
         // A wide resident is quantized here rather than refused; see
         // `narrow_readback_to_rgba8` for why that direction is the safe one.
         let (pixels, texel) =
             narrow_readback_to_rgba8(out, layout, snap.format, pixels, snap.bgra())?;
-        Ok(TargetReadback { pixels, texel })
+        Ok(TargetRead::Narrowed(TargetReadback { pixels, texel }))
     }
 }
 

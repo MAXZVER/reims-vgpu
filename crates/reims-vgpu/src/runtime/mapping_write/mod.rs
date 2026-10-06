@@ -1850,19 +1850,54 @@ pub fn write_native_image<M: HostMemory + HostOps>(
             }
         }
     } else {
-        for y in 0..height as usize {
-            let src_off = y * src_stride as usize;
-            let row_off = base_off.saturating_add((y as u64).saturating_mul(u64::from(bpr)));
-            let row = &src[src_off..src_off + tight as usize];
-            if !mapper::write_mapping_bytes(state, host, mapping_id, row_off, row, &vouched) {
-                return refuse(
-                    mapping_id,
-                    SurfaceWriteRefusal::MapperWrite {
-                        lo: row_off,
-                        len: row.len(),
-                    },
-                );
+        // One write for the whole frame carrying its rows as the selection, as
+        // `write_bgra8_inner` lands: a call per row re-ran the write prologue
+        // (deferred flush, vouch, page-list resolution) once a row - 1895 times
+        // for the 4935x1895 transition mask - and left row padding untouched
+        // only because each call stopped at `tight`, which the selection keeps.
+        let frame_len: usize;
+        let rows_at: &[u8];
+        let staged: Vec<u8>;
+        if src_stride == bpr {
+            frame_len = need;
+            rows_at = &src[..need];
+        } else {
+            let span = (height as usize - 1) * bpr as usize + tight as usize;
+            let mut frame = vec![0u8; span];
+            for y in 0..height as usize {
+                let s = y * src_stride as usize;
+                let d = y * bpr as usize;
+                frame[d..d + tight as usize].copy_from_slice(&src[s..s + tight as usize]);
             }
+            staged = frame;
+            frame_len = span;
+            rows_at = &staged;
+        }
+        let mut runs: Vec<(u64, u64)> = Vec::with_capacity(height as usize);
+        for y in 0..u64::from(height) {
+            let lo = base_off.saturating_add(y.saturating_mul(u64::from(bpr)));
+            let hi = lo.saturating_add(u64::from(tight));
+            match runs.last_mut() {
+                Some(last) if last.1 == lo => last.1 = hi,
+                _ => runs.push((lo, hi)),
+            }
+        }
+        if !mapper::write_mapping_bytes_only(
+            state,
+            host,
+            mapping_id,
+            base_off,
+            &rows_at[..frame_len],
+            Some(&runs),
+            &vouched,
+        ) {
+            return refuse(
+                mapping_id,
+                SurfaceWriteRefusal::MapperWrite {
+                    lo: base_off,
+                    len: frame_len,
+                },
+            );
         }
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);

@@ -133,6 +133,10 @@ fn store_render_frame_inner<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route("render_flush_gpu_declined");
         }
     }
+    if let Some(done) = store_native_frame(state, host, mapping_id, identity, width, height, started)
+    {
+        return done;
+    }
     // The copying arms. These are the only arms on a host that cannot import
     // guest RAM, and the arm a discrete GPU takes regardless.
     //
@@ -265,6 +269,110 @@ fn store_render_frame_inner<M: HostMemory + HostOps>(
     }
     finish(state, mapping_id, identity, frame_len, started, false);
     true
+}
+
+/// TEMP (lab, live `NATIVE_PAY=on|off`, on unless `=off`): whether a copying
+/// writeback of a resident whose texels are not four-byte colour lands them as
+/// they are ([`store_native_frame`]).
+fn lab_native_pay() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    crate::runtime::lab_live::on("NATIVE_PAY").unwrap_or(true)
+}
+
+/// The copying writeback of a resident whose texels are not four-byte colour,
+/// into a mapping declared in that same texel layout, as the resident's own
+/// bytes.
+///
+/// The eight-bit rail read such a resident back through a lease it then
+/// refused (a second readback), widened every texel to RGBA8, exchanged R and
+/// B, and narrowed each row back to the mapping's texel on its way into guest
+/// pages: for the 4935x1895 R8 transition mask, two readbacks and three
+/// whole-frame passes over four times its bytes (p062: half of the 45 ms
+/// tranche that opens every Finder full-screen animation was this payment,
+/// convert 27 % of it). Here: one readback, one write of the bytes the guest
+/// declared.
+///
+/// `None` hands the frame to the eight-bit rail untouched: a four-byte colour
+/// mapping (the common case, which that rail exists for), a format with no
+/// sampled layout, or a resident that does not hold the mapping's layout - the
+/// last one after its readback, which is then landed by the eight-bit rail
+/// from the bytes already read rather than a second readback.
+fn store_native_frame<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+    started: std::time::Instant,
+) -> Option<bool> {
+    if !lab_native_pay() {
+        return None;
+    }
+    let m = state.mappings.get(&mapping_id)?;
+    // The geometry the native writer lands at (a mapping that declared its own);
+    // anything else is the eight-bit rail's, refusal included.
+    if !m.has_geom || m.width != width || m.height != height {
+        return None;
+    }
+    let format = crate::runtime::mapping_write::mapping_store_format(m);
+    let (layout, _, _) = crate::backend::vulkan::translate::pixel::sampled_pixels(format).ok()?;
+    if layout.is_four_byte_color() {
+        return None;
+    }
+    let write_started = std::time::Instant::now();
+    let read = match crate::backend::vulkan::engine::read_target_keeping(identity, Some(layout)) {
+        Ok(read) => read,
+        // The eight-bit rail reads again and owns the loss report.
+        Err(_) => return None,
+    };
+    let (ok, frame_len) = match read {
+        crate::backend::vulkan::engine::TargetRead::Native(bytes, _) => {
+            crate::runtime::drain::note_store_route("render_flush_native");
+            let stride = width.saturating_mul(u32::from(layout.bytes_per_texel()));
+            let ok = crate::runtime::mapping_write::write_native_image(
+                state, host, mapping_id, &bytes, stride, width, height, format,
+            );
+            (ok, bytes.len())
+        }
+        crate::backend::vulkan::engine::TargetRead::Narrowed(rb) => {
+            crate::runtime::drain::note_store_route("render_flush_native_layout_differs");
+            let texel = rb.texel;
+            let Some(scanout) = rb.into_bgra8() else {
+                crate::observe::fail(format!(
+                    "render_store_lost reason=readback_texel_not_scanout \
+                     mapping={mapping_id} geom={width}x{height} texel={texel:?}"
+                ));
+                return Some(false);
+            };
+            let bytes = std::sync::Arc::new(scanout);
+            let len = bytes.len();
+            let ok = crate::runtime::mapping_write::write_bgra8_owned(
+                state,
+                host,
+                mapping_id,
+                &bytes,
+                width.saturating_mul(4),
+                width,
+                height,
+            );
+            (ok, len)
+        }
+    };
+    crate::runtime::drain::note_readback_phase(
+        crate::runtime::drain::ReadbackPhase::Write,
+        write_started.elapsed().as_micros() as u64,
+    );
+    if !ok {
+        crate::observe::fail(format!(
+            "render_store_lost mapping={mapping_id} {width}x{height} reason=write_refused rail=native"
+        ));
+        return Some(false);
+    }
+    finish(state, mapping_id, identity, frame_len, started, false);
+    Some(true)
 }
 
 /// Publish a Store for a resident whose attachment memory is the guest mapping.

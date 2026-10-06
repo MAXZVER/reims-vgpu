@@ -1184,6 +1184,57 @@ fn write_bgra8_fragmented_skips_final_row_padding() {
     );
 }
 
+/// The native writer's scattered-page arm lands each row at its own pitch in
+/// one write and leaves the padding between rows (and after the last) alone -
+/// the shape the R8 transition mask's writeback takes once it stops widening
+/// to RGBA8 (`render_writeback::vulkan::store_native_frame`).
+#[test]
+fn write_native_image_fragmented_lands_rows_and_skips_padding() {
+    use crate::model::PAGE_SHIFT_X86;
+    use crate::protocol::pixel_format::MTL_FORMAT_R8_UNORM;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    host.strict_linux_map = true;
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let gpa0 = 0x3700_0000u64;
+    let gpa1 = 0x4800_0000u64;
+    host.map_range(gpa0, page as usize, 0xCC);
+    host.map_range(gpa1, page as usize, 0xCC);
+    let pfn0 = (gpa0 >> PAGE_SHIFT_X86) as u32;
+    let pfn1 = (gpa1 >> PAGE_SHIFT_X86) as u32;
+    let mid = 14u32;
+    state.map_surface(mid);
+    {
+        let m = state.mappings.get_mut(&mid).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![
+            (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+        ];
+    }
+    assert!(state.set_mapping_geom(mid, 3, 2, MTL_FORMAT_R8_UNORM));
+    assert!(
+        mapper::ensure_contig_view(&mut state, &mut host, mid).is_none(),
+        "two non-adjacent pages must take the fragmented arm this test is about"
+    );
+    let src = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66];
+    assert!(write_native_image(&mut state, &mut host, mid, &src, 3, 3, 2, MTL_FORMAT_R8_UNORM));
+
+    // No device descriptor, so the invented window applies: tight = 3,
+    // bpr = ALIGN_UP(3, ROW_BYTES_ALIGN) = 128.
+    let tight = 3usize;
+    let bpr = 128usize;
+    let mut got = vec![0u8; page as usize];
+    assert!(host.read_gpa(gpa0, &mut got).is_ok());
+    let mut want = vec![0xCCu8; page as usize];
+    want[..tight].copy_from_slice(&src[..tight]);
+    want[bpr..bpr + tight].copy_from_slice(&src[tight..]);
+    let first_diff = got.iter().zip(want.iter()).position(|(a, b)| a != b);
+    assert_eq!(first_diff, None, "byte {first_diff:?} outside the rows was modified");
+}
+
 /// The packed-contig BGRA write pokes rows straight into a raw host pointer,
 /// so its only bound is the sample window `contig_for_span` validated. The
 /// fragmented path's equivalent is checked by

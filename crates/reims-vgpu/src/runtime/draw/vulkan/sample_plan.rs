@@ -2371,17 +2371,27 @@ pub(crate) fn plan_mapper_ref_memo<M: HostMemory + HostOps>(
     let window_key = crate::runtime::mapper::mapping_window_key_readonly(state, mid)
         .ok_or(SampleBail::ColdWindow)?;
     let key = (mid, w, h);
+    // The serial rung's byte order (`lab_memo_bgra`), so a plan and the serial
+    // fill it stands in for agree on what the memo holds.
+    let bgra = super::lab_memo_bgra();
+    let want_layout = if bgra { TexelLayout::Bgra8 } else { TexelLayout::Rgba8 };
     let serve = match state.mapper_ref_texture_memo.peek(&key) {
-        Some(entry) if entry.native[..] == native[..] => MemoServe::Hit {
-            rgba: std::sync::Arc::clone(&entry.rgba),
-            generation: entry.generation,
-            layout: entry.layout,
-        },
+        Some(entry) if entry.native[..] == native[..] && entry.layout == want_layout => {
+            MemoServe::Hit {
+                rgba: std::sync::Arc::clone(&entry.rgba),
+                generation: entry.generation,
+                layout: entry.layout,
+            }
+        }
         _ => {
             // First sight or the native bytes changed: convert fresh, new
             // generation — the serial fill, minus its drain-thread read.
-            let mut rgba = vec![0u8; (u64::from(stride) * u64::from(h)) as usize];
-            let converted =
+            let len = (u64::from(stride) * u64::from(h)) as usize;
+            let mut rgba = vec![0u8; len];
+            let converted = if bgra {
+                rgba.copy_from_slice(&native[..len]);
+                true
+            } else {
                 pixel_format::RowToRgba8::for_format(sample_fmt).is_some_and(|row_rail| {
                     (0..h as usize).all(|y| {
                         let off = y * stride as usize;
@@ -2391,7 +2401,8 @@ pub(crate) fn plan_mapper_ref_memo<M: HostMemory + HostOps>(
                             &mut rgba[off..off + (w as usize) * 4],
                         )
                     })
-                });
+                })
+            };
             if !converted {
                 return Err(SampleBail::ZeroCopyDeclined);
             }
@@ -2403,8 +2414,7 @@ pub(crate) fn plan_mapper_ref_memo<M: HostMemory + HostOps>(
                 native,
                 rgba: std::sync::Arc::new(rgba),
                 generation: state.next_sampled_content_generation(),
-                // This rail converts every format to RGBA8 unconditionally.
-                layout: TexelLayout::Rgba8,
+                layout: want_layout,
                 entry_bytes,
             }
         }
