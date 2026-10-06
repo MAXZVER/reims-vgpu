@@ -1739,6 +1739,182 @@ fn load_buffer_texture_native<M: HostMemory + HostOps>(
     Some((w, h, bytes, layout))
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_BUFTEX_MEMO` (live `BUFTEX_MEMO=on|off`, off
+/// unless `=on`): the Vulkan rail serves a buffer-backed texture through
+/// [`load_buffer_texture_memoized`] before [`load_buffer_texture_rgba`]. Off
+/// under test.
+pub(crate) fn lab_buftex_memo() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("BUFTEX_MEMO") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(std::env::var("REIMS_VGPU_LAB_BUFTEX_MEMO").as_deref(), Ok("on"));
+        crate::observe::off(format!("lab_buftex_memo on={}", u8::from(on)));
+        on
+    })
+}
+
+/// A buffer-backed texture loaded through [`load_buffer_texture_memoized`]:
+/// width, height, the tight upload bytes, and the `(key, generation)` content
+/// identity that equal bytes keep.
+pub(crate) struct MemoizedBufferTexture {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) bytes: std::sync::Arc<Vec<u8>>,
+    pub(crate) layout: TexelLayout,
+    pub(crate) key: u64,
+    pub(crate) generation: u64,
+}
+
+/// TEMP (lab, BUFTEX_MEMO): [`load_buffer_texture_rgba`] behind a byte-exact
+/// revalidated memo — the contract of the guest-linear memo
+/// (`load_linear_guest_memoized`), applied to opcode-9 buffer-backed
+/// textures, which had none.
+///
+/// p047's mass slow tranches spent 13 % of the drain in the loader, 9 % of it
+/// the BGRA->RGBA swizzle: one 256x256 BGRA8 texture re-bound thousands of
+/// times a phase, each bind reading the buffer from the texture's offset to
+/// the end of its allocation into a zeroed vector, converting it, and handing
+/// the engine bytes with no identity, so the engine hashed and compared them
+/// again. Here every bind still settles and re-reads the guest bytes — the
+/// read is how it knows they are unchanged — but only the texture's own window
+/// (`bpr * (h - 1) + tight`), and a window equal to the memo's byte for byte,
+/// padding included, returns the converted bytes and the identity it was
+/// converted under: no convert, no allocation, no engine hash.
+///
+/// `None` for every geometry the plain loader would refuse or report; the
+/// caller falls through to it, so its fail lines stay the only ones.
+pub(crate) fn load_buffer_texture_memoized<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    bt: &BufferTextureDescriptor,
+) -> Option<MemoizedBufferTexture> {
+    let (w, h) = (bt.desc.width, bt.desc.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let fmt = if bt.desc.pixel_format != 0 {
+        bt.desc.pixel_format
+    } else {
+        MTL_FORMAT_BGRA8_UNORM
+    };
+    let tight = u64::from(pixel_format::tight_row_bytes(w, fmt)?);
+    let bpr = if bt.bytes_per_row == 0 {
+        tight
+    } else {
+        bt.bytes_per_row
+    };
+    if bpr < tight {
+        return None;
+    }
+    let row_rail = pixel_format::RowToRgba8::for_format(fmt)?;
+    let span = bpr.checked_mul(u64::from(h - 1))?.checked_add(tight)?;
+    let read_len = host_alloc_len(span)?;
+    let dst_row = (w as usize).checked_mul(RGBA8_BPP as usize)?;
+    let out_len = dst_row.checked_mul(h as usize)?;
+    // The plain loader's two payments: the texture-view object here, the
+    // buffer (narrowed to this window) by the settle below.
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+    let backing = resolve_buffer_backing(state, host, task_id, bt.buffer_ref, None)?;
+    if bt.offset >= backing.size || backing.size - bt.offset < span {
+        return None;
+    }
+    let read_gva = backing.gva.checked_add(bt.offset)?;
+    crate::runtime::writeback_debt::settle_for_texture(
+        state,
+        host,
+        task_id,
+        bt.buffer_ref,
+        read_gva,
+        span,
+        crate::runtime::render_writeback::SettleSite::BufferGuestRead,
+    );
+    let mut scratch = std::mem::take(&mut state.buffer_texture_scratch);
+    scratch.clear();
+    scratch.resize(read_len, 0);
+    if gva_mem::read_task_gva_by_id(
+        host,
+        &state.tasks,
+        task_id,
+        read_gva,
+        &mut scratch,
+        state.page_shift,
+    )
+    .is_err()
+    {
+        state.buffer_texture_scratch = scratch;
+        return None;
+    }
+    let memo_key = (task_id, read_gva, w, h, bpr, fmt);
+    let key = crate::backend::hash::hash_u64(
+        read_gva,
+        (u64::from(w) << 32 | u64::from(h)) ^ bpr.rotate_left(17) ^ (u64::from(fmt) << 48),
+    );
+    let hit = match state.buffer_texture_memo.get_touch(&memo_key) {
+        None => {
+            crate::runtime::drain::note_store_route("buftex_memo_absent");
+            None
+        }
+        Some(m) if m.native == scratch => {
+            crate::runtime::drain::note_store_route("buftex_memo_hit");
+            Some((m.rgba.clone(), m.generation, m.layout))
+        }
+        Some(_) => {
+            crate::runtime::drain::note_store_route("buftex_memo_changed");
+            None
+        }
+    };
+    if let Some((bytes, generation, layout)) = hit {
+        state.buffer_texture_scratch = scratch;
+        return Some(MemoizedBufferTexture {
+            width: w,
+            height: h,
+            bytes,
+            layout,
+            key,
+            generation,
+        });
+    }
+    note_sampled_narrowing("buftex_narrowed", texture_ref, fmt, w, h);
+    let (tight, bpr) = (tight as usize, bpr as usize);
+    let mut rgba = vec![0u8; out_len];
+    for y in 0..h as usize {
+        let src = &scratch[y * bpr..y * bpr + tight];
+        let dst = &mut rgba[y * dst_row..(y + 1) * dst_row];
+        if !row_rail.convert(src, w, dst) {
+            state.buffer_texture_scratch = scratch;
+            return None;
+        }
+    }
+    let generation = state.next_sampled_content_generation();
+    let rgba = std::sync::Arc::new(rgba);
+    let entry_bytes = scratch.len() + rgba.len();
+    state.buffer_texture_memo.insert(
+        memo_key,
+        crate::model::GuestLinearMemo {
+            native: scratch,
+            rgba: rgba.clone(),
+            layout: TexelLayout::Rgba8,
+            generation,
+        },
+        entry_bytes,
+    );
+    Some(MemoizedBufferTexture {
+        width: w,
+        height: h,
+        bytes: rgba,
+        layout: TexelLayout::Rgba8,
+        key,
+        generation,
+    })
+}
+
 fn index_elem_size(index_type: u32) -> Option<usize> {
     match index_type {
         0 => Some(2), // MTLIndexTypeUInt16

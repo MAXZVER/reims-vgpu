@@ -9369,3 +9369,144 @@ mod par_clear {
         assert!(ram(&host, PAGES).iter().all(|&b| b == 0xee));
     }
 }
+
+/// TEMP (lab, BUFTEX_MEMO): an unchanged buffer-texture window is served from
+/// the memo under the identity it was converted with; a write inside the
+/// window converts again under a new one; a write outside it changes nothing.
+///
+/// The identity is what lets the engine skip its own content hash, so a hit
+/// that kept the bytes but minted a new generation would cost the upload it
+/// claims to save, and a changed window served under the old one would bind
+/// the previous texels.
+#[test]
+fn a_buffer_texture_window_is_converted_once_until_its_bytes_change() {
+    use crate::protocol::endian::{st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,
+    };
+    use crate::runtime::host::HostMemory;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let (dir_pfn, root_pfn) = (2u32, 3u32);
+    let dir_gpa = u64::from(dir_pfn) << PAGE_SHIFT_ARM64E;
+    let root_gpa = u64::from(root_pfn) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    for i in 0..8u32 {
+        let pfn = 4 + i;
+        host.map_range(u64::from(pfn) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        let _ = host.write_gpa(root_gpa + u64::from(i) * 4, &pte);
+    }
+    let task_id = 1u32;
+    state.define_task(task_id, 0x1000, dir_pfn);
+    assert!(state.set_object_list(task_id, 0, 32));
+
+    // A buffer of 0x4000 bytes at handle 5, named by object ref 7.
+    const BUF_REF: u32 = 7;
+    const BUF_HANDLE: u32 = 5;
+    const BUF_SIZE: u64 = 0x4000;
+    let buf_gva = u64::from(BUF_HANDLE) << RESOURCE_PAGE_SHIFT;
+    let desc_gva = 0x1a0u64;
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], BUF_SIZE);
+    st64(&mut bdesc[8..], u64::from(BUF_HANDLE));
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &bdesc);
+    let entry_off = list_object_entry_offset(BUF_REF, 32).unwrap();
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut le[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | ((bdesc.len() as u32) << 8),
+    );
+    le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], entry_off, &le);
+
+    // A 16x16 BGRA8 texture at offset 0x100 with 0x80-byte rows: a 64-byte
+    // row of texels and 64 bytes of padding, 15 * 0x80 + 64 bytes in all.
+    let (offset, bpr, w, h) = (0x100u64, 0x80u64, 16u32, 16u32);
+    let window = (bpr * u64::from(h - 1) + u64::from(w) * 4) as usize;
+    let texels: Vec<u8> = (0..window).map(|i| (i % 251) as u8).collect();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva + offset, &texels);
+    let bt = BufferTextureDescriptor {
+        new_texture_ref: 31,
+        buffer_ref: BUF_REF,
+        offset,
+        bytes_per_row: bpr,
+        desc: crate::runtime::heap_query::TextureDescriptor {
+            texture_type: 2,
+            framebuffer_only: false,
+            is_drawable: false,
+            allow_gpu_optimized_contents: false,
+            usage: 0,
+            pixel_format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            width: w,
+            height: h,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            resource_options: 0,
+            protection_options: 0,
+            swizzle: None,
+        },
+    };
+    let load = |state: &mut DeviceState, host: &mut FakeHost| {
+        load_buffer_texture_memoized(state, host, task_id, 31, &bt)
+            .expect("the window resolves and converts")
+    };
+
+    let first = load(&mut state, &mut host);
+    assert_eq!((first.width, first.height), (w, h));
+    assert_eq!(first.bytes.len(), (w * h * 4) as usize, "tight RGBA8 rows");
+    assert_eq!(
+        &first.bytes[0..4],
+        &[texels[2], texels[1], texels[0], texels[3]],
+        "BGRA texels arrive in RGBA order"
+    );
+    let row1 = (w * 4) as usize;
+    assert_eq!(
+        first.bytes[row1 + 2],
+        texels[bpr as usize],
+        "row 1 starts one stride in, not one tight row in"
+    );
+
+    let second = load(&mut state, &mut host);
+    assert_eq!(
+        (second.key, second.generation),
+        (first.key, first.generation),
+        "an unchanged window keeps the identity the engine cached it under"
+    );
+    assert!(std::sync::Arc::ptr_eq(&first.bytes, &second.bytes));
+
+    // Padding inside the window is still the window: a write there is seen.
+    write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva + offset + 0x70, &[0xab]);
+    let third = load(&mut state, &mut host);
+    assert_eq!(third.key, first.key, "the same window keeps its key");
+    assert_ne!(
+        third.generation, first.generation,
+        "changed bytes are a new content"
+    );
+
+    // Past the window's last texel: not this texture's bytes.
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        buf_gva + offset + window as u64,
+        &[0xcd],
+    );
+    let fourth = load(&mut state, &mut host);
+    assert_eq!(fourth.generation, third.generation);
+
+    // A write into a texel converts again, and the new bytes are served.
+    write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva + offset, &[0x11]);
+    let fifth = load(&mut state, &mut host);
+    assert_ne!(fifth.generation, fourth.generation);
+    assert_eq!(fifth.bytes[2], 0x11, "B lands in the third RGBA byte");
+}

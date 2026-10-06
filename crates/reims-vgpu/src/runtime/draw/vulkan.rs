@@ -1127,6 +1127,10 @@ pub(super) struct StagedSampledRequest {
 /// of them — a device-global counter, never per-entry — so a `(key, generation)`
 /// pair names one content for the life of the device and content cannot alias
 /// even if two producers did collide on a key.
+///
+/// The buffer-backed texture memo (TEMP lab, BUFTEX_MEMO) keys by a hash of
+/// its window's name, like the zero-copy gather rail, and is unflagged for the
+/// same reason that rail is: the generation alone keeps contents apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LinearSampleIdentity {
     pub(super) key: u64,
@@ -3235,6 +3239,29 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 return Some((w, h, 0, request));
             }
         }
+        // TEMP (lab, BUFTEX_MEMO): the converted bytes of an unchanged window
+        // and the identity they were converted under, so neither the convert
+        // nor the engine's content hash runs again.
+        if super::lab_buftex_memo() {
+            if let Some(m) =
+                super::load_buffer_texture_memoized(state, host, task_id, texture_ref, &bt)
+            {
+                return Some((
+                    m.width,
+                    m.height,
+                    0,
+                    SampledSourceRequest::Bytes(
+                        m.bytes,
+                        Some(LinearSampleIdentity {
+                            key: m.key,
+                            generation: m.generation,
+                        }),
+                        SampledByteFormat::from_source(m.layout, source),
+                        crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
+                    ),
+                ));
+            }
+        }
         // TEMP (lab, BUFTEX_NATIVE): BGRA8/RGBA8 keep their order and read
         // only their own window.
         if super::lab_buftex_native() {
@@ -4846,7 +4873,34 @@ fn try_ref_texture_view_from_resident<M: HostMemory + HostOps>(
             note_store_route_n_px("lab_rtv_gpu_served_px", view.width, view.height);
             Some(SampledSourceRequest::TargetRegion(top.resident_id, format, components))
         }
-        _ => refuse("lab_rtv_gpu_not_current"),
+        outcome => {
+            // TEMP (lab): which of the two "not current" answers the mask gets
+            // (p052: 34 of its 38 binds) - the guest wrote over a ready resident,
+            // or there was no ready resident - and what the witness said.
+            let slug = match outcome {
+                sample_plan::TopOutcome::Refused => "lab_rtv_gpu_not_current_refused",
+                sample_plan::TopOutcome::NotReady => "lab_rtv_gpu_not_current_not_ready",
+                _ => "lab_rtv_gpu_not_current_other",
+            };
+            note_store_route(slug);
+            let gw = top.guest_write();
+            let key = u64::from(mid) | (u64::from(outcome as u8) << 32);
+            if crate::observe::first_sight("lab_rtv_gpu_not_current", key) {
+                crate::observe::off(format!(
+                    "lab_rtv_gpu_not_current mid={mid} outcome={slug} gw={gw:?} backing={:?} \
+                     surface={}x{} fmt={} view={}x{} fmt={} routes={}",
+                    top.resident_backing,
+                    m.width,
+                    m.height,
+                    m.format,
+                    view.width,
+                    view.height,
+                    view.pixel_format,
+                    top.routes.join(",")
+                ));
+            }
+            refuse("lab_rtv_gpu_not_current")
+        }
     }
 }
 

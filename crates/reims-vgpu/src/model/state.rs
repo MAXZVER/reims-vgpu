@@ -3466,6 +3466,20 @@ pub struct DeviceState {
     pub mapper_ref_texture_memo: LruBytesMemo<(u32, u32, u32), GuestLinearMemo>,
     /// Reusable native BGRA read buffer for the mapper-ref-texture memo re-read.
     pub mapper_ref_texture_memo_scratch: Vec<u8>,
+    /// TEMP (lab, BUFTEX_MEMO): byte-exact revalidated memo for opcode-9
+    /// buffer-backed textures (`load_buffer_texture_memoized`). Same contract
+    /// as [`Self::guest_linear_memo`]: every bind re-reads the texture's own
+    /// window of the buffer (`bpr * (h - 1) + tight`), and the RGBA8 convert,
+    /// the zeroed read of the rest of the allocation and the engine's content
+    /// hash + memcmp (via the returned content identity) are skipped on
+    /// unchanged bytes. p047's mass slow tranches spent 13 % of the drain in
+    /// the unmemoized loader, 9 % of it the BGRA->RGBA swizzle of one
+    /// 256x256 texture re-bound thousands of times a phase. Keyed by
+    /// (task_id, window gva, width, height, bytes per row, pixel format).
+    /// Byte-bounded LRU ([`GUEST_LINEAR_MEMO_BYTE_CAP`]).
+    pub buffer_texture_memo: LruBytesMemo<(u32, u64, u32, u32, u64, u16), GuestLinearMemo>,
+    /// Reusable window read buffer for the buffer-texture memo re-read.
+    pub buffer_texture_scratch: Vec<u8>,
     /// Last guest-visible generation produced by a compute storage-image
     /// writeback, keyed by the exact window it was produced for.
     ///
@@ -3793,6 +3807,8 @@ impl DeviceState {
             ref_texture_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             mapper_ref_texture_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             mapper_ref_texture_memo_scratch: Vec::new(),
+            buffer_texture_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+            buffer_texture_scratch: Vec::new(),
             gva_host_views: Vec::new(),
             view_stale_reads: 0,
             par: None,

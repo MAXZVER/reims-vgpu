@@ -5178,12 +5178,18 @@ fn read_target_changed_pages_inner(
                         depth: 1,
                     })];
                 d.cmd_copy_image_to_buffer(cb, snap.image, read_access.layout(), cur_b, &region);
-                let after_copy = [vk::MemoryBarrier::default()
+                // Each branch names only the accesses its destination stage
+                // performs (`VUID-vkCmdPipelineBarrier-dstAccessMask-02816`,
+                // p056 validation: shader accesses at a transfer stage).
+                let after_copy_to_transfer = [vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(
-                        vk::AccessFlags::TRANSFER_READ
-                            | vk::AccessFlags::SHADER_READ
-                            | vk::AccessFlags::SHADER_WRITE,
+                        vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+                    )];
+                let after_copy_to_compute = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
                     )];
                 if fresh {
                     // The whole frame goes to the guest, and the shadow becomes it.
@@ -5192,7 +5198,7 @@ fn read_target_changed_pages_inner(
                         vk::PipelineStageFlags::TRANSFER,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::DependencyFlags::empty(),
-                        &after_copy,
+                        &after_copy_to_transfer,
                         &[],
                         &[],
                     );
@@ -5208,7 +5214,7 @@ fn read_target_changed_pages_inner(
                         vk::PipelineStageFlags::TRANSFER,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::DependencyFlags::empty(),
-                        &after_copy,
+                        &after_copy_to_compute,
                         &[],
                         &[],
                     );
