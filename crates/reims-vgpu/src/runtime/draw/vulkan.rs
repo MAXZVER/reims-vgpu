@@ -5068,6 +5068,12 @@ pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
             pixel_format::MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
             pixel_format::MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
             pixel_format::MTL_FORMAT_RG11B10_FLOAT => TexelLayout::Rg11b10Float,
+            // TEMP (lab, REFVIEW_NATIVE): the mask's byte stays one byte; the
+            // image view moves it to alpha (`bytes_channel_plan`).
+            pixel_format::MTL_FORMAT_A8_UNORM if lab_refview_native() => {
+                crate::runtime::drain::note_store_route("lab_refview_native_a8");
+                TexelLayout::R8
+            }
             _ => TexelLayout::Rgba8,
         },
         view.pixel_format,
@@ -5092,8 +5098,10 @@ pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
         });
     };
     if let Some(m) = state.ref_texture_view_memo.get_touch(&memo_key) {
-        // Vec equality is length + byte memcmp with early exit on change.
-        if m.native == native {
+        // Vec equality is length + byte memcmp with early exit on change. The
+        // layout too: an entry filled under the other REFVIEW_NATIVE setting
+        // holds the same texels at another width.
+        if m.layout == byte_format.layout() && m.native == native {
             let rgba = m.rgba.clone();
             let generation = m.generation;
             ok_line("memo", &rgba);
@@ -8156,6 +8164,27 @@ pub(crate) fn lab_zc_swizzle() -> bool {
     *ON.get_or_init(|| {
         let on = matches!(std::env::var("REIMS_VGPU_LAB_ZC_SWIZZLE").as_deref(), Ok("on"));
         crate::observe::off(format!("lab_zc_swizzle on={}", u8::from(on)));
+        on
+    })
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_REFVIEW_NATIVE` (live `REFVIEW_NATIVE=on|off`,
+/// off unless `=on`): [`load_ref_texture_view_rgba`] keeps an `A8Unorm` view's
+/// byte as `R8` and the image view moves it to alpha, instead of expanding
+/// every texel to RGBA8 on the drain. p047's heavy tranches: the 4935x1895
+/// transition mask, ~37 MB of RGBA8 a changed bind (load 14 %, convert 15 %
+/// of those tranches). Off under test.
+pub(crate) fn lab_refview_native() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("REFVIEW_NATIVE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(std::env::var("REIMS_VGPU_LAB_REFVIEW_NATIVE").as_deref(), Ok("on"));
+        crate::observe::off(format!("lab_refview_native on={}", u8::from(on)));
         on
     })
 }
@@ -11361,6 +11390,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     SampledSourceRequest::Bytes(rgba, identity, byte_format, origin) => {
                         bytes_identity = identity;
                         sampled_vk_format = translate::pixel::vk_sampled_bytes(byte_format);
+                        // Identity unless the loader kept its source's own
+                        // texels in a layout whose channels the source names
+                        // differently (`A8Unorm` in `R8`, REFVIEW_NATIVE).
+                        sampled_components = translate::pixel::bytes_channel_plan(byte_format);
                         byte_origin = origin;
                         crate::backend::vulkan::engine::SampledSource::Bytes(rgba)
                     }

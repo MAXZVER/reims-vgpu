@@ -1208,6 +1208,14 @@ impl SampledByteFormat {
     pub fn srgb_source(self) -> Option<u16> {
         self.source.filter(|&source| is_srgb(source))
     }
+
+    /// The guest format the values were loaded from, or `None` for synthesised
+    /// bytes. For a rail that must ask what the source's own channels mean on
+    /// the layout the bytes are in — `A8Unorm`'s byte carried in `R8` is alpha,
+    /// not red — and not for re-deriving the layout.
+    pub fn source_format(self) -> Option<u16> {
+        self.source
+    }
 }
 
 #[repr(u8)]

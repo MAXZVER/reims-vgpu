@@ -82,6 +82,22 @@ pub fn sampled_pixels(
     Ok((sampled.layout, loss, sampled.components))
 }
 
+/// The channel plan CPU-loaded sampled bytes need on their image view.
+///
+/// A loader that kept its source's own texels — the layout it wrote is the one
+/// [`sampled_pixels`] names for the source format — hands over bytes whose
+/// channels mean what that format's plan says they mean: `A8Unorm`'s byte in
+/// an `R8` image is alpha. A loader that converted (any other layout, or
+/// synthesised bytes) already put every channel where it belongs, and gets the
+/// identity.
+pub fn bytes_channel_plan(bytes: SampledByteFormat) -> SwizzlePlan {
+    bytes
+        .source_format()
+        .and_then(|source| rail::sampled_pixels(source).ok())
+        .filter(|sampled| sampled.layout == bytes.layout())
+        .map_or_else(pixel_format::swizzle_identity, |sampled| sampled.components)
+}
+
 /// The engine's storage-image format for a Metal pixel format.
 ///
 /// See [`reims_vgpu_vulkan::pixel::storage_image`] for why this rail keeps an
@@ -1006,5 +1022,25 @@ mod tests {
             TranslateReason::SrgbDowngraded(0).slug(),
             crate::runtime::census::srgb_census::SRGB_DOWNGRADED_SLUG
         );
+    }
+
+    /// CPU-loaded bytes get their source's channel plan exactly when the
+    /// loader kept the source's own texels: `A8Unorm` kept as `R8` samples its
+    /// byte as alpha, the same mask expanded to RGBA8 already holds it there,
+    /// and bytes this device synthesised have no source to ask.
+    #[test]
+    fn kept_texels_carry_their_formats_plan_and_converted_ones_do_not() {
+        use super::{bytes_channel_plan, rail, SampledByteFormat, TexelLayout};
+        use crate::protocol::pixel_format::MTL_FORMAT_A8_UNORM;
+        let kept = SampledByteFormat::from_source(TexelLayout::R8, MTL_FORMAT_A8_UNORM);
+        assert_eq!(bytes_channel_plan(kept), rail::ALPHA_IN_RED);
+        let expanded = SampledByteFormat::from_source(TexelLayout::Rgba8, MTL_FORMAT_A8_UNORM);
+        assert!(bytes_channel_plan(expanded).is_identity());
+        let bgra = SampledByteFormat::from_source(
+            TexelLayout::Bgra8,
+            crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        );
+        assert!(bytes_channel_plan(bgra).is_identity());
+        assert!(bytes_channel_plan(SampledByteFormat::synthesised(TexelLayout::R8)).is_identity());
     }
 }

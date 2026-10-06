@@ -1739,10 +1739,12 @@ fn load_buffer_texture_native<M: HostMemory + HostOps>(
     Some((w, h, bytes, layout))
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_BUFTEX_MEMO` (live `BUFTEX_MEMO=on|off`, off
-/// unless `=on`): the Vulkan rail serves a buffer-backed texture through
+/// TEMP (lab): `REIMS_VGPU_LAB_BUFTEX_MEMO` (live `BUFTEX_MEMO=on|off`, on
+/// unless `=off`): the Vulkan rail serves a buffer-backed texture through
 /// [`load_buffer_texture_memoized`] before [`load_buffer_texture_rgba`]. Off
-/// under test.
+/// under test. Default since p058 (ABBA, Intel 5K: slow tranches 3.89/4.05 s
+/// off against 3.72/3.78 s on, Finder transition frames 62/61 against 68/63,
+/// snapshots clean).
 pub(crate) fn lab_buftex_memo() -> bool {
     if cfg!(test) {
         return false;
@@ -1752,7 +1754,7 @@ pub(crate) fn lab_buftex_memo() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = matches!(std::env::var("REIMS_VGPU_LAB_BUFTEX_MEMO").as_deref(), Ok("on"));
+        let on = !matches!(std::env::var("REIMS_VGPU_LAB_BUFTEX_MEMO").as_deref(), Ok("off"));
         crate::observe::off(format!("lab_buftex_memo on={}", u8::from(on)));
         on
     })
