@@ -2436,7 +2436,8 @@ fn take_memo_budget(budget: &std::sync::atomic::AtomicU64, bytes: u64) -> Result
     budget.fetch_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
-        |left| (left >= bytes).then_some(left - bytes),
+        // `then`, not `then_some`: the difference is taken only when it exists.
+        |left| (left >= bytes).then(|| left - bytes),
     )
 }
 

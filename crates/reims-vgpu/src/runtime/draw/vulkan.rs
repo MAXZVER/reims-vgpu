@@ -1039,6 +1039,14 @@ pub(super) enum SampledSourceRequest {
         crate::backend::vulkan::engine::TargetIdentity,
         ash::vk::Format,
     ),
+    /// TEMP (lab, RTV_GPU): the top-left `w x h` of a resident read through
+    /// the given format — a serialized view over the resident's surface (see
+    /// [`try_ref_texture_view_from_resident`]); the engine copies it into a
+    /// sampled image of its own.
+    TargetRegion(
+        crate::backend::vulkan::engine::TargetIdentity,
+        ash::vk::Format,
+    ),
     /// Zero-copy guest gather: the engine copies the texel bytes from
     /// imported guest RAM inside the draw CB — no CPU read, no memo, no
     /// hash. Carries the native texel layout the image is created with.
@@ -2670,7 +2678,7 @@ fn lab_resolve_census(ns: u64, loaded: Option<&(u32, u32, u32, SampledSourceRequ
         Some((w, h, _, src)) => (
             match src {
                 SampledSourceRequest::Bytes(..) => 0,
-                SampledSourceRequest::Target(..) => 1,
+                SampledSourceRequest::Target(..) | SampledSourceRequest::TargetRegion(..) => 1,
                 SampledSourceRequest::GuestRuns(..) => 2,
                 // TEMP (lab, PASS_STAGE): with the runs rail it stands for.
                 SampledSourceRequest::Staged(..) => 2,
@@ -3312,6 +3320,19 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                                 bpp,
                             },
                         );
+                    }
+                }
+                // TEMP (lab, RTV_GPU): a view over the top-left of a surface
+                // whose resident is current is copied out of the resident.
+                if may_bind_resident && lab_rtv_gpu() {
+                    if let Some(src) = try_ref_texture_view_from_resident(
+                        state,
+                        host,
+                        mid,
+                        view,
+                        resolved_resource.as_ref(),
+                    ) {
+                        return Some((view.width, view.height, mid, src));
                     }
                 }
                 // Zero-copy the decoded plane straight from guest pages when
@@ -4611,6 +4632,173 @@ fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
 /// bind re-reads the native plane window so a guest write is always observed;
 /// conversion, allocation, and — via the returned content identity — the
 /// engine upload are skipped when the bytes are unchanged.
+/// TEMP (lab): `REIMS_VGPU_LAB_RTV_GPU` (live `RTV_GPU=on|off`, off unless
+/// `=on`): a serialized view that must be materialized is copied out of its
+/// surface's current resident on the GPU ([`try_ref_texture_view_from_resident`])
+/// instead of paying the surface's debt, reading the pages back and converting
+/// them on the drain.
+pub(crate) fn lab_rtv_gpu() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("RTV_GPU") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(std::env::var("REIMS_VGPU_LAB_RTV_GPU").as_deref(), Ok("on"));
+        crate::observe::off(format!("lab_rtv_gpu on={}", u8::from(on)));
+        on
+    })
+}
+
+/// TEMP (lab, RTV_GPU): the Vulkan colour format a view's or a surface's
+/// texels are copied as, when an image copy may carry them bit for bit: an
+/// uncompressed colour format with Metal's channels on Vulkan's own (no
+/// component plan), answered with its texel size. Depth/stencil formats and
+/// remapped ones (`A8Unorm`) are not.
+fn lab_rtv_copy_format(format: u16) -> Option<(ash::vk::Format, u32)> {
+    use ash::vk::Format as F;
+    let p = translate::pixel::translate(format).ok()?;
+    let depth = matches!(
+        p.vk,
+        F::D16_UNORM
+            | F::D32_SFLOAT
+            | F::D24_UNORM_S8_UINT
+            | F::D32_SFLOAT_S8_UINT
+            | F::D16_UNORM_S8_UINT
+            | F::X8_D24_UNORM_PACK32
+            | F::S8_UINT
+    );
+    (!depth && p.components.is_identity() && p.bytes_per_texel > 0)
+        .then_some((p.vk, p.bytes_per_texel))
+}
+
+/// TEMP (lab, RTV_GPU): one line per distinct refused view shape, so a boot
+/// says which views the copy did not take and why.
+fn lab_rtv_note_refusal(route: &'static str, m: &crate::model::MappingEntry, view: &objects::RefTextureView) {
+    crate::runtime::drain::note_store_route(route);
+    let key = crate::backend::hash::hash_u64(
+        (u64::from(m.format) << 48) ^ (u64::from(view.pixel_format) << 32) ^ (u64::from(view.plane_index) << 24),
+        (u64::from(view.width) << 32 | u64::from(view.height)) ^ (u64::from(m.width) << 40) ^ u64::from(m.height) ^ route.len() as u64,
+    );
+    if crate::observe::first_sight("lab_rtv_gpu_refused", key) {
+        crate::observe::off(format!(
+            "lab_rtv_gpu_refused why={route} base={}x{} base_fmt={:#x} geom={} view={}x{} view_fmt={:#x} plane={} depth={}",
+            m.width, m.height, m.format, u8::from(m.has_geom), view.width, view.height, view.pixel_format,
+            view.plane_index, view.depth
+        ));
+    }
+}
+
+/// TEMP (lab, RTV_GPU): a serialized view over the top-left of a surface whose
+/// resident is current, served from that resident.
+///
+/// The CPU loader below serves such a view by reading the surface's pages, and
+/// when the surface's last frame lives only in its resident (a Store whose
+/// writeback is still owed) that read pays the debt first: a GPU readback with
+/// a fence wait and a 4-byte-per-texel write into guest RAM, then the same
+/// bytes read back, swizzled to RGBA8 and uploaded again. p045's heavy
+/// tranches (200-700 draws at 85-210 us a draw) spent 42 % of the drain in
+/// sampled resolution and 27 % in surface writebacks, most of it this round
+/// trip.
+///
+/// A view whose texels are the surface's own pixel grid — plane 0, the same
+/// four-byte size class, the same row pitch and origin, no larger than the
+/// surface — is exactly the resident's top-left `view.width x view.height`
+/// rectangle with the view's format laid over the same bits. The engine copies
+/// that rectangle into a sampled image of the view's format (the snapshot arm,
+/// marked by [`crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView`]
+/// on a target source), which is what Metal's texture view means: the same
+/// bits read through another format. The debt stays owed; nothing here needs
+/// the guest's copy.
+///
+/// Only a current resident serves — the same rung ladder ([`sample_plan::surface_top`])
+/// the base surface binds through. Anything else returns `None` with its
+/// reason as a route and keeps the CPU loader.
+fn try_ref_texture_view_from_resident<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mid: u32,
+    view: objects::RefTextureView,
+    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
+) -> Option<SampledSourceRequest> {
+    use crate::runtime::drain::note_store_route;
+    let refuse = |route: &'static str| -> Option<SampledSourceRequest> {
+        note_store_route(route);
+        None
+    };
+    let Some(m) = state.mappings.get(&mid) else {
+        return refuse("lab_rtv_gpu_no_mapping");
+    };
+    if view.plane_index != 0 || view.depth != 1 {
+        lab_rtv_note_refusal("lab_rtv_gpu_plane", m, &view);
+        return None;
+    }
+    let base_copy = lab_rtv_copy_format(m.format);
+    let view_copy = lab_rtv_copy_format(view.pixel_format);
+    let same_size = matches!((base_copy, view_copy), (Some((_, a)), Some((_, b))) if a == b);
+    if !m.has_geom || !same_size {
+        lab_rtv_note_refusal("lab_rtv_gpu_format", m, &view);
+        return None;
+    }
+    if view.width == 0 || view.height == 0 || view.width > m.width || view.height > m.height {
+        lab_rtv_note_refusal("lab_rtv_gpu_extent", m, &view);
+        return None;
+    }
+    let view_window = mapping_write::ref_texture_sample_window(
+        m,
+        0,
+        view.width,
+        view.height,
+        view.pixel_format,
+    );
+    let base_window = mapping_write::ref_texture_sample_window(m, 0, m.width, m.height, m.format);
+    match (view_window, base_window) {
+        (Some((voff, vbpr, _)), Some((boff, bbpr, _))) if voff == boff && vbpr == bbpr => {}
+        _ => {
+            lab_rtv_note_refusal("lab_rtv_gpu_window", m, &view);
+            return None;
+        }
+    }
+    let Some((format, _)) = view_copy else {
+        return refuse("lab_rtv_gpu_untranslated");
+    };
+    let base_formats = translate::pixel::translate(m.format)
+        .map(|p| [p.vk, p.linear_vk])
+        .ok();
+    let Ok(top) = sample_plan::surface_top(state, host, mid, true, |identity| {
+        Some(
+            resource
+                .filter(|resource| resource_type_owns_surface_resident(resource.entry.object_type))
+                .map(|resource| resource_lease::resident_target_backing(resource, identity))
+                .unwrap_or_else(|| crate::backend::vulkan::engine::resident_content_backing(identity)),
+        )
+    }) else {
+        return refuse("lab_rtv_gpu_no_top");
+    };
+    match top.outcome {
+        sample_plan::TopOutcome::Direct | sample_plan::TopOutcome::Resident => {
+            // The resident must hold the surface's own texels: the size check
+            // above was made against the surface's declared format.
+            if !base_formats.is_some_and(|f| f.contains(&top.resident_id.resident_format())) {
+                return refuse("lab_rtv_gpu_resident_format");
+            }
+            for route in &top.routes {
+                note_store_route(route);
+            }
+            note_store_route("lab_rtv_gpu_served");
+            note_store_route_n_px("lab_rtv_gpu_served_px", view.width, view.height);
+            Some(SampledSourceRequest::TargetRegion(top.resident_id, format))
+        }
+        _ => refuse("lab_rtv_gpu_not_current"),
+    }
+}
+
+fn note_store_route_n_px(route: &'static str, w: u32, h: u32) {
+    crate::runtime::drain::note_store_route_n(route, u64::from(w) * u64::from(h));
+}
+
 pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -10898,6 +11086,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             let route = match &src {
                                 SampledSourceRequest::Bytes(..) => "bytes",
                                 SampledSourceRequest::Target(..) => "target",
+                                SampledSourceRequest::TargetRegion(..) => "target_region",
                                 SampledSourceRequest::GuestRuns(..) => "guest_runs",
                                 // TEMP (lab, PASS_STAGE): with the runs rail.
                                 SampledSourceRequest::Staged(..) => "guest_runs",
@@ -10971,7 +11160,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // handed the guest's own bytes over untouched.
                 let mut sampled_components = pixel_format::swizzle_identity();
                 let mut source_planes = 1;
-                let source_is_target = matches!(&loaded, SampledSourceRequest::Target(_, _));
+                let source_is_target = matches!(
+                    &loaded,
+                    SampledSourceRequest::Target(_, _) | SampledSourceRequest::TargetRegion(_, _)
+                );
                 let source = match loaded {
                     SampledSourceRequest::Bytes(rgba, identity, byte_format, origin) => {
                         bytes_identity = identity;
@@ -10998,6 +11190,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // statically uses. The engine's
                         // `used_binding_absent_from_layout` then refused the
                         // whole draw, which cost the guest every pixel of it.
+                        crate::backend::vulkan::engine::SampledSource::Target(identity)
+                    }
+                    // TEMP (lab, RTV_GPU): a target source whose origin is a
+                    // serialized view is the engine's cue to copy the bind's
+                    // extent out of the resident's top-left.
+                    SampledSourceRequest::TargetRegion(identity, format) => {
+                        sampled_vk_format = format;
+                        byte_origin =
+                            crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView;
                         crate::backend::vulkan::engine::SampledSource::Target(identity)
                     }
                     SampledSourceRequest::GuestRuns(

@@ -767,6 +767,7 @@ fn variant_pair_route(pair: (&SampledSourceRequest, &SampledSourceRequest)) -> &
 fn variant_name(src: &SampledSourceRequest) -> &'static str {
     match src {
         SampledSourceRequest::Target(..) => "target",
+        SampledSourceRequest::TargetRegion(..) => "target_region",
         SampledSourceRequest::GuestRuns(..) => "runs",
         SampledSourceRequest::Bytes(..) => "bytes",
         // TEMP (lab, PASS_STAGE): the staged twin of the runs rail.

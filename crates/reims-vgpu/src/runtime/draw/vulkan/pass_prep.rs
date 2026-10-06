@@ -3234,6 +3234,7 @@ mod tests {
                         match planned_src {
                             SampledSourceRequest::GuestRuns(..) => "runs",
                             SampledSourceRequest::Target(..) => "target",
+                            SampledSourceRequest::TargetRegion(..) => "target_region",
                             SampledSourceRequest::Bytes(..) => "bytes",
                             SampledSourceRequest::Staged(..) => "staged",
                         }

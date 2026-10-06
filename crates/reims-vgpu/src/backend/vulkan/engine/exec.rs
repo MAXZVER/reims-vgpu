@@ -4407,6 +4407,10 @@ pub(crate) unsafe fn execute_draw_inner(
                 });
             }
             SampledSource::Target(identity) => {
+                // TEMP (lab, RTV_GPU): a serialized view over this resident's
+                // surface — its bind extent is the resident's top-left, read
+                // through the bind's format, and it always takes a snapshot.
+                let region = resource.byte_origin == super::SampledByteOrigin::SerializedSurfaceView;
                 // Reading a resident is using it. Marked before the lookup so
                 // the refusal paths below cannot skip it: a resident whose
                 // content is not ready yet, or whose geometry disagrees with
@@ -4449,11 +4453,21 @@ pub(crate) unsafe fn execute_draw_inner(
                         }
                     }
                 }
+                // A region bind is held to fit inside the resident rather than
+                // to equal it; every other check is the same.
+                let (expect_width, expect_height) = match held.as_ref() {
+                    Some((_, _, _, _, _, width, height, _, _))
+                        if region && resource.width <= *width && resource.height <= *height =>
+                    {
+                        (*width, *height)
+                    }
+                    _ => (resource.width, resource.height),
+                };
                 validate_sampled_resident(
                     resource.binding,
                     identity,
-                    resource.width,
-                    resource.height,
+                    expect_width,
+                    expect_height,
                     resource.multisampled,
                     held.as_ref().map(|held| (held.4, held.5, held.6, held.7)),
                     prior,
@@ -4495,7 +4509,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 // A whole guest mip chain when the runtime named one and every
                 // level is a ready resident of its own extent; otherwise level 0
                 // alone, as before, counted.
-                if self_slot.is_none() && !swizzled {
+                if self_slot.is_none() && !swizzled && !region {
                     if let Some(pyramid) = req.sampled_pyramids.iter().find(|p| {
                         p.binding == resource.binding
                             && p.array_element == resource.array_element
@@ -4535,18 +4549,26 @@ pub(crate) unsafe fn execute_draw_inner(
                         }
                     }
                 }
-                if let Some(_attachment_index) = feedback_color_index(
-                    req,
-                    resource,
-                    ctx.features.attachment_feedback_loop_layout,
-                ) {
+                if let Some(_attachment_index) = (!region)
+                    .then(|| {
+                        feedback_color_index(
+                            req,
+                            resource,
+                            ctx.features.attachment_feedback_loop_layout,
+                        )
+                    })
+                    .flatten()
+                {
                     crate::runtime::drain::note_store_route("sampled_self_feedback_loop");
                     sampled.push(PreparedSampled::Feedback {
                         binding: resource.binding,
                         array_element: resource.array_element,
                         view: source_view,
                     });
-                } else if self_slot.is_some() || swizzled {
+                } else if self_slot.is_some() || swizzled || region {
+                    if region {
+                        crate::runtime::drain::note_store_route("lab_rtv_gpu_snapshot");
+                    }
                     match self_slot {
                         // Which attachment this draw is sampling of its own. The
                         // primary is the case this arm has always taken; the

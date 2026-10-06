@@ -3338,7 +3338,38 @@ fn unused_binds_disabled() -> bool {
 /// visible while declining nothing. The caller checks the attribute list it
 /// already has.
 pub fn may_serve_neutral(access: ReflectedBufferAccess, feeds_stage_in: bool) -> bool {
-    matches!(access, ReflectedBufferAccess::Unused) && !feeds_stage_in && !unused_binds_disabled()
+    let unread = match access {
+        ReflectedBufferAccess::Unused => true,
+        // TEMP (lab, ABSENT_NEUTRAL): a render-stage bind at an index the
+        // stage's module declares no buffer at is read by nothing in that
+        // module — there is no descriptor for it — and the stage-in use the
+        // `Absent` doc warns about is excluded by `feeds_stage_in`, which the
+        // vertex caller answers from the attribute list and the fragment
+        // caller answers `false` because a fragment stage has no stage-in.
+        // These are the encoder's leftover binds from earlier pipelines: p046
+        // counted ~250k a phase, nearly every whole fragment bind (24 GB of
+        // windows resolved, debt-checked and staged for nothing).
+        ReflectedBufferAccess::Absent => lab_absent_neutral(),
+        _ => false,
+    };
+    unread && !feeds_stage_in && !unused_binds_disabled()
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_ABSENT_NEUTRAL` (live `ABSENT_NEUTRAL=on|off`,
+/// off unless `=on`): see [`may_serve_neutral`]. Off under test.
+pub fn lab_absent_neutral() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("ABSENT_NEUTRAL") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(std::env::var("REIMS_VGPU_LAB_ABSENT_NEUTRAL").as_deref(), Ok("on"));
+        crate::observe::off(format!("lab_absent_neutral on={}", u8::from(on)));
+        on
+    })
 }
 
 /// Whether the shader declares a `[[buffer(n)]]` argument at `metal_index` (as
