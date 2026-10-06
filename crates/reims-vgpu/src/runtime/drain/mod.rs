@@ -2343,7 +2343,7 @@ fn lab_exec_write_tokens(
     use reims_vgpu_core::exec::ResolvedOperation;
     use reims_vgpu_core::render::RenderOp;
 
-    let mut name = |texture_ref: u32, names: &mut AheadNames| {
+    let name = |texture_ref: u32, names: &mut AheadNames| {
         if texture_ref == 0 || !names.seen.insert((task_id, texture_ref)) {
             return;
         }

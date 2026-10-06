@@ -65,6 +65,13 @@ pub const MAX_DEBTS: usize = 32;
 /// samples). Latched; [`MAX_DEBTS`] outside the lab.
 pub fn lab_max_debts() -> usize {
     use std::sync::OnceLock;
+    // Live (`MAX_DEBTS=N` in the lab live file): a bound, read where the ledger
+    // is trimmed or armed, so a change moves only what is paid after it.
+    if let Some(n) = crate::runtime::lab_live::value("MAX_DEBTS")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return n.clamp(MAX_DEBTS, 1024);
+    }
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         let n = std::env::var("REIMS_VGPU_LAB_MAX_DEBTS")

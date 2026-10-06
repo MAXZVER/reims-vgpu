@@ -276,6 +276,15 @@ fn worker_spin() -> Duration {
 /// reported up to N-1 draws later, which those draws' preparation has run past
 /// (observations, caches and debt payment, correct on their own). Read once.
 pub(crate) fn depth() -> u32 {
+    // Live (`RECORDER_DEPTH=N` in the lab live file): `submit` reads it per job;
+    // a smaller value than the jobs already out only makes the next submit wait
+    // below it, as a full queue always did.
+    #[cfg(not(test))]
+    if let Some(n) = crate::runtime::lab_live::value("RECORDER_DEPTH")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        return n.clamp(1, 16);
+    }
     static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *DEPTH.get_or_init(|| {
         std::env::var("REIMS_VGPU_LAB_RECORDER_DEPTH")

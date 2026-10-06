@@ -1449,6 +1449,11 @@ fn lab_recorder_gva_store() -> bool {
 /// GVA-resident Store recording past its encode (see `encode_draw_chain`).
 /// On (waiting) by default until measured. Latched.
 fn lab_recorder_store_join() -> bool {
+    // Live (`RECORDER_STORE_JOIN=on|off` in the lab live file): asked at each
+    // record's exit, so a switch moves only the records after it.
+    if let Some(on) = crate::runtime::lab_live::on("RECORDER_STORE_JOIN") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var("REIMS_VGPU_LAB_RECORDER_STORE_JOIN").map_or(true, |v| v != "off");
@@ -3177,6 +3182,15 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         // RGBA8 order and decodes nothing, so the transfer function the guest
         // declared is still the one these bytes carry.
         let source = bt.desc.pixel_format;
+        // TEMP (lab, BUFTEX_ZC): the GPU gathers the window; the CPU convert
+        // below is the fallback for what that rail refuses.
+        if lab_buftex_zc() {
+            if let Some((w, h, request)) =
+                try_buffer_texture_zero_copy(state, host, task_id, texture_ref, &bt)
+            {
+                return Some((w, h, 0, request));
+            }
+        }
         let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)?;
         return Some((
             w,
@@ -7539,6 +7553,138 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             native,
             sampled_vk_format,
             planes,
+            Some(LinearSampleIdentity::from(seen.identity)),
+            seen.vouch,
+            seen.evidence,
+            native_components,
+        ),
+    ))
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_BUFTEX_ZC` (live `BUFTEX_ZC=on|off`, off unless
+/// `=on`): a buffer-backed texture is sampled through the guest-RAM gather
+/// ([`try_buffer_texture_zero_copy`]) instead of being read and converted to
+/// RGBA8 on the drain at every bind.
+pub(crate) fn lab_buftex_zc() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("BUFTEX_ZC") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(std::env::var("REIMS_VGPU_LAB_BUFTEX_ZC").as_deref(), Ok("on"));
+        crate::observe::off(format!("lab_buftex_zc on={}", u8::from(on)));
+        on
+    })
+}
+
+/// TEMP (lab, BUFTEX_ZC): an opcode-9 buffer-backed texture
+/// (`newTextureWithDescriptor:offset:bytesPerRow:` over an `MTLBuffer`) sampled
+/// the way [`try_linear_sample_zero_copy`]'s copied fallback samples a linear
+/// texture: the buffer's window in task memory goes to the engine as guest-RAM
+/// runs with the format's native layout, the GPU copies the texels, and the
+/// gather witness lets an unchanged window bind its retained image again.
+///
+/// What it replaces is [`super::load_buffer_texture_rgba`] on every bind: a
+/// read of the whole buffer, a zeroed `w*h*4` allocation and a per-row
+/// conversion to RGBA8 on the drain, then a content hash in the engine (p032:
+/// ~23 % of `resolve_sampled_source`, ~4 % of the drain on full-screen
+/// transitions). The debts are the CPU path's: the texture's and the buffer's,
+/// and any GVA debt over the window; nothing is read on this thread, so there is
+/// nothing to settle (the GPU reads the runs after any payment on the queue).
+pub(super) fn try_buffer_texture_zero_copy<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    bt: &crate::runtime::decode::resource::BufferTextureDescriptor,
+) -> Option<(u32, u32, SampledSourceRequest)> {
+    use crate::backend::vulkan::engine;
+    let (w, h) = (bt.desc.width, bt.desc.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let fmt = if bt.desc.pixel_format != 0 {
+        bt.desc.pixel_format
+    } else {
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
+    };
+    let (native, sampled_vk_format, native_components) =
+        match translate::pixel::sampled_pixels(fmt) {
+            Ok((layout, _decline, components)) => {
+                if !engine::supports_sampled_layout_bind(layout) {
+                    crate::runtime::drain::note_store_route("lab_buftex_zc_unfilterable");
+                    return None;
+                }
+                (layout, translate::pixel::translate(fmt).ok()?.vk, components)
+            }
+            Err(_) => {
+                crate::runtime::drain::note_store_route("lab_buftex_zc_no_layout");
+                return None;
+            }
+        };
+    let bpp = u64::from(native.bytes_per_texel());
+    let tight = u64::from(w).checked_mul(bpp)?;
+    let bpr = if bt.bytes_per_row == 0 {
+        tight
+    } else {
+        bt.bytes_per_row
+    };
+    if bpr < tight {
+        return None;
+    }
+    let (span, row_length_texels) = strided_window_extent(w, h, bpp, bpr)?;
+    let backing = super::resolve_buffer_backing(state, host, task_id, bt.buffer_ref, None)?;
+    if bt.offset.checked_add(span)? > backing.size {
+        crate::runtime::drain::note_store_route("lab_buftex_zc_past_buffer");
+        return None;
+    }
+    if !sampled_gather_floor_admits(SampledFloorRail::Linear, native, span) {
+        crate::runtime::drain::note_store_route("lab_buftex_zc_under_floor");
+        return None;
+    }
+    let gva = backing.gva.checked_add(bt.offset)?;
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, bt.buffer_ref);
+    crate::runtime::writeback_debt::pay_gva_overlapping(state, host, task_id, gva, span);
+    let (gpas, runs) = match task_gva_guest_run_window(state, host, task_id, gva, span) {
+        Ok(window) => window,
+        Err(_) => {
+            crate::runtime::drain::note_store_route("lab_buftex_zc_no_window");
+            return None;
+        }
+    };
+    let page = state.page_size() as usize;
+    let seen = crate::runtime::gather_witness::note_gather(
+        state,
+        host,
+        crate::runtime::gather_witness::GatherRail::Linear,
+        crate::runtime::gather_witness::GatherKey::TaskGva { task_id, gva },
+        crate::runtime::gather_witness::GatherWindow {
+            gpas: &gpas,
+            runs: &runs,
+            span,
+            page_size: page,
+        },
+    );
+    crate::runtime::drain::note_store_route("lab_buftex_zc_served");
+    Some((
+        w,
+        h,
+        SampledSourceRequest::GuestRuns(
+            engine::GuestRunSource {
+                runs: std::sync::Arc::new(runs),
+                source_offset: 0,
+                total_len: span,
+                row_length_texels,
+                pages: guest_page_window(host, &gpas, page as u64, gva % page as u64, span),
+                direct_image: None,
+            },
+            native,
+            sampled_vk_format,
+            1,
             Some(LinearSampleIdentity::from(seen.identity)),
             seen.vouch,
             seen.evidence,

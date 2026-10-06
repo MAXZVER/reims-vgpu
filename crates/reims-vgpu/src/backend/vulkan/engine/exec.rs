@@ -2385,6 +2385,12 @@ fn lab_mrt_batch() -> bool {
             _ => {}
         }
     }
+    // Live (`MRT_BATCH=on|off` in the lab live file): the rule is asked per
+    // draw, so a switch moves only the draws after it.
+    #[cfg(not(test))]
+    if let Some(on) = crate::runtime::lab_live::on("MRT_BATCH") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
