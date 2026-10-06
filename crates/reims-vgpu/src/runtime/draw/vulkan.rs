@@ -4862,8 +4862,15 @@ fn try_ref_texture_view_from_resident<M: HostMemory + HostOps>(
     match top.outcome {
         sample_plan::TopOutcome::Direct | sample_plan::TopOutcome::Resident => {
             // The resident must hold the surface's own texels: the size check
-            // above was made against the surface's declared format.
-            if !base_formats.is_some_and(|f| f.contains(&top.resident_id.resident_format())) {
+            // above was made against the surface's declared format. Asked of
+            // the format the image is actually allocated in - what a direct
+            // bind of it samples ([`surface_sample_format`]) - not of the
+            // identity's key format: a surface identity is keyed in scanout
+            // order whatever its texels, so an R8 mask's resident read as
+            // B8G8R8A8 here and every view of it was refused (p064: 17 of 17
+            // once the witness stopped reporting the device's own payments).
+            let held = surface_sample_format(state, mid, &top.resident_id);
+            if !base_formats.is_some_and(|f| f.contains(&held)) {
                 return refuse("lab_rtv_gpu_resident_format");
             }
             for route in &top.routes {

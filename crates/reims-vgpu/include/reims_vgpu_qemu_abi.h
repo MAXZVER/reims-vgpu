@@ -21,7 +21,11 @@
 extern "C" {
 #endif
 
-/* v27: ReimsVgpuHostOps.guest_write_sync_ahead — TEMP lab SYNC_AHEAD: queue the named tracked
+/* v28: ReimsVgpuHostOps.guest_write_rebase - the device itself just stored into these pages of a
+ *      tracked set (a writeback landing a GPU frame): a set the tracker answers for by hashing page
+ *      content takes their content as its baseline, so the device's own stores do not read back as
+ *      the guest writing the surface. NULL: no rebase (a hashed set reports them, as before).
+ * v27: ReimsVgpuHostOps.guest_write_sync_ahead — TEMP lab SYNC_AHEAD: queue the named tracked
  *      sets for the dirty tracker's workers to bring up to date now, without waiting, so the
  *      reads a pass makes later (its planned binds) find them synced. NULL: no such queue.
  * v26: ReimsVgpuHostOps.guest_write_sync_many — TEMP lab PREP_SYNC: bring the named tracked
@@ -128,7 +132,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 27u
+#define REIMS_VGPU_QEMU_ABI_VERSION 28u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -478,6 +482,13 @@ typedef struct ReimsVgpuHostOps {
      * skipped; a read that arrives first syncs as before. Safe from any thread. NULL: no queue.
      */
     void (*guest_write_sync_ahead)(void *ctx, const uint64_t *tokens, size_t count);
+    /*
+     * The device itself just stored into these `count` page-aligned GPAs of `token`'s tracked set.
+     * A set the tracker answers for by hashing page content re-takes their hashes as its baseline,
+     * so its generation moves only for stores made after this; any other set ignores it. Waits for
+     * a sync of the set already running. Safe from any thread. NULL: no rebase.
+     */
+    void (*guest_write_rebase)(void *ctx, uint64_t token, const uint64_t *gpas, size_t count);
 } ReimsVgpuHostOps;
 
 /*

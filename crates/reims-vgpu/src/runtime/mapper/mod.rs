@@ -3299,10 +3299,85 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
         only,
         "mapping_write",
     );
+    if ok {
+        rebase_device_write(state, &*host, mapping_id, off, off.saturating_add(buf.len() as u64), only);
+    }
     if let Some(m) = state.mappings.get_mut(&mapping_id) {
         m.guest_bytes_seq = m.guest_bytes_seq.wrapping_add(1);
     }
     ok
+}
+
+/// TEMP (lab, live `GW_REBASE=on|off`, off by default until its A/B): whether
+/// [`rebase_device_write`] tells the host about the device's own stores.
+fn lab_gw_rebase() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    crate::runtime::lab_live::on("GW_REBASE").unwrap_or(false)
+}
+
+/// The device's own stores just landed in `[off, end)` of `mapping_id` (only
+/// the parts `only` names, when given): hand the pages they touched to the
+/// mapping's guest-write witness ([`HostOps::guest_write_rebase`]).
+///
+/// The witness exists to see the guest CPU's stores, which no device operation
+/// announces. A host that watches a set by hashing its pages' content (Intel:
+/// every set up to `DIRTY_HASH_MAX` pages that is cheaper to hash than to
+/// query) sees content, not stores, so without this a writeback the device
+/// lands here — a trim payment at a tranche end, a reader's payment — reads
+/// back at the next sync as the guest writing the surface's pixels: the next
+/// bind refuses the resident the frame came from (an overlay or a whole-frame
+/// merge), and a view over it is refused as not current (p058: the transition
+/// mask, `gw=Wrote` on 1194 of its 2369 pages).
+///
+/// Whole pages are handed over, so a guest store into the unwritten rest of a
+/// page this write touched, made since the set's last sync, is taken in with
+/// the device's: the same window in which a guest store into the written part
+/// is already lost under the device's bytes.
+fn rebase_device_write<H: HostOps>(
+    state: &DeviceState,
+    host: &H,
+    mapping_id: u32,
+    off: u64,
+    end: u64,
+    only: Option<&[(u64, u64)]>,
+) {
+    if !lab_gw_rebase() {
+        return;
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return;
+    };
+    // A token built for another page list watches pages this surface no longer
+    // owns (see `MappingEntry::guest_write_token_gen`).
+    if m.guest_write_token == 0 || m.guest_write_token_gen != m.map_generation {
+        return;
+    }
+    let shift = state.page_shift;
+    let page = 1u64 << shift;
+    let mut gpas: Vec<u64> = Vec::new();
+    let mut next = 0u64; // the first page index not yet handed over
+    for (lo, hi) in selected_within(only, off, end) {
+        let first = (lo >> shift).max(next);
+        let last = hi.div_ceil(page);
+        for p in first..last {
+            if let Some(gpa) = m
+                .page_entries
+                .get(p as usize)
+                .and_then(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, shift))
+            {
+                gpas.push(gpa);
+            }
+        }
+        next = next.max(last);
+    }
+    if gpas.is_empty() {
+        return;
+    }
+    host.guest_write_rebase(m.guest_write_token, &gpas);
+    crate::runtime::drain::note_store_route("gw_rebase_writes");
+    crate::runtime::drain::note_store_route_n("gw_rebase_pages", gpas.len() as u64);
 }
 
 /// Read mapping linear `[off, off+buf.len())` via packed map_pages runs.

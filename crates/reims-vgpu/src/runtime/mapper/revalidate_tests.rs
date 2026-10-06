@@ -742,6 +742,37 @@ mod par_land {
         ]
     }
 
+    /// The device's own landing hands the guest-write witness exactly the pages
+    /// it touched - whole pages, in the mapping's own order, each once - so a
+    /// hashed set takes them as its baseline instead of reporting them as the
+    /// guest's at its next sync.
+    #[test]
+    fn a_device_landing_hands_the_witness_the_pages_it_touched() {
+        let order = scrambled();
+        let (mut state, mut host, mid) = fixture(&order, false);
+        let token = ensure_guest_write_token(&mut state, &mut host, mid).expect("tracked");
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let end = PAGES as u64 * page - 300;
+        rebase_device_write(&state, &host, mid, 100, end, Some(&selection()));
+        let expected: Vec<u64> = [0usize, 1, 3, 4, 5, 6, 7, 8, 20]
+            .into_iter()
+            .chain(25..=90)
+            .map(|i| BASE + order[i] as u64 * page)
+            .collect();
+        assert_eq!(*host.rebased.borrow(), vec![(token, expected)]);
+    }
+
+    /// A token built for an earlier page list watches pages the surface no
+    /// longer owns: nothing is handed to it.
+    #[test]
+    fn a_landing_under_a_moved_page_list_hands_over_nothing() {
+        let (mut state, mut host, mid) = fixture(&scrambled(), false);
+        ensure_guest_write_token(&mut state, &mut host, mid).expect("tracked");
+        state.mappings.get_mut(&mid).unwrap().map_generation += 1;
+        rebase_device_write(&state, &host, mid, 0, 4096, None);
+        assert!(host.rebased.borrow().is_empty());
+    }
+
     #[test]
     fn a_pooled_landing_writes_what_the_serial_walk_writes() {
         let (serial, pooled, answer) = land_both(&scrambled(), 100, &selection());

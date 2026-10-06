@@ -168,6 +168,11 @@ pub struct ReimsVgpuHostOps {
     /// workers to sync now, without waiting; see the ABI header.
     pub guest_write_sync_ahead:
         Option<unsafe extern "C" fn(ctx: *mut c_void, tokens: *const u64, count: usize)>,
+    /// The device itself just stored into these pages of a tracked set: a
+    /// hashed set takes their content as its baseline; see the ABI header.
+    pub guest_write_rebase: Option<
+        unsafe extern "C" fn(ctx: *mut c_void, token: u64, gpas: *const u64, count: usize),
+    >,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -288,6 +293,7 @@ impl ReimsVgpuHostOps {
             note_ring_tail: None,
             guest_write_sync_many: None,
             guest_write_sync_ahead: None,
+            guest_write_rebase: None,
         }
     }
 }
@@ -594,6 +600,18 @@ impl ReimsVgpuHostOps {
             Some(f) => unsafe { f(self.ctx, gpa) != 0 },
             // Older/missing table: do not invent a reject (map_pages still RAM-checks).
             None => true,
+        }
+    }
+
+    /// [`HostOps::guest_write_rebase`].
+    pub(crate) fn rebase(&self, token: u64, gpas: &[u64]) {
+        if token == 0 || gpas.is_empty() {
+            return;
+        }
+        if let Some(f) = self.guest_write_rebase {
+            // SAFETY: QEMU owns ctx; the slice outlives the call, which reads
+            // it in place and keeps no pointer into it.
+            unsafe { f(self.ctx, token, gpas.as_ptr(), gpas.len()) }
         }
     }
 
@@ -1082,6 +1100,10 @@ impl HostOps for QemuHost<'_> {
         }
     }
 
+    fn guest_write_rebase(&self, token: u64, gpas: &[u64]) {
+        self.ops.rebase(token, gpas);
+    }
+
     fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
         self.ops.written_pages(token, since_gen)
     }
@@ -1271,6 +1293,10 @@ impl HostOps for WorkerHost<'_> {
 
     fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
         self.ops.written_pages(token, since_gen)
+    }
+
+    fn guest_write_rebase(&self, token: u64, gpas: &[u64]) {
+        self.ops.rebase(token, gpas);
     }
 
     /// The host's own answer, not the trait's conservative default. Aliasing

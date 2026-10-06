@@ -682,6 +682,20 @@ pub trait HostOps {
     /// and a read that arrives before a worker syncs as it always did.
     fn guest_write_sync_ahead(&self, _tokens: &[u64]) {}
 
+    /// The device itself just stored into these page-aligned GPAs of the
+    /// tracked set `token` (a writeback landing the frame a resident holds).
+    ///
+    /// A host that watches a set by hashing its pages' content cannot tell
+    /// the device's stores from the guest's: without this, its next sync
+    /// reports the device's own frame as the guest writing the surface, and
+    /// the sampled ladder refuses the very resident that frame came from. The
+    /// host re-takes those pages' hashes as the set's baseline, so the set's
+    /// generation moves only for stores made after this call. A host whose
+    /// witness the device's stores never reach (the hypervisor bitmap, a
+    /// write-protected page written through the host's own mapping) does
+    /// nothing, which is also the default.
+    fn guest_write_rebase(&self, _token: u64, _gpas: &[u64]) {}
+
     /// TEMP (lab, `REIMS_VGPU_LAB_ASYNC_BASELINE`): start the
     /// [`Self::guest_write_gen`] read of `token` on another thread and return
     /// its answer to come. `None` when this host has no such thread — read
@@ -846,6 +860,10 @@ pub struct FakeHost {
     /// hundred existing tests are asserting about; a rail that latches a
     /// baseline should turn it on and prove it recovers.
     pub guest_write_startup_window: bool,
+    /// Every [`HostOps::guest_write_rebase`] call, in order: the token and the
+    /// pages the device handed over. The fixture's witness is the bitmap kind,
+    /// which the device's stores never reach, so it only records them.
+    pub rebased: std::cell::RefCell<Vec<(u64, Vec<u64>)>>,
 }
 
 #[cfg(test)]
@@ -1519,6 +1537,10 @@ impl HostOps for FakeHost {
             .get(&token)
             .map(|s| s.gen_)
             .filter(|gen_| *gen_ != 0)
+    }
+
+    fn guest_write_rebase(&self, token: u64, gpas: &[u64]) {
+        self.rebased.borrow_mut().push((token, gpas.to_vec()));
     }
 
     fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
