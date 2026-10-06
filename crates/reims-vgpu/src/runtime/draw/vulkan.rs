@@ -6770,6 +6770,18 @@ fn gva_resident_ready(
     ready
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_ADMIT_AHEAD`): the write-tracking token of the
+/// surface `texture_ref` names, as the sampled planner names it
+/// (`sample_plan::plan_guest_write_token`), for the drain's admission batch to
+/// hand to the tracker's sync workers before the batch runs.
+pub(crate) fn lab_guest_write_token(
+    state: &DeviceState,
+    texture_ref: u32,
+    resource: &crate::model::TaskResource,
+) -> Option<u64> {
+    sample_plan::plan_guest_write_token(state, texture_ref, resource)
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_GPU_CLEAR` lands a clear-only pass over a GVA
 /// target in the target's resident on the GPU and defers the guest pages to
 /// the writeback debt, instead of filling them on the drain thread
@@ -11825,6 +11837,45 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             .as_ref()
                             .map(|identity| identity.resident_format())
                             .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
+                        // TEMP (lab, PRIVATE_GPU census): whose window this door
+                        // reads — an IOSurface, a Private GVA target this device
+                        // stored before, or one it never stored (contents
+                        // undefined by contract), in texels.
+                        {
+                            let class = if c0.mapping_id != 0 {
+                                "lab_preserve_mapping"
+                            } else {
+                                match crate::runtime::writeback_debt::lab_target_storage_mode(
+                                    state,
+                                    req.task_id,
+                                    c0.texture_ref,
+                                ) {
+                                    Some(2)
+                                        if state
+                                            .gva_store_witness
+                                            .stored_ref(req.task_id, c0.texture_ref) =>
+                                    {
+                                        "lab_preserve_gva_private_stored"
+                                    }
+                                    Some(2) => "lab_preserve_gva_private_unstored",
+                                    _ => "lab_preserve_gva_other",
+                                }
+                            };
+                            crate::runtime::drain::note_store_route(class);
+                            crate::runtime::drain::note_store_route_n(
+                                match class {
+                                    "lab_preserve_mapping" => "lab_preserve_mapping_px",
+                                    "lab_preserve_gva_private_stored" => {
+                                        "lab_preserve_gva_private_stored_px"
+                                    }
+                                    "lab_preserve_gva_private_unstored" => {
+                                        "lab_preserve_gva_private_unstored_px"
+                                    }
+                                    _ => "lab_preserve_gva_other_px",
+                                },
+                                u64::from(w) * u64::from(h),
+                            );
+                        }
                         match try_preserve_seed_from_guest_window(
                             state,
                             host,

@@ -2283,12 +2283,129 @@ fn distinct_bind_refs(work: &reims_vgpu_core::exec::ExecWork) -> Vec<u32> {
     refs
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_ADMIT_AHEAD=<K>`, live `ADMIT_AHEAD=<K>`): how
+/// many consecutive EXEC packets the child drain admits under one tail read
+/// before it runs any of them; 0 or 1 is today's admit-then-run.
+///
+/// The drain's largest single cost on full-screen transitions is the
+/// foreground dirty sync (p031: 23.6k syncs, 3.07 s of 13.6 s drain busy in
+/// one 80 s phase; 71 % of them sets the prefetch had not reached). A packet's
+/// reads need the guest's stores ordered before its doorbell, and every packet
+/// under one tail read is covered by the epoch that read opens — so a batch
+/// admitted under one read can name every write-tracked surface it touches to
+/// the tracker's sync workers ([`HostOps::guest_write_sync_ahead`]) before the
+/// first of them runs, and the syncs run on seven threads at once instead of
+/// one at a time on the drain, each as the drain reaches it. Admission is the
+/// ordering model's own parking: a packet admitted early holds its position
+/// and runs in ring order, exactly as one waiting on a stamp does. Only EXECs
+/// are batched — a non-EXEC packet (a re-point acts at arrival) is read only
+/// after every EXEC before it has run.
+fn lab_admit_ahead() -> usize {
+    if cfg!(test) {
+        return 0;
+    }
+    if let Some(v) = crate::runtime::lab_live::value("ADMIT_AHEAD") {
+        return v.trim().parse::<usize>().unwrap_or(0).min(64);
+    }
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let k = std::env::var("REIMS_VGPU_LAB_ADMIT_AHEAD")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(64);
+        crate::observe::off(format!("lab_admit_ahead k={k}"));
+        k
+    })
+}
+
+/// TEMP (lab, ADMIT_AHEAD): the write-tracking tokens an admission batch has
+/// named so far, and the `(task, ref)` pairs already looked at.
+#[derive(Default)]
+struct AheadNames {
+    seen: std::collections::HashSet<(u32, u32)>,
+    named: std::collections::HashSet<u64>,
+    tokens: Vec<u64>,
+    /// Of `tokens`, how many are GVA witness targets (census).
+    gva: u64,
+}
+
+/// TEMP (lab, ADMIT_AHEAD): every write-tracked surface an admitted EXEC binds,
+/// renders into, resolves into or copies, as tracker tokens appended to
+/// `names.tokens`. Read-only: a reference not constructed yet names nothing
+/// (its first bind constructs it, and syncs it, as before).
+fn lab_exec_write_tokens(
+    state: &DeviceState,
+    task_id: u32,
+    work: &reims_vgpu_core::exec::ExecWork,
+    names: &mut AheadNames,
+) {
+    use reims_vgpu_core::exec::ResolvedOperation;
+    use reims_vgpu_core::render::RenderOp;
+
+    let mut name = |texture_ref: u32, names: &mut AheadNames| {
+        if texture_ref == 0 || !names.seen.insert((task_id, texture_ref)) {
+            return;
+        }
+        // The GVA target this texture's last deferred Store stamped: its next
+        // Store's witness stamp is a synced read of that set on this thread.
+        if let Some(token) = state.gva_store_witness.token_for_ref(task_id, texture_ref) {
+            if names.named.insert(token) {
+                names.gva += 1;
+                names.tokens.push(token);
+            }
+        }
+        let Some(resource) = state.constructed_object(task_id, texture_ref) else {
+            return;
+        };
+        #[cfg(feature = "backend-vulkan")]
+        if let Some(token) =
+            crate::runtime::draw::vulkan::lab_guest_write_token(state, texture_ref, &resource)
+        {
+            if names.named.insert(token) {
+                names.tokens.push(token);
+            }
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        let _ = resource;
+    };
+    let mut parts = Vec::new();
+    for record in work.records() {
+        if let ResolvedOperation::Render(op) = &record.op {
+            match op {
+                RenderOp::BindTextures { entries, .. } => {
+                    for b in work.arenas.object_bindings.get(entries.range()).unwrap_or(&[]) {
+                        if let Some(object) = b.object {
+                            name(object.slot.0, names);
+                        }
+                    }
+                }
+                RenderOp::BindBuffers { entries, .. }
+                | RenderOp::BindBuffersWithStride { entries, .. } => {
+                    for b in work.arenas.buffer_bindings.get(entries.range()).unwrap_or(&[]) {
+                        if let Some(buffer) = b.buffer {
+                            name(buffer.slot.0, names);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        parts.clear();
+        record.op.participations(&work.arenas, &mut parts);
+        for p in &parts {
+            name(p.resource.slot.0, names);
+        }
+    }
+}
+
 fn admit_and_park<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     fifo: crate::runtime::ingress::Fifo,
     completion_slot: u32,
     packet: Packet,
+    ahead: Option<&mut AheadNames>,
 ) {
     use reims_vgpu_core::identity::StampSlot;
 
@@ -2570,6 +2687,18 @@ fn admit_and_park<H: HostMemory + HostOps>(
             if arrival_declare_on() {
                 arrival_declare(state, host, task_id, &refs);
             }
+        }
+    }
+    // TEMP (lab, ADMIT_AHEAD): name this EXEC's surfaces to the sync workers
+    // now, while the packets admitted before it in the batch still wait to run.
+    if let (Some(names), Some(submission), Some(work)) =
+        (ahead, arrived.submission.as_ref(), resolved.as_ref())
+    {
+        let from = names.tokens.len();
+        lab_exec_write_tokens(state, submission.task_id(), work, names);
+        if names.tokens.len() > from {
+            note_store_route_n("lab_admit_ahead_tokens", (names.tokens.len() - from) as u64);
+            host.guest_write_sync_ahead(&names.tokens[from..]);
         }
     }
     let work = match (arrived.submission, resolved) {
@@ -5066,6 +5195,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                     crate::runtime::ingress::Fifo::ROOT,
                     ROOT_STAMP_SLOT,
                     packet,
+                    None,
                 );
                 settle_model_work(state, host);
             }
@@ -8166,47 +8296,79 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 });
                 break;
             }
-            Arrival::Packet(packet) => {
+            Arrival::Packet(first) => {
                 lab_consumed = true;
-                host.note_work_scope(crate::runtime::host::WorkScope::PacketRead(channel_id));
-                // The census the model's own stamp plane now acts on. Asked for
-                // the reading and not for a verdict: a wait that is not yet met
-                // is an ordering position in `admit`, not a ring head this loop
-                // refuses to move.
-                note_packet_stamp_waits(state, host, Some(channel_id), &packet);
+                // TEMP (lab, ADMIT_AHEAD): the EXECs right behind an EXEC under
+                // this same tail read are admitted before any of them runs, and
+                // their surfaces named to the tracker's sync workers; see
+                // [`lab_admit_ahead`]. Off (0/1): one packet, as always.
+                let ahead_k = if first.opcode == CHILD_OP_EXEC_INDIRECT2 {
+                    lab_admit_ahead()
+                } else {
+                    0
+                };
+                let mut names = (ahead_k > 1).then(AheadNames::default);
+                let mut batch = 0usize;
+                let mut next = Some(first);
+                while let Some(packet) = next.take() {
+                    host.note_work_scope(crate::runtime::host::WorkScope::PacketRead(channel_id));
+                    // The census the model's own stamp plane now acts on. Asked for
+                    // the reading and not for a verdict: a wait that is not yet met
+                    // is an ordering position in `admit`, not a ring head this loop
+                    // refuses to move.
+                    note_packet_stamp_waits(state, host, Some(channel_id), &packet);
 
-                // **The head advances first, and unconditionally.** Everything
-                // this packet needs has been taken out of the ring — the
-                // snapshot is decoded and the exec class's command buffers are
-                // read at arrival — so the ring position is free whatever the
-                // model then decides. That is the switch: a packet that cannot
-                // run yet holds an ordering position instead of a consumer
-                // pointer, and the packets behind it are not behind anything.
-                head = packet.next_head;
-                let head_started = std::time::Instant::now();
-                let head_write = gpa_map::write_u32(
-                    host,
-                    regs_gpa + CHILD_REG_HEAD,
-                    head,
-                    state.page_size() as usize,
-                );
-                census::note_drain_regs(
-                    census::RegsOp::HeadWrite,
-                    head_started.elapsed().as_nanos() as u64,
-                );
-                if head_write.is_err() {
-                    // The consumer pointer never advanced: the next drain
-                    // re-reads the stale head and admits the same packets again.
-                    // Fail-visible so that silent replay is diagnosable
-                    // (drain.rs Rank-1 audit).
-                    state.record_fail(FailEvent::MalformedChildPacket {
-                        channel: channel_id,
-                        fault: PacketFault::ChildHeadWriteback,
+                    // **The head advances first, and unconditionally.** Everything
+                    // this packet needs has been taken out of the ring — the
+                    // snapshot is decoded and the exec class's command buffers are
+                    // read at arrival — so the ring position is free whatever the
+                    // model then decides. That is the switch: a packet that cannot
+                    // run yet holds an ordering position instead of a consumer
+                    // pointer, and the packets behind it are not behind anything.
+                    head = packet.next_head;
+                    let head_started = std::time::Instant::now();
+                    let head_write = gpa_map::write_u32(
+                        host,
+                        regs_gpa + CHILD_REG_HEAD,
                         head,
-                    });
-                }
+                        state.page_size() as usize,
+                    );
+                    census::note_drain_regs(
+                        census::RegsOp::HeadWrite,
+                        head_started.elapsed().as_nanos() as u64,
+                    );
+                    if head_write.is_err() {
+                        // The consumer pointer never advanced: the next drain
+                        // re-reads the stale head and admits the same packets again.
+                        // Fail-visible so that silent replay is diagnosable
+                        // (drain.rs Rank-1 audit).
+                        state.record_fail(FailEvent::MalformedChildPacket {
+                            channel: channel_id,
+                            fault: PacketFault::ChildHeadWriteback,
+                            head,
+                        });
+                    }
 
-                admit_and_park(state, host, fifo, stamp_index, packet);
+                    admit_and_park(state, host, fifo, stamp_index, packet, names.as_mut());
+                    batch += 1;
+                    // Only another EXEC joins the batch, and only one this read
+                    // already covers: anything else is read again, after the
+                    // batch has run, by the loop above.
+                    if names.is_some() && batch < ahead_k && head != tail {
+                        if let Arrival::Packet(p) = arrival(&ring, host, head, tail) {
+                            if p.opcode == CHILD_OP_EXEC_INDIRECT2 {
+                                next = Some(p);
+                            }
+                        }
+                    }
+                }
+                if batch > 1 {
+                    note_store_route("lab_admit_ahead_batches");
+                    note_store_route_n("lab_admit_ahead_packets", batch as u64);
+                }
+                if let Some(n) = names.as_ref().filter(|n| n.gva > 0) {
+                    note_store_route_n("lab_admit_ahead_gva_tokens", n.gva);
+                }
                 settle_model_work(state, host);
 
                 if state.pending.host_action_yield {

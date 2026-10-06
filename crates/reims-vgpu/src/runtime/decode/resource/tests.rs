@@ -1460,6 +1460,39 @@ fn a_sample_count_is_read_only_from_a_trailer_that_corroborates_the_extent() {
     assert_eq!(d.height, 300);
 }
 
+/// TEMP (lab, PRIVATE_GPU): the storage mode is `resource_options[7:4]`, four
+/// bytes past the sample count, and is read under the same corroboration.
+#[test]
+fn the_storage_mode_is_read_only_from_a_corroborated_trailer() {
+    use crate::protocol::endian::{st16, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let build = |trailer_w: u32, options: u16| {
+        let mut b = vec![0u8; TEXTURE_DESC_BASE_LEN];
+        st64(&mut b[0..], 0x10000);
+        st32(&mut b[8..], 0x10);
+        st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 1200);
+        st32(&mut b[TEXTURE_DESC_WIDTH..], 300);
+        st32(&mut b[TEXTURE_DESC_HEIGHT..], 300);
+        st16(&mut b[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
+        st32(&mut b[TEXTURE_DESC_TRAILER_WIDTH..], trailer_w);
+        st32(&mut b[TEXTURE_DESC_TRAILER_HEIGHT..], 300);
+        st16(&mut b[TEXTURE_DESC_SAMPLE_COUNT..], 1);
+        st16(&mut b[TEXTURE_DESC_RESOURCE_OPTIONS..], options);
+        b
+    };
+    // `MTLResourceStorageModePrivate` with the default cache mode: 0x0020.
+    let d = decode_texture_descriptor(&build(300, 0x0020)).unwrap();
+    assert_eq!(d.storage_mode, Some(2));
+    // Shared, write-combined: 0x0001.
+    let d = decode_texture_descriptor(&build(300, 0x0001)).unwrap();
+    assert_eq!(d.storage_mode, Some(0));
+    // A trailer that contradicts the extent establishes nothing.
+    let d = decode_texture_descriptor(&build(301, 0x0020)).unwrap();
+    assert_eq!(d.storage_mode, None);
+    const _: () = assert!(TEXTURE_DESC_RESOURCE_OPTIONS == TEXTURE_DESC_SAMPLE_COUNT + 4);
+    const _: () = assert!(TEXTURE_DESC_RESOURCE_OPTIONS + 2 <= TEXTURE_DESC_BASE_LEN);
+}
+
 /// The two trailer offsets are fixed distances from the anchor, so a change to
 /// the anchor moves all three together and cannot desynchronise them.
 #[test]

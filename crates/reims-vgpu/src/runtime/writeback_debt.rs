@@ -2185,10 +2185,33 @@ fn gva_writeback_is_recoverable<B: crate::backend::Backend, M: HostMemory + Host
         crate::runtime::drain::note_store_route("gvadebt_arm_unnamed");
         return false;
     };
-    let undeclared = !state
-        .buffer_write_gen
-        .declared(plane.resource.task_id, plane.resource.texture_ref);
-    crate::runtime::gva_store_witness::note_store_deferral(state, host, key, &ordered, undeclared);
+    let (task_id, texture_ref) = (plane.resource.task_id, plane.resource.texture_ref);
+    let storage = lab_target_storage_mode(state, task_id, texture_ref);
+    crate::runtime::drain::note_store_route(match storage {
+        Some(0) => "lab_gva_target_shared",
+        Some(1) => "lab_gva_target_managed",
+        Some(2) => "lab_gva_target_private",
+        Some(3) => "lab_gva_target_memoryless",
+        Some(_) => "lab_gva_target_storage_other",
+        None => "lab_gva_target_storage_unknown",
+    });
+    if storage == Some(2) && lab_private_gpu() {
+        crate::runtime::gva_store_witness::note_store_contract_quiet(
+            state,
+            key,
+            &ordered,
+            task_id,
+            texture_ref,
+        );
+    } else {
+        let undeclared = !state.buffer_write_gen.declared(task_id, texture_ref);
+        crate::runtime::gva_store_witness::note_store_deferral(
+            state, host, key, &ordered, undeclared,
+        );
+        state
+            .gva_store_witness
+            .note_ref_target(task_id, texture_ref, key);
+    }
     if crate::runtime::gva_store_witness::armed(state, key) {
         true
     } else {
@@ -2233,7 +2256,48 @@ pub fn retire_gva_for_task(state: &mut DeviceState, task_id: u32) -> usize {
 }
 
 /// Retire one resource at its explicit lifetime boundary.
+/// TEMP (lab): `REIMS_VGPU_LAB_PRIVATE_GPU` (live `PRIVATE_GPU=on|off`, on
+/// unless `=off`): a deferred Store into an `MTLStorageModePrivate` GVA target
+/// arms its writer witness quiet by contract instead of tracking and syncing
+/// the target's pages — see
+/// [`crate::runtime::gva_store_witness::note_store_contract_quiet`]. Every GVA
+/// target the compositor stores is Private (p035/p036 census: ~20-25k a phase,
+/// none other). Default since two ABBA runs in one boot each (Intel, 5K,
+/// full-screen transitions): slow tranches -20 % / -17 %, drain us per draw
+/// -16 % / -17 %, GVA Store routing 1.6-2.3 s -> 0.05 s a phase, mid-transition
+/// snapshots on/off alike, no streaks.
+pub(crate) fn lab_private_gpu() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("PRIVATE_GPU") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_PRIVATE_GPU").map_or(true, |v| v != "off");
+        crate::observe::off(format!("lab_private_gpu on={}", u8::from(on)));
+        on
+    })
+}
+
+/// TEMP (lab, PRIVATE_GPU): the `MTLStorageMode` the texture `(task_id,
+/// texture_ref)` was constructed with, when its descriptor's trailer
+/// corroborated its layout.
+pub(crate) fn lab_target_storage_mode(
+    state: &DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+) -> Option<u8> {
+    let resource = state.constructed_object(task_id, texture_ref)?;
+    match resource.decoded() {
+        Ok(crate::runtime::decode::resource::Descriptor::Texture(t)) => t.storage_mode,
+        _ => None,
+    }
+}
+
 pub fn retire_gva_resource(state: &mut DeviceState, task_id: u32, texture_ref: u32) -> bool {
+    crate::runtime::gva_store_witness::forget_contract_ref(state, task_id, texture_ref);
     let key = GvaResourceKey {
         task_id,
         texture_ref,

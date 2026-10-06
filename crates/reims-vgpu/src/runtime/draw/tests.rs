@@ -7771,6 +7771,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
         // it states no sample count -- which is the honest value for a
         // descriptor nothing corroborated.
         sample_count: None,
+        storage_mode: None,
         levels: vec![TextureLevelLayout {
             offset: 0,
             size: span,

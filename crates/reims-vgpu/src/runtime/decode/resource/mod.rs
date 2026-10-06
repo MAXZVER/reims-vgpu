@@ -524,6 +524,12 @@ pub struct TextureDescriptor {
     pub sample_count: Option<u32>,
     /// Per-mip layouts (index 0 = L0). Empty if geometry incomplete.
     pub levels: Vec<TextureLevelLayout>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_PRIVATE_GPU`): `MTLStorageMode`
+    /// (`resource_options[7:4]` of the trailer, [`TEXTURE_DESC_RESOURCE_OPTIONS`]),
+    /// under the same corroboration as [`Self::sample_count`]: `None` when the
+    /// trailer did not prove its layout. 2 is `MTLStorageModePrivate` — no CPU
+    /// access at all, by contract.
+    pub storage_mode: Option<u8>,
 }
 
 impl TextureDescriptor {
@@ -726,6 +732,13 @@ pub const TEXTURE_DESC_SAMPLE_COUNT: usize = TEXTURE_DESC_PIXEL_FORMAT + 16;
 /// — see [`TextureDescriptor::sample_count`]. Same derivation rule as above.
 pub const TEXTURE_DESC_TRAILER_WIDTH: usize = TEXTURE_DESC_PIXEL_FORMAT + 2;
 pub const TEXTURE_DESC_TRAILER_HEIGHT: usize = TEXTURE_DESC_PIXEL_FORMAT + 6;
+/// `resource_options`, `u16`, in the descriptor trailer: the trailer is the
+/// 32-byte `TextureDescriptorBody` of `reims_vgpu_wire::ops::texture` starting
+/// two bytes before the pixel format (its `packed` word ends with the format),
+/// which puts the sample count at body +18 ([`TEXTURE_DESC_SAMPLE_COUNT`], the
+/// offset this file already reads under corroboration) and the options at
+/// body +22. Same derivation rule as above.
+pub const TEXTURE_DESC_RESOURCE_OPTIONS: usize = TEXTURE_DESC_PIXEL_FORMAT + 20;
 #[cfg(test)]
 pub(crate) const TEXTURE_DESC_BASE_LEN: usize = 116;
 /// Mip level records this device will read from a texture descriptor.
@@ -2331,6 +2344,12 @@ fn decode_texture_dimension_block(
         let (corroborate_w, corroborate_h) = corroborate.unwrap_or((out.width, out.height));
         out.sample_count =
             decode_trailer_sample_count(bytes, format_shift, corroborate_w, corroborate_h);
+        // The options sit four bytes past the sample count in the same trailer,
+        // so they are read only when the trailer corroborated its layout.
+        let ro_off = TEXTURE_DESC_RESOURCE_OPTIONS + format_shift;
+        if out.sample_count.is_some() && bytes.len() >= ro_off + 2 {
+            out.storage_mode = Some(((ld16(&bytes[ro_off..]) >> 4) & 0xf) as u8);
+        }
     } else if crate::observe::first_sight("texture_desc_format_unreachable", levels as u64) {
         // No fallback to the unshifted offset. The fallback's own length test
         // was `TEXTURE_DESC_PIXEL_FORMAT + 2`, so for a single-mip body it
