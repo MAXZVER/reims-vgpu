@@ -2512,6 +2512,41 @@ pub fn supersede_gva_overlapping(state: &mut DeviceState, task_id: u32, gva: u64
     );
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_GPU_CLEAR`): [`supersede_gva_overlapping`] for a
+/// clear that has just landed in `own`'s resident rather than in the guest
+/// pages.
+///
+/// Every other plane over these pages is superseded and its resident released,
+/// exactly as for the CPU clear. The target's own plane is only dropped from
+/// the ledger: its resident now holds the clear, and the caller arms the new
+/// debt on it next — releasing it would abandon the very image the clear went
+/// into.
+pub fn supersede_gva_overlapping_for_gpu_clear(
+    state: &mut DeviceState,
+    own: GvaPlaneKey,
+    span: u64,
+) {
+    if !state.pending_writebacks.is_empty() && span != 0 {
+        let owed = state
+            .pending_writebacks
+            .take_gva_overlapping(own.resource.task_id, own.gva, span);
+        if !owed.is_empty() {
+            let rail = crate::backend::selected();
+            for (plane, debt) in owed {
+                if plane == own {
+                    crate::runtime::drain::note_store_route("lab_gpu_clear_own_debt_replaced");
+                    continue;
+                }
+                crate::runtime::drain::note_store_route("gvadebt_superseded_by_clear");
+                release_gva(rail, debt);
+            }
+        }
+    }
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::ClearOnlyGva,
+    );
+}
+
 /// [`settle_for_mapping`] for a caller that cannot name the mapping it is about
 /// to touch, so it owes every debt.
 pub fn settle_unnamed<M: HostMemory + HostOps>(

@@ -6133,6 +6133,196 @@ pub fn overlay_guest_bytes_onto_resident(
     Ok(Ok(regions.len() as u32))
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_GPU_CLEAR`): why [`clear_resident`] left a
+/// clear-only pass to the CPU rail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClearResidentDecline {
+    /// No resident under this identity: nothing on the GPU to clear, and the
+    /// guest pages are the only copy.
+    NotResident,
+    /// A multisample resident; the clear rail publishes one sample.
+    Multisample,
+    /// An imported resident is the guest allocation itself.
+    GuestBacked,
+    /// A layout a barrier may not name as its source or destination here.
+    LayoutUnusable,
+    /// The resident's allocation is not the attachment's own format (an sRGB
+    /// view over a UNORM allocation, a fallback family), so the clear value's
+    /// encoding would differ from what the guest's attachment stores.
+    FormatDiffers,
+}
+
+impl ClearResidentDecline {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NotResident => "lab_gpu_clear_not_resident",
+            Self::Multisample => "lab_gpu_clear_multisample",
+            Self::GuestBacked => "lab_gpu_clear_guest_backed",
+            Self::LayoutUnusable => "lab_gpu_clear_layout_unusable",
+            Self::FormatDiffers => "lab_gpu_clear_format_differs",
+        }
+    }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_GPU_CLEAR`): land a clear-only pass in its
+/// target's resident, on the queue, and publish the resident as holding it.
+///
+/// # What this replaces
+///
+/// A clear-only pass (`MTLLoadActionClear`, no draws, Store) was executed by
+/// filling the target's guest pages with the clear colour on the drain thread,
+/// and the next pass that LOADs the target then read those same pages back to
+/// seed the resident (or, for a zero colour, probed every byte to prove it zero
+/// and cleared on the GPU anyway). macOS 26 does exactly that to its pooled
+/// glass masks every frame of a full-screen transition: p023 (Intel, 5K, two
+/// Safari phases) — 775 clear-only passes, ~14.7 GB filled and 14.5 GB probed
+/// by the drain, inside the slow tranches a WindowServer swap waits on.
+///
+/// Here the clear is one `vkCmdClearColorImage` on the image the next pass will
+/// load, and the caller arms the same resource-scoped writeback debt a render
+/// Store arms, so the guest pages are written only if something asks for them
+/// (a named synchronize, a fallback reader) — the contract every GPU Store into
+/// this target already has.
+///
+/// # Ordering
+///
+/// As [`overlay_guest_bytes_onto_resident`]: appended to the open batch when
+/// there is one, otherwise its own entry submitted without a wait; the leading
+/// barrier orders it after every earlier use of the image, the trailing one
+/// makes the write visible to every later command and returns the image to the
+/// layout the registry records (or, for an untouched image, to the colour pass
+/// exit layout, recorded as a colour write).
+pub fn clear_resident(
+    identity: &TargetIdentity,
+    attachment_format: ash::vk::Format,
+    clear: types::ColorClearValue,
+) -> Result<Result<(), ClearResidentDecline>, DrawError> {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let Some(slot) = pools.registry_get(identity) else {
+        return Ok(Err(ClearResidentDecline::NotResident));
+    };
+    if slot.sample_count != 1 {
+        return Ok(Err(ClearResidentDecline::Multisample));
+    }
+    if slot.memory.guest_backing().is_some() || slot.memory.is_guest_imported() {
+        return Ok(Err(ClearResidentDecline::GuestBacked));
+    }
+    // `vkCmdClearColorImage` writes through the image's own (allocation)
+    // format, not through the attachment's view: an sRGB declaration over a
+    // UNORM family would store the clear colour unencoded.
+    if slot.format.declared() != attachment_format || slot.format.needs_own_view() {
+        return Ok(Err(ClearResidentDecline::FormatDiffers));
+    }
+    let image = slot.image;
+    let access = slot.access;
+    let old_layout = access.layout();
+    // An untouched image is cleared from UNDEFINED (its contents are about to
+    // be replaced whole) and left where a colour pass would have left it.
+    let (src_stage, src_access, new_access) = match access {
+        pools::ResidentAccess::Untouched => (
+            ash::vk::PipelineStageFlags::TOP_OF_PIPE,
+            ash::vk::AccessFlags::empty(),
+            pools::ResidentAccess::ColorWrite(caches::color0_pass_exit_layout()),
+        ),
+        pools::ResidentAccess::GuestBacking | pools::ResidentAccess::ColorFeedback(_) => {
+            return Ok(Err(ClearResidentDecline::LayoutUnusable));
+        }
+        other => {
+            let (stage, acc) = other.source_scope();
+            (stage, acc, other)
+        }
+    };
+    if matches!(
+        old_layout,
+        ash::vk::ImageLayout::PREINITIALIZED | ash::vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+    ) || (old_layout == ash::vk::ImageLayout::UNDEFINED
+        && access != pools::ResidentAccess::Untouched)
+    {
+        return Ok(Err(ClearResidentDecline::LayoutUnusable));
+    }
+    let final_layout = new_access.layout();
+    unsafe {
+        let appended = pools.batch_open_recording();
+        let (cb, fence) = match appended {
+            Some(pair) => pair,
+            None => {
+                let pair = pools.begin_entry(ctx, counters)?;
+                pools.begin_slot_recording(
+                    ctx,
+                    pair.0,
+                    gpu_span::Kind::Draw,
+                    VkOp::ResidentClearResetCb,
+                    VkOp::ResidentClearBeginCb,
+                )?;
+                pair
+            }
+        };
+        pools.close_open_pass(&ctx.device, cb);
+        let to_transfer = [ash::vk::ImageMemoryBarrier::default()
+            .src_access_mask(src_access | RESIDENT_READ_SRC_ACCESS)
+            .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(old_layout)
+            .new_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(image)
+            .subresource_range(color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            src_stage | ash::vk::PipelineStageFlags::ALL_COMMANDS,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_transfer,
+        );
+        ctx.device.cmd_clear_color_image(
+            cb,
+            image,
+            ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &clear.vk(),
+            &[color_subresource_range()],
+        );
+        let back = [ash::vk::ImageMemoryBarrier::default()
+            .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(RESIDENT_READ_SRC_ACCESS | ash::vk::AccessFlags::TRANSFER_READ)
+            .old_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(final_layout)
+            .image(image)
+            .subresource_range(color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::PipelineStageFlags::ALL_COMMANDS,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &back,
+        );
+        if appended.is_none() {
+            pools.gpu_span_seal_current(ctx, cb);
+            ctx.device
+                .end_command_buffer(cb)
+                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentClearEndCb, e)))?;
+            let cbs = [cb];
+            ctx.submit_guest_work(&cbs, fence)
+                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentClearSubmit, e)))?;
+            let sealed = pools.seal_entry(Vec::new(), Vec::new());
+            pools.finish_entry_async(&ctx.device, sealed);
+        }
+    }
+    // New content, whole image: ready, every row damaged (the payment band),
+    // sole copy until a payment lands it in the guest pages.
+    pools.registry_mark_ready_with_access(identity, new_access, pay_band::RowBand::Full);
+    Ok(Ok(()))
+}
+
 /// Copy the same window spans from one resident into another, on the queue.
 ///
 /// The GPU replay of a guest CPU copy between two presented framebuffers: the

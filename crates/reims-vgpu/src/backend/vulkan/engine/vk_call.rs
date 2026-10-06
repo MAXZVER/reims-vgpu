@@ -76,6 +76,17 @@ pub enum VkOp {
     /// `vkQueueSubmit` of the resident overlay.
     ResidentOverlaySubmit,
 
+    // ---- mod.rs `clear_resident` — TEMP (lab, GPU_CLEAR): a clear-only pass
+    //      landed in the target's resident on the queue ----
+    /// `vkResetCommandBuffer` before recording the resident clear.
+    ResidentClearResetCb,
+    /// `vkBeginCommandBuffer` for the resident clear.
+    ResidentClearBeginCb,
+    /// `vkEndCommandBuffer` closing the resident clear.
+    ResidentClearEndCb,
+    /// `vkQueueSubmit` of the resident clear.
+    ResidentClearSubmit,
+
     // ---- mod.rs `read_resident_storage` — the pinned deferred-writeback
     //      storage-image flush rail (GPU→host tight copy, then unpin) ----
     /// `vkResetCommandBuffer` before recording the storage flush copy.
@@ -392,6 +403,10 @@ impl Decline for VkCall {
             VkOp::ResidentOverlayBeginCb => "vk_resident_overlay_begin_cb",
             VkOp::ResidentOverlayEndCb => "vk_resident_overlay_end_cb",
             VkOp::ResidentOverlaySubmit => "vk_resident_overlay_submit",
+            VkOp::ResidentClearResetCb => "vk_resident_clear_reset_cb",
+            VkOp::ResidentClearBeginCb => "vk_resident_clear_begin_cb",
+            VkOp::ResidentClearEndCb => "vk_resident_clear_end_cb",
+            VkOp::ResidentClearSubmit => "vk_resident_clear_submit",
 
             VkOp::StorageReadResetCb => "vk_storage_read_reset_cb",
             VkOp::StorageReadBeginCb => "vk_storage_read_begin_cb",
@@ -577,6 +592,10 @@ mod tests {
         VkOp::ResidentOverlayBeginCb,
         VkOp::ResidentOverlayEndCb,
         VkOp::ResidentOverlaySubmit,
+        VkOp::ResidentClearResetCb,
+        VkOp::ResidentClearBeginCb,
+        VkOp::ResidentClearEndCb,
+        VkOp::ResidentClearSubmit,
         VkOp::StorageReadResetCb,
         VkOp::StorageReadBeginCb,
         VkOp::StorageReadEndCb,

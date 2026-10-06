@@ -6770,6 +6770,113 @@ fn gva_resident_ready(
     ready
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_GPU_CLEAR=on` lands a clear-only pass over a GVA
+/// target in the target's resident on the GPU and defers the guest pages to
+/// the writeback debt, instead of filling them on the drain thread
+/// ([`lab_gpu_clear_gva`]). Off (the old CPU fill) unless set. Live
+/// (`GPU_CLEAR=on|off` in the lab live file) so one boot can A/B it by phase.
+pub(crate) fn lab_gpu_clear_enabled() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("GPU_CLEAR") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("REIMS_VGPU_LAB_GPU_CLEAR").is_ok_and(|v| v == "on");
+        crate::observe::off(format!("lab_gpu_clear on={}", u8::from(on)));
+        on
+    })
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_GPU_CLEAR`): a clear-only pass over a GVA target,
+/// on the GPU.
+///
+/// The clear is a Store of a solid colour, so it takes the Store's contract:
+/// the colour goes into the resident the next pass will LOAD
+/// ([`crate::backend::vulkan::engine::clear_resident`]) and the resource-scoped
+/// writeback debt is armed over it exactly as a GPU render Store arms it
+/// ([`crate::runtime::writeback_debt::arm_gva`]), so a later LOAD chains on the
+/// resident, a sample binds it, a named synchronize pays it into the guest
+/// pages, and a guest CPU write under it is overlaid as for any other deferred
+/// Store. `false` leaves the pass to the CPU fill, which then runs as before
+/// (no resident to clear, a format whose clear encoding differs, a debt the
+/// witness cannot arm); the resident may already hold the clear by then, which
+/// is the same content the CPU fill writes.
+pub(crate) fn lab_gpu_clear_gva<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c0: &ColorRtRequest,
+    clear_color: [f64; 4],
+) -> bool {
+    use crate::backend::vulkan::translate::pixel;
+    let note = crate::runtime::drain::note_store_route;
+    if c0.texture_ref == 0 || c0.target_gva == 0 || c0.sample_count > 1 {
+        note("lab_gpu_clear_unnamed");
+        return false;
+    }
+    let Ok((attachment, _)) = pixel::color_attachment(c0.format) else {
+        note("lab_gpu_clear_format_untranslated");
+        return false;
+    };
+    let span = GvaSpan {
+        texture_ref: c0.texture_ref,
+        gva: c0.target_gva,
+        row_stride: c0.row_stride,
+        width: c0.width,
+        height: c0.height,
+        format: c0.format,
+    };
+    let Some(identity) = gva_span_identity(state, host, task_id, span) else {
+        note("lab_gpu_clear_no_identity");
+        return false;
+    };
+    match crate::backend::vulkan::engine::clear_resident(
+        &identity,
+        attachment.vk,
+        attachment.clear_value(clear_color),
+    ) {
+        Ok(Ok(())) => {}
+        Ok(Err(decline)) => {
+            note(decline.slug());
+            return false;
+        }
+        Err(e) => {
+            note("lab_gpu_clear_engine_error");
+            if crate::observe::first_sight("lab_gpu_clear_engine_error", 0) {
+                crate::observe::fail(format!("lab_gpu_clear_engine_error {e:?}"));
+            }
+            return false;
+        }
+    }
+    let Some(window) = crate::backend::vulkan::gva_window(&identity) else {
+        note("lab_gpu_clear_no_window");
+        return false;
+    };
+    let own = crate::runtime::writeback_debt::GvaResourceKey {
+        task_id,
+        texture_ref: c0.texture_ref,
+    }
+    .plane(c0.target_gva);
+    crate::runtime::writeback_debt::supersede_gva_overlapping_for_gpu_clear(
+        state,
+        own,
+        u64::from(c0.row_stride).saturating_mul(u64::from(c0.height)),
+    );
+    if !crate::runtime::writeback_debt::arm_gva(
+        crate::backend::vulkan::VulkanBackend,
+        state,
+        host,
+        task_id,
+        c0,
+        window,
+    ) {
+        note("lab_gpu_clear_unarmed");
+        return false;
+    }
+    note("lab_gpu_clear_armed");
+    true
+}
+
 /// Name the engine resident a render Store into this GVA span would have
 /// published into, without asking whether the guest's own bytes still agree
 /// with it.

@@ -6695,6 +6695,30 @@ fn apply_clear<M: HostMemory + HostOps>(
         );
         return false;
     };
+    // TEMP (lab, `REIMS_VGPU_LAB_GPU_CLEAR=on`): the clear goes into the
+    // target's resident on the GPU and the guest pages into the writeback debt
+    // (`draw::vulkan::lab_gpu_clear_gva`); the CPU fill below runs only when
+    // that declines.
+    #[cfg(feature = "backend-vulkan")]
+    if c0.target_gva != 0
+        && crate::backend::selected().rail() == crate::backend::Rail::Vulkan
+        && crate::runtime::draw::vulkan::lab_gpu_clear_enabled()
+        && crate::runtime::draw::vulkan::lab_gpu_clear_gva(
+            state,
+            host,
+            task_id,
+            c0,
+            att.clear_color,
+        )
+    {
+        crate::runtime::surface_cache::forget_gva_copies(
+            state,
+            task_id,
+            c0.target_gva,
+            att.texture_ref,
+        );
+        return true;
+    }
     if c0.target_gva != 0 {
         let mut converted = Vec::new();
         let frame = match (one_row, clear.encoding()) {

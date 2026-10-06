@@ -1207,7 +1207,15 @@ pub(crate) struct SubmissionToken {
 /// pooled staging live at once — bounded, pooled. `retire_wait` still ~17 µs, so
 /// a deeper ring or render-pass batching (only ~37 % of draws join a shared pass)
 /// may reclaim more.
-pub(crate) const RING_DEPTH: usize = 8;
+///
+/// TEMP (lab, Opus 2026-10-06): 16, not 8. p016 (Intel, 5K): the ring blocked on
+/// an unsignalled fence 4 519 times a boot (`ring_retire_blocks`) and the
+/// recorder spent ~14 % of its draw work in those fence waits while the GPU was
+/// mostly idle - the latency of a submit, not its work. p024 (Intel, 5K, one boot
+/// an arm, 8/16/16/8): Finder transition frames 44-45 against 29-32, the
+/// windowed glass scene 184 against 138-165 Hz. 16 is the most the hang trail's
+/// `SUBMIT_SLOTS` holds.
+pub(crate) const RING_DEPTH: usize = 16;
 
 /// One bit per ring slot: the set of slots a deferred handle is still waiting
 /// on. Sized so the whole ring fits, which is what bounds the graveyard — a
