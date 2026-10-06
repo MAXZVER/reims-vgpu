@@ -1217,7 +1217,7 @@ impl DeviceContext {
         let storage_image_write_without_format_bgra =
             features.storage_image_write_without_format_bgra();
         let sampled_linear_filter = features.sampled_linear_filter;
-        let has16 = features.storage16;
+        let has16 = features.wants_16bit_storage();
         // Defined bounds-clamped behavior for out-of-range shader buffer access
         // is among these — the ONE feature the Vulkan spec requires every
         // implementation to support, so enabling it is portability-clean and
@@ -1370,6 +1370,8 @@ impl DeviceContext {
         // this is enabled. Chained only when the host advertised it, because
         // asking for a feature a device declined fails `vkCreateDevice`.
         let mut en_image_robustness = features.enabled_image_robustness();
+        // The translator's `discard_fragment()` capability (p054 validation).
+        let mut en_demote = features.enabled_demote_to_helper();
         let mut en_attachment_feedback = features.enabled_attachment_feedback_loop_layout();
         let mut en_extended_dynamic_state = features.enabled_extended_dynamic_state();
         let mut en_extended_dynamic_state3 = features.enabled_extended_dynamic_state3();
@@ -1386,6 +1388,9 @@ impl DeviceContext {
         }
         if features.image_robustness.is_available() {
             dci = dci.push_next(&mut en_image_robustness);
+        }
+        if features.demote_to_helper.is_available() {
+            dci = dci.push_next(&mut en_demote);
         }
         if features.attachment_feedback_loop_layout {
             dci = dci.push_next(&mut en_attachment_feedback);
@@ -1998,6 +2003,38 @@ impl DeviceContext {
         unsafe { self.device.queue_submit(self.queue(), &[info], fence) }?;
         note.submitted(value);
         Ok(())
+    }
+
+    /// `vkGetFenceStatus`, except for a fence whose submission the queue owner
+    /// has accepted and not yet passed to `vkQueueSubmit`: that one is
+    /// unsignalled by construction and is answered without touching it (see
+    /// `queue_owner::UnsubmittedFences`).
+    pub(crate) unsafe fn fence_status(&self, fence: vk::Fence) -> Result<bool, vk::Result> {
+        if self
+            .queue_owner
+            .as_ref()
+            .is_some_and(|owner| owner.fence_unsubmitted(fence))
+        {
+            return Ok(false);
+        }
+        unsafe { self.device.get_fence_status(fence) }
+    }
+
+    /// `vkWaitForFences`, after letting the queue owner pass any of `fences`
+    /// it has accepted and not yet submitted, so the wait never overlaps that
+    /// submission.
+    pub(crate) unsafe fn wait_fences(
+        &self,
+        fences: &[vk::Fence],
+        wait_all: bool,
+        timeout: u64,
+    ) -> Result<(), vk::Result> {
+        if let Some(owner) = self.queue_owner.as_ref() {
+            if fences.iter().any(|f| owner.fence_unsubmitted(*f)) {
+                owner.barrier();
+            }
+        }
+        unsafe { self.device.wait_for_fences(fences, wait_all, timeout) }
     }
 
     pub(crate) fn queue_failure(&self) -> Option<vk::Result> {

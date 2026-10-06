@@ -891,6 +891,18 @@ impl ResourcePools {
         {
             return Ok(Some(*view));
         }
+        // A mutable-format image may only be viewed in a format of its own
+        // compatibility class; a wider texel reads past the allocation.
+        let allocation = slot.format.allocation();
+        if !view_texel_size_agrees(allocation, format) {
+            return Err(DrawError::DrawExecution(
+                super::super::draw_execution::DrawExecutionDecline::ResidentViewFormatIncompatible {
+                    identity: identity.clone(),
+                    resident: allocation,
+                    requested: format,
+                },
+            ));
+        }
         let view = unsafe {
             ctx.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
@@ -5804,5 +5816,55 @@ pub(super) mod pin_count_tests {
             3,
             "the peak is a high-water mark, not the current population"
         );
+    }
+}
+
+/// The texel size of the colour formats a resident is allocated in or viewed
+/// through here, or `None` for one this table does not name.
+fn view_texel_bytes(format: vk::Format) -> Option<u32> {
+    use vk::Format as F;
+    Some(match format {
+        F::R8_UNORM | F::R8_SNORM | F::R8_UINT | F::R8_SINT | F::R8_SRGB => 1,
+        F::R8G8_UNORM | F::R8G8_SNORM | F::R8G8_UINT | F::R8G8_SINT | F::R16_UNORM
+        | F::R16_SFLOAT | F::R16_UINT | F::R16_SINT => 2,
+        F::R8G8B8A8_UNORM | F::R8G8B8A8_SRGB | F::R8G8B8A8_UINT | F::R8G8B8A8_SINT
+        | F::R8G8B8A8_SNORM | F::B8G8R8A8_UNORM | F::B8G8R8A8_SRGB
+        | F::A2B10G10R10_UNORM_PACK32 | F::A2R10G10B10_UNORM_PACK32
+        | F::B10G11R11_UFLOAT_PACK32 | F::R32_SFLOAT | F::R32_UINT | F::R32_SINT
+        | F::R16G16_UNORM | F::R16G16_SFLOAT | F::R16G16_UINT | F::R16G16_SINT => 4,
+        F::R16G16B16A16_SFLOAT | F::R16G16B16A16_UNORM | F::R16G16B16A16_UINT
+        | F::R16G16B16A16_SINT | F::R32G32_SFLOAT | F::R32G32_UINT | F::R32G32_SINT => 8,
+        F::R32G32B32A32_SFLOAT | F::R32G32B32A32_UINT | F::R32G32B32A32_SINT => 16,
+        _ => return None,
+    })
+}
+
+/// Whether `requested` may view an image allocated as `allocation`: equal
+/// texel sizes, or a format this table cannot size (left to the driver, as
+/// before).
+fn view_texel_size_agrees(allocation: vk::Format, requested: vk::Format) -> bool {
+    match (view_texel_bytes(allocation), view_texel_bytes(requested)) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod view_format_tests {
+    use super::*;
+
+    #[test]
+    fn a_resident_view_keeps_the_allocation_texel_size() {
+        // p055: a B8G8R8A8 view over an R8 resident reads four times its memory.
+        assert!(!view_texel_size_agrees(vk::Format::R8_UNORM, vk::Format::B8G8R8A8_UNORM));
+        assert!(!view_texel_size_agrees(
+            vk::Format::B8G8R8A8_UNORM,
+            vk::Format::R16G16B16A16_SFLOAT
+        ));
+        // The reinterpretations a mutable-format resident exists for.
+        assert!(view_texel_size_agrees(vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB));
+        assert!(view_texel_size_agrees(vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM));
+        // A format the table cannot size stays the driver's question.
+        assert!(view_texel_size_agrees(vk::Format::R8_UNORM, vk::Format::BC1_RGBA_UNORM_BLOCK));
     }
 }

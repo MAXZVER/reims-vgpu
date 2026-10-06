@@ -113,6 +113,34 @@ impl ImageRobustness {
     }
 }
 
+/// `shaderDemoteToHelperInvocation`: whether a fragment shader may declare the
+/// `DemoteToHelperInvocation` SPIR-V capability, which the translator emits for
+/// Metal's `discard_fragment()`.
+///
+/// Three rungs for the reason [`ImageRobustness`] has three: promoted to core
+/// at Vulkan 1.3, an extension before, and how it is available decides what is
+/// named at device creation. The p054 validation boot found the capability in
+/// the guest's modules with the feature never enabled
+/// (`VUID-VkShaderModuleCreateInfo-pCode-08740`): modules the driver was not
+/// obliged to run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DemoteToHelper {
+    /// `VkPhysicalDeviceVulkan13Features::shaderDemoteToHelperInvocation`.
+    Core13,
+    /// `VK_EXT_shader_demote_to_helper_invocation`.
+    Ext,
+    /// Neither; reported, and the modules that declare it are created anyway,
+    /// as before.
+    #[default]
+    Unsupported,
+}
+
+impl DemoteToHelper {
+    pub fn is_available(self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+}
+
 /// The `maxImageDimension2D` every Vulkan 1.2 implementation must report at
 /// least (spec table "Required Limits"). Used only as the floor a queried
 /// value is clamped to, and as the answer when no device has been resolved.
@@ -277,6 +305,10 @@ pub struct DeviceFeatures {
     /// and not from a reading of the spec's table.
     pub color_attachment: [bool; TexelLayout::ALL.len()],
     pub storage16: bool,
+    /// `storageInputOutput16`: 16-bit values as stage inputs and outputs, which
+    /// the translator emits for Metal's `half` varyings
+    /// (`VUID-RuntimeSpirv-storageInputOutput16-11162` in the p054 boot).
+    pub storage_io16: bool,
     pub storage8: bool,
     pub float16: bool,
     pub int8: bool,
@@ -306,6 +338,8 @@ pub struct DeviceFeatures {
     /// How this host can promise that an out-of-bounds texture read is defined,
     /// which every Metal shader is entitled to assume. See [`ImageRobustness`].
     pub image_robustness: ImageRobustness,
+    /// How this host offers `shaderDemoteToHelperInvocation`. See [`DemoteToHelper`].
+    pub demote_to_helper: DemoteToHelper,
     /// `VK_EXT_attachment_feedback_loop_layout`: whether a render attachment
     /// may also be bound as a sampled image in the extension's explicit
     /// feedback-loop layout. This is the native Vulkan spelling of Metal's
@@ -646,6 +680,21 @@ impl DeviceFeatures {
     pub fn enabled_16bit_storage(&self) -> vk::PhysicalDevice16BitStorageFeatures<'static> {
         vk::PhysicalDevice16BitStorageFeatures::default()
             .storage_buffer16_bit_access(self.storage16)
+            .storage_input_output16(self.storage_io16)
+    }
+
+    /// Whether the 16-bit storage struct belongs on the device chain at all.
+    pub fn wants_16bit_storage(&self) -> bool {
+        self.storage16 || self.storage_io16
+    }
+
+    /// `shaderDemoteToHelperInvocation`, chained by its `EXT` spelling on both
+    /// rungs for the reason [`Self::enabled_image_robustness`] gives.
+    pub fn enabled_demote_to_helper(
+        &self,
+    ) -> vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT<'static> {
+        vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT::default()
+            .shader_demote_to_helper_invocation(self.demote_to_helper.is_available())
     }
 
     /// One line naming every feature and limit this backend resolved against the
@@ -691,6 +740,7 @@ impl DeviceFeatures {
             sampled_linear_filter,
             color_attachment,
             storage16,
+            storage_io16,
             storage8,
             float16,
             int8,
@@ -699,6 +749,7 @@ impl DeviceFeatures {
             descriptor_binding_partially_bound,
             mirror_clamp_to_edge,
             image_robustness,
+            demote_to_helper,
             attachment_feedback_loop_layout,
             image_drm_format_modifier,
             dual_src_blend,
@@ -729,7 +780,7 @@ impl DeviceFeatures {
         };
         format!(
             "vk_features robust_buffer_access={robust_buffer_access} \
-             image_robustness={image_robustness:?} \
+             image_robustness={image_robustness:?} demote_to_helper={demote_to_helper:?} \
              attachment_feedback_loop_layout={attachment_feedback_loop_layout} \
              image_drm_format_modifier={image_drm_format_modifier} \
              sampler_anisotropy={sampler_anisotropy} max_sampler_anisotropy={max_sampler_anisotropy} \
@@ -751,7 +802,7 @@ impl DeviceFeatures {
              storage_image_write_without_format={storage_image_write_without_format} \
              storage_image_read_without_format={storage_image_read_without_format} \
              bgra8_storage={bgra8_storage} no_linear_filter={} no_blendable_attachment={} \
-             storage16={storage16} storage8={storage8} float16={float16} int8={int8} \
+             storage16={storage16} storage_io16={storage_io16} storage8={storage8} float16={float16} int8={int8} \
              shader_output_viewport_index={shader_output_viewport_index} \
              timeline_semaphore={timeline_semaphore} \
              descriptor_binding_partially_bound={descriptor_binding_partially_bound} \
@@ -770,6 +821,18 @@ impl DeviceFeatures {
         )
     }
 
+    /// [`Self::required_extensions`] as names, for tests: a `const` `&CStr`
+    /// has no guaranteed address, so comparing the pointers this returns with
+    /// `NAME.as_ptr()` is a test of the compiler's layout, not of this table
+    /// (it began failing when unrelated code moved).
+    #[cfg(test)]
+    pub fn required_extension_names(&self) -> Vec<&'static std::ffi::CStr> {
+        self.required_extensions()
+            .into_iter()
+            .map(|p| unsafe { std::ffi::CStr::from_ptr(p) })
+            .collect()
+    }
+
     /// Device extension names this feature set requires, beyond the ones the
     /// interop rails ask for.
     pub fn required_extensions(&self) -> Vec<*const std::os::raw::c_char> {
@@ -779,6 +842,9 @@ impl DeviceFeatures {
         }
         if self.image_robustness == ImageRobustness::ExtImageRobustness {
             out.push(vk::EXT_IMAGE_ROBUSTNESS_NAME.as_ptr());
+        }
+        if self.demote_to_helper == DemoteToHelper::Ext {
+            out.push(vk::EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_NAME.as_ptr());
         }
         if self.attachment_feedback_loop_layout {
             out.push(vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME.as_ptr());
@@ -823,12 +889,16 @@ pub unsafe fn query(
     // extension name valid — so one query covers both rungs and only the
     // *enable* side has to know which it took.
     let mut supported_image_robustness = vk::PhysicalDeviceImageRobustnessFeaturesEXT::default();
+    // The same reasoning: the EXT spelling answers on both rungs.
+    let mut supported_demote =
+        vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT::default();
     let mut features2 = vk::PhysicalDeviceFeatures2::default()
         .push_next(&mut supported_16)
         .push_next(&mut supported_8)
         .push_next(&mut supported_f16i8)
         .push_next(&mut supported_vulkan12)
-        .push_next(&mut supported_image_robustness);
+        .push_next(&mut supported_image_robustness)
+        .push_next(&mut supported_demote);
     unsafe { instance.get_physical_device_features2(pd, &mut features2) };
     let supported = features2.features;
     let props = unsafe { instance.get_physical_device_properties(pd) };
@@ -912,6 +982,15 @@ pub unsafe fn query(
     } else {
         ImageRobustness::Unsupported
     };
+    let demote_to_helper = if supported_demote.shader_demote_to_helper_invocation != vk::TRUE {
+        DemoteToHelper::Unsupported
+    } else if props.api_version >= vk::API_VERSION_1_3 {
+        DemoteToHelper::Core13
+    } else if has_extension(vk::EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_NAME) {
+        DemoteToHelper::Ext
+    } else {
+        DemoteToHelper::Unsupported
+    };
     let mirror_clamp_to_edge = if supported_vulkan12.sampler_mirror_clamp_to_edge == vk::TRUE {
         MirrorClampToEdge::Core12
     } else if has_extension(vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME) {
@@ -979,6 +1058,7 @@ pub unsafe fn query(
     DeviceFeatures {
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         image_robustness,
+        demote_to_helper,
         attachment_feedback_loop_layout,
         image_drm_format_modifier,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
@@ -1044,6 +1124,7 @@ pub unsafe fn query(
         sampled_linear_filter,
         color_attachment,
         storage16: supported_16.storage_buffer16_bit_access == vk::TRUE,
+        storage_io16: supported_16.storage_input_output16 == vk::TRUE,
         storage8: supported_8.storage_buffer8_bit_access == vk::TRUE,
         float16: supported_f16i8.shader_float16 == vk::TRUE,
         int8: supported_f16i8.shader_int8 == vk::TRUE,
@@ -1061,6 +1142,8 @@ mod tests {
 
     fn all_supported() -> DeviceFeatures {
         DeviceFeatures {
+            storage_io16: true,
+            demote_to_helper: DemoteToHelper::Core13,
             occlusion_query_precise: true,
             extended_dynamic_state: true,
             dynamic_polygon_mode: true,
@@ -1174,12 +1257,12 @@ mod tests {
     /// depth-clamp members together and is named where *either* was reported.
     #[test]
     fn the_dynamic_raster_bits_name_the_extensions_whose_features_they_set() {
-        let eds = vk::EXT_EXTENDED_DYNAMIC_STATE_NAME.as_ptr();
-        let eds3 = vk::EXT_EXTENDED_DYNAMIC_STATE3_NAME.as_ptr();
+        let eds = vk::EXT_EXTENDED_DYNAMIC_STATE_NAME;
+        let eds3 = vk::EXT_EXTENDED_DYNAMIC_STATE3_NAME;
 
         let all = all_supported();
-        assert!(all.required_extensions().contains(&eds));
-        assert!(all.required_extensions().contains(&eds3));
+        assert!(all.required_extension_names().contains(&eds));
+        assert!(all.required_extension_names().contains(&eds3));
         assert_eq!(
             all.enabled_extended_dynamic_state().extended_dynamic_state,
             vk::TRUE
@@ -1204,7 +1287,7 @@ mod tests {
                 dynamic_depth_clamp: clamp,
                 ..all_supported()
             };
-            let names = caps.required_extensions();
+            let names = caps.required_extension_names();
             assert_eq!(names.contains(&eds), cull);
             assert_eq!(names.contains(&eds3), polygon || clamp);
             assert_eq!(caps.wants_extended_dynamic_state3(), polygon || clamp);
@@ -1232,8 +1315,8 @@ mod tests {
                 dynamic_primitive_topology_unrestricted: unrestricted,
                 ..all_supported()
             };
-            assert!(!caps.required_extensions().contains(&eds));
-            assert!(!caps.required_extensions().contains(&eds3));
+            assert!(!caps.required_extension_names().contains(&eds));
+            assert!(!caps.required_extension_names().contains(&eds3));
             assert!(!caps.wants_extended_dynamic_state3());
         }
 
@@ -1245,8 +1328,8 @@ mod tests {
         assert!(!none.dynamic_polygon_mode);
         assert!(!none.dynamic_depth_clamp);
         assert!(!none.wants_extended_dynamic_state3());
-        assert!(!none.required_extensions().contains(&eds));
-        assert!(!none.required_extensions().contains(&eds3));
+        assert!(!none.required_extension_names().contains(&eds));
+        assert!(!none.required_extension_names().contains(&eds3));
         assert!(!none.dynamic_primitive_topology_unrestricted);
     }
 
@@ -1285,8 +1368,8 @@ mod tests {
             vk::TRUE
         );
         assert!(!caps
-            .required_extensions()
-            .contains(&vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr()));
+            .required_extension_names()
+            .contains(&vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME));
     }
 
     /// The extension rung is the mirror image: extension string, no core bit.
@@ -1304,8 +1387,8 @@ mod tests {
             vk::FALSE
         );
         assert!(caps
-            .required_extensions()
-            .contains(&vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr()));
+            .required_extension_names()
+            .contains(&vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME));
     }
 
     /// Neither rung: nothing is requested. The sampler path must decline the
@@ -1322,8 +1405,8 @@ mod tests {
             vk::FALSE
         );
         assert!(!caps
-            .required_extensions()
-            .contains(&vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr()));
+            .required_extension_names()
+            .contains(&vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME));
         assert!(!caps.mirror_clamp_to_edge.is_available());
     }
 
@@ -1336,7 +1419,7 @@ mod tests {
     /// fails `vkCreateDevice`.
     #[test]
     fn image_robustness_is_enabled_on_both_rungs_and_named_on_one() {
-        let ext_name = vk::EXT_IMAGE_ROBUSTNESS_NAME.as_ptr();
+        let ext_name = vk::EXT_IMAGE_ROBUSTNESS_NAME;
 
         let core13 = DeviceFeatures {
             image_robustness: ImageRobustness::Core13,
@@ -1347,7 +1430,7 @@ mod tests {
             vk::TRUE
         );
         assert!(
-            !core13.required_extensions().contains(&ext_name),
+            !core13.required_extension_names().contains(&ext_name),
             "promoted to core at 1.3, so the string would be redundant"
         );
 
@@ -1357,7 +1440,7 @@ mod tests {
         };
         assert_eq!(ext.enabled_image_robustness().robust_image_access, vk::TRUE);
         assert!(
-            ext.required_extensions().contains(&ext_name),
+            ext.required_extension_names().contains(&ext_name),
             "the 1.2-baseline rung has to name the extension it is chaining"
         );
 
@@ -1367,7 +1450,7 @@ mod tests {
             vk::FALSE,
             "asking for a feature the host declined fails vkCreateDevice"
         );
-        assert!(!none.required_extensions().contains(&ext_name));
+        assert!(!none.required_extension_names().contains(&ext_name));
         assert!(!none.image_robustness.is_available());
     }
 
@@ -1377,7 +1460,7 @@ mod tests {
     /// for the feature without the advertised extension fails device creation.
     #[test]
     fn attachment_feedback_loop_feature_and_extension_move_together() {
-        let name = vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME.as_ptr();
+        let name = vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME;
         let on = DeviceFeatures {
             attachment_feedback_loop_layout: true,
             ..Default::default()
@@ -1387,7 +1470,7 @@ mod tests {
                 .attachment_feedback_loop_layout,
             vk::TRUE
         );
-        assert!(on.required_extensions().contains(&name));
+        assert!(on.required_extension_names().contains(&name));
 
         let off = DeviceFeatures::default();
         assert_eq!(
@@ -1395,19 +1478,19 @@ mod tests {
                 .attachment_feedback_loop_layout,
             vk::FALSE
         );
-        assert!(!off.required_extensions().contains(&name));
+        assert!(!off.required_extension_names().contains(&name));
     }
 
     #[test]
     fn explicit_drm_layout_names_its_extension_only_when_available() {
-        let name = vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr();
+        let name = vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME;
         let on = DeviceFeatures {
             image_drm_format_modifier: true,
             ..Default::default()
         };
-        assert!(on.required_extensions().contains(&name));
+        assert!(on.required_extension_names().contains(&name));
         assert!(!DeviceFeatures::default()
-            .required_extensions()
+            .required_extension_names()
             .contains(&name));
     }
 

@@ -110,12 +110,52 @@ impl FailureLatch {
     }
 }
 
+/// The fences of submissions this owner has accepted and not yet passed to
+/// `vkQueueSubmit`.
+///
+/// `vkQueueSubmit`'s `fence` is externally synchronized, and a submission
+/// accepted here runs later on the owner thread. Meanwhile the ring retires,
+/// the heartbeat and the readback waits ask about the same fence from other
+/// threads: the p054 validation boot caught `vkGetFenceStatus` on the
+/// heartbeat thread overlapping `vkQueueSubmit` of that fence on this one
+/// (`UNASSIGNED-Threading-MultipleThreads-*`). A fence in this set has not been
+/// submitted, so it is unsignalled by construction - a status query can answer
+/// that without touching it, and a wait first lets the owner pass it.
+#[derive(Default)]
+pub(crate) struct UnsubmittedFences(Mutex<Vec<vk::Fence>>);
+
+impl UnsubmittedFences {
+    fn insert(&self, fence: vk::Fence) {
+        if fence != vk::Fence::null() {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).push(fence);
+        }
+    }
+
+    fn remove(&self, fence: vk::Fence) {
+        if fence == vk::Fence::null() {
+            return;
+        }
+        let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = set.iter().position(|f| *f == fence) {
+            set.swap_remove(at);
+        }
+    }
+
+    pub(crate) fn contains(&self, fence: vk::Fence) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&fence)
+    }
+}
+
 /// Running queue thread.  `stop` is explicit because its cloned device handle
 /// and every queued operation must be gone before `vkDestroyDevice`.
 pub(crate) struct QueueOwner {
     sender: mpsc::Sender<Request>,
     failure: Arc<FailureLatch>,
     stats: Arc<QueueStats>,
+    unsubmitted: Arc<UnsubmittedFences>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -126,6 +166,8 @@ impl QueueOwner {
         let stats = Arc::new(QueueStats::default());
         let thread_failure = Arc::clone(&failure);
         let thread_stats = Arc::clone(&stats);
+        let unsubmitted = Arc::new(UnsubmittedFences::default());
+        let thread_unsubmitted = Arc::clone(&unsubmitted);
         let thread_device = device.clone();
         let join = std::thread::Builder::new()
             .name("reims-vgpu-submit".into())
@@ -137,12 +179,14 @@ impl QueueOwner {
                     receiver,
                     &thread_failure,
                     &thread_stats,
+                    &thread_unsubmitted,
                 )
             })?;
         Ok(Self {
             sender,
             failure,
             stats,
+            unsubmitted,
             join: Some(join),
         })
     }
@@ -182,6 +226,7 @@ impl QueueOwner {
             timeline,
             async_queued_at: None,
         };
+        self.unsubmitted.insert(submit.fence);
         self.send_sync(|reply| Request::Submit {
             submit,
             reply: Some(reply),
@@ -201,6 +246,7 @@ impl QueueOwner {
         let queued_point = timeline
             .as_ref()
             .map(|(_, value, note)| (*value, note.clone()));
+        self.unsubmitted.insert(fence);
         self.sender
             .send(Request::Submit {
                 submit: OwnedSubmit {
@@ -238,6 +284,7 @@ impl QueueOwner {
             timeline: None,
             async_queued_at: None,
         };
+        self.unsubmitted.insert(submit.fence);
         self.send_sync(|reply| Request::Submit {
             submit,
             reply: Some(reply),
@@ -270,6 +317,7 @@ impl QueueOwner {
             async_queued_at: None,
         };
         let (reply, receiver) = mpsc::sync_channel(1);
+        self.unsubmitted.insert(submit.fence);
         self.sender
             .send(Request::PresentTransaction {
                 submit,
@@ -307,6 +355,12 @@ impl QueueOwner {
         }
     }
 
+    /// Whether `fence` belongs to a submission accepted and not yet passed to
+    /// `vkQueueSubmit` (see [`UnsubmittedFences`]).
+    pub(crate) fn fence_unsubmitted(&self, fence: vk::Fence) -> bool {
+        self.unsubmitted.contains(fence)
+    }
+
     pub(crate) fn failure(&self) -> Option<vk::Result> {
         self.failure.get()
     }
@@ -336,15 +390,20 @@ fn run(
     receiver: mpsc::Receiver<Request>,
     failure: &FailureLatch,
     stats: &QueueStats,
+    unsubmitted: &UnsubmittedFences,
 ) {
     while let Ok(request) = receiver.recv() {
         match request {
             Request::Submit { submit, reply } => {
                 let async_queued_at = submit.async_queued_at;
+                let fence = submit.fence;
                 let driver_started = std::time::Instant::now();
                 let result = failure
                     .get()
                     .map_or_else(|| unsafe { execute_submit(device, queue, submit) }, Err);
+                // Passed (or refused): either way no later `vkQueueSubmit` will
+                // touch the fence, so other threads may.
+                unsubmitted.remove(fence);
                 if let Some(queued_at) = async_queued_at {
                     stats.async_submits.fetch_add(1, Ordering::Relaxed);
                     stats.async_queue_us.fetch_add(
@@ -375,6 +434,7 @@ fn run(
                 reply,
             } => {
                 let driver_started = std::time::Instant::now();
+                let fence = submit.fence;
                 let result = complete_present_transaction(
                     failure,
                     || unsafe { execute_submit(device, queue, submit) },
@@ -393,6 +453,7 @@ fn run(
                         }
                     },
                 );
+                unsubmitted.remove(fence);
                 stats.present_transactions.fetch_add(1, Ordering::Relaxed);
                 stats.present_queue_us.fetch_add(
                     driver_started.duration_since(queued_at).as_micros() as u64,
@@ -479,11 +540,26 @@ mod tests {
     use super::*;
     use ash::vk::Handle;
 
+    #[test]
+    fn a_fence_is_unsubmitted_from_acceptance_until_the_owner_passes_it() {
+        let set = UnsubmittedFences::default();
+        let fence = vk::Fence::from_raw(7);
+        assert!(!set.contains(fence));
+        set.insert(fence);
+        assert!(set.contains(fence));
+        set.remove(fence);
+        assert!(!set.contains(fence));
+        // The null fence of a fenceless submission is never tracked.
+        set.insert(vk::Fence::null());
+        assert!(!set.contains(vk::Fence::null()));
+    }
+
     fn owner_with_sender(sender: mpsc::Sender<Request>) -> QueueOwner {
         QueueOwner {
             sender,
             failure: Arc::new(FailureLatch::default()),
             stats: Arc::new(QueueStats::default()),
+            unsubmitted: Arc::new(UnsubmittedFences::default()),
             join: None,
         }
     }

@@ -4551,7 +4551,7 @@ fn lab_spin_on_fence(ctx: &context::DeviceContext, fence: ash::vk::Fence) {
     let started = std::time::Instant::now();
     let budget = std::time::Duration::from_micros(budget);
     loop {
-        match unsafe { ctx.device.get_fence_status(fence) } {
+        match unsafe { ctx.fence_status(fence) } {
             Ok(true) => {
                 crate::runtime::drain::note_store_route("lab_pd_spin_signalled");
                 return;

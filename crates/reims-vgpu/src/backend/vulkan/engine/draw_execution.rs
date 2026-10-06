@@ -111,6 +111,17 @@ pub enum DrawExecutionDecline {
         resident_samples: u32,
         shader_multisampled: bool,
     },
+    /// A view of a resident was asked for in a format whose texel is not the
+    /// size of the resident's own: `VUID-VkImageViewCreateInfo-image-01761`,
+    /// and a view that reads past the image's memory. The p055 validation boot
+    /// caught a `B8G8R8A8` view requested over an `R8_UNORM` resident in the
+    /// boots that lost the device; refusing the view loses the draw instead of
+    /// the device.
+    ResidentViewFormatIncompatible {
+        identity: TargetIdentity,
+        resident: ash::vk::Format,
+        requested: ash::vk::Format,
+    },
     /// A staging write asked for more bytes than the slot it is writing into
     /// holds.
     ///
@@ -186,6 +197,9 @@ impl Decline for DrawExecutionDecline {
             }
             Self::SampledResidentSampleCountMismatch { .. } => {
                 "vk_draw_exec_sampled_resident_sample_count_mismatch"
+            }
+            Self::ResidentViewFormatIncompatible { .. } => {
+                "vk_draw_exec_resident_view_format_incompatible"
             }
             Self::StagingWriteBeyondSlot { .. } => "vk_draw_exec_staging_write_beyond_slot",
             Self::ReadBackBeyondSlot { .. } => "vk_draw_exec_read_back_beyond_slot",
@@ -277,6 +291,18 @@ impl Decline for DrawExecutionDecline {
                     ("resident_height", resident_height.to_string()),
                     ("resource_width", resource_width.to_string()),
                     ("resource_height", resource_height.to_string()),
+                ]);
+                fields
+            }
+            Self::ResidentViewFormatIncompatible {
+                identity,
+                resident,
+                requested,
+            } => {
+                let mut fields = identity_fields(identity);
+                fields.extend([
+                    ("resident", format!("{resident:?}")),
+                    ("requested", format!("{requested:?}")),
                 ]);
                 fields
             }
@@ -438,6 +464,11 @@ mod tests {
                 resource_width: 64,
                 resource_height: 32,
             },
+            DrawExecutionDecline::ResidentViewFormatIncompatible {
+                identity: identity(),
+                resident: ash::vk::Format::R8_UNORM,
+                requested: ash::vk::Format::B8G8R8A8_UNORM,
+            },
         ]
     }
 
@@ -470,7 +501,11 @@ mod tests {
         // Back up to 12: `*_load_secondary_content_not_ready` is the primary's
         // readiness guard given to the MRT secondary slot, which had gone
         // without one for as long as MRT has existed.
-        assert_eq!(before, 12, "the draw executor's reason census moved");
+        //
+        // Up to 13: `*_resident_view_format_incompatible` refuses a view of a
+        // resident in a format of another texel size (p055 validation: a
+        // B8G8R8A8 view over an R8 resident), which reads past the image.
+        assert_eq!(before, 13, "the draw executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-execution slug");
     }
 

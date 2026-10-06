@@ -118,6 +118,14 @@ pub(crate) fn lanes_on() -> bool {
             return true;
         }
     }
+    // TEMP (lab): live through `REIMS_VGPU_LAB_LIVE_FILE` (`DRAIN_LANES=2`
+    // opens it, any other value closes it), so an A/B runs as phases of one
+    // boot. A lane's plan is checked at commit like every other plan, so one
+    // left in the store across a switch is refused, not served.
+    #[cfg(not(test))]
+    if let Some(v) = crate::runtime::lab_live::value("DRAIN_LANES") {
+        return v == "2";
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = matches!(

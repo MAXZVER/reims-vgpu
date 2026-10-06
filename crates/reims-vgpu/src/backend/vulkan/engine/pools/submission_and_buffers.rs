@@ -1470,8 +1470,7 @@ impl ResourcePools {
             ));
         }
         let fence = self.slots[index].fence;
-        ctx.device
-            .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
+        ctx.wait_fences(&[fence], true, FENCE_TIMEOUT_NS)
             .map_err(|e| {
                 // The wait that every macos-11 freeze lands in. Until now the
                 // failure said only that *a* wait timed out; this names the
@@ -1527,9 +1526,7 @@ impl ResourcePools {
             if self.slots[index].pending.is_none() {
                 continue;
             }
-            let signaled = ctx
-                .device
-                .get_fence_status(self.slots[index].fence)
+            let signaled = ctx.fence_status(self.slots[index].fence)
                 .map_err(|e| Self::wait_error(counters, e, status_op))?;
             if !signaled {
                 break;
@@ -1598,9 +1595,7 @@ impl ResourcePools {
             // Count as a "block" only when the fence is genuinely unsignaled
             // (the GPU still owns the slot); reclaiming a finished slot on
             // advance is bookkeeping, not a stall.
-            let still_running = !ctx
-                .device
-                .get_fence_status(self.slots[next].fence)
+            let still_running = !ctx.fence_status(self.slots[next].fence)
                 .map_err(|e| {
                     Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
                 })?;
@@ -1629,9 +1624,7 @@ impl ResourcePools {
         self.forget_pass_echo();
         let next = (self.cur + 1) % self.slots.len();
         if self.slots[next].pending.is_some() {
-            let still_running = !ctx
-                .device
-                .get_fence_status(self.slots[next].fence)
+            let still_running = !ctx.fence_status(self.slots[next].fence)
                 .map_err(|e| {
                     Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
                 })?;
@@ -1661,9 +1654,7 @@ impl ResourcePools {
             if self.slots[index].pending.is_none() {
                 continue;
             }
-            let signaled = ctx
-                .device
-                .get_fence_status(self.slots[index].fence)
+            let signaled = ctx.fence_status(self.slots[index].fence)
                 .map_err(|e| {
                     Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
                 })?;
@@ -2238,8 +2229,7 @@ impl ResourcePools {
         if slot.serial != token.serial || slot.pending.is_none() {
             return Ok(true);
         }
-        ctx.device
-            .get_fence_status(slot.fence)
+        ctx.fence_status(slot.fence)
             .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry))
     }
 
@@ -2287,8 +2277,7 @@ impl ResourcePools {
                 DeviceLostOp::PoolsWaitFencesEntry,
             ));
         }
-        ctx.device
-            .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
+        ctx.wait_fences(&[fence], true, FENCE_TIMEOUT_NS)
             .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))
     }
 
