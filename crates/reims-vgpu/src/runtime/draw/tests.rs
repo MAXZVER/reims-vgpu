@@ -1677,24 +1677,28 @@ fn overlay_guard_drops_an_adoption_the_guest_moved_during() {
     );
 }
 
-/// TEMP (lab, OVERLAY_GUARD): the gate is off unless the lab asks for it, so
-/// the default build's overlay and seed rails run byte-identical to before.
+/// TEMP (lab, OVERLAY_GUARD): the gate is on unless the lab turns it off -
+/// flipped by 5baf7317 (n240/n251: 0 family-2 events across the boots that
+/// convicted it, Hz parity), so the default build's overlay and seed rails
+/// are guarded; `=off` restores the unguarded behaviour for A/B.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn overlay_guard_is_off_by_default() {
+fn overlay_guard_is_on_by_default() {
     std::env::remove_var("REIMS_VGPU_LAB_OVERLAY_GUARD");
     // The latch is a `OnceLock`, so this test reads the process's first
-    // answer; the suite never sets the variable, so that answer is "off".
-    assert!(!overlay_guard_on());
+    // answer; the suite never sets the variable, so that answer is "on".
+    assert!(overlay_guard_on());
 }
 
-/// TEMP (lab, PRESERVE_SEED): the gate is off unless the lab asks for it, so
-/// the default build's unseeded partial-preserving arm runs unchanged.
+/// TEMP (lab, PRESERVE_SEED): the gate is on unless the lab turns it off -
+/// flipped by 5baf7317 alongside the other artifact fixes, so the default
+/// build's unseeded partial-preserving arm is seeded from the guest window;
+/// `=off` restores.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn preserve_seed_is_off_by_default() {
+fn preserve_seed_is_on_by_default() {
     std::env::remove_var("REIMS_VGPU_LAB_PRESERVE_SEED");
-    assert!(!preserve_seed_on());
+    assert!(preserve_seed_on());
 }
 
 /// TEMP (lab, PRESERVE_SEED): a mapping target whose requested geometry is a
@@ -6772,7 +6776,8 @@ fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
         resource.lifetime_ref(),
     )
     .expect("the retained allocation directly supplies this plane");
-    let super::vulkan::SampledSourceRequest::GuestRuns(source, _, _, 1, None, _, _) = request
+    let super::vulkan::SampledSourceRequest::GuestRuns(source, _, _, 1, None, _, _, _) =
+        request
     else {
         panic!("a direct single plane has no copied-content identity")
     };

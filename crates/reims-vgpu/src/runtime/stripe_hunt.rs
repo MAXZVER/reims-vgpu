@@ -47,7 +47,8 @@
 //! OFF stripe_hunt present mid=1 5120x2160 dc_px=0 clear_px=0 \
 //!   unseeded=2 lost_px=430000 rows=[481-489,502-526] mids=[91,100] more=0 \
 //!   elide=12 elide_px=26214400 provided=0 skip=31 skip_kb=36 gather=0 \
-//!   overlay=1 overlay_rows=[932-1406] reopen=2 recreate=3 t=100245
+//!   overlay=1 overlay_rows=[932-1406] reopen=2 recreate=3 guard_drop=0 \
+//!   skip_guard_drop=0 t=100245
 //! ```
 //!
 //! Join on `t=` against the frame timestamps. A stripe frame whose present
@@ -119,6 +120,9 @@ struct Hunt {
     /// TEMP (lab, OVERLAY_GUARD): adoptions the post-read guard dropped — the
     /// suspected stripe mechanism caught in the act, one per drop.
     guard_drop: u32,
+    /// TEMP (lab, SKIP_GUARD): gather skips the bind-time re-check revoked —
+    /// the skip rail's member of the same family, one per drop.
+    skip_guard_drop: u32,
 }
 
 impl Hunt {
@@ -146,6 +150,7 @@ impl Hunt {
             reopen: 0,
             recreate: 0,
             guard_drop: 0,
+            skip_guard_drop: 0,
         }
     }
 
@@ -287,6 +292,10 @@ impl Hunt {
         self.guard_drop += 1;
     }
 
+    fn note_skip_guard_drop(&mut self) {
+        self.skip_guard_drop += 1;
+    }
+
     /// Render the per-present line and reset every delta. The reset is the
     /// emit: what follows is the next window's account, whatever order the
     /// hooks ran in.
@@ -316,7 +325,7 @@ impl Hunt {
              elide={} elide_px={} provided={} \
              skip={} skip_kb={} gather={} \
              overlay={} overlay_rows=[{}] overlay_rows_more={} \
-             reopen={} recreate={} guard_drop={} t={}",
+             reopen={} recreate={} guard_drop={} skip_guard_drop={} t={}",
             self.dc_px,
             self.clear_px,
             self.clear_white_px,
@@ -337,6 +346,7 @@ impl Hunt {
             self.reopen,
             self.recreate,
             self.guard_drop,
+            self.skip_guard_drop,
             crate::observe::elapsed_us() / 1000,
         );
         *self = Hunt::default();
@@ -471,6 +481,20 @@ pub fn note_guard_drop() {
         .note_guard_drop();
 }
 
+/// Hook (lab, SKIP_GUARD): a gather skip was revoked at the bind because the
+/// guest-write generation moved between the vouch and the moment the retained
+/// image would have been served — the skip rail's member of the same family,
+/// named on the present it preceded.
+pub fn note_skip_guard_drop() {
+    if !on() {
+        return;
+    }
+    window()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .note_skip_guard_drop();
+}
+
 /// Hook: the drain presented `mid` at `w`x`h`. Emits the window's line on the
 /// lab channel and resets the accounting.
 pub fn note_present(mid: u32, w: u32, h: u32) {
@@ -559,6 +583,7 @@ mod tests {
         h.note_reopen();
         h.note_reopen();
         h.note_recreate();
+        h.note_skip_guard_drop();
         let line = h.take_present_line(1, 5120, 2160);
         assert!(line.contains("mid=1 5120x2160"), "{line}");
         assert!(line.contains("dc_px=1000 clear_px=2000"), "{line}");
@@ -571,10 +596,12 @@ mod tests {
         assert!(line.contains("skip=1 skip_kb=4 gather=1"), "{line}");
         assert!(line.contains("overlay=1 overlay_rows=[0-1,2-3]"), "{line}");
         assert!(line.contains("reopen=2 recreate=1"), "{line}");
+        assert!(line.contains("guard_drop=0 skip_guard_drop=1"), "{line}");
         // The reset: a second present says zero, not a running total.
         let again = h.take_present_line(1, 5120, 2160);
         assert!(again.contains("unseeded=0 lost_px=0"), "{again}");
         assert!(again.contains("skip=0 skip_kb=0 gather=0"), "{again}");
+        assert!(again.contains("skip_guard_drop=0"), "{again}");
         assert!(again.contains("rows=[none]"), "{again}");
     }
 

@@ -1004,8 +1004,16 @@ fn wrap_staged(
     request: SampledSourceRequest,
     staged: &crate::backend::vulkan::engine::pass_stage::StagedSlice,
 ) -> SampledSourceRequest {
-    let SampledSourceRequest::GuestRuns(src, native, format, planes, identity, vouch, components) =
-        request
+    let SampledSourceRequest::GuestRuns(
+        src,
+        native,
+        format,
+        planes,
+        identity,
+        vouch,
+        evidence,
+        components,
+    ) = request
     else {
         unreachable!("a staged wrap is applied to a guest-runs serve");
     };
@@ -1016,6 +1024,7 @@ fn wrap_staged(
         planes,
         identity,
         vouch,
+        evidence,
         components,
         staged: staged.clone(),
     }))
@@ -1167,6 +1176,7 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
                 1,
                 Some(LinearSampleIdentity::from(outcome.identity)),
                 outcome.vouch,
+                outcome.evidence,
                 pixel_format::swizzle_identity(),
             ),
         )
@@ -1589,6 +1599,7 @@ impl LinearPlan {
                 outcome.map_or(crate::runtime::gather_witness::GatherVouch::Fresh, |seen| {
                     seen.vouch
                 }),
+                outcome.map_or(None, |seen| seen.evidence),
                 self.native_components,
             ),
         )
@@ -1976,6 +1987,7 @@ impl MapperRefPlan {
                 1,
                 Some(LinearSampleIdentity::from(outcome.identity)),
                 outcome.vouch,
+                outcome.evidence,
                 pixel_format::swizzle_identity(),
             ),
         )
@@ -2989,7 +3001,8 @@ mod tests {
         crate::runtime::gather_witness::GatherVouch,
     ) {
         let (w, h, mid, src) = served;
-        let SampledSourceRequest::GuestRuns(source, layout, format, _, identity, vouch, _) = src
+        let SampledSourceRequest::GuestRuns(source, layout, format, _, identity, vouch, _, _) =
+            src
         else {
             panic!("expected a guest-run serve")
         };
@@ -3517,7 +3530,8 @@ mod tests {
         crate::runtime::gather_witness::GatherVouch,
     ) {
         let (w, h, mid, src) = served;
-        let SampledSourceRequest::GuestRuns(source, layout, _vk, planes, identity, vouch, _) = src
+        let SampledSourceRequest::GuestRuns(source, layout, _vk, planes, identity, vouch, _, _) =
+            src
         else {
             panic!("expected a linear guest-run serve");
         };

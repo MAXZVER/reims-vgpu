@@ -3014,9 +3014,12 @@ mod scanout_snapshot_tests {
     }
 
     #[test]
-    fn scanout_snapshot_is_off_by_default() {
+    fn scanout_snapshot_is_on_by_default() {
         std::env::remove_var("REIMS_VGPU_LAB_SCANOUT_SNAPSHOT");
-        assert!(!super::scanout_snapshot_on());
+        // TEMP (lab): flipped on by 5baf7317 (n251: 0 events in 8 boots, Hz
+        // parity); `=off` restores. The latch is a `OnceLock`, so this reads
+        // the process's first answer; the suite never sets the variable.
+        assert!(super::scanout_snapshot_on());
     }
 }
 

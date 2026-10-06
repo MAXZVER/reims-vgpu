@@ -2028,7 +2028,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 }
             }
             SampledSource::Bytes(_) => {}
-            SampledSource::GuestRuns(src, _) => {
+            SampledSource::GuestRuns(src, ..) => {
                 validate_guest_runs_shape(image, src, block, expected)?;
             }
             // TEMP (lab, PASS_STAGE): a staged bind validates exactly as the
@@ -2543,6 +2543,7 @@ unsafe fn sample_guest_runs(
     resource: &super::types::SampledImageResource,
     src: &super::types::GuestRunSource,
     vouch: crate::runtime::gather_witness::GatherVouch,
+    evidence: Option<crate::runtime::gather_witness::SkipGuardEvidence>,
     staged: Option<super::pass_stage::StagedSlice>,
     sampled: &mut Vec<PreparedSampled>,
     guest_gathers: &mut Vec<PendingGuestGather>,
@@ -2590,13 +2591,25 @@ unsafe fn sample_guest_runs(
     if let Some(image) =
         pools.find_gathered_sampled(SampledKey::of(resource), resource.identity, counters)
     {
-        counters.note_sampled_gather_skipped(src.total_len);
-        sampled.push(PreparedSampled::Cached {
-            binding: resource.binding,
-            array_element: resource.array_element,
-            image,
-        });
-        return Ok(());
+        // TEMP (lab, SKIP_GUARD): the moment the skip is spent. The vouch was
+        // minted at the producer's resolve, an instant the guest's stores can
+        // post-date; this re-asks the guest half before the retained image is
+        // served, and on movement falls through to the ladder below exactly as
+        // the miss above does — the gather re-reads the guest bytes, and the
+        // next bind's witness re-vouches. Only a *hit* pays the re-check: a
+        // miss was never going to serve retained content.
+        if crate::runtime::gather_witness::skip_guard_admits(evidence, src.total_len) {
+            counters.note_sampled_gather_skipped(src.total_len);
+            sampled.push(PreparedSampled::Cached {
+                binding: resource.binding,
+                array_element: resource.array_element,
+                image,
+            });
+            return Ok(());
+        }
+        // The vouch is revoked at the bind: `note_sampled_gather_unskipped`
+        // below is told `vouch` as the producer minted it, and the guard's own
+        // census (`skip_guard_dropped_n`) is what names the third reason.
     }
     // The elision did not fire, and the two reasons it can fail want
     // opposite fixes: no vouch to spend, or a vouch with nothing
@@ -4598,12 +4611,13 @@ pub(crate) unsafe fn execute_draw_inner(
                     resource,
                     &staged.src,
                     staged.vouch,
+                    staged.evidence,
                     Some(staged.staged.clone()),
                     &mut sampled,
                     &mut guest_gathers,
                 )?;
             }
-            SampledSource::GuestRuns(src, vouch) => {
+            SampledSource::GuestRuns(src, vouch, evidence) => {
                 sample_guest_runs(
                     ctx,
                     pools,
@@ -4612,6 +4626,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     resource,
                     src,
                     *vouch,
+                    *evidence,
                     None,
                     &mut sampled,
                     &mut guest_gathers,
@@ -7921,6 +7936,8 @@ mod tests {
                     // No witness ran for a synthetic source, so nothing vouches:
                     // the gather is the only disposition this fixture can take.
                     crate::runtime::gather_witness::GatherVouch::Fresh,
+                    // TEMP (lab, SKIP_GUARD): no vouch, so nothing to re-check.
+                    None,
                 ),
                 byte_origin: Default::default(),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
@@ -8710,7 +8727,7 @@ mod tests {
         req.sampled_images[0].layers = 3;
         assert!(validate_v1(&req).is_ok());
 
-        let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
+        let SampledSource::GuestRuns(source, ..) = &mut req.sampled_images[0].source else {
             panic!("the fixture is guest-backed")
         };
         source.total_len -= 1;
@@ -8734,7 +8751,7 @@ mod tests {
     fn sampled_subrange_validates_inside_its_resource_owned_runs() {
         let mut req = guest_run_req(4, 4, 4 * 4 * 4, 0);
         {
-            let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
+            let SampledSource::GuestRuns(source, ..) = &mut req.sampled_images[0].source else {
                 panic!("the fixture is guest-backed")
             };
             source.source_offset = 32;
@@ -8747,7 +8764,7 @@ mod tests {
         assert!(validate_v1(&req).is_ok());
 
         {
-            let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
+            let SampledSource::GuestRuns(source, ..) = &mut req.sampled_images[0].source else {
                 panic!("the fixture is guest-backed")
             };
             source.runs = std::sync::Arc::new(vec![GuestRun::whole(
