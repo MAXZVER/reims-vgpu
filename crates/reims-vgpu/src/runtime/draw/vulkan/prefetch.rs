@@ -578,8 +578,8 @@ pub(crate) fn shadow_compare(
                 }
             }
             (
-                SampledSourceRequest::GuestRuns(asrc, al, af, ad, aid, av, _),
-                SampledSourceRequest::GuestRuns(bsrc, bl, bf, bd, bid, bv, _),
+                SampledSourceRequest::GuestRuns(asrc, al, af, ad, aid, av, _, _),
+                SampledSourceRequest::GuestRuns(bsrc, bl, bf, bd, bid, bv, _, _),
             ) => {
                 // A generation the witness spent this bind is issued from the
                 // device-global counter by whichever arm asked, so only a

@@ -1049,6 +1049,10 @@ pub(super) enum SampledSourceRequest {
         u32,
         Option<LinearSampleIdentity>,
         crate::runtime::gather_witness::GatherVouch,
+        /// TEMP (lab, SKIP_GUARD): the vouch's re-checkable half, riding to the
+        /// engine beside the vouch and validated at the bind that spends the
+        /// skip (`skip_guard_admits`).
+        Option<crate::runtime::gather_witness::SkipGuardEvidence>,
         pixel_format::SwizzlePlan,
     ),
     /// TEMP (lab, PASS_STAGE, design 8.4): a [`Self::GuestRuns`] bind whose
@@ -1068,6 +1072,9 @@ pub(super) struct StagedSampledRequest {
     pub(super) planes: u32,
     pub(super) identity: Option<LinearSampleIdentity>,
     pub(super) vouch: crate::runtime::gather_witness::GatherVouch,
+    /// TEMP (lab, SKIP_GUARD): the vouch's re-checkable half, validated at the
+    /// bind exactly as the plain guest-runs request's is.
+    pub(super) evidence: Option<crate::runtime::gather_witness::SkipGuardEvidence>,
     pub(super) components: pixel_format::SwizzlePlan,
     pub(super) staged: crate::backend::vulkan::engine::pass_stage::StagedSlice,
 }
@@ -1620,7 +1627,7 @@ fn lab_cover_tex(
             format!("bytes(len={})", b.len())
         }
         crate::backend::vulkan::engine::SampledSource::Target(t) => format!("target({t:?})"),
-        crate::backend::vulkan::engine::SampledSource::GuestRuns(g, vouch) => format!(
+        crate::backend::vulkan::engine::SampledSource::GuestRuns(g, vouch, _) => format!(
             "guest_runs(runs={} len={} first_ptr={:?} vouch={vouch:?})",
             g.runs.len(),
             g.total_len,
@@ -1662,7 +1669,7 @@ fn lab_wallpx(
     img: &crate::backend::vulkan::engine::SampledImageResource,
 ) {
     use crate::backend::vulkan::engine::SampledSource;
-    let SampledSource::GuestRuns(src, vouch) = &img.source else {
+    let SampledSource::GuestRuns(src, vouch, _) = &img.source else {
         return;
     };
     if (img.width, img.height) != (1920, 1080) {
@@ -5616,6 +5623,8 @@ pub(super) fn direct_linear_sample_from_packed(
         1,
         None,
         crate::runtime::gather_witness::GatherVouch::Fresh,
+        // TEMP (lab, SKIP_GUARD): a direct image carries no vouch to re-check.
+        None,
         native_components,
     ))
 }
@@ -7321,6 +7330,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                     planes,
                     Some(LinearSampleIdentity::from(seen.identity)),
                     seen.vouch,
+                    seen.evidence,
                     native_components,
                 ),
             ));
@@ -7378,6 +7388,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             planes,
             Some(LinearSampleIdentity::from(seen.identity)),
             seen.vouch,
+            seen.evidence,
             native_components,
         ),
     ))
@@ -7478,6 +7489,8 @@ pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
             1,
             None,
             crate::runtime::gather_witness::GatherVouch::Fresh,
+            // TEMP (lab, SKIP_GUARD): a direct image carries no vouch to re-check.
+            None,
             pixel_format::swizzle_identity(),
         ));
     }
@@ -7517,6 +7530,7 @@ pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
         1,
         Some(LinearSampleIdentity::from(seen.identity)),
         seen.vouch,
+        seen.evidence,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
         pixel_format::swizzle_identity(),
@@ -7610,6 +7624,8 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
             1,
             None,
             crate::runtime::gather_witness::GatherVouch::Fresh,
+            // TEMP (lab, SKIP_GUARD): a direct image carries no vouch to re-check.
+            None,
             pixel_format::swizzle_identity(),
         ));
     }
@@ -7649,6 +7665,7 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
         1,
         Some(LinearSampleIdentity::from(seen.identity)),
         seen.vouch,
+        seen.evidence,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
         pixel_format::swizzle_identity(),
@@ -10685,13 +10702,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         planes,
                         identity,
                         vouch,
+                        evidence,
                         components,
                     ) => {
                         sampled_vk_format = format;
                         sampled_components = components;
                         source_planes = planes;
                         bytes_identity = identity;
-                        crate::backend::vulkan::engine::SampledSource::GuestRuns(src, vouch)
+                        crate::backend::vulkan::engine::SampledSource::GuestRuns(
+                            src,
+                            vouch,
+                            evidence,
+                        )
                     }
                     // TEMP (lab, PASS_STAGE): the staged twin of the arm
                     // above, carrying the same facts to the engine beside the
@@ -10705,6 +10727,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             crate::backend::vulkan::engine::StagedSampled {
                                 src: staged.src,
                                 vouch: staged.vouch,
+                                evidence: staged.evidence,
                                 staged: staged.staged,
                             },
                         )

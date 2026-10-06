@@ -2300,7 +2300,17 @@ pub enum SampledSource {
     /// says is possible. Resource-owned direct images carry no copied-content
     /// identity. If the backend declines one, the copy fallback therefore runs
     /// conservatively instead of reusing content that was never witnessed.
-    GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherVouch),
+    ///
+    /// TEMP (lab, SKIP_GUARD): the third field is the vouch's re-checkable
+    /// half — the tracking token and the guest-write generation the vouch
+    /// compared equal — which the bind re-validates
+    /// ([`crate::runtime::gather_witness::skip_guard_admits`]) before serving
+    /// a retained image on it. `None` exactly where the vouch is `Fresh`.
+    GuestRuns(
+        GuestRunSource,
+        crate::runtime::gather_witness::GatherVouch,
+        Option<crate::runtime::gather_witness::SkipGuardEvidence>,
+    ),
     /// TEMP (lab, PASS_STAGE, design §8.4): a [`Self::GuestRuns`] bind whose
     /// window a pool worker pre-gathered into its arena. The engine resolves
     /// it exactly as the guest-runs bind it stands for — the content cache's
@@ -2316,6 +2326,9 @@ pub enum SampledSource {
 pub struct StagedSampled {
     pub src: GuestRunSource,
     pub vouch: crate::runtime::gather_witness::GatherVouch,
+    /// TEMP (lab, SKIP_GUARD): the vouch's re-checkable half, validated at
+    /// the bind exactly as the plain guest-runs variant's is.
+    pub evidence: Option<crate::runtime::gather_witness::SkipGuardEvidence>,
     pub staged: super::pass_stage::StagedSlice,
 }
 

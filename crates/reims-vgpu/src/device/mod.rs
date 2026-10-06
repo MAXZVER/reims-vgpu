@@ -324,6 +324,10 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     }
     if let Some(ops) = ops.as_ref() {
         crate::runtime::write_baseline::install(ops);
+        // TEMP (lab, SKIP_GUARD): the consumption-side re-check of a gather
+        // vouch needs a generation read the engine cannot reach through its
+        // recorded request; the shim table installed here is that read.
+        crate::runtime::gather_witness::install_skip_guard(ops);
     }
     let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
     let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);

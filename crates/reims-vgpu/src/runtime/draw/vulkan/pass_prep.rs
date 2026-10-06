@@ -2243,6 +2243,7 @@ mod tests {
                 1,
                 None,
                 crate::runtime::gather_witness::GatherVouch::Fresh,
+                None,
                 pixel_format::swizzle_identity(),
             ),
         );
@@ -2564,8 +2565,8 @@ mod tests {
                 assert_eq!((pw, ph), (sw, sh), "the geometry agrees");
                 match (psrc, ssrc) {
                     (
-                        SampledSourceRequest::GuestRuns(p, playout, _, pplanes, _, _, _),
-                        SampledSourceRequest::GuestRuns(s, slayout, _, splanes, _, _, _),
+                        SampledSourceRequest::GuestRuns(p, playout, _, pplanes, _, _, _, _),
+                        SampledSourceRequest::GuestRuns(s, slayout, _, splanes, _, _, _, _),
                     ) => {
                         assert!(Arc::ptr_eq(&p.runs, &s.runs) || p.runs[..] == s.runs[..]);
                         assert_eq!(p.source_offset, s.source_offset);

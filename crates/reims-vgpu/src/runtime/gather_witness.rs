@@ -1087,6 +1087,13 @@ pub struct GatherObservation {
     /// re-derived from [`Self::verdict`] — a `Disagreed` audit vouches and still
     /// spends, so the two do not agree.
     pub vouch: GatherVouch,
+    /// TEMP (lab, SKIP_GUARD): the re-checkable half of a vouch — the tracking
+    /// token and the guest-write generation the vouch compared equal — handed
+    /// to the engine beside the identity, so the bind that *spends* the skip
+    /// can ask the guest half again (see [`skip_guard_admits`]). `None` on
+    /// every bind that did not vouch: a Fresh identity names bytes no retained
+    /// image was ever built from and there is nothing to re-check.
+    pub evidence: Option<SkipGuardEvidence>,
     /// What the guest's stated channel said about the same question the
     /// hypervisor half of [`Self::verdict`] answers. Observed only; no arm of
     /// this module branches on it.
@@ -1159,6 +1166,10 @@ pub struct GatherOutcome {
     pub identity: GatheredIdentity,
     /// Whether that identity can name an image the cache already holds.
     pub vouch: GatherVouch,
+    /// TEMP (lab, SKIP_GUARD): the re-checkable half of the vouch, for the
+    /// engine to validate at the bind that spends it
+    /// ([`skip_guard_admits`]). `Some` exactly where `vouch` is `Vouched`.
+    pub evidence: Option<SkipGuardEvidence>,
 }
 
 /// What one bind of `key`'s window reads from device state before the witness
@@ -1391,6 +1402,7 @@ pub(crate) fn commit_gather<M: crate::runtime::host::HostOps>(
             generation: plan.seen.generation,
         },
         vouch: plan.seen.vouch,
+        evidence: plan.seen.evidence,
     })
 }
 
@@ -1445,6 +1457,7 @@ impl PlannedGather {
                 generation: self.seen.generation,
             },
             vouch: self.seen.vouch,
+            evidence: self.seen.evidence,
         }
     }
 
@@ -1589,6 +1602,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             generation: seen.generation,
         },
         vouch: seen.vouch,
+        evidence: seen.evidence,
     }
 }
 
@@ -1644,6 +1658,215 @@ pub struct GatheredIdentity {
     /// Generation vouched for these bytes, from
     /// `DeviceState::next_sampled_content_generation`.
     pub generation: u64,
+}
+
+/// TEMP (lab, SKIP_GUARD): the re-checkable half of one vouch, handed to the
+/// engine beside the identity it vouches for.
+///
+/// The witness's own verdict at a bind compares `guest_write_gen(token)` now
+/// against the generation the previous bind recorded — the guest half of the
+/// two halves this module documents. A vouch says "the generation did not
+/// move, so the retained image gathered under this identity still names those
+/// bytes". This pair is that statement in a form the **consumer** can ask
+/// again: `token` is the tracking set, `gen` is the generation the vouch
+/// compared equal at the moment it was minted.
+///
+/// `gen` is the *guest-write* generation (the hypervisor dirty counter), not
+/// [`GatheredIdentity::generation`] (the device-global sampled-content
+/// counter). The two live on different axes: the identity names which image,
+/// the evidence names what the guest had (not) done when the vouch was taken.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SkipGuardEvidence {
+    /// Tracking token armed over the window's pages at the vouch.
+    pub token: u64,
+    /// `guest_write_gen(token)` as read at the vouch — the value the vouch
+    /// compared equal against the previous bind.
+    pub gen: u64,
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_SKIP_GUARD=off`, default **on**): re-validate
+/// the guest-write half of a vouch at the moment the **skip is spent** — the
+/// engine's bind of the retained image — and on movement treat the bind as
+/// unvouched, falling through to the gather ladder exactly as a cache miss
+/// would.
+///
+/// # The hole this guards
+///
+/// The witness observes at the *producer's* moment T0 (the drain's resolve, or
+/// a pool plan's commit): "no guest store into these pages since the gather
+/// that filled the retained image". The engine *spends* that answer at its own
+/// later moment T1, when `find_gathered_sampled` hits and the retained image
+/// is bound without reading a byte (`sample_guest_runs`, engine/exec.rs). A
+/// guest store landing in (T0, T1) — a memset→fill of fresh pages straddling
+/// the resolve→bind window — is invisible to the T0 vouch and is served as
+/// whatever the retained image held: on n252's artifact frame (sn1, t=92048)
+/// the STRIPE_HUNT census read `unseeded=0 overlay=0 gather=3` beside
+/// `skip=54 / skip_kb=525956`, and the black rows were whole guest pages read
+/// as zeros — a retained image built from pre-fill zeroed pages, served by
+/// skips whose vouch predated the fill (`lab/journal/2026-10-05-stripe-hunt.md`
+/// §2 C4 names the class; this guard is the skip rail's member of the same
+/// family the OVERLAY_GUARD closed for the adoption rails).
+///
+/// The re-check is meaningful for the same reason the overlay guard's is:
+/// `guest_write_gen` is an idempotent generation whose reads sync their own
+/// set, so a bind-time read that still returns the vouch-time generation is
+/// evidence no *observed* write landed in between. A write whose sync has not
+/// landed by the check stays invisible — the guard narrows the window, it
+/// cannot close it.
+///
+/// # What it does not re-check
+///
+/// The **host-write half** (this device's own writes into the window's pages)
+/// is not re-validated: the pages-precise question needs the window's page
+/// list, which does not travel with the bind, and the device's own writes are
+/// queue-ordered with the very draw being guarded. That half stays the
+/// witness's own next-bind answer, as it was before this guard.
+///
+/// # Cost and census
+///
+/// One `guest_write_gen(token)` read per skip that actually hits — the same
+/// read the witness's own T0 verdict already pays per bind, paid once more at
+/// the moment of consumption; misses and Fresh binds pay nothing. Census:
+/// `skip_guard_passed_n` / `skip_guard_dropped_n` / `skip_guard_dropped_kb`
+/// and the reason slug `skip_guard_drop_gen_moved`; each drop also lands on
+/// the STRIPE_HUNT per-present line as `skip_guard_drop=`. Default on (this
+/// lands on top of the already-defaulted artifact fixes); `=off` restores the
+/// witness-only behaviour for A/B.
+pub fn skip_guard_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("REIMS_VGPU_LAB_SKIP_GUARD").as_deref(),
+            Ok("off")
+        )
+    })
+}
+
+/// What the bind-time re-check said about one skip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipGuardVerdict {
+    /// Nothing observed moved between the vouch and this bind (or the host
+    /// cannot answer now). The skip stands.
+    Passed,
+    /// The guest-write generation moved: a guest store the vouch never saw
+    /// landed before this bind, so the retained image it would serve predates
+    /// the guest's bytes. The skip is revoked — gather instead.
+    DroppedGenMoved,
+}
+
+impl SkipGuardVerdict {
+    pub fn dropped(self) -> bool {
+        matches!(self, Self::DroppedGenMoved)
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Passed => "skip_guard_passed_n",
+            Self::DroppedGenMoved => "skip_guard_drop_gen_moved",
+        }
+    }
+}
+
+/// The verdict, as a pure function of the evidence and a fresh generation
+/// reading. Split out so the policy is testable against stated readings, the
+/// same shape as the overlay guard's `overlay_guard_verdict`.
+pub fn skip_guard_verdict(evidence: &SkipGuardEvidence, gen_now: Option<u64>) -> SkipGuardVerdict {
+    // The host cannot say right now (an unarmed read answers 0/None): not
+    // evidence of movement, and dropping on it would refuse every skip whose
+    // token sits between syncs — the overlay guard's own no-evidence rule.
+    let Some(now) = gen_now else {
+        return SkipGuardVerdict::Passed;
+    };
+    if now != evidence.gen {
+        return SkipGuardVerdict::DroppedGenMoved;
+    }
+    SkipGuardVerdict::Passed
+}
+
+/// How the engine asks the host for a generation: this module has no `HostOps`
+/// at the consumption site (the engine binds with only the recorded request),
+/// so the device installs its shim table's read here once at creation — the
+/// same single-instance stance `write_baseline::install` takes.
+type SkipGuardGen = std::sync::Arc<dyn Fn(u64) -> Option<u64> + Send + Sync>;
+
+/// The one process-wide slot the guard's generation read lives in. A `RwLock`
+/// rather than a `OnceLock` because the test that drives the drop path must
+/// install its fake over whatever a concurrent `device_create` put there —
+/// production installs only into the empty slot, tests replace and restore,
+/// and the read is one lock acquisition beside a hypervisor query that costs
+/// six orders of magnitude more. Every accessor goes through this one fn so
+/// the getter and the two installers share the same slot.
+fn skip_guard_gen_slot() -> &'static std::sync::RwLock<Option<SkipGuardGen>> {
+    static GEN: std::sync::RwLock<Option<SkipGuardGen>> = std::sync::RwLock::new(None);
+    &GEN
+}
+
+fn skip_guard_gen() -> Option<SkipGuardGen> {
+    skip_guard_gen_slot()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Install the guest-write generation read the skip guard re-checks with.
+/// Called from `device_create` with the QEMU host-service table; writes only
+/// the empty slot, so one device per process owns it (the same single-instance
+/// stance `write_baseline::install` takes) and a test's fake is not displaced
+/// by a racing device creation.
+pub fn install_skip_guard(ops: &crate::qemu::host_ops::ReimsVgpuHostOps) {
+    let mut slot = skip_guard_gen_slot()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    if slot.is_some() {
+        return;
+    }
+    let table = *ops;
+    *slot = Some(std::sync::Arc::new(move |token| table.write_gen(token)));
+}
+
+/// TEMP (lab, SKIP_GUARD, tests): install a fake generation read over
+/// whatever is there (a `device_create` in another test may have installed the
+/// real table first), and return the previous one so the caller can restore it.
+#[cfg(test)]
+pub(crate) fn install_skip_guard_for_test(read: SkipGuardGen) -> Option<SkipGuardGen> {
+    skip_guard_gen_slot()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(read)
+}
+
+/// The consumption-side gate, called by the engine at the moment a skip is
+/// spent: the retained-image lookup has *hit*, and this decides whether the
+/// vouch that predicted the hit still stands. `true` = bind the retained
+/// image; `false` = treat the bind as unvouched and fall through to the
+/// normal gather ladder — the serial gather re-reads the guest bytes, and the
+/// witness's next bind re-vouches (a guest write that moved the generation
+/// here is visible to that bind by construction, so the fall-through heals in
+/// the same frame rather than one late).
+///
+/// `evidence == None` (a Fresh bind, or a boot whose producer minted nothing)
+/// admits trivially: there was no vouch to revoke, and the lookup's hit is
+/// the cache's own `(key, generation)` coherence, not a witness claim.
+pub fn skip_guard_admits(evidence: Option<SkipGuardEvidence>, span: u64) -> bool {
+    use crate::runtime::drain::{note_store_route, note_store_route_n};
+    if !skip_guard_on() {
+        return true;
+    }
+    let Some(evidence) = evidence else {
+        return true;
+    };
+    let gen_now = skip_guard_gen().and_then(|read| read(evidence.token));
+    let verdict = skip_guard_verdict(&evidence, gen_now);
+    note_store_route(verdict.slug());
+    if verdict.dropped() {
+        note_store_route("skip_guard_dropped_n");
+        note_store_route_n("skip_guard_dropped_kb", span / 1024);
+        // TEMP (lab, STRIPE_HUNT): the skip rail's member of the family the
+        // per-present line hunts — named on the present it preceded.
+        crate::runtime::stripe_hunt::note_skip_guard_drop();
+        return false;
+    }
+    true
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_WATCHKEY=<content_key>` names one gather window
@@ -1826,6 +2049,9 @@ fn observe<M: crate::runtime::host::HostOps>(
             // assigns unconditionally: a re-pointed window has no previous bind
             // of these pages to have vouched for them.
             vouch: GatherVouch::Fresh,
+            // TEMP (lab, SKIP_GUARD): a re-arm re-points the window and gathers
+            // unconditionally, so no vouch exists to re-check.
+            evidence: None,
             // A re-point has no previous bind to compare a generation against,
             // which is the same "no answer" the channel gives an unaddressable
             // window. Reporting it as quiet would credit the stated channel with
@@ -2102,6 +2328,14 @@ fn decide_warm<M: crate::runtime::host::HostOps>(
         } else {
             GatherVouch::Fresh
         },
+        // TEMP (lab, SKIP_GUARD): minted exactly where `kept` is decided, so
+        // the evidence and the vouch cannot disagree — the re-check at the
+        // bind asks the guest half the same question this bind asked, against
+        // the generation this bind's vouch compared equal.
+        evidence: kept.then_some(SkipGuardEvidence {
+            token: entry.token,
+            gen,
+        }),
         stated,
     }
 }
@@ -3306,5 +3540,186 @@ mod tests {
             one_page(&GPAS, &runs),
         );
         assert_eq!(served.vouch, GatherVouch::Fresh);
+    }
+
+    /// TEMP (lab, SKIP_GUARD): the verdict table — the policy, stated as
+    /// readings, exactly as the overlay guard's own table test spells its
+    /// policy. Quiet passes; a host that cannot answer passes (not evidence of
+    /// movement); a generation that moved drops.
+    #[test]
+    fn skip_guard_verdict_passes_quiet_and_drops_movement() {
+        let ev = SkipGuardEvidence { token: 7, gen: 11 };
+        // Quiet: the generation the vouch compared equal is still the answer.
+        assert_eq!(
+            skip_guard_verdict(&ev, Some(11)),
+            SkipGuardVerdict::Passed,
+            "an unmoved generation must not revoke a skip"
+        );
+        // The host cannot say right now (unarmed, between syncs, token gone):
+        // not evidence of movement, and dropping on it would refuse every skip
+        // whose token sits between syncs.
+        assert_eq!(
+            skip_guard_verdict(&ev, None),
+            SkipGuardVerdict::Passed,
+            "an unanswered re-check is not a moved generation"
+        );
+        // The generation moved: a guest store the vouch never saw landed
+        // before the bind, so the retained image predates the guest's bytes.
+        let moved = skip_guard_verdict(&ev, Some(12));
+        assert!(moved.dropped());
+        assert_eq!(moved.slug(), "skip_guard_drop_gen_moved");
+    }
+
+    /// TEMP (lab, SKIP_GUARD): the evidence a vouch hands the engine names the
+    /// very token and generation the vouch compared — and no other kind of
+    /// bind hands anything, because a Fresh identity names bytes no retained
+    /// image was ever built from and there is nothing to re-check.
+    #[test]
+    fn a_vouch_carries_recheckable_evidence_and_no_other_bind_does() {
+        use crate::runtime::host::HostOps;
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+
+        // First sight: a re-arm gathers unconditionally — Fresh, no evidence.
+        let first = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 10);
+        assert_eq!(first.vouch, GatherVouch::Fresh);
+        assert_eq!(first.evidence, None);
+
+        // Quiet at both halves: vouched, and the evidence names the entry's
+        // own token with the generation the vouch compared equal.
+        let quiet = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 11);
+        assert_eq!(quiet.vouch, GatherVouch::Vouched);
+        let evidence = quiet.evidence.expect("a vouch carries its half");
+        assert_ne!(evidence.token, 0, "a vouch implies an armed token");
+        assert_eq!(
+            evidence.gen,
+            host.guest_write_gen(evidence.token).expect("the token is live"),
+            "the evidence must name the generation the vouch compared, not some other reading"
+        );
+
+        // The guest writes: the next bind is Fresh, and hands nothing — the
+        // skip that would have served the retained image must not survive as
+        // re-checkable after the witness itself refused.
+        host.guest_wrote_page(GPAS[0]);
+        let wrote = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 12);
+        assert_eq!(wrote.vouch, GatherVouch::Fresh);
+        assert_eq!(wrote.evidence, None);
+    }
+
+    /// TEMP (lab, SKIP_GUARD): the flow the guard exists for, over a fake
+    /// generation read installed where `device_create` installs the shim's.
+    ///
+    /// A vouch is minted while the guest is quiet; the guest's fill lands
+    /// after the vouch (between the producer's resolve and the engine's bind);
+    /// the bind-time re-check sees the moved generation and revokes the skip —
+    /// the retained image of pre-fill zeros is never served. The fall-through
+    /// is the miss path: nothing latches, and once the fill quiesces the next
+    /// bind re-vouches on the post-fill generation.
+    #[test]
+    fn skip_guard_admits_drops_a_vouch_the_guest_moved_under_and_the_next_bind_revouches() {
+        use crate::runtime::host::HostOps;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let buf = vec![0u8; PAGE];
+        let runs = [run_over(&buf)];
+
+        // Bind to a live vouch, exactly as the producer's resolve would.
+        let _ = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 10);
+        let vouched = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 11);
+        assert_eq!(vouched.vouch, GatherVouch::Vouched);
+        let evidence = vouched.evidence.expect("a vouch carries its half");
+
+        // The engine-side generation read, over a state this test controls:
+        // quiet until the guest's fill lands, moved after. Installed over
+        // whatever a concurrent `device_create` in the suite put there, and
+        // restored on the way out so no other test reads this fake.
+        let answers: Arc<Mutex<HashMap<u64, Option<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let previous = install_skip_guard_for_test({
+            let answers = Arc::clone(&answers);
+            Arc::new(move |token| answers.lock().unwrap().get(&token).copied().flatten())
+        });
+        let restore = |previous: Option<SkipGuardGen>| {
+            if let Some(back) = previous {
+                let _ = install_skip_guard_for_test(back);
+            }
+        };
+        {
+            let mut a = answers.lock().unwrap();
+            a.insert(evidence.token, Some(evidence.gen));
+        }
+
+        // The bind, before the fill: the re-check returns the vouch's own
+        // generation and the skip stands.
+        assert!(
+            skip_guard_admits(Some(evidence), PAGE as u64),
+            "an unmoved generation must admit the skip"
+        );
+
+        // The guest's fill lands inside the resolve-to-bind window: the
+        // tracker's answer moves, the vouch predates the fill, and the skip
+        // that would serve the retained image built from zeroed pages is
+        // revoked — the engine falls through to the gather ladder exactly as
+        // a cache miss would.
+        host.guest_wrote_page(GPAS[0]);
+        let moved_gen = host
+            .guest_write_gen(evidence.token)
+            .expect("the fake host answers for a live token");
+        assert_ne!(moved_gen, evidence.gen);
+        {
+            let mut a = answers.lock().unwrap();
+            a.insert(evidence.token, Some(moved_gen));
+        }
+        assert!(
+            !skip_guard_admits(Some(evidence), PAGE as u64),
+            "a generation that moved between the vouch and the bind must revoke the skip"
+        );
+
+        // The fall-through heals in the witness: the guest's write is visible
+        // to the next bind, which refuses (the gather the fall-through ran has
+        // re-read the bytes), and once quiet again the bind after it re-vouches
+        // on the post-fill generation — a new identity, a new evidence pair.
+        let refused = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 12);
+        assert_eq!(
+            refused.verdict,
+            GatherVerdict::Refused {
+                guest_wrote: true,
+                host_wrote_pages: false
+            }
+        );
+        assert_eq!(refused.vouch, GatherVouch::Fresh);
+        let revouched = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 13);
+        assert_eq!(revouched.vouch, GatherVouch::Vouched);
+        let new_evidence = revouched
+            .evidence
+            .expect("the re-vouch carries its own half");
+        assert_eq!(new_evidence.gen, moved_gen);
+        {
+            let mut a = answers.lock().unwrap();
+            a.insert(new_evidence.token, Some(new_evidence.gen));
+        }
+        assert!(
+            skip_guard_admits(Some(new_evidence), PAGE as u64),
+            "the post-fill vouch must admit: nothing moved since it was taken"
+        );
+
+        // A bind with no evidence (Fresh, or a producer that minted nothing)
+        // admits trivially — there was no vouch to revoke.
+        assert!(skip_guard_admits(None, PAGE as u64));
+        restore(previous);
+    }
+
+    /// TEMP (lab, SKIP_GUARD): the gate is on unless the lab turns it off, so
+    /// the default build's skip rail is guarded without any env.
+    #[test]
+    fn skip_guard_is_on_by_default() {
+        std::env::remove_var("REIMS_VGPU_LAB_SKIP_GUARD");
+        // The latch is a `OnceLock`, so this test reads the process's first
+        // answer; the suite never sets the variable, so that answer is "on".
+        assert!(skip_guard_on());
     }
 }
