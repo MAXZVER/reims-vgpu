@@ -162,12 +162,23 @@ pub fn lab_trim_debts<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("wbdebt_trim_settle_wait");
         return;
     }
-    if guest_waiting && YIELDS.fetch_add(1, Relaxed) < 8 {
+    // TEMP (lab TRIM_IDLE): while a doorbell is waiting, no trim at all below
+    // four times the bound, and one payment a tranche end above it; the ledger
+    // is paid down when the guest goes quiet (heartbeat tranche ends).
+    let idle_policy = lab_trim_idle();
+    if idle_policy && guest_waiting {
+        if state.pending_writebacks.debts.len() <= cap * 4 {
+            crate::runtime::drain::note_store_route("wbdebt_trim_idle_wait");
+            return;
+        }
+        crate::runtime::drain::note_store_route("wbdebt_trim_idle_over");
+    } else if guest_waiting && YIELDS.fetch_add(1, Relaxed) < 8 {
         crate::runtime::drain::note_store_route("wbdebt_trim_yielded");
         return;
     }
     YIELDS.store(0, Relaxed);
-    for _ in 0..if moving { 1 } else { 16 } {
+    let budget = if moving || (idle_policy && guest_waiting) { 1 } else { 16 };
+    for _ in 0..budget {
         if state.pending_writebacks.debts.len() <= cap {
             break;
         }
@@ -183,6 +194,24 @@ pub fn lab_trim_debts<M: HostMemory + HostOps>(
             pay(state, host, mapping_id, debt, "wbdebt_paid_trimmed");
         }
     }
+}
+
+/// TEMP (lab, live `TRIM_IDLE=on|off`, on unless `=off` since p072): the trim
+/// pays only while no doorbell is waiting - the heartbeat's tranche ends while
+/// the guest is quiet, as it is for 50-360 ms at each edge of a full-screen
+/// transition - and lets the ledger grow to four times its bound meanwhile (one
+/// payment a tranche end past that). p069: the trim was 41 % of the drain in the
+/// tranches that open a transition's animation (a fence wait and a guest-page
+/// write each), the frames the guest is waiting on; the bounded yield it had
+/// (eight tranche ends) runs out within the first frames. A debt kept longer is
+/// the same debt: a reader that names it pays it first. p072 (Intel ABBA): slow
+/// tranches 4.24/4.44 -> 3.90/4.10 s, the Safari animation-start tranches -19 %,
+/// named payments unchanged, snapshots clean.
+fn lab_trim_idle() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    crate::runtime::lab_live::on("TRIM_IDLE").unwrap_or(true)
 }
 
 /// TEMP (lab, `REIMS_VGPU_LAB_TRIM_DEFER=on`, live through `REIMS_VGPU_LAB_LIVE_FILE`):

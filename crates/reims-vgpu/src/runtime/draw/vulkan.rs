@@ -1477,8 +1477,13 @@ fn lab_recorder_store_join() -> bool {
 
 /// TEMP (lab): `REIMS_VGPU_LAB_EXIT_JOIN=off` — a record that did not defer takes
 /// only a failure already found at its exit (see `encode_draw_chain`). On
-/// (waiting) by default until measured. Latched.
+/// (waiting) by default until measured. Live (`EXIT_JOIN=on|off`), else latched:
+/// p070 measured RETAIN_FAST moving ~200 ms a phase of recorder waits off the
+/// resident doors and onto this exit, which then held the same total.
 fn lab_recorder_exit_join() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("EXIT_JOIN") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var("REIMS_VGPU_LAB_EXIT_JOIN").map_or(true, |v| v != "off");
