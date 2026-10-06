@@ -6829,6 +6829,55 @@ fn apply_clear<M: HostMemory + HostOps>(
     ok
 }
 
+/// TEMP (lab, GPU_CLEAR): land a solid clear colour in a GVA plane's guest
+/// pages with the CPU — the fill `apply_clear` performs, shared with the payment
+/// of a clear-only GPU debt (`writeback_debt::pay_gva`), which owes exactly
+/// these bytes and needs no readback to produce them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lab_fill_gva_solid<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    target_gva: u64,
+    width: u32,
+    height: u32,
+    row_stride: u32,
+    format: u16,
+    clear_color: &[f64; 4],
+) -> bool {
+    let one_row = clear_row_mode();
+    let image_height = if one_row { 1 } else { height };
+    let Some(clear) = lab_cached_clear_image(format, width, image_height, clear_color) else {
+        return false;
+    };
+    let mut converted = Vec::new();
+    let frame = match (one_row, clear.encoding()) {
+        (false, ClearImageEncoding::Rgba8) => draw::FrameRows::Rgba8(clear.pixels()),
+        (false, ClearImageEncoding::Native) => draw::FrameRows::Native(clear.pixels()),
+        (true, ClearImageEncoding::Native) => draw::FrameRows::Repeat(clear.pixels()),
+        (true, ClearImageEncoding::Rgba8) => {
+            let converts = pixel_format::tight_row_bytes(width, format).is_some_and(|tight| {
+                converted.resize(tight as usize, 0);
+                pixel_format::Rgba8ToRow::for_format(format)
+                    .is_some_and(|rail| rail.convert(clear.pixels(), width, &mut converted))
+            });
+            if !converts {
+                return false;
+            }
+            draw::FrameRows::Repeat(&converted)
+        }
+    };
+    match draw::write_gva_frame_within_par(
+        state, host, task_id, target_gva, width, height, row_stride, format, &frame,
+    ) {
+        Some(res) => res.is_ok(),
+        None => draw::write_gva_frame_within(
+            state, host, task_id, target_gva, width, height, row_stride, format, frame, None,
+        )
+        .is_ok(),
+    }
+}
+
 /// TEMP (lab, `REIMS_VGPU_LAB_CLEAR_CACHE`, on unless `=off`): the solid image
 /// of a clear-only pass, kept for the next clear of the same format, size and
 /// colour. A 5K clear built and filled ~42 MB every time; on fullscreen

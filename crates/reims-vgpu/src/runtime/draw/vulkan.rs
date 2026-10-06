@@ -6770,18 +6770,20 @@ fn gva_resident_ready(
     ready
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_GPU_CLEAR=on` lands a clear-only pass over a GVA
+/// TEMP (lab): `REIMS_VGPU_LAB_GPU_CLEAR` lands a clear-only pass over a GVA
 /// target in the target's resident on the GPU and defers the guest pages to
 /// the writeback debt, instead of filling them on the drain thread
-/// ([`lab_gpu_clear_gva`]). Off (the old CPU fill) unless set. Live
-/// (`GPU_CLEAR=on|off` in the lab live file) so one boot can A/B it by phase.
+/// ([`lab_gpu_clear_gva`]). On unless `=off` (the old CPU fill) since p027
+/// (Intel, 5K, six phases of one boot): slow tranches -18 %, Safari transition
+/// frames +47 %, Finder +25 %, no streaks, mid-transition snapshots matching the
+/// CPU fill (p026). Live (`GPU_CLEAR=on|off` in the lab live file).
 pub(crate) fn lab_gpu_clear_enabled() -> bool {
     if let Some(on) = crate::runtime::lab_live::on("GPU_CLEAR") {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("REIMS_VGPU_LAB_GPU_CLEAR").is_ok_and(|v| v == "on");
+        let on = std::env::var("REIMS_VGPU_LAB_GPU_CLEAR").map_or(true, |v| v != "off");
         crate::observe::off(format!("lab_gpu_clear on={}", u8::from(on)));
         on
     })
@@ -6873,6 +6875,7 @@ pub(crate) fn lab_gpu_clear_gva<M: HostMemory + HostOps>(
         note("lab_gpu_clear_unarmed");
         return false;
     }
+    state.pending_writebacks.lab_note_solid(own, clear_color);
     note("lab_gpu_clear_armed");
     true
 }

@@ -506,6 +506,12 @@ pub struct PendingWritebacks {
     /// TEMP (lab PAY_DEFER): the one payment taken from the ledger whose rail
     /// part is on the GPU and whose landing is still owed. See [`pay_deferred`].
     deferred: DeferredSlot,
+    /// TEMP (lab, `REIMS_VGPU_LAB_GPU_CLEAR`): GVA debts whose whole content is
+    /// a clear colour (a GPU clear with no draw after it), keyed by plane with
+    /// the debt's `seq` and the colour. Paying one is a CPU fill of the colour,
+    /// not a readback: see [`pay_gva`]. A later Store into the plane re-arms the
+    /// debt under a new `seq`, which retires the entry by mismatch.
+    lab_solid: std::collections::BTreeMap<GvaPlaneKey, (u64, [f64; 4])>,
 }
 
 /// TEMP (lab PAY_DEFER): a payment taken from the ledger and begun, not landed.
@@ -937,6 +943,27 @@ impl PendingWritebacks {
 
     fn take_gva_plane(&mut self, plane: GvaPlaneKey) -> Option<GvaWritebackDebt> {
         self.gva_debts.remove(&plane)
+    }
+
+    /// TEMP (lab, GPU_CLEAR): the debt now armed on `plane` holds nothing but
+    /// `color`. Bounded: the map is dropped whole past 4096 planes (a missing
+    /// entry only costs the readback the payment would have made anyway).
+    pub fn lab_note_solid(&mut self, plane: GvaPlaneKey, color: [f64; 4]) {
+        let Some(seq) = self.gva_debts.get(&plane).map(|d| d.seq) else {
+            return;
+        };
+        if self.lab_solid.len() >= 4096 {
+            self.lab_solid.clear();
+        }
+        self.lab_solid.insert(plane, (seq, color));
+    }
+
+    /// TEMP (lab, GPU_CLEAR): the clear colour `debt` (taken from `plane`) is
+    /// made of, if it is still the clear-only debt [`Self::lab_note_solid`]
+    /// recorded. Consumes the entry either way.
+    fn lab_take_solid(&mut self, plane: GvaPlaneKey, debt: &GvaWritebackDebt) -> Option<[f64; 4]> {
+        let (seq, color) = self.lab_solid.remove(&plane)?;
+        (seq == debt.seq).then_some(color)
     }
 
     /// Put back a debt whose guest backing was temporarily unavailable.
@@ -3035,6 +3062,31 @@ fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
     } else {
         Vec::new()
     };
+    // TEMP (lab, GPU_CLEAR): a clear-only debt owes the guest a solid colour,
+    // which the CPU writes as fast as the eager clear did, with no readback and
+    // no wait on the queue the resident was cleared on. The guest pages then
+    // hold the clear and the resident is released to them, the state the eager
+    // clear left.
+    if let Some(color) = state.pending_writebacks.lab_take_solid(plane, &debt) {
+        if skip.is_empty()
+            && crate::runtime::exec::lab_fill_gva_solid(
+                state,
+                host,
+                key.task_id,
+                debt.gva,
+                debt.width,
+                debt.height,
+                debt.row_stride,
+                debt.format,
+                &color,
+            )
+        {
+            crate::runtime::drain::note_store_route("lab_gpu_clear_paid_solid");
+            rail.abandon_resident(&target);
+            return true;
+        }
+        crate::runtime::drain::note_store_route("lab_gpu_clear_paid_readback");
+    }
     let pages = crate::runtime::draw::StoreTargetPages::from_ordered(&ordered, span);
     let request = crate::runtime::draw::ColorRtRequest {
         texture_ref: key.texture_ref,
