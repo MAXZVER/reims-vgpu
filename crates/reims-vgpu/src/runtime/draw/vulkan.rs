@@ -8043,17 +8043,25 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
     use crate::backend::vulkan::engine;
     use crate::runtime::mapping_write::ref_texture_sample_window;
     let (w, h) = (view.width, view.height);
+    // TEMP (lab): every refusal below is a route, so a boot says why a plane
+    // took the CPU loader (p048: ~300 4K video planes a phase did).
+    let no = |route: &'static str| -> Option<SampledSourceRequest> {
+        crate::runtime::drain::note_store_route(route);
+        None
+    };
     if w == 0 || h == 0 || view.depth != 1 {
-        return None;
+        return no("zc_t5_no_geometry");
     }
     // Match the CPU path's resolution before reading the plane pages.
     if !mapper::ensure_resolved_for_scanout(state, host, mid) {
-        return None;
+        return no("zc_t5_unresolved");
     }
     let (native, sampled_vk_format, bpp, base_off, bpr) = {
-        let m = state.mappings.get(&mid)?;
+        let Some(m) = state.mappings.get(&mid) else {
+            return no("zc_t5_no_mapping");
+        };
         if !m.mapped || m.page_entries.is_empty() {
-            return None;
+            return no("zc_t5_unmapped");
         }
         // Native formats whose guest bytes sample byte-identically through the
         // matching Vulkan image (the CPU loader's `texel_to_rgba8` is a
@@ -8071,14 +8079,22 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
                 }
                 (layout, layout.bytes_per_texel())
             }
-            Err(_) => return None,
+            Err(_) => return no("zc_t5_no_layout"),
         };
-        let (base_off, bpr_u32, _span_end) =
-            ref_texture_sample_window(m, view.plane_index, w, h, view.pixel_format)?;
-        let sampled_vk_format = translate::pixel::translate(view.pixel_format).ok()?.vk;
+        let Some((base_off, bpr_u32, _span_end)) =
+            ref_texture_sample_window(m, view.plane_index, w, h, view.pixel_format)
+        else {
+            return no("zc_t5_no_window");
+        };
+        let Ok(sampled_vk_format) = translate::pixel::translate(view.pixel_format).map(|p| p.vk)
+        else {
+            return no("zc_t5_untranslated");
+        };
         (native, sampled_vk_format, bpp, base_off, bpr_u32 as u64)
     };
-    let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, bpr)?;
+    let Some((span, row_length_texels)) = strided_window_extent(w, h, bpp as u64, bpr) else {
+        return no("zc_t5_no_extent");
+    };
     // Same rule as the linear rail's floor: a cost threshold may only turn a
     // plane away onto a CPU arm that produces the same pixels. The mapper-ref-texture rail
     // needs no such qualifier because `is_four_byte_color` already fixes what
@@ -8119,7 +8135,9 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
     if !sampled_gather_floor_admits(SampledFloorRail::RefTexture, native, span) {
         return None;
     }
-    let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
+    let Some((gpas, runs)) = mapping_window_guest_runs(state, host, mid, base_off, span) else {
+        return no("zc_t5_no_runs");
+    };
     let page = state.page_size() as usize;
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_mwgr_gather_us");
     let seen = crate::runtime::gather_witness::note_gather(
@@ -10468,6 +10486,33 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 content
             };
             lab_note_bind_bytes("frag", cap.is_some(), &content);
+            // TEMP (lab): which fragment functions bind a buffer they read
+            // without a bound, once per (function, index) — the whole binds
+            // left after ABSENT_NEUTRAL (p048: ~55k a phase, 4 GB of windows).
+            if cap.is_none()
+                && matches!(
+                    &content,
+                    crate::backend::vulkan::engine::BufferContent::GuestRuns(_)
+                )
+            {
+                let entry = f_shader.reflection.entry_point.as_deref().unwrap_or("?");
+                let key = crate::backend::hash::hash_u64(
+                    crate::backend::hash::hash_bytes(entry.as_bytes()),
+                    u64::from(b.index),
+                );
+                if crate::observe::first_sight("lab_frag_whole_bind", key) {
+                    let bytes = match &content {
+                        crate::backend::vulkan::engine::BufferContent::GuestRuns(src) => {
+                            src.total_len
+                        }
+                        _ => 0,
+                    };
+                    crate::observe::off(format!(
+                        "lab_frag_whole_bind fn={entry} index={} access={access:?} bytes={bytes} offset={}",
+                        b.index, b.offset
+                    ));
+                }
+            }
             frag_storage.push((b.index, content));
         }
         drop(fragment_span);

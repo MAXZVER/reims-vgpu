@@ -3356,7 +3356,10 @@ pub fn may_serve_neutral(access: ReflectedBufferAccess, feeds_stage_in: bool) ->
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_ABSENT_NEUTRAL` (live `ABSENT_NEUTRAL=on|off`,
-/// off unless `=on`): see [`may_serve_neutral`]. Off under test.
+/// on unless `=off`): see [`may_serve_neutral`]. p048 ABBA: slow tranches
+/// 5.83/5.36 s off against 4.20/4.13 s on (-26 %), transition frames Safari
+/// 58/57 -> 68/70, Finder 57/50 -> 77/57; whole fragment binds 227k (20 GB of
+/// windows) -> 51k a phase. Off under test.
 pub fn lab_absent_neutral() -> bool {
     if cfg!(test) {
         return false;
@@ -3366,7 +3369,7 @@ pub fn lab_absent_neutral() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = matches!(std::env::var("REIMS_VGPU_LAB_ABSENT_NEUTRAL").as_deref(), Ok("on"));
+        let on = !matches!(std::env::var("REIMS_VGPU_LAB_ABSENT_NEUTRAL").as_deref(), Ok("off"));
         crate::observe::off(format!("lab_absent_neutral on={}", u8::from(on)));
         on
     })
