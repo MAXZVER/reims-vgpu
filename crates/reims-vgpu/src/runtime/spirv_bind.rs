@@ -3161,10 +3161,27 @@ fn reflected_buffer_footprint_extent(
         return None;
     }
     let declared = reflected_buffer_extent(reflection, metal_index);
-    let footprint = reflection
+    let binding = reflection
         .bindings
         .iter()
-        .find(|binding| binding.kind == ResourceKind::Buffer && binding.metal_index == metal_index)
+        .find(|binding| binding.kind == ResourceKind::Buffer && binding.metal_index == metal_index);
+    // TEMP (lab): why a bind has no footprint cap — the whole-buffer binds are
+    // the bytes (p043: fragment whole binds 202k a phase, 20 GB; capped 0.1 GB).
+    if declared.is_none() {
+        crate::runtime::drain::note_store_route(match binding.map(|b| b.footprint.as_ref()) {
+            None => "lab_bbx_no_binding",
+            Some(None) => "lab_bbx_no_footprint",
+            Some(Some(f)) if f.has_unbounded_access => "lab_bbx_unbounded_access",
+            Some(Some(f)) if f.strided_accesses.iter().any(|a| {
+                a.terms.iter().any(|t| maximum(t.source).is_none())
+            }) =>
+            {
+                "lab_bbx_source_unbounded"
+            }
+            Some(Some(_)) => "lab_bbx_capped_or_empty",
+        });
+    }
+    let footprint = binding
         .and_then(|binding| binding.footprint.as_ref())
         .and_then(|footprint| {
             if footprint.has_unbounded_access {

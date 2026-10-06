@@ -2391,12 +2391,13 @@ fn lab_mrt_batch() -> bool {
     if let Some(on) = crate::runtime::lab_live::on("MRT_BATCH") {
         return on;
     }
+    // On unless `=off` since p041 (Intel 5K full-screen transitions, ABBA in one
+    // boot): slow tranches -13 %, drain us per draw -22 %, submits a phase
+    // 80k -> 11k, ring retire blocks 400-600 -> 0, Finder max_gap 240 -> 130 ms;
+    // p044: Safari and Finder mid-transition snapshots on/off alike, no streaks.
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
-            std::env::var("REIMS_VGPU_LAB_MRT_BATCH").as_deref(),
-            Ok("on")
-        )
+        std::env::var("REIMS_VGPU_LAB_MRT_BATCH").map_or(true, |v| v != "off")
     })
 }
 
