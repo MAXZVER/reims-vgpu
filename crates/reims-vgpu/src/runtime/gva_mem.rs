@@ -155,15 +155,19 @@ pub(crate) mod lab_tlb {
     /// spans walk, so one large read cannot evict the cache's working set.
     pub(super) const TLB_SPAN_PAGES: usize = 16;
 
-    /// TEMP (lab, `REIMS_VGPU_LAB_GVA_TLB_SPAN=off`): 1 restores the single-page
-    /// rule, for the A/B of the span rule.
+    /// TEMP (lab, `REIMS_VGPU_LAB_GVA_TLB_SPAN=on`): opt-in. p016 (Intel, ABC CBA)
+    /// found no gain from serving and filling multi-page reads — the chain cost
+    /// per draw read 47.9 / 47.9 us with it against 44.8 / 46.9 without, and the
+    /// transitions the same within noise; 256 direct-mapped slots filled sixteen
+    /// pages at a time likely evict the single-page entries that do hit. 1 (the
+    /// single-page rule) unless switched on.
     pub(super) fn span_pages() -> usize {
         static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *N.get_or_init(|| {
-            if std::env::var("REIMS_VGPU_LAB_GVA_TLB_SPAN").as_deref() == Ok("off") {
-                1
-            } else {
+            if std::env::var("REIMS_VGPU_LAB_GVA_TLB_SPAN").as_deref() == Ok("on") {
                 TLB_SPAN_PAGES
+            } else {
+                1
             }
         })
     }
