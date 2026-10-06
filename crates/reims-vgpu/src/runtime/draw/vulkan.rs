@@ -412,6 +412,19 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                         )
                     })
                 });
+                if !landed
+                    && req.colors.first().is_some_and(|c0| {
+                        crate::runtime::writeback_debt::lab_private_store_needs_no_walk(
+                            state,
+                            req.task_id,
+                            c0,
+                        )
+                    })
+                {
+                    // TEMP (lab, PRIVATE_GPU): the walk was skipped on the
+                    // contract, and the arm failed anyway: nothing below can land.
+                    crate::runtime::drain::note_store_route("lab_private_store_unlanded");
+                }
                 if landed {
                     note_mapper_ref_texture_store_route("gva_resident_authoritative");
                     gva_store_armed = true;
@@ -8424,6 +8437,12 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
     if !writeback_guest {
         return None;
     }
+    if color0.is_some_and(|c0| {
+        crate::runtime::writeback_debt::lab_private_store_needs_no_walk(state, task_id, c0)
+    }) {
+        crate::runtime::drain::note_store_route("lab_private_store_walk_skipped");
+        return None;
+    }
     // TEMP (lab, PASS_PREP step 3): the pass frame's planned walk for this
     // Store — read off the drain early (the chunk before the storing draw),
     // validated here against the live colour-0 and the registry generation.
@@ -11826,7 +11845,62 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // redraws everything and needs no complement, so the door
                     // stays shut for it — a whole-window upload there is cost
                     // with no repair.
+                    // TEMP (lab, PRIVATE_GPU): a Private GVA target's prior
+                    // contents are its resident's whenever the resident is
+                    // current — the gate the LOAD elision asks — so the
+                    // preserving pass keeps them on the GPU instead of paying the
+                    // target's debt into the guest's pages (a readback) and
+                    // uploading that window back (p037: ~600 a phase, ~1.4 Gpx,
+                    // every one a target this device stored itself).
+                    let mut preserved_from_resident = false;
                     if preserve_seed_on()
+                        && target_rgba8.is_none()
+                        && target_guest_seed.is_none()
+                        && !zero_seed_cleared
+                        && c0.mapping_id == 0
+                        && c0.target_gva != 0
+                        && req.scissors.first().is_some_and(|s| !s.covers(w, h))
+                        && crate::runtime::writeback_debt::lab_private_gpu()
+                        && crate::runtime::writeback_debt::lab_target_storage_mode(
+                            state,
+                            req.task_id,
+                            c0.texture_ref,
+                        ) == Some(2)
+                    {
+                        match gva_resident_if_current(
+                            state,
+                            host,
+                            req.task_id,
+                            GvaSpan {
+                                texture_ref: c0.texture_ref,
+                                gva: c0.target_gva,
+                                row_stride: c0.row_stride,
+                                width: c0.width,
+                                height: c0.height,
+                                format: c0.format,
+                            },
+                        ) {
+                            Ok(identity) => {
+                                chain_load_from_target = true;
+                                if gva_load_identity.is_none() {
+                                    gva_load_identity = Some(identity);
+                                }
+                                preserved_from_resident = true;
+                                crate::runtime::drain::note_store_route("lab_preserve_gva_resident");
+                                crate::runtime::drain::note_store_route_n(
+                                    "lab_preserve_gva_resident_px",
+                                    u64::from(w) * u64::from(h),
+                                );
+                            }
+                            Err(_) => {
+                                crate::runtime::drain::note_store_route(
+                                    "lab_preserve_gva_resident_refused",
+                                );
+                            }
+                        }
+                    }
+                    if preserve_seed_on()
+                        && !preserved_from_resident
                         && target_rgba8.is_none()
                         && target_guest_seed.is_none()
                         && !zero_seed_cleared

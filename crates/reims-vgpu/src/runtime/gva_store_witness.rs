@@ -133,10 +133,6 @@ struct Entry {
     host_epoch_at_store: u64,
     /// Store ordinal, for the eviction order.
     last_seen: u64,
-    /// TEMP (lab, PRIVATE_GPU): stamped quiet by contract — the target is
-    /// `MTLStorageModePrivate`, `token` is 0 and nothing is tracked. See
-    /// [`note_store_contract_quiet`].
-    contract_quiet: bool,
 }
 
 impl Entry {
@@ -163,7 +159,31 @@ pub struct GvaStoreWitness {
     /// TEMP (lab, ADMIT_AHEAD): the target each `(task, texture_ref)`'s last
     /// deferred Store stamped. See [`Self::note_ref_target`].
     by_ref: std::collections::HashMap<(u32, u32), GvaTargetKey>,
+    /// TEMP (lab, PRIVATE_GPU): the targets stamped quiet by contract, apart
+    /// from `entries` - they hold no hypervisor set, so the harvest bound
+    /// [`MAX_TRACKED_TARGETS`] has nothing to say about them, and evicting them
+    /// under it (p037: 1 955 evictions, 82 k reader misses a phase) sent every
+    /// reader of a Private target back to the guest's pages: a debt payment
+    /// (GPU readback) and a window upload of a frame the resident already held.
+    contract: BTreeMap<GvaTargetKey, ContractEntry>,
+    /// Which resource each contract entry belongs to, so the resource's
+    /// retirement finds it ([`forget_contract_ref`]).
+    contract_by_ref: std::collections::HashMap<(u32, u32), GvaTargetKey>,
 }
+
+/// TEMP (lab, PRIVATE_GPU): one target stamped quiet by contract.
+#[derive(Debug)]
+struct ContractEntry {
+    gpas: Vec<u64>,
+    host_epoch_at_store: u64,
+    last_seen: u64,
+    owner: (u32, u32),
+}
+
+/// TEMP (lab, PRIVATE_GPU): a memory bound on [`GvaStoreWitness::contract`], not
+/// a hypervisor one. Past it the least recently stored eighth is dropped at once
+/// (a dropped entry's next reader re-reads, as an unstamped target always did).
+const MAX_CONTRACT_TARGETS: usize = 4096;
 
 /// Upper bound on tracked GVA targets.
 ///
@@ -218,6 +238,8 @@ impl GvaStoreWitness {
             .filter(|t| *t != 0)
             .collect();
         self.entries.clear();
+        self.contract.clear();
+        self.contract_by_ref.clear();
         tokens
     }
 
@@ -241,9 +263,11 @@ impl GvaStoreWitness {
     /// TEMP (lab, PRIVATE_GPU census): whether a deferred Store of `(task_id,
     /// texture_ref)` has stamped a target this witness still holds.
     pub fn stored_ref(&self, task_id: u32, texture_ref: u32) -> bool {
-        self.by_ref
-            .get(&(task_id, texture_ref))
-            .is_some_and(|key| self.entries.contains_key(key))
+        self.contract_by_ref.contains_key(&(task_id, texture_ref))
+            || self
+                .by_ref
+                .get(&(task_id, texture_ref))
+                .is_some_and(|key| self.entries.contains_key(key))
     }
 
     /// TEMP (lab, `REIMS_VGPU_LAB_ADMIT_AHEAD`): the tracking token of the target
@@ -252,6 +276,20 @@ impl GvaStoreWitness {
     pub fn token_for_ref(&self, task_id: u32, texture_ref: u32) -> Option<u64> {
         let key = self.by_ref.get(&(task_id, texture_ref))?;
         self.entries.get(key).map(|e| e.token).filter(|t| *t != 0)
+    }
+
+    /// TEMP (lab, PRIVATE_GPU): drop the contract entry under `key` and its
+    /// owner link.
+    fn drop_contract(&mut self, key: &GvaTargetKey) -> bool {
+        match self.contract.remove(key) {
+            Some(c) => {
+                if self.contract_by_ref.get(&c.owner) == Some(key) {
+                    self.contract_by_ref.remove(&c.owner);
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     fn evict_oldest(&mut self, retired: &mut Vec<u64>) {
@@ -419,11 +457,20 @@ fn stamp<H: HostOps>(
         crate::runtime::drain::note_store_route("gvaw_unnamed_alloc");
         return;
     }
+    // TEMP (lab, PRIVATE_GPU): a key stamped quiet by contract names a Private
+    // target (the key is its page list and extent). An eager Store into it only
+    // moves the host-write epoch its readers compare against: there is still
+    // no guest write to watch.
+    if let Some(c) = state.gva_store_witness.contract.get_mut(&key) {
+        state.gva_store_witness.stores = state.gva_store_witness.stores.wrapping_add(1);
+        c.last_seen = state.gva_store_witness.stores;
+        c.host_epoch_at_store = state.host_writes.epoch();
+        crate::runtime::drain::note_store_route("lab_gvaw_contract_restamped");
+        return;
+    }
     let page_size = state.page_size() as usize;
     // Re-arming an existing key means the same page list by construction — the
     // hash is in the key — so the token is reused and only the stamps move.
-    // A contract-quiet entry (TEMP lab PRIVATE_GPU) holds no token: a Store
-    // that stamps its key the ordinary way tracks the pages afresh.
     let token = match state.gva_store_witness.entries.get(&key).filter(|e| e.token != 0) {
         Some(e) => e.token,
         None => {
@@ -499,7 +546,6 @@ fn stamp<H: HostOps>(
             exact: !lagged,
             host_epoch_at_store,
             last_seen,
-            contract_quiet: false,
         },
     );
 }
@@ -529,34 +575,50 @@ pub fn note_store_contract_quiet(
         crate::runtime::drain::note_store_route("gvaw_unnamed_alloc");
         return;
     }
-    if let Some(old) = state.gva_store_witness.entries.get(&key) {
+    let w = &mut state.gva_store_witness;
+    // A target tracked the ordinary way under this key is quiet by contract now:
+    // its hypervisor set is released.
+    if let Some(old) = w.entries.remove(&key) {
         if old.token != 0 {
             state.retired_guest_write_tokens.push(old.token);
         }
-    } else {
-        while state.gva_store_witness.entries.len() >= max_tracked_targets() {
-            let mut retired = Vec::new();
-            state.gva_store_witness.evict_oldest(&mut retired);
-            state.retired_guest_write_tokens.extend(retired);
+    }
+    let w = &mut state.gva_store_witness;
+    // This resource stored at a different key before (a new page list): that
+    // key is no longer its own.
+    if let Some(prev) = w.contract_by_ref.get(&(task_id, texture_ref)).copied() {
+        if prev != key {
+            w.drop_contract(&prev);
         }
     }
-    state.gva_store_witness.stores = state.gva_store_witness.stores.wrapping_add(1);
-    let last_seen = state.gva_store_witness.stores;
+    if w.contract.len() >= MAX_CONTRACT_TARGETS && !w.contract.contains_key(&key) {
+        let mut ages: Vec<(u64, GvaTargetKey)> =
+            w.contract.iter().map(|(k, c)| (c.last_seen, *k)).collect();
+        ages.sort_unstable();
+        for (_, k) in ages.iter().take(MAX_CONTRACT_TARGETS / 8) {
+            w.drop_contract(k);
+        }
+        crate::runtime::drain::note_store_route("lab_gvaw_contract_evict");
+    }
+    if let Some(owner) = w.contract.get(&key).map(|c| c.owner) {
+        if owner != (task_id, texture_ref) && w.contract_by_ref.get(&owner) == Some(&key) {
+            w.contract_by_ref.remove(&owner);
+        }
+    }
+    w.stores = w.stores.wrapping_add(1);
+    let last_seen = w.stores;
     let host_epoch_at_store = state.host_writes.epoch();
-    state.gva_store_witness.entries.insert(
+    let w = &mut state.gva_store_witness;
+    w.contract.insert(
         key,
-        Entry {
-            token: 0,
+        ContractEntry {
             gpas: gpas.to_vec(),
-            gen_at_store: 1,
-            pending: None,
-            exact: true,
             host_epoch_at_store,
             last_seen,
-            contract_quiet: true,
+            owner: (task_id, texture_ref),
         },
     );
-    state.gva_store_witness.note_ref_target(task_id, texture_ref, key);
+    w.contract_by_ref.insert((task_id, texture_ref), key);
     crate::runtime::drain::note_store_route("lab_gvaw_contract_quiet");
 }
 
@@ -565,11 +627,10 @@ pub fn note_store_contract_quiet(
 /// reuses those pages under the same key is not taken for the private texture.
 pub fn forget_contract_ref(state: &mut DeviceState, task_id: u32, texture_ref: u32) {
     let w = &mut state.gva_store_witness;
-    let Some(key) = w.by_ref.remove(&(task_id, texture_ref)) else {
+    let Some(key) = w.contract_by_ref.get(&(task_id, texture_ref)).copied() else {
         return;
     };
-    if w.entries.get(&key).is_some_and(|e| e.contract_quiet) {
-        w.entries.remove(&key);
+    if w.drop_contract(&key) {
         crate::runtime::drain::note_store_route("lab_gvaw_contract_forgotten");
     }
 }
@@ -597,6 +658,16 @@ pub fn retire_pages(state: &mut DeviceState, gone: &[u64]) {
                 state.retired_guest_write_tokens.push(e.token);
             }
         }
+    }
+    let doomed: Vec<GvaTargetKey> = state
+        .gva_store_witness
+        .contract
+        .iter()
+        .filter(|(_, c)| c.gpas.iter().any(|p| gone.contains(p)))
+        .map(|(k, _)| *k)
+        .collect();
+    for k in doomed {
+        state.gva_store_witness.drop_contract(&k);
     }
 }
 
@@ -651,21 +722,27 @@ impl GvaWriteReach {
 /// indexes the target's page epochs and is only reached when the guest half is
 /// clean.
 pub fn reach<H: HostOps>(state: &DeviceState, host: &H, key: GvaTargetKey) -> GvaWriteReach {
-    let Some(e) = state.gva_store_witness.entries.get(&key) else {
-        return GvaWriteReach::Guest(GuestWriteVerdict::NoMapping);
-    };
     // TEMP (lab, PRIVATE_GPU): no guest write is possible; only this device's own
     // writes are left to ask about.
-    let gen = if e.contract_quiet { None } else { e.gen() };
-    match gen {
+    if let Some(c) = state.gva_store_witness.contract.get(&key) {
+        crate::runtime::drain::note_store_route("lab_gvaw_reach_contract");
+        return match state
+            .host_writes
+            .wrote_any_since(c.host_epoch_at_store, &c.gpas)
+        {
+            HostWriteVerdict::Quiet => GvaWriteReach::Quiet,
+            other => GvaWriteReach::Host(other),
+        };
+    }
+    let Some(e) = state.gva_store_witness.entries.get(&key) else {
+        lab_note_miss(&state.gva_store_witness, key);
+        return GvaWriteReach::Guest(GuestWriteVerdict::NoMapping);
+    };
+    match e.gen() {
         // TEMP (lab): the Store's read is still out, so its packet's stamp is
         // held and the guest has not written the target since the Store. Only
         // the host-write half is left to ask.
-        None => crate::runtime::drain::note_store_route(if e.contract_quiet {
-            "lab_gvaw_reach_contract"
-        } else {
-            "lab_gvaw_reach_pending"
-        }),
+        None => crate::runtime::drain::note_store_route("lab_gvaw_reach_pending"),
         Some(0) => return GvaWriteReach::Guest(GuestWriteVerdict::NoStamp),
         Some(gen_at_store) => {
             if let Some(answer) = guest_half(host, e, gen_at_store) {
@@ -679,6 +756,57 @@ pub fn reach<H: HostOps>(state: &DeviceState, host: &H, key: GvaTargetKey) -> Gv
     match host_verdict {
         HostWriteVerdict::Quiet => GvaWriteReach::Quiet,
         other => GvaWriteReach::Host(other),
+    }
+}
+
+/// TEMP (lab, PRIVATE_GPU diagnostic): a reader found no entry for `key`. Is a
+/// target at the same gva stamped under another key — another page-list hash,
+/// another extent, another channel order — or nothing at that gva at all? The
+/// two key builders (the Store's debt window, the reader's span identity) must
+/// agree for the witness to answer anyone.
+fn lab_note_miss(w: &GvaStoreWitness, key: GvaTargetKey) {
+    let lo = GvaTargetKey {
+        gva: key.gva,
+        generation: 0,
+        width: 0,
+        height: 0,
+        bgra: false,
+    };
+    let hi = GvaTargetKey {
+        gva: key.gva,
+        generation: u64::MAX,
+        width: u32::MAX,
+        height: u32::MAX,
+        bgra: true,
+    };
+    let near = w
+        .contract
+        .range(lo..=hi)
+        .map(|(k, _)| *k)
+        .chain(w.entries.range(lo..=hi).map(|(k, _)| *k))
+        .next();
+    let route = match near {
+        None => "lab_gvaw_miss_no_gva",
+        Some(k) if k.width != key.width || k.height != key.height => "lab_gvaw_miss_extent",
+        Some(k) if k.generation != key.generation => "lab_gvaw_miss_generation",
+        Some(_) => "lab_gvaw_miss_order",
+    };
+    crate::runtime::drain::note_store_route(route);
+    if let Some(k) = near {
+        if crate::observe::first_sight(route, key.gva ^ k.generation) {
+            crate::observe::fail(format!(
+                "{route} reader gva={:#x} gen={:#x} {}x{} bgra={} stored gen={:#x} {}x{} bgra={}",
+                key.gva,
+                key.generation,
+                key.width,
+                key.height,
+                key.bgra,
+                k.generation,
+                k.width,
+                k.height,
+                k.bgra
+            ));
+        }
     }
 }
 
@@ -711,11 +839,12 @@ fn guest_half<H: HostOps>(host: &H, e: &Entry, gen_at_store: u64) -> Option<GvaW
 /// hypervisor's arming window, where the generation reads back 0 and no page
 /// stamp can be compared against it.
 pub fn armed(state: &DeviceState, key: GvaTargetKey) -> bool {
-    state
-        .gva_store_witness
-        .entries
-        .get(&key)
-        .is_some_and(|e| e.stamped() && e.exact)
+    state.gva_store_witness.contract.contains_key(&key)
+        || state
+            .gva_store_witness
+            .entries
+            .get(&key)
+            .is_some_and(|e| e.stamped() && e.exact)
 }
 
 /// Which of `key`'s pages the hypervisor has observed the guest write since the
@@ -739,15 +868,15 @@ pub fn written_pages<H: HostOps>(
     host: &H,
     key: GvaTargetKey,
 ) -> Option<Vec<u64>> {
-    let Some(e) = state.gva_store_witness.entries.get(&key) else {
-        crate::runtime::drain::note_store_route("gvaw_pages_no_entry");
-        return None;
-    };
-    if e.contract_quiet {
+    if state.gva_store_witness.contract.contains_key(&key) {
         // TEMP (lab, PRIVATE_GPU): the guest has no access to these pages.
         crate::runtime::drain::note_store_route("lab_gvaw_pages_contract");
         return Some(Vec::new());
     }
+    let Some(e) = state.gva_store_witness.entries.get(&key) else {
+        crate::runtime::drain::note_store_route("gvaw_pages_no_entry");
+        return None;
+    };
     let gen_at_store = match (e.gen(), &e.pending) {
         (Some(g), _) => g,
         (None, Some(p)) => {
@@ -886,6 +1015,23 @@ mod tests {
             reach(&state, &host, key(0xabc)),
             GvaWriteReach::Guest(GuestWriteVerdict::Wrote)
         );
+    }
+
+    /// TEMP (lab, PRIVATE_GPU): contract entries hold no hypervisor set, so the
+    /// harvest bound does not evict them (p037: evicting them under it sent
+    /// 82 k readers a phase back to the guest's pages).
+    #[test]
+    fn contract_entries_are_not_held_to_the_tracked_bound() {
+        let mut state = device();
+        let host = FakeHost::new();
+        let n = MAX_TRACKED_TARGETS as u64 * 2;
+        for i in 0..n {
+            let pages = [(10 + 2 * i) * PAGE, (11 + 2 * i) * PAGE];
+            note_store_contract_quiet(&mut state, key(i + 1), &pages, 7, i as u32 + 1);
+        }
+        for i in 0..n {
+            assert_eq!(reach(&state, &host, key(i + 1)), GvaWriteReach::Quiet);
+        }
     }
 
     /// TEMP (lab, `REIMS_VGPU_LAB_GVAW_LAGGED`): an eager re-stamp from the

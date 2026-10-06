@@ -2281,6 +2281,29 @@ pub(crate) fn lab_private_gpu() -> bool {
     })
 }
 
+/// TEMP (lab, PRIVATE_GPU): whether a Store into `c0` defers by contract, so
+/// the walk of its guest pages taken before the draw submits — which only the
+/// eager fallback writes through, when the debt fails to arm — buys nothing.
+///
+/// A Private GVA target's debt arms on the contract stamp (p038: 24 604 of
+/// 24 604 GVA Stores a phase armed, none fell back), and the deferred rail
+/// keeps no pages from the early walk: its eventual payment walks afresh and
+/// checks the allocation generation. The walk was `prep_pages`, ~0.8 s of the
+/// drain a phase. Should an arm ever fail for such a target, the fallback finds
+/// no pages, lands nothing, and says so (`lab_private_store_unlanded`); the
+/// frame stays in the resident, which is the only copy a Private texture has.
+pub(crate) fn lab_private_store_needs_no_walk(
+    state: &DeviceState,
+    task_id: u32,
+    c0: &crate::runtime::draw::ColorRtRequest,
+) -> bool {
+    c0.mapping_id == 0
+        && c0.target_gva != 0
+        && lab_private_gpu()
+        && lazy_writeback_enabled()
+        && lab_target_storage_mode(state, task_id, c0.texture_ref) == Some(2)
+}
+
 /// TEMP (lab, PRIVATE_GPU): the `MTLStorageMode` the texture `(task_id,
 /// texture_ref)` was constructed with, when its descriptor's trailer
 /// corroborated its layout.

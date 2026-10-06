@@ -5714,7 +5714,15 @@ fn finish_stream<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         if let Some(p) = pass_prep.as_mut() {
             if let Some(c0) = first_req.as_ref().and_then(|req| req.colors.first()) {
-                p.note_store_target(c0);
+                // TEMP (lab, PRIVATE_GPU): nothing to plan where the Store
+                // defers by contract.
+                if !crate::runtime::writeback_debt::lab_private_store_needs_no_walk(
+                    state,
+                    first_req.as_ref().map_or(0, |req| req.task_id),
+                    c0,
+                ) {
+                    p.note_store_target(c0);
+                }
             }
         }
         if first_draw.is_some() && first_req.is_none() {
