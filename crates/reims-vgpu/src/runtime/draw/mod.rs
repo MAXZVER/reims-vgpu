@@ -1610,6 +1610,135 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
     Some((w, h, rgba))
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_BUFTEX_NATIVE` (live `BUFTEX_NATIVE=on|off`,
+/// off unless `=on`): the Vulkan rail serves an 8-bit four-channel
+/// buffer-backed texture through [`load_buffer_texture_native`] instead of
+/// [`load_buffer_texture_rgba`]. Off under test.
+pub(crate) fn lab_buftex_native() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("BUFTEX_NATIVE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(std::env::var("REIMS_VGPU_LAB_BUFTEX_NATIVE").as_deref(), Ok("on"));
+        crate::observe::off(format!("lab_buftex_native on={}", u8::from(on)));
+        on
+    })
+}
+
+/// TEMP (lab, BUFTEX_NATIVE): [`load_buffer_texture_rgba`] for the two 8-bit
+/// four-channel orders a sampled image can take as they are.
+///
+/// p047's slow tranches spent 6.5 % of the drain in that loader: 60 % of it
+/// the per-texel BGRA->RGBA swizzle, the rest reading the buffer from the
+/// texture's offset to the **end of the allocation** (its extent was never
+/// passed) into a zeroed vector. Here the read is the texture's own window -
+/// `bytes_per_row * (height - 1) + width * 4`, the last row needing no pitch
+/// padding - and the bytes keep the guest's order: [`TexelLayout::Bgra8`] is
+/// uploaded as `B8G8R8A8` and the sampler swaps the channels, as every other
+/// BGRA8 rail here does. Tight rows hand the read buffer over without a
+/// second copy; padded rows are repacked row by row, still without a swizzle.
+///
+/// Every other format, and every geometry the loader would refuse, goes to
+/// [`load_buffer_texture_rgba`], which converts and reports as before.
+fn load_buffer_texture_native<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    bt: &BufferTextureDescriptor,
+) -> Option<(u32, u32, Vec<u8>, TexelLayout)> {
+    let converted = |state: &mut DeviceState, host: &mut M| {
+        load_buffer_texture_rgba(state, host, task_id, texture_ref, bt)
+            .map(|(w, h, rgba)| (w, h, rgba, TexelLayout::Rgba8))
+    };
+    let fmt = if bt.desc.pixel_format != 0 {
+        bt.desc.pixel_format
+    } else {
+        MTL_FORMAT_BGRA8_UNORM
+    };
+    let layout = match fmt {
+        pixel_format::MTL_FORMAT_BGRA8_UNORM | pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB => {
+            TexelLayout::Bgra8
+        }
+        pixel_format::MTL_FORMAT_RGBA8_UNORM | pixel_format::MTL_FORMAT_RGBA8_UNORM_SRGB => {
+            TexelLayout::Rgba8
+        }
+        _ => {
+            crate::runtime::drain::note_store_route("lab_buftex_native_other_format");
+            return converted(state, host);
+        }
+    };
+    let (w, h) = (bt.desc.width, bt.desc.height);
+    let tight = u64::from(w) * u64::from(RGBA8_BPP);
+    let bpr = if bt.bytes_per_row == 0 {
+        tight
+    } else {
+        bt.bytes_per_row
+    };
+    if w == 0 || h == 0 || bpr < tight {
+        return converted(state, host);
+    }
+    let span = bpr.checked_mul(u64::from(h - 1))?.checked_add(tight)?;
+    // The sibling payment `load_buffer_texture_rgba` makes: a debt may be armed
+    // under the texture-view object as well as under the buffer.
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+    let backing = resolve_buffer_backing(state, host, task_id, bt.buffer_ref, None)?;
+    let raw = read_buffer_bytes_resolved(
+        state,
+        host,
+        task_id,
+        bt.buffer_ref,
+        &backing,
+        bt.offset,
+        Some(span),
+    )?;
+    if (raw.len() as u64) < span {
+        crate::observe::fail(format!(
+            "buftex span_oob ref={texture_ref} buf={} off={} bpr={bpr} span={span} avail={} {w}x{h}",
+            bt.buffer_ref,
+            bt.offset,
+            raw.len()
+        ));
+        return None;
+    }
+    let out_len = usize::try_from(tight * u64::from(h)).ok()?;
+    // TEMP (lab): one line per buffer-texture shape this rail serves (p049:
+    // a Finder exit frame repeated its top 1024 rows down the screen).
+    let shape = crate::backend::hash::hash_u64(
+        u64::from(w) << 32 | u64::from(h),
+        bpr ^ (u64::from(fmt) << 48) ^ (bt.offset << 20),
+    );
+    if crate::observe::first_sight("lab_buftex_native_shape", shape) {
+        crate::observe::off(format!(
+            "lab_buftex_native_shape ref={texture_ref} buf={} {w}x{h} fmt={fmt:#x} bpr={bpr} off={} span={span} \
+             backing_size={} read={}",
+            bt.buffer_ref,
+            bt.offset,
+            backing.size,
+            raw.len()
+        ));
+    }
+    crate::runtime::drain::note_store_route("lab_buftex_native");
+    crate::runtime::drain::note_store_route_n("lab_buftex_native_bytes", out_len as u64);
+    let bytes = if bpr == tight {
+        let mut raw = raw;
+        raw.truncate(out_len);
+        raw
+    } else {
+        let (tight, bpr) = (tight as usize, bpr as usize);
+        let mut out = Vec::with_capacity(out_len);
+        for y in 0..h as usize {
+            out.extend_from_slice(&raw[y * bpr..y * bpr + tight]);
+        }
+        out
+    };
+    Some((w, h, bytes, layout))
+}
+
 fn index_elem_size(index_type: u32) -> Option<usize> {
     match index_type {
         0 => Some(2), // MTLIndexTypeUInt16

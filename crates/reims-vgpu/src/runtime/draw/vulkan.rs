@@ -1046,6 +1046,7 @@ pub(super) enum SampledSourceRequest {
     TargetRegion(
         crate::backend::vulkan::engine::TargetIdentity,
         ash::vk::Format,
+        pixel_format::SwizzlePlan,
     ),
     /// Zero-copy guest gather: the engine copies the texel bytes from
     /// imported guest RAM inside the draw CB — no CPU read, no memo, no
@@ -3199,6 +3200,23 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 return Some((w, h, 0, request));
             }
         }
+        // TEMP (lab, BUFTEX_NATIVE): BGRA8/RGBA8 keep their order and read
+        // only their own window.
+        if super::lab_buftex_native() {
+            let (w, h, bytes, layout) =
+                super::load_buffer_texture_native(state, host, task_id, texture_ref, &bt)?;
+            return Some((
+                w,
+                h,
+                0,
+                SampledSourceRequest::Bytes(
+                    std::sync::Arc::new(bytes),
+                    None,
+                    SampledByteFormat::from_source(layout, source),
+                    crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
+                ),
+            ));
+        }
         let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)?;
         return Some((
             w,
@@ -4654,10 +4672,13 @@ pub(crate) fn lab_rtv_gpu() -> bool {
 
 /// TEMP (lab, RTV_GPU): the Vulkan colour format a view's or a surface's
 /// texels are copied as, when an image copy may carry them bit for bit: an
-/// uncompressed colour format with Metal's channels on Vulkan's own (no
-/// component plan), answered with its texel size. Depth/stencil formats and
-/// remapped ones (`A8Unorm`) are not.
-fn lab_rtv_copy_format(format: u16) -> Option<(ash::vk::Format, u32)> {
+/// uncompressed colour format, answered with its texel size and the format's
+/// own channel plan (identity but for `A8Unorm`, whose byte rides in
+/// `R8_UNORM` and is moved to alpha where the sampled view is built - the plan
+/// travels with the bind, as on the gather rails). Depth/stencil formats are not.
+fn lab_rtv_copy_format(
+    format: u16,
+) -> Option<(ash::vk::Format, u32, pixel_format::SwizzlePlan)> {
     use ash::vk::Format as F;
     let p = translate::pixel::translate(format).ok()?;
     let depth = matches!(
@@ -4670,8 +4691,7 @@ fn lab_rtv_copy_format(format: u16) -> Option<(ash::vk::Format, u32)> {
             | F::X8_D24_UNORM_PACK32
             | F::S8_UINT
     );
-    (!depth && p.components.is_identity() && p.bytes_per_texel > 0)
-        .then_some((p.vk, p.bytes_per_texel))
+    (!depth && p.bytes_per_texel > 0).then_some((p.vk, p.bytes_per_texel, p.components))
 }
 
 /// TEMP (lab, RTV_GPU): one line per distinct refused view shape, so a boot
@@ -4737,7 +4757,7 @@ fn try_ref_texture_view_from_resident<M: HostMemory + HostOps>(
     }
     let base_copy = lab_rtv_copy_format(m.format);
     let view_copy = lab_rtv_copy_format(view.pixel_format);
-    let same_size = matches!((base_copy, view_copy), (Some((_, a)), Some((_, b))) if a == b);
+    let same_size = matches!((base_copy, view_copy), (Some((_, a, _)), Some((_, b, _))) if a == b);
     if !m.has_geom || !same_size {
         lab_rtv_note_refusal("lab_rtv_gpu_format", m, &view);
         return None;
@@ -4761,7 +4781,7 @@ fn try_ref_texture_view_from_resident<M: HostMemory + HostOps>(
             return None;
         }
     }
-    let Some((format, _)) = view_copy else {
+    let Some((format, _, components)) = view_copy else {
         return refuse("lab_rtv_gpu_untranslated");
     };
     let base_formats = translate::pixel::translate(m.format)
@@ -4789,7 +4809,7 @@ fn try_ref_texture_view_from_resident<M: HostMemory + HostOps>(
             }
             note_store_route("lab_rtv_gpu_served");
             note_store_route_n_px("lab_rtv_gpu_served_px", view.width, view.height);
-            Some(SampledSourceRequest::TargetRegion(top.resident_id, format))
+            Some(SampledSourceRequest::TargetRegion(top.resident_id, format, components))
         }
         _ => refuse("lab_rtv_gpu_not_current"),
     }
@@ -8033,6 +8053,24 @@ pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
 /// Mirrors `try_mapper_ref_texture_sample_zero_copy`'s page coalescing over the plane
 /// window from `ref_texture_sample_window` (which carries the wire plane index +
 /// biplanar offset); any gate miss falls back to the CPU byte path.
+/// TEMP (lab): `REIMS_VGPU_LAB_ZC_SWIZZLE` (live `ZC_SWIZZLE=on|off`, off unless
+/// `=on`): [`try_ref_texture_sample_zero_copy`] carries a format's own channel
+/// plan instead of refusing the plane. Off under test.
+pub(crate) fn lab_zc_swizzle() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("ZC_SWIZZLE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(std::env::var("REIMS_VGPU_LAB_ZC_SWIZZLE").as_deref(), Ok("on"));
+        crate::observe::off(format!("lab_zc_swizzle on={}", u8::from(on)));
+        on
+    })
+}
+
 pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -8056,7 +8094,7 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
     if !mapper::ensure_resolved_for_scanout(state, host, mid) {
         return no("zc_t5_unresolved");
     }
-    let (native, sampled_vk_format, bpp, base_off, bpr) = {
+    let (native, sampled_vk_format, bpp, base_off, bpr, components) = {
         let Some(m) = state.mappings.get(&mid) else {
             return no("zc_t5_no_mapping");
         };
@@ -8071,13 +8109,34 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
         // A multiplanar view's planes are the video luma/chroma formats, all of
         // which sit identically on their Vulkan spellings. Required rather than
         // assumed, for the reason the mapper-ref-texture rail states.
-        let (native, bpp) = match translate::pixel::sampled_pixels(view.pixel_format) {
+        let (native, bpp, components) = match translate::pixel::sampled_pixels(view.pixel_format) {
             Ok((layout, _decline, components)) => {
                 if !pixel_format::swizzle_is_identity(&components) {
-                    crate::runtime::drain::note_store_route("zc_t5_needs_swizzle");
-                    return None;
+                    // TEMP (lab, ZC_SWIZZLE): the plan rides with the bytes, as
+                    // it does on the linear rail (`A8Unorm`'s byte in `R8_UNORM`,
+                    // moved to alpha where the image view is built), instead of
+                    // sending the plane to the CPU loader's RGBA8 expansion
+                    // (p047: a 4935x1895 A8 mask, ~37 MB of RGBA8 a bind).
+                    if !lab_zc_swizzle() {
+                        crate::runtime::drain::note_store_route("zc_t5_needs_swizzle");
+                        return None;
+                    }
+                    crate::runtime::drain::note_store_route("lab_zc_t5_swizzle_carried");
+                    if crate::observe::first_sight(
+                        "lab_zc_t5_swizzle_carried",
+                        u64::from(mid) << 32 | u64::from(view.pixel_format),
+                    ) {
+                        crate::observe::off(format!(
+                            "lab_zc_t5_swizzle_carried mid={mid} view={w}x{h} fmt={:#x} plane={} \
+                             base={}x{} base_fmt={:#x}",
+                            view.pixel_format, view.plane_index, m.width, m.height, m.format
+                        ));
+                    }
                 }
-                (layout, layout.bytes_per_texel())
+                if !engine::supports_sampled_layout_bind(layout) {
+                    return no("zc_t5_layout_unfilterable");
+                }
+                (layout, layout.bytes_per_texel(), components)
             }
             Err(_) => return no("zc_t5_no_layout"),
         };
@@ -8090,7 +8149,7 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
         else {
             return no("zc_t5_untranslated");
         };
-        (native, sampled_vk_format, bpp, base_off, bpr_u32 as u64)
+        (native, sampled_vk_format, bpp, base_off, bpr_u32 as u64, components)
     };
     let Some((span, row_length_texels)) = strided_window_extent(w, h, bpp as u64, bpr) else {
         return no("zc_t5_no_extent");
@@ -8129,7 +8188,7 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
             crate::runtime::gather_witness::GatherVouch::Fresh,
             // TEMP (lab, SKIP_GUARD): a direct image carries no vouch to re-check.
             None,
-            pixel_format::swizzle_identity(),
+            components,
         ));
     }
     if !sampled_gather_floor_admits(SampledFloorRail::RefTexture, native, span) {
@@ -8173,7 +8232,7 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
         seen.evidence,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
-        pixel_format::swizzle_identity(),
+        components,
     ))
 }
 
@@ -11207,7 +11266,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let mut source_planes = 1;
                 let source_is_target = matches!(
                     &loaded,
-                    SampledSourceRequest::Target(_, _) | SampledSourceRequest::TargetRegion(_, _)
+                    SampledSourceRequest::Target(_, _) | SampledSourceRequest::TargetRegion(..)
                 );
                 let source = match loaded {
                     SampledSourceRequest::Bytes(rgba, identity, byte_format, origin) => {
@@ -11240,8 +11299,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // TEMP (lab, RTV_GPU): a target source whose origin is a
                     // serialized view is the engine's cue to copy the bind's
                     // extent out of the resident's top-left.
-                    SampledSourceRequest::TargetRegion(identity, format) => {
+                    SampledSourceRequest::TargetRegion(identity, format, components) => {
                         sampled_vk_format = format;
+                        sampled_components = components;
                         byte_origin =
                             crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView;
                         crate::backend::vulkan::engine::SampledSource::Target(identity)
