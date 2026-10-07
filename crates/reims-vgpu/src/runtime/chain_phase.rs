@@ -285,28 +285,56 @@ pub struct ChainPhaseWindow {
 /// no line.
 pub fn take_window() -> Option<ChainPhaseWindow> {
     let chains = CHAINS.swap(0, Ordering::Relaxed);
-    let w = ChainPhaseWindow {
-        prep_us: to_us(ACC[Phase::Prep as usize].swap(0, Ordering::Relaxed)),
-        pipeline_us: to_us(ACC[Phase::Pipeline as usize].swap(0, Ordering::Relaxed)),
-        pipeline_gen_us: to_us(ACC[Phase::PipelineGen as usize].swap(0, Ordering::Relaxed)),
-        pipeline_desc_us: to_us(ACC[Phase::PipelineDesc as usize].swap(0, Ordering::Relaxed)),
-        pipeline_mtlb_us: to_us(ACC[Phase::PipelineMtlb as usize].swap(0, Ordering::Relaxed)),
-        pipeline_air_us: to_us(ACC[Phase::PipelineAir as usize].swap(0, Ordering::Relaxed)),
-        pipeline_xlate_us: to_us(ACC[Phase::PipelineXlate as usize].swap(0, Ordering::Relaxed)),
-        binds_us: to_us(ACC[Phase::Binds as usize].swap(0, Ordering::Relaxed)),
-        sampled_us: to_us(ACC[Phase::Sampled as usize].swap(0, Ordering::Relaxed)),
-        seed_us: to_us(ACC[Phase::Seed as usize].swap(0, Ordering::Relaxed)),
-        assemble_us: to_us(ACC[Phase::Assemble as usize].swap(0, Ordering::Relaxed)),
-        engine_us: to_us(ACC[Phase::Engine as usize].swap(0, Ordering::Relaxed)),
-        store_us: to_us(ACC[Phase::Store as usize].swap(0, Ordering::Relaxed)),
-        prep_pages_us: to_us(ACC[Phase::PrepPages as usize].swap(0, Ordering::Relaxed)),
-        assemble_target_us: to_us(ACC[Phase::AssembleTarget as usize].swap(0, Ordering::Relaxed)),
-        assemble_depth_us: to_us(ACC[Phase::AssembleDepth as usize].swap(0, Ordering::Relaxed)),
-        assemble_trail_us: to_us(ACC[Phase::AssembleTrail as usize].swap(0, Ordering::Relaxed)),
+    let w = load_window(
+        |p| ACC[p as usize].swap(0, Ordering::Relaxed),
+        MAX_NS.swap(0, Ordering::Relaxed),
         chains,
-        max_us: to_us(MAX_NS.swap(0, Ordering::Relaxed)),
-    };
+    );
     (chains > 0).then_some(w)
+}
+
+/// The same window **without** clearing it, for a reader that wants a
+/// point-in-time reading rather than to consume the accumulator.
+///
+/// TEMP (lab, MONSTER_TRANCHE_PHASES): [`crate::runtime::drain::census`] reads
+/// this at a slow tranche's two ends and diffs, so one 107 ms tranche can be
+/// divided by the same bars the per-second line divides a window with — a
+/// window that spans an idle guest gap mixes tranches that never shared a
+/// regime, and the monster-tranche dissection (journal 2026-10-07) could only
+/// bound its phases from outside. Shares the field mapping with
+/// [`take_window`] through [`load_window`], so the two cannot drift apart.
+pub fn snapshot_window() -> ChainPhaseWindow {
+    load_window(
+        |p| ACC[p as usize].load(Ordering::Relaxed),
+        MAX_NS.load(Ordering::Relaxed),
+        CHAINS.load(Ordering::Relaxed),
+    )
+}
+
+/// Map the accumulators onto [`ChainPhaseWindow`] the one way both the taker
+/// and the snapshotter spell it.
+fn load_window(take: impl Fn(Phase) -> u64, max_ns: u64, chains: u64) -> ChainPhaseWindow {
+    ChainPhaseWindow {
+        prep_us: to_us(take(Phase::Prep)),
+        pipeline_us: to_us(take(Phase::Pipeline)),
+        pipeline_gen_us: to_us(take(Phase::PipelineGen)),
+        pipeline_desc_us: to_us(take(Phase::PipelineDesc)),
+        pipeline_mtlb_us: to_us(take(Phase::PipelineMtlb)),
+        pipeline_air_us: to_us(take(Phase::PipelineAir)),
+        pipeline_xlate_us: to_us(take(Phase::PipelineXlate)),
+        binds_us: to_us(take(Phase::Binds)),
+        sampled_us: to_us(take(Phase::Sampled)),
+        seed_us: to_us(take(Phase::Seed)),
+        assemble_us: to_us(take(Phase::Assemble)),
+        engine_us: to_us(take(Phase::Engine)),
+        store_us: to_us(take(Phase::Store)),
+        prep_pages_us: to_us(take(Phase::PrepPages)),
+        assemble_target_us: to_us(take(Phase::AssembleTarget)),
+        assemble_depth_us: to_us(take(Phase::AssembleDepth)),
+        assemble_trail_us: to_us(take(Phase::AssembleTrail)),
+        chains,
+        max_us: to_us(max_ns),
+    }
 }
 
 /// One named microsecond span inside a phase, committed on `Drop`.

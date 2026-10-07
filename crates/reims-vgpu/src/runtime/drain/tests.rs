@@ -3219,6 +3219,152 @@ fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
     assert!(c.take_flush_rails().is_none(), "{rails}");
 }
 
+/// TEMP (lab, MONSTER_TRANCHE_PHASES): the per-tranche phase line exists
+/// because a window cannot attribute a tranche it does not bound — the n260
+/// monster (107 ms, 1575 draws, 55 µs a draw against its walls' 8) sat inside a
+/// census window whose other nine seconds were walls and guest quiet, and every
+/// phase share read from that window was a blend. The line divides ONE slow
+/// tranche by the same three phase sets the per-second lines use, so the next
+/// monster arrives pre-divided.
+#[test]
+fn a_slow_tranche_phase_line_divides_one_tranche_across_the_three_phase_sets() {
+    use crate::runtime::chain_phase::ChainPhaseWindow;
+    use crate::runtime::drain::census::{
+        lab_slow_tranche_phase_line, ExecPhase, FinishPhase, TranchePhaseSnap,
+    };
+
+    // The tranche-start half: whatever the accumulators held when the doorbell
+    // rang, so the deltas name this tranche alone rather than the window.
+    let start = TranchePhaseSnap {
+        chain: ChainPhaseWindow::default(),
+        exec: [0; ExecPhase::COUNT],
+        fin: [0; FinishPhase::COUNT],
+    };
+    // Indices are `ExecPhase::ALL` / `FinishPhase::ALL` order; the label
+    // assertions below are what pin that, so an enum reordered without its
+    // census fails here rather than mis-reading a live boot.
+    let mut exec = [0; ExecPhase::COUNT];
+    exec[3] = 80_000_000; // Finish, ns — holds the draws
+    exec[0] = 1_500_000; // Load, ns
+    let mut fin = [0; FinishPhase::COUNT];
+    fin[6] = 85_000_000; // Encode, ns — the tranche's draws
+    fin[3] = 2_000_000; // PreludeMrt, ns — the LOAD-seed reads
+    let end = TranchePhaseSnap {
+        chain: ChainPhaseWindow {
+            sampled_us: 35_000,
+            engine_us: 40_000,
+            binds_us: 2_000,
+            seed_us: 500,
+            assemble_us: 300,
+            prep_us: 100,
+            store_us: 100,
+            chains: 1_575,
+            max_us: 24_130,
+            ..ChainPhaseWindow::default()
+        },
+        exec,
+        fin,
+    };
+
+    let line = lab_slow_tranche_phase_line(107_275, 1_575, &start, &end);
+
+    // The two identifiers first, so the line stands alone in a log full of
+    // tranches: which tranche it divides and how many draws shared the time.
+    assert!(
+        line.starts_with("lab_slow_tranche_phase us=107275 draws=1575"),
+        "{line}"
+    );
+    // The chain bars are this tranche's, not the window's: the monster's own
+    // reading was ~45 µs a chain, and a line that reported a window blend
+    // would license exactly the misattribution it was built to end.
+    assert!(line.contains("c_sampled_us=35000"), "{line}");
+    assert!(line.contains("c_engine_us=40000"), "{line}");
+    assert!(line.contains("c_binds_us=2000"), "{line}");
+    assert!(line.contains("c_seed_us=500"), "{line}");
+    assert!(line.contains("c_chains=1575"), "{line}");
+    // A new running max means a chain of THIS tranche set it (the guard that
+    // vetted the snapshots also means no report cleared it mid-tranche).
+    assert!(line.contains("chain_max_new_us=24130"), "{line}");
+    // The exec/fin halves arrive in microseconds, as their per-second lines do.
+    assert!(line.contains("x_finish_us=80000"), "{line}");
+    assert!(line.contains("x_load_us=1500"), "{line}");
+    assert!(line.contains("f_fin_encode_us=85000"), "{line}");
+    assert!(line.contains("f_fin_prelude_mrt_us=2000"), "{line}");
+    // Every phase of both enums must name itself, so a variant added without
+    // its census slot fails here rather than vanishing from a live boot.
+    for label in [
+        "x_load_us=",
+        "x_preflight_us=",
+        "x_walk_us=",
+        "x_finish_us=",
+        "x_header_us=",
+        "f_fin_prelude_rest_us=",
+        "f_fin_prelude_clear_us=",
+        "f_fin_prelude_icb_us=",
+        "f_fin_prelude_mrt_us=",
+        "f_fin_retarget_us=",
+        "f_fin_binds_us=",
+        "f_fin_encode_us=",
+        "f_fin_result_us=",
+        "f_fin_tail_us=",
+    ] {
+        assert!(
+            line.contains(label),
+            "every phase must report: {label}\n{line}"
+        );
+    }
+}
+
+/// TEMP (lab, MONSTER_TRANCHE_PHASES): a delta may not go negative and a max
+/// that did not move is not news.
+///
+/// The end half can read below the start when a per-second report cleared the
+/// accumulators inside the tranche — the snapshot guard suppresses the line in
+/// exactly that case, but the builder must still be safe under any pair it is
+/// handed: saturating zeros, never an underflow, and `chain_max_new_us=0` for
+/// a tranche whose worst chain matched the standing one.
+#[test]
+fn a_slow_tranche_phase_line_saturates_and_reports_no_new_max_as_zero() {
+    use crate::runtime::chain_phase::ChainPhaseWindow;
+    use crate::runtime::drain::census::{
+        lab_slow_tranche_phase_line, ExecPhase, FinishPhase, TranchePhaseSnap,
+    };
+
+    let start = TranchePhaseSnap {
+        chain: ChainPhaseWindow {
+            sampled_us: 50_000,
+            max_us: 9_457,
+            ..ChainPhaseWindow::default()
+        },
+        exec: [40_000_000; ExecPhase::COUNT],
+        fin: [10_000_000; FinishPhase::COUNT],
+    };
+    let end = TranchePhaseSnap {
+        chain: ChainPhaseWindow {
+            sampled_us: 10_000,
+            max_us: 9_457,
+            ..ChainPhaseWindow::default()
+        },
+        exec: [0; ExecPhase::COUNT],
+        fin: [0; FinishPhase::COUNT],
+    };
+
+    let line = lab_slow_tranche_phase_line(15_000, 3, &start, &end);
+
+    assert!(
+        line.contains("c_sampled_us=0") && line.contains("c_chains=0"),
+        "a cleared accumulator must read zero, not underflow: {line}"
+    );
+    assert!(
+        line.contains("x_finish_us=0") && line.contains("f_fin_encode_us=0"),
+        "{line}"
+    );
+    assert!(
+        line.contains("chain_max_new_us=0"),
+        "a max the tranche did not raise is no news: {line}"
+    );
+}
+
 /// The render rail's 6.9 ms has to divide before it can be fixed.
 ///
 /// `flush_rails` names the rail; it does not say whether the cost is the GPU

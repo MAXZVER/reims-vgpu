@@ -2149,6 +2149,27 @@ impl DrainDutyCensus {
         any.then(|| format!("exec_phase win_ms={win_ms}{body}"))
     }
 
+    /// TEMP (lab, MONSTER_TRANCHE_PHASES): the exec/fin phase accumulators and
+    /// the chain window as a point-in-time reading, clearing nothing — the two
+    /// ends of a slow tranche differ one of these and the per-second takers
+    /// stay the only writers that empty them.
+    pub(crate) fn phase_snapshot(&self) -> TranchePhaseSnap {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut exec = [0u64; ExecPhase::COUNT];
+        let mut fin = [0u64; FinishPhase::COUNT];
+        for phase in ExecPhase::ALL {
+            exec[phase.index()] = self.exec_ns[phase.index()].load(Relaxed);
+        }
+        for phase in FinishPhase::ALL {
+            fin[phase.index()] = self.fin_ns[phase.index()].load(Relaxed);
+        }
+        TranchePhaseSnap {
+            chain: crate::runtime::chain_phase::snapshot_window(),
+            exec,
+            fin,
+        }
+    }
+
     /// One stream's spans in one part of `finish_stream`: the nanoseconds it
     /// spent there and how many times it entered.
     ///
@@ -2964,6 +2985,13 @@ pub fn note_tranche_started(now_us: u64) {
     crate::runtime::gva_mem::lab_tlb::new_epoch();
     lab_ft(LabFtPoint::Drain);
     LAB_TRANCHE_SNAP.with(|c| c.set(DRAIN_DUTY.lab_snap()));
+    // TEMP (lab, MONSTER_TRANCHE_PHASES): the phase accumulators' two ends are
+    // read on this thread only (the drain worker owns the tranche), so the
+    // cell needs no lock against the emitter the way the atomics below need
+    // none against this store.
+    if lab_monster_tranche_phases() {
+        LAB_TRANCHE_PHASE_SNAP.with(|c| c.set(Some(DRAIN_DUTY.phase_snapshot())));
+    }
 }
 
 thread_local! {
@@ -3008,6 +3036,127 @@ fn lab_slow_tranche(tranche_us: u64) {
         ));
     }
     crate::observe::off(line);
+    // TEMP (lab, MONSTER_TRANCHE_PHASES): the same tranche divided by the
+    // phase bars, beside the tranche line it explains. Same reset guard: the
+    // builder is fed the same two snapshots the guard already vetted, so a
+    // report that fired mid-tranche suppresses both lines, not just one.
+    if lab_monster_tranche_phases() {
+        if let Some(start_phases) = LAB_TRANCHE_PHASE_SNAP.with(|c| c.get()) {
+            let end_phases = DRAIN_DUTY.phase_snapshot();
+            crate::observe::off(lab_slow_tranche_phase_line(
+                tranche_us,
+                now[0].saturating_sub(start[0]),
+                &start_phases,
+                &end_phases,
+            ));
+        }
+    }
+}
+
+/// TEMP (lab, MONSTER_TRANCHE_PHASES): `REIMS_VGPU_LAB_MONSTER_TRANCHE_PHASES`
+/// (live `MONSTER_TRANCHE_PHASES=on|off`, off unless `=on`). The per-second
+/// phase lines divide a *window*, and a window counts drain time: a tranche
+/// pair around a guest idle gap — the 107 ms monster of n260 sat inside a
+/// window whose other 9 s were walls and quiet — cannot be attributed from
+/// them. This reads the same accumulators at the two ends of one slow tranche
+/// and diffs, so the next monster arrives pre-divided.
+fn lab_monster_tranche_phases() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("MONSTER_TRANCHE_PHASES") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(
+            std::env::var("REIMS_VGPU_LAB_MONSTER_TRANCHE_PHASES").as_deref(),
+            Ok("on")
+        );
+        crate::observe::off(format!("lab_monster_tranche_phases on={}", u8::from(on)));
+        on
+    })
+}
+
+/// TEMP (lab, MONSTER_TRANCHE_PHASES): the three phase accumulators as one slow
+/// tranche started. The exec/fin halves are nanoseconds (as [`DrainDutyCensus`]
+/// holds them); the chain half is already microseconds.
+#[derive(Clone, Copy)]
+pub(crate) struct TranchePhaseSnap {
+    pub(crate) chain: crate::runtime::chain_phase::ChainPhaseWindow,
+    pub(crate) exec: [u64; ExecPhase::COUNT],
+    pub(crate) fin: [u64; FinishPhase::COUNT],
+}
+
+thread_local! {
+    /// TEMP (lab, MONSTER_TRANCHE_PHASES): [`TranchePhaseSnap`] as the running
+    /// tranche started, taken only while the gate is on so the default boot
+    /// pays nothing.
+    static LAB_TRANCHE_PHASE_SNAP: std::cell::Cell<Option<TranchePhaseSnap>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// TEMP (lab, MONSTER_TRANCHE_PHASES): the phase-delta line for one slow
+/// tranche, pure so a test can hold both ends still and read the division.
+///
+/// `chain_max_new_us` is not a delta — a max cannot be differenced — but the
+/// same guard that vetted the snapshots means no report cleared it mid-tranche,
+/// so an end above the start is exactly the maximum a chain of *this* tranche
+/// set, and an equal end means none did (reported 0, not repeated).
+pub(crate) fn lab_slow_tranche_phase_line(
+    tranche_us: u64,
+    draws: u64,
+    start: &TranchePhaseSnap,
+    end: &TranchePhaseSnap,
+) -> String {
+    let mut line = format!("lab_slow_tranche_phase us={tranche_us} draws={draws}");
+    {
+        use crate::runtime::chain_phase::ChainPhaseWindow;
+        let ChainPhaseWindow {
+            prep_us,
+            binds_us,
+            sampled_us,
+            seed_us,
+            assemble_us,
+            engine_us,
+            store_us,
+            chains,
+            ..
+        } = start.chain;
+        let d = |a: u64, b: u64| b.saturating_sub(a);
+        line.push_str(&format!(
+            " c_prep_us={} c_binds_us={} c_sampled_us={} c_seed_us={} c_assemble_us={} \
+             c_engine_us={} c_store_us={} c_chains={}",
+            d(prep_us, end.chain.prep_us),
+            d(binds_us, end.chain.binds_us),
+            d(sampled_us, end.chain.sampled_us),
+            d(seed_us, end.chain.seed_us),
+            d(assemble_us, end.chain.assemble_us),
+            d(engine_us, end.chain.engine_us),
+            d(store_us, end.chain.store_us),
+            d(chains, end.chain.chains),
+        ));
+        if end.chain.max_us > start.chain.max_us {
+            line.push_str(&format!(" chain_max_new_us={}", end.chain.max_us));
+        } else {
+            line.push_str(" chain_max_new_us=0");
+        }
+    }
+    for phase in ExecPhase::ALL {
+        line.push_str(&format!(
+            " x_{}_us={}",
+            phase.label(),
+            (end.exec[phase.index()].saturating_sub(start.exec[phase.index()])) / 1000
+        ));
+    }
+    for phase in FinishPhase::ALL {
+        line.push_str(&format!(
+            " f_{}_us={}",
+            phase.label(),
+            (end.fin[phase.index()].saturating_sub(start.fin[phase.index()])) / 1000
+        ));
+    }
+    line
 }
 
 /// How long the tranche now running has been running.
