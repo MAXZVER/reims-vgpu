@@ -166,7 +166,13 @@ pub fn lab_trim_debts<M: HostMemory + HostOps>(
     // four times the bound, and one payment a tranche end above it; the ledger
     // is paid down when the guest goes quiet (heartbeat tranche ends).
     let idle_policy = lab_trim_idle();
-    if idle_policy && guest_waiting {
+    // The guest is quiet when no doorbell waits *and* no packet has arrived for
+    // TRIM_QUIET_MS (live, default 16): a tranche end between two frames of an
+    // animation sees no doorbell for the few hundred microseconds before the
+    // next one rings, and paying sixteen debts there (p074: the trim still 24 %
+    // of the animation-start tranches with the doorbell test alone) blocks it.
+    let busy = guest_waiting || (idle_policy && !lab_guest_quiet());
+    if idle_policy && busy {
         if state.pending_writebacks.debts.len() <= cap * 4 {
             crate::runtime::drain::note_store_route("wbdebt_trim_idle_wait");
             return;
@@ -177,7 +183,7 @@ pub fn lab_trim_debts<M: HostMemory + HostOps>(
         return;
     }
     YIELDS.store(0, Relaxed);
-    let budget = if moving || (idle_policy && guest_waiting) { 1 } else { 16 };
+    let budget = if moving || (idle_policy && busy) { 1 } else { 16 };
     for _ in 0..budget {
         if state.pending_writebacks.debts.len() <= cap {
             break;
@@ -212,6 +218,28 @@ fn lab_trim_idle() -> bool {
         return false;
     }
     crate::runtime::lab_live::on("TRIM_IDLE").unwrap_or(true)
+}
+
+/// TEMP (lab, TRIM_IDLE): whether no packet has been decoded for TRIM_QUIET_MS
+/// (live, default 16 ms; 0 = the doorbell test alone). Polled at tranche ends,
+/// so "since" is measured from the first tranche end that saw the count move.
+fn lab_guest_quiet() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+    static SINCE_US: AtomicU64 = AtomicU64::new(0);
+    let quiet_ms = crate::runtime::lab_live::value("TRIM_QUIET_MS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(16);
+    if quiet_ms == 0 {
+        return true;
+    }
+    let now = crate::observe::elapsed_us();
+    let packets = crate::runtime::drain::census::packets_ever();
+    if SEEN.swap(packets, Relaxed) != packets {
+        SINCE_US.store(now, Relaxed);
+        return false;
+    }
+    now.saturating_sub(SINCE_US.load(Relaxed)) >= quiet_ms * 1000
 }
 
 /// TEMP (lab, `REIMS_VGPU_LAB_TRIM_DEFER=on`, live through `REIMS_VGPU_LAB_LIVE_FILE`):

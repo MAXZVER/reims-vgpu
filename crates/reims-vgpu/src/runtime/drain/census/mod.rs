@@ -2039,6 +2039,7 @@ impl DrainDutyCensus {
         use std::sync::atomic::Ordering::Relaxed;
         self.decode_ns.fetch_add(ns, Relaxed);
         self.packets.fetch_add(1, Relaxed);
+        PACKETS_EVER.fetch_add(1, Relaxed);
     }
 
     /// One `process_child_packet` dispatch, in nanoseconds, into the total and
@@ -2717,6 +2718,16 @@ pub fn note_vcpu_lock_wait(us: u64) {
 
 static DRAIN_DUTY: std::sync::LazyLock<DrainDutyCensus> =
     std::sync::LazyLock::new(DrainDutyCensus::default);
+
+/// Packets decoded since the process started, never reset (the duty census's
+/// own count is a per-second window).
+static PACKETS_EVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// TEMP (lab, TRIM_IDLE): the monotonic decoded-packet count, so a tranche end
+/// can tell whether the guest sent anything since the last one asked.
+pub(crate) fn packets_ever() -> u64 {
+    PACKETS_EVER.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 static RESIDENT_ARM: std::sync::LazyLock<ResidentArmCensus> =
     std::sync::LazyLock::new(ResidentArmCensus::default);
