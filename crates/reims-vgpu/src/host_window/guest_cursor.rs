@@ -29,7 +29,9 @@
 //! would fight the hand on the mouse. So the window moves the host pointer only
 //! once the host pointer has been still for [`HOST_IDLE`], and drops the move
 //! event its own placement generates ([`WarpGate`]) so that event neither reaches
-//! the guest as input nor counts as the host pointer moving.
+//! the guest as input nor counts as the host pointer moving. Once the host has
+//! shown raw pointer input, a move event without the host's pointer device
+//! moving is never input either, whatever caused it.
 //!
 //! # Ownership
 //!
@@ -227,6 +229,15 @@ pub fn glyph_rgba(glyph: &GuestCursorGlyph, scale: f64) -> Option<(Vec<u8>, u16,
 /// host one feels immediate.
 pub const HOST_IDLE: Duration = Duration::from_millis(150);
 
+/// How long the host's own pointer must have been still before an unfocused
+/// window moves it for the guest's cursor. With the host's mouse passed through
+/// too, nothing on the host moves it and the window can never get its focus
+/// back, so the unfocused window must still place; with the host's mouse in use
+/// on another window, the guest's cursor must not yank it across the screen
+/// (field report 2026-10-07: the passed-through Dell mouse "moved the Windows
+/// pointer" while a Windows window had the focus).
+pub const HOST_AWAY: Duration = Duration::from_secs(2);
+
 /// A host move event within this many window pixels of the last placement is
 /// that placement's own echo.
 const ECHO_PX: f64 = 1.5;
@@ -234,26 +245,57 @@ const ECHO_PX: f64 = 1.5;
 /// How long a placement's echo is waited for.
 const ECHO_TTL: Duration = Duration::from_millis(250);
 
+/// Placements whose echoes may still be in flight. The guest's cursor moves at
+/// its own rate while a passed-through pointer is fast, so a second placement
+/// often goes out before the first one's move event comes back; remembering only
+/// the last placement took that first echo for the host pointer moving, sent the
+/// guest the stale position as an absolute move, and stopped placing for
+/// [`HOST_IDLE`] — the cursor jumped back and froze, over and over (field report
+/// 2026-10-07: "the mouse stutters on fast moves").
+const ECHO_DEPTH: usize = 16;
+
+/// A host move event counts as the host pointer moving only within this long of
+/// the host's own pointer device moving (raw input). Placements, a window moved
+/// under a still pointer and the like move the pointer without any device.
+const RAW_WINDOW: Duration = Duration::from_millis(100);
+
 /// Decides when the guest's position may move the host pointer, and recognises
-/// the host move event a placement causes. Pure, so the rule is testable.
+/// the host move events that are not the host's pointer device moving. Pure, so
+/// the rule is testable.
 #[derive(Debug, Default)]
 pub struct WarpGate {
     host_moved_at: Option<Instant>,
-    placed: Option<((f64, f64), Instant)>,
+    placed: std::collections::VecDeque<((f64, f64), Instant)>,
+    /// The last raw motion of a host pointer device; `None` until the first,
+    /// and while it is `None` only the echo rule applies (a host whose pointer
+    /// produces no raw input, like a remote session, still drives the guest).
+    raw_at: Option<Instant>,
 }
 
 impl WarpGate {
-    /// A host pointer move arrived at `pos`. `false` when it is the echo of the
-    /// window's own placement: not input, and not the host pointer moving.
+    /// A host pointer device moved (raw input, delivered whatever the window
+    /// is under the pointer).
+    pub fn host_raw(&mut self, now: Instant) {
+        self.raw_at = Some(now);
+    }
+
+    /// A host pointer move arrived at `pos`. `false` when it is not input: the
+    /// echo of the window's own placement, or any move no host device made.
     pub fn host_move(&mut self, pos: (f64, f64), now: Instant) -> bool {
-        if let Some((target, at)) = self.placed {
-            if now.duration_since(at) <= ECHO_TTL
-                && (pos.0 - target.0).abs() <= ECHO_PX
-                && (pos.1 - target.1).abs() <= ECHO_PX
-            {
-                self.placed = None;
-                return false;
-            }
+        self.placed
+            .retain(|(_, at)| now.duration_since(*at) <= ECHO_TTL);
+        if let Some(i) = self.placed.iter().position(|(target, _)| {
+            (pos.0 - target.0).abs() <= ECHO_PX && (pos.1 - target.1).abs() <= ECHO_PX
+        }) {
+            // Its own echo, and every older placement's echo is overtaken.
+            self.placed.drain(..=i);
+            return false;
+        }
+        if self
+            .raw_at
+            .is_some_and(|at| now.duration_since(at) > RAW_WINDOW)
+        {
+            return false;
         }
         self.host_moved_at = Some(now);
         true
@@ -267,9 +309,12 @@ impl WarpGate {
         current: Option<(f64, f64)>,
         now: Instant,
     ) -> bool {
-        if self
-            .host_moved_at
-            .is_some_and(|at| now.duration_since(at) < HOST_IDLE)
+        // The host's own pointer moving anywhere, over this window or not, is
+        // the hand on the host mouse: the guest's cursor does not take it.
+        if [self.host_moved_at, self.raw_at]
+            .iter()
+            .flatten()
+            .any(|at| now.duration_since(*at) < HOST_IDLE)
         {
             return false;
         }
@@ -279,9 +324,21 @@ impl WarpGate {
         }
     }
 
+    /// Whether the host's own pointer has been left alone for [`HOST_AWAY`]
+    /// (or never shown raw input): only then may an unfocused window take the
+    /// host pointer for the guest's cursor. A focused window needs no such
+    /// wait; an unfocused one is what the user works around.
+    pub fn host_away(&self, now: Instant) -> bool {
+        self.raw_at
+            .is_none_or(|at| now.duration_since(at) >= HOST_AWAY)
+    }
+
     /// The window moved the host pointer to `target`.
     pub fn placed(&mut self, target: (f64, f64), now: Instant) {
-        self.placed = Some((target, now));
+        if self.placed.len() == ECHO_DEPTH {
+            self.placed.pop_front();
+        }
+        self.placed.push_back((target, now));
     }
 }
 
@@ -371,6 +428,55 @@ mod tests {
             Some((500.0, 500.0)),
             t0 + Duration::from_millis(5)
         ));
+    }
+
+    #[test]
+    fn echoes_of_several_placements_in_flight_are_all_dropped() {
+        let t0 = Instant::now();
+        let mut gate = WarpGate::default();
+        gate.placed((100.0, 100.0), t0);
+        gate.placed((140.0, 110.0), t0 + Duration::from_millis(4));
+        gate.placed((180.0, 120.0), t0 + Duration::from_millis(8));
+        // The first echo arrives after the third placement went out.
+        assert!(!gate.host_move((100.0, 100.0), t0 + Duration::from_millis(9)));
+        assert!(!gate.host_move((180.0, 120.0), t0 + Duration::from_millis(10)));
+        // None of them stopped the guest's cursor from placing.
+        assert!(gate.should_place(
+            (220.0, 130.0),
+            Some((180.0, 120.0)),
+            t0 + Duration::from_millis(12)
+        ));
+    }
+
+    #[test]
+    fn with_raw_input_only_device_motion_is_host_motion() {
+        let t0 = Instant::now();
+        let mut gate = WarpGate::default();
+        gate.host_raw(t0);
+        assert!(gate.host_move((10.0, 10.0), t0 + Duration::from_millis(1)));
+        // The host's own mouse went still (or is passed through): a move event
+        // now is the window or a placement, never input.
+        let later = t0 + RAW_WINDOW + Duration::from_millis(50);
+        assert!(!gate.host_move((400.0, 300.0), later));
+        assert!(gate.should_place((410.0, 300.0), Some((400.0, 300.0)), later + HOST_IDLE));
+        gate.host_raw(later + HOST_IDLE);
+        assert!(gate.host_move((420.0, 300.0), later + HOST_IDLE));
+    }
+
+    #[test]
+    fn the_host_mouse_moving_elsewhere_keeps_its_pointer() {
+        let t0 = Instant::now();
+        let mut gate = WarpGate::default();
+        assert!(gate.host_away(t0), "no raw input yet: nothing to keep");
+        gate.host_raw(t0);
+        assert!(!gate.should_place(
+            (50.0, 50.0),
+            Some((10.0, 10.0)),
+            t0 + Duration::from_millis(20)
+        ));
+        assert!(!gate.host_away(t0 + HOST_IDLE));
+        assert!(gate.should_place((50.0, 50.0), Some((10.0, 10.0)), t0 + HOST_IDLE));
+        assert!(gate.host_away(t0 + HOST_AWAY));
     }
 
     #[test]

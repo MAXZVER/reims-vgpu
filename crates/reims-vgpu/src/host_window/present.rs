@@ -33,8 +33,8 @@ use std::sync::{Arc, Mutex};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
@@ -876,9 +876,9 @@ struct App {
     /// Whether the guest may move the host pointer, and which host move event
     /// is the echo of the window's own placement.
     warp: WarpGate,
-    /// The window has keyboard focus. No longer gates placing the host pointer
-    /// on the guest's cursor (see `apply_guest_cursor`); kept as window state.
-    #[allow(dead_code)]
+    /// The window has keyboard focus: it may place the host pointer on the
+    /// guest's cursor at once; unfocused, only once the host's own mouse has
+    /// been left alone (see `apply_guest_cursor`).
     focused: bool,
 }
 
@@ -979,6 +979,10 @@ impl ApplicationHandler<FramePublished> for App {
         if self.window.is_some() {
             return;
         }
+        // Raw pointer motion even while another window has focus: with the
+        // host's mouse moving over this window unfocused, its `CursorMoved`
+        // is still input.
+        event_loop.listen_device_events(DeviceEvents::Always);
         let mut attrs = Window::default_attributes()
             .with_title(self.config.title.clone())
             .with_inner_size(winit::dpi::PhysicalSize::new(
@@ -1176,6 +1180,15 @@ impl ApplicationHandler<FramePublished> for App {
         self.apply_key_effect(effect);
         self.capture = None;
         self.window = None;
+    }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        // The host's own pointer device moved: the only thing that makes a
+        // following `CursorMoved` the host pointer moving (see `WarpGate`).
+        // A passed-through pointer is on WinUSB and produces none.
+        if let DeviceEvent::MouseMotion { .. } = event {
+            self.warp.host_raw(std::time::Instant::now());
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -1502,9 +1515,11 @@ impl App {
             // while the host pointer is still, and when the host's own mouse and
             // keyboard are passed through too nothing on the host can give the
             // window its focus back. The field test (2026-10-07) lost the cursor
-            // for good the moment the window lost focus. The idle gate still
-            // keeps a moving host pointer authoritative.
-            if snap.show {
+            // for good the moment the window lost focus. Unfocused, it waits
+            // for the host's own mouse to be left alone (`HOST_AWAY`), so a
+            // pointer the guest owns does not drag the host's pointer away
+            // from the window the user works in.
+            if snap.show && (self.focused || self.warp.host_away(std::time::Instant::now())) {
                 if let Some(guest) = self.guest_extent {
                     let target = crate::backend::window::viewport::guest_to_pointer(
                         (u32::from(snap.x), u32::from(snap.y)),
