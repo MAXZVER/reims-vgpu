@@ -1530,6 +1530,20 @@ pub const COLOR_GENERAL: &str = "REIMS_VGPU_COLOR_GENERAL";
 /// outcome a tiling compositor already produces. `host_window::present`'s
 /// `WindowMode` owns both halves.
 pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
+
+/// **Default on.** The host window shows the guest's hardware cursor: the glyph
+/// the guest hands the display (`CmdDisplayCursorGlyph`) becomes the window's
+/// own cursor, hidden whenever the guest hides it, and placed where the guest
+/// says it is whenever something other than the host pointer moved it — a USB
+/// mouse or a Bluetooth pointer passed into the guest, which the host pointer
+/// knows nothing about. Without it the only arrow over the window is the host's,
+/// and a pointer the guest drives has none at all.
+///
+/// The cursor is drawn by the host window system's cursor layer, not composited
+/// into the guest frame, so it costs no present, adds no latency to the host
+/// pointer, and never reaches a captured frame. `off` keeps the host's own arrow
+/// and never moves the host pointer — the behavior before this existed.
+pub const HOST_CURSOR: &str = "REIMS_VGPU_HOST_CURSOR";
 }
 
 counts! {

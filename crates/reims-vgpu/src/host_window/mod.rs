@@ -19,6 +19,8 @@
 //! - [`capture`] — the per-platform request that stops the desktop from
 //!   consuming shortcuts before the window sees them. A typed refusal where the
 //!   platform cannot honour it.
+//! - [`guest_cursor`] — the guest's hardware cursor (glyph, visibility,
+//!   position) on its way from the device to the window's cursor layer.
 //! - [`present`] — the window itself: event loop, native surface, and the
 //!   publish → fit → present loop. It also drives [`input_map`] and hands each
 //!   action to an `InputSink`; `lib.rs` wires that to the device's prompt action
@@ -29,6 +31,7 @@
 //! presenters need it too and `backend` may not reach up into this module.
 
 pub mod capture;
+pub mod guest_cursor;
 pub mod input_map;
 pub mod keyboard;
 pub mod present;

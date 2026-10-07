@@ -7577,6 +7577,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 state.cursor.show = show;
                 sample_cursor_position(state, host);
                 host.enqueue(HostAction::cursor(state.cursor.x, state.cursor.y, show));
+                host.guest_cursor_position(state.id.0, state.cursor.x, state.cursor.y, show);
             }
             Err(short) => note_short_payload("cursor_show", Some(channel_id), &short),
         },
@@ -7588,6 +7589,15 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     state.cursor.y,
                     state.cursor.show,
                 ));
+                if let Some(glyph) = crate::runtime::host::CursorGlyphRef::of(&state.cursor) {
+                    host.guest_cursor_glyph(state.id.0, glyph);
+                }
+                host.guest_cursor_position(
+                    state.id.0,
+                    state.cursor.x,
+                    state.cursor.y,
+                    state.cursor.show,
+                );
             }
         }
         CHILD_OP_EXEC_INDIRECT2 => {

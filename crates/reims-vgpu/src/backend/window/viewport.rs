@@ -62,9 +62,64 @@ pub fn pointer_to_guest(pos: (f64, f64), window: (u32, u32), guest: (u32, u32)) 
     )
 }
 
+/// The inverse of [`pointer_to_guest`]: where a guest-frame pixel lands in the
+/// window, through the same viewport the presenter draws. The guest's hardware
+/// cursor is placed with it, so a pointer the guest moved and a pointer the host
+/// moved meet at the same window pixel.
+///
+/// Answers the pixel's centre, so a round trip through [`pointer_to_guest`]
+/// returns the same guest pixel at any scale.
+pub fn guest_to_pointer(pos: (u32, u32), window: (u32, u32), guest: (u32, u32)) -> (f64, f64) {
+    let vp = aspect_fit(guest, window);
+    let sx = vp.width.max(1) as f64 / guest.0.max(1) as f64;
+    let sy = vp.height.max(1) as f64 / guest.1.max(1) as f64;
+    (
+        vp.x as f64 + (pos.0 as f64 + 0.5) * sx,
+        vp.y as f64 + (pos.1 as f64 + 0.5) * sy,
+    )
+}
+
+/// How many window pixels one guest pixel covers in the presented viewport (the
+/// horizontal scale; the viewport keeps the guest's aspect, so it is the
+/// vertical one too, up to rounding).
+pub fn guest_scale(window: (u32, u32), guest: (u32, u32)) -> f64 {
+    aspect_fit(guest, window).width.max(1) as f64 / guest.0.max(1) as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guest_pixel_round_trips_through_the_window() {
+        for (window, guest) in [
+            ((5120, 2160), (5120, 2160)),
+            ((5120, 2160), (1920, 1080)),
+            ((1920, 1080), (5120, 2160)),
+            ((1440, 900), (1920, 1080)),
+        ] {
+            for pos in [
+                (0, 0),
+                (17, 9),
+                (guest.0 / 2, guest.1 / 3),
+                (guest.0 - 1, guest.1 - 1),
+            ] {
+                let w = guest_to_pointer(pos, window, guest);
+                assert_eq!(
+                    pointer_to_guest(w, window, guest),
+                    pos,
+                    "window {window:?} guest {guest:?} pos {pos:?} -> {w:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_guest_scale_follows_the_letterboxed_viewport() {
+        assert_eq!(guest_scale((5120, 2160), (5120, 2160)), 1.0);
+        // 16:9 guest in a 64:27 window: full height, 2160/1080 = 2.
+        assert_eq!(guest_scale((5120, 2160), (1920, 1080)), 2.0);
+    }
 
     #[test]
     fn matching_aspect_covers_the_destination() {

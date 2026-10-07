@@ -1100,6 +1100,32 @@ impl HostOps for QemuHost<'_> {
         }
     }
 
+    fn guest_cursor_position(&mut self, device: u64, x: u16, y: u16, show: bool) {
+        // The host window draws the guest's cursor in its own cursor layer
+        // (`host_window::guest_cursor`); without a window for this device the
+        // publish finds no feed and does nothing.
+        #[cfg(feature = "host-window")]
+        crate::host_window::guest_cursor::publish_position(device, x, y, show);
+        #[cfg(not(feature = "host-window"))]
+        let _ = (device, x, y, show);
+    }
+
+    fn guest_cursor_glyph(&mut self, device: u64, glyph: crate::runtime::host::CursorGlyphRef<'_>) {
+        #[cfg(feature = "host-window")]
+        crate::host_window::guest_cursor::publish_glyph(
+            device,
+            crate::host_window::guest_cursor::GuestCursorGlyph {
+                width: glyph.width,
+                height: glyph.height,
+                hot_x: glyph.hot_x,
+                hot_y: glyph.hot_y,
+                argb: glyph.argb.to_vec(),
+            },
+        );
+        #[cfg(not(feature = "host-window"))]
+        let _ = (device, glyph);
+    }
+
     fn guest_write_rebase(&self, token: u64, gpas: &[u64]) {
         self.ops.rebase(token, gpas);
     }

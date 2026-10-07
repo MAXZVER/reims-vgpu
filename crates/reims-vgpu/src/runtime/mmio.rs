@@ -254,6 +254,12 @@ pub fn gfx_write<H: HostMemory + HostOps>(
                         state.cursor.y,
                         state.cursor.show,
                     ));
+                    host.guest_cursor_position(
+                        state.id.0,
+                        state.cursor.x,
+                        state.cursor.y,
+                        state.cursor.show,
+                    );
                 }
                 host.enqueue(HostAction::irq_gfx());
                 host.schedule_bh();

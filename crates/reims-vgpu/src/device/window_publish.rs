@@ -154,6 +154,11 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     // covers the gap, so a publish that beats the loop's creation costs latency
     // rather than a frame.
     let wake = WindowWaker::new();
+    // The guest's hardware cursor rides the same wake (`host_window::guest_cursor`):
+    // registered by device id, so the MMIO and drain paths that report the
+    // cursor reach it without a device lock.
+    let guest_cursor = crate::host_window::guest_cursor::GuestCursorFeed::new(Arc::clone(&wake));
+    crate::host_window::guest_cursor::register(id, Arc::clone(&guest_cursor));
     // Weak so a live window does not pin a destroyed device; post-destroy input
     // upgrades to None and is dropped (the guest is gone anyway).
     let weak = Arc::downgrade(&slot);
@@ -202,6 +207,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
             Arc::clone(&stop),
             Arc::clone(&exited),
             Arc::clone(&wake),
+            Arc::clone(&guest_cursor),
         ) {
             crate::observe::Emit::decline("host_window_start", &error)
                 .field("id", id)
@@ -217,6 +223,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         Arc::clone(&frames),
         Arc::clone(&stop),
         Arc::clone(&wake),
+        Arc::clone(&guest_cursor),
     ));
     *link = Some(WindowLink {
         frames,
@@ -436,6 +443,8 @@ pub fn device_window_stop(id: u64) -> bool {
     let Some(mut link) = link else {
         return true; // no window (or already stopped)
     };
+    // The guest's cursor reports for this device go nowhere from here on.
+    crate::host_window::guest_cursor::unregister(id);
     link.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     #[cfg(target_os = "macos")]
     {

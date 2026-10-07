@@ -452,6 +452,32 @@ pub enum WorkScope {
     RingEmpty(u32),
 }
 
+/// One guest cursor image as [`HostOps::guest_cursor_glyph`] receives it,
+/// borrowed from the device's [`crate::model::CursorState`].
+#[derive(Clone, Copy, Debug)]
+pub struct CursorGlyphRef<'a> {
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    /// `width * height` words, `0xAARRGGBB`.
+    pub argb: &'a [u32],
+}
+
+impl<'a> CursorGlyphRef<'a> {
+    /// The ready glyph `cursor` holds, if any.
+    pub fn of(cursor: &'a crate::model::CursorState) -> Option<Self> {
+        let need = usize::from(cursor.width) * usize::from(cursor.height);
+        (cursor.glyph_ready && need != 0 && cursor.pixels.len() >= need).then(|| Self {
+            width: cursor.width,
+            height: cursor.height,
+            hot_x: cursor.hot_x,
+            hot_y: cursor.hot_y,
+            argb: &cursor.pixels[..need],
+        })
+    }
+}
+
 /// Services the device cannot provide itself (time, wake, action enqueue,
 /// guest CPU / KVA access for the IOSurface mapper path).
 pub trait HostOps {
@@ -681,6 +707,17 @@ pub trait HostOps {
     /// the reader. A hint with no answer: a host without workers does nothing,
     /// and a read that arrives before a worker syncs as it always did.
     fn guest_write_sync_ahead(&self, _tokens: &[u64]) {}
+
+    /// The guest's hardware cursor of `device` is at `(x, y)` in display pixels,
+    /// shown or not — what the guest last told the display. For a host that
+    /// draws the cursor itself (the host window's cursor layer); the console
+    /// keeps getting [`HostAction::cursor`] either way. Default: nothing.
+    fn guest_cursor_position(&mut self, _device: u64, _x: u16, _y: u16, _show: bool) {}
+
+    /// The guest's hardware cursor of `device` took a new image: `argb` is
+    /// `width * height` words, `0xAARRGGBB`, rows top to bottom, with the hot
+    /// spot at `(hot_x, hot_y)`. Default: nothing.
+    fn guest_cursor_glyph(&mut self, _device: u64, _glyph: CursorGlyphRef<'_>) {}
 
     /// The device itself just stored into these page-aligned GPAs of the
     /// tracked set `token` (a writeback landing the frame a resident holds).

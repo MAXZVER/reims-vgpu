@@ -39,6 +39,7 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use super::capture::{Capture, CaptureEngaged, CaptureMode};
+use super::guest_cursor::{self, GuestCursorHandle, WarpGate};
 use super::input_map;
 use super::keyboard::{Grab, KeyEffect, Keyboard};
 use crate::backend::window::WindowPresentOutcome;
@@ -660,10 +661,11 @@ pub fn spawn(
     frames: FrameSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
+    guest_cursor: GuestCursorHandle,
 ) -> std::thread::JoinHandle<Result<(), WindowError>> {
     std::thread::Builder::new()
         .name("reims-vgpu-window".to_string())
-        .spawn(move || run(config, on_input, frames, stop, wake))
+        .spawn(move || run(config, on_input, frames, stop, wake, guest_cursor))
         .expect("spawn reims-vgpu-window thread")
 }
 
@@ -676,10 +678,11 @@ pub fn run(
     frames: FrameSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
+    guest_cursor: GuestCursorHandle,
 ) -> Result<(), WindowError> {
     let event_loop = build_event_loop()?;
     wake.arm(event_loop.create_proxy());
-    let mut app = App::new(config, on_input, frames, stop);
+    let mut app = App::new(config, on_input, frames, stop, guest_cursor);
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::RunApp(e.to_string()))
@@ -714,6 +717,7 @@ pub fn start_main_thread(
     stop: StopFlag,
     exited: ExitedFlag,
     wake: WindowWakeHandle,
+    guest_cursor: GuestCursorHandle,
 ) -> Result<(), WindowError> {
     MAIN_THREAD_WINDOW.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -726,7 +730,7 @@ pub fn start_main_thread(
         }
         let event_loop = build_event_loop()?;
         wake.arm(event_loop.create_proxy());
-        let app = App::new(config, on_input, frames, stop);
+        let app = App::new(config, on_input, frames, stop, guest_cursor);
         *slot = Some(MainThreadWindow {
             id,
             event_loop,
@@ -854,6 +858,27 @@ struct App {
     pending_guest_resize: Option<PendingGuestResize>,
     /// What this event loop actually did, per second. See [`LoopCensus`].
     loop_census: LoopCensus,
+    /// The guest's hardware cursor as the device last reported it, and what of
+    /// it this window has applied. See [`super::guest_cursor`].
+    guest_cursor: GuestCursorHandle,
+    /// [`crate::config::HOST_CURSOR`] is not `off`. Read once at start.
+    guest_cursor_on: bool,
+    cursor_applied_pos_gen: u64,
+    cursor_applied_glyph_gen: u64,
+    /// The window-pixels-per-guest-pixel scale the applied glyph was built at.
+    cursor_glyph_scale: f64,
+    /// The visibility last handed to the window system; `None` before the guest
+    /// has reported any.
+    cursor_visible: Option<bool>,
+    /// The host pointer's last known position in window pixels (a host move
+    /// event, or where the window placed it).
+    host_pointer: Option<(f64, f64)>,
+    /// Whether the guest may move the host pointer, and which host move event
+    /// is the echo of the window's own placement.
+    warp: WarpGate,
+    /// The window has keyboard focus: the only time the guest's pointer may
+    /// move the host's.
+    focused: bool,
 }
 
 /// How often the window's event loop looked for a guest frame, and what it
@@ -894,6 +919,10 @@ struct LoopCensus {
     draws_fresh: u64,
     /// TEMP lab: host `CursorMoved` deliveries forwarded to the guest.
     cursor_moves: u64,
+    /// Host pointer placements made for the guest's cursor, and the host move
+    /// events dropped as their echo.
+    cursor_places: u64,
+    cursor_echoes: u64,
 }
 
 impl LoopCensus {
@@ -907,6 +936,8 @@ impl LoopCensus {
             draws_held: 0,
             draws_fresh: 0,
             cursor_moves: 0,
+            cursor_places: 0,
+            cursor_echoes: 0,
         }
     }
 
@@ -925,7 +956,8 @@ impl LoopCensus {
         }
         crate::observe::off(format!(
             "host_window_loop win_ms={} ticks={} redraws_asked={} draws={} \
-             draws_fresh={} draws_stale={} draws_held={} cursor_moves={}",
+             draws_fresh={} draws_stale={} draws_held={} cursor_moves={} \
+             cursor_places={} cursor_echoes={}",
             elapsed.as_millis(),
             self.ticks,
             self.redraws_asked,
@@ -934,6 +966,8 @@ impl LoopCensus {
             self.draws_stale,
             self.draws_held,
             self.cursor_moves,
+            self.cursor_places,
+            self.cursor_echoes,
         ));
         *self = Self::new();
     }
@@ -1081,10 +1115,20 @@ impl ApplicationHandler<FramePublished> for App {
                 // also where the desktop's shortcuts are taken and handed back.
                 let effect = self.keyboard.focus(focused);
                 self.apply_key_effect(effect);
+                self.focused = focused;
             }
             WindowEvent::CursorMoved { position, .. } => {
+                let pos = (position.x, position.y);
+                self.host_pointer = Some(pos);
+                if self.guest_cursor_on && !self.warp.host_move(pos, std::time::Instant::now()) {
+                    // The echo of placing the host pointer on the guest's
+                    // cursor: the guest is already there, and this is not the
+                    // host pointer moving.
+                    self.loop_census.cursor_echoes += 1;
+                    return;
+                }
                 self.loop_census.cursor_moves += 1;
-                self.pointer_move((position.x, position.y));
+                self.pointer_move(pos);
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(btn) = input_map::mouse_button(button) {
@@ -1135,6 +1179,7 @@ impl ApplicationHandler<FramePublished> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.loop_census.tick();
+        self.apply_guest_cursor(event_loop);
         // The device sets `stop` on VM teardown. The loop wakes at least once per
         // [`WINDOW_REDRAW_BACKSTOP`], so the request is picked up within
         // one of those — then the loop exits and `exiting` releases the
@@ -1191,7 +1236,14 @@ impl ApplicationHandler<FramePublished> for App {
     /// put a second caller on the platform's redraw path, and the two would
     /// disagree about the backstop — `about_to_wait` runs after this and after
     /// every other event, so it is the one place that can hold that decision.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: FramePublished) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: FramePublished) {
+        // The same wake carries the guest's cursor (see
+        // `guest_cursor::GuestCursorFeed`). A wake that changed only the cursor
+        // asks for no redraw: the cursor layer needs none, and a present per
+        // pointer move on a still scene is what this design exists to avoid.
+        if self.apply_guest_cursor(event_loop) && !self.frame_slot_fresh() {
+            return;
+        }
         // TEMP (lab): `REIMS_VGPU_LAB_DIRECT_REDRAW=1` presents here, on the
         // publish's own wake, instead of asking for a redraw: on Windows that
         // request is a WM_PAINT, which the message loop delivers only once
@@ -1262,7 +1314,17 @@ impl App {
     /// `start_main_thread` on macOS's main thread — and every field but the
     /// four they are given is fixed. Written out at each site, a field added
     /// to the struct could be initialised in one and missed in the other.
-    fn new(config: WindowConfig, on_input: InputSink, frames: FrameSlot, stop: StopFlag) -> Self {
+    fn new(
+        config: WindowConfig,
+        on_input: InputSink,
+        frames: FrameSlot,
+        stop: StopFlag,
+        guest_cursor: GuestCursorHandle,
+    ) -> Self {
+        let guest_cursor_on = !matches!(
+            crate::config::read(crate::config::HOST_CURSOR).0,
+            crate::config::Switch::Off
+        );
         Self {
             config,
             on_input,
@@ -1289,6 +1351,15 @@ impl App {
             guest_extent: None,
             pending_guest_resize: None,
             loop_census: LoopCensus::new(),
+            guest_cursor,
+            guest_cursor_on,
+            cursor_applied_pos_gen: 0,
+            cursor_applied_glyph_gen: 0,
+            cursor_glyph_scale: 0.0,
+            cursor_visible: None,
+            host_pointer: None,
+            warp: WarpGate::default(),
+            focused: false,
         }
     }
 
@@ -1367,6 +1438,87 @@ impl App {
             (self.on_input)(HostAction::window_closed());
             self.closed_sent = true;
         }
+    }
+
+    /// Whether the frame slot holds a frame this window has not presented.
+    fn frame_slot_fresh(&self) -> bool {
+        let incoming = self
+            .frames
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|frame| frame.seq));
+        self.redraw_required || (incoming.is_some() && incoming != self.last_presented_seq)
+    }
+
+    /// Bring the window's cursor up to what the guest last reported: its image
+    /// (rebuilt when the guest's or the viewport's scale changed), its
+    /// visibility, and - when the guest moved its pointer itself - the host
+    /// pointer's position. `true` when anything was reported since the last
+    /// call. See [`super::guest_cursor`] for who may move the pointer and why.
+    fn apply_guest_cursor(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        if !self.guest_cursor_on {
+            return false;
+        }
+        let Some(window) = self.window.clone() else {
+            return false;
+        };
+        let snap = self.guest_cursor.snapshot();
+        let dims = self.surface_dims();
+        let scale = self
+            .guest_extent
+            .map(|guest| crate::backend::window::viewport::guest_scale(dims, guest))
+            .unwrap_or(1.0);
+        let rescale = snap.glyph.is_some() && (scale - self.cursor_glyph_scale).abs() > 1e-3;
+        if snap.pos_gen == self.cursor_applied_pos_gen
+            && snap.glyph_gen == self.cursor_applied_glyph_gen
+            && !rescale
+        {
+            return false;
+        }
+        if snap.glyph_gen != self.cursor_applied_glyph_gen || rescale {
+            if let Some(glyph) = snap.glyph.as_deref() {
+                if let Some((rgba, w, h, hx, hy)) = guest_cursor::glyph_rgba(glyph, scale) {
+                    match winit::window::CustomCursor::from_rgba(rgba, w, h, hx, hy) {
+                        Ok(source) => window.set_cursor(event_loop.create_custom_cursor(source)),
+                        Err(error) => crate::observe::fail(format!(
+                            "host_window_cursor FAIL reason=glyph_refused {}x{} hot=({},{}) {error}",
+                            glyph.width, glyph.height, glyph.hot_x, glyph.hot_y
+                        )),
+                    }
+                }
+            }
+            self.cursor_applied_glyph_gen = snap.glyph_gen;
+            self.cursor_glyph_scale = scale;
+        }
+        if snap.pos_gen != self.cursor_applied_pos_gen {
+            self.cursor_applied_pos_gen = snap.pos_gen;
+            if self.cursor_visible != Some(snap.show) {
+                window.set_cursor_visible(snap.show);
+                self.cursor_visible = Some(snap.show);
+            }
+            if snap.show && self.focused {
+                if let Some(guest) = self.guest_extent {
+                    let target = crate::backend::window::viewport::guest_to_pointer(
+                        (u32::from(snap.x), u32::from(snap.y)),
+                        dims,
+                        guest,
+                    );
+                    let now = std::time::Instant::now();
+                    if self.warp.should_place(target, self.host_pointer, now)
+                        && window
+                            .set_cursor_position(winit::dpi::PhysicalPosition::new(
+                                target.0, target.1,
+                            ))
+                            .is_ok()
+                    {
+                        self.warp.placed(target, now);
+                        self.host_pointer = Some(target);
+                        self.loop_census.cursor_places += 1;
+                    }
+                }
+            }
+        }
+        true
     }
 
     fn surface_dims(&self) -> (u32, u32) {
