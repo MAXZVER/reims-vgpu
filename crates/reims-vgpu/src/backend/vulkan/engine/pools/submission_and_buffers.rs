@@ -459,8 +459,10 @@ impl ResourcePools {
             // working set, and what a quiet desktop keeps is one spare block per
             // size class — tens of MiB against the ~177 MiB of frozen staging
             // this trim was written for.
-            self.slabs
-                .trim_empty_blocks(device, BUFFER_SLAB_IDLE_KEEP_EMPTY);
+            self.slabs.trim_empty_blocks(
+                device,
+                BUFFER_SLAB_IDLE_KEEP_EMPTY.max(super::lab_slab_warm_keep()),
+            );
             // The standalone (non-slab) compute-storage recycle pool re-allocs via
             // a full `vkAllocateMemory` on the next dispatch — like the buffer
             // pools above and unlike the slab-backed image pools (cheap
@@ -3676,6 +3678,11 @@ impl ResourcePools {
         let total = total_len as usize;
         let mut off = 0usize;
         let mut skip = source_offset;
+        // TEMP (lab PAR_STAGE): a large copy is collected as segments and split
+        // over helper threads (`par_stage`); the bytes and their places are the
+        // serial loop's.
+        let split = total >= super::par_stage::PAR_STAGE_MIN_BYTES && super::par_stage::on();
+        let mut segs: Vec<super::par_stage::Segment> = Vec::new();
         unsafe {
             for run in runs {
                 if off >= total {
@@ -3693,12 +3700,25 @@ impl ResourcePools {
                 // `HostOps::map_pages`, valid for the VM lifetime; `ptr` is the
                 // mapped staging span of `size >= total` bytes and `off + n <=
                 // total`, so the destination stays in bounds.
-                std::ptr::copy_nonoverlapping(
-                    (run.host_ptr() as *const u8).add(within),
-                    ptr.add(off),
-                    n,
-                );
+                if split {
+                    segs.push(super::par_stage::Segment {
+                        src: (run.host_ptr() as *const u8).add(within),
+                        dst: ptr.add(off),
+                        n,
+                    });
+                } else {
+                    std::ptr::copy_nonoverlapping(
+                        (run.host_ptr() as *const u8).add(within),
+                        ptr.add(off),
+                        n,
+                    );
+                }
                 off += n;
+            }
+            if split {
+                // SAFETY: the segments are the loop's copies - disjoint
+                // destinations inside the mapped span, sources in guest RAM.
+                super::par_stage::copy_segments(&segs);
             }
             // Runs underfilled the span (short read) or the 4-byte minimum tail:
             // zero the remainder so the bind reads defined memory.

@@ -4385,6 +4385,10 @@ fn apply_backing<M: HostMemory>(
             .unwrap_or_else(|| std::mem::take(&mut m.page_entries));
         let changed = prior != entries;
         let replaced = !prior.is_empty() && changed;
+        if replaced {
+            // TEMP (lab, REPOINT_KEEP): a recycled id is new content.
+            crate::model::DeviceState::end_repoint_keep(m);
+        }
         if changed {
             crate::model::DeviceState::bump_map_generation(m);
         }
@@ -4443,6 +4447,16 @@ fn apply_backing<M: HostMemory>(
         m.mapped = true;
         m.page_table_kva = 0;
         m.device_desc = device_desc;
+        if std::mem::take(&mut m.repoint_keep) {
+            // TEMP (lab, REPOINT_KEEP): the re-pointed list is in; the resident
+            // identity it kept follows the page plan again from the next bump.
+            crate::runtime::drain::note_store_route("repoint_keep_carried");
+            crate::observe::off(format!(
+                "repoint_keep_carried mid={surface_id} map_gen={} identity_gen={} (the guest \
+                 re-pointed the backing; the resident keeps the surface's content)",
+                m.map_generation, m.identity_generation
+            ));
+        }
         // Latched with the list rather than near it: this records the walk that
         // produced the entries above, so a later reader can repeat that walk —
         // and find out whether the entries still name the guest's memory —
@@ -4816,6 +4830,16 @@ fn repoint_settle_owed_frame<H: HostMemory + crate::runtime::host::HostOps>(
     }
 }
 
+/// TEMP (lab, live `REPOINT_KEEP`, default on; `REIMS_VGPU_LAB_REPOINT_KEEP=off`
+/// at boot turns it off): see `MappingEntry::identity_generation`.
+fn lab_repoint_keep() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("REPOINT_KEEP") {
+        return on;
+    }
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var("REIMS_VGPU_LAB_REPOINT_KEEP").as_deref() != Ok("off"))
+}
+
 pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -4918,6 +4942,28 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
             state.pending_writebacks.get(target).is_some(),
             state.mappings.get(&target).map(|m| m.map_generation)
         ));
+    }
+    // TEMP (lab, REPOINT_KEEP): the guest moved this surface's pages, not its
+    // content. Keep the resident identity across the bumps until the re-pointed
+    // list is adopted (`MappingEntry::identity_generation`). Not over a guest
+    // import: that resident's image *is* the old memory.
+    // Nor when the old list's witness saw the guest store into the surface since
+    // the device's last copy: the guest's copy to the new pages carries those
+    // stores and the resident does not, so the old rule (seed from the pages)
+    // stands.
+    if lab_repoint_keep() {
+        let guest_wrote = matches!(
+            crate::runtime::mapper::mapping_guest_write_verdict(state, &*host, target),
+            crate::runtime::mapper::GuestWriteVerdict::Wrote
+        );
+        if let Some(m) = state.mappings.get_mut(&target) {
+            if guest_wrote {
+                crate::runtime::drain::note_store_route("repoint_keep_refused_guest_wrote");
+            } else if m.contig_import.is_none() && m.has_geom {
+                m.repoint_keep = true;
+                crate::runtime::drain::note_store_route("repoint_keep_armed");
+            }
+        }
     }
     let had = state.invalidate_mapping_pages(target);
     crate::runtime::drain::note_store_route(if had {

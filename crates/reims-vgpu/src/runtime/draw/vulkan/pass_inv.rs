@@ -185,7 +185,7 @@ impl PassInvariants {
             }) => state
                 .mappings
                 .get(id)
-                .is_some_and(|m| u64::from(m.map_generation) == *generation),
+                .is_some_and(|m| u64::from(m.identity_generation) == *generation),
             // A Gva generation is the draw-0 page-set hash: re-deriving it is
             // the walk it stands in for, and nothing inside one pass rewrites
             // a task's page tables (map/unmap packets are drain-serialized
@@ -526,7 +526,7 @@ mod tests {
 
         // Whatever a mid-pass resolve was: it advanced the mapping's
         // generation, which is the only device-side witness this rail has.
-        state.mappings.get_mut(&18).unwrap().map_generation += 1;
+        crate::model::DeviceState::bump_map_generation(state.mappings.get_mut(&18).unwrap());
 
         let before = store_route_count("pass_inv_recomputed_fallback");
         let fresh = chain_identity(&state, &req);

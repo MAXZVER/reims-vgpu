@@ -2080,6 +2080,20 @@ pub struct MappingEntry {
     /// import-present so a recycled mid never reuses a stale GPU target, and
     /// as a fail-closed check before zero-copy DMA into contig views.
     pub map_generation: u32,
+    /// TEMP (lab, live `REPOINT_KEEP`, default on): the generation a resident of
+    /// this mapping is keyed by (`present_identity::surface_identity`). It follows
+    /// [`Self::map_generation`] except across a `ReplacePhysical`, which moves the
+    /// surface's pages and not its content. Keyed by the page plan, a re-point
+    /// orphaned the resident, and for a surface this device never pays — a
+    /// scanout buffer, whose guest pages stay unpainted — that resident was the
+    /// content's only copy: the next LOAD seeded the surface from the unpainted
+    /// pages and every pixel outside the pass's damage went black (p79c/p80a boot
+    /// wallpaper stripes, mid 14/52 re-pointed at 80.4 s/76.9 s).
+    pub identity_generation: u32,
+    /// TEMP (lab, REPOINT_KEEP): a `ReplacePhysical` retired this mapping's page
+    /// list, and the next list adopted is that re-point's; generation bumps until
+    /// then leave [`Self::identity_generation`] where it was.
+    pub repoint_keep: bool,
     /// Guest page-table entries (valid bit + PFN); empty until resolved.
     pub page_entries: Vec<u32>,
     /// Page entries retired by a trailing `DeleteIOSurfaceBacking2` while the
@@ -5932,6 +5946,19 @@ impl DeviceState {
         if e.map_generation == 0 {
             e.map_generation = 1;
         }
+        // TEMP (lab, REPOINT_KEEP): see `MappingEntry::identity_generation`.
+        if !e.repoint_keep {
+            e.identity_generation = e.map_generation;
+        }
+    }
+
+    /// TEMP (lab, REPOINT_KEEP): the mapping's content is no longer the content a
+    /// pending re-point carries (a new surface, an unmap, a recycled id): the
+    /// resident identity follows the page plan again from the next bump on.
+    pub fn end_repoint_keep(e: &mut MappingEntry) {
+        if std::mem::take(&mut e.repoint_keep) {
+            crate::runtime::drain::note_store_route("repoint_keep_ended");
+        }
     }
 
     /// Drop compute storage-residency mirror entries whose byte window
@@ -6110,6 +6137,7 @@ impl DeviceState {
             e.condemned_entries = None;
             e.mapping_internal = 0;
             e.device_desc.clear();
+            Self::end_repoint_keep(e);
             Self::bump_map_generation(e);
             e.has_geom = false;
             e.width = 0;
@@ -6162,6 +6190,7 @@ impl DeviceState {
         e.device_desc.clear();
         e.content_generation = 0;
         e.surface_content_epoch = 0;
+        Self::end_repoint_keep(e);
         Self::bump_map_generation(e);
         // New MappingInternal ⇒ new surface; force device-desc re-resolve.
         e.has_geom = false;

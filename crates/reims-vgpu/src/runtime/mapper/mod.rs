@@ -609,6 +609,10 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                 import.id()
             });
         }
+        if incarnation_changed {
+            // TEMP (lab, REPOINT_KEEP): a new incarnation is new content.
+            DeviceState::end_repoint_keep(m);
+        }
         if pages_changed {
             DeviceState::bump_map_generation(m);
         }
@@ -681,6 +685,10 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         m.page_table_kva = plan.page_table_kva;
         m.mapping_internal = internal;
         m.mapped = true;
+        if std::mem::take(&mut m.repoint_keep) {
+            // TEMP (lab, REPOINT_KEEP): the re-pointed list is in.
+            crate::runtime::drain::note_store_route("repoint_keep_carried");
+        }
         if let Some(ref d) = device_desc {
             m.device_desc = d.clone();
         }

@@ -3113,10 +3113,32 @@ fn slab_retain_enabled() -> bool {
 /// trim *below* a budget that was chosen to absorb exactly this churn.
 fn idle_slab_trim_keep(settled: bool) -> Option<usize> {
     if settled || !slab_retain_enabled() {
-        Some(IDLE_SLAB_KEEP_EMPTY)
+        Some(IDLE_SLAB_KEEP_EMPTY.max(lab_slab_warm_keep()))
     } else {
         None
     }
+}
+
+/// TEMP (lab, live `SLAB_WARM_KEEP=N`, 0 by default until its A/B): empty
+/// blocks per size class that a *settled* idle keeps in both slab families -
+/// the host-visible upload pool and the device-local image slab - instead of
+/// 1 and 0.
+///
+/// A full-screen transition comes after a pause long enough to settle, so the
+/// settled trim hands back exactly the blocks its first frames re-allocate.
+/// p079 (Intel): 49 upload-block (16 MiB) and 47 image-slab-block allocations a
+/// phase, nine transitions; p078: vkAllocateMemory and the first map of a new
+/// block were a third of the recorder in the tranches that open an animation,
+/// where the drain waits on the recorder. Six blocks are 96 MiB of host memory
+/// and up to 6 x 64 MiB of VRAM held across a quiet desktop.
+pub(crate) fn lab_slab_warm_keep() -> usize {
+    if cfg!(test) {
+        return 0;
+    }
+    crate::runtime::lab_live::value("SLAB_WARM_KEEP")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(16)
 }
 
 /// Pop one entry from the LARGEST non-empty bucket of a size-keyed recycle pool.
@@ -3793,6 +3815,7 @@ impl Drop for SlowStagingWrite {
 
 pub mod buffer_gather_working_set;
 mod images_and_registry;
+pub(crate) mod par_stage;
 /// What the resident registry says about an identity's content, readable
 /// without the engine lock.
 pub(crate) mod readiness;

@@ -590,6 +590,97 @@ fn replace_physical_drops_the_cached_page_list() {
     );
 }
 
+/// TEMP (lab, REPOINT_KEEP): a re-point moves a declared surface's pages and
+/// not its content, so the resident identity survives it — through the bump
+/// that drops the list and the one that adopts the new list — while the page
+/// plan's generation moves as before. A new surface on the id (or an unmap)
+/// is new content and moves the identity again.
+///
+/// Fails without the fix: `surface_identity` was keyed by `map_generation`,
+/// so the re-point orphaned the resident and the next LOAD seeded a scanout
+/// buffer from its never-painted guest pages (p79c/p80a wallpaper stripes).
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_replace_physical_keeps_the_resident_identity_of_a_declared_surface() {
+    use crate::backend::vulkan::present_identity::surface_identity;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.map_surface(7);
+    {
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.has_geom = true;
+        m.width = 64;
+        m.height = 32;
+        m.page_entries = vec![0x11, 0x22, 0x33];
+        m.backing_walk = Some(crate::model::BackingWalk {
+            task_id: 0,
+            backing_pfn: 0x20,
+            map_generation: m.map_generation,
+        });
+    }
+    let before = surface_identity(&state, 7, 64, 32);
+    let plan_before = state.mappings[&7].map_generation;
+
+    crate::runtime::objects::replace_physical(&mut state, &mut host, 0, 7);
+    let m = state.mappings.get(&7).unwrap();
+    assert_ne!(m.map_generation, plan_before, "the page plan's generation still moves");
+    assert!(m.repoint_keep, "the carry waits for the re-pointed list");
+    assert_eq!(surface_identity(&state, 7, 64, 32), before, "the resident survives the drop");
+
+    // The adoption of the new list bumps again (a changed plan) and ends the carry.
+    {
+        let m = state.mappings.get_mut(&7).unwrap();
+        DeviceState::bump_map_generation(m);
+        m.page_entries = vec![0x44, 0x55, 0x66];
+        m.repoint_keep = false;
+    }
+    assert_eq!(surface_identity(&state, 7, 64, 32), before, "and the adoption");
+
+    // Past the carry an unmap is new content: the identity follows the plan again.
+    assert!(state.unmap_surface(7));
+    assert_ne!(surface_identity(&state, 7, 64, 32), before);
+}
+
+/// TEMP (lab, REPOINT_KEEP): a re-point carry that a new surface interrupts
+/// ends there — the new incarnation's resident must not inherit the old one.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_new_surface_on_a_repointed_id_does_not_inherit_its_resident() {
+    use crate::backend::vulkan::present_identity::surface_identity;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.map_surface(9);
+    {
+        let m = state.mappings.get_mut(&9).unwrap();
+        m.mapped = true;
+        m.has_geom = true;
+        m.width = 64;
+        m.height = 32;
+        m.mapping_internal = 0x1000;
+        m.page_entries = vec![0x11, 0x22];
+        m.backing_walk = Some(crate::model::BackingWalk {
+            task_id: 0,
+            backing_pfn: 0x20,
+            map_generation: m.map_generation,
+        });
+    }
+    let before = surface_identity(&state, 9, 64, 32);
+    crate::runtime::objects::replace_physical(&mut state, &mut host, 0, 9);
+    assert!(state.mappings[&9].repoint_keep);
+    assert!(state.attach_mapping_internal(9, 0x2000));
+    let m = state.mappings.get(&9).unwrap();
+    assert!(!m.repoint_keep, "a new MappingInternal ends the carry");
+    assert_eq!(m.identity_generation, m.map_generation);
+    {
+        let m = state.mappings.get_mut(&9).unwrap();
+        m.has_geom = true;
+        m.width = 64;
+        m.height = 32;
+    }
+    assert_ne!(surface_identity(&state, 9, 64, 32), before);
+}
+
 /// A `CmdReplacePhysical` too short to hold its eight bytes reports, and does
 /// not act.
 ///

@@ -52,10 +52,12 @@ pub fn surface_identity(
     width: u32,
     height: u32,
 ) -> TargetIdentity {
+    // TEMP (lab, REPOINT_KEEP): the identity generation, which a `ReplacePhysical`
+    // does not move — see `MappingEntry::identity_generation`.
     let gen = state
         .mappings
         .get(&mapping_id)
-        .map(|m| m.map_generation as u64)
+        .map(|m| m.identity_generation as u64)
         .unwrap_or(0);
     TargetIdentity::Surface {
         id: mapping_id,
