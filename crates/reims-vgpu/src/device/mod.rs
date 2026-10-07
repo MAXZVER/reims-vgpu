@@ -700,6 +700,10 @@ pub fn device_drain(id: u64) -> bool {
     // can say how late in this tranche it happened without threading a start
     // time through every call. See `census::tranche_elapsed_us`.
     crate::runtime::drain::note_tranche_started(crate::observe::elapsed_us());
+    // TEMP (lab, MONSTER_PREWARM): a new tranche retires every held currency
+    // answer, so the doorbell's first binds ask for themselves. Free when the
+    // switch is off (one relaxed fetch_add).
+    crate::runtime::surface_currency::prewarm_new_tranche();
     crate::runtime::drain::lab_act(1); // TEMP (lab)
     device.drain(&mut host);
     // TEMP (lab, REIMS_VGPU_LAB_IRQ_BATCH): the gfx pulse held for this tranche.

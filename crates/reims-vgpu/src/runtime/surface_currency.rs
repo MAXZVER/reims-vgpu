@@ -205,7 +205,27 @@ impl SurfaceCurrency {
 /// `width`/`height` are the geometry the consumer is about to serve at, not the
 /// mapping's latched geometry, because the window they resolve is what decides
 /// [`SurfaceCurrency::WroteElsewhere`].
+///
+/// TEMP (lab, MONSTER_PREWARM): with the switch on, the ask is tranche-scoped —
+/// see [`surface_currency_memo`]. The full ask below is unchanged and is what a
+/// served entry was filled by, so the two can never disagree about how an
+/// answer is reached.
 pub fn surface_currency<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> SurfaceCurrency {
+    if lab_monster_prewarm() {
+        return surface_currency_memo(state, host, mapping_id, width, height);
+    }
+    surface_currency_ask(state, host, mapping_id, width, height)
+}
+
+/// The unmemoized ask: one hypervisor verdict, and on `Wrote` the page
+/// enumeration and offset walk that narrow it to this window.
+fn surface_currency_ask<M: HostOps>(
     state: &DeviceState,
     host: &M,
     mapping_id: u32,
@@ -234,6 +254,203 @@ pub fn surface_currency<M: HostOps>(
         });
     }
     currency
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_MONSTER_PREWARM=on`, live `MONSTER_PREWARM=on|off`,
+/// off unless `=on`).
+///
+/// # What the field data said the cold-bind class pays per bind
+///
+/// The n264/r0b instrumented boot (`lab_slow_tranche_phase`, journal
+/// 2026-10-07-monster-tranche.md) read the relayout class (95 tranches, 1.85 s
+/// of a 6.9 s slow-tranche boot) at **48 % `c_sampled` + 27 % `c_seed`** of its
+/// chain time — and the seed *provides* were only 827 for the whole boot, ~1.3
+/// ms each, far too few to own the bars. What recurs is the ask itself: this
+/// function runs per sampled bind ([`sample_plan::surface_top`]) and per
+/// attachment LOAD seed door, and for a surface the guest is actively writing
+/// every ask pays the `Wrote` arm — a synced generation read plus a
+/// `guest_written_pages` enumeration plus the offset walk over the surface's
+/// page list. `seedx_currency_us` alone read **741 ms** for the boot.
+///
+/// # The memo, and why its freshness contract is the planner's
+///
+/// Within one tranche, binds of the same `(mapping, window)` re-ask the same
+/// question against the same stamp. The memo holds the first ask's answer with
+/// the mapping row it was reached under and the **lagged** generation read
+/// right after it — exactly the pair the sampled-source plans carry as
+/// `sample_plan::SampleReads::observed_gen` — and serves it again only while
+/// all three hold:
+///
+/// * the tranche epoch has not moved (a new doorbell tranche re-asks once);
+/// * every mapping row field the answer rests on is unchanged — a Store's
+///   stamp, a token retirement, a page-list repoint each change one and are
+///   each a different question;
+/// * the host's lagged generation still equals the one read after the fill, so
+///   no sync has observed a guest write since. A write no sync has observed
+///   yet is a race the guest owns: the serial ask at that moment would be
+///   served the same epoch's answer by the tracker (the planner's own
+///   wording), and a later sync that does observe it moves the lagged value
+///   and the next ask re-asks.
+///
+/// A served entry skips the synced read and, on the `Wrote` arm, the page
+/// enumeration — the parts the field data priced. Anything else re-asks, and
+/// the fresh answer replaces the entry, so a serve is never older than the
+/// last full ask under the same row.
+///
+/// The memo is per thread: the drain thread and each pool worker pay their own
+/// first ask per `(mapping, window)` per tranche, and no lock is added to a
+/// path that holds none today.
+fn surface_currency_memo<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> SurfaceCurrency {
+    use crate::runtime::drain::note_store_route;
+    let epoch = PREWARM_TRANCHE_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    let row = MemoRow::of(state, mapping_id);
+    let key = (mapping_id, width, height);
+    let lagged_now = (row.guest_write_token != 0)
+        .then(|| host.guest_write_gen_lagged(row.guest_write_token))
+        .flatten();
+    let mut served = None;
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some(entry) = m.get(&key) {
+            if entry.epoch == epoch && entry.row == row && entry.lagged_then == lagged_now {
+                note_store_route("prewarm_currency_serve");
+                served = Some(entry.answer.clone());
+            } else if entry.epoch != epoch {
+                note_store_route("prewarm_currency_new_tranche");
+                m.remove(&key);
+            } else if entry.row != row {
+                note_store_route("prewarm_currency_row_moved");
+                m.remove(&key);
+            } else {
+                note_store_route("prewarm_currency_lagged_moved");
+                m.remove(&key);
+            }
+        }
+    });
+    if let Some(answer) = served {
+        return answer;
+    }
+    let answer = surface_currency_ask(state, host, mapping_id, width, height);
+    // The lagged read comes after the fill, as the planner's does, so "no sync
+    // observed a new write since the fill" is the exact claim a later serve
+    // makes. The row is re-read for the same reason a stamp between the ask
+    // and the insert must not vouch for the answer just reached.
+    let row_after = MemoRow::of(state, mapping_id);
+    let lagged_after = (row_after.guest_write_token != 0)
+        .then(|| host.guest_write_gen_lagged(row_after.guest_write_token))
+        .flatten();
+    if row_after == row {
+        note_store_route("prewarm_currency_ask");
+        MEMO.with(|m| {
+            m.borrow_mut().insert(
+                key,
+                MemoEntry {
+                    epoch,
+                    row,
+                    lagged_then: lagged_after,
+                    answer: answer.clone(),
+                },
+            );
+        });
+    } else {
+        // The row moved during the ask (a concurrent stamp this thread did not
+        // make does not happen on the drain thread, but a worker planning
+        // beside it can read one): refuse to vouch and let the next ask fill.
+        note_store_route("prewarm_currency_fill_refused_row_moved");
+    }
+    answer
+}
+
+/// TEMP (lab, MONSTER_PREWARM): the tranche the memo's entries were filled in.
+/// Bumped once per drain tranche by [`prewarm_new_tranche`]; entries carry the
+/// epoch they were filled at and never serve under a later one.
+static PREWARM_TRANCHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// TEMP (lab, MONSTER_PREWARM): start a new tranche — every memo entry, on
+/// every thread, stops serving. Called from the drain loop's tranche start, so
+/// the answer a doorbell's first binds reach is always asked for that tranche.
+pub fn prewarm_new_tranche() {
+    PREWARM_TRANCHE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// TEMP (lab, MONSTER_PREWARM): the mapping-row fields an answer rests on.
+/// Every one of them is a field the ask itself reads, and every one that can
+/// change mid-tranche — the Store's stamp, a token retirement, a repoint, the
+/// stated generation — changes the question the memo would be answering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MemoRow {
+    map_generation: u32,
+    width: u32,
+    height: u32,
+    format: u16,
+    guest_write_token: u64,
+    guest_write_token_gen: u32,
+    guest_write_gen_at_store: u64,
+    guest_stated_gen: u32,
+    guest_stated_at_stamp: u32,
+}
+
+impl MemoRow {
+    /// The mapping's own current row; every field 0 when the mapping is gone,
+    /// which is itself a row a memoized answer must not serve under.
+    fn of(state: &DeviceState, mapping_id: u32) -> Self {
+        let m = state.mappings.get(&mapping_id);
+        Self {
+            map_generation: m.map_or(0, |m| m.map_generation),
+            width: m.map_or(0, |m| m.width),
+            height: m.map_or(0, |m| m.height),
+            format: m.map_or(0, |m| m.format),
+            guest_write_token: m.map_or(0, |m| m.guest_write_token),
+            guest_write_token_gen: m.map_or(0, |m| m.guest_write_token_gen),
+            guest_write_gen_at_store: m.map_or(0, |m| m.guest_write_gen_at_store),
+            guest_stated_gen: m.map_or(0, |m| m.guest_stated_gen),
+            guest_stated_at_stamp: m.map_or(0, |m| m.guest_stated_at_stamp),
+        }
+    }
+}
+
+/// TEMP (lab, MONSTER_PREWARM): one asked-and-held answer.
+#[derive(Clone, Debug)]
+struct MemoEntry {
+    epoch: u64,
+    row: MemoRow,
+    lagged_then: Option<u64>,
+    answer: SurfaceCurrency,
+}
+
+thread_local! {
+    /// TEMP (lab, MONSTER_PREWARM): this thread's held answers. Per thread
+    /// because the drain thread and each pool worker ask independently; the
+    /// epoch is shared so all of them retire together at the tranche boundary.
+    static MEMO: std::cell::RefCell<std::collections::HashMap<(u32, u32, u32), MemoEntry>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// TEMP (lab, MONSTER_PREWARM): see [`surface_currency_memo`]. Off under test —
+/// the memo itself is tested directly against [`surface_currency_ask`] so the
+/// gate cannot hide a divergence between them.
+fn lab_monster_prewarm() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("MONSTER_PREWARM") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(
+            std::env::var("REIMS_VGPU_LAB_MONSTER_PREWARM").as_deref(),
+            Ok("on")
+        );
+        crate::observe::off(format!("lab_monster_prewarm on={}", u8::from(on)));
+        on
+    })
 }
 
 /// The second stage: where the writes landed relative to the pixel window.
@@ -439,5 +656,161 @@ mod tests {
             END
         ));
         assert!(!ranges_touch_window(&[], BASE, END));
+    }
+
+    /// TEMP (lab, MONSTER_PREWARM): the fixture every memo test stands on — a
+    /// mapped surface with a live token, stamped the way a Store leaves it, so
+    /// the first currency ask answers `Unwritten(Clean)`.
+    fn stamped_surface() -> (
+        crate::model::DeviceState,
+        crate::runtime::host::FakeHost,
+        u64, /* the page GPA a guest write lands in */
+    ) {
+        use crate::model::{DeviceId, DeviceState};
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::runtime::host::{FakeHost, HostOps};
+
+        let page_shift = crate::model::PAGE_SHIFT_X86;
+        let mut state = DeviceState::new(DeviceId(1), page_shift);
+        let mut host = FakeHost::new();
+        let page = state.page_size() as u64;
+        assert!(state.map_surface(7));
+        let gpa = 0x40 * page;
+        {
+            let m = state.mappings.get_mut(&7).expect("mapped above");
+            m.page_entries =
+                vec![(((gpa >> page_shift) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7)
+            .expect("FakeHost observes guest writes");
+        let stamped = host.guest_write_gen(token).expect("a live token has one");
+        state
+            .mappings
+            .get_mut(&7)
+            .expect("mapped above")
+            .guest_write_gen_at_store = stamped;
+        (state, host, gpa)
+    }
+
+    /// TEMP (lab, MONSTER_PREWARM): the second bind of the same window inside
+    /// one tranche is the whole point of the memo — the field data priced the
+    /// re-ask (a synced generation read, and on the `Wrote` arm a page
+    /// enumeration) at the top of the cold-bind class's `c_sampled`+`c_seed`.
+    ///
+    /// The served answer must be the ask's own answer, and the second call must
+    /// not pay for one: `ask` stays at one while `serve` moves.
+    #[test]
+    fn a_second_bind_of_the_same_window_serves_the_first_asks_answer() {
+        let route = |k: &str| crate::runtime::drain::store_route_count(k);
+        let ask0 = route("prewarm_currency_ask");
+        let serve0 = route("prewarm_currency_serve");
+
+        let (state, host, _gpa) = stamped_surface();
+        let first = surface_currency_memo(&state, &host, 7, 64, 32);
+        let second = surface_currency_memo(&state, &host, 7, 64, 32);
+
+        assert_eq!(
+            first, second,
+            "a serve must repeat the ask's answer exactly"
+        );
+        assert_eq!(
+            surface_currency_ask(&state, &host, 7, 64, 32),
+            first,
+            "the memo cannot disagree with the unmemoized ask on the same state"
+        );
+        assert_eq!(route("prewarm_currency_ask"), ask0 + 1, "one ask fills");
+        assert!(
+            route("prewarm_currency_serve") >= serve0 + 1,
+            "the second bind serves"
+        );
+
+        // A different window of the same mapping is a different question: it
+        // fills its own entry rather than borrowing this one's.
+        surface_currency_memo(&state, &host, 7, 128, 32);
+        assert_eq!(route("prewarm_currency_ask"), ask0 + 2, "per (mid, w, h)");
+    }
+
+    /// TEMP (lab, MONSTER_PREWARM): a guest write between two binds is the one
+    /// event a memo must never fold over. The lagged generation moves with the
+    /// host's observation of the write, the entry is dropped, and the second
+    /// bind pays a fresh ask that answers `Wrote` — the same answer a boot
+    /// without the memo would have reached.
+    #[test]
+    fn a_guest_write_between_binds_drops_the_held_answer() {
+        use crate::runtime::host::HostOps;
+        let route = |k: &str| crate::runtime::drain::store_route_count(k);
+        let ask0 = route("prewarm_currency_ask");
+
+        let (state, mut host, gpa) = stamped_surface();
+        let first = surface_currency_memo(&state, &host, 7, 64, 32);
+        assert!(matches!(first, SurfaceCurrency::Unwritten(_)));
+
+        host.guest_wrote_page(gpa);
+        let second = surface_currency_memo(&state, &host, 7, 64, 32);
+        assert!(
+            !first.serves(CurrencyStandard::NoContraryEvidence)
+                || !second.serves(CurrencyStandard::NoContraryEvidence),
+            "a write the host observed must reach the second bind: {second:?}"
+        );
+        assert_eq!(
+            route("prewarm_currency_ask"),
+            ask0 + 2,
+            "the write re-asked"
+        );
+        assert!(
+            route("prewarm_currency_lagged_moved") >= 1,
+            "and says why the serve was refused"
+        );
+    }
+
+    /// TEMP (lab, MONSTER_PREWARM): a Store's stamp between two binds changes
+    /// the question — the stamp names the generation the answer is "since" — so
+    /// the row check must refuse the held answer even though the token and its
+    /// generation did not move.
+    #[test]
+    fn a_restamp_between_binds_drops_the_held_answer() {
+        use crate::runtime::host::HostOps;
+        let route = |k: &str| crate::runtime::drain::store_route_count(k);
+        let ask0 = route("prewarm_currency_ask");
+
+        let (mut state, host, _gpa) = stamped_surface();
+        let token = state.mappings[&7].guest_write_token;
+        let _ = surface_currency_memo(&state, &host, 7, 64, 32);
+
+        // What `commit_guest_write_stamp` leaves behind: the same token, a new
+        // generation the answer is held against.
+        let restamped = host.guest_write_gen(token).expect("still live");
+        state.mappings.get_mut(&7).unwrap().guest_write_gen_at_store = restamped + 7;
+        surface_currency_memo(&state, &host, 7, 64, 32);
+
+        assert_eq!(route("prewarm_currency_ask"), ask0 + 2, "a stamp re-asks");
+        assert!(
+            route("prewarm_currency_row_moved") >= 1,
+            "and names the row, not the token, as what moved"
+        );
+    }
+
+    /// TEMP (lab, MONSTER_PREWARM): a new tranche retires every held answer —
+    /// the doorbell's first binds ask for themselves, so the memo can never
+    /// carry an answer across the boundary the drain's accounting draws.
+    #[test]
+    fn a_new_tranche_retires_every_held_answer() {
+        let route = |k: &str| crate::runtime::drain::store_route_count(k);
+        let ask0 = route("prewarm_currency_ask");
+
+        let (state, host, _gpa) = stamped_surface();
+        let _ = surface_currency_memo(&state, &host, 7, 64, 32);
+        prewarm_new_tranche();
+        surface_currency_memo(&state, &host, 7, 64, 32);
+
+        assert_eq!(
+            route("prewarm_currency_ask"),
+            ask0 + 2,
+            "the tranche re-asked"
+        );
+        assert!(
+            route("prewarm_currency_new_tranche") >= 1,
+            "the retirement is named"
+        );
     }
 }
