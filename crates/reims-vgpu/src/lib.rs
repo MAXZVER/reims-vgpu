@@ -152,6 +152,19 @@ mod lab_alloc;
 /// TEMP (lab): performance or efficiency core, for the census.
 #[cfg(windows)]
 mod lab_cores;
+/// TEMP (lab): the core-pinning and thread-priority hints are Windows calls;
+/// elsewhere the threads keep the scheduler's placement.
+#[cfg(not(windows))]
+mod lab_cores {
+    pub(crate) fn pin_to_performance_cores(_who: &str) {}
+    pub(crate) fn device_thread_priority(_who: &str) {}
+    #[allow(dead_code)]
+    pub(crate) fn pin_device_ccd(_who: &str) {}
+    #[allow(dead_code)]
+    pub(crate) fn on_efficiency_core() -> bool {
+        false
+    }
+}
 #[cfg(all(windows, not(test), feature = "lab-tcache"))]
 #[global_allocator]
 static LAB_ALLOCATOR: lab_alloc::ThreadCache = lab_alloc::ThreadCache;
