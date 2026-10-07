@@ -876,8 +876,9 @@ struct App {
     /// Whether the guest may move the host pointer, and which host move event
     /// is the echo of the window's own placement.
     warp: WarpGate,
-    /// The window has keyboard focus: the only time the guest's pointer may
-    /// move the host's.
+    /// The window has keyboard focus. No longer gates placing the host pointer
+    /// on the guest's cursor (see `apply_guest_cursor`); kept as window state.
+    #[allow(dead_code)]
     focused: bool,
 }
 
@@ -1496,7 +1497,14 @@ impl App {
                 window.set_cursor_visible(snap.show);
                 self.cursor_visible = Some(snap.show);
             }
-            if snap.show && self.focused {
+            // Not gated on focus: a guest-driven move (a passed-through USB or
+            // Bluetooth pointer) is the only thing that moves the guest's cursor
+            // while the host pointer is still, and when the host's own mouse and
+            // keyboard are passed through too nothing on the host can give the
+            // window its focus back. The field test (2026-10-07) lost the cursor
+            // for good the moment the window lost focus. The idle gate still
+            // keeps a moving host pointer authoritative.
+            if snap.show {
                 if let Some(guest) = self.guest_extent {
                     let target = crate::backend::window::viewport::guest_to_pointer(
                         (u32::from(snap.x), u32::from(snap.y)),
