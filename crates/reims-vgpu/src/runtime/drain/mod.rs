@@ -4034,8 +4034,11 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     write_stamp_now(state, host, stamp_index, stamp_value);
 }
 
-/// TEMP (lab, live `STAMP_DEFER=on|off`, else `REIMS_VGPU_LAB_STAMP_DEFER=on`; off
-/// unless `on`): a completion word that follows draws the recorder has not
+/// TEMP (lab, live `STAMP_DEFER=on|off`, else `REIMS_VGPU_LAB_STAMP_DEFER=off` to
+/// disable; on by default since b077 - drain joins on the recorder halved on
+/// every scenario, drain us a draw Weather 11.5 -> 10.75 (present latency
+/// 11.65 -> 10.87 ms), reveal-desktop 20.5 -> 19.1, fps +2-3 % on the
+/// reveal-desktop and Safari, Finder even; ART 0): a completion word that follows draws the recorder has not
 /// recorded yet is held, in order, and published once the recorder is idle -
 /// instead of the drain joining the recorder for it.
 ///
@@ -4058,7 +4061,7 @@ pub(crate) fn stamp_defer_on() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_STAMP_DEFER").as_deref() == Ok("on"))
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_STAMP_DEFER").as_deref() != Ok("off"))
 }
 
 /// TEMP (lab, STAMP_DEFER): whether the recorder still holds draws this drain
