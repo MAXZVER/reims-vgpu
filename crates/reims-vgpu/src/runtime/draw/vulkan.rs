@@ -2704,21 +2704,77 @@ pub(crate) fn lab_encoder_begin() {
 
 /// (task, texture ref, retained resource address, may bind resident).
 type ResolveMemoKey = (u32, u32, usize, bool);
-/// A CPU-byte sampled source as `resolve_sampled_source` returned it.
-type ResolveMemoBytes = (
-    u32,
-    u32,
-    u32,
-    std::sync::Arc<Vec<u8>>,
-    Option<LinearSampleIdentity>,
-    pixel_format::SampledByteFormat,
-    crate::backend::vulkan::engine::SampledByteOrigin,
-);
+/// A sampled source as `resolve_sampled_source` returned it.
+type ResolveMemoEntry = (u32, u32, u32, SampledSourceRequest);
 
 thread_local! {
-    /// TEMP (lab, RESOLVE_MEMO): this render encoder's CPU-byte sampled sources.
-    static RESOLVE_MEMO: std::cell::RefCell<std::collections::HashMap<ResolveMemoKey, ResolveMemoBytes>> =
+    /// TEMP (lab, RESOLVE_MEMO): this render encoder's resolved sampled sources.
+    static RESOLVE_MEMO: std::cell::RefCell<std::collections::HashMap<ResolveMemoKey, ResolveMemoEntry>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// TEMP (lab, live `RESOLVE_MEMO_ALL=on|off`, else `REIMS_VGPU_LAB_RESOLVE_MEMO_ALL=off`
+/// to disable; on by default since b074): let the memo keep the target and
+/// guest-run routes too, not only CPU bytes. b074 (A/M live, one boot): Safari
+/// win fps 131/125/127/125 against 122/119/123/113, Finder 130/129 against
+/// 122/122, reveal-desktop and Weather in noise; ART 0.
+///
+/// b071 (tonight's defaults): the guest-run route costs 7 us a resolve on
+/// Weather, 10-29 on the reveal-desktop and 12.7 on Safari, and 73-75 % of
+/// those resolves repeat a (task, ref) already resolved in the same render
+/// encoder; the target route repeats 50-74 %. b073: in Safari ~11 % of the
+/// drain's busy time is `reims_vgpu_dirty_gen` - the guest-write generation
+/// the surface-currency verdict and the gather witness ask per bind. The
+/// argument that makes a repeat safe is the bytes memo's: inside one encoder
+/// the guest cannot legally write a texture it has encoded a read of, the
+/// encoder's own attachments are not sampled, and the debts the first resolve
+/// settled are only created at a Store into an attachment. A guest-run repeat
+/// reuses the first resolve's identity, so the engine binds the image that
+/// first bind gathered (or gathers again on a miss - the identity's generation
+/// names one content either way); its skip-guard evidence is dropped, because
+/// the re-check it asks for (a guest store after the vouch) was already made
+/// for this encoder by the first bind and would only ask the dirty generation
+/// again (b072 without this: the sampled phase's saving reappeared in the
+/// engine phase). The staged variant (PASS_STAGE) owns a worker's arena slice
+/// and is never kept.
+fn lab_resolve_memo_all() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("RESOLVE_MEMO_ALL") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_MEMO_ALL").as_deref() != Ok("off"))
+}
+
+/// The memo's copy of a resolved source, or `None` for what it must not keep.
+/// `repeat`: the copy is what a repeat bind is served (see
+/// [`lab_resolve_memo_all`] for why its skip-guard evidence is dropped).
+fn memo_copy(src: &SampledSourceRequest, all: bool, repeat: bool) -> Option<SampledSourceRequest> {
+    match src {
+        SampledSourceRequest::Bytes(bytes, identity, fmt, origin) => Some(
+            SampledSourceRequest::Bytes(bytes.clone(), *identity, *fmt, *origin),
+        ),
+        SampledSourceRequest::Target(identity, format) if all => {
+            Some(SampledSourceRequest::Target(identity.clone(), *format))
+        }
+        SampledSourceRequest::TargetRegion(identity, format, swizzle) if all => Some(
+            SampledSourceRequest::TargetRegion(identity.clone(), *format, *swizzle),
+        ),
+        SampledSourceRequest::GuestRuns(src, layout, format, planes, identity, vouch, evidence, swizzle)
+            if all =>
+        {
+            Some(SampledSourceRequest::GuestRuns(
+                src.clone(),
+                *layout,
+                *format,
+                *planes,
+                *identity,
+                *vouch,
+                if repeat { None } else { *evidence },
+                *swizzle,
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// TEMP (lab): live `RESOLVE_MEMO=on|off`, else `REIMS_VGPU_LAB_RESOLVE_MEMO=off`
@@ -2748,17 +2804,19 @@ pub(crate) fn lab_resolve_memo_on() -> bool {
 
 fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledSourceRequest)> {
     RESOLVE_MEMO.with(|m| {
-        m.borrow().get(key).map(|(w, h, mid, bytes, identity, fmt, origin)| {
-            (*w, *h, *mid, SampledSourceRequest::Bytes(bytes.clone(), *identity, *fmt, *origin))
+        m.borrow().get(key).and_then(|(w, h, mid, src)| {
+            if !matches!(src, SampledSourceRequest::Bytes(..)) {
+                crate::runtime::drain::note_store_route("lab_resolve_memo_hit_route");
+            }
+            memo_copy(src, true, true).map(|src| (*w, *h, *mid, src))
         })
     })
 }
 
 fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSourceRequest)) {
-    if let SampledSourceRequest::Bytes(bytes, identity, fmt, origin) = &loaded.3 {
+    if let Some(src) = memo_copy(&loaded.3, lab_resolve_memo_all(), false) {
         RESOLVE_MEMO.with(|m| {
-            m.borrow_mut()
-                .insert(key, (loaded.0, loaded.1, loaded.2, bytes.clone(), *identity, *fmt, *origin));
+            m.borrow_mut().insert(key, (loaded.0, loaded.1, loaded.2, src));
         });
     }
 }
