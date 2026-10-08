@@ -19464,29 +19464,6 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
 ///
 /// Full-screen planes only. A pass over a scratch offscreen answers a different
 /// question and there are thousands of them.
-/// The part of a draw the plane ring keeps: how much geometry it submitted and
-/// what it was clipped to. A pass that covers the whole plane and one clipped to
-/// a window's own rect are the two answers that matter when a plane's whole
-/// field changes at once, and neither is recoverable from the pipeline id.
-pub(crate) struct PlaneDrawShape {
-    pub vertex_count: u32,
-    pub scissor: String,
-}
-
-impl PlaneDrawShape {
-    pub(crate) fn of(req: &DrawEncodeRequest) -> Self {
-        let scissor = req
-            .scissors
-            .first()
-            .map(|s| format!("s{}+{}+{}x{}", s.x, s.y, s.width, s.height))
-            .unwrap_or_else(|| "s-none".to_string());
-        Self {
-            vertex_count: req.vertex_count,
-            scissor,
-        }
-    }
-}
-
 /// The last few passes that rendered into each full-screen plane.
 ///
 /// The latched census below reports which *declarations* exist; it cannot
@@ -19518,8 +19495,63 @@ pub(crate) static PLANE_DRAW_RING: std::sync::LazyLock<
 pub(crate) struct PlaneDrawWindow {
     /// Draws into this plane since the last drain, never truncated.
     arrivals: u64,
-    /// The most recent [`PLANE_DRAW_RING_DEPTH`] of them, formatted.
-    passes: std::collections::VecDeque<String>,
+    /// The most recent [`PLANE_DRAW_RING_DEPTH`] of them, as recorded; text
+    /// only when a reader drains the ring.
+    passes: std::collections::VecDeque<PlanePass>,
+}
+
+/// Fragment texture refs one [`PlanePass`] keeps inline; more are counted.
+const PLANE_PASS_TEXTURES: usize = 8;
+
+/// One remembered pass of a plane's ring, kept as its fields and formatted only
+/// when read.
+///
+/// The ring is written on every draw into a full-screen plane - the
+/// compositor's whole draw rate (b058, the Weather app: ~31 000 a second, most
+/// of the device's draws) - and read only when a plane's field turns uniform.
+/// Formatting at write time cost several string allocations per draw on the
+/// drain thread for text that was almost never read.
+#[derive(Clone, Copy)]
+pub(crate) struct PlanePass {
+    pipeline_ref: u32,
+    vertex_count: u32,
+    scissor: Option<(u32, u32, u32, u32)>,
+    load_action: u16,
+    /// Only for a pass that declares CLEAR (see `record_plane_draw`).
+    clear: Option<[f64; 4]>,
+    textures: [u32; PLANE_PASS_TEXTURES],
+    texture_count: u8,
+    textures_more: u16,
+}
+
+impl std::fmt::Display for PlanePass {
+    /// The text the ring stored per pass before it kept fields:
+    /// `p<pipe>/v<verts>/s<x>+<y>+<w>x<h>/l<load>[/c[r,g,b,a]]/t<ref>.<ref>`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "p{}/v{}/", self.pipeline_ref, self.vertex_count)?;
+        match self.scissor {
+            Some((x, y, w, h)) => write!(f, "s{x}+{y}+{w}x{h}")?,
+            None => write!(f, "s-none")?,
+        }
+        write!(f, "/l{:#x}", self.load_action)?;
+        if let Some(c) = self.clear {
+            write!(f, "/c[{:.3},{:.3},{:.3},{:.3}]", c[0], c[1], c[2], c[3])?;
+        }
+        if self.texture_count == 0 {
+            return write!(f, "/t-none");
+        }
+        write!(f, "/t")?;
+        for (i, t) in self.textures[..usize::from(self.texture_count)].iter().enumerate() {
+            if i > 0 {
+                write!(f, ".")?;
+            }
+            write!(f, "{t}")?;
+        }
+        if self.textures_more > 0 {
+            write!(f, ".+{}", self.textures_more)?;
+        }
+        Ok(())
+    }
 }
 
 /// Passes remembered per plane. Enough to cover a compositor frame's layers
@@ -19598,7 +19630,12 @@ pub(crate) fn read_plane_draw_ring(reader: PlaneDrawReader, mapping_id: u32) -> 
         match ring.get(&mapping_id) {
             Some(window) => (
                 window.arrivals,
-                window.passes.iter().cloned().collect::<Vec<_>>().join(" "),
+                window
+                    .passes
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" "),
             ),
             None => (0, String::new()),
         }
@@ -19705,7 +19742,42 @@ pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
             crate::runtime::drain::note_store_route("plane_multiquad_redrawn_unpublished");
         }
     }
-    let shape = PlaneDrawShape::of(req);
+    // The clear colour rides along only for a pass that declares CLEAR. That is
+    // the one case where the colour is what the attachment ends up holding
+    // wherever the draw does not cover, and it is not otherwise recorded: the
+    // latched census reports it, but only from the colour-seed site, which a
+    // pass whose seed is elided never reaches -- so the full-screen CLEAR passes
+    // are exactly the ones missing from it.
+    let clear = (color.load_action == reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_CLEAR)
+        .then_some(color.clear_color);
+    // What the fragment stage samples, because a full-screen quad that fills the
+    // plane with one flat colour is either a solid-colour pass or a textured
+    // pass whose texture resolved to a single value, and those are opposite
+    // defects. Refs only: the ring is a breadcrumb and the identity of a ref is
+    // recoverable from the records that already name it.
+    let mut pass = PlanePass {
+        pipeline_ref: req.pipeline_ref,
+        vertex_count: req.vertex_count,
+        scissor: req.scissors.first().map(|s| (s.x, s.y, s.width, s.height)),
+        load_action: color.load_action,
+        clear,
+        textures: [0; PLANE_PASS_TEXTURES],
+        texture_count: 0,
+        textures_more: 0,
+    };
+    for t in req.fragment_textures.iter().filter(|t| t.texture_ref != 0) {
+        if usize::from(pass.texture_count) < PLANE_PASS_TEXTURES {
+            pass.textures[usize::from(pass.texture_count)] = t.texture_ref;
+            pass.texture_count += 1;
+        } else {
+            pass.textures_more = pass.textures_more.saturating_add(1);
+        }
+    }
+    // TEMP (lab, A/B): live `PLANE_RING_TEXT=on` pays the old per-draw text
+    // again (formatted and dropped) - the control arm for keeping fields.
+    if crate::runtime::lab_live::on("PLANE_RING_TEXT") == Some(true) {
+        std::hint::black_box(pass.to_string());
+    }
     let mut ring = PLANE_DRAW_RING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -19715,40 +19787,7 @@ pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
     if passes.len() == PLANE_DRAW_RING_DEPTH {
         passes.pop_front();
     }
-    // The clear colour rides along only for a pass that declares CLEAR. That is
-    // the one case where the colour is what the attachment ends up holding
-    // wherever the draw does not cover, and it is not otherwise recorded: the
-    // latched census reports it, but only from the colour-seed site, which a
-    // pass whose seed is elided never reaches -- so the full-screen CLEAR passes
-    // are exactly the ones missing from it.
-    let clear = if color.load_action == reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_CLEAR {
-        format!(
-            "/c[{:.3},{:.3},{:.3},{:.3}]",
-            color.clear_color[0], color.clear_color[1], color.clear_color[2], color.clear_color[3]
-        )
-    } else {
-        String::new()
-    };
-    // What the fragment stage samples, because a full-screen quad that fills the
-    // plane with one flat colour is either a solid-colour pass or a textured
-    // pass whose texture resolved to a single value, and those are opposite
-    // defects. Refs only: the ring is a breadcrumb and the identity of a ref is
-    // recoverable from the records that already name it.
-    let textures = req
-        .fragment_textures
-        .iter()
-        .filter(|t| t.texture_ref != 0)
-        .map(|t| t.texture_ref.to_string())
-        .collect::<Vec<_>>();
-    let textures = if textures.is_empty() {
-        "/t-none".to_string()
-    } else {
-        format!("/t{}", textures.join("."))
-    };
-    passes.push_back(format!(
-        "p{}/v{}/{}/l{:#x}{clear}{textures}",
-        req.pipeline_ref, shape.vertex_count, shape.scissor, color.load_action
-    ));
+    passes.push_back(pass);
 }
 
 pub(crate) fn note_compositor_plane_pass(
