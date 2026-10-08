@@ -86,6 +86,33 @@ pub(super) fn lab_prep_resolve() -> bool {
     })
 }
 
+/// TEMP (lab, live `PREP_BUFFERS=on|off`, else `REIMS_VGPU_LAB_PREP_BUFFERS`; on
+/// unless `off`): whether the chunks plan buffer and index binds (step 3) beside
+/// the sampled sources. b067: with PASS_PREP off altogether the drain's `binds`
+/// phase is 1.9-2.0 us a draw against 2.5-2.6 with it on, on Weather, the
+/// reveal-desktop and Safari alike, and Weather's ~45k items a second are
+/// almost all buffers - while Safari's sampled phase rises 7.5 -> 13 us
+/// without the sampled plans. Re-read at most every 100 ms per thread.
+fn lab_prep_buffers() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    thread_local! {
+        static CACHED: std::cell::Cell<(u64, bool)> = const { std::cell::Cell::new((0, true)) };
+    }
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let now = crate::observe::elapsed_us();
+    let (checked, on) = CACHED.with(|c| c.get());
+    if checked != 0 && now.saturating_sub(checked) < 100_000 {
+        return on;
+    }
+    let on = crate::runtime::lab_live::on("PREP_BUFFERS").unwrap_or_else(|| {
+        *ENV.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PREP_BUFFERS").as_deref() != Ok("off"))
+    });
+    CACHED.with(|c| c.set((now.max(1), on)));
+    on
+}
+
 /// Latched; off in unit tests (the test hosts have no workers to hand sets to).
 fn lab_sync_ahead() -> bool {
     if cfg!(test) {
@@ -203,17 +230,64 @@ pub(crate) fn pass_prep_mode() -> PassPrepMode {
             _ => return PassPrepMode::Off,
         }
     }
+    if let Some(mode) = live_pass_prep_mode() {
+        return mode;
+    }
     *MODE.get_or_init(
         || match std::env::var("REIMS_VGPU_LAB_PASS_PREP").as_deref() {
-            // On by default (n102: fullscreen transitions 14-15 % frames >25 ms
-            // against 21-22 % off, +15-22 % frames, sampled 16 against 21-22 us a
-            // chain; drag and input latency neutral); `=off` restores the serial
-            // ladder, `=shadow` plans and compares.
-            Ok("off") => PassPrepMode::Off,
+            // Off by default since b067/b068 (Intel, tonight's build with the
+            // indexed sampled cache and RESOLVE_MEMO): off against on, drain us
+            // a draw - Weather 11.3-11.5 against 14.3-14.8 (present latency
+            // 11.5 against 14.9 ms), reveal-desktop 17.7 against 20.3-20.9,
+            // Safari 31.7-31.9 against 34.4-36.0 (win fps 129/123 against
+            // 110/116), Finder 25.8 against 30.3 (137 against 122). The fork
+            // per chunk and the buffer plans' asks cost more than the plans
+            // save; Safari's sampled phase rises 7 -> 12 us without them and
+            // the transition is still faster. n102 (on by default then) was
+            // measured before those two changes. `=on` restores it,
+            // `=shadow` plans and compares.
+            Ok("on") => PassPrepMode::On,
             Ok("shadow") => PassPrepMode::Shadow,
-            _ => PassPrepMode::On,
+            _ => PassPrepMode::Off,
         },
     )
+}
+
+/// TEMP (lab, live `PASS_PREP=off|shadow|on`): the mode for an A/B inside one
+/// boot. Re-read at most every 100 ms per thread, so the per-bind callers do
+/// not take the live file's lock each time. A switch lands between passes in
+/// practice; one landing mid-pass is safe either way (a bind without a frame,
+/// or with a frame under `off`, takes the serial ladder).
+#[cfg(not(test))]
+fn live_pass_prep_mode() -> Option<PassPrepMode> {
+    thread_local! {
+        static CACHED: std::cell::Cell<(u64, u8)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    let now = crate::observe::elapsed_us();
+    let (checked, code) = CACHED.with(|c| c.get());
+    let code = if checked != 0 && now.saturating_sub(checked) < 100_000 {
+        code
+    } else {
+        let code = match crate::runtime::lab_live::value("PASS_PREP").as_deref() {
+            Some("off") => 1,
+            Some("shadow") => 2,
+            Some("on") => 3,
+            _ => 0,
+        };
+        CACHED.with(|c| c.set((now.max(1), code)));
+        code
+    };
+    match code {
+        1 => Some(PassPrepMode::Off),
+        2 => Some(PassPrepMode::Shadow),
+        3 => Some(PassPrepMode::On),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn live_pass_prep_mode() -> Option<PassPrepMode> {
+    None
 }
 
 /// Force the mode for the lifetime of the returned guard (tests only).
@@ -699,6 +773,7 @@ impl<'a> PassPrep<'a> {
         // buffer rails and index binds beside the sampled sources.
         let mut seen_buffers = HashSet::new();
         let mut seen_indexes = HashSet::new();
+        let buffers_on = lab_prep_buffers();
         for table in &self.tables[self.offered..end] {
             for bind in table.fragment.iter().chain(table.vertex.iter()) {
                 if bind.texture_ref == 0 || self.planned.contains(&bind.texture_ref) {
@@ -738,6 +813,9 @@ impl<'a> PassPrep<'a> {
                         resource,
                     });
                 }
+            }
+            if !buffers_on {
+                continue;
             }
             for bind in table.buffers() {
                 if bind.buffer_ref == 0 || self.planned_buffers.contains(&bind.buffer_ref) {

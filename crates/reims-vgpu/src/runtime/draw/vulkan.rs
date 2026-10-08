@@ -2721,8 +2721,11 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// TEMP (lab): live `RESOLVE_MEMO=on|off`, else `REIMS_VGPU_LAB_RESOLVE_MEMO=on`;
-/// off by default until measured.
+/// TEMP (lab): live `RESOLVE_MEMO=on|off`, else `REIMS_VGPU_LAB_RESOLVE_MEMO=off`
+/// to disable; on by default since b066 (with the recorder's indexed sampled
+/// cache: Weather drain 15.4-15.9 -> 14.1-14.4 us a draw, present latency
+/// -1.9 ms; reveal-desktop 89/92 -> 101/100 fps; Safari/Finder in noise; ART 0
+/// in b064 and b066).
 ///
 /// b062/b063: the Weather app resolves ~45k CPU-byte sampled textures a second
 /// (mostly at most 64x64, 1.6 us each on the drain: the guest-write check, the
@@ -2740,7 +2743,7 @@ pub(crate) fn lab_resolve_memo_on() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_MEMO").as_deref() == Ok("on"))
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_MEMO").as_deref() != Ok("off"))
 }
 
 fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledSourceRequest)> {

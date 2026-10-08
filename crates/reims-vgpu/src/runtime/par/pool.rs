@@ -486,7 +486,7 @@ impl Pool {
             sh.epoch.store(hand_off.epoch, Ordering::Release);
         }
         // The coordinator takes a share itself, so `total - 1` helpers at most.
-        for _ in 0..sh.workers.min(total - 1) {
+        for _ in 0..sh.workers.min(total - 1).min(lab_wake_cap(total)) {
             sh.wake.notify_one();
         }
         let fork_us = entered.elapsed().as_micros() as u64;
@@ -615,6 +615,35 @@ impl Pool {
 impl Drop for Pool {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// TEMP (lab, live `PAR_WAKE=N`, else `REIMS_VGPU_LAB_PAR_WAKE=N`; unset: no
+/// cap): wake at most one helper per `N` items. b058 (Weather): PassPrep forks
+/// ~5.2k scopes a second of ~8.8 items at ~1.2 us each, and the fork itself -
+/// six `notify_one` wakes, ~1.2 us each on Windows - cost 7 us a scope, more
+/// than the items; `Condvar::notify_one_slow` was 5.4 % of the drain's busy
+/// samples. Waking fewer helpers for a small batch trades a little item
+/// parallelism for most of the wake cost.
+fn lab_wake_cap(total: usize) -> usize {
+    if cfg!(test) {
+        return usize::MAX;
+    }
+    static ENV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let per = crate::runtime::lab_live::value("PAR_WAKE")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            *ENV.get_or_init(|| {
+                std::env::var("REIMS_VGPU_LAB_PAR_WAKE")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0)
+            })
+        });
+    if per == 0 {
+        usize::MAX
+    } else {
+        total.div_ceil(per).max(1)
     }
 }
 
@@ -754,8 +783,18 @@ fn worker_main(shared: &Arc<Shared>, index: usize) {
 /// Returns the epoch and the batch current at that epoch, which may already be
 /// gone if the coordinator finished alone first.
 fn next_batch(shared: &Shared, seen: u64) -> Option<(u64, Option<Arc<Batch>>)> {
-    if !shared.worker_spin.is_zero() {
-        let spin_until = Instant::now() + shared.worker_spin;
+    // TEMP (lab, live `PAR_SPIN=us`): the idle helper's spin, overriding the
+    // latched `REIMS_VGPU_LAB_PAR_SPIN_US` - a helper still spinning when the
+    // next scope publishes needs no wake (see `lab_wake_cap`).
+    let worker_spin = if cfg!(test) {
+        shared.worker_spin
+    } else {
+        crate::runtime::lab_live::value("PAR_SPIN")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(shared.worker_spin, Duration::from_micros)
+    };
+    if !worker_spin.is_zero() {
+        let spin_until = Instant::now() + worker_spin;
         while shared.epoch.load(Ordering::Acquire) == seen && Instant::now() < spin_until {
             std::hint::spin_loop();
         }
