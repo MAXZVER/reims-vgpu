@@ -123,6 +123,10 @@ struct BoundDevice {
     /// poll path. One shared limiter keeps guest pacing independent of which
     /// path happens to win the device lock.
     vbl_last_us: AtomicU64,
+    /// TEMP (lab, POLL_YIELD): the drain worker is about to take, or holds,
+    /// `inner`. The heartbeat poll then leaves `inner` alone (see
+    /// [`device_poll`]).
+    drain_wants: std::sync::atomic::AtomicBool,
     /// QEMU HostOps (GPA / clock / schedule worker). None in pure unit tests.
     ops: Option<ReimsVgpuHostOps>,
     /// The device's parallel worker pool, when its shim can register worker
@@ -253,8 +257,11 @@ fn lab_drain_lock_note(holder: usize, us: u64) {
 /// Apply queued MMIO writes in publication order. Lock order is ingress then
 /// inner everywhere; producers use `try_lock` for inner and therefore never
 /// wait behind shader translation/GPU work.
-fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner> {
+fn lock_for_drain(slot: &BoundDevice) -> DrainGuard<'_> {
     let lab_t0 = std::time::Instant::now(); // TEMP (lab)
+    // TEMP (lab, POLL_YIELD): announce the take before trying it, so a poll
+    // that has not yet taken `inner` stands aside.
+    slot.drain_wants.store(true, Ordering::SeqCst);
     let mut ingress = slot.gfx_ingress.lock();
     let lab_ingress_us = lab_t0.elapsed().as_micros() as u64;
     let mut inner = match slot.inner.try_lock() {
@@ -263,8 +270,40 @@ fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner
             // TEMP (lab): who held it, and for how long the drain waited.
             let holder = LAB_INNER_HOLDER.load(Ordering::Relaxed);
             let t1 = std::time::Instant::now();
-            let g = slot.inner.lock();
-            lab_drain_lock_note(holder as usize, t1.elapsed().as_micros() as u64);
+            // TEMP (lab, POLL_SPIN, b042): the heartbeat poll holds `inner`
+            // for microseconds (b041: ~4 us a tick, at most ~0.6 ms), yet a
+            // collision cost the drain ~200 us - the park and the wake, not the
+            // hold. Spin on `try_lock` for up to POLL_SPIN_US before parking
+            // when the poll is the holder.
+            let spun = (holder == 4)
+                .then(|| {
+                    let budget = std::time::Duration::from_micros(lab_poll_spin_us());
+                    loop {
+                        if let Some(g) = slot.inner.try_lock() {
+                            break Some(g);
+                        }
+                        if t1.elapsed() >= budget {
+                            break None;
+                        }
+                        std::hint::spin_loop();
+                    }
+                })
+                .flatten();
+            let g = match spun {
+                Some(g) => {
+                    crate::runtime::drain::note_store_route("lab_drain_lock_spun");
+                    g
+                }
+                None => slot.inner.lock(),
+            };
+            let waited = t1.elapsed().as_micros() as u64;
+            lab_drain_lock_note(holder as usize, waited);
+            // TEMP (lab, b044): the holder the drain finally took the lock from,
+            // when it is not the one it found - a waiter that jumped in between.
+            let last = LAB_INNER_HOLDER.load(Ordering::Relaxed);
+            if last != holder {
+                lab_drain_lock_handoff(holder, last, waited);
+            }
             g
         }
     };
@@ -287,7 +326,55 @@ fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner
     // `publish_stranded_fifos` re-publishes from the open-domain set — a ring
     // left unfolded would be invisible to both.
     crate::runtime::drain::fold_rung_child_doorbells(&mut inner.device.state);
-    inner
+    DrainGuard {
+        inner: Some(inner),
+        slot,
+    }
+}
+
+/// TEMP (lab, POLL_YIELD): the drain's hold on `inner`, which clears
+/// [`BoundDevice::drain_wants`] as it lets go so the heartbeat poll takes the
+/// device again only while the drain is out.
+struct DrainGuard<'a> {
+    inner: Option<parking_lot::MutexGuard<'a, DeviceInner>>,
+    slot: &'a BoundDevice,
+}
+
+impl std::ops::Deref for DrainGuard<'_> {
+    type Target = DeviceInner;
+    fn deref(&self) -> &DeviceInner {
+        self.inner.as_ref().expect("DrainGuard holds inner until drop")
+    }
+}
+
+impl std::ops::DerefMut for DrainGuard<'_> {
+    fn deref_mut(&mut self) -> &mut DeviceInner {
+        self.inner.as_mut().expect("DrainGuard holds inner until drop")
+    }
+}
+
+impl Drop for DrainGuard<'_> {
+    fn drop(&mut self) {
+        // Release first, then clear the flag, then wake the BH: a BH woken
+        // while `inner` is still held would find it taken and stop with the
+        // lock-owning actions still queued.
+        let pending = self.inner.as_ref().is_some_and(|g| !g.actions.is_empty());
+        drop(self.inner.take());
+        self.slot.drain_wants.store(false, Ordering::SeqCst);
+        // The action BH, not the drain worker: `schedule_bh` wakes the drain
+        // (b045's first cut called it here and re-ran a needless tranche per
+        // release with actions queued, leaving the actions undelivered).
+        if pending && lab_poll_yield() {
+            if let Some(ops) = self.slot.ops {
+                if let Some(notify) = ops.notify_actions {
+                    // SAFETY: QEMU owns ctx for the device lifetime;
+                    // notify_actions is the thread-safe action-BH wake the
+                    // prompt rail uses.
+                    unsafe { notify(ops.ctx) }
+                }
+            }
+        }
+    }
 }
 
 /// Create a device. `ops` is the QEMU host-service table (nullable for tests).
@@ -358,6 +445,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             vbl_online: AtomicBool::new(false),
             vbl_page_size: AtomicU64::new(0),
             vbl_last_us: AtomicU64::new(0),
+            drain_wants: std::sync::atomic::AtomicBool::new(false),
             ops,
             par,
             #[cfg(feature = "host-window")]
@@ -888,6 +976,31 @@ pub fn device_poll(id: u64) -> bool {
         return false;
     };
     lab_stamp_rewake_tick(&slot);
+    // TEMP (lab, POLL_YIELD, b041): the drain worker is taking or holding
+    // `inner`. b041: the poll held `inner` only ~160 ms a phase (a few
+    // microseconds a tick, 1000 ticks a second), yet the drain waited 0.9-1.3 s
+    // a phase behind it (7-10 thousand collisions, ~120 us each, up to 104 ms in
+    // one second) - the cost of the collision itself: the drain parks, and a
+    // heartbeat descheduled while holding the lock keeps it parked. Everything
+    // the poll does under `inner` the drain does itself on its way in (doorbell
+    // fold, stranded FIFOs) or is the VBL the lock-free pulse below already
+    // delivers, so while the drain is in, the poll stands aside.
+    if lab_poll_yield() && slot.drain_wants.load(Ordering::SeqCst) {
+        vbl_contended_pulse(&slot);
+        // The rescue half of the poll without `inner`: `publish_stranded_fifos`
+        // wakes the drain for ring work no doorbell announced, and the drain
+        // reads its rings to a snapshot taken at tranche start - work landing
+        // during the tranche waits for the next wake. b042/b045/b046: with the
+        // poll standing aside and not waking, Safari's mid-animation frames ran
+        // 5-14 % slower (smooth fps 135 -> 118-127). A spurious wake costs the
+        // drain one empty check.
+        if lab_poll_yield_wake() {
+            schedule_device(&slot);
+        }
+        crate::runtime::drain::note_store_route("lab_poll_yielded");
+        crate::backend::selected().maintain(crate::observe::elapsed_ms() as u64);
+        return true;
+    }
     let Some(mut d) = slot.inner.try_lock() else {
         // Contended: the drain worker owns `inner` doing present/GPU-encode.
         // The full poll below would early-return and drop the VBL — under load
@@ -898,6 +1011,7 @@ pub fn device_poll(id: u64) -> bool {
         return true;
     };
     lab_held(4);
+    let lab_t = std::time::Instant::now(); // TEMP (lab, b041): parts under `inner`
     let Some(ops) = slot.ops else {
         return true;
     };
@@ -908,10 +1022,12 @@ pub fn device_poll(id: u64) -> bool {
     // could not see the very channels the doorbell rail is responsible for.
     crate::runtime::drain::fold_rung_child_doorbells(&mut device.state);
     crate::runtime::drain::publish_stranded_fifos(&mut device.state, &mut host);
+    let lab_t1 = lab_t.elapsed();
     crate::runtime::drain::try_display_online(&mut device.state, &mut host);
     // After ONLINE, pulse VBL so the guest compositor has a display time base
     //. Missing VBL → clear-only dual-mid present thrash.
     crate::runtime::drain::signal_display_vbl(&mut device.state, &mut host, &slot.vbl_last_us);
+    let lab_t2 = lab_t.elapsed();
     // Republish the lock-free VBL snapshot for the contended fast path above.
     // These change only at online-ack/reinit, but publishing every poll keeps
     // the snapshot fresh with no extra synchronization on the rare-change path.
@@ -926,6 +1042,7 @@ pub fn device_poll(id: u64) -> bool {
     // Aliases the previous tick's maintenance released. Needs the host view of
     // the device's action queue, so it stays under `inner`.
     crate::runtime::mapper::drain_deferred_unmaps(&mut host);
+    let lab_t3 = lab_t.elapsed();
     // Pre-boundary early-console → host window (headless-safe: the heartbeat
     // drives poll even under -display none). No-op post-boundary or with no
     // window attached.
@@ -936,6 +1053,7 @@ pub fn device_poll(id: u64) -> bool {
     }
     drop(host);
     drop(d);
+    lab_poll_parts([lab_t1, lab_t2 - lab_t1, lab_t3 - lab_t2, lab_t.elapsed() - lab_t3]);
     // Census both source polls and the independently time-gated VBL rate.
     // Drive bounded maintenance from the poll heartbeat, which ticks even when
     // the guest stops publishing. The wall clock returns already-dead resources
@@ -950,6 +1068,39 @@ pub fn device_poll(id: u64) -> bool {
     // them. The aliases it releases are unmapped by the next tick above.
     crate::backend::selected().maintain(crate::observe::elapsed_ms() as u64);
     true
+}
+
+/// TEMP (lab, b041): what the heartbeat poll spends holding `inner` - b039: the
+/// drain waited 250-510 ms a phase for it (holder 4), up to 107 ms in one
+/// second, concentrated in the gaps at a transition's end. Parts: 0 doorbell
+/// fold + stranded FIFOs, 1 display online + VBL, 2 deferred unmaps, 3 the
+/// early window frame. A line a second: per part, sum / max in microseconds.
+fn lab_poll_parts(parts: [std::time::Duration; 4]) {
+    use std::sync::atomic::AtomicU64;
+    static SUM: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static MAX: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    for (i, d) in parts.iter().enumerate() {
+        let us = d.as_micros() as u64;
+        SUM[i].fetch_add(us, Ordering::Relaxed);
+        MAX[i].fetch_max(us, Ordering::Relaxed);
+    }
+    let now = crate::observe::elapsed_ms() as u64;
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 1000
+        || LAST_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let mut line = String::from("lab_poll_parts");
+    for i in 0..4 {
+        let s = SUM[i].swap(0, Ordering::Relaxed);
+        let m = MAX[i].swap(0, Ordering::Relaxed);
+        line.push_str(&format!(" p{i}={s}/{m}us"));
+    }
+    crate::observe::off(line);
 }
 
 /// Lock-free VBL pulse for a `device_poll` that could not take `inner`.
@@ -1023,6 +1174,24 @@ pub fn device_pop_action(id: u64) -> Option<HostAction> {
             return Some(a);
         }
     }
+    // TEMP (lab, POLL_YIELD, b044): the drain is taking `inner`. b044: almost
+    // all the drain's remaining lock wait (450 of 454 ms a Safari phase, 661 of
+    // 673 Finder) was this pop barging in on an unfair lock while the woken
+    // drain thread was still being scheduled - each pop holds microseconds, but
+    // the BH loops on it. The lock-owning actions keep their after-drain
+    // semantics: `DrainGuard` reschedules the BH when it lets go with any left.
+    // b045: yielding unconditionally cost frames (Safari 84 -> 67/80, Finder
+    // 100 -> 84/93 while the drain's lock wait fell 1442 -> 554-611 ms): a
+    // queued scanout action that used to slip in while the drain waited now
+    // waited out the whole next tranche. A pending present is delivered at once;
+    // only the empty-queue checks the BH loops on stand aside.
+    if lab_poll_yield()
+        && slot.drain_wants.load(Ordering::SeqCst)
+        && !slot.present_action_pending.load(Ordering::Acquire)
+    {
+        crate::runtime::drain::note_store_route("lab_pop_yielded");
+        return None;
+    }
     let mut d = slot.inner.try_lock()?;
     lab_held(5);
     d.actions.pop_front()
@@ -1067,3 +1236,70 @@ where
 
 #[cfg(test)]
 mod tests;
+
+/// TEMP (lab): POLL_YIELD - live `POLL_YIELD=on|off`, else
+/// `REIMS_VGPU_LAB_POLL_YIELD=off`; on by default.
+fn lab_poll_yield() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("POLL_YIELD") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_POLL_YIELD").as_deref() != Ok("off"))
+}
+
+/// TEMP (lab): POLL_SPIN - how long the drain spins on `inner` held by the
+/// heartbeat poll before parking: live `POLL_SPIN_US=N` (0..5000), else
+/// `REIMS_VGPU_LAB_POLL_SPIN_US`, default 0 (parks at once, as before):
+/// b043 - spinning up to 1 ms did not lower the drain's total wait.
+fn lab_poll_spin_us() -> u64 {
+    if let Some(n) = crate::runtime::lab_live::value("POLL_SPIN_US").and_then(|v| v.trim().parse::<u64>().ok()) {
+        return n.min(5000);
+    }
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_POLL_SPIN_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(0, |n| n.min(5000))
+    })
+}
+
+/// TEMP (lab, b044): drain lock waits whose holder changed while the drain
+/// waited - `first->last` pairs, count and wait. A line a second while any.
+fn lab_drain_lock_handoff(first: u8, last: u8, us: u64) {
+    use std::sync::atomic::AtomicU64;
+    static N: [AtomicU64; 121] = [const { AtomicU64::new(0) }; 121];
+    static W: [AtomicU64; 121] = [const { AtomicU64::new(0) }; 121];
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    let i = (usize::from(first.min(10))) * 11 + usize::from(last.min(10));
+    N[i].fetch_add(1, Ordering::Relaxed);
+    W[i].fetch_add(us, Ordering::Relaxed);
+    let now = crate::observe::elapsed_ms() as u64;
+    let prev = LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 1000
+        || LAST_MS
+            .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let mut line = String::from("lab_drain_lock_handoff");
+    for j in 0..121 {
+        let n = N[j].swap(0, Ordering::Relaxed);
+        let w = W[j].swap(0, Ordering::Relaxed);
+        if n > 0 {
+            line.push_str(&format!(" h{}->h{}={n}/{w}us", j / 11, j % 11));
+        }
+    }
+    crate::observe::off(line);
+}
+
+/// TEMP (lab): POLL_YIELD_WAKE - a yielding poll still wakes the drain; live
+/// `POLL_YIELD_WAKE=on|off`, else `REIMS_VGPU_LAB_POLL_YIELD_WAKE=off`; on by default.
+fn lab_poll_yield_wake() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("POLL_YIELD_WAKE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_POLL_YIELD_WAKE").as_deref() != Ok("off"))
+}

@@ -4633,8 +4633,11 @@ fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
     // The permissive standard, because this rung has one under it: rung 2 reads
     // the surface's own guest pages, so a refusal here costs a copy and a serve
     // this rung should not have made is the only outcome nothing corrects.
+    // TEMP (lab, b040): the mapping door's own parts of `seedx_provide_us`.
+    let span = crate::runtime::chain_phase::CostSpan::new("seedx_door_currency_us");
     let guest_replaced = !surface_currency(state, host, mapping_id, w, h)
         .serves(CurrencyStandard::NoContraryEvidence);
+    drop(span);
     if guest_replaced {
         crate::runtime::drain::note_store_route("t11seed_cache_refused_guest_wrote");
     }
@@ -4651,11 +4654,13 @@ fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
     // partial-preserving arm, which is a worse defect than any tear — and
     // counts a race when the guest is still moving after the retry.
     let guard = overlay_guard_on();
+    let span = crate::runtime::chain_phase::CostSpan::new("seedx_door_guard_us");
     let guard_pre = guard
         .then(|| {
             crate::runtime::mapper::observe_current_guest_write_gen(state, host, mapping_id)
         })
         .unwrap_or_default();
+    drop(span);
     let guest_page_rungs = |state: &mut DeviceState, host: &mut M| {
         try_mapper_ref_texture_target_guest_seed(state, host, mapping_id, w, h, target_format)
             .map(|seed| {
@@ -4679,6 +4684,7 @@ fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
                     })
             })
     };
+    let span = crate::runtime::chain_phase::CostSpan::new("seedx_door_rungs_us");
     let mut served = if let Some(bgra) = cached {
         Some((
             MapperRefTextureLoadSeed::Host(bgra, SeedOrder::Bgra8),
@@ -4687,6 +4693,8 @@ fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
     } else {
         guest_page_rungs(state, host)
     };
+    drop(span);
+    let _span = crate::runtime::chain_phase::CostSpan::new("seedx_door_guard_us");
     if guard && served.as_ref().is_some_and(|(_, rung)| *rung == MapperRefTextureSeedRung::GuestPages)
     {
         let now =
