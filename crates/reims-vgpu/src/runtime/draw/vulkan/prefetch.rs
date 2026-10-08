@@ -470,6 +470,10 @@ pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
     STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         let Some(frame) = stack.last_mut() else {
+            // TEMP (lab, b021): which half of the ~88k ladder target binds a
+            // Safari phase pays 3.2 us each for - no frame at all (a pass
+            // PassPrep never opened) or a frame without this ref.
+            crate::runtime::drain::note_store_route("prefetch_serial_noframe");
             return Prefetched::Serial;
         };
         let key = (task_id, texture_ref);
@@ -486,7 +490,21 @@ pub(crate) fn prefetched_source<M: HostMemory + HostOps>(
             }
         }
         match frame.map.get(&key) {
-            None => Prefetched::Serial,
+            None => {
+                crate::runtime::drain::note_store_route("prefetch_serial_nokey");
+                // TEMP (lab, PREP_RESOLVE): a ref the pass bailed on (cold
+                // packed, upper rung) keeps no entry, so every later bind of it
+                // in the pass took the ladder. The ladder this bind runs next
+                // warms what the bail lacked; the consumed list makes the next
+                // chunk plan the ref again from that state. Once per ref per
+                // chunk: `ahead` drains the list and re-adds the ref to
+                // `planned` as it plans it.
+                if super::pass_prep::lab_prep_resolve() && !frame.consumed.contains(&texture_ref) {
+                    frame.consumed.push(texture_ref);
+                    crate::runtime::drain::note_store_route("prefetch_nokey_replan");
+                }
+                Prefetched::Serial
+            }
             Some(StreamPlan::Surface(plan)) => {
                 if let Err(invalid) = sample_plan::validate_sampled_plan(
                     state,

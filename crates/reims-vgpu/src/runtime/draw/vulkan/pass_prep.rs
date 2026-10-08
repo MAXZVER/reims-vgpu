@@ -66,6 +66,26 @@ fn lab_prep_sync() -> bool {
 /// against 117.3 / 121.7; Intel n224 188.9 / 194.3 against 188.0 / 185.6 and
 /// 150.2 / 146.1 against 131.9 / 150.1; PassPrep helper work -30-48 %,
 /// foreground hashing -30-50 %); `=off` restores syncing on the items alone.
+/// TEMP (lab, `REIMS_VGPU_LAB_PREP_RESOLVE`, live `PREP_RESOLVE=on|off`, off
+/// unless `on`): plan the sampled binds the walk left without a retained
+/// resource by resolving it in [`PassPrep::ahead`] (b022), and replan a ref
+/// whose bind found no plan (a bail stands for the whole pass otherwise:
+/// b023 - ~300k binds a phase, all with a retained resource).
+pub(super) fn lab_prep_resolve() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("PREP_RESOLVE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = matches!(std::env::var("REIMS_VGPU_LAB_PREP_RESOLVE").as_deref(), Ok("on"));
+        crate::observe::off(format!("lab_prep_resolve on={}", u8::from(on)));
+        on
+    })
+}
+
 /// Latched; off in unit tests (the test hosts have no workers to hand sets to).
 fn lab_sync_ahead() -> bool {
     if cfg!(test) {
@@ -684,8 +704,33 @@ impl<'a> PassPrep<'a> {
                 if bind.texture_ref == 0 || self.planned.contains(&bind.texture_ref) {
                     continue;
                 }
-                let Some(resource) = bind.resource.clone() else {
-                    continue;
+                let resource = match bind.resource.clone() {
+                    Some(resource) => resource,
+                    // TEMP (lab, PREP_RESOLVE): a bind the walk did not retain
+                    // a resource for was never planned, and its draws resolved
+                    // it on the ladder instead - b022: 137k such binds a
+                    // Safari phase (`prefetch_serial_nokey`), 3.2 us each on
+                    // the target rung against 0.2 us served from a plan. The
+                    // lookup is the same read-only one `push_tex` makes, once
+                    // per ref per chunk here instead of once per bind there.
+                    None if lab_prep_resolve() && !seen.contains(&bind.texture_ref) => {
+                        match crate::runtime::objects::resolve_resource(
+                            state,
+                            host,
+                            self.task_id,
+                            bind.texture_ref,
+                        ) {
+                            Ok(resource) => {
+                                crate::runtime::drain::note_store_route("pass_prep_resolved_unretained");
+                                resource
+                            }
+                            Err(_) => {
+                                crate::runtime::drain::note_store_route("pass_prep_unretained_unresolved");
+                                continue;
+                            }
+                        }
+                    }
+                    None => continue,
                 };
                 if seen.insert(bind.texture_ref) {
                     items.push(PrepItem::Sample {

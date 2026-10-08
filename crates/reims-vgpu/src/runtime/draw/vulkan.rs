@@ -2673,16 +2673,21 @@ fn lab_sampled_grid_probe(
 
 /// TEMP (lab): `REIMS_VGPU_LAB_RESOLVE_CENSUS=1` — time `resolve_sampled_source`
 /// by the route it returned and by texture size (tiny = at most 64x64), and
-/// report the totals every 2 s.
-fn lab_resolve_census(ns: u64, loaded: Option<&(u32, u32, u32, SampledSourceRequest)>) {
+/// report the totals every 2 s. `plan` splits the binds a validated pass/stream
+/// plan served (`plan_*`) from those the serial ladder resolved (`ladder_*`).
+fn lab_resolve_census(
+    ns: u64,
+    loaded: Option<&(u32, u32, u32, SampledSourceRequest)>,
+    plan: bool,
+) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_RESOLVE_CENSUS").is_some()) {
         return;
     }
-    // [route][size] -> (ns, n); route: 0 bytes 1 target 2 guest_runs 3 none
-    static NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-    static N: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    // [plan][route][size] -> (ns, n); route: 0 bytes 1 target 2 guest_runs 3 none
+    static NS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    static N: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     let (route, tiny) = match loaded {
         Some((w, h, _, src)) => (
@@ -2697,7 +2702,7 @@ fn lab_resolve_census(ns: u64, loaded: Option<&(u32, u32, u32, SampledSourceRequ
         ),
         None => (3, true),
     };
-    let i = route * 2 + usize::from(!tiny);
+    let i = usize::from(plan) * 8 + route * 2 + usize::from(!tiny);
     NS[i].fetch_add(ns, Ordering::Relaxed);
     N[i].fetch_add(1, Ordering::Relaxed);
     let now = crate::observe::elapsed_us() / 1000;
@@ -2720,7 +2725,8 @@ fn lab_resolve_census(ns: u64, loaded: Option<&(u32, u32, u32, SampledSourceRequ
         "none_big",
     ];
     let mut line = String::from("lab_resolve_census");
-    for (k, name) in names.iter().enumerate() {
+    for k in 0..16 {
+        let name = format!("{}_{}", if k >= 8 { "plan" } else { "ladder" }, names[k % 8]);
         let n = N[k].swap(0, Ordering::Relaxed);
         let t = NS[k].swap(0, Ordering::Relaxed);
         if n > 0 {
@@ -11255,6 +11261,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             texture_resource.as_ref(),
                             view_swizzle.is_none(),
                         );
+                        let lab_plan_served = matches!(prefetched, prefetch::Prefetched::Serve(_));
                         let lab_resolved = match prefetched {
                             prefetch::Prefetched::Serve(served) => Some(served),
                             other => {
@@ -11279,6 +11286,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         lab_resolve_census(
                             lab_resolve_t0.elapsed().as_nanos() as u64,
                             lab_resolved.as_ref(),
+                            lab_plan_served,
                         );
                         let Some(loaded) = lab_resolved else {
                             let detail = sample_miss_detail(state, host, req.task_id, texture_ref);
