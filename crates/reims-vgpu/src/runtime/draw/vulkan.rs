@@ -1495,8 +1495,14 @@ fn lab_recorder_exit_join() -> bool {
 
 /// TEMP (lab): `REIMS_VGPU_LAB_RECORDER_STREAM_JOIN=off` skips the wait for the
 /// recorder at the end of a stream (see `settle_deferred_draws_at_stream_end`).
-/// On (waiting) by default until measured. Latched.
+/// On (waiting) by default until measured. Live (`RECORDER_STREAM_JOIN=on|off`),
+/// else latched: b070 - with EXIT_JOIN and RECORDER_STORE_JOIN off the wait
+/// moves here (stream end, ~5k joins/s, ~44 ms/s on Weather); with this off too
+/// it moves to whichever door comes next, and the join sites name that door.
 fn lab_recorder_stream_join() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("RECORDER_STREAM_JOIN") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var("REIMS_VGPU_LAB_RECORDER_STREAM_JOIN").map_or(true, |v| v != "off");
