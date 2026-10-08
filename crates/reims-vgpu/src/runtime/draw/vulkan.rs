@@ -355,6 +355,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut gva_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         record_plane_draw(req);
+        lab_draw_sig(req);
         req.chain_resident_established = false;
         let engine = try_metal2vulkan_draw(state, host, req, writeback_guest);
         // Set from the result itself rather than inside the arms, because the
@@ -19788,6 +19789,87 @@ pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
         passes.pop_front();
     }
     passes.push_back(pass);
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_DRAW_SIG=1` - how repetitive the draw stream is.
+/// b058: the Weather app makes ~35 600 draws a second (~870 a frame) at ~18 us
+/// of drain each. Per second, the draws against their distinct signatures at
+/// three depths: `state` (pipeline, colour targets, textures, samplers),
+/// `bufs` (+ buffer refs), `full` (+ buffer offsets, counts, scissor). Few
+/// distinct signatures for many draws means the frame repeats itself, and the
+/// per-draw resolution could be kept across frames. One `lab_draw_sig` line a
+/// second; nothing is kept but three sets of hashes.
+fn lab_draw_sig(req: &DrawEncodeRequest) {
+    use std::hash::{Hash, Hasher};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_SIG").as_deref() == Ok("1")) {
+        return;
+    }
+    struct Win {
+        t0_us: u64,
+        draws: u64,
+        state: std::collections::HashSet<u64>,
+        bufs: std::collections::HashSet<u64>,
+        full: std::collections::HashSet<u64>,
+    }
+    static WIN: std::sync::Mutex<Option<Win>> = std::sync::Mutex::new(None);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    req.pipeline_ref.hash(&mut h);
+    for c in &req.colors {
+        (c.mapping_id, c.texture_ref, c.load_action).hash(&mut h);
+    }
+    for t in req.vertex_textures.iter().chain(req.fragment_textures.iter()) {
+        (t.index, t.texture_ref).hash(&mut h);
+    }
+    for s in req.vertex_samplers.iter().chain(req.fragment_samplers.iter()) {
+        (s.index, s.sampler_ref).hash(&mut h);
+    }
+    let state = h.finish();
+    for b in req.vertex_buffers.iter().chain(req.fragment_buffers.iter()) {
+        (b.index, b.buffer_ref).hash(&mut h);
+    }
+    if let Some(ix) = &req.indexed {
+        ix.index_buffer_ref.hash(&mut h);
+    }
+    let bufs = h.finish();
+    for b in req.vertex_buffers.iter().chain(req.fragment_buffers.iter()) {
+        b.offset.hash(&mut h);
+    }
+    (req.vertex_count, req.instance_count, req.first_vertex).hash(&mut h);
+    if let Some(ix) = &req.indexed {
+        (ix.index_count, ix.index_buffer_offset, ix.base_vertex).hash(&mut h);
+    }
+    for s in &req.scissors {
+        (s.x, s.y, s.width, s.height).hash(&mut h);
+    }
+    let full = h.finish();
+    let now = crate::observe::elapsed_us();
+    let mut g = WIN.lock().unwrap_or_else(|p| p.into_inner());
+    let w = g.get_or_insert_with(|| Win {
+        t0_us: now,
+        draws: 0,
+        state: Default::default(),
+        bufs: Default::default(),
+        full: Default::default(),
+    });
+    if now.saturating_sub(w.t0_us) >= 1_000_000 {
+        crate::observe::off(format!(
+            "lab_draw_sig draws={} state={} bufs={} full={}",
+            w.draws,
+            w.state.len(),
+            w.bufs.len(),
+            w.full.len()
+        ));
+        w.t0_us = now;
+        w.draws = 0;
+        w.state.clear();
+        w.bufs.clear();
+        w.full.clear();
+    }
+    w.draws += 1;
+    w.state.insert(state);
+    w.bufs.insert(bufs);
+    w.full.insert(full);
 }
 
 pub(crate) fn note_compositor_plane_pass(
