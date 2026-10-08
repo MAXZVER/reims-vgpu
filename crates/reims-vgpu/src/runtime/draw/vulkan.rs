@@ -1463,6 +1463,11 @@ fn lab_recorder_gva_store() -> bool {
 /// GVA-resident Store recording past its encode (see `encode_draw_chain`).
 /// On (waiting) by default until measured. Latched.
 fn lab_recorder_store_join() -> bool {
+    // TEMP (lab, STAMP_DEFER): the completion word waits for the recorder
+    // instead, and this join only stood in front of that one.
+    if crate::runtime::drain::stamp_defer_on() {
+        return false;
+    }
     // Live (`RECORDER_STORE_JOIN=on|off` in the lab live file): asked at each
     // record's exit, so a switch moves only the records after it.
     if let Some(on) = crate::runtime::lab_live::on("RECORDER_STORE_JOIN") {
@@ -1482,6 +1487,11 @@ fn lab_recorder_store_join() -> bool {
 /// p070 measured RETAIN_FAST moving ~200 ms a phase of recorder waits off the
 /// resident doors and onto this exit, which then held the same total.
 fn lab_recorder_exit_join() -> bool {
+    // TEMP (lab, STAMP_DEFER): the completion word waits for the recorder
+    // instead, and this join only stood in front of that one.
+    if crate::runtime::drain::stamp_defer_on() {
+        return false;
+    }
     if let Some(on) = crate::runtime::lab_live::on("EXIT_JOIN") {
         return on;
     }
@@ -1500,6 +1510,11 @@ fn lab_recorder_exit_join() -> bool {
 /// moves here (stream end, ~5k joins/s, ~44 ms/s on Weather); with this off too
 /// it moves to whichever door comes next, and the join sites name that door.
 fn lab_recorder_stream_join() -> bool {
+    // TEMP (lab, STAMP_DEFER): the completion word waits for the recorder
+    // instead, and this join only stood in front of that one.
+    if crate::runtime::drain::stamp_defer_on() {
+        return false;
+    }
     if let Some(on) = crate::runtime::lab_live::on("RECORDER_STREAM_JOIN") {
         return on;
     }

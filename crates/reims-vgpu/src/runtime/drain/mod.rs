@@ -3157,6 +3157,8 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     // this device is next entered. A guest that ordered a packet behind a fence
     // this very drain published would wait on a doorbell instead.
     loop {
+        // TEMP (lab, STAMP_DEFER): words the recorder has caught up with.
+        flush_deferred_stamps(state, host, false);
         observe_awaited_stamps(&*state, &*host);
         pump_translations(&*state, &*host);
         for ingress in state.take_ready() {
@@ -4014,6 +4016,92 @@ fn note_stamp_visible(state: &DeviceState, index: u32, value: u32, site: &'stati
 
 /// Write stamp value to FIFO base page slot and set status bit.
 pub fn write_stamp<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    stamp_index: u32,
+    stamp_value: u32,
+) {
+    // TEMP (lab, STAMP_DEFER): behind draws the recorder has not recorded yet,
+    // the word waits in order and the drain goes on (see `stamp_defer_on`).
+    if stamp_defer_on()
+        && lab_ctrl_stamp::current() == lab_ctrl_stamp::Kind::None
+        && (!state.lab_deferred_stamps.is_empty() || recorder_has_draws_out())
+    {
+        state.lab_deferred_stamps.push((stamp_index, stamp_value));
+        note_store_route("stamp_deferred_behind_recorder");
+        return;
+    }
+    write_stamp_now(state, host, stamp_index, stamp_value);
+}
+
+/// TEMP (lab, live `STAMP_DEFER=on|off`, else `REIMS_VGPU_LAB_STAMP_DEFER=on`; off
+/// unless `on`): a completion word that follows draws the recorder has not
+/// recorded yet is held, in order, and published once the recorder is idle -
+/// instead of the drain joining the recorder for it.
+///
+/// b070/b076 (Weather, ~5k streams/s): with the stream's three recorder joins
+/// off (record exit, Store job, stream end) the ~40-45 ms/s of waits land on
+/// the completion word - `guest_access_outstanding` settles the recorder to
+/// learn whether the draws read guest RAM. That wait is required: a word must
+/// not tell the guest its work finished before that work is recorded (a debt
+/// paid from a vCPU against a resident the recorder has not drawn yet would
+/// land stale pixels). What is not required is that the *drain* waits for it.
+/// The model still completes the transaction at once (the ordering plane
+/// releases what waited on it); only the guest-visible word and its interrupt
+/// trail the recorder, by at most its queue (a few draws). On, this also turns
+/// the three stream joins off - each only stood in front of this one.
+pub(crate) fn stamp_defer_on() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("STAMP_DEFER") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_STAMP_DEFER").as_deref() == Ok("on"))
+}
+
+/// TEMP (lab, STAMP_DEFER): whether the recorder still holds draws this drain
+/// handed it.
+fn recorder_has_draws_out() -> bool {
+    #[cfg(feature = "backend-vulkan")]
+    if crate::backend::selected().rail() == crate::backend::Rail::Vulkan {
+        return crate::backend::vulkan::engine::recorder_outstanding() > 0;
+    }
+    false
+}
+
+/// TEMP (lab, STAMP_DEFER): publish the held words, in order, once the
+/// recorder has recorded everything before them. `block` waits for it (the
+/// drain's end: nothing may stay held while it sleeps); otherwise a busy
+/// recorder leaves them held. `true` when any word was published.
+pub(crate) fn flush_deferred_stamps<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    block: bool,
+) -> bool {
+    if state.lab_deferred_stamps.is_empty() {
+        return false;
+    }
+    if recorder_has_draws_out() {
+        if !block {
+            return false;
+        }
+        #[cfg(feature = "backend-vulkan")]
+        if let Some(failure) = crate::backend::vulkan::engine::settle_deferred_draws() {
+            crate::backend::vulkan::engine::report_deferred_failure(&failure);
+        }
+        note_store_route("stamp_deferred_flush_waited");
+    }
+    let held = std::mem::take(&mut state.lab_deferred_stamps);
+    note_store_route_n("stamp_deferred_flushed", held.len() as u64);
+    for (slot, value) in held {
+        write_stamp_now(state, host, slot, value);
+    }
+    true
+}
+
+fn write_stamp_now<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     stamp_index: u32,
@@ -9735,6 +9823,19 @@ pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
 }
 
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    drain_pending_inner(state, host);
+    // TEMP (lab, STAMP_DEFER): nothing stays held while the worker sleeps. A
+    // published word can release work waiting on it, which runs here unless the
+    // drain is yielding to a present action.
+    while flush_deferred_stamps(state, host, true) {
+        if state.pending.host_action_yield {
+            break;
+        }
+        settle_model_work(state, host);
+    }
+}
+
+fn drain_pending_inner<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
     // wakeups must leave guest work queued until scanout consumes the action.

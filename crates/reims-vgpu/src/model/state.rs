@@ -3651,6 +3651,9 @@ pub struct DeviceState {
     /// TEMP (lab, REIMS_VGPU_LAB_HOLD_PRESENT_STAMP): completion words held back
     /// from the DisplaySwap that started the hold to the end of the settle loop.
     pub lab_held_words: Vec<(u32, u32, u32)>,
+    /// TEMP (lab, STAMP_DEFER): completion words held until the recorder has
+    /// recorded every draw before them, as `(slot, value)` in publish order.
+    pub lab_deferred_stamps: Vec<(u32, u32)>,
     pub lab_hold_since: Option<std::time::Instant>,
     pub lab_hold_packets: u32,
     pub lab_hold_exec_us: u64,
@@ -3812,6 +3815,7 @@ impl DeviceState {
             completion_stamp_seq: 0,
             guest_copies_framebuffers: false,
             lab_held_words: Vec::new(),
+            lab_deferred_stamps: Vec::new(),
             lab_hold_since: None,
             lab_hold_packets: 0,
             lab_hold_exec_us: 0,
