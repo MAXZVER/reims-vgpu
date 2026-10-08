@@ -5346,6 +5346,9 @@ fn finish_stream<M: HostMemory + HostOps>(
 ) {
     let draws_at_entry = (out.metal_draws_ok, out.metal_draws_fail);
     let clears_at_entry = out.clears_applied;
+    // TEMP (lab, RESOLVE_MEMO): no sampled source outlives the stream.
+    #[cfg(feature = "backend-vulkan")]
+    crate::runtime::draw::vulkan::lab_encoder_begin();
     // Opens in `Prelude` and is charged to whichever part is open until it
     // drops, so the six tile this function rather than sampling it. See
     // [`finish_phase`] for what the split is for.
@@ -5670,6 +5673,7 @@ fn finish_stream<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         if crate::backend::selected().rail() == crate::backend::Rail::Vulkan {
             crate::runtime::draw::vulkan::prewake_recorder_for_stream(draw_list.len());
+            crate::runtime::draw::vulkan::lab_encoder_begin(); // TEMP (lab, RESOLVE_REPEAT)
         }
         // TEMP (lab, PASS_PREP): the first chunk's scope runs here, before the
         // first record's request is built, so its fork overlaps the recorder's

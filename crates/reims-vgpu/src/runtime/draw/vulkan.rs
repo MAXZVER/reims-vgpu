@@ -2672,6 +2672,129 @@ fn lab_sampled_grid_probe(
     ));
 }
 
+thread_local! {
+    /// TEMP (lab, RESOLVE_REPEAT): the render encoder (draw list) the drain is
+    /// encoding, and the texture refs resolved in it so far.
+    static LAB_ENCODER: std::cell::RefCell<(u64, std::collections::HashSet<(u32, u32)>)> =
+        std::cell::RefCell::new((0, std::collections::HashSet::new()));
+}
+
+fn lab_resolve_repeat_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_REPEAT").as_deref() == Ok("1"))
+}
+
+/// TEMP (lab, RESOLVE_REPEAT / RESOLVE_MEMO): a render encoder's draw list
+/// starts.
+pub(crate) fn lab_encoder_begin() {
+    if lab_resolve_repeat_on() {
+        LAB_ENCODER.with(|e| {
+            let mut e = e.borrow_mut();
+            e.0 += 1;
+            e.1.clear();
+        });
+    }
+    RESOLVE_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if !m.is_empty() {
+            m.clear();
+        }
+    });
+}
+
+/// (task, texture ref, retained resource address, may bind resident).
+type ResolveMemoKey = (u32, u32, usize, bool);
+/// A CPU-byte sampled source as `resolve_sampled_source` returned it.
+type ResolveMemoBytes = (
+    u32,
+    u32,
+    u32,
+    std::sync::Arc<Vec<u8>>,
+    Option<LinearSampleIdentity>,
+    pixel_format::SampledByteFormat,
+    crate::backend::vulkan::engine::SampledByteOrigin,
+);
+
+thread_local! {
+    /// TEMP (lab, RESOLVE_MEMO): this render encoder's CPU-byte sampled sources.
+    static RESOLVE_MEMO: std::cell::RefCell<std::collections::HashMap<ResolveMemoKey, ResolveMemoBytes>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// TEMP (lab): live `RESOLVE_MEMO=on|off`, else `REIMS_VGPU_LAB_RESOLVE_MEMO=on`;
+/// off by default until measured.
+///
+/// b062/b063: the Weather app resolves ~45k CPU-byte sampled textures a second
+/// (mostly at most 64x64, 1.6 us each on the drain: the guest-write check, the
+/// debt settlement over the texture's pages, the host-cache lookup), and 88 %
+/// of them repeat a (task, ref) already resolved earlier in the same render
+/// encoder. Within one encoder the bytes cannot change: the guest's CPU writes
+/// to a texture it has encoded a read of are a race on any GPU, the encoder's
+/// own attachments are sampled through the target rails rather than as bytes,
+/// and the writeback debts the first resolve settled are only created at a
+/// pass's Store. So a repeat in the encoder takes the first resolve's bytes -
+/// the same `Arc` and identity, which also lets the engine's content cache hit
+/// without re-hashing. Cleared at every draw list's start.
+pub(crate) fn lab_resolve_memo_on() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("RESOLVE_MEMO") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_MEMO").as_deref() == Ok("on"))
+}
+
+fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledSourceRequest)> {
+    RESOLVE_MEMO.with(|m| {
+        m.borrow().get(key).map(|(w, h, mid, bytes, identity, fmt, origin)| {
+            (*w, *h, *mid, SampledSourceRequest::Bytes(bytes.clone(), *identity, *fmt, *origin))
+        })
+    })
+}
+
+fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSourceRequest)) {
+    if let SampledSourceRequest::Bytes(bytes, identity, fmt, origin) = &loaded.3 {
+        RESOLVE_MEMO.with(|m| {
+            m.borrow_mut()
+                .insert(key, (loaded.0, loaded.1, loaded.2, bytes.clone(), *identity, *fmt, *origin));
+        });
+    }
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_RESOLVE_REPEAT=1` - b062: the Weather app resolves
+/// ~50k tiny CPU-byte textures a second at 1.6 us each, and its draw state
+/// repeats ~20x a second. How many sampled resolves repeat a (task, ref) already
+/// resolved earlier in the same render encoder - where the guest cannot have
+/// written the texture in between - by route, per second.
+fn lab_resolve_repeat(task_id: u32, texture_ref: u32, loaded: Option<&(u32, u32, u32, SampledSourceRequest)>) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    if !lab_resolve_repeat_on() {
+        return;
+    }
+    // [route: bytes, target, runs/staged, none][first, repeat]
+    static N: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    let route = match loaded.map(|l| &l.3) {
+        Some(SampledSourceRequest::Bytes(..)) => 0,
+        Some(SampledSourceRequest::Target(..) | SampledSourceRequest::TargetRegion(..)) => 1,
+        Some(SampledSourceRequest::GuestRuns(..) | SampledSourceRequest::Staged(..)) => 2,
+        None => 3,
+    };
+    let repeat = LAB_ENCODER.with(|e| !e.borrow_mut().1.insert((task_id, texture_ref)));
+    N[route * 2 + usize::from(repeat)].fetch_add(1, Relaxed);
+    let now = crate::observe::elapsed_us() / 1000;
+    let last = LAST_MS.load(Relaxed);
+    if now.saturating_sub(last) < 1000
+        || LAST_MS.compare_exchange(last, now, Relaxed, Relaxed).is_err()
+    {
+        return;
+    }
+    let n: Vec<u64> = N.iter().map(|a| a.swap(0, Relaxed)).collect();
+    crate::observe::off(format!(
+        "lab_resolve_repeat bytes={}/{} target={}/{} runs={}/{} none={}/{} (first/repeat)",
+        n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7]
+    ));
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_RESOLVE_CENSUS=1` — time `resolve_sampled_source`
 /// by the route it returned and by texture size (tiny = at most 64x64), and
 /// report the totals every 2 s. `plan` splits the binds a validated pass/stream
@@ -11259,6 +11382,26 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             crate::runtime::sampled_phase::Part::ResolveSource,
                         );
                         let lab_resolve_t0 = crate::lab_clock::LabInstant::now();
+                        // TEMP (lab, RESOLVE_MEMO): a CPU-byte source already
+                        // resolved in this render encoder (see
+                        // `lab_resolve_memo_on`).
+                        let memo_on = lab_resolve_memo_on();
+                        let memo_key: ResolveMemoKey = (
+                            req.task_id,
+                            texture_ref,
+                            texture_resource
+                                .as_ref()
+                                .map_or(0, |r| std::sync::Arc::as_ptr(r) as usize),
+                            view_swizzle.is_none(),
+                        );
+                        let memoed = if memo_on { lab_resolve_memo_get(&memo_key) } else { None };
+                        let memo_hit = memoed.is_some();
+                        if memo_hit {
+                            crate::runtime::drain::note_store_route("lab_resolve_memo_hit");
+                        }
+                        let (lab_resolved, lab_plan_served) = if let Some(hit) = memoed {
+                            (Some(hit), false)
+                        } else {
                         // TEMP (lab, REIMS_VGPU_LAB_PAR_PREFETCH): a stream plan
                         // validated here serves the bind (on) or is compared with
                         // the serial ladder (shadow); otherwise the ladder runs.
@@ -11292,11 +11435,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 serial
                             }
                         };
+                        if memo_on {
+                            if let Some(loaded) = lab_resolved.as_ref() {
+                                lab_resolve_memo_put(memo_key, loaded);
+                            }
+                        }
+                        (lab_resolved, lab_plan_served)
+                        };
                         lab_resolve_census(
                             lab_resolve_t0.elapsed().as_nanos() as u64,
                             lab_resolved.as_ref(),
                             lab_plan_served,
                         );
+                        lab_resolve_repeat(req.task_id, texture_ref, lab_resolved.as_ref());
                         let Some(loaded) = lab_resolved else {
                             let detail = sample_miss_detail(state, host, req.task_id, texture_ref);
                             return Err(DrawError::DrawPreparation(
