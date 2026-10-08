@@ -364,7 +364,7 @@ pub(crate) struct ResourcePools {
     attachment_snapshot_live: Vec<SampledSlot>,
     /// Exact-content sampled images retained across draw calls. Hash narrows
     /// candidates only; a hit always requires full byte equality.
-    sampled_cache: Vec<ResidentSampledSlot>,
+    sampled_cache: sampled_cache::SampledCache,
     sampled_cache_bytes: usize,
     /// Linear sampled images bound directly over resource-owned packed guest
     /// allocations. Unlike upload slots these images never enter a recycle
@@ -3819,6 +3819,7 @@ pub(crate) mod par_stage;
 /// What the resident registry says about an identity's content, readable
 /// without the engine lock.
 pub(crate) mod readiness;
+mod sampled_cache;
 pub mod sampled_working_set;
 mod submission_and_buffers;
 /// The lease's own extent travels with its pointer; see [`ReadbackLease`].

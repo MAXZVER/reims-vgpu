@@ -295,7 +295,7 @@ impl ResourcePools {
                 ATTACHMENT_SNAPSHOT_FREE_CAP_TOTAL,
             ),
             attachment_snapshot_live: Vec::new(),
-            sampled_cache: Vec::new(),
+            sampled_cache: super::sampled_cache::SampledCache::new(),
             sampled_cache_bytes: 0,
             guest_sampled: HashMap::new(),
             sampled_victims: std::collections::VecDeque::new(),
@@ -546,8 +546,8 @@ impl ResourcePools {
     /// An entry with no identity is not remembered. The gather rail's lookup is
     /// identity-only, so such a window could never have been found again at any
     /// cache size and banding its distance would answer a question nobody asked.
-    fn evict_sampled_entry(&mut self, index: usize, route: SampledVictimRoute) -> SampledSlot {
-        let evicted = self.sampled_cache.remove(index);
+    fn evict_sampled_entry(&mut self, route: SampledVictimRoute) -> Option<SampledSlot> {
+        let evicted = self.sampled_cache.pop_oldest()?;
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_sub(evicted.content_len);
         if let Some(identity) = evicted.identity {
             self.sampled_victims.push_front(SampledVictim {
@@ -558,7 +558,7 @@ impl ResourcePools {
             });
             self.sampled_victims.truncate(SAMPLED_VICTIM_LEDGER);
         }
-        evicted.slot
+        Some(evicted.slot)
     }
 
     /// Update the consecutive-settled-pass counter for maintenance and return
@@ -1849,8 +1849,8 @@ impl ResourcePools {
         }
         crate::runtime::drain::note_store_route("sampled_cache_discarded");
         let mut taken = Vec::with_capacity(self.sampled_cache.len());
-        while !self.sampled_cache.is_empty() {
-            taken.push(self.evict_sampled_entry(0, SampledVictimRoute::Discarded));
+        while let Some(slot) = self.evict_sampled_entry(SampledVictimRoute::Discarded) {
+            taken.push(slot);
         }
         taken
     }
@@ -4526,15 +4526,10 @@ impl ResourcePools {
             crate::runtime::drain::note_store_route("sampled_identity_off");
             return None;
         }
-        let index = self
-            .sampled_cache
-            .iter()
-            .position(|entry| entry.slot.key() == key && entry.identity == Some(id))?;
-        let mut entry = self.sampled_cache.remove(index);
-        entry.last_touch_ms = self.idle_clock_ms;
-        let handles = entry.slot.handles();
-        self.sampled_cache.push(entry);
-        Some(handles)
+        let found = self.sampled_cache.find_identity(key, id)?;
+        self.sampled_cache.touch(found);
+        *self.sampled_cache.get_mut_last_touch(found) = self.idle_clock_ms;
+        Some(self.sampled_cache.get(found).slot.handles())
     }
 
     /// The guest-gather rail's lookup: the complete image key, and identity as
@@ -4628,26 +4623,23 @@ impl ResourcePools {
         // The digest narrows the walk to one candidate; the retained bytes are
         // what decide the hit. `ResidentSampledSlot::content` carries why the
         // digest is not allowed to answer on its own.
-        let found = self.sampled_cache.iter().position(|entry| {
-            entry.slot.key() == key
-                && entry.fingerprint == SampledFingerprint::Content(content_hash)
-                && entry.content.as_deref().is_some_and(|b| b == content)
+        let found = self.sampled_cache.find_content(key, content_hash, |entry| {
+            entry.content.as_deref().is_some_and(|b| b == content)
         });
-        let Some(index) = found else {
+        let Some(found) = found else {
             counters
                 .sampled_cache_misses
                 .fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        let mut entry = self.sampled_cache.remove(index);
         // Same content re-presented under a new identity/generation: adopt it
         // so the fast path serves the follow-up draws.
-        if identity.is_some() {
-            entry.identity = identity;
+        if let Some(id) = identity {
+            self.sampled_cache.adopt_identity(found, id);
         }
-        entry.last_touch_ms = self.idle_clock_ms;
-        let handles = entry.slot.handles();
-        self.sampled_cache.push(entry);
+        self.sampled_cache.touch(found);
+        *self.sampled_cache.get_mut_last_touch(found) = self.idle_clock_ms;
+        let handles = self.sampled_cache.get(found).slot.handles();
         counters.sampled_cache_hits.fetch_add(1, Ordering::Relaxed);
         counters
             .sampled_cache_hit_bytes
@@ -4738,24 +4730,27 @@ impl ResourcePools {
         // something else confirms it. Collapsing two entries here is exactly as
         // wrong as returning the wrong one from `find_cached_sampled` — the
         // survivor then answers for content it was not built from.
-        let duplicate = self.sampled_cache.iter_mut().find(|entry| {
-            entry.slot.key() == slot.key()
-                && entry.fingerprint == fingerprint
-                && match fingerprint {
-                    // Every `Gathered` fingerprint is equal to every other, so
-                    // identity is the only thing separating two windows that
-                    // gathered different pixels.
-                    SampledFingerprint::Gathered => entry.identity == identity,
-                    // The bytes decide, as on the lookup path.
-                    SampledFingerprint::Content(_) => {
-                        entry.content.as_deref() == retained.as_deref()
-                    }
-                }
-        });
+        let key = slot.key();
+        let duplicate = match fingerprint {
+            // Every `Gathered` fingerprint is equal to every other, so
+            // identity is the only thing separating two windows that
+            // gathered different pixels.
+            SampledFingerprint::Gathered => identity
+                .and_then(|id| self.sampled_cache.find_identity(key, id))
+                .filter(|&found| {
+                    self.sampled_cache.get(found).fingerprint == SampledFingerprint::Gathered
+                }),
+            // The bytes decide, as on the lookup path.
+            SampledFingerprint::Content(digest) => {
+                self.sampled_cache.find_content(key, digest, |entry| {
+                    entry.content.as_deref() == retained.as_deref()
+                })
+            }
+        };
         if let Some(existing) = duplicate {
             crate::runtime::drain::note_store_route("sampled_admit_duplicate");
-            if identity.is_some() {
-                existing.identity = identity;
+            if let Some(id) = identity {
+                self.sampled_cache.adopt_identity(existing, id);
             }
             self.sampled_live.push(slot);
             return Vec::new();
@@ -4782,7 +4777,10 @@ impl ResourcePools {
         let mut evicted = Vec::new();
         while self.sampled_cache_bytes > SAMPLED_CACHE_BYTE_CAP {
             crate::runtime::drain::note_store_route(SAMPLED_EVICT_BYTE_CAP);
-            evicted.push(self.evict_sampled_entry(0, SampledVictimRoute::Cap));
+            let Some(slot) = self.evict_sampled_entry(SampledVictimRoute::Cap) else {
+                break;
+            };
+            evicted.push(slot);
         }
         evicted
     }

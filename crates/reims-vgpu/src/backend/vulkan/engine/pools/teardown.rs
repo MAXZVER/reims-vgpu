@@ -156,7 +156,7 @@ impl ResourcePools {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
-        for s in self.sampled_cache.drain(..) {
+        while let Some(s) = self.sampled_cache.pop_oldest() {
             device.destroy_image_view(s.slot.view, None);
             device.destroy_image(s.slot.image, None);
         }
