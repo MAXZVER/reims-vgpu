@@ -134,6 +134,9 @@ pub(crate) fn emit_engine_delta() {
         let _ = write!(line, " {name}={value}");
     }
     crate::observe::off(line);
+    if let Some(sites) = crate::backend::vulkan::engine::lab_gpu_host_sites_line() {
+        crate::observe::off(sites);
+    }
     emit_pcache_shard();
     emit_registry_pressure(&now);
     emit_draw_phase();

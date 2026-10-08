@@ -12410,10 +12410,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             target_format,
                         ) {
                             Some(MapperRefTextureLoadSeed::Host(bytes, order)) => {
+                                lab_seed_trace(state, "mapping", "host", c0.mapping_id, w, h, declared);
                                 target_rgba8 = Some(bytes);
                                 seed_order = order;
                             }
                             Some(MapperRefTextureLoadSeed::Guest(seed)) => {
+                                lab_seed_trace(state, "mapping", "guest", c0.mapping_id, w, h, declared);
                                 target_guest_seed = Some(seed)
                             }
                             None => {}
@@ -12563,6 +12565,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 );
                             }
                             Some(MapperRefTextureLoadSeed::Guest(seed)) => {
+                                lab_seed_trace(state, "preserve", "guest", c0.mapping_id, w, h, declared);
                                 target_guest_seed = Some(seed);
                                 crate::runtime::drain::note_store_route("preserve_seed_n");
                                 crate::runtime::drain::note_store_route_n(
@@ -20568,3 +20571,45 @@ mod zero_seed_tests {
         }
     }
 }
+
+/// TEMP (lab, b036): one line per colour-target seed taken from the guest's
+/// pages or a host copy of them - b035: a Safari phase uploads 1.3 GB of such
+/// seeds (312, ~4 MB each) right beside 1.38 GB of render flushes into the
+/// same kind of surface, so the question is whether the seeded surface is one
+/// this device just flushed (the round trip) and why its resident was not
+/// found: the mapping's generations, how long ago and from which site its
+/// generation last moved, and how long ago this device last flushed into it.
+/// Capped per boot.
+fn lab_seed_trace(
+    state: &DeviceState,
+    door: &str,
+    src: &str,
+    mapping_id: u32,
+    w: u32,
+    h: u32,
+    declared: reims_vgpu_protocol::pass_action::LoadAction,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 4000 {
+        return;
+    }
+    let now = crate::observe::elapsed_us();
+    let age = |t: u64| if t == 0 { -1 } else { (now.saturating_sub(t) / 1000) as i64 };
+    let line = match state.mappings.get(&mapping_id) {
+        Some(m) => format!(
+            "lab_seed_trace door={door} src={src} mid={mapping_id} {w}x{h} declared={declared:?} \
+             mapgen={} idgen={} contentgen={} bump_age_ms={} bump_site={}:{} flush_age_ms={}",
+            m.map_generation,
+            m.identity_generation,
+            m.content_generation,
+            age(m.lab_bump_us),
+            m.lab_bump_site.0.rsplit(['/', '\\']).next().unwrap_or(""),
+            m.lab_bump_site.1,
+            age(m.lab_flush_us),
+        ),
+        None => format!("lab_seed_trace door={door} src={src} mid={mapping_id} {w}x{h} declared={declared:?} unmapped"),
+    };
+    crate::observe::off(line);
+}
+

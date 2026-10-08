@@ -99,6 +99,23 @@ fn store_render_frame_inner<M: HostMemory + HostOps>(
 ) -> bool {
     let started = std::time::Instant::now();
     crate::runtime::drain::note_store_route("surface_flush");
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        let now = crate::observe::elapsed_us();
+        // TEMP (lab, b037): which surfaces the 1.4 GB a Safari phase of render
+        // flushes are - geometry, whether scanout presented it, how long since
+        // the previous flush into it. Capped per boot.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4000 {
+            crate::observe::off(format!(
+                "lab_flush_trace mid={mapping_id} {width}x{height} presented={} mapgen={} since_prev_ms={}",
+                u8::from(m.scanout_presented),
+                m.map_generation,
+                if m.lab_flush_us == 0 { -1 } else { (now.saturating_sub(m.lab_flush_us) / 1000) as i64 },
+            ));
+        }
+        m.lab_flush_us = now;
+    }
     if crate::runtime::writeback_debt::pay_diff_enabled()
         && state
             .mappings
@@ -387,6 +404,9 @@ pub fn store_guest_backed_frame(
 ) -> Result<(), crate::runtime::mapping_write::vulkan::GpuWritebackDecline> {
     let started = std::time::Instant::now();
     crate::runtime::drain::note_store_route("surface_flush");
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.lab_flush_us = crate::observe::elapsed_us();
+    }
     let bytes = crate::runtime::mapping_write::vulkan::synchronize_guest_backed_resident(
         state,
         mapping_id,

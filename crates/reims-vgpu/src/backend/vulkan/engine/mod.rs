@@ -5559,7 +5559,28 @@ pub use page_diff::{pay_hash_verify_totals, with_pay_hash, PayHash};
 ///   property rather than on any driver name.
 /// - **No mapping to lend**, which a readback slot always has and so should not
 ///   occur; the fallback keeps it from mattering if it ever does.
+/// TEMP (lab): the window's GPU-to-host / host-to-GPU call-site line
+/// (`counters::lab_site`), for `emit_engine_delta`.
+pub(crate) fn lab_gpu_host_sites_line() -> Option<String> {
+    counters::lab_site::take_line()
+}
+
+/// TEMP (lab): charge one call to `counters::lab_site` from outside the engine.
+pub(crate) fn lab_site_note(kind: &'static str, site: &'static std::panic::Location<'static>, bytes: u64) {
+    counters::lab_site::note(kind, site, bytes);
+}
+
+#[track_caller]
 pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFrame>, DrawError> {
+    let site = std::panic::Location::caller();
+    let r = read_target_leased_inner(identity);
+    if let Ok(Some(frame)) = &r {
+        counters::lab_site::note("read_leased", site, frame.len as u64);
+    }
+    r
+}
+
+fn read_target_leased_inner(identity: &TargetIdentity) -> Result<Option<LeasedFrame>, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -8341,8 +8362,14 @@ pub fn read_target_keeping(
 }
 
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
+#[track_caller]
 pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
-    read_target_inner(identity)
+    let site = std::panic::Location::caller();
+    let r = read_target_inner(identity);
+    if let Ok(rb) = &r {
+        counters::lab_site::note("read", site, rb.pixels.len() as u64);
+    }
+    r
 }
 
 /// Run bounded maintenance for dead resources and already-free pool entries.

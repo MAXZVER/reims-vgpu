@@ -1105,7 +1105,9 @@ impl EngineCounters {
         total.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    #[track_caller]
     pub fn note_seed_upload(&self, bytes: u64) {
+        lab_site::note("seed", std::panic::Location::caller(), bytes);
         self.seed_uploads.fetch_add(1, Ordering::Relaxed);
         self.seed_upload_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -1496,5 +1498,42 @@ mod tests {
         assert_eq!(snapshot.sampled_free_allocs, 0);
         assert_eq!(snapshot.target_free_hits, 0);
         assert_eq!(snapshot.target_free_allocs, 0);
+    }
+}
+
+/// TEMP (lab): calls and bytes per call site of the GPU-to-host target reads and
+/// the host-to-GPU seed uploads. b034: a Safari phase of ten full-screen
+/// transitions reads 2.17 GB of resident targets back to the host (396 reads)
+/// and seeds 1.3 GB back up (362 uploads) - ~220 MB down and ~130 MB up per
+/// transition, the round trip the heavy first frames of each transition wait
+/// on. Which call sites carry it decides what has to stay on the GPU. One line
+/// beside `engine_delta`, the window's sites sorted by bytes.
+pub(crate) mod lab_site {
+    type Key = (&'static str, &'static str, u32);
+    static SITES: std::sync::Mutex<Option<std::collections::HashMap<Key, (u64, u64)>>> =
+        std::sync::Mutex::new(None);
+
+    pub(crate) fn note(kind: &'static str, site: &'static std::panic::Location<'static>, bytes: u64) {
+        let mut g = SITES.lock().unwrap_or_else(|e| e.into_inner());
+        let e = g
+            .get_or_insert_with(std::collections::HashMap::new)
+            .entry((kind, site.file(), site.line()))
+            .or_insert((0, 0));
+        e.0 += 1;
+        e.1 += bytes;
+    }
+
+    /// The window's line, or `None` when no site was charged.
+    pub(crate) fn take_line() -> Option<String> {
+        let map = SITES.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+        let mut rows: Vec<_> = map.into_iter().collect();
+        rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        let mut line = String::from("lab_gpu_host_sites");
+        for ((kind, file, ln), (n, bytes)) in rows.iter().take(24) {
+            use std::fmt::Write as _;
+            let short = file.rsplit(['/', '\\']).take(2).collect::<Vec<_>>();
+            let _ = write!(line, " {kind}@{}/{}:{ln}={n}:{bytes}", short.get(1).unwrap_or(&""), short[0]);
+        }
+        Some(line)
     }
 }

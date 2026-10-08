@@ -1483,6 +1483,7 @@ pub fn owes_mapping(state: &DeviceState, mapping_id: u32) -> bool {
 /// The one call a reader of a named mapping's guest bytes makes before it reads
 /// them. Free when nothing is owed — one `BTreeMap` emptiness check, which is
 /// the answer on nearly every call.
+#[track_caller]
 pub fn pay_for_mapping<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1490,6 +1491,11 @@ pub fn pay_for_mapping<M: HostMemory + HostOps>(
 ) {
     if state.pending_writebacks.is_empty() {
         return;
+    }
+    // TEMP (lab, b039): which readers make a named payment - the call site, in
+    // `lab_gpu_host_sites` beside the target reads it causes.
+    if state.pending_writebacks.get(mapping_id).is_some() {
+        crate::backend::vulkan::engine::lab_site_note("pay_named", std::panic::Location::caller(), 0);
     }
     if state.pending_writebacks.deferred_mapping() == Some(mapping_id) {
         crate::runtime::drain::note_store_route("lab_pay_defer_named");
@@ -1877,6 +1883,7 @@ pub fn owes_texture(state: &DeviceState, task_id: u32, texture_ref: u32) -> bool
         .any(|mapping_id| state.pending_writebacks.get(mapping_id).is_some())
 }
 
+#[track_caller]
 pub fn pay_for_texture<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2486,6 +2493,7 @@ pub(crate) fn pay_key<M: HostMemory + HostOps>(
 /// lazy: `settle_guest_writes_unless_disjoint` runs the closure only when
 /// something is outstanding, and a mapping that cannot name its pages answers
 /// `None`, which waits.
+#[track_caller]
 pub fn settle_for_mapping<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,

@@ -2094,6 +2094,12 @@ pub struct MappingEntry {
     /// list, and the next list adopted is that re-point's; generation bumps until
     /// then leave [`Self::identity_generation`] where it was.
     pub repoint_keep: bool,
+    /// TEMP (lab, b036 `lab_seed_trace`): when and from where the last
+    /// [`DeviceState::bump_map_generation`] ran, and when this device last
+    /// flushed a render target into the mapping's pages.
+    pub lab_bump_us: u64,
+    pub lab_bump_site: (&'static str, u32),
+    pub lab_flush_us: u64,
     /// Guest page-table entries (valid bit + PFN); empty until resolved.
     pub page_entries: Vec<u32>,
     /// Page entries retired by a trailing `DeleteIOSurfaceBacking2` while the
@@ -5941,7 +5947,11 @@ impl DeviceState {
     /// Bump [`MappingEntry::map_generation`] (never 0 after first bump).
     ///
     /// The bump orphans any generation-keyed resident for the mapping.
+    #[track_caller]
     pub fn bump_map_generation(e: &mut MappingEntry) {
+        let site = std::panic::Location::caller();
+        e.lab_bump_us = crate::observe::elapsed_us();
+        e.lab_bump_site = (site.file(), site.line());
         e.map_generation = e.map_generation.wrapping_add(1);
         if e.map_generation == 0 {
             e.map_generation = 1;

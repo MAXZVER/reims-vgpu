@@ -4272,6 +4272,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // its exact CPU fallback. Fragmented imports append a gather owed by this
     // command buffer; the copy into the attachment is deliberately recorded
     // only after the shared gather block below has filled it.
+    let mut target_guest_zero = false;
     let target_guest_texels =
         match guest_target_load(target_loads_guest_backing, req.target_guest_seed.as_ref()) {
             GuestTargetLoad::SharedBacking(seed) => {
@@ -4293,6 +4294,25 @@ pub(crate) unsafe fn execute_draw_inner(
                         seed.source.total_len,
                     );
                     Some(source)
+                }
+                // ZERO_SEED for guest-page target seeds (b037: a Safari phase of
+                // ten full-screen transitions seeded 157 of its 313 guest-page
+                // target loads from pages that were all zero - 747 MB, Finder
+                // 70 of 71, 401 MB - WebKit's freshly allocated 512-row tiles).
+                // Checked here, on the recorder, where the CPU fallback reads
+                // the same runs anyway: the scan is a read, the staging write it
+                // replaces a read plus a write into host-visible memory, and
+                // b038 put it on the drain thread instead and lost the gain.
+                // The pass still LOADs; the attachment is cleared to zero in
+                // place of the copy (see the seed block below).
+                None if zero_seed_mapping_mode() && guest_runs_are_zero(&seed.source) => {
+                    crate::runtime::drain::note_store_route("zero_seed_target_cleared");
+                    crate::runtime::drain::note_store_route_n(
+                        "zero_seed_target_cleared_bytes",
+                        seed.source.total_len,
+                    );
+                    target_guest_zero = true;
+                    None
                 }
                 None => {
                     let slot = {
@@ -5048,7 +5068,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &barrier,
         );
-    } else if target_guest_texels.is_some() {
+    } else if target_guest_texels.is_some() || target_guest_zero {
         // Recorded after the gather shared with sampled/buffer sources below.
     } else if let Some((seed_image, seed_access, seed_next_access)) = seed_from_resolved {
         unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
@@ -5444,6 +5464,53 @@ pub(crate) unsafe fn execute_draw_inner(
     // the device-local result of the gather just recorded, or the exact CPU
     // fallback. All three expose one buffer range and therefore share the same
     // target transition and copy.
+    if !target_loads_guest_backing && target_guest_zero {
+        // The all-zero guest seed: the bytes the copy below would have landed,
+        // written by a clear, with the same transitions around it.
+        unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
+        let (src_stage, src_access) =
+            target_prior_access(target_snapshotted, target_access, target_guest_backed)
+                .source_scope();
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            src_stage,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
+        ctx.device.cmd_clear_color_image(
+            cb,
+            target_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &vk::ClearColorValue::default(),
+            &[super::color_subresource_range()],
+        );
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(target_dst_access)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(target_pass_layout)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            target_dst_stage,
+            target_dependency,
+            &[],
+            &[],
+            &barrier,
+        );
+    }
     if !target_loads_guest_backing {
         if let (Some(source), Some(seed)) = (&target_guest_texels, &req.target_guest_seed) {
             unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
@@ -6219,6 +6286,7 @@ pub(crate) unsafe fn execute_draw_inner(
             let seed_copied = !target_loads_guest_backing
                 && (seed_slot.is_some()
                     || target_guest_texels.is_some()
+                    || target_guest_zero
                     || seed_from_resolved.is_some());
             super::pay_band::pass_rows(
                 load_uses_gpu_content,
@@ -9322,4 +9390,54 @@ mod depth_load_tests {
         }
         assert_eq!(checked, COMPARES.len() * OPS.len() * 2);
     }
+}
+
+/// Whether every byte a guest-page target seed's CPU fallback would copy is
+/// zero, stopping at the first 4 KiB block that is not (ZERO_SEED for target
+/// seeds).
+///
+/// The same runs over the same window `write_staging_from_runs` copies, so
+/// "zero" is exactly "the upload would have written zeroes". Row padding inside
+/// the window counts: a non-zero pad byte answers `false`, the safe direction.
+fn guest_runs_are_zero(source: &super::GuestRunSource) -> bool {
+    let (mut skip, mut left) = (source.source_offset, source.total_len);
+    for run in source.runs.iter() {
+        if left == 0 {
+            break;
+        }
+        let len = run.len();
+        if skip >= len {
+            skip -= len;
+            continue;
+        }
+        let n = (len - skip).min(left);
+        // SAFETY: a run's host pointer is a live RAMBlock alias for `run.len()`
+        // bytes for the VM lifetime (the contract `write_staging_from_runs`
+        // relies on); `skip + n <= run.len()`.
+        let bytes = unsafe {
+            std::slice::from_raw_parts((run.host_ptr() as *const u8).add(skip as usize), n as usize)
+        };
+        if bytes.chunks(4096).any(|c| c.iter().fold(0u8, |a, &b| a | b) != 0) {
+            return false;
+        }
+        skip = 0;
+        left -= n;
+    }
+    left == 0
+}
+
+/// TEMP (lab): ZERO_SEED for guest-page target seeds on the recorder - live
+/// `ZERO_SEED_MAPPING=on|off`, else `REIMS_VGPU_LAB_ZERO_SEED_MAPPING=off`; on
+/// by default, never on when ZERO_SEED itself is off.
+fn zero_seed_mapping_mode() -> bool {
+    if !crate::runtime::draw::zero_seed_mode() {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("ZERO_SEED_MAPPING") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_ZERO_SEED_MAPPING").as_deref() != Ok("off")
+    })
 }
