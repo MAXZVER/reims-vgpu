@@ -19928,15 +19928,17 @@ pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
             pass.textures_more = pass.textures_more.saturating_add(1);
         }
     }
-    // TEMP (lab, A/B): live `PLANE_RING_TEXT=on` pays the old per-draw text
-    // again (formatted and dropped) - the control arm for keeping fields.
-    if crate::runtime::lab_live::on("PLANE_RING_TEXT") == Some(true) {
-        std::hint::black_box(pass.to_string());
-    }
     let mut ring = PLANE_DRAW_RING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let window = ring.entry(color.mapping_id).or_default();
+    // Sized once: the compositor's planes are recycled mapping ids (a new
+    // window most frames on Weather), and a default deque grew through five
+    // allocations to the ring's depth - `RawVec<PlanePass>::grow_one` was ~1 %
+    // of the drain's busy samples (b069).
+    let window = ring.entry(color.mapping_id).or_insert_with(|| PlaneDrawWindow {
+        arrivals: 0,
+        passes: std::collections::VecDeque::with_capacity(PLANE_DRAW_RING_DEPTH),
+    });
     window.arrivals = window.arrivals.saturating_add(1);
     let passes = &mut window.passes;
     if passes.len() == PLANE_DRAW_RING_DEPTH {

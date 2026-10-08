@@ -84,13 +84,35 @@ fn refresh(l: &Live) {
 /// The live value of lab switch `name` (without the `REIMS_VGPU_LAB_` prefix),
 /// or `None` when the live file is unset, missing, or does not name it.
 pub(crate) fn value(name: &str) -> Option<String> {
-    let l = live()?;
-    refresh(l);
-    let st = l.state.lock().unwrap_or_else(|e| e.into_inner());
-    st.1.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+    with_value(name, |v| v.to_string())
 }
 
 /// [`value`] read as a switch: `on` is true, anything else false.
 pub(crate) fn on(name: &str) -> Option<bool> {
-    value(name).map(|v| v == "on")
+    with_value(name, |v| v == "on")
+}
+
+/// Look `name` up in this thread's copy of the parsed pairs, refreshed from
+/// the shared state only when its generation moved. Some switches are asked
+/// per draw or per bind (b069: `value` ~1.5 % of the drain's busy samples when
+/// it took the state lock and cloned a string each time).
+fn with_value<T>(name: &str, f: impl FnOnce(&str) -> T) -> Option<T> {
+    let l = live()?;
+    refresh(l);
+    thread_local! {
+        static COPY: std::cell::RefCell<(u64, Vec<(String, String)>)> =
+            const { std::cell::RefCell::new((u64::MAX, Vec::new())) };
+    }
+    let generation = l.generation.load(Relaxed);
+    COPY.with(|copy| {
+        let mut copy = copy.borrow_mut();
+        if copy.0 != generation {
+            let st = l.state.lock().unwrap_or_else(|e| e.into_inner());
+            // Read the generation again under the lock: `refresh` bumps it
+            // while holding the lock, so this pair is consistent.
+            copy.0 = l.generation.load(Relaxed);
+            copy.1 = st.1.clone();
+        }
+        copy.1.iter().find(|(k, _)| k == name).map(|(_, v)| f(v))
+    })
 }
