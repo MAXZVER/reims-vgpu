@@ -35,6 +35,9 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 incremental = true
+# TEMP (lab, 2026-10-09): line tables only, for the drain sampler's per-line
+# profiles (addr2line); no effect on code generation.
+debug = "line-tables-only"
 
 # Windows/Tahoe edition: the translator with the macOS 26 fixes, kept beside this
 # checkout (MacOnIntel/metal2vulkan, branch windows-tahoe) until they land upstream.
