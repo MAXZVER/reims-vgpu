@@ -304,10 +304,12 @@ pub fn note_registry_levels(state: &crate::model::DeviceState) {
 /// Every held bind resolution on this device.
 #[derive(Default, Debug)]
 pub struct BoundBuffers {
-    held: HashMap<Key, BoundBuffer>,
-    packed: HashMap<(u32, u32), PackedBufferResolution>,
+    // Fx-keyed (asked several times a draw; b105: SipHash under held_buffer_content and
+    // whole_runs_bind ~0.8 % of Weather's drain).
+    held: reims_vgpu_core::fasthash::FxHashMap<Key, BoundBuffer>,
+    packed: reims_vgpu_core::fasthash::FxHashMap<(u32, u32), PackedBufferResolution>,
     /// TEMP (lab): see [`WholeRuns`].
-    whole: HashMap<(u32, u32), WholeRuns>,
+    whole: reims_vgpu_core::fasthash::FxHashMap<(u32, u32), WholeRuns>,
     /// TEMP (lab, PASS_PREP step 3): moved by every retirement rule and by
     /// [`Self::clear`] — exactly the events that announce a page-table or
     /// naming change. A pool-planned buffer bind reads it when it plans and

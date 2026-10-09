@@ -1595,11 +1595,11 @@ struct Task {
     object_list: Option<ObjectList>,
     namespace: Namespace,
     heaps: Heaps,
-    resident: HashMap<ResourceId, Resident>,
+    resident: crate::fasthash::FxHashMap<ResourceId, Resident>,
     /// What each byte-less name is a window onto, where the guest said. An
     /// entry exists only for a name with no [`Self::resident`] row; the two
     /// tables never both hold one name.
-    aliases: HashMap<ResourceId, Aliasing>,
+    aliases: crate::fasthash::FxHashMap<ResourceId, Aliasing>,
 }
 
 /// Where a task's object list is and how big the guest said it is.
@@ -1624,8 +1624,8 @@ impl Task {
             object_list: None,
             namespace: Namespace::new(),
             heaps: Heaps::default(),
-            resident: HashMap::new(),
-            aliases: HashMap::new(),
+            resident: Default::default(),
+            aliases: Default::default(),
         }
     }
 
@@ -1728,7 +1728,7 @@ impl Task {
 /// — which is the one thing the plan says this device does not do.
 #[derive(Debug, Default)]
 pub struct Lifecycle {
-    tasks: HashMap<TaskId, Task>,
+    tasks: crate::fasthash::FxHashMap<TaskId, Task>,
     content: ContentLedger,
 }
 

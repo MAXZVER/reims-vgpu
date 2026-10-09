@@ -150,7 +150,14 @@ pub(crate) mod lab_tlb {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    const SLOTS: usize = 256;
+    /// Slots kept per thread. 4096 since 2026-10-09: an object list of a few
+    /// thousand entries spans hundreds of pages, and with 256 direct-mapped
+    /// slots about half the reads on Weather missed and walked (b105, with
+    /// TLB_KEEP neutral in b103: capacity, not the tranche rule).
+    const SLOTS: usize = 4096;
+    /// TEMP (lab, live `TLB_SLOTS=N`, a power of two up to [`SLOTS`]): the slots
+    /// in use, refreshed at each tranche start; 256 is the old size.
+    static IN_USE: AtomicU64 = AtomicU64::new(SLOTS as u64);
     /// The longest read (in pages) served from or filled into the cache; longer
     /// spans walk, so one large read cannot evict the cache's working set.
     pub(super) const TLB_SPAN_PAGES: usize = 16;
@@ -213,7 +220,19 @@ pub(crate) mod lab_tlb {
     }
 
     fn index(dir: u32, page: u64) -> usize {
-        ((page ^ (page >> 8) ^ u64::from(dir).wrapping_mul(0x9e37_79b9)) as usize) & (SLOTS - 1)
+        let mask = IN_USE.load(Relaxed) as usize - 1;
+        ((page ^ (page >> 12) ^ u64::from(dir).wrapping_mul(0x9e37_79b9)) as usize) & mask
+    }
+
+    /// Re-read the live slot count (a tranche starts).
+    pub(crate) fn refresh_slots() {
+        let n = crate::runtime::lab_live::value("TLB_SLOTS")
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| n.is_power_of_two() && *n <= SLOTS && *n >= 16)
+            .unwrap_or(SLOTS);
+        if IN_USE.swap(n as u64, Relaxed) != n as u64 {
+            new_epoch();
+        }
     }
 
     pub(super) fn get(dir: u32, page: u64) -> Option<u64> {

@@ -559,7 +559,7 @@ impl PipelineScope {
 /// The pipeline objects of one session.
 #[derive(Debug, Default)]
 pub struct PipelineTable {
-    pipelines: HashMap<PipelineId, Pipeline>,
+    pipelines: crate::fasthash::FxHashMap<PipelineId, Pipeline>,
     /// What an executor has published about each pipeline's shaders.
     ///
     /// Beside [`Self::pipelines`] rather than a field of [`Pipeline`], which is
@@ -571,7 +571,7 @@ pub struct PipelineTable {
     ///
     /// Keyed by [`PipelineId`], so what one task published is answered to that
     /// task only.
-    usage: HashMap<PipelineId, PublishedUsage>,
+    usage: crate::fasthash::FxHashMap<PipelineId, PublishedUsage>,
     census: Census,
 }
 

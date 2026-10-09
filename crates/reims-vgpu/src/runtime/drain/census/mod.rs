@@ -2982,6 +2982,9 @@ static TRANCHE_START_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Mark the start of a drain tranche, for [`tranche_elapsed_us`].
 pub fn note_tranche_started(now_us: u64) {
     TRANCHE_START_US.store(now_us, std::sync::atomic::Ordering::Relaxed);
+    if crate::runtime::lab_live::present() {
+        crate::runtime::gva_mem::lab_tlb::refresh_slots();
+    }
     if !crate::runtime::gva_mem::lab_tlb::keep_across_tranches() {
         crate::runtime::gva_mem::lab_tlb::new_epoch();
     }

@@ -2751,8 +2751,8 @@ type ResolveMemoEntry = (u32, u32, u32, SampledSourceRequest);
 
 thread_local! {
     /// TEMP (lab, RESOLVE_MEMO): this render encoder's resolved sampled sources.
-    static RESOLVE_MEMO: std::cell::RefCell<std::collections::HashMap<ResolveMemoKey, ResolveMemoEntry>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static RESOLVE_MEMO: std::cell::RefCell<reims_vgpu_core::fasthash::FxHashMap<ResolveMemoKey, ResolveMemoEntry>> =
+        std::cell::RefCell::new(reims_vgpu_core::fasthash::FxHashMap::with_hasher(Default::default()));
 }
 
 /// TEMP (lab, live `RESOLVE_MEMO_ALL=on|off`, else `REIMS_VGPU_LAB_RESOLVE_MEMO_ALL=off`
@@ -5879,13 +5879,13 @@ struct RunMemoEntry {
 
 #[derive(Default)]
 struct RunMemo {
-    entries: std::collections::HashMap<u64, RunMemoEntry>,
+    entries: reims_vgpu_core::fasthash::FxHashMap<u64, RunMemoEntry>,
 }
 
 impl RunMemo {
     fn key(window: &[u64], page: u64, head_off: u64, span: u64) -> u64 {
         use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = reims_vgpu_core::fasthash::FxHasher::default();
         (window, page, head_off, span).hash(&mut h);
         h.finish()
     }
