@@ -445,8 +445,20 @@ unsafe impl GlobalAlloc for ThreadCache {
                     }
                 }
                 if !head.is_null() {
-                    (*cache).heads[c] = *(head as *mut *mut u8);
+                    let next = *(head as *mut *mut u8);
+                    (*cache).heads[c] = next;
                     (*cache).counts[c] -= 1;
+                    // The next block is often one another thread freed (the
+                    // depot's batches, the recorder's drops), so its link is
+                    // cold in this core's cache: fetch it now, while the caller
+                    // uses this one, instead of stalling on it at the next
+                    // allocation (b105: the pop's own time 4 % of the drain).
+                    #[cfg(target_arch = "x86_64")]
+                    if !next.is_null() {
+                        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
+                            next as *const i8,
+                        );
+                    }
                     return head;
                 }
             }
