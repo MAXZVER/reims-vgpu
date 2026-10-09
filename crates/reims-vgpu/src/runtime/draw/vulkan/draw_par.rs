@@ -552,7 +552,24 @@ fn cpu_read_worker<M: HostMemory + HostOps>(
     {
         return Err(Bail::BufferRead);
     }
+    // TEMP (lab, DRAW_PAR v15): into this worker's arena, when it has one.
+    if let Some(slice) = JOB_STAGER.with(|s| s.borrow().as_ref().and_then(|st| st.stage_bytes(&buf))) {
+        crate::runtime::drain::note_store_route("draw_par_staged_bind");
+        return Ok(crate::backend::vulkan::engine::BufferContent::Staged(slice));
+    }
     Ok(crate::backend::vulkan::engine::BufferContent::from(buf))
+}
+
+thread_local! {
+    /// TEMP (lab, DRAW_PAR v15): the arena the running prepare job stages
+    /// CPU-read bind bytes into (`prepare_job` sets and clears it).
+    static JOB_STAGER: std::cell::RefCell<Option<super::pass_stage::Stager>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn stage_on() -> bool {
+    crate::runtime::par::staging::draw_par_stage_wanted()
+        && crate::runtime::lab_live::on("DRAW_PAR_STAGE") != Some(false)
 }
 
 /// The obligations a serial CPU read of guest bytes settles — a debt the
@@ -1423,6 +1440,13 @@ fn prepare_job(
     let mut host = env.host();
     let mut req = req.clone();
     let mut log = PrepareLog::default();
+    let stager = if stage_on() {
+        crate::backend::vulkan::engine::pass_stage::arenas()
+            .and_then(|arenas| super::pass_stage::Stager::of(arenas, usize::from(env.worker.0)))
+    } else {
+        None
+    };
+    JOB_STAGER.with(|s| *s.borrow_mut() = stager);
     let outcome = super::try_metal2vulkan_draw_with(
         &mut StateAccess::Worker(st),
         &mut host,
@@ -1430,6 +1454,7 @@ fn prepare_job(
         *writeback_guest,
         Some(&mut log),
     );
+    JOB_STAGER.with(|s| *s.borrow_mut() = None);
     match (outcome, log.bail, log.done.is_some()) {
         (Ok(_), None, true) => Some(PreparedDraw {
             task_id: req.task_id,

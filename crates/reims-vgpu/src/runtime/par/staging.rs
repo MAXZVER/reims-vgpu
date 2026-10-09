@@ -172,11 +172,35 @@ pub(crate) fn chunk_bytes() -> u64 {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             // 48 MiB: the 5K colour seed is 44 MB and refused to fit 8 MiB
-            // (n207: arena_full 1.1 GB a boot bypassing the rail).
-            .unwrap_or(49152)
+            // (n207: arena_full 1.1 GB a boot bypassing the rail). DRAW_PAR's
+            // buffer staging alone stages sub-16 KiB windows: 4 MiB chunks.
+            .unwrap_or(if enabled() { 49152 } else { 4096 })
             .max(64);
         kb.saturating_mul(1024)
     })
+}
+
+/// TEMP (lab, DRAW_PAR v15, `REIMS_VGPU_LAB_DRAW_PAR_STAGE=off` disables;
+/// live `DRAW_PAR_STAGE`): the DRAW_PAR workers copy the guest bytes a bind
+/// reads on the CPU straight into their own arena, so the recorder binds the
+/// window instead of acquiring staging and copying them (b136: the recorder's
+/// buffer staging was 1.5 of its 5.3 us a draw). Independent of PASS_STAGE:
+/// only the arenas are shared, none of that rail's planners run.
+pub(crate) fn draw_par_stage_wanted() -> bool {
+    #[cfg(test)]
+    {
+        return false;
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_PAR_STAGE").as_deref() != Ok("off"))
+    }
+}
+
+/// Whether the worker arenas are to be created at all.
+pub(crate) fn arenas_wanted() -> bool {
+    enabled() || draw_par_stage_wanted()
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_PASS_STAGE_CHUNKS`, clamped 1..=8.
@@ -186,7 +210,7 @@ pub(crate) fn chunks_per_arena() -> usize {
         std::env::var("REIMS_VGPU_LAB_PASS_STAGE_CHUNKS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(2)
+            .unwrap_or(if enabled() { 2 } else { 4 })
             .clamp(1, 8)
     })
 }

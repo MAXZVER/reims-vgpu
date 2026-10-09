@@ -168,7 +168,7 @@ pub(crate) fn arena_of<'a>(arenas: &'a Arc<[WorkerArena]>, worker: u16) -> Optio
 /// `ctx` must be the live device, and the caller must hold the engine (every
 /// other Vulkan call in the process goes through it).
 pub(crate) unsafe fn ensure_installed(ctx: &DeviceContext) {
-    if arenas().is_some() || !crate::runtime::par::staging::enabled() {
+    if arenas().is_some() || !crate::runtime::par::staging::arenas_wanted() {
         return;
     }
     let population = crate::runtime::par::staging::population();
