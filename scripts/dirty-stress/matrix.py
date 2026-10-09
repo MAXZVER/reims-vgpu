@@ -103,6 +103,13 @@ cfgs = [
     # Informational, not a control: unlike the queried path, a hashed set is hashed again once wholly read-only, so a
     # store that raced the unpaused protect is caught by that hash (2026-10-09: 0 violations, ~480 faults a row).
     ('hash+wp_hashed: protects without pausing the writers', dict(WP0, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on', G + 'DIRTY_WP_HASHED': 'on', G + 'DIRTY_WP_HASHED_MIN': '8'}), '?'),
+    # DIRTY_WP_OVERLAP (opt-in, 2026-10-09): sets protected over pages another protected set holds; a page keeps
+    # read-only while any protected set counts it. Every set eligible (min 1, 1 clean sync) maximises overlaps.
+    ('wp overlap: nopause, every set (min 1), 1 clean sync', dict(WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_MIN': '1', G + 'DIRTY_WP_STREAK': '1', G + 'DIRTY_WP_OVERLAP': 'on'}), '0'),
+    ('wp overlap: paused protect, every set', dict(WP, **{G + 'DIRTY_WP_MIN': '1', G + 'DIRTY_WP_STREAK': '1', G + 'DIRTY_WP_OVERLAP': 'on'}), '0'),
+    ('wp overlap: nopause + merge off, named + ring + hole=tail', {**NAMED, **RING, **WP, 'STRESS_WP_NOPAUSE': '1', G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_MIN': '1', G + 'DIRTY_WP_STREAK': '1', G + 'DIRTY_WP_OVERLAP': 'on', G + 'DIRTY_WP_MERGE': 'off'}, '0'),
+    ('wp overlap + hash+wp_hashed: every set, nopause', {**WP0, 'STRESS_WP_NOPAUSE': '1', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_HASH': 'on', G + 'DIRTY_WP_HASHED': 'on', G + 'DIRTY_WP_HASHED_MIN': '1', G + 'DIRTY_WP_MIN': '1', G + 'DIRTY_WP_STREAK': '1', G + 'DIRTY_WP_OVERLAP': 'on'}, '0'),
+    ('CONTROL wp overlap: protects without pausing the writers', dict(WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_WP_MIN': '1', G + 'DIRTY_WP_STREAK': '1', G + 'DIRTY_WP_OVERLAP': 'on'}), '>0'),
     ('CONTROL hash: drain reads lagged', {'STRESS_DRAIN_LAGGED': '1', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on'}, '>0'),
     ('wp calm=off: wp nopause, ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_CALM': 'off'}), '0'),
     ('wp calm=off: wp nopause + wp_hole, ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_HOLE': 'on', G + 'DIRTY_WP_CALM': 'off'}), '0'),
