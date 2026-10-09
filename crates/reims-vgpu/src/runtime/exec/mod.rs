@@ -5638,18 +5638,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                         crate::runtime::draw::vulkan::PassPrep::open(&*state, task_id, tables);
                     None
                 } else {
-                    // TEMP (lab, SYNC_AHEAD_SOLO): the pass's write-tracking sets
-                    // to the host's sync workers before the draws ask for them.
-                    crate::runtime::draw::vulkan::sync_ahead_stream(
-                        &*state,
-                        &*host,
-                        draw_list.iter().flat_map(|pd| {
-                            [
-                                pd.fragment_textures.as_slice(),
-                                pd.vertex_textures.as_slice(),
-                            ]
-                        }),
-                    );
                     Some(crate::runtime::draw::vulkan::prefetch_stream(
                         &*state,
                         task_id,

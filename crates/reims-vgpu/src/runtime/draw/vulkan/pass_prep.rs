@@ -693,56 +693,6 @@ impl<'a> PassPrep<'a> {
         }
     }
 
-}
-
-/// TEMP (lab, live `SYNC_AHEAD_SOLO=on|off`, else `REIMS_VGPU_LAB_SYNC_AHEAD_SOLO`;
-/// off unless `on`): with PassPrep off (the default since b068), the one part of
-/// it that paid for itself on every load - handing the pass's write-tracking
-/// sets to the host's sync workers before the draws need them - went with it.
-/// b078: `reims_vgpu_dirty_gen` -> `dirty_sync_one` is 12 % of the drain's busy
-/// time on Safari, the foreground content hash of sets nobody synced ahead.
-/// This hands every sampled source of the stream to those workers once, at the
-/// stream's start, and does not wait; a set a worker has not reached when its
-/// bind asks is synced by the bind, as before.
-pub(crate) fn sync_ahead_stream<'a, H: crate::runtime::host::HostOps>(
-    state: &DeviceState,
-    host: &H,
-    tables: impl Iterator<Item = &'a [TextureBind]>,
-) {
-    if cfg!(test) {
-        return;
-    }
-    let on = crate::runtime::lab_live::on("SYNC_AHEAD_SOLO").unwrap_or_else(|| {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SYNC_AHEAD_SOLO").as_deref() == Ok("on"))
-    });
-    if !on {
-        return;
-    }
-    let mut seen = HashSet::new();
-    let mut tokens = Vec::new();
-    for table in tables {
-        for bind in table {
-            if bind.texture_ref == 0 || !seen.insert(bind.texture_ref) {
-                continue;
-            }
-            let Some(resource) = bind.resource.as_ref() else {
-                continue;
-            };
-            if let Some(token) = sample_plan::plan_guest_write_token(state, bind.texture_ref, resource) {
-                tokens.push(token);
-            }
-        }
-    }
-    if tokens.is_empty() {
-        return;
-    }
-    crate::runtime::drain::note_store_route("lab_sync_ahead_solo_streams");
-    crate::runtime::drain::note_store_route_n("lab_sync_ahead_solo_tokens", tokens.len() as u64);
-    host.guest_write_sync_ahead(&tokens);
-}
-
-impl<'a> PassPrep<'a> {
     /// TEMP (lab, `REIMS_VGPU_LAB_SYNC_AHEAD=on`): hand the write-tracking sets of
     /// every sampled source past the first chunk to the host's sync workers, once,
     /// before the first chunk is planned — and do not wait for them.
