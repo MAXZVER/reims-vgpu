@@ -3497,13 +3497,16 @@ fn run_parked_packet<H: HostMemory + HostOps>(
         }
         let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
         lab_act(lab_prev_act);
-        census::note_drain_proc(work.packet().opcode, started.elapsed().as_nanos() as u64);
-        lab_chan::lat_ran(domain, work.packet().completion_stamp, started.elapsed().as_micros() as u64);
-        lab_dag_run(ingress.0, domain, work.packet().opcode, started.elapsed().as_micros() as u64);
+        // One clock read for the four consumers below.
+        let ran = started.elapsed();
+        let ran_us = ran.as_micros() as u64;
+        census::note_drain_proc(work.packet().opcode, ran.as_nanos() as u64);
+        lab_chan::lat_ran(domain, work.packet().completion_stamp, ran_us);
+        lab_dag_run(ingress.0, domain, work.packet().opcode, ran_us);
         if lab_hold_present_stamp() {
             if state.lab_hold_since.is_some() {
                 state.lab_hold_packets += 1;
-                state.lab_hold_exec_us += started.elapsed().as_micros() as u64;
+                state.lab_hold_exec_us += ran_us;
             } else if matches!(
                 work.packet().opcode,
                 CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3

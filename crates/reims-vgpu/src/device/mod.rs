@@ -886,9 +886,19 @@ pub fn device_drain(id: u64) -> bool {
     // measures how long a slot the guest named takes to appear, so the sampling
     // interval is the resolution of the answer. Returns immediately when nothing
     // is watched, which is every tranche on every rail but macos-26.
-    post_sweep(PostSweep::SlotRecheck, || {
-        crate::runtime::objects::slot_recheck::sweep(&device.state, &host)
-    });
+    // TEMP (lab, 2026-10-10): at most every 10 ms, and not at all with the
+    // route census off - measure-only, and per tranche it walked 300-430
+    // watches with their guest reads (~5-6 ms/s of the drain on Weather, b115).
+    if crate::runtime::drain::census::route_census_on() {
+        static LAST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let last = LAST_US.load(std::sync::atomic::Ordering::Relaxed);
+        if busy_end_us.saturating_sub(last) >= 10_000 {
+            LAST_US.store(busy_end_us, std::sync::atomic::Ordering::Relaxed);
+            post_sweep(PostSweep::SlotRecheck, || {
+                crate::runtime::objects::slot_recheck::sweep(&device.state, &host)
+            });
+        }
+    }
     // The ordering plane's own residue, on the same one-second cadence as the
     // levels above and for the reason `backing_outstanding_census` is emitted
     // beside `store_routes`: the routes count what *happened* to a pipeline and

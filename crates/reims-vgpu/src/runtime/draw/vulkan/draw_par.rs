@@ -1161,8 +1161,24 @@ pub(crate) fn overlap_on() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_PAR_OVERLAP").as_deref() != Ok("off"))
 }
 
-/// Records at a region's head whose sampled sources the drain primes.
-const PRIME_HEAD: usize = 8;
+/// Prime the resolve memo with the sampled sources of a stream's records 2+,
+/// once, on the drain, before its first region (see `lab_resolve_memo_prime`).
+/// Once per stream, not per region: a region that stops re-primed its whole
+/// remainder in v9 (quadratic, b128), and a region priming only its head left
+/// the helpers resolving the rest themselves, each job its own big linear
+/// textures (b129 v10: the drain parked on them 19 % of its time).
+/// Live `DRAW_PAR_PRIME=off` skips it.
+pub(crate) fn prime_stream<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    reqs: &[(DrawEncodeRequest, bool)],
+) {
+    if reqs.is_empty() || crate::runtime::lab_live::on("DRAW_PAR_PRIME") == Some(false) {
+        return;
+    }
+    let primed = super::lab_resolve_memo_prime(state, host, reqs);
+    crate::runtime::drain::note_store_route_n("draw_par_memo_primed", u64::from(primed));
+}
 
 /// What a shared-state commit owes the device state, landed by the drain
 /// with its exclusive access once the region's helpers are quiescent: the
@@ -1357,19 +1373,9 @@ where
     let jobs = &reqs[nc..];
     // The fresh records' sampled sources, once, on the drain (see
     // `lab_resolve_memo_prime`); the carried ones are already prepared.
-    // TEMP (lab, live `DRAW_PAR_PRIME=off`): skip it - in a region the prime
-    // is serial drain time ahead of the helpers' start, and the helpers resolve
-    // (and memo) a source themselves on a miss; the price is the duplicate
-    // resolves of jobs that start together on one new source.
+    // The sampled sources are primed once per stream by the caller
+    // (`prime_stream`), not per region.
     if !jobs.is_empty() {
-        if crate::runtime::lab_live::on("DRAW_PAR_PRIME") != Some(false) {
-            // Only the region's head: a region that stops early re-primes
-            // from its stop, so priming the whole remainder each time was
-            // quadratic in the stream (b128: binds 1.63 -> 2.19 us/draw).
-            let head = &jobs[..jobs.len().min(PRIME_HEAD)];
-            let primed = super::lab_resolve_memo_prime(state, host, head);
-            crate::runtime::drain::note_store_route_n("draw_par_memo_primed", u64::from(primed));
-        }
         crate::runtime::drain::note_store_route_n("draw_par_offered", jobs.len() as u64);
     }
     crate::runtime::drain::note_store_route("draw_par_regions");

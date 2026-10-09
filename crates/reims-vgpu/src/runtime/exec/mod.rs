@@ -5823,6 +5823,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 (r, do_writeback)
                             })
                             .collect();
+                        crate::runtime::draw::vulkan::draw_par::prime_stream(state, host, &ov_reqs);
                     }
                 }
                 if !ov_reqs.is_empty() && di >= ov_base {

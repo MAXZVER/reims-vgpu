@@ -551,6 +551,42 @@ impl Handoff {
         self.settle_slow(site);
     }
 
+    /// TEMP (lab, RETAIN_TARGETED): wait until `done` holds - a condition the
+    /// worker's job completions make true (a resident's last writer finished) -
+    /// rather than for every job out. Spins first (a job is ~5 us), then parks
+    /// on the per-job completion signal; counted at `site` like a settle.
+    #[cold]
+    #[track_caller]
+    pub(crate) fn settle_until(&self, site: JoinSite, mut done: impl FnMut() -> bool) {
+        let started = Instant::now();
+        let spin_until = started + JOIN_SPIN.max(Duration::from_micros(50)).min(Duration::from_micros(200));
+        let mut i = 0u32;
+        while !done() {
+            if !self.in_flight.load(Ordering::Acquire) {
+                break;
+            }
+            std::hint::spin_loop();
+            i = i.wrapping_add(1);
+            if i & 7 == 0 && Instant::now() >= spin_until {
+                let mut g = self.inner.lock();
+                while !done() && g.outstanding != 0 {
+                    g.waiters += 1;
+                    self.done_cv.wait_for(&mut g, Duration::from_micros(500));
+                    g.waiters -= 1;
+                }
+                break;
+            }
+        }
+        let ns = started.elapsed().as_nanos() as u64;
+        let s = site.index();
+        self.stats.join_n[s].fetch_add(1, Ordering::Relaxed);
+        if ns > 1_000 {
+            self.stats.join_blocked[s].fetch_add(1, Ordering::Relaxed);
+        }
+        self.stats.join_ns[s].fetch_add(ns, Ordering::Relaxed);
+        self.stats.join_max_ns[s].fetch_max(ns, Ordering::Relaxed);
+    }
+
     #[cold]
     #[track_caller]
     fn settle_slow(&self, site: JoinSite) {
@@ -857,6 +893,21 @@ pub(crate) fn settle_unless_pending(is_drain: bool, site: JoinSite, identity: &s
         if !pending {
             crate::runtime::drain::note_store_route("lab_retain_fast_skipped");
             return false;
+        }
+        // TEMP (lab, live `RETAIN_TARGETED=off` restores the full settle): wait
+        // for the jobs that write this resident, not for the whole queue. The
+        // queue is FIFO and only a writer changes what the registry answers for
+        // it, so once the last one is done the answer is the one a full settle
+        // gives - the state the no-writer case above already acts on. b129
+        // (overlap, queue 64): the full settle here was 7.5 % of the drain.
+        if !crate::runtime::par::planning()
+            && crate::runtime::lab_live::on("RETAIN_TARGETED") != Some(false)
+        {
+            DRAW.settle_until(site, || {
+                !PENDING_TARGETS.lock().iter().any(|(id, _)| id == identity)
+            });
+            crate::runtime::drain::note_store_route("lab_retain_targeted");
+            return true;
         }
     }
     settle_if_drain(is_drain, site);
