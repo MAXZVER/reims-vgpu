@@ -264,6 +264,30 @@ impl LinearMemoFact {
     }
 }
 
+fn linear_zc_bail_route(bail: sample_plan::SampleBail) -> &'static str {
+    use sample_plan::SampleBail as B;
+    match bail {
+        B::NullRef => "draw_par_lin_zc_null_ref",
+        B::BufferTexture => "draw_par_lin_zc_buffer_texture",
+        B::RefTextureView => "draw_par_lin_zc_ref_view",
+        B::NotSurface => "draw_par_lin_zc_not_surface",
+        B::ColdMapperRef => "draw_par_lin_zc_cold_mapper_ref",
+        B::ColdBacking => "draw_par_lin_zc_cold_backing",
+        B::NoGeometry => "draw_par_lin_zc_no_geometry",
+        B::ColdLease => "draw_par_lin_zc_cold_lease",
+        B::GuestReplaced => "draw_par_lin_zc_guest_replaced",
+        B::NoHostCache => "draw_par_lin_zc_no_host_cache",
+        B::LowerRung => "draw_par_lin_zc_lower_rung",
+        B::ZeroCopyDeclined => "draw_par_lin_zc_declined",
+        B::OwedFrame => "draw_par_lin_zc_owed_frame",
+        B::ColdWindow => "draw_par_lin_zc_cold_window",
+        B::ColdWitness => "draw_par_lin_zc_cold_witness",
+        B::UpperRung => "draw_par_lin_zc_upper_rung",
+        B::ColdPacked => "draw_par_lin_zc_cold_packed",
+        B::MemoBudget => "draw_par_lin_zc_memo_budget",
+    }
+}
+
 /// The witness-backed halves of a gathered request — what a commit may change
 /// against the prediction a worker assembled with.
 type GatherMarks = (
@@ -709,7 +733,13 @@ pub(super) fn resolve_sampled_source_worker<M: HostMemory + HostOps>(
                     });
                     Ok(served)
                 }
-                Err(_) => resolve_linear_worker(state, host, log, task_id, texture_ref, &resource),
+                Err(bail) => {
+                    // Which refusal sent the bind to the memo rung, by the
+                    // planner's own name (b121: a quarter of Weather's records
+                    // still bail at the gather floor below).
+                    crate::runtime::drain::note_store_route(linear_zc_bail_route(bail));
+                    resolve_linear_worker(state, host, log, task_id, texture_ref, &resource)
+                }
             }
         }
         // The surface ladder fell past every host-side copy: the zero-copy
@@ -790,15 +820,27 @@ fn resolve_linear_worker<M: HostMemory + HostOps>(
     // The zero-copy rail above this rung: a packed alias of the allocation
     // serves directly, and a window the gather floor admits is gathered on
     // the witness. Both are the drain's.
-    if matches!(
-        state.bound_buffers.packed(task_id, texture_ref),
-        Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(_))
-    ) {
-        return Err(Bail::LinearPacked);
-    }
-    if let Ok((native, _, _)) = translate::pixel::sampled_pixels(declared_format) {
-        if sampled_gather_floor_pure(native, span) {
-            return Err(Bail::LinearFloor);
+    // The serial zero-copy rail rests on the allocation's packed alias: where
+    // one stands the rail serves (the drain's); where the construction was
+    // refused for this geometry (`Unavailable`) the rail declines and the
+    // ladder reads the memo rung whatever the span - b121: a quarter of
+    // Weather's and 71 % of Safari's records are those textures. Never primed
+    // means the drain would construct, so the worker leaves a floor-clearing
+    // window to it.
+    match state.bound_buffers.packed(task_id, texture_ref) {
+        Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(_)) => {
+            return Err(Bail::LinearPacked);
+        }
+        Some(crate::runtime::bound_buffers::PackedBufferResolution::Unavailable { gva: g, size: sz })
+            if tex.allocation_size != 0
+                && tex.allocation_base_gva(state.page_shift) == Some(*g)
+                && *sz == tex.allocation_size => {}
+        _ => {
+            if let Ok((native, _, _)) = translate::pixel::sampled_pixels(declared_format) {
+                if sampled_gather_floor_pure(native, span) {
+                    return Err(Bail::LinearFloor);
+                }
+            }
         }
     }
     guest_bytes_readable(state, host, task_id, texture_ref, gva, span)?;
@@ -933,7 +975,21 @@ fn commit_prepared<M: HostMemory + HostOps>(
     }
     // The plans, in bind order, each validated at the key it served and its
     // facts landed — the same facts the serial ladder would have made.
+    let registry_generation = state.bound_buffers.generation();
     for b in &log.buffers {
+        // Planned under this registry generation: the worker validated it
+        // against the state the commit sees (see `land_prepared_buffer_unchecked`).
+        if b.plan.generation() == registry_generation {
+            buffer_plan::land_prepared_buffer_unchecked(
+                state,
+                &b.plan,
+                task_id,
+                b.buffer_ref,
+                b.offset,
+                b.cap,
+            );
+            continue;
+        }
         match buffer_plan::commit_prepared_buffer(
             state,
             &b.plan,

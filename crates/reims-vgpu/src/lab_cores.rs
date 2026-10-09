@@ -29,6 +29,20 @@ pub(crate) fn pin_to_performance_cores(who: &str) {
     if !std::env::var("REIMS_VGPU_LAB_PCORES").is_ok_and(|v| v == "on") {
         return;
     }
+    pin_to_performance_cores_now(who);
+}
+
+/// TEMP (lab, DRAW_PAR, `REIMS_VGPU_LAB_PAR_PCORES=on`): the pool's helpers
+/// alone on the performance cores. b120: a helper's job took 8.1 us against
+/// the drain's ~3.4 for the same work, and the fork-join waits for the slowest.
+pub(crate) fn pin_pool_to_performance_cores(who: &str) {
+    if !std::env::var("REIMS_VGPU_LAB_PAR_PCORES").is_ok_and(|v| v == "on") {
+        return;
+    }
+    pin_to_performance_cores_now(who);
+}
+
+fn pin_to_performance_cores_now(who: &str) {
     let ids = performance_cpu_set_ids();
     if ids.is_empty() {
         return;

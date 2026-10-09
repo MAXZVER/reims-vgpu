@@ -752,6 +752,7 @@ impl Drop for ItemDone<'_> {
 /// A helper's whole life: register with RCU, serve batches, deregister.
 fn worker_main(shared: &Arc<Shared>, index: usize) {
     crate::lab_cores::device_thread_priority("par-pool");
+    crate::lab_cores::pin_pool_to_performance_cores("par-pool");
     let attachment = shared.registrar.attach();
     shared.attached.fetch_add(1, Ordering::AcqRel);
     let member = WorkerId(index as u16);

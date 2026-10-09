@@ -770,6 +770,47 @@ pub(super) fn commit_prepared_buffer(
     commit_buffer_plan(state, plan, task_id, buffer_ref, resource, offset, extent_cap, true)
 }
 
+/// TEMP (lab, DRAW_PAR): the commit of a plan whose registry generation is
+/// the one it was planned under — nothing retired in between, and the only
+/// writes since were this chunk's own commits (holds, memo entries, witness
+/// moves) and submits, none of which can take a rail from under a plan. Lands
+/// the walked window's hold where no entry stands and validates nothing else.
+/// A packed alias the serial fallback of an earlier record constructed for
+/// the same reference makes this hold a per-offset twin of it (a registry
+/// cost, not a wrong answer: both name the same allocation).
+pub(super) fn land_prepared_buffer_unchecked(
+    state: &mut DeviceState,
+    plan: &BufferContentPlan,
+    task_id: u32,
+    buffer_ref: u32,
+    offset: u64,
+    extent_cap: Option<u64>,
+) {
+    if let BufferRail::Walked { bound, .. } = &plan.rail {
+        if state
+            .bound_buffers
+            .get(task_id, buffer_ref, offset, extent_cap)
+            .is_none()
+        {
+            BoundBufferHold {
+                task: task_id,
+                buffer_ref,
+                offset,
+                cap: extent_cap,
+                bound,
+            }
+            .land(state);
+        }
+    }
+}
+
+impl BufferContentPlan {
+    /// TEMP (lab, DRAW_PAR): the registry generation the plan was made under.
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 /// TEMP (lab, DRAW_PAR): whether a bind's window sits below the zero-copy
 /// floor — the population whose serial answer is the CPU read (see
 /// `stage_or_bail`).

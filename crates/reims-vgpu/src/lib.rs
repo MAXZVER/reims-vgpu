@@ -157,6 +157,7 @@ mod lab_cores;
 #[cfg(not(windows))]
 mod lab_cores {
     pub(crate) fn pin_to_performance_cores(_who: &str) {}
+    pub(crate) fn pin_pool_to_performance_cores(_who: &str) {}
     pub(crate) fn device_thread_priority(_who: &str) {}
     #[allow(dead_code)]
     pub(crate) fn pin_device_ccd(_who: &str) {}
