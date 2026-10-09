@@ -754,14 +754,23 @@ impl Drop for PendingTargets {
     }
 }
 
-/// TEMP (lab, live `RETAIN_FAST=on|off`, off by default until its A/B): whether
-/// a drain question about one resident ([`settle_unless_pending`]) skips the
-/// wait for deferred draws that do not write it.
+/// TEMP (lab, live `RETAIN_FAST=on|off`, else `REIMS_VGPU_LAB_RETAIN_FAST=off` to
+/// disable; on by default since b091): whether a drain question about one
+/// resident ([`settle_unless_pending`]) skips the wait for deferred draws that
+/// do not write it. p070/p077 left it opt-in because the waits it removed moved
+/// to the stream-end completion word; STAMP_DEFER now holds that word behind
+/// the recorder instead of the drain. b091 (ROUTES=off): drain joins 15 -> 10
+/// ms/s on the reveal-desktop, window fps reveal 126 against 122, Safari 126
+/// against 122, Finder 105 against 103, Weather even; ART 0.
 pub(crate) fn lab_retain_fast() -> bool {
     if cfg!(test) {
         return false;
     }
-    crate::runtime::lab_live::on("RETAIN_FAST").unwrap_or(false)
+    if let Some(on) = crate::runtime::lab_live::on("RETAIN_FAST") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RETAIN_FAST").as_deref() != Ok("off"))
 }
 
 /// The drain's settle before a question about `identity` alone: skipped when no
