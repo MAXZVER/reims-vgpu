@@ -1460,7 +1460,10 @@ fn lab_recorder_gva_store() -> bool {
 }
 
 /// TEMP (lab, live `DEFER_SURFACE_STORE=on|off`, else
-/// `REIMS_VGPU_LAB_DEFER_SURFACE_STORE=on`; off unless `on`): a stream's last
+/// `REIMS_VGPU_LAB_DEFER_SURFACE_STORE=off` to disable; on by default since b089 -
+/// every copied-resident surface Store deferred, drain joins on the recorder
+/// halved again, drain us a draw Weather 11.57 -> 10.67, reveal-desktop 18.4 ->
+/// 16.6, Finder 21.9 -> 20.4, Safari even; fps even or up; ART 0): a stream's last
 /// record whose Store goes to a copied surface resident is handed to the
 /// recorder like the GVA store, instead of running on the drain behind a join.
 /// b077/b085: after STAMP_DEFER the largest join left is this one (engine
@@ -1474,7 +1477,7 @@ pub(crate) fn lab_defer_surface_store() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DEFER_SURFACE_STORE").as_deref() == Ok("on"))
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DEFER_SURFACE_STORE").as_deref() != Ok("off"))
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_RECORDER_STORE_JOIN=off` leaves a deferred
@@ -14097,7 +14100,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             && req.visibility.is_none()
             && resources.occlusion_query.is_none()
             && resources.skip_readback
-            && !resources.record_guest_store
         {
             if let Some(identity) = surface_resident_store.clone() {
                 if crate::backend::vulkan::engine::surface_store_guest_backed_lock_free(
@@ -14105,6 +14107,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     resources.guest_target_memory.is_some(),
                 ) == Some(false)
                 {
+                    // Every surface Store asks for a guest store, and the engine
+                    // records one only into a guest-backed target; this one is
+                    // not, so the ask is withdrawn and the deferred draw keeps
+                    // the recorder's rule that it never publishes into guest
+                    // memory (`guest_writes_outstanding`).
+                    resources.record_guest_store = false;
                     pass_stage::arm_seed_stage(&mut resources);
                     crate::backend::vulkan::engine::submit_deferred_draw(
                         state,
