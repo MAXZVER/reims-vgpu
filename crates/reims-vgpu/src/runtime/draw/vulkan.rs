@@ -1452,7 +1452,7 @@ fn sampled_mip_chain(
 /// by default (5K drag, fgs*: busy 817/811 -> 775/785 ms/s, 17.6 -> 16.0 us a
 /// draw, 101.4/100.5 -> 102.1/102.5 Hz); `REIMS_VGPU_LAB_RECORDER_GVA_STORE=off`
 /// keeps it synchronous. Latched.
-fn lab_recorder_gva_store() -> bool {
+pub(super) fn lab_recorder_gva_store() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var("REIMS_VGPU_LAB_RECORDER_GVA_STORE").map_or(true, |v| v != "off");
@@ -14686,15 +14686,47 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             if !crate::backend::vulkan::engine::recorder::enabled() {
                 worker_bail!(Bail::RecorderOff);
             }
-            if !resident_render_chain {
-                worker_bail!(Bail::NotChain);
-            }
             if req.visibility.is_some() || resources.occlusion_query.is_some() {
                 worker_bail!(Bail::Query);
             }
-            if !resources.skip_readback || resources.record_guest_store {
-                worker_bail!(Bail::Store);
-            }
+            // TEMP (lab, DRAW_PAR v13): which of the serial ladder's deferred
+            // arms below this record takes - the chain intermediate, or (the
+            // stream's last record) the GVA-resident or copied-surface Store -
+            // decided from the same values those arms read; anything else is
+            // the drain's.
+            let kind = if resident_render_chain {
+                if !resources.skip_readback || resources.record_guest_store {
+                    worker_bail!(Bail::Store);
+                }
+                draw_par::PreparedKind::Chain
+            } else if !draw_par::last_on() {
+                worker_bail!(Bail::NotChain);
+            } else if surface_resident_store.is_none()
+                && lab_recorder_gva_store()
+                && resources.skip_readback
+                && !resources.record_guest_store
+                && gva_resident_store.is_some()
+            {
+                draw_par::PreparedKind::GvaStore(gva_resident_store.clone().unwrap_or_else(|| unreachable!()))
+            } else if lab_defer_surface_store()
+                && crate::runtime::writeback_debt::lazy_writeback_enabled()
+                && resources.skip_readback
+            {
+                let Some(identity) = surface_resident_store.clone() else {
+                    worker_bail!(Bail::NotChain);
+                };
+                if crate::backend::vulkan::engine::surface_store_guest_backed_lock_free(
+                    &identity,
+                    resources.guest_target_memory.is_some(),
+                ) != Some(false)
+                {
+                    worker_bail!(Bail::Store);
+                }
+                resources.record_guest_store = false;
+                draw_par::PreparedKind::SurfaceStore(identity)
+            } else {
+                worker_bail!(Bail::NotChain);
+            };
             let Some(chain_identity) = resources.target_identity.clone() else {
                 worker_bail!(Bail::NotDeferrable);
             };
@@ -14709,9 +14741,10 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                     vertex_count,
                 },
                 chain_identity,
+                kind: kind.clone(),
             });
             req.visibility_samples = None;
-            return Ok(M2vDrawSpan::ResidentChain);
+            return Ok(kind.span());
         }
         if recorder_on || crate::backend::vulkan::engine::deferred_draws_pending() {
             if let Some(failure) = crate::backend::vulkan::engine::take_deferred_failure() {

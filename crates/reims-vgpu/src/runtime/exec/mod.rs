@@ -5776,8 +5776,15 @@ fn finish_stream<M: HostMemory + HostOps>(
             && crate::runtime::draw::vulkan::draw_par::overlap_on()
             && pass_prep.is_none()
             && !crate::runtime::drain::lab_preempt_record_on();
+        // TEMP (lab, DRAW_PAR v13, live `DRAW_PAR_LAST`): the last record is
+        // prepared too; the region stops at it and offers it to the serial
+        // encode, whose door commits it and then routes its Store.
         #[cfg(feature = "backend-vulkan")]
-        let ov_end = draw_list.len().saturating_sub(1);
+        let ov_end = if crate::runtime::draw::vulkan::draw_par::last_on() {
+            draw_list.len()
+        } else {
+            draw_list.len().saturating_sub(1)
+        };
         #[cfg(feature = "backend-vulkan")]
         let mut ov_reqs: Vec<(draw::DrawEncodeRequest, bool)> = Vec::new();
         #[cfg(feature = "backend-vulkan")]
@@ -5833,11 +5840,11 @@ fn finish_stream<M: HostMemory + HostOps>(
                         host,
                         &ov_reqs[di - ov_base..],
                         carried,
-                        |st, h, _k, req, prepared, owed| {
+                        |st, h, _k, req, writeback, prepared, owed| {
                             use crate::runtime::draw::vulkan::draw_par::{RegionStep, SharedCommit};
                             // The full body owns what a fast commit does not:
                             // an armed occlusion query, a Store, a broken chain.
-                            if req.visibility.is_some() || !resident_chain {
+                            if req.visibility.is_some() || !resident_chain || *writeback {
                                 return RegionStep::Stop(Some(prepared));
                             }
                             let draw_started = std::time::Instant::now();

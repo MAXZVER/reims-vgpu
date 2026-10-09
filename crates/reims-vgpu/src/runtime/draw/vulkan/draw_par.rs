@@ -376,6 +376,54 @@ pub(crate) struct PreparedRequest {
     pub(super) resources: AssertSend<DrawRequest>,
     pub(super) meta: DeferredMeta,
     pub(super) chain_identity: TargetIdentity,
+    pub(super) kind: PreparedKind,
+}
+
+/// TEMP (lab, DRAW_PAR v13): which deferred arm of the serial ladder a
+/// prepared draw takes, and so the span its commit returns.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PreparedKind {
+    /// A resident render-pass chain intermediate.
+    Chain,
+    /// The stream's last record, its Store left on the GVA resident
+    /// (`REIMS_VGPU_LAB_RECORDER_GVA_STORE`).
+    GvaStore(TargetIdentity),
+    /// The stream's last record, its Store into a copied (not guest-backed)
+    /// surface resident (`DEFER_SURFACE_STORE`).
+    SurfaceStore(TargetIdentity),
+}
+
+impl PreparedKind {
+    pub(super) fn span(&self) -> M2vDrawSpan {
+        match self {
+            PreparedKind::Chain => M2vDrawSpan::ResidentChain,
+            PreparedKind::GvaStore(identity) => M2vDrawSpan::ResidentGvaStore {
+                identity: identity.clone(),
+            },
+            PreparedKind::SurfaceStore(identity) => M2vDrawSpan::ResidentSurfaceStore {
+                identity: identity.clone(),
+                guest_store: GuestStoreStatus {
+                    guest_backed: false,
+                    recorded: false,
+                    footprint: None,
+                },
+            },
+        }
+    }
+}
+
+/// `REIMS_VGPU_LAB_DRAW_PAR_LAST=off` disables; live `DRAW_PAR_LAST`. On: a
+/// stream's last record (its deferred Store) is prepared on the pool too and
+/// committed through the serial encode's door, which then routes the Store.
+pub(crate) fn last_on() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("DRAW_PAR_LAST") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_PAR_LAST").as_deref() != Ok("off"))
 }
 
 /// One draw a worker prepared, ready for the drain's commit.
@@ -1011,10 +1059,7 @@ fn commit_prepared<M: HostMemory + HostOps>(
 ) -> Result<Result<M2vDrawSpan, DrawError>, Bail> {
     let PreparedDraw { log, task_id } = prepared;
     let done = log.done.ok_or(Bail::NotDeferrable)?;
-    if task_id != req.task_id
-        || !req.chain_from_resident
-        || pass_inv::chain_identity(state, req).as_ref() != Some(&done.chain_identity)
-    {
+    if task_id != req.task_id || !req.chain_from_resident || !kind_holds(state, req, &done) {
         return Err(Bail::ChainMoved);
     }
     // The secondary attachments' identities were read, not declared, on the
@@ -1139,7 +1184,45 @@ fn commit_prepared<M: HostMemory + HostOps>(
     crate::backend::vulkan::engine::submit_deferred_draw(state, resources, done.meta);
     req.visibility_samples = None;
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
-    Ok(Ok(M2vDrawSpan::ResidentChain))
+    match &done.kind {
+        PreparedKind::Chain => {}
+        PreparedKind::GvaStore(_) => {
+            req.lab_left_store_job = true;
+            crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
+            crate::runtime::drain::note_store_route("lab_recorder_gva_store_deferred");
+            crate::runtime::drain::note_store_route("draw_par_last_gva");
+        }
+        PreparedKind::SurfaceStore(_) => {
+            req.lab_left_store_job = true;
+            crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
+            crate::runtime::drain::note_store_route("lab_surface_store_deferred");
+            crate::runtime::drain::note_store_route("draw_par_last_surface");
+        }
+    }
+    Ok(Ok(done.kind.span()))
+}
+
+/// Whether the target a prepared draw rendered into is still the one the
+/// serial ladder would name for `req` now, for its kind.
+fn kind_holds(state: &DeviceState, req: &DrawEncodeRequest, done: &PreparedRequest) -> bool {
+    match &done.kind {
+        PreparedKind::Chain => {
+            pass_inv::chain_identity(state, req).as_ref() == Some(&done.chain_identity)
+        }
+        PreparedKind::GvaStore(identity) => {
+            done.chain_identity == *identity
+                && super::gva_chain_identity(req).as_ref() == Some(identity)
+                && super::lab_recorder_gva_store()
+        }
+        PreparedKind::SurfaceStore(identity) => {
+            done.chain_identity == *identity
+                && pass_inv::store_identity(state, req, true).as_ref() == Some(identity)
+                && crate::backend::vulkan::engine::surface_store_guest_backed_lock_free(
+                    identity,
+                    done.resources.0.guest_target_memory.is_some(),
+                ) == Some(false)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,6 +1308,14 @@ pub(crate) fn commit_shared<M: HostMemory + HostOps>(
 ) -> SharedCommit {
     if !prepared.log.gathers.is_empty()
         || crate::backend::vulkan::engine::deferred_failure_stashed()
+    {
+        return SharedCommit::Exclusive(prepared);
+    }
+    if prepared
+        .log
+        .done
+        .as_ref()
+        .is_some_and(|done| done.kind != PreparedKind::Chain)
     {
         return SharedCommit::Exclusive(prepared);
     }
@@ -1367,7 +1458,7 @@ pub(crate) fn run_region<M, S>(
 ) -> RegionStop
 where
     M: HostMemory + HostOps,
-    S: FnMut(&DeviceState, &mut M, usize, &DrawEncodeRequest, PreparedDraw, &mut RegionOwed) -> RegionStep,
+    S: FnMut(&DeviceState, &mut M, usize, &DrawEncodeRequest, &bool, PreparedDraw, &mut RegionOwed) -> RegionStep,
 {
     let nc = carried.len().min(reqs.len());
     let jobs = &reqs[nc..];
@@ -1437,7 +1528,7 @@ where
                     crate::runtime::drain::note_store_route_n("draw_par_prepared", prepared_n);
                     return stop_at(k, None, ov, &mut carried);
                 };
-                match step(shared, host, k, &reqs[k].0, prepared, &mut owed) {
+                match step(shared, host, k, &reqs[k].0, &reqs[k].1, prepared, &mut owed) {
                     RegionStep::Committed => {}
                     RegionStep::Stop(exclusive) => {
                         crate::runtime::drain::note_store_route_n("draw_par_prepared", prepared_n);
