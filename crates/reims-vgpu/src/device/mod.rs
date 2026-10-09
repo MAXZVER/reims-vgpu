@@ -258,12 +258,18 @@ fn lab_drain_lock_note(holder: usize, us: u64) {
 /// inner everywhere; producers use `try_lock` for inner and therefore never
 /// wait behind shader translation/GPU work.
 fn lock_for_drain(slot: &BoundDevice) -> DrainGuard<'_> {
-    let lab_t0 = std::time::Instant::now(); // TEMP (lab)
+    // TEMP (lab): the uncontended path's clock reads feed only the LAB_LOCK_*
+    // census, so they follow the phase timers (off in the working launcher's
+    // ROUTES=off mode; b101: ~4.7 % of the drain's busy samples on the Finder
+    // toggles were these reads).
+    let lab_timed = crate::lab_clock::timers_on();
+    let lab_t0 = lab_timed.then(std::time::Instant::now); // TEMP (lab)
+    let lab_us = |t: Option<std::time::Instant>| t.map_or(0, |t| t.elapsed().as_micros() as u64);
     // TEMP (lab, POLL_YIELD): announce the take before trying it, so a poll
     // that has not yet taken `inner` stands aside.
     slot.drain_wants.store(true, Ordering::SeqCst);
     let mut ingress = slot.gfx_ingress.lock();
-    let lab_ingress_us = lab_t0.elapsed().as_micros() as u64;
+    let lab_ingress_us = lab_us(lab_t0);
     let mut inner = match slot.inner.try_lock() {
         Some(g) => g,
         None => {
@@ -312,14 +318,16 @@ fn lock_for_drain(slot: &BoundDevice) -> DrainGuard<'_> {
         LAB_LOCK_INGRESS_US.fetch_add(lab_ingress_us, Ordering::Relaxed);
         LAB_LOCK_INGRESS_N.fetch_add(1, Ordering::Relaxed);
     }
-    let lab_t2 = std::time::Instant::now();
+    let lab_t2 = lab_timed.then(std::time::Instant::now);
     while let Some(write) = ingress.pop_front() {
         apply_gfx_write(&mut inner, slot, write);
     }
     drop(ingress);
-    LAB_LOCK_APPLY_US.fetch_add(lab_t2.elapsed().as_micros() as u64, Ordering::Relaxed);
-    LAB_LOCK_TOTAL_US.fetch_add(lab_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-    LAB_LOCK_TOTAL_N.fetch_add(1, Ordering::Relaxed);
+    if lab_timed {
+        LAB_LOCK_APPLY_US.fetch_add(lab_us(lab_t2), Ordering::Relaxed);
+        LAB_LOCK_TOTAL_US.fetch_add(lab_us(lab_t0), Ordering::Relaxed);
+        LAB_LOCK_TOTAL_N.fetch_add(1, Ordering::Relaxed);
+    }
     // Here rather than only inside `drain_pending`, because this is the one
     // point every entry to the drain passes through. `device_drain` returns
     // before `drain_pending` when the device has no host ops, and

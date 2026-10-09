@@ -86,10 +86,16 @@ pub(crate) struct FinishTimer {
     n: [u64; FinishPhase::COUNT],
     open: usize,
     last: Instant,
+    /// [`crate::lab_clock::timers_on`] at open: with the phase timers off (the
+    /// working launcher's ROUTES=off) no part is timed or flushed. b101: these
+    /// clock reads, four or five a draw, were most of the drain's ~3.7 % in
+    /// `Instant::now` on Weather.
+    on: bool,
 }
 
 impl FinishTimer {
     pub(crate) fn open() -> Self {
+        let on = crate::lab_clock::timers_on();
         let now = Instant::now();
         let mut n = [0u64; FinishPhase::COUNT];
         n[FinishPhase::Prelude.index()] = 1;
@@ -98,6 +104,7 @@ impl FinishTimer {
             n,
             open: FinishPhase::Prelude.index(),
             last: now,
+            on,
         }
     }
 
@@ -106,6 +113,9 @@ impl FinishTimer {
     /// `fin_retarget_n` the records that were retargeted — the denominators the
     /// microseconds need.
     pub(crate) fn enter(&mut self, next: FinishPhase) {
+        if !self.on {
+            return;
+        }
         let now = Instant::now();
         self.ns[self.open] += crate::observe::phase_clock::charge_ns(now.duration_since(self.last));
         self.last = now;
@@ -116,6 +126,9 @@ impl FinishTimer {
     /// Close the part that is still open. Separate from [`Drop`] so a test can
     /// read the tiling without going through the process-wide census.
     fn close(&mut self) {
+        if !self.on {
+            return;
+        }
         let now = Instant::now();
         self.ns[self.open] += crate::observe::phase_clock::charge_ns(now.duration_since(self.last));
         self.last = now;
@@ -124,6 +137,9 @@ impl FinishTimer {
 
 impl Drop for FinishTimer {
     fn drop(&mut self) {
+        if !self.on {
+            return;
+        }
         self.close();
         for phase in FinishPhase::ALL {
             let i = phase.index();
