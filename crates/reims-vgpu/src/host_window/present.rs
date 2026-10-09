@@ -880,6 +880,9 @@ struct App {
     /// guest's cursor at once; unfocused, only once the host's own mouse has
     /// been left alone (see `apply_guest_cursor`).
     focused: bool,
+    /// TEMP lab: `REIMS_VGPU_LAB_WINDOW_BACKGROUND=1` — the window is off screen
+    /// and never places the host pointer.
+    lab_background: bool,
 }
 
 /// How often the window's event loop looked for a guest frame, and what it
@@ -955,6 +958,7 @@ impl LoopCensus {
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
+        super::lab_trace::flush();
         crate::observe::off(format!(
             "host_window_loop win_ms={} ticks={} redraws_asked={} draws={} \
              draws_fresh={} draws_stale={} draws_held={} cursor_moves={} \
@@ -1006,6 +1010,8 @@ impl ApplicationHandler<FramePublished> for App {
             }
             crate::observe::off("host_window_background on=1");
         }
+        // An off-screen window must never move the operator's pointer.
+        self.lab_background = background;
         if self.config.mode == WindowMode::Borderless && !background {
             // `None` means "the monitor this window opens on", which is the only
             // answer available before the window exists — winit has no monitor
@@ -1132,6 +1138,7 @@ impl ApplicationHandler<FramePublished> for App {
                     self.loop_census.cursor_echoes += 1;
                     return;
                 }
+                super::lab_trace::event('H', pos.0, pos.1);
                 self.loop_census.cursor_moves += 1;
                 self.pointer_move(pos);
             }
@@ -1374,6 +1381,7 @@ impl App {
             host_pointer: None,
             warp: WarpGate::default(),
             focused: false,
+            lab_background: false,
         }
     }
 
@@ -1506,6 +1514,7 @@ impl App {
         }
         if snap.pos_gen != self.cursor_applied_pos_gen {
             self.cursor_applied_pos_gen = snap.pos_gen;
+            super::lab_trace::event('A', f64::from(snap.x), f64::from(snap.y));
             if self.cursor_visible != Some(snap.show) {
                 window.set_cursor_visible(snap.show);
                 self.cursor_visible = Some(snap.show);
@@ -1519,7 +1528,10 @@ impl App {
             // for the host's own mouse to be left alone (`HOST_AWAY`), so a
             // pointer the guest owns does not drag the host's pointer away
             // from the window the user works in.
-            if snap.show && (self.focused || self.warp.host_away(std::time::Instant::now())) {
+            if snap.show
+                && !self.lab_background
+                && (self.focused || self.warp.host_away(std::time::Instant::now()))
+            {
                 if let Some(guest) = self.guest_extent {
                     let target = crate::backend::window::viewport::guest_to_pointer(
                         (u32::from(snap.x), u32::from(snap.y)),
@@ -1535,6 +1547,7 @@ impl App {
                             .is_ok()
                     {
                         self.warp.placed(target, now);
+                        super::lab_trace::event('W', target.0, target.1);
                         self.host_pointer = Some(target);
                         self.loop_census.cursor_places += 1;
                     }

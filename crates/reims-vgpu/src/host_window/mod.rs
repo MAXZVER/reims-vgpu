@@ -34,4 +34,5 @@ pub mod capture;
 pub mod guest_cursor;
 pub mod input_map;
 pub mod keyboard;
+pub mod lab_trace;
 pub mod present;

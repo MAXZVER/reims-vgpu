@@ -103,6 +103,10 @@ impl GuestCursorFeed {
             }
             Err(_) => false,
         };
+        if super::lab_trace::on() {
+            let kind = if changed { 'G' } else { 'g' };
+            super::lab_trace::event(kind, f64::from(x), f64::from(y));
+        }
         if changed {
             self.wake.wake();
         }
