@@ -3368,6 +3368,16 @@ type SampledRefKey = (u32, u32);
 /// What one resolved to: mapping, and the view extent bound for it.
 type SampledRefBacking = (u32, u32, u32);
 
+/// TEMP (lab, VEC_CAP): the per-draw resource vectors sized up front. Live
+/// `VEC_CAP=off` (or `REIMS_VGPU_LAB_VEC_CAP=off`) restores growth from empty.
+fn lab_vec_cap() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("VEC_CAP") {
+        return on;
+    }
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var("REIMS_VGPU_LAB_VEC_CAP").as_deref() != Ok("off"))
+}
+
 /// The last resolution reported for each `(task, texture ref)`, so a change of
 /// backing is reportable and a steady bind is silent.
 /// Asked once per sampled bind, so keyed through the Fx hasher (b093: the
@@ -11086,7 +11096,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // buffer at that binding (never name-keyed).
         // At most every vertex and fragment buffer, in one allocation (b093).
         let mut storage: Vec<crate::backend::vulkan::engine::StorageBufferResource> =
-            Vec::with_capacity(vtx_storage.len() + frag_storage.len());
+            Vec::with_capacity(if lab_vec_cap() { vtx_storage.len() + frag_storage.len() } else { 0 });
         for (idx, content) in &vtx_storage {
             if !vertex_buffer_needs_storage_binding(
                 &v_shader.reflection,
@@ -11276,12 +11286,29 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Sized from the tables up front: these leave with the draw (to the
         // recorder), and a default Vec grew through several reallocations per
         // draw (`grow_one` ~1 % of Weather drain busy, b093).
+        let vec_cap = lab_vec_cap();
         let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> =
-            Vec::with_capacity(req.vertex_textures.len() + req.fragment_textures.len());
+            Vec::with_capacity(if vec_cap {
+                req.vertex_textures
+                    .iter()
+                    .chain(req.fragment_textures.iter())
+                    .filter(|t| t.texture_ref != 0)
+                    .count()
+            } else {
+                0
+            });
         // Guest mip chains the sampled binds read whole; see `sampled_mip_chain`.
         let mut mip_chains: Vec<crate::backend::vulkan::engine::types::SampledPyramid> = Vec::new();
         let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> =
-            Vec::with_capacity(req.vertex_samplers.len() + req.fragment_samplers.len());
+            Vec::with_capacity(if vec_cap {
+                req.vertex_samplers
+                    .iter()
+                    .chain(req.fragment_samplers.iter())
+                    .filter(|s| s.sampler_ref != 0)
+                    .count()
+            } else {
+                0
+            });
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
         // Where each provisioned sampler's state came from, keyed by binding, for
         // the hang trail. A `SamplerResource` cannot be asked this after the
