@@ -1684,6 +1684,12 @@ pub fn submit_deferred_draw(
 /// failure. A panic in the job is re-raised here, where the synchronous path
 /// would have raised it.
 #[track_caller]
+/// TEMP (lab, DRAW_PAR overlap): a deferred draw's failure is waiting to be
+/// taken (see `recorder::Handoff::failure_stashed`).
+pub(crate) fn deferred_failure_stashed() -> bool {
+    recorder::DRAW.failure_stashed()
+}
+
 pub fn take_deferred_failure() -> Option<DeferredFailure> {
     // Lab RECORDER_DEPTH > 1: the join before the next draw does not wait.
     let taken = if recorder::depth() > 1 {

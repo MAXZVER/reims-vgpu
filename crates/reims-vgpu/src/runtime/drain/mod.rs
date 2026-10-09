@@ -6164,7 +6164,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                 // was lost. `present_black` below is the alarm. Wherever the
                 // window presents from the engine's own device this is the
                 // normal outcome of every present.
-                crate::observe::line(format!(
+                crate::observe::verbose(|| format!(
                     "present_content_unsampled mid={mapping} {w}x{h} gen={gen} \
                      (a resident carried the frame; no CPU pixels to judge)"
                 ));
@@ -6202,7 +6202,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // not.
         // One line per accepted present, verbose-only. `present_enqueue` carried
         // the same fields through the always-on sink alongside it.
-        crate::observe::line(format!(
+        crate::observe::verbose(|| format!(
             "present paint mid={mapping} {w}x{h} gen={gen} encoded={} retain={} unpainted={}",
             encoded as u8,
             state.present.frame_valid as u8,
@@ -6880,7 +6880,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 gva,
                 state.page_shift,
             );
-            crate::observe::line(format!(
+            crate::observe::verbose(|| format!(
                 "map_probe op={name} ch={channel_id} task={task_id} gva={gva:#x} len={length:#x} page_shift={} {walk}",
                 state.page_shift
             ));
@@ -6888,7 +6888,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
             state.map_family_events = state.map_family_events.saturating_add(1);
             if state.map_family_events == 1 || state.map_family_events.is_multiple_of(32) {
                 let census = crate::runtime::gva_mem::format_active_tasks(&state.tasks);
-                crate::observe::line(format!(
+                crate::observe::verbose(|| format!(
                     "map_census n={} last_op={name} task={task_id} {census}",
                     state.map_family_events
                 ));
@@ -7591,7 +7591,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             let task = decoded
                 .task
                 .map_or_else(|| "-".to_string(), |task| format!("{task:#x}"));
-            crate::observe::line(format!(
+            crate::observe::verbose(|| format!(
                 "present_txn op={opcode:#x} ch={channel_id} pipe={} sid={mapping} task={task} \
                  plen={} unpainted={} prior_present_mapping={}",
                 decoded.pipe,
@@ -10300,6 +10300,12 @@ pub(crate) fn lab_preempt_between_streams<H: HostMemory + HostOps>(
 /// re-asks it, its plans revalidate at use), the engine flushes an open batch on
 /// any consumer path, and the nested drain still defers every EXEC it releases,
 /// so only control packets the model finds independent run.
+/// TEMP (lab, DRAW_PAR overlap): whether `lab_preempt_between_records` can
+/// run at all (an overlap region cannot call it: it needs the exclusive state).
+pub(crate) fn lab_preempt_record_on() -> bool {
+    lab_chan::preempt_record_on()
+}
+
 pub(crate) fn lab_preempt_between_records<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,

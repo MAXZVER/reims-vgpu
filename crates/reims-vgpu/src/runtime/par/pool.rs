@@ -56,7 +56,7 @@ use parking_lot::{Condvar, Mutex};
 use reims_vgpu_core::executor::{Assignment, FixedExecutor, WorkerId};
 use reims_vgpu_core::identity::IngressOrdinal;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -208,6 +208,11 @@ struct Shared {
     /// lock.
     epoch: AtomicU64,
     executor: Mutex<FixedExecutor>,
+    /// Helpers parked on `wake` right now (counted under `hand_off`). A
+    /// publish wakes at most this many: a helper still spinning on `epoch`, or
+    /// one between batches, sees the new epoch without a `notify_one` (~1.2 us
+    /// each on Windows, the bulk of a fork's cost).
+    parked: AtomicUsize,
     batch_seq: AtomicU64,
     attached: AtomicUsize,
     detached: AtomicUsize,
@@ -268,6 +273,7 @@ impl Pool {
                 wake: Condvar::new(),
                 epoch: AtomicU64::new(0),
                 executor: Mutex::new(FixedExecutor::with_population(population)),
+                parked: AtomicUsize::new(0),
                 batch_seq: AtomicU64::new(0),
                 attached: AtomicUsize::new(0),
                 detached: AtomicUsize::new(0),
@@ -486,7 +492,9 @@ impl Pool {
             sh.epoch.store(hand_off.epoch, Ordering::Release);
         }
         // The coordinator takes a share itself, so `total - 1` helpers at most.
-        for _ in 0..sh.workers.min(total - 1).min(lab_wake_cap(total)) {
+        // Only parked helpers need a wake: the others see the epoch.
+        let wanted = sh.workers.min(total - 1).min(lab_wake_cap(total));
+        for _ in 0..wanted.min(sh.parked.load(Ordering::Acquire)) {
             sh.wake.notify_one();
         }
         let fork_us = entered.elapsed().as_micros() as u64;
@@ -508,6 +516,146 @@ impl Pool {
             batch.helped.load(Ordering::Acquire),
             batch.helper_busy_ns.load(Ordering::Acquire),
         ))
+    }
+
+    /// TEMP (lab, DRAW_PAR overlap): run `f` over `items` on the helpers while
+    /// `body` consumes the results in order on the caller.
+    ///
+    /// Unlike [`Self::scope`] the caller does not take a share up front: it
+    /// publishes the batch and goes straight into `body`, whose
+    /// [`Overlap::wait`] hands it item `i` as soon as `i` is done - running `i`
+    /// itself only when no helper has claimed it yet, so a pool whose helpers
+    /// are slow to wake (or absent) costs time, never progress. `body` runs on
+    /// the caller with `shared` still borrowed shared by the jobs, which is the
+    /// point: the caller commits item `i` against the same state the helpers are
+    /// preparing `i + 1..` from.
+    ///
+    /// The caller is **not** a planning thread inside `body` (its engine doors
+    /// settle as on the serial path); it is one only while it runs an item.
+    /// Leaving `body` - normally or by unwinding - cancels the items nobody has
+    /// claimed and waits for the claimed ones, so the lifetime erasure rests on
+    /// the same invariant as `scope`'s (see the module doc).
+    pub fn overlap<S, I, T, F, R>(
+        &self,
+        shared: &S,
+        items: &[I],
+        f: F,
+        body: impl FnOnce(&mut Overlap<'_, T>) -> R,
+    ) -> R
+    where
+        S: Sync + ?Sized,
+        I: Sync,
+        T: Send,
+        F: Fn(&S, &WorkerEnv<'_>, &I) -> T + Sync,
+    {
+        let entered = Instant::now();
+        let total = items.len();
+        let sh = &self.shared;
+        let slots: Vec<OverlapSlot<T>> = (0..total)
+            .map(|_| OverlapSlot {
+                ready: AtomicBool::new(false),
+                value: Mutex::new(None),
+            })
+            .collect();
+        let waiting = AtomicUsize::new(usize::MAX);
+        let notify: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+        let run = |i: usize, env: &WorkerEnv<'_>| {
+            let outcome = catch_unwind(AssertUnwindSafe(|| f(shared, env, &items[i])));
+            let outcome = outcome.map_err(|payload| {
+                sh.job_panics.fetch_add(1, Ordering::Relaxed);
+                crate::runtime::drain::note_store_route("par_job_panicked");
+                crate::observe::panic::report("par_job", payload.as_ref());
+                JobPanic {
+                    message: crate::observe::panic::payload_text(payload.as_ref()),
+                }
+            });
+            *slots[i].value.lock() = Some(outcome);
+            slots[i].ready.store(true, Ordering::SeqCst);
+            if waiting.load(Ordering::SeqCst) == i {
+                let _g = notify.0.lock();
+                notify.1.notify_all();
+            }
+        };
+        let runner: &Runner<'_> = &run;
+        let guard = if total >= 2 && sh.workers > 0 && self.state.load(Ordering::Acquire) != STOPPED {
+            self.scope_lock.try_lock().filter(|_| self.ensure_started())
+        } else {
+            None
+        };
+        let batch = guard.as_ref().map(|_| {
+            // SAFETY: the batch is waited to completion (claimed items) or
+            // cancelled (unclaimed ones) by `OverlapJoin` before this frame
+            // returns or unwinds, so `run` outlives every dereference of the
+            // erased pointer; see the module doc.
+            let erased: &'static Runner<'static> =
+                unsafe { std::mem::transmute::<&Runner<'_>, &'static Runner<'static>>(runner) };
+            Arc::new(Batch {
+                seq: sh.batch_seq.fetch_add(1, Ordering::Relaxed) + 1,
+                total,
+                next: AtomicUsize::new(0),
+                pending: AtomicUsize::new(total),
+                run: RunPtr(erased),
+                helped: AtomicUsize::new(0),
+                helper_busy_ns: AtomicU64::new(0),
+                done: Mutex::new(()),
+                done_cv: Condvar::new(),
+            })
+        });
+        let join = batch.as_ref().map(|batch| OverlapJoin { shared: sh, batch });
+        if let Some(batch) = batch.as_ref() {
+            {
+                let mut hand_off = sh.hand_off.lock();
+                hand_off.epoch += 1;
+                hand_off.batch = Some(Arc::clone(batch));
+                sh.epoch.store(hand_off.epoch, Ordering::Release);
+            }
+            let wanted = sh.workers.min(total).min(lab_wake_cap(total));
+            for _ in 0..wanted.min(sh.parked.load(Ordering::Acquire)) {
+                sh.wake.notify_one();
+            }
+        }
+        let fork_us = entered.elapsed().as_micros() as u64;
+        let mut ov = Overlap {
+            sh,
+            batch: batch.as_ref(),
+            run: runner,
+            slots: &slots,
+            waiting: &waiting,
+            notify: &notify,
+            coordinator: self.coordinator(),
+            cancelled_from: usize::MAX,
+            stopped: false,
+            wait_ns: 0,
+            ran_here: 0,
+        };
+        let out = body(&mut ov);
+        let (wait_ns, ran_here, stopped) = (ov.wait_ns, ov.ran_here, ov.stopped);
+        drop(ov);
+        drop(join);
+        drop(guard);
+        let helped = batch.as_ref().map_or(0, |b| b.helped.load(Ordering::Acquire));
+        let busy_us = batch
+            .as_ref()
+            .map_or(0, |b| b.helper_busy_ns.load(Ordering::Acquire))
+            / 1000;
+        sh.scopes.fetch_add(1, Ordering::Relaxed);
+        sh.jobs.fetch_add(total as u64, Ordering::Relaxed);
+        sh.helped_jobs.fetch_add(helped as u64, Ordering::Relaxed);
+        use crate::runtime::drain::{note_store_route, note_store_route_n, note_store_route_us};
+        note_store_route("par_overlaps");
+        if batch.is_none() {
+            note_store_route("par_overlaps_serial");
+        }
+        if stopped {
+            note_store_route("par_overlaps_stopped");
+        }
+        note_store_route_n("par_overlap_items", total as u64);
+        note_store_route_n("par_overlap_helped", helped as u64);
+        note_store_route_n("par_overlap_ran_here", ran_here as u64);
+        note_store_route_us("par_overlap_fork_us", fork_us);
+        note_store_route_us("par_overlap_wait_us", wait_ns / 1000);
+        note_store_route_us("par_overlap_busy_us", busy_us);
+        out
     }
 
     /// Start the helper threads on first use. `false` when they cannot run:
@@ -644,6 +792,177 @@ fn lab_wake_cap(total: usize) -> usize {
         usize::MAX
     } else {
         total.div_ceil(per).max(1)
+    }
+}
+
+/// One item's result in an [`Overlap`], flagged ready after the fill.
+struct OverlapSlot<T> {
+    ready: AtomicBool,
+    value: Mutex<Option<Result<T, JobPanic>>>,
+}
+
+/// The caller's side of a [`Pool::overlap`]: take item `i` when it is done.
+pub struct Overlap<'a, T> {
+    sh: &'a Shared,
+    /// `None`: the batch was not forked; `wait` runs each item on the caller.
+    batch: Option<&'a Arc<Batch>>,
+    run: &'a Runner<'a>,
+    slots: &'a [OverlapSlot<T>],
+    waiting: &'a AtomicUsize,
+    notify: &'a (Mutex<()>, Condvar),
+    coordinator: WorkerId,
+    /// Items at or past this were cancelled unclaimed (`usize::MAX`: none).
+    cancelled_from: usize,
+    stopped: bool,
+    wait_ns: u64,
+    ran_here: usize,
+}
+
+impl<T> Overlap<'_, T> {
+    /// Whether the batch runs on helpers (`false`: every item on the caller).
+    pub fn forked(&self) -> bool {
+        self.batch.is_some()
+    }
+
+    /// Item `i`'s result: at once if it is done, by running it here if no
+    /// helper has claimed it, else after waiting for the helper that has.
+    /// `None` for an item cancelled by [`Self::stop`] or already taken.
+    pub fn wait(&mut self, i: usize) -> Option<Result<T, JobPanic>> {
+        let slots = self.slots;
+        let slot = slots.get(i)?;
+        if i >= self.cancelled_from {
+            return None;
+        }
+        let Some(batch) = self.batch else {
+            if !slot.ready.load(Ordering::Acquire) {
+                self.run_here(i, None);
+            }
+            return slot.value.lock().take();
+        };
+        let mut started: Option<Instant> = None;
+        loop {
+            if slot.ready.load(Ordering::Acquire) {
+                break;
+            }
+            if batch.next.load(Ordering::Relaxed) <= i {
+                let idx = batch.next.fetch_add(1, Ordering::AcqRel);
+                if idx < batch.total {
+                    self.run_here(idx, Some(batch));
+                    continue;
+                }
+            }
+            // Claimed by a helper and still running: spin, then park.
+            let t0 = *started.get_or_insert_with(Instant::now);
+            let spin_until = Instant::now().max(t0) + self.sh.join_spin;
+            while !slot.ready.load(Ordering::Acquire) && Instant::now() < spin_until {
+                std::hint::spin_loop();
+            }
+            if slot.ready.load(Ordering::Acquire) {
+                break;
+            }
+            self.waiting.store(i, Ordering::SeqCst);
+            {
+                let mut g = self.notify.0.lock();
+                while !slot.ready.load(Ordering::SeqCst) {
+                    self.notify.1.wait_for(&mut g, Duration::from_micros(500));
+                }
+            }
+            self.waiting.store(usize::MAX, Ordering::SeqCst);
+        }
+        if let Some(t0) = started {
+            self.wait_ns += t0.elapsed().as_nanos() as u64;
+        }
+        slot.value.lock().take()
+    }
+
+    /// Cancel the items no helper has claimed, wait for the claimed ones, and
+    /// return every result not yet taken, from item `from` on (`None` for a
+    /// cancelled item). The overlap is over: later `wait`s answer `None`.
+    pub fn stop(&mut self, from: usize) -> Vec<Option<Result<T, JobPanic>>> {
+        self.stopped = true;
+        if let Some(batch) = self.batch {
+            cancel_unclaimed(batch);
+            wait_pending(self.sh, batch);
+        }
+        let out = self
+            .slots
+            .iter()
+            .skip(from)
+            .map(|slot| {
+                if slot.ready.load(Ordering::Acquire) {
+                    slot.value.lock().take()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.cancelled_from = 0;
+        out
+    }
+
+    fn run_here(&mut self, idx: usize, batch: Option<&Arc<Batch>>) {
+        // The caller is a planning thread for exactly the item it runs.
+        let _planning = super::enter_planning();
+        let _finished = batch.map(|batch| ItemDone {
+            batch,
+            started: None,
+            helper: false,
+        });
+        let env = WorkerEnv {
+            worker: self.coordinator,
+            helper: false,
+            ops: &self.sh.ops,
+        };
+        let _ = catch_unwind(AssertUnwindSafe(|| (self.run)(idx, &env)));
+        self.ran_here += 1;
+    }
+}
+
+/// Take every unclaimed item off the cursor; the first index cancelled
+/// (`total` when every item was claimed).
+fn cancel_unclaimed(batch: &Batch) -> usize {
+    let prev = batch.next.swap(batch.total, Ordering::AcqRel).min(batch.total);
+    let unclaimed = batch.total - prev;
+    if unclaimed > 0 && batch.pending.fetch_sub(unclaimed, Ordering::AcqRel) == unclaimed {
+        let _guard = batch.done.lock();
+        batch.done_cv.notify_one();
+    }
+    prev
+}
+
+/// Wait for a batch's claimed items to finish.
+fn wait_pending(shared: &Shared, batch: &Batch) {
+    if batch.pending.load(Ordering::Acquire) != 0 {
+        let spin_until = Instant::now() + shared.join_spin;
+        while batch.pending.load(Ordering::Acquire) != 0 && Instant::now() < spin_until {
+            std::hint::spin_loop();
+        }
+        let mut guard = batch.done.lock();
+        while batch.pending.load(Ordering::Acquire) != 0 {
+            batch.done_cv.wait(&mut guard);
+        }
+    }
+}
+
+/// An [`Overlap`]'s exit, on drop: cancel what nobody claimed, wait for what
+/// somebody did, withdraw the batch. A guard for the same reason as [`Join`].
+struct OverlapJoin<'a> {
+    shared: &'a Shared,
+    batch: &'a Arc<Batch>,
+}
+
+impl Drop for OverlapJoin<'_> {
+    fn drop(&mut self) {
+        cancel_unclaimed(self.batch);
+        wait_pending(self.shared, self.batch);
+        let mut hand_off = self.shared.hand_off.lock();
+        if hand_off
+            .batch
+            .as_ref()
+            .is_some_and(|published| published.seq == self.batch.seq)
+        {
+            hand_off.batch = None;
+        }
     }
 }
 
@@ -808,6 +1127,8 @@ fn next_batch(shared: &Shared, seen: u64) -> Option<(u64, Option<Arc<Batch>>)> {
         if hand_off.epoch != seen {
             return Some((hand_off.epoch, hand_off.batch.clone()));
         }
+        shared.parked.fetch_add(1, Ordering::AcqRel);
         shared.wake.wait(&mut hand_off);
+        shared.parked.fetch_sub(1, Ordering::AcqRel);
     }
 }

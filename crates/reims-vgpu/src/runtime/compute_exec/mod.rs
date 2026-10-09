@@ -1937,7 +1937,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                                     args_hex.push('…');
                                 }
                             }
-                            crate::observe::line(format!(
+                            crate::observe::verbose(|| format!(
                                 "compute_stage_tex ref_texture ref={texture_ref} sid={sid} ensure={} owner_task={owner_task} desc_len={} args_n={args_n} args_hex={args_hex}",
                                 ok as u8,
                                 desc.len(),
@@ -2014,7 +2014,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 // view over the same bytes. Per-bind measurement (view vs base
                 // geom), not a failure — verbose-gated to keep the always-on sink
                 // for genuine failures.
-                crate::observe::line(format!(
+                crate::observe::verbose(|| format!(
                     "compute_stage_tex ref_texture_view mapping={mapping_id} view={}x{} fmt={:#x} base={}x{} fmt={:#x} multiplanar={}",
                     rec.width,
                     rec.height,
@@ -2201,7 +2201,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             // Per-bind ref-texture sample-window measurement, not a failure — verbose-gated
             // (was a per-bind always-on line). Genuine window failures above emit
             // `mapper_ref_texture_fail reason=window` always-on.
-            crate::observe::line(format!(
+            crate::observe::verbose(|| format!(
                 "compute_stage_tex ref_texture_view_window mapping={mapping_id} view={width}x{height} fmt={stage_fmt:#x} bpp={bpp} tight={tight} surface_off={surface_offset} surface_bpr={surface_bpr} span_end={span_end}"
             ));
         }
@@ -2330,7 +2330,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             // Per-bind ref-texture stage SUCCESS census — not a failure; verbose-gated
             // (was always-on, ~300/boot). Genuine ref-texture stage failures above emit
             // `mapper_ref_texture_fail reason=<slug>` always-on.
-            crate::observe::line(format!(
+            crate::observe::verbose(|| format!(
                 "compute_stage_tex ref_texture_ok ref={texture_ref} sid={mapping_id} {width}x{height} fmt={stage_fmt:#x} pages={pages_n}"
             ));
         }
@@ -3430,7 +3430,7 @@ fn resolve_dispatch_dims_reported<M: HostMemory + HostOps>(
                 |e| format!("[{},{},{}]", e.width, e.height, e.depth),
             )
         };
-        crate::observe::line(format!(
+        crate::observe::verbose(|| format!(
             "compute_resolve_dims fail {e:?} kind={:?} grid={} tg={} ntex={}",
             dispatch_kind(dispatch),
             extent(grid),

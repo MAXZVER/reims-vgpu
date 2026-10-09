@@ -4141,7 +4141,7 @@ fn handle_render_draw<M: HostMemory + HostOps>(
     // said this row is a draw.
     if kind.is_wide_encoding() {
         if let DrawRecord::Indexed(d) = &record {
-            crate::observe::line(format!(
+            crate::observe::verbose(|| format!(
                 "render_wide_indexed task={task_id} target_refs={:?} pipeline={} prim={} \
                  index_type={} index_ref={} count={} offset={:#x}",
                 acc.color_targets,
@@ -5762,18 +5762,127 @@ fn finish_stream<M: HostMemory + HostOps>(
         let mut draw_par_base = 0usize;
         #[cfg(feature = "backend-vulkan")]
         let mut draw_par_next = 1usize;
+        // TEMP (lab, DRAW_PAR v9 overlap): records 2+ up to the stream's last
+        // (whose Store stays serial) are prepared on the pool while this loop
+        // commits them in order, each as soon as it is ready, under the shared
+        // state (`draw_par::run_region`). A region runs from the record at hand
+        // to the first record it cannot commit; that record takes the body
+        // below (offered its preparation when it needs the exclusive commit),
+        // and the next region starts after it with what the helpers had
+        // already prepared. Needs the exclusive state between records for
+        // nothing else: PASS_PREP and PREEMPT_RECORD keep the chunked driver.
+        #[cfg(feature = "backend-vulkan")]
+        let draw_par_overlap = draw_par_active
+            && crate::runtime::draw::vulkan::draw_par::overlap_on()
+            && pass_prep.is_none()
+            && !crate::runtime::drain::lab_preempt_record_on();
+        #[cfg(feature = "backend-vulkan")]
+        let ov_end = draw_list.len().saturating_sub(1);
+        #[cfg(feature = "backend-vulkan")]
+        let mut ov_reqs: Vec<(draw::DrawEncodeRequest, bool)> = Vec::new();
+        #[cfg(feature = "backend-vulkan")]
+        let mut ov_base = 0usize;
+        #[cfg(feature = "backend-vulkan")]
+        let mut ov_next = 1usize;
+        #[cfg(feature = "backend-vulkan")]
+        let mut ov_carried: Vec<crate::runtime::draw::vulkan::draw_par::Carried> = Vec::new();
+        #[cfg(feature = "backend-vulkan")]
+        let mut ov_exclusive: Option<(usize, crate::runtime::draw::vulkan::draw_par::PreparedDraw)> =
+            None;
+        #[cfg(feature = "backend-vulkan")]
+        let mut ov_skip_until = 0usize;
         for (di, pd) in draw_list.iter().enumerate() {
+            // TEMP (lab, DRAW_PAR v9): records a region committed.
+            #[cfg(feature = "backend-vulkan")]
+            if di < ov_skip_until {
+                continue;
+            }
             // TEMP (lab, `REIMS_VGPU_LAB_PREEMPT_RECORD=on`): the control rings,
             // between this stream's records (rate-limited inside).
             if di > 0 {
                 crate::runtime::drain::lab_preempt_between_records(state, host);
+            }
+            // TEMP (lab, DRAW_PAR v9): an overlap region from this record.
+            #[cfg(feature = "backend-vulkan")]
+            if draw_par_overlap && di >= 1 && di >= ov_next && di < ov_end && resident_chain {
+                if ov_reqs.is_empty() && ov_end - di >= crate::runtime::draw::vulkan::draw_par::MIN_DRAWS {
+                    if let Some(template) = attachment_template.as_ref() {
+                        ov_base = di;
+                        ov_reqs = (di..ov_end)
+                            .map(|j| {
+                                let pd = draw_list[j];
+                                let mut r = retarget_render_pass_draw(template, pd);
+                                fill_draw_binds_from_pending(&mut r, pd);
+                                (r.continues_render_pass, r.render_pass_continues) =
+                                    render_pass_chain_position(j, draw_list.len());
+                                for c in &mut r.colors {
+                                    c.load_action = MTL_LOAD_ACTION_LOAD;
+                                }
+                                r.chain_from_resident = true;
+                                let (do_writeback, _) = multi_draw_store_plan(draw_list.len(), j);
+                                (r, do_writeback)
+                            })
+                            .collect();
+                    }
+                }
+                if !ov_reqs.is_empty() && di >= ov_base {
+                    let carried = std::mem::take(&mut ov_carried);
+                    let stop = crate::runtime::draw::vulkan::draw_par::run_region(
+                        state,
+                        host,
+                        &ov_reqs[di - ov_base..],
+                        carried,
+                        |st, h, _k, req, prepared, owed| {
+                            use crate::runtime::draw::vulkan::draw_par::{RegionStep, SharedCommit};
+                            // The full body owns what a fast commit does not:
+                            // an armed occlusion query, a Store, a broken chain.
+                            if req.visibility.is_some() || !resident_chain {
+                                return RegionStep::Stop(Some(prepared));
+                            }
+                            let draw_started = std::time::Instant::now();
+                            fin.enter(crate::runtime::drain::FinishPhase::Encode);
+                            match crate::runtime::draw::vulkan::draw_par::commit_shared(
+                                st, &*h, req, prepared, owed,
+                            ) {
+                                SharedCommit::Committed => {
+                                    resident_chain_before_last_record =
+                                        resident_chain_before_this_record;
+                                    resident_chain_before_this_record = resident_chain;
+                                    crate::runtime::draw::vulkan::record_plane_draw(req);
+                                    crate::runtime::drain::note_store_route("draw_par_committed");
+                                    fin.enter(crate::runtime::drain::FinishPhase::Result);
+                                    crate::runtime::drain::note_drain_phase(
+                                        crate::runtime::drain::DrainPhase::Draw,
+                                        draw_started,
+                                    );
+                                    out.metal_draws_ok += 1;
+                                    resident_chain = true;
+                                    RegionStep::Committed
+                                }
+                                SharedCommit::Exclusive(p) => RegionStep::Stop(Some(p)),
+                                SharedCommit::Invalid(bail) => {
+                                    crate::runtime::drain::note_store_route(bail.route());
+                                    RegionStep::Stop(None)
+                                }
+                            }
+                        },
+                    );
+                    let stop_di = di + stop.at;
+                    ov_carried = stop.after;
+                    ov_exclusive = stop.exclusive.map(|p| (stop_di, p));
+                    ov_next = stop_di + 1;
+                    ov_skip_until = stop_di;
+                    if stop_di > di {
+                        continue;
+                    }
+                }
             }
             // TEMP (lab, DRAW_PAR): at the top of a chunk, prepare the records
             // of `[di, di + K)` on the pool, against the template they retarget
             // from, exactly as the loop below builds them. Only while the chain
             // is resident: a chain that broke has nothing a worker can prepare.
             #[cfg(feature = "backend-vulkan")]
-            if draw_par_active && di >= 1 && di >= draw_par_next && resident_chain {
+            if draw_par_active && !draw_par_overlap && di >= 1 && di >= draw_par_next && resident_chain {
                 draw_par_slots.clear();
                 draw_par_base = di;
                 let end = (di + draw_par_chunk).min(draw_list.len());
@@ -5818,7 +5927,11 @@ fn finish_stream<M: HostMemory + HostOps>(
                 req
             } else {
                 #[cfg(feature = "backend-vulkan")]
-                let prebuilt = if draw_par_active
+                let prebuilt = if draw_par_overlap {
+                    di.checked_sub(ov_base)
+                        .and_then(|j| ov_reqs.get(j))
+                        .map(|(r, _)| r.clone())
+                } else if draw_par_active
                     && di >= draw_par_base
                     && di < draw_par_base + draw_par_reqs.len()
                 {
@@ -5900,7 +6013,13 @@ fn finish_stream<M: HostMemory + HostOps>(
                 // that never reached the engine door cannot leave it for the
                 // next one.
                 #[cfg(feature = "backend-vulkan")]
-                if draw_par_active && di >= draw_par_base && di < draw_par_base + draw_par_slots.len() {
+                if draw_par_overlap {
+                    if let Some((at, prepared)) = ov_exclusive.take() {
+                        if at == di && resident_chain && req.chain_from_resident {
+                            crate::runtime::draw::vulkan::draw_par::offer(prepared);
+                        }
+                    }
+                } else if draw_par_active && di >= draw_par_base && di < draw_par_base + draw_par_slots.len() {
                     if resident_chain && req.chain_from_resident {
                         if let Some(prepared) = draw_par_slots[di - draw_par_base].take() {
                             crate::runtime::draw::vulkan::draw_par::offer(prepared);

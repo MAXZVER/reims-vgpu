@@ -804,6 +804,75 @@ pub(super) fn land_prepared_buffer_unchecked(
     }
 }
 
+/// TEMP (lab, DRAW_PAR overlap): a hold a shared-state commit owes the
+/// registry. Landed by the drain when the overlap region ends; until then the
+/// registry simply misses it, which `plan_answer` already tolerates (a later
+/// record of the region plans the same walk and owes the same hold).
+pub(crate) struct OwedHold {
+    task: u32,
+    buffer_ref: u32,
+    offset: u64,
+    cap: Option<u64>,
+    bound: crate::runtime::bound_buffers::BoundBuffer,
+}
+
+impl OwedHold {
+    pub(crate) fn land(self, state: &mut DeviceState) {
+        if state
+            .bound_buffers
+            .get(self.task, self.buffer_ref, self.offset, self.cap)
+            .is_none()
+        {
+            state
+                .bound_buffers
+                .insert(self.task, self.buffer_ref, self.offset, self.cap, self.bound);
+        }
+    }
+}
+
+/// TEMP (lab, DRAW_PAR overlap): [`land_prepared_buffer_unchecked`] and
+/// [`commit_prepared_buffer`] under the drain's *shared* state: the same
+/// validation, the hold returned instead of landed. `Err` is the commit's
+/// `PlanInvalid`.
+pub(super) fn commit_prepared_buffer_shared(
+    state: &DeviceState,
+    plan: &BufferContentPlan,
+    task_id: u32,
+    buffer_ref: u32,
+    resource: Option<&crate::model::TaskResource>,
+    offset: u64,
+    extent_cap: Option<u64>,
+) -> Result<Option<OwedHold>, ()> {
+    if plan.generation == state.bound_buffers.generation() {
+        if let BufferRail::Walked { bound, .. } = &plan.rail {
+            if state
+                .bound_buffers
+                .get(task_id, buffer_ref, offset, extent_cap)
+                .is_none()
+            {
+                return Ok(Some(OwedHold {
+                    task: task_id,
+                    buffer_ref,
+                    offset,
+                    cap: extent_cap,
+                    bound: bound.clone(),
+                }));
+            }
+        }
+        return Ok(None);
+    }
+    match plan_answer(state, plan, task_id, buffer_ref, resource, offset, extent_cap, true) {
+        Ok(Some((_, hold))) => Ok(hold.map(|h| OwedHold {
+            task: h.task,
+            buffer_ref: h.buffer_ref,
+            offset: h.offset,
+            cap: h.cap,
+            bound: h.bound.clone(),
+        })),
+        _ => Err(()),
+    }
+}
+
 impl BufferContentPlan {
     /// TEMP (lab, DRAW_PAR): the registry generation the plan was made under.
     pub(super) fn generation(&self) -> u64 {

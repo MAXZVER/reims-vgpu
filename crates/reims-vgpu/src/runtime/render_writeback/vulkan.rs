@@ -1344,7 +1344,7 @@ fn finish(
         crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Render),
         started,
     );
-    crate::observe::line(format!(
+    crate::observe::verbose(|| format!(
         "render_store mapping={mapping_id} bytes={frame_len} us={}",
         started.elapsed().as_micros()
     ));

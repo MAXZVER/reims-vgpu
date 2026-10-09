@@ -509,3 +509,88 @@ fn planning_flag_is_scoped() {
         pool.shutdown();
     }
 }
+
+#[test]
+fn an_overlap_hands_every_item_in_order_while_helpers_run_the_rest() {
+    let seen = Registrations::default();
+    let pool = pool(&seen, 4);
+    let items: Vec<u32> = (0..64).collect();
+    let runs = AtomicUsize::new(0);
+    let got = pool.overlap(
+        &(),
+        &items,
+        |_, _, &i| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_micros(50));
+            i * 3
+        },
+        |ov| {
+            assert!(ov.forked());
+            (0..items.len())
+                .map(|i| ov.wait(i).expect("not cancelled").expect("no panic"))
+                .collect::<Vec<u32>>()
+        },
+    );
+    assert_eq!(got, items.iter().map(|i| i * 3).collect::<Vec<_>>());
+    assert_eq!(runs.load(Ordering::SeqCst), items.len());
+    pool.shutdown();
+}
+
+#[test]
+fn an_overlap_stopped_early_cancels_the_unclaimed_and_keeps_the_finished() {
+    let seen = Registrations::default();
+    let pool = pool(&seen, 2);
+    let items: Vec<u32> = (0..200).collect();
+    let runs = AtomicUsize::new(0);
+    let (first, rest) = pool.overlap(
+        &(),
+        &items,
+        |_, _, &i| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_micros(200));
+            i
+        },
+        |ov| {
+            let first = ov.wait(0).unwrap().unwrap();
+            let rest = ov.stop(1);
+            // Every later wait is over.
+            assert!(ov.wait(5).is_none());
+            (first, rest)
+        },
+    );
+    assert_eq!(first, 0);
+    assert_eq!(rest.len(), items.len() - 1);
+    // Finished items form a prefix and carry their own value; the cancelled
+    // suffix never ran.
+    let done = rest.iter().take_while(|r| r.is_some()).count();
+    assert!(rest[done..].iter().all(Option::is_none));
+    for (k, r) in rest.iter().take(done).enumerate() {
+        assert_eq!(r.as_ref().unwrap().as_ref().unwrap(), &(k as u32 + 1));
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 1 + done);
+    assert!(done < items.len() - 1, "the stop cancelled something");
+    pool.shutdown();
+}
+
+#[test]
+fn an_overlap_without_helpers_runs_each_item_on_the_caller() {
+    let seen = Registrations::default();
+    let pool = pool(&seen, 0);
+    let items: Vec<u32> = (0..8).collect();
+    let caller = std::thread::current().id();
+    let got = pool.overlap(
+        &(),
+        &items,
+        |_, _, &i| {
+            assert_eq!(std::thread::current().id(), caller);
+            assert!(planning(), "an item runs as planning");
+            i + 1
+        },
+        |ov| {
+            assert!(!ov.forked());
+            assert!(!planning(), "the body is not planning");
+            (0..items.len()).map(|i| ov.wait(i).unwrap().unwrap()).collect::<Vec<_>>()
+        },
+    );
+    assert_eq!(got, (1..=8).collect::<Vec<u32>>());
+}

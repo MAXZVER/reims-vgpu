@@ -1123,6 +1123,302 @@ fn commit_prepared<M: HostMemory + HostOps>(
 }
 
 // ---------------------------------------------------------------------------
+// The overlapped commit (v9)
+// ---------------------------------------------------------------------------
+
+/// `REIMS_VGPU_LAB_DRAW_PAR_OVERLAP=off` disables; live `DRAW_PAR_OVERLAP`.
+/// On: a stream's records 2+ are prepared on the pool while the drain commits
+/// them in order, each as soon as it is ready (one overlap region per run of
+/// committable records). Off: the chunked fork-join of v1-v8.
+pub(crate) fn overlap_on() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("DRAW_PAR_OVERLAP") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_PAR_OVERLAP").as_deref() != Ok("off"))
+}
+
+/// What a shared-state commit owes the device state, landed by the drain
+/// with its exclusive access once the region's helpers are quiescent: the
+/// registry holds of walked buffer plans and the linear memo's facts. Both are
+/// caches with an "equal entry landed first" rule, so landing them late only
+/// costs a later record of the region the re-plan it would have skipped.
+#[derive(Default)]
+pub(crate) struct RegionOwed {
+    holds: Vec<buffer_plan::OwedHold>,
+    linear: Vec<LinearMemoFact>,
+}
+
+impl RegionOwed {
+    pub(crate) fn land(&mut self, state: &mut DeviceState) {
+        for hold in self.holds.drain(..) {
+            hold.land(state);
+        }
+        for fact in self.linear.drain(..) {
+            fact.land(state);
+        }
+    }
+}
+
+/// The outcome of one shared-state commit.
+pub(crate) enum SharedCommit {
+    /// Submitted to the recorder.
+    Committed,
+    /// Needs the exclusive commit (a zero-copy gather lands witness state, or
+    /// the recorder holds a failure to report): offer it to the serial encode.
+    Exclusive(PreparedDraw),
+    /// The preparation no longer holds: the serial encode runs.
+    Invalid(Bail),
+}
+
+/// [`commit_prepared`] under the drain's shared state, while the pool's
+/// helpers read the same state: the same checks in the same order; the
+/// registry holds and linear-memo facts go to `owed` instead of landing.
+pub(crate) fn commit_shared<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    req: &DrawEncodeRequest,
+    prepared: PreparedDraw,
+    owed: &mut RegionOwed,
+) -> SharedCommit {
+    if !prepared.log.gathers.is_empty()
+        || crate::backend::vulkan::engine::deferred_failure_stashed()
+    {
+        return SharedCommit::Exclusive(prepared);
+    }
+    let PreparedDraw { log, task_id } = prepared;
+    let Some(done) = log.done else {
+        return SharedCommit::Invalid(Bail::NotDeferrable);
+    };
+    if task_id != req.task_id
+        || !req.chain_from_resident
+        || pass_inv::chain_identity(state, req).as_ref() != Some(&done.chain_identity)
+    {
+        return SharedCommit::Invalid(Bail::ChainMoved);
+    }
+    if !log
+        .secondaries
+        .iter()
+        .all(|w| super::secondary_witness_holds(state, task_id, w))
+    {
+        return SharedCommit::Invalid(Bail::PlanInvalid);
+    }
+    let first_hold = owed.holds.len();
+    for b in &log.buffers {
+        match buffer_plan::commit_prepared_buffer_shared(
+            state,
+            &b.plan,
+            task_id,
+            b.buffer_ref,
+            Some(b.resource.as_ref()),
+            b.offset,
+            b.cap,
+        ) {
+            Ok(Some(hold)) => owed.holds.push(hold),
+            Ok(None) => {}
+            Err(()) => {
+                owed.holds.truncate(first_hold);
+                return SharedCommit::Invalid(Bail::PlanInvalid);
+            }
+        }
+    }
+    for s in &log.samples {
+        if sample_plan::validate_sampled_plan(
+            state,
+            host,
+            &s.plan,
+            task_id,
+            s.texture_ref,
+            s.resource.as_ref(),
+            s.may_bind_resident,
+        )
+        .is_err()
+        {
+            owed.holds.truncate(first_hold);
+            return SharedCommit::Invalid(Bail::PlanInvalid);
+        }
+        let _ = sample_plan::take_sampled_plan(state, &s.plan, true);
+    }
+    owed.linear.extend(log.linear);
+    for n in &log.notes {
+        note_sampled_ref_backing(state, task_id, n.texture_ref, n.rw, n.rh, n.mid, n.route);
+        crate::runtime::scanout::note_sampled_surface_field(state, host, n.mid, n.texture_ref, n.route);
+    }
+    let mut resources = done.resources.into_inner();
+    pass_stage::arm_seed_stage(&mut resources);
+    crate::backend::vulkan::engine::submit_deferred_draw(state, resources, done.meta);
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
+    SharedCommit::Committed
+}
+
+/// What the region's per-record step answered.
+pub(crate) enum RegionStep {
+    /// Committed; the region goes on.
+    Committed,
+    /// Ends the region: the record goes to the serial encode, offered this
+    /// preparation when there is one.
+    Stop(Option<PreparedDraw>),
+}
+
+/// One record after a region's stop that the helpers had already attempted.
+pub(crate) enum Carried {
+    Prepared(PreparedDraw),
+    /// The worker bailed (its route is noted): the serial encode runs.
+    Bailed,
+}
+
+/// Where a region stopped.
+pub(crate) struct RegionStop {
+    /// Index (into the region's requests) of the first record the region did
+    /// not commit; the requests' length when it committed them all.
+    pub(crate) at: usize,
+    /// That record's preparation, when it needs the exclusive commit.
+    pub(crate) exclusive: Option<PreparedDraw>,
+    /// The records after `at` the helpers had already attempted, in order.
+    pub(crate) after: Vec<Carried>,
+}
+
+fn prepare_job(
+    st: &DeviceState,
+    env: &crate::runtime::par::WorkerEnv<'_>,
+    item: &(DrawEncodeRequest, bool),
+) -> Option<PreparedDraw> {
+    let (req, writeback_guest) = item;
+    let mut host = env.host();
+    let mut req = req.clone();
+    let mut log = PrepareLog::default();
+    let outcome = super::try_metal2vulkan_draw_with(
+        &mut StateAccess::Worker(st),
+        &mut host,
+        &mut req,
+        *writeback_guest,
+        Some(&mut log),
+    );
+    match (outcome, log.bail, log.done.is_some()) {
+        (Ok(_), None, true) => Some(PreparedDraw {
+            task_id: req.task_id,
+            log,
+        }),
+        (_, Some(bail), _) => {
+            crate::runtime::drain::note_store_route(bail.route());
+            None
+        }
+        _ => {
+            crate::runtime::drain::note_store_route("draw_par_bail_encode_err");
+            None
+        }
+    }
+}
+
+/// Run one overlap region over `reqs` (records 2+ of a resident chain, in
+/// order): the records in `carried` were attempted already (a previous
+/// region's helpers) and the rest are prepared on the pool now, while the
+/// drain commits each record in order through `step` as soon as it is ready.
+/// The region ends at the first record `step` stops at, or that has no
+/// preparation; the owed holds land before this returns.
+pub(crate) fn run_region<M, S>(
+    state: &mut DeviceState,
+    host: &mut M,
+    reqs: &[(DrawEncodeRequest, bool)],
+    carried: Vec<Carried>,
+    mut step: S,
+) -> RegionStop
+where
+    M: HostMemory + HostOps,
+    S: FnMut(&DeviceState, &mut M, usize, &DrawEncodeRequest, PreparedDraw, &mut RegionOwed) -> RegionStep,
+{
+    let nc = carried.len().min(reqs.len());
+    let jobs = &reqs[nc..];
+    // The fresh records' sampled sources, once, on the drain (see
+    // `lab_resolve_memo_prime`); the carried ones are already prepared.
+    if !jobs.is_empty() {
+        let primed = super::lab_resolve_memo_prime(state, host, jobs);
+        crate::runtime::drain::note_store_route_n("draw_par_memo_primed", u64::from(primed));
+        crate::runtime::drain::note_store_route_n("draw_par_offered", jobs.len() as u64);
+    }
+    crate::runtime::drain::note_store_route("draw_par_regions");
+    let mut owed = RegionOwed::default();
+    let mut carried: Vec<Option<Carried>> = carried.into_iter().take(nc).map(Some).collect();
+    let stop = {
+        let shared: &DeviceState = &*state;
+        let Some(pool) = shared.par() else {
+            return RegionStop {
+                at: 0,
+                exclusive: None,
+                after: Vec::new(),
+            };
+        };
+        pool.overlap(shared, jobs, prepare_job, |ov| {
+            let mut stop_at = |k: usize,
+                               exclusive: Option<PreparedDraw>,
+                               ov: &mut crate::runtime::par::Overlap<'_, Option<PreparedDraw>>,
+                               carried: &mut Vec<Option<Carried>>|
+             -> RegionStop {
+                let mut after: Vec<Carried> = carried
+                    .iter_mut()
+                    .skip(k + 1)
+                    .filter_map(Option::take)
+                    .collect();
+                let from_job = (k + 1).saturating_sub(nc);
+                for r in ov.stop(from_job) {
+                    match r {
+                        Some(Ok(Some(p))) => after.push(Carried::Prepared(p)),
+                        Some(_) => after.push(Carried::Bailed),
+                        // Cancelled unclaimed: this and everything after it
+                        // is prepared afresh by the next region.
+                        None => break,
+                    }
+                }
+                RegionStop {
+                    at: k,
+                    exclusive,
+                    after,
+                }
+            };
+            let mut prepared_n = 0u64;
+            for k in 0..reqs.len() {
+                let prepared = if k < nc {
+                    match carried[k].take() {
+                        Some(Carried::Prepared(p)) => Some(p),
+                        _ => None,
+                    }
+                } else {
+                    match ov.wait(k - nc) {
+                        Some(Ok(Some(p))) => {
+                            prepared_n += 1;
+                            Some(p)
+                        }
+                        _ => None,
+                    }
+                };
+                let Some(prepared) = prepared else {
+                    crate::runtime::drain::note_store_route_n("draw_par_prepared", prepared_n);
+                    return stop_at(k, None, ov, &mut carried);
+                };
+                match step(shared, host, k, &reqs[k].0, prepared, &mut owed) {
+                    RegionStep::Committed => {}
+                    RegionStep::Stop(exclusive) => {
+                        crate::runtime::drain::note_store_route_n("draw_par_prepared", prepared_n);
+                        return stop_at(k, exclusive, ov, &mut carried);
+                    }
+                }
+            }
+            crate::runtime::drain::note_store_route_n("draw_par_prepared", prepared_n);
+            RegionStop {
+                at: reqs.len(),
+                exclusive: None,
+                after: Vec::new(),
+            }
+        })
+    };
+    owed.land(state);
+    stop
+}
+
+// ---------------------------------------------------------------------------
 // The fork
 // ---------------------------------------------------------------------------
 

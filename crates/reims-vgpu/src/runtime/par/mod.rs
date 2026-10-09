@@ -70,7 +70,7 @@ pub(crate) mod staging;
 #[cfg(test)]
 mod tests;
 
-pub use pool::{JobPanic, Pool, PoolStats, Scoped, WorkerEnv};
+pub use pool::{JobPanic, Overlap, Pool, PoolStats, Scoped, WorkerEnv};
 
 use std::cell::Cell;
 use std::time::Duration;

@@ -378,6 +378,19 @@ impl Handoff {
         self.in_flight.load(Ordering::Acquire) || self.stash_pending.load(Ordering::Acquire)
     }
 
+    /// TEMP (lab, DRAW_PAR overlap): whether the stash holds a failure (or a
+    /// panic) nobody has taken, without taking it. A shared-state commit
+    /// cannot report one (the report abandons the chain, which needs the
+    /// drain's exclusive state), so it asks first and hands the record to the
+    /// exclusive commit, whose take finds it exactly as before.
+    pub(crate) fn failure_stashed(&self) -> bool {
+        self.stash_pending.load(Ordering::Acquire)
+            && matches!(
+                self.inner.lock().stash,
+                Some(JobResult::Failed(_)) | Some(JobResult::Panicked(_))
+            )
+    }
+
     /// TEMP (lab, PASS_PREP): jobs posted and not yet finished (queued or
     /// running). The census reads this at a planning scope's entry: a positive
     /// reading is the overlap the scope exists for — the recorder had draws to

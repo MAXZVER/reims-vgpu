@@ -436,11 +436,11 @@ impl CachedShader {
                     let n = crate::runtime::spirv_bind::offset_fragment_sampled_resource_bindings(
                         &mut w,
                     );
-                    crate::observe::line(format!("linux_m2v frag_sampled_reloc n={n}"));
+                    crate::observe::verbose(|| format!("linux_m2v frag_sampled_reloc n={n}"));
                 }
                 if buf_collide {
                     let n = crate::runtime::spirv_bind::offset_fragment_buffer_bindings(&mut w);
-                    crate::observe::line(format!("linux_m2v frag_buf_reloc n={n}"));
+                    crate::observe::verbose(|| format!("linux_m2v frag_buf_reloc n={n}"));
                 }
                 ShaderVariant::of(
                     Arc::new(w),
