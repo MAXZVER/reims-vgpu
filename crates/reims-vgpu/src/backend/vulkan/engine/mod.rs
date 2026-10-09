@@ -25,6 +25,7 @@ mod draw_preparation;
 pub(crate) mod draw_validation;
 mod driver_breadcrumb;
 mod exec;
+pub(crate) use exec::host_gathers_on_cpu;
 mod exec_compute;
 mod facade_decline;
 mod guest_scatter;

@@ -180,7 +180,7 @@ pub(crate) fn chunk_bytes() -> u64 {
     })
 }
 
-/// TEMP (lab, DRAW_PAR v15, `REIMS_VGPU_LAB_DRAW_PAR_STAGE=off` disables;
+/// TEMP (lab, DRAW_PAR v15, `REIMS_VGPU_LAB_DRAW_PAR_STAGE=on` enables;
 /// live `DRAW_PAR_STAGE`): the DRAW_PAR workers copy the guest bytes a bind
 /// reads on the CPU straight into their own arena, so the recorder binds the
 /// window instead of acquiring staging and copying them (b136: the recorder's
@@ -194,7 +194,10 @@ pub(crate) fn draw_par_stage_wanted() -> bool {
     #[cfg(not(test))]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_PAR_STAGE").as_deref() != Ok("off"))
+        // Opt-in since b138: no recorder gain on Weather (its staging is guest
+        // runs, not bytes) and the reveal-desktop transitions ran 137/138
+        // window fps against 149 with it on.
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_PAR_STAGE").as_deref() == Ok("on"))
     }
 }
 

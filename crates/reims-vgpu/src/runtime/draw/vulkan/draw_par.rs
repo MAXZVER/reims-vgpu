@@ -567,6 +567,38 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// TEMP (lab, DRAW_PAR v15): a planned buffer window this host would gather
+/// on the CPU anyway (no guest-RAM import on the copying rail) is gathered here,
+/// into the worker's arena - the exact copy `write_staging_from_runs` makes on
+/// the recorder (`Stager::stage_runs`), at prepare time instead of record time;
+/// both are CPU reads ahead of the GPU's. Windows past 256 KiB keep the runs.
+fn stage_guest_runs(
+    content: crate::backend::vulkan::engine::BufferContent,
+) -> crate::backend::vulkan::engine::BufferContent {
+    use crate::backend::vulkan::engine::BufferContent;
+    let BufferContent::GuestRuns(src) = &content else {
+        return content;
+    };
+    if src.total_len == 0
+        || src.total_len > 256 * 1024
+        || !crate::backend::vulkan::engine::host_gathers_on_cpu()
+    {
+        return content;
+    }
+    let staged = JOB_STAGER.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|st| st.stage_runs(&src.runs, src.source_offset, src.total_len))
+    });
+    match staged {
+        Some(slice) => {
+            crate::runtime::drain::note_store_route("draw_par_staged_runs");
+            BufferContent::Staged(slice)
+        }
+        None => content,
+    }
+}
+
 fn stage_on() -> bool {
     crate::runtime::par::staging::draw_par_stage_wanted()
         && crate::runtime::lab_live::on("DRAW_PAR_STAGE") != Some(false)
@@ -665,7 +697,7 @@ pub(super) fn load_buffer_content_worker<M: HostMemory + HostOps>(
                             offset,
                             cap: extent_cap,
                         });
-                        return Ok(content);
+                        return Ok(stage_guest_runs(content));
                     }
                     // Not this bind's rail: the serial ladder reads on.
                     Ok(None) => {}
@@ -727,7 +759,7 @@ pub(super) fn load_index_content_worker<M: HostMemory + HostOps>(
                         offset: info.index_buffer_offset,
                         cap: Some(need as u64),
                     });
-                    return Ok(content);
+                    return Ok(stage_guest_runs(content));
                 }
                 Ok(None) => {}
                 Err(_) => return Err(Bail::IndexPredict),

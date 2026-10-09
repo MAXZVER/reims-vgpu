@@ -652,6 +652,15 @@ struct StageBufferUse {
     gather_role: BufferGatherRole,
 }
 
+/// TEMP (lab, DRAW_PAR v15): set once the recorder has met a guest-runs bind
+/// on a host without host-pointer import (the CPU-gather rail).
+static HOST_GATHERS_ON_CPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// TEMP (lab, DRAW_PAR v15): see [`HOST_GATHERS_ON_CPU`].
+pub(crate) fn host_gathers_on_cpu() -> bool {
+    HOST_GATHERS_ON_CPU.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 unsafe fn stage_buffer_content(
     ctx: &super::context::DeviceContext,
     pools: &mut ResourcePools,
@@ -713,6 +722,12 @@ unsafe fn stage_buffer_content(
             }
         }
         BufferContent::GuestRuns(src) => {
+            // TEMP (lab, DRAW_PAR v15): tell the planners this host gathers
+            // guest runs on the CPU (no host-pointer import), so a worker may
+            // make the same copy ahead of the recorder.
+            if !ctx.caps.host_pointer.is_available() {
+                HOST_GATHERS_ON_CPU.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             // The bytes are already in memory the device can address. Bind them.
             //
             // What keeps this safe is not the mechanism — a host pointer is one
