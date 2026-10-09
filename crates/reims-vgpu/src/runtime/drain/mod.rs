@@ -6695,7 +6695,11 @@ fn apply_map_family<H: HostMemory + HostOps>(
         }
     }
     // TEMP (lab): translations cached this tranche may name the pages moved.
-    crate::runtime::gva_mem::lab_tlb::new_epoch();
+    // Under TLB_TARGET the forget waits for the notice below, which names them.
+    let tlb_targeted = crate::runtime::gva_mem::lab_tlb::targeted();
+    if !tlb_targeted {
+        crate::runtime::gva_mem::lab_tlb::new_epoch();
+    }
     // Every branch below stamps the packet complete whatever it did with
     // it: the guest is waiting on the stamp, and a lifecycle event this
     // device chose not to act on is still an event the guest performed.
@@ -6719,10 +6723,25 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // it. Reported by name rather than falling through to the generic
         // census line, which prints two words of a record it could not read.
         Err(short) => {
+            if tlb_targeted {
+                crate::runtime::gva_mem::lab_tlb::new_epoch();
+            }
             note_short_payload(family.slug(), Some(channel_id), &short);
             return;
         }
     };
+    if tlb_targeted {
+        use crate::runtime::gva_mem::lab_tlb;
+        match &notice {
+            Some(n) => match state.tasks.get(n.task_id).filter(|t| t.directory_pfn != 0) {
+                Some(t) => lab_tlb::forget_range(t.directory_pfn, n.gva, n.length, state.page_shift),
+                None => lab_tlb::new_epoch(),
+            },
+            // Invalidate/Synchronize resources and DeleteIOSurfaceBacking2
+            // change no page table.
+            None => lab_tlb::forget_others(),
+        }
+    }
     // The same, for the retirement that shares this arm. A payload too short to
     // name the surface is one whose backing this device cannot condemn, and the
     // id is reused within tens of milliseconds under scroll — so a dropped

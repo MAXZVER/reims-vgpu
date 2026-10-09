@@ -2985,9 +2985,7 @@ pub fn note_tranche_started(now_us: u64) {
     if crate::runtime::lab_live::present() {
         crate::runtime::gva_mem::lab_tlb::refresh_slots();
     }
-    if !crate::runtime::gva_mem::lab_tlb::keep_across_tranches() {
-        crate::runtime::gva_mem::lab_tlb::new_epoch();
-    }
+    crate::runtime::gva_mem::lab_tlb::tranche_started();
     lab_ft(LabFtPoint::Drain);
     LAB_TRANCHE_SNAP.with(|c| c.set(DRAIN_DUTY.lab_snap()));
     // TEMP (lab, MONSTER_TRANCHE_PHASES): the phase accumulators' two ends are

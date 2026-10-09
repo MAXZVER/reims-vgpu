@@ -179,6 +179,79 @@ pub(crate) mod lab_tlb {
         })
     }
     static EPOCH: AtomicU64 = AtomicU64::new(1);
+    /// TEMP (lab, TLB_TARGET): the epoch the drain thread's own cache answers
+    /// to. Moved by every full forget ([`new_epoch`]) but not by the targeted
+    /// ones, which the drain thread applies to its own slots directly.
+    static DRAIN_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+    thread_local! {
+        /// Whether this thread is the drain (marked at each tranche start).
+        static IS_DRAIN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[inline]
+    fn epoch_here() -> u64 {
+        if IS_DRAIN.with(Cell::get) {
+            DRAIN_EPOCH.load(Relaxed)
+        } else {
+            EPOCH.load(Relaxed)
+        }
+    }
+
+    /// TEMP (lab, live `TLB_TARGET=on|off`, else `REIMS_VGPU_LAB_TLB_TARGET=on`):
+    /// on the drain thread, forget only the translations a MapMemory2 or
+    /// UnmapMemory names — its task's directory, its GVA range — and keep the
+    /// rest across tranches and across the map family's other members
+    /// (Invalidate/Synchronize resources and DeleteIOSurfaceBacking2 change no
+    /// page table). Every other thread still forgets everything on each of
+    /// them. b107/b103: the cache lived ~2 ms (≈460 map-family packets a second
+    /// on Weather's ch2), which neither a larger table nor keeping it across
+    /// tranches alone could fix.
+    pub(crate) fn targeted() -> bool {
+        if let Some(on) = crate::runtime::lab_live::on("TLB_TARGET") {
+            return on;
+        }
+        static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENV.get_or_init(|| std::env::var("REIMS_VGPU_LAB_TLB_TARGET").as_deref() == Ok("on"))
+    }
+
+    /// A drain tranche starts on this thread.
+    pub(crate) fn tranche_started() {
+        IS_DRAIN.with(|d| d.set(true));
+        if targeted() {
+            // The others still forget per tranche; the drain keeps its slots.
+            EPOCH.fetch_add(1, Relaxed);
+        } else if !keep_across_tranches() {
+            new_epoch();
+        }
+    }
+
+    /// The guest changed `[gva, gva + len)` of the task whose directory is
+    /// `dir` (MapMemory2 / UnmapMemory): every thread but this one forgets
+    /// everything; this one (the drain) drops the slots in the range.
+    pub(crate) fn forget_range(dir: u32, gva: u64, len: u64, page_shift: u32) {
+        EPOCH.fetch_add(1, Relaxed);
+        if !IS_DRAIN.with(Cell::get) {
+            DRAIN_EPOCH.fetch_add(1, Relaxed);
+            return;
+        }
+        let lo = gva >> page_shift;
+        let hi = gva.saturating_add(len.max(1) - 1) >> page_shift;
+        TLB.with(|t| {
+            for c in t.iter() {
+                let s = c.get();
+                if s.dir == dir && s.page >= lo && s.page <= hi {
+                    c.set(Slot { epoch: 0, ..s });
+                }
+            }
+        });
+    }
+
+    /// A map-family member that changes no page table: the other threads keep
+    /// the old rule (forget everything), the drain keeps its slots.
+    pub(crate) fn forget_others() {
+        EPOCH.fetch_add(1, Relaxed);
+    }
 
     #[derive(Clone, Copy)]
     struct Slot {
@@ -217,6 +290,7 @@ pub(crate) mod lab_tlb {
     /// Forget every translation: a tranche starts, or the guest remapped.
     pub(crate) fn new_epoch() {
         EPOCH.fetch_add(1, Relaxed);
+        DRAIN_EPOCH.fetch_add(1, Relaxed);
     }
 
     fn index(dir: u32, page: u64) -> usize {
@@ -236,7 +310,7 @@ pub(crate) mod lab_tlb {
     }
 
     pub(super) fn get(dir: u32, page: u64) -> Option<u64> {
-        let epoch = EPOCH.load(Relaxed);
+        let epoch = epoch_here();
         TLB.with(|t| {
             let s = t[index(dir, page)].get();
             (s.epoch == epoch && s.dir == dir && s.page == page).then_some(s.base)
@@ -244,7 +318,7 @@ pub(crate) mod lab_tlb {
     }
 
     pub(super) fn put(dir: u32, page: u64, base: u64) {
-        let epoch = EPOCH.load(Relaxed);
+        let epoch = epoch_here();
         TLB.with(|t| {
             t[index(dir, page)].set(Slot {
                 epoch,
