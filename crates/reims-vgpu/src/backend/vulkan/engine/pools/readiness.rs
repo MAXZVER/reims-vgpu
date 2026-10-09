@@ -60,7 +60,7 @@
 use super::super::types::TargetIdentity;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -151,8 +151,8 @@ impl Cell {
     }
 }
 
-static TABLE: Lazy<RwLock<HashMap<TargetIdentity, Arc<Cell>>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
+static TABLE: Lazy<RwLock<reims_vgpu_core::fasthash::FxHashMap<TargetIdentity, Arc<Cell>>>> =
+    Lazy::new(|| RwLock::new(Default::default()));
 
 /// The published state of `identity`, or `None` when no resident is registered
 /// under it.

@@ -15,7 +15,7 @@
 //! on a sweep, and a warm bind still reads the retention back without entering
 //! the engine.
 
-use std::collections::HashMap;
+
 
 use super::{
     retain_resident_resource, ResidentContentBacking, ResidentResourceLease, TargetIdentity,
@@ -29,7 +29,7 @@ use crate::model::{RailResourceState, TaskResource};
 /// matching identity instead of overwriting an unrelated child lease. The lease
 /// owns its resident pin and its allocation classification.
 #[derive(Debug, Default)]
-pub struct ResidentTargets(HashMap<TargetIdentity, ResidentResourceLease>);
+pub struct ResidentTargets(reims_vgpu_core::fasthash::FxHashMap<TargetIdentity, ResidentResourceLease>);
 
 impl RailResourceState for ResidentTargets {}
 

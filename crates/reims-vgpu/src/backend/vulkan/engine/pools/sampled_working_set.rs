@@ -35,7 +35,6 @@
 //! given a synthetic key. Folding those in would inflate the working set with
 //! windows no cap change could help.
 
-use std::collections::HashMap;
 
 use super::{SampledKey, SAMPLED_CACHE_BYTE_CAP, SAMPLED_REACH_BAND};
 use crate::backend::vulkan::engine::SampledContentIdentity;
@@ -46,7 +45,7 @@ struct Window {
     /// Distinct `(key, identity)` windows, each with the bytes it would occupy.
     /// The value is the content length; a repeat of the same pair overwrites it
     /// with the same number rather than adding, which is the whole point.
-    wanted: HashMap<(SampledKey, SampledContentIdentity), usize>,
+    wanted: reims_vgpu_core::fasthash::FxHashMap<(SampledKey, SampledContentIdentity), usize>,
     /// Binds naming no identity. Counted, never inserted — see the module doc.
     no_identity: u64,
     /// Distinct windows refused because [`Window::CAPACITY`] was reached.

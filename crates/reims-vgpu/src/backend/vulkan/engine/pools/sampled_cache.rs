@@ -29,7 +29,7 @@
 
 use super::{ResidentSampledSlot, SampledFingerprint, SampledKey};
 use crate::backend::vulkan::engine::SampledContentIdentity;
-use std::collections::HashMap;
+use reims_vgpu_core::fasthash::FxHashMap;
 
 const NIL: u32 = u32::MAX;
 
@@ -52,8 +52,8 @@ pub(super) struct SampledCache {
     oldest: u32,
     newest: u32,
     len: usize,
-    by_identity: HashMap<(SampledKey, SampledContentIdentity), u32>,
-    by_content: HashMap<(SampledKey, u128), Vec<u32>>,
+    by_identity: FxHashMap<(SampledKey, SampledContentIdentity), u32>,
+    by_content: FxHashMap<(SampledKey, u128), Vec<u32>>,
 }
 
 impl SampledCache {
@@ -64,8 +64,8 @@ impl SampledCache {
             oldest: NIL,
             newest: NIL,
             len: 0,
-            by_identity: HashMap::new(),
-            by_content: HashMap::new(),
+            by_identity: FxHashMap::default(),
+            by_content: FxHashMap::default(),
         }
     }
 
