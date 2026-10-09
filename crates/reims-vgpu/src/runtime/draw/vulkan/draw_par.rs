@@ -444,6 +444,19 @@ pub(crate) fn chunk() -> usize {
     })
 }
 
+/// TEMP (lab, DRAW_PAR v10, live `DRAW_PAR_COLD_BAIL=on` restores the bail):
+/// a sub-floor buffer or index window no record has walked yet (`ColdWindow`:
+/// in practice the < 16 KiB remainder of a reference, first sight of its
+/// `(ref, offset, cap)`) is read on the worker - the bytes the serial walk's
+/// runs would gather, through the same `cpu_read_worker` readability gate the
+/// below-floor read uses - instead of bailing the whole record to the drain.
+/// The serial walk would also have left a registry hold; on Weather these keys
+/// hardly repeat (~3k first sightings a second, ring-allocated offsets), so
+/// nothing is warmed: a repeat reads again, on a worker.
+fn cold_bytes() -> bool {
+    crate::runtime::lab_live::on("DRAW_PAR_COLD_BAIL") != Some(true)
+}
+
 /// A pass shorter than this (records 2+) is encoded serially: the fork would
 /// cost more than the draws.
 pub(crate) const MIN_DRAWS: usize = 4;
@@ -596,6 +609,10 @@ pub(super) fn load_buffer_content_worker<M: HostMemory + HostOps>(
             // PASS_STAGE's `stage_or_bail` reads on a worker for the same
             // reason: the floor already refused the gather.
             Err(buffer_plan::BufferBail::BelowFloor | buffer_plan::BufferBail::ColdPacked) => {}
+            // A sub-floor window nobody has walked yet (see `cold_bytes`).
+            Err(buffer_plan::BufferBail::ColdWindow) if cold_bytes() => {
+                crate::runtime::drain::note_store_route("draw_par_cold_bytes_buf");
+            }
             // Everything else is a construction (whole, a walked window) or a
             // refusal the serial ladder names itself.
             Err(bail) => return Err(Bail::BufferPlan(bail)),
@@ -649,6 +666,9 @@ pub(super) fn load_index_content_worker<M: HostMemory + HostOps>(
             }
         }
         Err(buffer_plan::BufferBail::BelowFloor | buffer_plan::BufferBail::ColdPacked) => {}
+        Err(buffer_plan::BufferBail::ColdWindow) if cold_bytes() => {
+            crate::runtime::drain::note_store_route("draw_par_cold_bytes_idx");
+        }
         Err(bail) => return Err(Bail::IndexPlan(bail)),
     }
     if !buffer_plan::below_floor(backing.size, info.index_buffer_offset) {
@@ -1141,6 +1161,9 @@ pub(crate) fn overlap_on() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_PAR_OVERLAP").as_deref() != Ok("off"))
 }
 
+/// Records at a region's head whose sampled sources the drain primes.
+const PRIME_HEAD: usize = 8;
+
 /// What a shared-state commit owes the device state, landed by the drain
 /// with its exclusive access once the region's helpers are quiescent: the
 /// registry holds of walked buffer plans and the linear memo's facts. Both are
@@ -1334,9 +1357,19 @@ where
     let jobs = &reqs[nc..];
     // The fresh records' sampled sources, once, on the drain (see
     // `lab_resolve_memo_prime`); the carried ones are already prepared.
+    // TEMP (lab, live `DRAW_PAR_PRIME=off`): skip it - in a region the prime
+    // is serial drain time ahead of the helpers' start, and the helpers resolve
+    // (and memo) a source themselves on a miss; the price is the duplicate
+    // resolves of jobs that start together on one new source.
     if !jobs.is_empty() {
-        let primed = super::lab_resolve_memo_prime(state, host, jobs);
-        crate::runtime::drain::note_store_route_n("draw_par_memo_primed", u64::from(primed));
+        if crate::runtime::lab_live::on("DRAW_PAR_PRIME") != Some(false) {
+            // Only the region's head: a region that stops early re-primes
+            // from its stop, so priming the whole remainder each time was
+            // quadratic in the stream (b128: binds 1.63 -> 2.19 us/draw).
+            let head = &jobs[..jobs.len().min(PRIME_HEAD)];
+            let primed = super::lab_resolve_memo_prime(state, host, head);
+            crate::runtime::drain::note_store_route_n("draw_par_memo_primed", u64::from(primed));
+        }
         crate::runtime::drain::note_store_route_n("draw_par_offered", jobs.len() as u64);
     }
     crate::runtime::drain::note_store_route("draw_par_regions");
