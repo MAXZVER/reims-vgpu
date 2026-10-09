@@ -4253,6 +4253,9 @@ impl DeviceState {
     /// ignore.
     pub fn define_task(&mut self, task_id: u32, length: u64, directory_pfn: u32) {
         self.max_task_id_seen = self.max_task_id_seen.max(task_id);
+        // A directory page may come back under a new task (or the same id) with
+        // other tables: cached translations keyed by it are not this task's.
+        crate::runtime::gva_mem::lab_tlb::new_epoch();
         // Redefining a *live* task is the one shape here that can lose published
         // guest state: the objects below are dropped, and if the new directory
         // roots a different physical page at the list's own GVA then everything
@@ -4368,6 +4371,7 @@ impl DeviceState {
         self.map_audit.remove(&task_id);
         self.node_guard.remove(&task_id);
         self.tasks.remove(task_id);
+        crate::runtime::gva_mem::lab_tlb::new_epoch();
         true
     }
 

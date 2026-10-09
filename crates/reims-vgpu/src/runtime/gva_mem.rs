@@ -192,6 +192,21 @@ pub(crate) mod lab_tlb {
         *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GVA_TLB").map_or(true, |v| v != "off"))
     }
 
+    /// TEMP (lab, TLB_KEEP): keep translations across drain tranches; they are
+    /// still forgotten when the guest maps or unmaps (`apply_map_family`) and
+    /// when a task is defined or deleted. A tranche runs per doorbell, so the
+    /// per-tranche rule left the cache cold for most reads: b101, the walk and
+    /// its guest-physical reads were ~5 % of Weather's drain under object-list
+    /// lookups. Live `TLB_KEEP=on|off`, else `REIMS_VGPU_LAB_TLB_KEEP=on`; off by
+    /// default until measured.
+    pub(crate) fn keep_across_tranches() -> bool {
+        if let Some(on) = crate::runtime::lab_live::on("TLB_KEEP") {
+            return on;
+        }
+        static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENV.get_or_init(|| std::env::var("REIMS_VGPU_LAB_TLB_KEEP").as_deref() == Ok("on"))
+    }
+
     /// Forget every translation: a tranche starts, or the guest remapped.
     pub(crate) fn new_epoch() {
         EPOCH.fetch_add(1, Relaxed);

@@ -16,6 +16,15 @@
 //! so the allocator never allocates through itself; a thread's cache is left
 //! behind when the thread exits (the device's threads live as long as QEMU).
 //!
+//! A thread whose list of a class is full hands half of it, as one batch, to a
+//! shared per-class depot, and a thread whose list is empty takes a batch back
+//! before it asks the system heap. Without that, a block allocated on one thread
+//! and freed on another — every deferred draw's resource vectors, built on the
+//! drain and dropped on the recorder — went from the producer's empty list to
+//! the system heap and from the consumer's full list back to it, a locked
+//! `RtlAllocateHeap`/`RtlFreeHeap` pair per block (b101). `REIMS_VGPU_LAB_DEPOT=off`
+//! frees past the cap to the system heap as before.
+//!
 //! `REIMS_VGPU_LAB_TCACHE=big` caches blocks up to 64 KiB (the system heap
 //! serves blocks past its low-fragmentation sizes under its lock), each class
 //! holding at most 1 MiB. `REIMS_VGPU_LAB_TCACHE=off` passes everything to the system heap. Read once,
@@ -53,6 +62,90 @@ const LARGE_SLOTS: usize = 32;
 const LARGE_CAP_BYTES: usize = 384 << 20;
 /// Whether the large-block list is in use (1), decided with the mode.
 static LARGE_ON: AtomicU8 = AtomicU8::new(0);
+/// Whether the cross-thread depot is in use (1), decided with the mode.
+static DEPOT_ON: AtomicU8 = AtomicU8::new(0);
+/// Batches one class's depot holds; a batch past that goes back to the system heap.
+const DEPOT_BATCHES: usize = 16;
+
+/// One class's shared batches: intrusive lists (the block's first word links
+/// to the next) with their lengths, under a spin lock.
+struct Depot {
+    lock: AtomicBool,
+    heads: core::cell::UnsafeCell<[*mut u8; DEPOT_BATCHES]>,
+    counts: core::cell::UnsafeCell<[u32; DEPOT_BATCHES]>,
+    n: core::cell::UnsafeCell<usize>,
+}
+
+// SAFETY: the cells are only touched under `lock`.
+unsafe impl Sync for Depot {}
+
+#[allow(clippy::declare_interior_mutable_const)]
+const DEPOT_INIT: Depot = Depot {
+    lock: AtomicBool::new(false),
+    heads: core::cell::UnsafeCell::new([core::ptr::null_mut(); DEPOT_BATCHES]),
+    counts: core::cell::UnsafeCell::new([0; DEPOT_BATCHES]),
+    n: core::cell::UnsafeCell::new(0),
+};
+
+static DEPOTS: [Depot; CLASS_SIZES.len()] = [DEPOT_INIT; CLASS_SIZES.len()];
+
+impl Depot {
+    fn lock(&self) {
+        let mut spins = 0u32;
+        while self
+            .lock
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spins += 1;
+            if spins < 64 {
+                core::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    fn unlock(&self) {
+        self.lock.store(false, Ordering::Release);
+    }
+
+    /// Keep a batch, or hand it back when the depot is full.
+    fn put(&self, head: *mut u8, count: u32) -> bool {
+        self.lock();
+        // SAFETY: under `lock`.
+        let kept = unsafe {
+            let n = &mut *self.n.get();
+            if *n < DEPOT_BATCHES {
+                (*self.heads.get())[*n] = head;
+                (*self.counts.get())[*n] = count;
+                *n += 1;
+                true
+            } else {
+                false
+            }
+        };
+        self.unlock();
+        kept
+    }
+
+    /// A batch, or `(null, 0)`.
+    fn take(&self) -> (*mut u8, u32) {
+        self.lock();
+        // SAFETY: under `lock`.
+        let got = unsafe {
+            let n = &mut *self.n.get();
+            if *n == 0 {
+                (core::ptr::null_mut(), 0)
+            } else {
+                *n -= 1;
+                ((*self.heads.get())[*n], (*self.counts.get())[*n])
+            }
+        };
+        self.unlock();
+        got
+    }
+}
 static LARGE_LOCK: AtomicBool = AtomicBool::new(false);
 
 struct LargeList {
@@ -148,6 +241,16 @@ fn decide() -> bool {
     let ln = unsafe { GetEnvironmentVariableW(lname.as_ptr(), lbuf.as_mut_ptr(), lbuf.len() as u32) };
     let loff = ln == 3 && lbuf[0] == u16::from(b'o') && lbuf[1] == u16::from(b'f') && lbuf[2] == u16::from(b'f');
     LARGE_ON.store(u8::from(!off && !loff), Ordering::Relaxed);
+    const DNAME: &[u8] = b"REIMS_VGPU_LAB_DEPOT\0";
+    let mut dname = [0u16; 32];
+    for (i, b) in DNAME.iter().enumerate() {
+        dname[i] = u16::from(*b);
+    }
+    let mut dbuf = [0u16; 8];
+    // SAFETY: both buffers are ours and sized as passed.
+    let dn = unsafe { GetEnvironmentVariableW(dname.as_ptr(), dbuf.as_mut_ptr(), dbuf.len() as u32) };
+    let doff = dn == 3 && dbuf[0] == u16::from(b'o') && dbuf[1] == u16::from(b'f') && dbuf[2] == u16::from(b'f');
+    DEPOT_ON.store(u8::from(!off && !doff), Ordering::Relaxed);
     let mut on = !off;
     if on {
         // SAFETY: plain Win32 call.
@@ -331,7 +434,16 @@ unsafe impl GlobalAlloc for ThreadCache {
             let c = class_of(layout.size());
             let cache = cache();
             if !cache.is_null() {
-                let head = (*cache).heads[c];
+                let mut head = (*cache).heads[c];
+                if head.is_null() && DEPOT_ON.load(Ordering::Relaxed) == 1 {
+                    // Empty: a batch some other thread freed, before the heap.
+                    let (h, n) = DEPOTS[c].take();
+                    if !h.is_null() {
+                        (*cache).heads[c] = h;
+                        (*cache).counts[c] = n;
+                        head = h;
+                    }
+                }
                 if !head.is_null() {
                     (*cache).heads[c] = *(head as *mut *mut u8);
                     (*cache).counts[c] -= 1;
@@ -385,6 +497,24 @@ unsafe impl GlobalAlloc for ThreadCache {
             }
             let c = class_of(layout.size());
             let cache = cache();
+            if !cache.is_null() && (*cache).counts[c] >= class_cap(c) && class_cap(c) >= 2
+                && DEPOT_ON.load(Ordering::Relaxed) == 1
+            {
+                // Full: the older half of the list (the blocks past its first
+                // half) goes to the depot as one batch, for a thread that
+                // allocates what this one frees.
+                let keep = class_cap(c) / 2;
+                let mut tail = (*cache).heads[c];
+                for _ in 1..keep {
+                    tail = *(tail as *mut *mut u8);
+                }
+                let batch = *(tail as *mut *mut u8);
+                let moved = (*cache).counts[c] - keep;
+                if !batch.is_null() && DEPOTS[c].put(batch, moved) {
+                    *(tail as *mut *mut u8) = core::ptr::null_mut();
+                    (*cache).counts[c] = keep;
+                }
+            }
             if !cache.is_null() && (*cache).counts[c] < class_cap(c) {
                 *(ptr as *mut *mut u8) = (*cache).heads[c];
                 (*cache).heads[c] = ptr;
@@ -442,6 +572,40 @@ unsafe impl GlobalAlloc for ThreadCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Blocks made on one thread and freed on another come back through the
+    /// depot intact: every block handed out is a whole, writable class block,
+    /// and the producer's later allocations are served (the depot holds what
+    /// the consumer's full list passed on).
+    #[test]
+    fn blocks_freed_on_another_thread_return_through_the_depot() {
+        if !enabled() {
+            return; // switched off in this environment
+        }
+        let l = Layout::from_size_align(200, 8).unwrap();
+        for round in 0..20u8 {
+            let blocks: Vec<usize> = (0..600)
+                .map(|i| unsafe {
+                    let p = ThreadCache.alloc(l);
+                    assert!(!p.is_null());
+                    core::ptr::write_bytes(p, round ^ (i as u8), l.size());
+                    p as usize
+                })
+                .collect();
+            std::thread::spawn(move || {
+                for (i, &p) in blocks.iter().enumerate() {
+                    unsafe {
+                        let p = p as *mut u8;
+                        // Past the link word, the bytes are still the producer's.
+                        assert!((8..l.size()).all(|k| *p.add(k) == round ^ (i as u8)));
+                        ThreadCache.dealloc(p, l);
+                    }
+                }
+            })
+            .join()
+            .unwrap();
+        }
+    }
 
     #[test]
     fn every_size_fits_its_class() {
