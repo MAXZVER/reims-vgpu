@@ -18,7 +18,7 @@
 //! device state and guest memory, write nothing. Every state mutation the
 //! serial encode makes has a worker-side twin here that either *describes* the
 //! mutation for the commit (a buffer plan, a sampled plan) or bails — the seed
-//! doors, the zero-copy constructions, MRT, cube faces, the synchronous engine
+//! doors, the zero-copy constructions, cube faces, the synchronous engine
 //! rails. A bail costs the draw nothing but the worker's time: the drain's
 //! serial path is unchanged and runs exactly as before.
 //!
@@ -114,12 +114,13 @@ pub(crate) enum Bail {
     LinearConvert,
     /// A cube map: six faces the drain reloads.
     Cube,
-    /// An attachment alias of a secondary slot.
-    AliasSecondary,
+    /// A secondary colour attachment (MRT) whose resource-ledger entry is cold:
+    /// the serial identity call would declare it, which only the drain may do.
+    /// Also a record that does not load every colour (a DontCare attachment
+    /// consults the engine's residency).
+    MrtCold,
     /// A miss whose detail the drain reports.
     MissDetail,
-    /// More than one colour attachment.
-    Mrt,
     /// The record does not load from the chain's resident: its seed doors
     /// are the drain's.
     NoChainLoad,
@@ -164,9 +165,8 @@ impl Bail {
             Bail::ZcOutcome => "draw_par_commit_zc_outcome",
             Bail::LinearConvert => "draw_par_bail_lin_convert",
             Bail::Cube => "draw_par_bail_cube",
-            Bail::AliasSecondary => "draw_par_bail_alias_secondary",
+            Bail::MrtCold => "draw_par_bail_mrt_cold",
             Bail::MissDetail => "draw_par_bail_miss_detail",
-            Bail::Mrt => "draw_par_bail_mrt",
             Bail::NoChainLoad => "draw_par_bail_no_chain_load",
             Bail::RecorderOff => "draw_par_bail_recorder_off",
             Bail::NotChain => "draw_par_bail_not_chain",
@@ -333,6 +333,29 @@ pub(crate) struct SampledNote {
     route: &'static str,
 }
 
+/// What one secondary colour attachment's identity rests on, as the worker
+/// peeked it. The serial encode resolves that identity through the drain's
+/// `&mut` ledger; a peek that agrees with the ledger at commit is byte-for-byte
+/// what the serial call would have answered without mutating anything, so
+/// nothing needs landing — only re-deriving.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SecondaryWitness {
+    /// A ledgered GVA plane: the generation the ledger held for it at `span`.
+    Gva {
+        texture_ref: u32,
+        gva: u64,
+        span: u64,
+        generation: u64,
+    },
+    /// A mapper-ref surface and the identity `surface_identity` named for it.
+    Surface {
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+        identity: TargetIdentity,
+    },
+}
+
 /// The worker's running record of one draw's preparation: the plans the
 /// request rests on, the notes the commit owes, and — once the body reaches
 /// the engine door — the finished request.
@@ -343,6 +366,7 @@ pub(crate) struct PrepareLog {
     pub(super) gathers: Vec<ZcCommit>,
     pub(super) linear: Vec<LinearMemoFact>,
     pub(super) notes: Vec<SampledNote>,
+    pub(super) secondaries: Vec<SecondaryWitness>,
     pub(super) bail: Option<Bail>,
     pub(super) done: Option<PreparedRequest>,
 }
@@ -972,6 +996,15 @@ fn commit_prepared<M: HostMemory + HostOps>(
         || pass_inv::chain_identity(state, req).as_ref() != Some(&done.chain_identity)
     {
         return Err(Bail::ChainMoved);
+    }
+    // The secondary attachments' identities were read, not declared, on the
+    // worker; they hold if the ledger still answers them the same way.
+    if !log
+        .secondaries
+        .iter()
+        .all(|w| super::secondary_witness_holds(state, task_id, w))
+    {
+        return Err(Bail::PlanInvalid);
     }
     // The plans, in bind order, each validated at the key it served and its
     // facts landed — the same facts the serial ladder would have made.

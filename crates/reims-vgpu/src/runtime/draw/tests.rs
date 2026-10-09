@@ -6075,6 +6075,167 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
     let _ = &mut state;
 }
 
+/// TEMP (lab, DRAW_PAR): the colours of a two-attachment pass whose secondary is
+/// a ledgered GVA plane, and the key/span its resource-ledger entry lives under.
+#[cfg(feature = "backend-vulkan")]
+fn mrt_peek_fixture() -> (
+    Vec<ColorRtRequest>,
+    crate::runtime::writeback_debt::GvaResourceKey,
+    u64,
+) {
+    let colors = vec![
+        ColorRtRequest {
+            slot: 0,
+            texture_ref: 10,
+            target_gva: 0x1000,
+            row_stride: 256,
+            width: 64,
+            height: 64,
+            format: MTL_FORMAT_BGRA8_UNORM,
+            ..ColorRtRequest::default()
+        },
+        ColorRtRequest {
+            slot: 1,
+            texture_ref: 11,
+            target_gva: 0x2000,
+            row_stride: 256,
+            width: 64,
+            height: 64,
+            format: crate::protocol::pixel_format::MTL_FORMAT_RG16_FLOAT,
+            ..ColorRtRequest::default()
+        },
+    ];
+    let key = crate::runtime::writeback_debt::GvaResourceKey {
+        task_id: 1,
+        texture_ref: 11,
+    };
+    (colors, key, 256 * 64)
+}
+
+/// A worker's peek of a secondary's identity on a warm ledger is the serial
+/// call's answer, and the serial call leaves the ledger as it found it — the
+/// premise that lets the commit only re-derive the witness instead of landing
+/// anything. The build the worker runs from peeked identities equals the drain's.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_warm_ledger_peek_equals_the_serial_secondary_identity() {
+    use crate::runtime::decode::resource::RenderPipelineDescriptor;
+    let (colors, key, span) = mrt_peek_fixture();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let generation = state
+        .pending_writebacks
+        .ensure_gva_resource(key, 0x2000, span, Some(vec![0x10, 0x11, 0x12, 0x13]));
+    let format = crate::backend::vulkan::translate::pixel::color_attachment(colors[1].format)
+        .expect("RG16Float is an admitted secondary format")
+        .0
+        .vk;
+    let mut host = crate::runtime::host::FakeHost::new();
+
+    let peeked = secondary_attachment_identity_peek(&state, &mut host, 1, &colors[1], format)
+        .expect("a declared plane with pages is warm")
+        .expect("a GVA secondary is named");
+    let served = secondary_attachment_identity(&mut state, &mut host, 1, &colors[1], format)
+        .expect("a GVA secondary is named");
+    assert_eq!(peeked, served);
+    assert_eq!(
+        crate::runtime::writeback_debt::gva_plane_generation(&state, key, 0x2000, span),
+        Some(generation),
+        "the serial call on a warm ledger declares nothing"
+    );
+
+    // The worker's build from peeked identities is the drain's build.
+    let pipeline = RenderPipelineDescriptor::default();
+    let primary = crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva: 0x1000,
+        width: 64,
+        height: 64,
+        generation: 0,
+        format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+    };
+    let mut log = vulkan::draw_par::PrepareLog::default();
+    let worker = build_secondary_targets_worker(
+        &state, &mut host, 1, &colors, &pipeline, &primary, 64, 64, &mut log,
+    )
+    .expect("a warm ledger does not bail")
+    .expect("the secondary builds");
+    let drain = build_secondary_targets(
+        &mut state, &mut host, 1, &colors, &pipeline, &primary, 64, 64,
+    )
+    .expect("the secondary builds");
+    assert_eq!(worker.len(), 1);
+    assert_eq!(worker[0].identity, drain[0].identity);
+    assert_eq!(worker[0].identity, peeked);
+
+    // The witness holds while the ledger answers the same and not after the
+    // plane is redeclared at another span (a new generation).
+    let witness = secondary_witness(&colors[1], &peeked).expect("a ledgered plane is witnessed");
+    assert!(secondary_witness_holds(&state, 1, &witness));
+    state
+        .pending_writebacks
+        .ensure_gva_resource(key, 0x2000, span + 4096, Some(vec![0x10]));
+    assert!(!secondary_witness_holds(&state, 1, &witness));
+}
+
+/// A ledger the serial call would declare into peeks cold, and the peek does
+/// not declare it: the worker gives the record back instead.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_cold_ledger_peeks_none_and_stays_cold() {
+    use crate::runtime::decode::resource::RenderPipelineDescriptor;
+    let (colors, key, span) = mrt_peek_fixture();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let format = crate::backend::vulkan::translate::pixel::color_attachment(colors[1].format)
+        .expect("RG16Float is an admitted secondary format")
+        .0
+        .vk;
+    let mut host = crate::runtime::host::FakeHost::new();
+
+    assert_eq!(
+        secondary_attachment_identity_peek(&state, &mut host, 1, &colors[1], format),
+        None,
+        "never declared"
+    );
+    // Declared without its pages is cold too: the serial call walks them.
+    state
+        .pending_writebacks
+        .ensure_gva_resource(key, 0x2000, span, None);
+    assert_eq!(
+        secondary_attachment_identity_peek(&state, &mut host, 1, &colors[1], format),
+        None,
+        "declared without pages"
+    );
+    state
+        .pending_writebacks
+        .ensure_gva_resource(key, 0x2000, span, Some(vec![0x10]));
+    assert!(
+        secondary_attachment_identity_peek(&state, &mut host, 1, &colors[1], format).is_some(),
+        "the pages arrived"
+    );
+    let cold = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    assert_eq!(
+        crate::runtime::writeback_debt::gva_plane_generation(&cold, key, 0x2000, span),
+        None
+    );
+    let pipeline = RenderPipelineDescriptor::default();
+    let primary = crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva: 0x1000,
+        width: 64,
+        height: 64,
+        generation: 0,
+        format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+    };
+    let mut log = vulkan::draw_par::PrepareLog::default();
+    let bailed = build_secondary_targets_worker(
+        &cold, &mut host, 1, &colors, &pipeline, &primary, 64, 64, &mut log,
+    );
+    assert!(matches!(bailed, Err(vulkan::draw_par::Bail::MrtCold)));
+    assert_eq!(
+        crate::runtime::writeback_debt::gva_plane_generation(&cold, key, 0x2000, span),
+        None,
+        "the worker's bail declares nothing"
+    );
+}
+
 /// A secondary colour attachment this device cannot build refuses the draw.
 ///
 /// Every arm here used to `return Vec::new()`, which the caller could not tell

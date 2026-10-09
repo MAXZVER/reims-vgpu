@@ -2760,15 +2760,27 @@ type ResolveMemoEntry = (u32, u32, u32, SampledSourceRequest);
 /// pointers (`GuestRuns`), asserted `Send` by the recorder's argument. Cleared
 /// by the drain at every encoder's start, never inside a scope.
 static RESOLVE_MEMO: std::sync::LazyLock<
-    parking_lot::Mutex<
-        reims_vgpu_core::fasthash::FxHashMap<
-            ResolveMemoKey,
-            crate::backend::vulkan::engine::recorder::AssertSend<ResolveMemoEntry>,
-        >,
-    >,
+    parking_lot::Mutex<reims_vgpu_core::fasthash::FxHashMap<ResolveMemoKey, MemoSlot>>,
 > = std::sync::LazyLock::new(|| {
     parking_lot::Mutex::new(reims_vgpu_core::fasthash::FxHashMap::with_hasher(Default::default()))
 });
+
+/// TEMP (lab, DRAW_PAR): a memo key is *claimed* by the first thread to ask
+/// for it and filled when that thread's resolve lands. b123: a chunk's ~19 jobs
+/// start together and every one of them asked for the same large texture
+/// before any had filled the memo, so each read and compared the whole texture
+/// (the linear memo rung) - the helpers ran 1 s/s where the serial ladder read
+/// it once per encoder, and the drain waited on them (20 us a draw against 10).
+/// A thread finding a claim waits for the fill, bounded; a claim whose resolve
+/// bailed is released so nobody waits on it.
+enum MemoSlot {
+    Claimed(std::time::Instant),
+    Ready(crate::backend::vulkan::engine::recorder::AssertSend<ResolveMemoEntry>),
+}
+
+/// How long a thread waits for another's claimed resolve before resolving
+/// itself (a 4 MiB texture's read and compare is ~0.3 ms).
+const MEMO_CLAIM_WAIT: std::time::Duration = std::time::Duration::from_millis(3);
 
 /// TEMP (lab, live `RESOLVE_MEMO_ALL=on|off`, else `REIMS_VGPU_LAB_RESOLVE_MEMO_ALL=off`
 /// to disable; on by default since b074): let the memo keep the target and
@@ -2859,15 +2871,58 @@ pub(crate) fn lab_resolve_memo_on() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_MEMO").as_deref() != Ok("off"))
 }
 
+/// The memo's answer, or a claim: `None` means the caller resolves (it holds
+/// the claim and must `put` or `release`).
 fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledSourceRequest)> {
-    let m = RESOLVE_MEMO.lock();
-    m.get(key).and_then(|entry| {
+    let copy = |entry: &crate::backend::vulkan::engine::recorder::AssertSend<ResolveMemoEntry>| {
         let (w, h, mid, src) = &entry.0;
         if !matches!(src, SampledSourceRequest::Bytes(..)) {
             crate::runtime::drain::note_store_route("lab_resolve_memo_hit_route");
         }
         memo_copy(src, true, true).map(|src| (*w, *h, *mid, src))
-    })
+    };
+    let started = std::time::Instant::now();
+    let mut waited = false;
+    loop {
+        {
+            let mut m = RESOLVE_MEMO.lock();
+            match m.get(key) {
+                Some(MemoSlot::Ready(entry)) => {
+                    if waited {
+                        crate::runtime::drain::note_store_route("lab_resolve_memo_waited_hit");
+                    }
+                    return copy(entry);
+                }
+                Some(MemoSlot::Claimed(since)) => {
+                    // A claim older than the wait is a resolve that never
+                    // landed (a job that bailed without releasing): take it over.
+                    if since.elapsed() > MEMO_CLAIM_WAIT {
+                        m.insert(*key, MemoSlot::Claimed(std::time::Instant::now()));
+                        crate::runtime::drain::note_store_route("lab_resolve_memo_claim_taken_over");
+                        return None;
+                    }
+                }
+                None => {
+                    m.insert(*key, MemoSlot::Claimed(started));
+                    return None;
+                }
+            }
+        }
+        if started.elapsed() > MEMO_CLAIM_WAIT {
+            crate::runtime::drain::note_store_route("lab_resolve_memo_wait_timeout");
+            return None;
+        }
+        waited = true;
+        std::thread::yield_now();
+    }
+}
+
+/// Drop a claim whose resolve did not land, so waiters stop waiting.
+fn lab_resolve_memo_release(key: &ResolveMemoKey) {
+    let mut m = RESOLVE_MEMO.lock();
+    if matches!(m.get(key), Some(MemoSlot::Claimed(_))) {
+        m.remove(key);
+    }
 }
 
 fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSourceRequest)) {
@@ -2879,13 +2934,20 @@ fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSou
             SampledSourceRequest::GuestRuns(..) | SampledSourceRequest::Staged(..)
         )
     {
+        lab_resolve_memo_release(&key);
         return;
     }
-    if let Some(src) = memo_copy(&loaded.3, lab_resolve_memo_all(), false) {
-        RESOLVE_MEMO.lock().insert(
-            key,
-            crate::backend::vulkan::engine::recorder::AssertSend((loaded.0, loaded.1, loaded.2, src)),
-        );
+    match memo_copy(&loaded.3, lab_resolve_memo_all(), false) {
+        Some(src) => {
+            RESOLVE_MEMO.lock().insert(
+                key,
+                MemoSlot::Ready(crate::backend::vulkan::engine::recorder::AssertSend((
+                    loaded.0, loaded.1, loaded.2, src,
+                ))),
+            );
+        }
+        // Not a source the memo keeps: the claim goes, or waiters would wait.
+        None => lab_resolve_memo_release(&key),
     }
 }
 
@@ -10196,7 +10258,6 @@ pub(super) fn secondary_attachment_identity<M: HostMemory + HostOps>(
     c: &ColorRtRequest,
     format: ash::vk::Format,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
-    use crate::backend::vulkan::engine::TargetIdentity;
     // Identity mirrors the primary namespaces: normal-texture linear GVA, else
     // mapper-ref-texture surface.
     //
@@ -10206,51 +10267,273 @@ pub(super) fn secondary_attachment_identity<M: HostMemory + HostOps>(
     // Without one this attachment is keyed on `(gva, width, height)` alone
     // and two guest allocations reusing that address at that geometry share
     // one GPU image — the wrong-content class `74748d2` closed for color0.
-    Some(if c.target_gva != 0 {
-        TargetIdentity::Gva {
-            gva: c.target_gva,
-            width: c.width,
-            height: c.height,
-            generation: if c.texture_ref != 0 {
-                crate::runtime::writeback_debt::gva_resource_generation(
-                    state,
-                    host,
-                    crate::runtime::writeback_debt::GvaResourceKey {
-                        task_id,
-                        texture_ref: c.texture_ref,
-                    },
-                    c.target_gva,
-                    u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
-                )
-            } else {
-                gva_span_alloc_generation(
-                    state,
-                    host,
+    match secondary_naming(c) {
+        SecondaryNaming::Gva { ledgered: true } => {
+            let generation = crate::runtime::writeback_debt::gva_resource_generation(
+                state,
+                host,
+                crate::runtime::writeback_debt::GvaResourceKey {
                     task_id,
-                    c.target_gva,
-                    c.row_stride,
-                    c.height,
-                )
-            },
-            // The format this attachment's image is actually created with,
-            // not a re-derivation of it. `registry_ensure_attachment` takes
-            // `format` — resolved by the caller's `color_attachment` — so
-            // answering the key from anything else lets the identity claim
-            // one format while the image holds another. It did: a
-            // `R16G16_SFLOAT` secondary is admitted by `color_attachment`
-            // and got an identity saying eight-bit RGBA.
-            format,
+                    texture_ref: c.texture_ref,
+                },
+                c.target_gva,
+                secondary_gva_span(c),
+            );
+            Some(secondary_gva_identity(c, format, generation))
+        }
+        SecondaryNaming::Gva { ledgered: false } => {
+            let generation = gva_span_alloc_generation(
+                state,
+                host,
+                task_id,
+                c.target_gva,
+                c.row_stride,
+                c.height,
+            );
+            Some(secondary_gva_identity(c, format, generation))
+        }
+        SecondaryNaming::Mapping => Some(secondary_surface_identity(state, c)),
+        SecondaryNaming::Unnamed => None,
+    }
+}
+
+/// How one secondary colour attachment is named: the single decision
+/// [`secondary_attachment_identity`] and [`secondary_attachment_identity_peek`]
+/// both branch on, so the two cannot disagree about which namespace a colour
+/// lives in.
+enum SecondaryNaming {
+    /// A normal-texture linear GVA. `ledgered` when the resource ledger names
+    /// the allocation (`texture_ref != 0`); otherwise the pages are walked.
+    Gva { ledgered: bool },
+    /// A mapper-ref-texture surface.
+    Mapping,
+    /// Neither a GVA nor a mapping to be named by.
+    Unnamed,
+}
+
+fn secondary_naming(c: &ColorRtRequest) -> SecondaryNaming {
+    if c.target_gva != 0 {
+        SecondaryNaming::Gva {
+            ledgered: c.texture_ref != 0,
         }
     } else if c.mapping_id != 0 {
-        crate::backend::vulkan::present_identity::surface_identity(
-            state,
-            c.mapping_id,
-            c.width,
-            c.height,
-        )
+        SecondaryNaming::Mapping
     } else {
-        return None;
-    })
+        SecondaryNaming::Unnamed
+    }
+}
+
+/// The span the resource ledger declares for a secondary GVA plane.
+fn secondary_gva_span(c: &ColorRtRequest) -> u64 {
+    u64::from(c.row_stride).saturating_mul(u64::from(c.height))
+}
+
+/// The one place a secondary GVA identity's key is spelled.
+fn secondary_gva_identity(
+    c: &ColorRtRequest,
+    format: ash::vk::Format,
+    generation: u64,
+) -> crate::backend::vulkan::engine::TargetIdentity {
+    crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva: c.target_gva,
+        width: c.width,
+        height: c.height,
+        generation,
+        // The format this attachment's image is actually created with,
+        // not a re-derivation of it. `registry_ensure_attachment` takes
+        // `format` — resolved by the caller's `color_attachment` — so
+        // answering the key from anything else lets the identity claim
+        // one format while the image holds another. It did: a
+        // `R16G16_SFLOAT` secondary is admitted by `color_attachment`
+        // and got an identity saying eight-bit RGBA.
+        format,
+    }
+}
+
+fn secondary_surface_identity(
+    state: &DeviceState,
+    c: &ColorRtRequest,
+) -> crate::backend::vulkan::engine::TargetIdentity {
+    crate::backend::vulkan::present_identity::surface_identity(
+        state,
+        c.mapping_id,
+        c.width,
+        c.height,
+    )
+}
+
+/// TEMP (lab, DRAW_PAR): [`secondary_attachment_identity`] without the right to
+/// declare anything — what a pool worker may ask.
+///
+/// The outer `None` says the GVA resource ledger is cold for this plane (never
+/// declared, declared at another span, or declared without its pages), where
+/// the serial call would walk the guest pages and mutate the ledger. The inner
+/// value is exactly what the serial call returns on a warm ledger: the serial
+/// call hands back the stored generation before it touches anything, so a hit
+/// read here is the same answer.
+pub(super) fn secondary_attachment_identity_peek<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c: &ColorRtRequest,
+    format: ash::vk::Format,
+) -> Option<Option<crate::backend::vulkan::engine::TargetIdentity>> {
+    match secondary_naming(c) {
+        SecondaryNaming::Gva { ledgered: true } => {
+            let generation = crate::runtime::writeback_debt::gva_plane_generation(
+                state,
+                crate::runtime::writeback_debt::GvaResourceKey {
+                    task_id,
+                    texture_ref: c.texture_ref,
+                },
+                c.target_gva,
+                secondary_gva_span(c),
+            )?;
+            Some(Some(secondary_gva_identity(c, format, generation)))
+        }
+        SecondaryNaming::Gva { ledgered: false } => {
+            let generation = gva_span_alloc_generation(
+                state,
+                host,
+                task_id,
+                c.target_gva,
+                c.row_stride,
+                c.height,
+            );
+            Some(Some(secondary_gva_identity(c, format, generation)))
+        }
+        SecondaryNaming::Mapping => Some(Some(secondary_surface_identity(state, c))),
+        SecondaryNaming::Unnamed => Some(None),
+    }
+}
+
+/// TEMP (lab, DRAW_PAR): what a peeked identity rests on, for the commit to
+/// re-derive. `None` for a colour with no ledger entry or mapping to witness
+/// (a GVA without a `texture_ref` is named by a page walk, not the ledger).
+pub(super) fn secondary_witness(
+    c: &ColorRtRequest,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) -> Option<draw_par::SecondaryWitness> {
+    match (secondary_naming(c), identity) {
+        (
+            SecondaryNaming::Gva { ledgered: true },
+            crate::backend::vulkan::engine::TargetIdentity::Gva { generation, .. },
+        ) => Some(draw_par::SecondaryWitness::Gva {
+            texture_ref: c.texture_ref,
+            gva: c.target_gva,
+            span: secondary_gva_span(c),
+            generation: *generation,
+        }),
+        (SecondaryNaming::Mapping, _) => Some(draw_par::SecondaryWitness::Surface {
+            mapping_id: c.mapping_id,
+            width: c.width,
+            height: c.height,
+            identity: identity.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// TEMP (lab, DRAW_PAR): whether a witness still holds, read-only. The commit
+/// runs this where the serial encode would have run the identity call: if the
+/// ledger answers the same, the serial call would not have mutated and the
+/// prepared request is the one it would have built.
+pub(super) fn secondary_witness_holds(
+    state: &DeviceState,
+    task_id: u32,
+    witness: &draw_par::SecondaryWitness,
+) -> bool {
+    match witness {
+        draw_par::SecondaryWitness::Gva {
+            texture_ref,
+            gva,
+            span,
+            generation,
+        } => {
+            crate::runtime::writeback_debt::gva_plane_generation(
+                state,
+                crate::runtime::writeback_debt::GvaResourceKey {
+                    task_id,
+                    texture_ref: *texture_ref,
+                },
+                *gva,
+                *span,
+            ) == Some(*generation)
+        }
+        draw_par::SecondaryWitness::Surface {
+            mapping_id,
+            width,
+            height,
+            identity,
+        } => {
+            crate::backend::vulkan::present_identity::surface_identity(
+                state,
+                *mapping_id,
+                *width,
+                *height,
+            ) == *identity
+        }
+    }
+}
+
+/// TEMP (lab, DRAW_PAR): the worker's `build_secondary_targets`. Every
+/// secondary's identity is peeked first and the first cold ledger entry gives
+/// the record back before the build can emit a census line the serial re-run
+/// would emit again; the build itself then resolves from the peeked table. The
+/// witnesses the commit re-derives are appended to `log`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every argument is a distinct wire-derived input to the attachment set"
+)]
+pub(super) fn build_secondary_targets_worker<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &mut M,
+    task_id: u32,
+    colors: &[ColorRtRequest],
+    pipeline: &crate::runtime::decode::resource::RenderPipelineDescriptor,
+    primary: &crate::backend::vulkan::engine::TargetIdentity,
+    fb_w: u32,
+    fb_h: u32,
+    log: &mut draw_par::PrepareLog,
+) -> Result<
+    Result<
+        Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
+        crate::runtime::census::present_proxy::SecondaryMrtRefusal,
+    >,
+    draw_par::Bail,
+> {
+    let mut resolved: Vec<(u32, Option<crate::backend::vulkan::engine::TargetIdentity>)> =
+        Vec::new();
+    for c in colors.iter().skip(1) {
+        // A format the build refuses never reaches its resolver.
+        let Ok((attachment, _)) = translate::pixel::color_attachment(c.format) else {
+            continue;
+        };
+        let Some(identity) =
+            secondary_attachment_identity_peek(state, host, task_id, c, attachment.vk)
+        else {
+            return Err(draw_par::Bail::MrtCold);
+        };
+        if let Some(witness) = identity.as_ref().and_then(|id| secondary_witness(c, id)) {
+            if !log.secondaries.contains(&witness) {
+                log.secondaries.push(witness);
+            }
+        }
+        resolved.push((c.slot, identity));
+    }
+    Ok(build_secondary_targets_with(
+        colors,
+        pipeline,
+        primary,
+        fb_w,
+        fb_h,
+        |c, _format| {
+            resolved
+                .iter()
+                .find(|(slot, _)| *slot == c.slot)
+                .and_then(|(_, identity)| identity.clone())
+        },
+    ))
 }
 
 #[allow(
@@ -10266,6 +10549,34 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     primary: &crate::backend::vulkan::engine::TargetIdentity,
     fb_w: u32,
     fb_h: u32,
+) -> Result<
+    Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
+    crate::runtime::census::present_proxy::SecondaryMrtRefusal,
+> {
+    build_secondary_targets_with(colors, pipeline, primary, fb_w, fb_h, |c, format| {
+        secondary_attachment_identity(state, host, task_id, c, format)
+    })
+}
+
+/// [`build_secondary_targets`] over an identity resolver: the drain resolves
+/// each secondary through the serial [`secondary_attachment_identity`], a pool
+/// worker through identities it peeked beforehand
+/// ([`build_secondary_targets_worker`]). Everything else here is a pure
+/// function of the wire fields, so both reach the same build.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every argument is a distinct wire-derived input to the attachment set"
+)]
+fn build_secondary_targets_with(
+    colors: &[ColorRtRequest],
+    pipeline: &crate::runtime::decode::resource::RenderPipelineDescriptor,
+    primary: &crate::backend::vulkan::engine::TargetIdentity,
+    fb_w: u32,
+    fb_h: u32,
+    mut resolve_identity: impl FnMut(
+        &ColorRtRequest,
+        ash::vk::Format,
+    ) -> Option<crate::backend::vulkan::engine::TargetIdentity>,
 ) -> Result<
     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
@@ -10328,7 +10639,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             }
         };
         let format = attachment.vk;
-        let Some(identity) = secondary_attachment_identity(state, host, task_id, c, format) else {
+        let Some(identity) = resolve_identity(c, format) else {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::NoIdentity,
                 c.width,
@@ -10632,8 +10943,20 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             }
         };
     }
-    if acc.is_worker() && req.colors.len() > 1 {
-        worker_bail!(Bail::Mrt);
+    // TEMP (lab, DRAW_PAR): a worker prepares MRT records from peeked
+    // identities (see `build_secondary_targets_worker`), which holds only while
+    // every attachment loads. A DontCare attachment decides its load from the
+    // engine's `resident_content_ready`, a read the worker does not take; the
+    // chunk builder never forks such a record (`exec/mod.rs` loads every colour),
+    // so this is the invariant stated rather than a path.
+    if acc.is_worker()
+        && req.colors.len() > 1
+        && req
+            .colors
+            .iter()
+            .any(|c| c.load_action != MTL_LOAD_ACTION_LOAD)
+    {
+        worker_bail!(Bail::MrtCold);
     }
     // Only the final record of a portability render-pass chain reads back CPU
     // pixels; used by the resident-chain rail below (harmless on other paths).
@@ -11608,13 +11931,49 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                                                 format,
                                             )
                                         }),
-                                        // TEMP (lab, DRAW_PAR): a secondary
-                                        // slot's alias is the drain's.
+                                        // TEMP (lab, DRAW_PAR): the worker reads
+                                        // the identity the drain would resolve
+                                        // from a warm ledger; a cold entry, which
+                                        // the serial call would declare, is the
+                                        // drain's. The witness lets the commit
+                                        // re-derive what this rests on.
                                         None => {
-                                            if let Some(log) = prep.as_deref_mut() {
-                                                log.bail = Some(Bail::AliasSecondary);
+                                            let Some(log) = prep.as_deref_mut() else {
+                                                return Err(WORKER_ERR);
+                                            };
+                                            match color.zip(format) {
+                                                None => None,
+                                                Some((color, format)) => {
+                                                    match secondary_attachment_identity_peek(
+                                                        acc.shared(),
+                                                        host,
+                                                        req.task_id,
+                                                        color,
+                                                        format,
+                                                    ) {
+                                                        Some(found) => {
+                                                            if let Some(witness) = found
+                                                                .as_ref()
+                                                                .and_then(|id| {
+                                                                    secondary_witness(color, id)
+                                                                })
+                                                            {
+                                                                if !log
+                                                                    .secondaries
+                                                                    .contains(&witness)
+                                                                {
+                                                                    log.secondaries.push(witness);
+                                                                }
+                                                            }
+                                                            found
+                                                        }
+                                                        None => {
+                                                            log.bail = Some(Bail::MrtCold);
+                                                            return Err(WORKER_ERR);
+                                                        }
+                                                    }
+                                                }
                                             }
-                                            None
                                         }
                                     }
                                 }
@@ -11712,6 +12071,9 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                             ) {
                                 Ok(served) => (Some(served), false),
                                 Err(bail) => {
+                                    if memo_on {
+                                        lab_resolve_memo_release(&memo_key);
+                                    }
                                     log.bail = Some(bail);
                                     return Err(WORKER_ERR);
                                 }
@@ -11754,8 +12116,9 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                             }
                         };
                         if memo_on {
-                            if let Some(loaded) = lab_resolved.as_ref() {
-                                lab_resolve_memo_put(memo_key, loaded);
+                            match lab_resolved.as_ref() {
+                                Some(loaded) => lab_resolve_memo_put(memo_key, loaded),
+                                None => lab_resolve_memo_release(&memo_key),
                             }
                         }
                         (lab_resolved, lab_plan_served)
@@ -14228,8 +14591,25 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                     w,
                     h,
                 ),
-                // TEMP (lab, DRAW_PAR): a worker only ever holds one colour.
-                None => Ok(Vec::new()),
+                // TEMP (lab, DRAW_PAR): the worker's build resolves each
+                // secondary from a read-only peek of the resource ledger.
+                None => {
+                    let log = prep_log!();
+                    match build_secondary_targets_worker(
+                        acc.shared(),
+                        host,
+                        req.task_id,
+                        &req.colors,
+                        pd,
+                        &primary_id,
+                        w,
+                        h,
+                        log,
+                    ) {
+                        Ok(built) => built,
+                        Err(bail) => worker_bail!(bail),
+                    }
+                }
             };
             // Second half of the census: `built` vs `refused` separates "the
             // guest issued an MRT draw and we render every attachment" from
