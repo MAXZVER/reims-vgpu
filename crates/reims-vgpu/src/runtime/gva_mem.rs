@@ -150,13 +150,13 @@ pub(crate) mod lab_tlb {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    /// Slots kept per thread. 4096 since 2026-10-09: an object list of a few
-    /// thousand entries spans hundreds of pages, and with 256 direct-mapped
-    /// slots about half the reads on Weather missed and walked (b105, with
-    /// TLB_KEEP neutral in b103: capacity, not the tranche rule).
-    const SLOTS: usize = 4096;
+    /// Slots kept per thread. b107 (2026-10-09) measured 4096 against 256 and
+    /// found them equal (Weather -1 %, the rest even): the walks b105 saw under
+    /// task-GVA reads are not capacity misses, and 4096 slots cost 128 KiB of
+    /// thread-local storage on every thread of the process.
+    const SLOTS: usize = 256;
     /// TEMP (lab, live `TLB_SLOTS=N`, a power of two up to [`SLOTS`]): the slots
-    /// in use, refreshed at each tranche start; 256 is the old size.
+    /// in use, refreshed at each tranche start.
     static IN_USE: AtomicU64 = AtomicU64::new(SLOTS as u64);
     /// The longest read (in pages) served from or filled into the cache; longer
     /// spans walk, so one large read cannot evict the cache's working set.
