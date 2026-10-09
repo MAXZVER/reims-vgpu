@@ -2738,12 +2738,12 @@ pub(crate) fn lab_encoder_begin() {
             e.1.clear();
         });
     }
-    RESOLVE_MEMO.with(|m| {
-        let mut m = m.borrow_mut();
+    {
+        let mut m = RESOLVE_MEMO.lock();
         if !m.is_empty() {
             m.clear();
         }
-    });
+    }
 }
 
 /// (task, texture ref, retained resource address, may bind resident).
@@ -2751,11 +2751,24 @@ type ResolveMemoKey = (u32, u32, usize, bool);
 /// A sampled source as `resolve_sampled_source` returned it.
 type ResolveMemoEntry = (u32, u32, u32, SampledSourceRequest);
 
-thread_local! {
-    /// TEMP (lab, RESOLVE_MEMO): this render encoder's resolved sampled sources.
-    static RESOLVE_MEMO: std::cell::RefCell<reims_vgpu_core::fasthash::FxHashMap<ResolveMemoKey, ResolveMemoEntry>> =
-        std::cell::RefCell::new(reims_vgpu_core::fasthash::FxHashMap::with_hasher(Default::default()));
-}
+/// TEMP (lab, RESOLVE_MEMO): this render encoder's resolved sampled sources.
+///
+/// TEMP (lab, DRAW_PAR): process-wide rather than the drain's thread-local, so
+/// the pool workers preparing a chunk read what the drain and the other workers
+/// resolved and fill it for the binds after theirs — within one encoder the
+/// bytes cannot change, whichever thread resolved them. The entries carry host
+/// pointers (`GuestRuns`), asserted `Send` by the recorder's argument. Cleared
+/// by the drain at every encoder's start, never inside a scope.
+static RESOLVE_MEMO: std::sync::LazyLock<
+    parking_lot::Mutex<
+        reims_vgpu_core::fasthash::FxHashMap<
+            ResolveMemoKey,
+            crate::backend::vulkan::engine::recorder::AssertSend<ResolveMemoEntry>,
+        >,
+    >,
+> = std::sync::LazyLock::new(|| {
+    parking_lot::Mutex::new(reims_vgpu_core::fasthash::FxHashMap::with_hasher(Default::default()))
+});
 
 /// TEMP (lab, live `RESOLVE_MEMO_ALL=on|off`, else `REIMS_VGPU_LAB_RESOLVE_MEMO_ALL=off`
 /// to disable; on by default since b074): let the memo keep the target and
@@ -2846,76 +2859,23 @@ pub(crate) fn lab_resolve_memo_on() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_MEMO").as_deref() != Ok("off"))
 }
 
-/// TEMP (lab, DRAW_PAR): the encoder's memo as a pool worker sees it — a
-/// snapshot the drain takes at the fork. Workers read it and fill nothing; the
-/// drain's own memo is a thread-local the worker threads cannot see.
-pub(super) type ResolveMemoSnapshot =
-    std::sync::Arc<reims_vgpu_core::fasthash::FxHashMap<ResolveMemoKey, ResolveMemoEntry>>;
-
-thread_local! {
-    static WORKER_MEMO: std::cell::RefCell<Option<ResolveMemoSnapshot>> = const { std::cell::RefCell::new(None) };
-}
-
-pub(super) fn lab_resolve_memo_snapshot() -> ResolveMemoSnapshot {
-    RESOLVE_MEMO.with(|m| {
-        std::sync::Arc::new(
-            m.borrow()
-                .iter()
-                .filter_map(|(k, (w, h, mid, src))| {
-                    memo_copy(src, true, true).map(|src| (*k, (*w, *h, *mid, src)))
-                })
-                .collect(),
-        )
-    })
-}
-
-/// Installs a snapshot as this thread's memo for the length of a pool job.
-pub(super) struct WorkerMemoGuard;
-
-impl WorkerMemoGuard {
-    pub(super) fn set(memo: ResolveMemoSnapshot) -> Self {
-        WORKER_MEMO.with(|w| *w.borrow_mut() = Some(memo));
-        WorkerMemoGuard
-    }
-}
-
-impl Drop for WorkerMemoGuard {
-    fn drop(&mut self) {
-        WORKER_MEMO.with(|w| *w.borrow_mut() = None);
-    }
-}
-
 fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledSourceRequest)> {
-    // TEMP (lab, DRAW_PAR): inside a pool scope every thread, the coordinator
-    // included, answers from the fork's snapshot, so a job's answer does not
-    // depend on which thread ran it.
-    if crate::runtime::par::planning() {
-        return WORKER_MEMO.with(|w| {
-            w.borrow().as_ref().and_then(|m| {
-                m.get(key)
-                    .and_then(|(w, h, mid, src)| memo_copy(src, true, true).map(|src| (*w, *h, *mid, src)))
-            })
-        });
-    }
-    RESOLVE_MEMO.with(|m| {
-        m.borrow().get(key).and_then(|(w, h, mid, src)| {
-            if !matches!(src, SampledSourceRequest::Bytes(..)) {
-                crate::runtime::drain::note_store_route("lab_resolve_memo_hit_route");
-            }
-            memo_copy(src, true, true).map(|src| (*w, *h, *mid, src))
-        })
+    let m = RESOLVE_MEMO.lock();
+    m.get(key).and_then(|entry| {
+        let (w, h, mid, src) = &entry.0;
+        if !matches!(src, SampledSourceRequest::Bytes(..)) {
+            crate::runtime::drain::note_store_route("lab_resolve_memo_hit_route");
+        }
+        memo_copy(src, true, true).map(|src| (*w, *h, *mid, src))
     })
 }
 
 fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSourceRequest)) {
-    // TEMP (lab, DRAW_PAR): a job fills nothing (see `lab_resolve_memo_get`).
-    if crate::runtime::par::planning() {
-        return;
-    }
     if let Some(src) = memo_copy(&loaded.3, lab_resolve_memo_all(), false) {
-        RESOLVE_MEMO.with(|m| {
-            m.borrow_mut().insert(key, (loaded.0, loaded.1, loaded.2, src));
-        });
+        RESOLVE_MEMO.lock().insert(
+            key,
+            crate::backend::vulkan::engine::recorder::AssertSend((loaded.0, loaded.1, loaded.2, src)),
+        );
     }
 }
 
@@ -12573,7 +12533,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             // from the chain's resident — every seed door below is the drain's.
             None => {
                 if !chain_load_from_target {
-                    worker_bail!(Bail::NotDeferrable);
+                    worker_bail!(Bail::NoChainLoad);
                 }
                 None
             }
@@ -14322,14 +14282,19 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         // chain intermediate is prepared: everything else runs synchronously
         // on the drain and reads the engine's answer.
         if acc.is_worker() {
-            let deferrable = recorder_on
-                && resident_render_chain
-                && req.visibility.is_none()
-                && resources.occlusion_query.is_none()
-                && resources.skip_readback
-                && !resources.record_guest_store;
-            let Some(chain_identity) = resources.target_identity.clone().filter(|_| deferrable)
-            else {
+            if !recorder_on {
+                worker_bail!(Bail::RecorderOff);
+            }
+            if !resident_render_chain {
+                worker_bail!(Bail::NotChain);
+            }
+            if req.visibility.is_some() || resources.occlusion_query.is_some() {
+                worker_bail!(Bail::Query);
+            }
+            if !resources.skip_readback || resources.record_guest_store {
+                worker_bail!(Bail::Store);
+            }
+            let Some(chain_identity) = resources.target_identity.clone() else {
                 worker_bail!(Bail::NotDeferrable);
             };
             let log = prep_log!();

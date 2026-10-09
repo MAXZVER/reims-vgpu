@@ -90,8 +90,18 @@ pub(crate) enum Bail {
     SampledRail,
     /// More than one colour attachment.
     Mrt,
-    /// The draw is not a deferrable resident-chain intermediate (a Store, a
-    /// readback, a query, or the recorder is off).
+    /// The record does not load from the chain's resident: its seed doors
+    /// are the drain's.
+    NoChainLoad,
+    /// The recorder is off: nothing is deferred.
+    RecorderOff,
+    /// Not a resident-chain intermediate (no chain identity resolved).
+    NotChain,
+    /// An occlusion query is armed.
+    Query,
+    /// The record stores or reads back (the last record of the pass).
+    Store,
+    /// Deferrable by every test but without a target identity (a wiring gap).
     NotDeferrable,
     /// The chain the draw was prepared against is not the one at commit.
     ChainMoved,
@@ -113,6 +123,11 @@ impl Bail {
             Bail::SampledPlan => "draw_par_bail_smp_plan",
             Bail::SampledRail => "draw_par_bail_smp_rail",
             Bail::Mrt => "draw_par_bail_mrt",
+            Bail::NoChainLoad => "draw_par_bail_no_chain_load",
+            Bail::RecorderOff => "draw_par_bail_recorder_off",
+            Bail::NotChain => "draw_par_bail_not_chain",
+            Bail::Query => "draw_par_bail_query",
+            Bail::Store => "draw_par_bail_store",
             Bail::NotDeferrable => "draw_par_bail_not_deferrable",
             Bail::ChainMoved => "draw_par_commit_chain_moved",
             Bail::PlanInvalid => "draw_par_commit_plan_invalid",
@@ -139,6 +154,50 @@ pub(crate) struct SampleCommit {
     may_bind_resident: bool,
 }
 
+/// A linear texture's guest rows a worker read and compared against the
+/// device's linear memo (`DeviceState::guest_linear_memo`): the memo entry it
+/// matched (`native: None`, touched at the commit) or the entry the serial
+/// rung would have inserted (`native: Some`, inserted at the commit unless an
+/// equal one landed first).
+pub(crate) struct LinearMemoFact {
+    key: (u32, u64, u32, u32, u32, u16),
+    native: Option<Vec<u8>>,
+    rgba: Arc<Vec<u8>>,
+    layout: TexelLayout,
+    generation: u64,
+}
+
+impl LinearMemoFact {
+    fn land(self, state: &mut DeviceState) {
+        match self.native {
+            None => {
+                let _ = state.guest_linear_memo.get_touch(&self.key);
+            }
+            Some(native) => {
+                if state
+                    .guest_linear_memo
+                    .peek(&self.key)
+                    .is_some_and(|m| m.native == native)
+                {
+                    let _ = state.guest_linear_memo.get_touch(&self.key);
+                    return;
+                }
+                let entry_bytes = native.len() + self.rgba.len();
+                state.guest_linear_memo.insert(
+                    self.key,
+                    crate::model::GuestLinearMemo {
+                        native,
+                        rgba: self.rgba,
+                        layout: self.layout,
+                        generation: self.generation,
+                    },
+                    entry_bytes,
+                );
+            }
+        }
+    }
+}
+
 /// What a fragment-stage sampled bind resolved to, for the two censuses the
 /// serial path notes where it resolves (deferred to the commit so an
 /// uncommitted preparation records nothing).
@@ -157,6 +216,7 @@ pub(crate) struct SampledNote {
 pub(crate) struct PrepareLog {
     pub(super) buffers: Vec<BufferCommit>,
     pub(super) samples: Vec<SampleCommit>,
+    pub(super) linear: Vec<LinearMemoFact>,
     pub(super) notes: Vec<SampledNote>,
     pub(super) bail: Option<Bail>,
     pub(super) done: Option<PreparedRequest>,
@@ -256,8 +316,37 @@ fn cpu_read_worker<M: HostMemory + HostOps>(
         .filter(|&n| n > 0)
         .ok_or(Bail::BufferRead)?;
     let (read_gva, read_span) = (gva + offset, want as u64);
+    guest_bytes_readable(state, host, task_id, buffer_ref, read_gva, read_span)?;
+    let mut buf = vec![0u8; want];
+    if gva_mem::read_task_gva_by_id(
+        host,
+        &state.tasks,
+        task_id,
+        read_gva,
+        &mut buf,
+        state.page_shift,
+    )
+    .is_err()
+    {
+        return Err(Bail::BufferRead);
+    }
+    Ok(crate::backend::vulkan::engine::BufferContent::from(buf))
+}
+
+/// The obligations a serial CPU read of guest bytes settles — a debt the
+/// reference or the span owes, a device write still in flight over the pages —
+/// asked read-only: when any stands, the settle is the drain's and the worker
+/// bails.
+fn guest_bytes_readable<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+    read_gva: u64,
+    read_span: u64,
+) -> Result<(), Bail> {
     if !state.pending_writebacks.is_empty() {
-        if crate::runtime::writeback_debt::owes_texture(state, task_id, buffer_ref)
+        if crate::runtime::writeback_debt::owes_texture(state, task_id, texture_ref)
             || state
                 .pending_writebacks
                 .owes_gva_overlapping(task_id, read_gva, read_span)
@@ -266,7 +355,7 @@ fn cpu_read_worker<M: HostMemory + HostOps>(
         }
         let deferred = state.pending_writebacks.deferred_mapping();
         if let Some(deferred) = deferred {
-            let named = state.mappings_named_by(task_id, buffer_ref);
+            let named = state.mappings_named_by(task_id, texture_ref);
             if named.iter().any(|m| m == deferred) {
                 return Err(Bail::BufferOwed);
             }
@@ -290,20 +379,7 @@ fn cpu_read_worker<M: HostMemory + HostOps>(
             return Err(Bail::BufferOwed);
         }
     }
-    let mut buf = vec![0u8; want];
-    if gva_mem::read_task_gva_by_id(
-        host,
-        &state.tasks,
-        task_id,
-        read_gva,
-        &mut buf,
-        state.page_shift,
-    )
-    .is_err()
-    {
-        return Err(Bail::BufferRead);
-    }
-    Ok(crate::backend::vulkan::engine::BufferContent::from(buf))
+    Ok(())
 }
 
 /// The worker's [`super::load_buffer_content`]: a warm-rail plan where one
@@ -464,8 +540,130 @@ pub(super) fn resolve_sampled_source_worker<M: HostMemory + HostOps>(
             });
             Ok(served)
         }
+        // A linear texture: the serial ladder's `is_linear_tex` branch.
+        Err(sample_plan::SampleBail::NotSurface) => {
+            resolve_linear_worker(state, host, log, task_id, texture_ref, &resource)
+        }
         Err(_) => Err(Bail::SampledPlan),
     }
+}
+
+/// The worker's twin of the serial ladder's linear branch — its memo rung
+/// (`load_linear_guest_memoized`) read-only: the guest rows are read and
+/// compared against the device's linear memo, the match or the new entry
+/// becomes a fact the commit lands. The rungs above it on the serial ladder
+/// construct (a packed alias, a gather window on the witness) or serve a GVA
+/// resident; where one of those would answer, the worker leaves the bind to
+/// the drain so the two paths serve the same rail.
+fn resolve_linear_worker<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    log: &mut PrepareLog,
+    task_id: u32,
+    texture_ref: u32,
+    resource: &Arc<crate::model::TaskResource>,
+) -> Result<(u32, u32, u32, SampledSourceRequest), Bail> {
+    let tex = match resource.decoded() {
+        Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => tex,
+        _ => return Err(Bail::SampledRail),
+    };
+    let declared_format = tex.declared_pixel_format().ok_or(Bail::SampledRail)?;
+    let sample_fmt = crate::runtime::draw::texture_view::effective_view_sample_format(declared_format, None)
+        .ok_or(Bail::SampledRail)?;
+    let (gva, layout) = tex.level_gva(0, state.page_shift).ok_or(Bail::SampledRail)?;
+    let (w, h) = (layout.width, layout.height);
+    if w == 0 || h == 0 {
+        return Err(Bail::SampledRail);
+    }
+    let bpr = layout.row_stride;
+    let planes = layout.planes();
+    let tight = pixel_format::tight_row_bytes(w, declared_format).ok_or(Bail::SampledRail)? as u64;
+    if bpr < tight {
+        return Err(Bail::SampledRail);
+    }
+    let storage_rows = pixel_format::tight_row_count(h, declared_format).ok_or(Bail::SampledRail)?;
+    let span = bpr
+        .checked_mul(u64::from(storage_rows))
+        .and_then(|s| s.checked_mul(u64::from(planes)))
+        .ok_or(Bail::SampledRail)?;
+    let native_len = crate::runtime::draw::host_alloc_len(span).ok_or(Bail::SampledRail)?;
+    if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
+        return Err(Bail::SampledRail);
+    }
+    // The zero-copy rail above this rung: a packed alias of the allocation
+    // serves directly, and a window the gather floor admits is gathered on
+    // the witness. Both are the drain's.
+    if matches!(
+        state.bound_buffers.packed(task_id, texture_ref),
+        Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(_))
+    ) {
+        return Err(Bail::SampledRail);
+    }
+    if let Ok((native, _, _)) = translate::pixel::sampled_pixels(declared_format) {
+        if sampled_gather_floor_pure(native, span) {
+            return Err(Bail::SampledRail);
+        }
+    }
+    guest_bytes_readable(state, host, task_id, texture_ref, gva, span)?;
+    let mut scratch = vec![0u8; native_len];
+    if gva_mem::read_task_gva_by_id(host, &state.tasks, task_id, gva, &mut scratch, state.page_shift)
+        .is_err()
+    {
+        return Err(Bail::BufferRead);
+    }
+    let key = (task_id, gva, w, h, planes, sample_fmt);
+    if let Some(m) = state.guest_linear_memo.peek(&key) {
+        if m.native == scratch {
+            crate::runtime::drain::note_store_route("draw_par_lin_memo_hit");
+            log.linear.push(LinearMemoFact {
+                key,
+                native: None,
+                rgba: m.rgba.clone(),
+                layout: m.layout,
+                generation: m.generation,
+            });
+            return Ok((
+                w,
+                h,
+                0,
+                SampledSourceRequest::Bytes(
+                    m.rgba.clone(),
+                    Some(LinearSampleIdentity {
+                        key: gva,
+                        generation: m.generation,
+                    }),
+                    SampledByteFormat::from_source(m.layout, sample_fmt),
+                    crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
+                ),
+            ));
+        }
+    }
+    let (rgba, fmt) = native_scratch_to_upload(&scratch, w, h, planes, bpr, sample_fmt, tight)
+        .ok_or(Bail::SampledRail)?;
+    let generation = state.next_sampled_content_generation();
+    let rgba = Arc::new(rgba);
+    crate::runtime::drain::note_store_route("draw_par_lin_memo_fill");
+    log.linear.push(LinearMemoFact {
+        key,
+        native: Some(scratch),
+        rgba: rgba.clone(),
+        layout: fmt,
+        generation,
+    });
+    Ok((
+        w,
+        h,
+        0,
+        SampledSourceRequest::Bytes(
+            rgba,
+            Some(LinearSampleIdentity {
+                key: gva,
+                generation,
+            }),
+            SampledByteFormat::from_source(fmt, sample_fmt),
+            crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
+        ),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +766,9 @@ fn commit_prepared<M: HostMemory + HostOps>(
         }
         let _ = sample_plan::take_sampled_plan(state, &s.plan, true);
     }
+    for fact in log.linear {
+        fact.land(state);
+    }
     for n in &log.notes {
         note_sampled_ref_backing(state, task_id, n.texture_ref, n.rw, n.rh, n.mid, n.route);
         crate::runtime::scanout::note_sampled_surface_field(
@@ -608,9 +809,7 @@ pub(crate) fn prepare_chunk(
     let Some(pool) = state.par() else {
         return reqs.iter().map(|_| None).collect();
     };
-    let memo = super::lab_resolve_memo_snapshot();
     let scoped = pool.scope(state, reqs, |st, env, (req, writeback_guest)| {
-        let _memo = super::WorkerMemoGuard::set(memo.clone());
         let mut host = env.host();
         let mut req = req.clone();
         let mut log = PrepareLog::default();
