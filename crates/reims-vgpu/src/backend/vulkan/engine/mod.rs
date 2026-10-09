@@ -3394,8 +3394,46 @@ pub fn resident_content_state(identity: &TargetIdentity) -> ResidentContent {
 /// false when the identity is absent or not content_ready, which the caller
 /// must treat as "the elision is off for this surface" rather than ignore.
 pub fn stamp_resident_content_epoch(identity: &TargetIdentity, epoch: u32) -> bool {
+    // TEMP (lab, DEFER_SURFACE_STORE): behind a deferred draw into this resident
+    // the stamp is a recorder job of its own, ordered after that draw (which
+    // clears the stamp when it marks the resident ready), instead of the drain
+    // waiting for the draw. Held as a pending write of the identity until it
+    // runs, so a reader that settles only for its identity still waits for it.
+    if is_drain_thread()
+        && crate::runtime::draw::vulkan::lab_defer_surface_store()
+        && recorder::DRAW.in_flight()
+    {
+        let identity = identity.clone();
+        let writes = recorder::PendingTargets::hold(vec![identity.clone()]);
+        crate::runtime::drain::note_store_route("lab_surface_stamp_deferred");
+        recorder::DRAW.submit(Box::new(move || {
+            let _writes = writes;
+            let mut guard = lock_engine();
+            guard.pools.registry_stamp_content_epoch(&identity, epoch);
+            recorder::JobResult::Done
+        }));
+        return true;
+    }
     let mut guard = lock_engine();
     guard.pools.registry_stamp_content_epoch(identity, epoch)
+}
+
+/// TEMP (lab, DEFER_SURFACE_STORE): whether the resident registered under
+/// `identity` is (or, absent, would be made) an import of guest memory, asked
+/// without the engine lock or a join: the readiness table when the resident
+/// exists, else what this draw asks for. `None` when the two disagree or a
+/// deferred draw still out writes the identity - the caller then keeps the
+/// synchronous Store.
+pub fn surface_store_guest_backed_lock_free(
+    identity: &TargetIdentity,
+    request_guest_memory: bool,
+) -> Option<bool> {
+    let known = pools::readiness::lookup(identity).map(|r| r.guest_imported);
+    match known {
+        Some(imported) if imported == request_guest_memory => Some(imported),
+        Some(_) => None,
+        None => Some(request_guest_memory),
+    }
 }
 
 /// Record that this resident's pixels now exist somewhere that outlives the

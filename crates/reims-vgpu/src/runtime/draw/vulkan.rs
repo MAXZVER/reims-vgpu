@@ -1459,6 +1459,24 @@ fn lab_recorder_gva_store() -> bool {
     })
 }
 
+/// TEMP (lab, live `DEFER_SURFACE_STORE=on|off`, else
+/// `REIMS_VGPU_LAB_DEFER_SURFACE_STORE=on`; off unless `on`): a stream's last
+/// record whose Store goes to a copied surface resident is handed to the
+/// recorder like the GVA store, instead of running on the drain behind a join.
+/// b077/b085: after STAMP_DEFER the largest join left is this one (engine
+/// mod.rs:1567, ~1.3-2k/s on Weather), and the draw itself runs on the drain
+/// holding the engine lock the recorder wants.
+pub(crate) fn lab_defer_surface_store() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("DEFER_SURFACE_STORE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DEFER_SURFACE_STORE").as_deref() == Ok("on"))
+}
+
 /// TEMP (lab): `REIMS_VGPU_LAB_RECORDER_STORE_JOIN=off` leaves a deferred
 /// GVA-resident Store recording past its encode (see `encode_draw_chain`).
 /// On (waiting) by default until measured. Latched.
@@ -14060,6 +14078,58 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
                 crate::runtime::drain::note_store_route("lab_recorder_gva_store_deferred");
                 return Ok(M2vDrawSpan::ResidentGvaStore { identity });
+            }
+        }
+        // TEMP (lab, DEFER_SURFACE_STORE): the last record of a stream whose Store
+        // goes to a copied (not guest-backed) surface resident is the same case
+        // for the engine as the GVA store above - skip_readback, no query,
+        // nothing published into guest memory - and the Store routing reads only
+        // `target_guest_backed` of `out`, which the readiness table answers
+        // without the engine (`surface_store_guest_backed_lock_free`). The
+        // lazy rail then arms the debt and stamps the resident; the stamp is a
+        // recorder job ordered after this draw (`stamp_resident_content_epoch`).
+        // A guest-backed resident keeps the synchronous Store: its routing needs
+        // the guest-store footprint the engine records.
+        if recorder_on
+            && !resident_render_chain
+            && lab_defer_surface_store()
+            && crate::runtime::writeback_debt::lazy_writeback_enabled()
+            && req.visibility.is_none()
+            && resources.occlusion_query.is_none()
+            && resources.skip_readback
+            && !resources.record_guest_store
+        {
+            if let Some(identity) = surface_resident_store.clone() {
+                if crate::backend::vulkan::engine::surface_store_guest_backed_lock_free(
+                    &identity,
+                    resources.guest_target_memory.is_some(),
+                ) == Some(false)
+                {
+                    pass_stage::arm_seed_stage(&mut resources);
+                    crate::backend::vulkan::engine::submit_deferred_draw(
+                        state,
+                        resources,
+                        crate::backend::vulkan::engine::DeferredMeta {
+                            pipeline_ref: req.pipeline_ref,
+                            task_id: req.task_id,
+                            width: w,
+                            height: h,
+                            vertex_count,
+                        },
+                    );
+                    req.visibility_samples = None;
+                    req.lab_left_store_job = true;
+                    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
+                    crate::runtime::drain::note_store_route("lab_surface_store_deferred");
+                    return Ok(M2vDrawSpan::ResidentSurfaceStore {
+                        identity,
+                        guest_store: GuestStoreStatus {
+                            guest_backed: false,
+                            recorded: false,
+                            footprint: None,
+                        },
+                    });
+                }
             }
         }
         let out = crate::backend::vulkan::engine::execute_draw_request(state, &resources)?;
