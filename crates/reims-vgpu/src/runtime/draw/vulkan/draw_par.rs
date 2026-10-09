@@ -1131,10 +1131,18 @@ fn commit_prepared<M: HostMemory + HostOps>(
 /// chain fields set), each with the `writeback_guest` the loop will encode it
 /// with. Returns one slot per request: the prepared draw, or `None` where the
 /// worker bailed (the route says why).
-pub(crate) fn prepare_chunk(
-    state: &DeviceState,
+pub(crate) fn prepare_chunk<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
     reqs: &[(DrawEncodeRequest, bool)],
 ) -> Vec<Option<PreparedDraw>> {
+    if state.par().is_none() {
+        return reqs.iter().map(|_| None).collect();
+    }
+    // The chunk's sampled sources, once, on the drain (see `lab_resolve_memo_prime`).
+    let primed = super::lab_resolve_memo_prime(state, host, reqs);
+    crate::runtime::drain::note_store_route_n("draw_par_memo_primed", u64::from(primed));
+    let state: &DeviceState = &*state;
     let Some(pool) = state.par() else {
         return reqs.iter().map(|_| None).collect();
     };

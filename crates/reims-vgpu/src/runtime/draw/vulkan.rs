@@ -2765,22 +2765,15 @@ static RESOLVE_MEMO: std::sync::LazyLock<
     parking_lot::Mutex::new(reims_vgpu_core::fasthash::FxHashMap::with_hasher(Default::default()))
 });
 
-/// TEMP (lab, DRAW_PAR): a memo key is *claimed* by the first thread to ask
-/// for it and filled when that thread's resolve lands. b123: a chunk's ~19 jobs
-/// start together and every one of them asked for the same large texture
-/// before any had filled the memo, so each read and compared the whole texture
-/// (the linear memo rung) - the helpers ran 1 s/s where the serial ladder read
-/// it once per encoder, and the drain waited on them (20 us a draw against 10).
-/// A thread finding a claim waits for the fill, bounded; a claim whose resolve
-/// bailed is released so nobody waits on it.
+/// TEMP (lab, DRAW_PAR): the memo's entry. (A claim-and-wait slot was tried in
+/// b124 and dropped: with 24 vCPUs on 28 host threads a waiter yielding on a
+/// helper's resolve waited out its whole bound - Weather fell to 3.5 fps. The
+/// duplicate resolves a chunk's jobs made are avoided ahead of the fork instead:
+/// `draw_par::prepare_chunk` resolves the chunk's unique sampled sources on the
+/// drain, once per encoder, exactly as the serial ladder's first bind does.)
 enum MemoSlot {
-    Claimed(std::time::Instant),
     Ready(crate::backend::vulkan::engine::recorder::AssertSend<ResolveMemoEntry>),
 }
-
-/// How long a thread waits for another's claimed resolve before resolving
-/// itself (a 4 MiB texture's read and compare is ~0.3 ms).
-const MEMO_CLAIM_WAIT: std::time::Duration = std::time::Duration::from_millis(3);
 
 /// TEMP (lab, live `RESOLVE_MEMO_ALL=on|off`, else `REIMS_VGPU_LAB_RESOLVE_MEMO_ALL=off`
 /// to disable; on by default since b074): let the memo keep the target and
@@ -2871,58 +2864,76 @@ pub(crate) fn lab_resolve_memo_on() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_MEMO").as_deref() != Ok("off"))
 }
 
-/// The memo's answer, or a claim: `None` means the caller resolves (it holds
-/// the claim and must `put` or `release`).
 fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledSourceRequest)> {
-    let copy = |entry: &crate::backend::vulkan::engine::recorder::AssertSend<ResolveMemoEntry>| {
+    let m = RESOLVE_MEMO.lock();
+    m.get(key).and_then(|MemoSlot::Ready(entry)| {
         let (w, h, mid, src) = &entry.0;
         if !matches!(src, SampledSourceRequest::Bytes(..)) {
             crate::runtime::drain::note_store_route("lab_resolve_memo_hit_route");
         }
         memo_copy(src, true, true).map(|src| (*w, *h, *mid, src))
-    };
-    let started = std::time::Instant::now();
-    let mut waited = false;
-    loop {
-        {
-            let mut m = RESOLVE_MEMO.lock();
-            match m.get(key) {
-                Some(MemoSlot::Ready(entry)) => {
-                    if waited {
-                        crate::runtime::drain::note_store_route("lab_resolve_memo_waited_hit");
-                    }
-                    return copy(entry);
+    })
+}
+
+/// TEMP (lab, DRAW_PAR): resolve, on the drain and with the serial ladder, every
+/// sampled source the chunk's records bind that the encoder's memo does not hold
+/// yet, and memo it - so the chunk's jobs, which start together, find it there
+/// instead of each resolving (and for a large linear texture reading and
+/// comparing) the same source. This is the work the serial ladder does for the
+/// first bind of a source in an encoder; the workers get the repeats. Binds that
+/// alias the pass's own attachments take the alias arm, not the memo, and are
+/// skipped. Returns how many sources were resolved here.
+pub(super) fn lab_resolve_memo_prime<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    reqs: &[(DrawEncodeRequest, bool)],
+) -> u32 {
+    if !lab_resolve_memo_on() {
+        return 0;
+    }
+    let mut seen: Vec<ResolveMemoKey> = Vec::new();
+    let mut resolved = 0u32;
+    for (req, _) in reqs {
+        let attachments: Vec<u32> = req.colors.iter().map(|c| c.texture_ref).collect();
+        for (frag_stage, binds) in [(false, &req.vertex_textures), (true, &req.fragment_textures)] {
+            for bind in binds.iter() {
+                if bind.texture_ref == 0 || (frag_stage && attachments.contains(&bind.texture_ref)) {
+                    continue;
                 }
-                Some(MemoSlot::Claimed(since)) => {
-                    // A claim older than the wait is a resolve that never
-                    // landed (a job that bailed without releasing): take it over.
-                    if since.elapsed() > MEMO_CLAIM_WAIT {
-                        m.insert(*key, MemoSlot::Claimed(std::time::Instant::now()));
-                        crate::runtime::drain::note_store_route("lab_resolve_memo_claim_taken_over");
-                        return None;
-                    }
+                let resource = bind.resource.clone().or_else(|| {
+                    objects::resolve_resource(&*state, &*host, req.task_id, bind.texture_ref).ok()
+                });
+                let view_swizzle = resource
+                    .as_ref()
+                    .filter(|r| r.entry.object_type == crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW)
+                    .and_then(|_| resolve_texture_view(&*state, &*host, req.task_id, bind.texture_ref))
+                    .and_then(|view| view.swizzle)
+                    .filter(|plan| !pixel_format::swizzle_is_identity(plan));
+                let key: ResolveMemoKey = (
+                    req.task_id,
+                    bind.texture_ref,
+                    resource.as_ref().map_or(0, |r| std::sync::Arc::as_ptr(r) as usize),
+                    view_swizzle.is_none(),
+                );
+                if seen.contains(&key) || lab_resolve_memo_get(&key).is_some() {
+                    continue;
                 }
-                None => {
-                    m.insert(*key, MemoSlot::Claimed(started));
-                    return None;
+                seen.push(key);
+                if let Some(loaded) = resolve_sampled_source(
+                    state,
+                    host,
+                    req.task_id,
+                    bind.texture_ref,
+                    resource,
+                    view_swizzle.is_none(),
+                ) {
+                    lab_resolve_memo_put(key, &loaded);
+                    resolved += 1;
                 }
             }
         }
-        if started.elapsed() > MEMO_CLAIM_WAIT {
-            crate::runtime::drain::note_store_route("lab_resolve_memo_wait_timeout");
-            return None;
-        }
-        waited = true;
-        std::thread::yield_now();
     }
-}
-
-/// Drop a claim whose resolve did not land, so waiters stop waiting.
-fn lab_resolve_memo_release(key: &ResolveMemoKey) {
-    let mut m = RESOLVE_MEMO.lock();
-    if matches!(m.get(key), Some(MemoSlot::Claimed(_))) {
-        m.remove(key);
-    }
+    resolved
 }
 
 fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSourceRequest)) {
@@ -2934,7 +2945,6 @@ fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSou
             SampledSourceRequest::GuestRuns(..) | SampledSourceRequest::Staged(..)
         )
     {
-        lab_resolve_memo_release(&key);
         return;
     }
     match memo_copy(&loaded.3, lab_resolve_memo_all(), false) {
@@ -2946,8 +2956,7 @@ fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSou
                 ))),
             );
         }
-        // Not a source the memo keeps: the claim goes, or waiters would wait.
-        None => lab_resolve_memo_release(&key),
+        None => {}
     }
 }
 
@@ -12071,9 +12080,6 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                             ) {
                                 Ok(served) => (Some(served), false),
                                 Err(bail) => {
-                                    if memo_on {
-                                        lab_resolve_memo_release(&memo_key);
-                                    }
                                     log.bail = Some(bail);
                                     return Err(WORKER_ERR);
                                 }
@@ -12116,9 +12122,8 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                             }
                         };
                         if memo_on {
-                            match lab_resolved.as_ref() {
-                                Some(loaded) => lab_resolve_memo_put(memo_key, loaded),
-                                None => lab_resolve_memo_release(&memo_key),
+                            if let Some(loaded) = lab_resolved.as_ref() {
+                                lab_resolve_memo_put(memo_key, loaded);
                             }
                         }
                         (lab_resolved, lab_plan_served)

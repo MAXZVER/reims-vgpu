@@ -5796,7 +5796,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                             })
                             .collect();
                         draw_par_slots =
-                            crate::runtime::draw::vulkan::draw_par::prepare_chunk(&*state, &reqs);
+                            crate::runtime::draw::vulkan::draw_par::prepare_chunk(state, host, &reqs);
                         draw_par_reqs = reqs.into_iter().map(|(r, _)| Some(r)).collect();
                     }
                 }
