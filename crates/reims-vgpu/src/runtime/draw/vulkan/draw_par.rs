@@ -71,7 +71,11 @@ pub(crate) enum Bail {
     /// A bind without a retained resource: the serial ladder reads the guest.
     BufferNoResource,
     /// The buffer plan refused with a reason the serial ladder constructs for.
-    BufferPlan,
+    BufferPlan(buffer_plan::BufferBail),
+    /// The plan answered but not for this bind's key.
+    BufferPredict,
+    /// Above the zero-copy floor the serial ladder constructs a rail.
+    BufferAboveFloor,
     /// The backing did not resolve read-only.
     BufferBacking,
     /// A debt or an in-flight writeback stands over the bytes: the settle is
@@ -79,15 +83,36 @@ pub(crate) enum Bail {
     BufferOwed,
     /// The guest read failed; the serial path reports it.
     BufferRead,
-    /// The index bind's window could not be planned or read.
-    Index,
+    /// The index bind's window did not resolve.
+    IndexWindow,
+    /// The index buffer's resource did not resolve.
+    IndexResource,
+    /// The index plan refused.
+    IndexPlan(buffer_plan::BufferBail),
+    /// The index plan answered but not for this key.
+    IndexPredict,
+    /// Above the floor the serial ladder constructs the index window.
+    IndexAboveFloor,
     /// A sampled bind without a retained resource.
     SampledNoResource,
     /// The sampled planner bailed (a lower rung, a cold construction).
     SampledPlan,
-    /// The source needs a drain-only rail (cube faces, attachment alias of a
-    /// secondary slot, a miss that wants its detail).
-    SampledRail,
+    /// A linear texture without a decodable texture descriptor or geometry.
+    LinearShape,
+    /// A linear texture whose allocation has a packed alias: the serial
+    /// ladder serves it zero-copy from there.
+    LinearPacked,
+    /// A linear texture whose window the gather floor admits: the serial
+    /// ladder gathers it on the witness.
+    LinearFloor,
+    /// The linear rows could not be converted for upload.
+    LinearConvert,
+    /// A cube map: six faces the drain reloads.
+    Cube,
+    /// An attachment alias of a secondary slot.
+    AliasSecondary,
+    /// A miss whose detail the drain reports.
+    MissDetail,
     /// More than one colour attachment.
     Mrt,
     /// The record does not load from the chain's resident: its seed doors
@@ -114,14 +139,26 @@ impl Bail {
         match self {
             Bail::PassInvariants => "draw_par_bail_pass_inv",
             Bail::BufferNoResource => "draw_par_bail_buf_no_resource",
-            Bail::BufferPlan => "draw_par_bail_buf_plan",
+            Bail::BufferPlan(b) => buffer_bail_route(b, false),
+            Bail::BufferPredict => "draw_par_bail_buf_predict",
+            Bail::BufferAboveFloor => "draw_par_bail_buf_above_floor",
             Bail::BufferBacking => "draw_par_bail_buf_backing",
             Bail::BufferOwed => "draw_par_bail_buf_owed",
             Bail::BufferRead => "draw_par_bail_buf_read",
-            Bail::Index => "draw_par_bail_index",
+            Bail::IndexWindow => "draw_par_bail_idx_window",
+            Bail::IndexResource => "draw_par_bail_idx_resource",
+            Bail::IndexPlan(b) => buffer_bail_route(b, true),
+            Bail::IndexPredict => "draw_par_bail_idx_predict",
+            Bail::IndexAboveFloor => "draw_par_bail_idx_above_floor",
             Bail::SampledNoResource => "draw_par_bail_smp_no_resource",
             Bail::SampledPlan => "draw_par_bail_smp_plan",
-            Bail::SampledRail => "draw_par_bail_smp_rail",
+            Bail::LinearShape => "draw_par_bail_lin_shape",
+            Bail::LinearPacked => "draw_par_bail_lin_packed",
+            Bail::LinearFloor => "draw_par_bail_lin_floor",
+            Bail::LinearConvert => "draw_par_bail_lin_convert",
+            Bail::Cube => "draw_par_bail_cube",
+            Bail::AliasSecondary => "draw_par_bail_alias_secondary",
+            Bail::MissDetail => "draw_par_bail_miss_detail",
             Bail::Mrt => "draw_par_bail_mrt",
             Bail::NoChainLoad => "draw_par_bail_no_chain_load",
             Bail::RecorderOff => "draw_par_bail_recorder_off",
@@ -132,6 +169,28 @@ impl Bail {
             Bail::ChainMoved => "draw_par_commit_chain_moved",
             Bail::PlanInvalid => "draw_par_commit_plan_invalid",
         }
+    }
+}
+
+fn buffer_bail_route(bail: buffer_plan::BufferBail, index: bool) -> &'static str {
+    use buffer_plan::BufferBail as B;
+    match (index, bail) {
+        (false, B::NullRef) => "draw_par_bail_buf_null_ref",
+        (false, B::ColdBacking) => "draw_par_bail_buf_cold_backing",
+        (false, B::ColdPacked) => "draw_par_bail_buf_cold_packed",
+        (false, B::ColdWhole) => "draw_par_bail_buf_cold_whole",
+        (false, B::ColdWindow) => "draw_par_bail_buf_cold_window",
+        (false, B::BelowFloor) => "draw_par_bail_buf_below_floor",
+        (false, B::OffsetPastEnd) => "draw_par_bail_buf_offset_past_end",
+        (false, B::OwedStage) => "draw_par_bail_buf_owed_stage",
+        (true, B::NullRef) => "draw_par_bail_idx_null_ref",
+        (true, B::ColdBacking) => "draw_par_bail_idx_cold_backing",
+        (true, B::ColdPacked) => "draw_par_bail_idx_cold_packed",
+        (true, B::ColdWhole) => "draw_par_bail_idx_cold_whole",
+        (true, B::ColdWindow) => "draw_par_bail_idx_cold_window",
+        (true, B::BelowFloor) => "draw_par_bail_idx_below_floor",
+        (true, B::OffsetPastEnd) => "draw_par_bail_idx_offset_past_end",
+        (true, B::OwedStage) => "draw_par_bail_idx_owed_stage",
     }
 }
 
@@ -430,7 +489,7 @@ pub(super) fn load_buffer_content_worker<M: HostMemory + HostOps>(
                     }
                     // Not this bind's rail: the serial ladder reads on.
                     Ok(None) => {}
-                    Err(_) => return Err(Bail::BufferPlan),
+                    Err(_) => return Err(Bail::BufferPredict),
                 }
             }
             // A sub-floor window the serial ladder reads on the CPU, or a
@@ -440,7 +499,7 @@ pub(super) fn load_buffer_content_worker<M: HostMemory + HostOps>(
             Err(buffer_plan::BufferBail::BelowFloor | buffer_plan::BufferBail::ColdPacked) => {}
             // Everything else is a construction (whole, a walked window) or a
             // refusal the serial ladder names itself.
-            Err(_) => return Err(Bail::BufferPlan),
+            Err(bail) => return Err(Bail::BufferPlan(bail)),
         }
     }
     let backing = resolve_buffer_backing(state, host, task_id, buffer_ref, Some(resource.as_ref()))
@@ -448,7 +507,7 @@ pub(super) fn load_buffer_content_worker<M: HostMemory + HostOps>(
     if allow_zero_copy && !buffer_plan::below_floor(backing.size, offset) {
         // Above the floor the serial ladder constructs a rail (packed, whole,
         // a walked window) rather than reading.
-        return Err(Bail::BufferPlan);
+        return Err(Bail::BufferAboveFloor);
     }
     cpu_read_worker(state, host, task_id, buffer_ref, &backing, offset, extent_cap)
 }
@@ -462,9 +521,9 @@ pub(super) fn load_index_content_worker<M: HostMemory + HostOps>(
     info: &IndexedDrawInfo,
 ) -> Result<crate::backend::vulkan::engine::BufferContent, Bail> {
     let (backing, need) =
-        resolve_index_window_reason(state, host, task_id, info).map_err(|_| Bail::Index)?;
+        resolve_index_window_reason(state, host, task_id, info).map_err(|_| Bail::IndexWindow)?;
     let resource = objects::resolve_resource(state, host, task_id, info.index_buffer_ref)
-        .map_err(|_| Bail::Index)?;
+        .map_err(|_| Bail::IndexResource)?;
     match buffer_plan::plan_index_content(state, host, task_id, info, None) {
         Ok(plan) => {
             match buffer_plan::predict_buffer_plan(
@@ -487,14 +546,14 @@ pub(super) fn load_index_content_worker<M: HostMemory + HostOps>(
                     return Ok(content);
                 }
                 Ok(None) => {}
-                Err(_) => return Err(Bail::Index),
+                Err(_) => return Err(Bail::IndexPredict),
             }
         }
         Err(buffer_plan::BufferBail::BelowFloor | buffer_plan::BufferBail::ColdPacked) => {}
-        Err(_) => return Err(Bail::Index),
+        Err(bail) => return Err(Bail::IndexPlan(bail)),
     }
     if !buffer_plan::below_floor(backing.size, info.index_buffer_offset) {
-        return Err(Bail::Index);
+        return Err(Bail::IndexAboveFloor);
     }
     cpu_read_worker(
         state,
@@ -565,30 +624,30 @@ fn resolve_linear_worker<M: HostMemory + HostOps>(
 ) -> Result<(u32, u32, u32, SampledSourceRequest), Bail> {
     let tex = match resource.decoded() {
         Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => tex,
-        _ => return Err(Bail::SampledRail),
+        _ => return Err(Bail::LinearShape),
     };
-    let declared_format = tex.declared_pixel_format().ok_or(Bail::SampledRail)?;
+    let declared_format = tex.declared_pixel_format().ok_or(Bail::LinearShape)?;
     let sample_fmt = crate::runtime::draw::texture_view::effective_view_sample_format(declared_format, None)
-        .ok_or(Bail::SampledRail)?;
-    let (gva, layout) = tex.level_gva(0, state.page_shift).ok_or(Bail::SampledRail)?;
+        .ok_or(Bail::LinearShape)?;
+    let (gva, layout) = tex.level_gva(0, state.page_shift).ok_or(Bail::LinearShape)?;
     let (w, h) = (layout.width, layout.height);
     if w == 0 || h == 0 {
-        return Err(Bail::SampledRail);
+        return Err(Bail::LinearShape);
     }
     let bpr = layout.row_stride;
     let planes = layout.planes();
-    let tight = pixel_format::tight_row_bytes(w, declared_format).ok_or(Bail::SampledRail)? as u64;
+    let tight = pixel_format::tight_row_bytes(w, declared_format).ok_or(Bail::LinearShape)? as u64;
     if bpr < tight {
-        return Err(Bail::SampledRail);
+        return Err(Bail::LinearShape);
     }
-    let storage_rows = pixel_format::tight_row_count(h, declared_format).ok_or(Bail::SampledRail)?;
+    let storage_rows = pixel_format::tight_row_count(h, declared_format).ok_or(Bail::LinearShape)?;
     let span = bpr
         .checked_mul(u64::from(storage_rows))
         .and_then(|s| s.checked_mul(u64::from(planes)))
-        .ok_or(Bail::SampledRail)?;
-    let native_len = crate::runtime::draw::host_alloc_len(span).ok_or(Bail::SampledRail)?;
+        .ok_or(Bail::LinearShape)?;
+    let native_len = crate::runtime::draw::host_alloc_len(span).ok_or(Bail::LinearShape)?;
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
-        return Err(Bail::SampledRail);
+        return Err(Bail::LinearShape);
     }
     // The zero-copy rail above this rung: a packed alias of the allocation
     // serves directly, and a window the gather floor admits is gathered on
@@ -597,11 +656,11 @@ fn resolve_linear_worker<M: HostMemory + HostOps>(
         state.bound_buffers.packed(task_id, texture_ref),
         Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(_))
     ) {
-        return Err(Bail::SampledRail);
+        return Err(Bail::LinearPacked);
     }
     if let Ok((native, _, _)) = translate::pixel::sampled_pixels(declared_format) {
         if sampled_gather_floor_pure(native, span) {
-            return Err(Bail::SampledRail);
+            return Err(Bail::LinearFloor);
         }
     }
     guest_bytes_readable(state, host, task_id, texture_ref, gva, span)?;
@@ -639,7 +698,7 @@ fn resolve_linear_worker<M: HostMemory + HostOps>(
         }
     }
     let (rgba, fmt) = native_scratch_to_upload(&scratch, w, h, planes, bpr, sample_fmt, tight)
-        .ok_or(Bail::SampledRail)?;
+        .ok_or(Bail::LinearConvert)?;
     let generation = state.next_sampled_content_generation();
     let rgba = Arc::new(rgba);
     crate::runtime::drain::note_store_route("draw_par_lin_memo_fill");

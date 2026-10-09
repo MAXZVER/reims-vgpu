@@ -11602,7 +11602,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                                         // slot's alias is the drain's.
                                         None => {
                                             if let Some(log) = prep.as_deref_mut() {
-                                                log.bail = Some(Bail::SampledRail);
+                                                log.bail = Some(Bail::AliasSecondary);
                                             }
                                             None
                                         }
@@ -11761,7 +11761,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                                 // TEMP (lab, DRAW_PAR): the detail is the
                                 // drain's; the record goes back to it.
                                 if let Some(log) = prep.as_deref_mut() {
-                                    log.bail = Some(Bail::SampledRail);
+                                    log.bail = Some(Bail::MissDetail);
                                 }
                                 return Err(WORKER_ERR);
                             };
@@ -12088,7 +12088,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                     let Some(state) = acc.exclusive() else {
                         // TEMP (lab, DRAW_PAR): the six-face reload is the drain's.
                         if let Some(log) = prep.as_deref_mut() {
-                            log.bail = Some(Bail::SampledRail);
+                            log.bail = Some(Bail::Cube);
                         }
                         return Err(WORKER_ERR);
                     };
@@ -14282,7 +14282,9 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         // chain intermediate is prepared: everything else runs synchronously
         // on the drain and reads the engine's answer.
         if acc.is_worker() {
-            if !recorder_on {
+            // The gate alone: `deferred_draws_enabled` also asks for the
+            // drain thread, and the commit that submits this record runs there.
+            if !crate::backend::vulkan::engine::recorder::enabled() {
                 worker_bail!(Bail::RecorderOff);
             }
             if !resident_render_chain {
