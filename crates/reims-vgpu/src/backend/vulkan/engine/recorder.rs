@@ -61,7 +61,7 @@
 //! the drain waited, split by the door it waited in.
 
 use std::any::Any;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -210,6 +210,9 @@ pub(crate) struct Handoff {
     /// submitter and cleared by the worker when the last one finishes, both
     /// under `inner`; the worker's job writes happen before its clear.
     in_flight: AtomicBool,
+    /// `Inner::outstanding`, mirrored for a submitter that spins for a free
+    /// slot instead of parking on `done_cv` (written under `inner` alongside it).
+    out_n: AtomicU32,
     alive: AtomicBool,
     stats: Stats,
 }
@@ -270,6 +273,29 @@ fn worker_spin() -> Duration {
     })
 }
 
+/// TEMP (lab, BELOW_SPIN): how long a submit that finds the queue full spins
+/// for a free slot before it parks. Live `BELOW_SPIN=N` (microseconds) or
+/// `REIMS_VGPU_LAB_BELOW_SPIN_US`; default 50, `0` restores the bare park and
+/// a settle's fixed 30 us spin (it otherwise spins 8 us a job out).
+fn below_spin() -> Duration {
+    #[cfg(not(test))]
+    if let Some(n) =
+        crate::runtime::lab_live::value("BELOW_SPIN").and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Duration::from_micros(n.min(1_000));
+    }
+    static SPIN: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *SPIN.get_or_init(|| {
+        Duration::from_micros(
+            std::env::var("REIMS_VGPU_LAB_BELOW_SPIN_US")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(50)
+                .min(1_000),
+        )
+    })
+}
+
 /// Lab `REIMS_VGPU_LAB_RECORDER_DEPTH=N` (1..=16, default 4): how many deferred
 /// draws may be out at once. Above 1 the drain's explicit join before the next
 /// draw takes only a failure already found and does not wait; a failure is then
@@ -324,6 +350,7 @@ impl Handoff {
             stash_pending: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             in_flight: AtomicBool::new(false),
+            out_n: AtomicU32::new(0),
             alive: AtomicBool::new(false),
             stats: Stats::new(),
         }
@@ -428,6 +455,7 @@ impl Handoff {
             let mut g = self.inner.lock();
             stash_result(&mut g, &self.stash_pending, result);
             g.outstanding -= 1;
+            self.out_n.store(g.outstanding, Ordering::Release);
             if g.outstanding == 0 {
                 self.in_flight.store(false, Ordering::Release);
             }
@@ -447,7 +475,7 @@ impl Handoff {
         if depth <= 1 && self.in_flight() {
             // Defensive: wait for it rather than overwrite it.
             self.settle(JoinSite::Explicit);
-        } else if depth > 1 && self.inner.lock().outstanding >= depth {
+        } else if depth > 1 && self.out_n.load(Ordering::Acquire) >= depth {
             self.wait_below(depth);
         }
         if !self.ensure_worker() {
@@ -462,6 +490,7 @@ impl Handoff {
         let mut g = self.inner.lock();
         g.jobs.push_back(job);
         g.outstanding += 1;
+        self.out_n.store(g.outstanding, Ordering::Release);
         self.in_flight.store(true, Ordering::Release);
         self.pending.store(true, Ordering::Release);
         if g.worker_parked {
@@ -513,7 +542,14 @@ impl Handoff {
         if !self.in_flight.load(Ordering::Acquire) {
             return;
         }
-        let spin_until = started + JOIN_SPIN;
+        // TEMP (lab, BELOW_SPIN): a settle waits for every job out, up to the
+        // queue's depth of them, so its spin scales with how many there are.
+        let spin = if below_spin().is_zero() {
+            JOIN_SPIN
+        } else {
+            JOIN_SPIN.max(Duration::from_micros(8 * u64::from(self.out_n.load(Ordering::Acquire))))
+        };
+        let spin_until = started + spin.min(Duration::from_micros(200));
         let mut i = 0u32;
         let mut blocked = false;
         while self.in_flight.load(Ordering::Acquire) {
@@ -579,6 +615,18 @@ impl Handoff {
     #[track_caller]
     fn wait_below(&self, depth: u32) {
         let started = Instant::now();
+        // A slot frees within one job (~5 us a draw), while a park on
+        // `done_cv` costs a Windows wake (20-50 us) and makes the worker pay a
+        // notify per job: spin for it first, as a settle does.
+        let spin_until = started + below_spin();
+        let mut i = 0u32;
+        while self.out_n.load(Ordering::Acquire) >= depth {
+            std::hint::spin_loop();
+            i = i.wrapping_add(1);
+            if i & 31 == 0 && Instant::now() >= spin_until {
+                break;
+            }
+        }
         let mut g = self.inner.lock();
         while g.outstanding >= depth {
             g.waiters += 1;
