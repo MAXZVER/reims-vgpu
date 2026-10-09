@@ -724,7 +724,7 @@ impl Handoff {
 }
 
 #[cfg(windows)]
-fn current_thread_priority() -> Option<i32> {
+pub(super) fn current_thread_priority() -> Option<i32> {
     extern "system" {
         fn GetCurrentThread() -> *mut core::ffi::c_void;
         fn GetThreadPriority(h: *mut core::ffi::c_void) -> i32;
@@ -736,7 +736,7 @@ fn current_thread_priority() -> Option<i32> {
 }
 
 #[cfg(windows)]
-fn apply_thread_priority(priority: Option<i32>) {
+pub(super) fn apply_thread_priority(priority: Option<i32>) {
     extern "system" {
         fn GetCurrentThread() -> *mut core::ffi::c_void;
         fn SetThreadPriority(h: *mut core::ffi::c_void, p: i32) -> i32;
@@ -750,12 +750,12 @@ fn apply_thread_priority(priority: Option<i32>) {
 }
 
 #[cfg(not(windows))]
-fn current_thread_priority() -> Option<i32> {
+pub(super) fn current_thread_priority() -> Option<i32> {
     None
 }
 
 #[cfg(not(windows))]
-fn apply_thread_priority(_priority: Option<i32>) {}
+pub(super) fn apply_thread_priority(_priority: Option<i32>) {}
 
 /// The process's recorder: draws only.
 pub(crate) static DRAW: Handoff = Handoff::new("reims-vgpu-recorder");

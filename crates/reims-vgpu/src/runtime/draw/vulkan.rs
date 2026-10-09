@@ -44,6 +44,8 @@ pub(crate) mod pass_stage;
 // binds. `pub(crate) mod` because the drain feeds it at admission and retires
 // it at execution; everything between lives inside this tree.
 pub(crate) mod lanes;
+/// TEMP (lab, DRAW_PAR, 2026-10-09): whole-draw preparation on the pool.
+pub(crate) mod draw_par;
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
@@ -2844,7 +2846,57 @@ pub(crate) fn lab_resolve_memo_on() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_MEMO").as_deref() != Ok("off"))
 }
 
+/// TEMP (lab, DRAW_PAR): the encoder's memo as a pool worker sees it — a
+/// snapshot the drain takes at the fork. Workers read it and fill nothing; the
+/// drain's own memo is a thread-local the worker threads cannot see.
+pub(super) type ResolveMemoSnapshot =
+    std::sync::Arc<reims_vgpu_core::fasthash::FxHashMap<ResolveMemoKey, ResolveMemoEntry>>;
+
+thread_local! {
+    static WORKER_MEMO: std::cell::RefCell<Option<ResolveMemoSnapshot>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn lab_resolve_memo_snapshot() -> ResolveMemoSnapshot {
+    RESOLVE_MEMO.with(|m| {
+        std::sync::Arc::new(
+            m.borrow()
+                .iter()
+                .filter_map(|(k, (w, h, mid, src))| {
+                    memo_copy(src, true, true).map(|src| (*k, (*w, *h, *mid, src)))
+                })
+                .collect(),
+        )
+    })
+}
+
+/// Installs a snapshot as this thread's memo for the length of a pool job.
+pub(super) struct WorkerMemoGuard;
+
+impl WorkerMemoGuard {
+    pub(super) fn set(memo: ResolveMemoSnapshot) -> Self {
+        WORKER_MEMO.with(|w| *w.borrow_mut() = Some(memo));
+        WorkerMemoGuard
+    }
+}
+
+impl Drop for WorkerMemoGuard {
+    fn drop(&mut self) {
+        WORKER_MEMO.with(|w| *w.borrow_mut() = None);
+    }
+}
+
 fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledSourceRequest)> {
+    // TEMP (lab, DRAW_PAR): inside a pool scope every thread, the coordinator
+    // included, answers from the fork's snapshot, so a job's answer does not
+    // depend on which thread ran it.
+    if crate::runtime::par::planning() {
+        return WORKER_MEMO.with(|w| {
+            w.borrow().as_ref().and_then(|m| {
+                m.get(key)
+                    .and_then(|(w, h, mid, src)| memo_copy(src, true, true).map(|src| (*w, *h, *mid, src)))
+            })
+        });
+    }
     RESOLVE_MEMO.with(|m| {
         m.borrow().get(key).and_then(|(w, h, mid, src)| {
             if !matches!(src, SampledSourceRequest::Bytes(..)) {
@@ -2856,6 +2908,10 @@ fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledS
 }
 
 fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSourceRequest)) {
+    // TEMP (lab, DRAW_PAR): a job fills nothing (see `lab_resolve_memo_get`).
+    if crate::runtime::par::planning() {
+        return;
+    }
     if let Some(src) = memo_copy(&loaded.3, lab_resolve_memo_all(), false) {
         RESOLVE_MEMO.with(|m| {
             m.borrow_mut().insert(key, (loaded.0, loaded.1, loaded.2, src));
@@ -10554,6 +10610,61 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     req: &mut DrawEncodeRequest,
     writeback_guest: bool,
 ) -> Result<M2vDrawSpan, DrawError> {
+    // TEMP (lab, DRAW_PAR): a record a pool worker prepared is committed here
+    // — its plans validated, its facts landed, its request submitted — and the
+    // body below runs only for a record nobody prepared or whose preparation
+    // no longer holds.
+    match draw_par::commit_offered(state, host, req) {
+        draw_par::Committed::Span(span) => return span,
+        draw_par::Committed::Serial => {}
+    }
+    try_metal2vulkan_draw_with(
+        &mut draw_par::StateAccess::Drain(state),
+        host,
+        req,
+        writeback_guest,
+        None,
+    )
+}
+
+/// The encode body, over either access to the device state.
+///
+/// TEMP (lab, DRAW_PAR): with [`draw_par::StateAccess::Worker`] every site
+/// that would mutate the state plans the mutation into `prep` or bails (the
+/// log says why), and the body ends at the engine door with the finished
+/// request in the log instead of a submit. See `draw_par`.
+pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
+    acc: &mut draw_par::StateAccess<'_>,
+    host: &mut M,
+    req: &mut DrawEncodeRequest,
+    writeback_guest: bool,
+    mut prep: Option<&mut draw_par::PrepareLog>,
+) -> Result<M2vDrawSpan, DrawError> {
+    use draw_par::Bail;
+    // The error a worker's closure returns where the body cannot `return` a
+    // span: the job discards it (the log's bail is the reason), so any typed
+    // refusal serves — this one is never reported.
+    const WORKER_ERR: DrawError = DrawError::Facade(crate::backend::vulkan::engine::EngineFacadeDecline::DeviceCachesUnreachable);
+    // A worker's refusal: name it in the log and leave the record to the drain.
+    macro_rules! worker_bail {
+        ($b:expr) => {{
+            if let Some(log) = prep.as_deref_mut() {
+                log.bail = Some($b);
+            }
+            return Ok(M2vDrawSpan::None);
+        }};
+    }
+    macro_rules! prep_log {
+        () => {
+            match prep.as_deref_mut() {
+                Some(log) => log,
+                None => return Ok(M2vDrawSpan::None),
+            }
+        };
+    }
+    if acc.is_worker() && req.colors.len() > 1 {
+        worker_bail!(Bail::Mrt);
+    }
     // Only the final record of a portability render-pass chain reads back CPU
     // pixels; used by the resident-chain rail below (harmless on other paths).
     let _ = &writeback_guest;
@@ -10578,7 +10689,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     // TEMP (lab, PASS_INVARIANTS): the attachment set is fixed for the pass,
     // so records 2+ reuse draw 0's answer (guarded, with the serial walk as
     // the fallback) instead of re-walking the page set per record.
-    req.gva_alloc_gen = pass_inv::gva_alloc_gen(state, host, req);
+    req.gva_alloc_gen = match acc.exclusive() {
+        Some(state) => pass_inv::gva_alloc_gen(state, host, req),
+        // TEMP (lab, DRAW_PAR): a worker reuses draw 0's answer or leaves the
+        // record to the drain.
+        None => match pass_inv::reusable_gva_alloc_gen(acc.shared(), req) {
+            Some(generation) => generation,
+            None => worker_bail!(Bail::PassInvariants),
+        },
+    };
     // One call for the pipeline descriptor and both translated shaders. It is
     // memoized on the three objects' list entries — see
     // `crate::backend::vulkan::pipeline_resolve` for what that identity is and what it
@@ -10588,7 +10707,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     // so a boot's `chain_phase` line says how much of the span survived.
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PipelineDesc);
     let resolved = crate::backend::vulkan::pipeline_resolve::resolve(
-        state,
+        acc.shared(),
         host,
         req.task_id,
         req.pipeline_ref,
@@ -10732,10 +10851,23 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Binds);
     crate::runtime::bind_phase::note_bind();
 
-    let mut early_index = req
-        .indexed
-        .as_ref()
-        .map(|idx| load_index_content_reason(state, host, req.task_id, idx));
+    let mut early_index = match req.indexed.as_ref() {
+        None => None,
+        Some(idx) => Some(match acc.exclusive() {
+            Some(state) => load_index_content_reason(state, host, req.task_id, idx),
+            // TEMP (lab, DRAW_PAR): the worker's plan-or-read twin.
+            None => match draw_par::load_index_content_worker(
+                acc.shared(),
+                host,
+                prep_log!(),
+                req.task_id,
+                idx,
+            ) {
+                Ok(content) => Ok(content),
+                Err(bail) => worker_bail!(bail),
+            },
+        }),
+    };
 
     // The two modules in the numbering this draw will use, from the translation
     // cache. Each carries the walks of its own numbering beside it — see
@@ -10861,16 +10993,34 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 )
             } else {
                 crate::runtime::bind_phase::note_unused_staged(access);
-                let Some(content) = load_buffer_content(
-                    state,
-                    host,
-                    req.task_id,
-                    b.buffer_ref,
-                    b.resource.as_deref(),
-                    b.offset,
-                    allow_zc,
-                    cap,
-                ) else {
+                let loaded = match acc.exclusive() {
+                    Some(state) => load_buffer_content(
+                        state,
+                        host,
+                        req.task_id,
+                        b.buffer_ref,
+                        b.resource.as_deref(),
+                        b.offset,
+                        allow_zc,
+                        cap,
+                    ),
+                    // TEMP (lab, DRAW_PAR): the worker's plan-or-read twin.
+                    None => match draw_par::load_buffer_content_worker(
+                        acc.shared(),
+                        host,
+                        prep_log!(),
+                        req.task_id,
+                        b.buffer_ref,
+                        b.resource.as_ref(),
+                        b.offset,
+                        allow_zc,
+                        cap,
+                    ) {
+                        Ok(content) => Some(content),
+                        Err(bail) => worker_bail!(bail),
+                    },
+                };
+                let Some(content) = loaded else {
                     return Err(DrawError::DrawPreparation(
                         DrawPreparationDecline::VertexBufferMissing {
                             index: b.index,
@@ -10915,16 +11065,34 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 )
             } else {
                 crate::runtime::bind_phase::note_unused_staged(access);
-                let Some(content) = load_buffer_content(
-                    state,
-                    host,
-                    req.task_id,
-                    b.buffer_ref,
-                    b.resource.as_deref(),
-                    b.offset,
-                    true,
-                    cap,
-                ) else {
+                let loaded = match acc.exclusive() {
+                    Some(state) => load_buffer_content(
+                        state,
+                        host,
+                        req.task_id,
+                        b.buffer_ref,
+                        b.resource.as_deref(),
+                        b.offset,
+                        true,
+                        cap,
+                    ),
+                    // TEMP (lab, DRAW_PAR): the worker's plan-or-read twin.
+                    None => match draw_par::load_buffer_content_worker(
+                        acc.shared(),
+                        host,
+                        prep_log!(),
+                        req.task_id,
+                        b.buffer_ref,
+                        b.resource.as_ref(),
+                        b.offset,
+                        true,
+                        cap,
+                    ) {
+                        Ok(content) => Some(content),
+                        Err(bail) => worker_bail!(bail),
+                    },
+                };
+                let Some(content) = loaded else {
                     return Err(DrawError::DrawPreparation(
                         DrawPreparationDecline::FragmentBufferMissing {
                             index: b.index,
@@ -11377,7 +11545,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         crate::runtime::sampled_phase::Part::Lookup,
                     );
                     let texture_resource = retained.cloned().or_else(|| {
-                        objects::resolve_resource(state, host, req.task_id, texture_ref).ok()
+                        objects::resolve_resource(acc.shared(), host, req.task_id, texture_ref).ok()
                     });
                     // A texture-view's channel remap. Resolved here rather than in
                     // the loaders because it describes how the bind READS the
@@ -11391,7 +11559,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             resource.entry.object_type
                                 == crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW
                         })
-                        .and_then(|_| resolve_texture_view(state, host, req.task_id, texture_ref))
+                        .and_then(|_| resolve_texture_view(acc.shared(), host, req.task_id, texture_ref))
                         .and_then(|view| view.swizzle)
                         .filter(|plan| !pixel_format::swizzle_is_identity(plan));
                     (texture_resource, view_swizzle)
@@ -11419,7 +11587,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 texture_ref,
                                 sampled_base_level_gva(
                                     texture_resource.as_deref(),
-                                    state.page_shift,
+                                    acc.shared().page_shift,
                                 ),
                             )
                         })
@@ -11458,17 +11626,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 // Colour 0 is the chain's own resident; a secondary is
                                 // named exactly as the pass that drew into it named it.
                                 let identity = if slot == 0 {
-                                    pass_inv::chain_identity(state, req)
+                                    pass_inv::chain_identity(acc.shared(), req)
                                 } else {
-                                    color.zip(format).and_then(|(color, format)| {
-                                        secondary_attachment_identity(
-                                            state,
-                                            host,
-                                            req.task_id,
-                                            color,
-                                            format,
-                                        )
-                                    })
+                                    match acc.exclusive() {
+                                        Some(state) => color.zip(format).and_then(|(color, format)| {
+                                            secondary_attachment_identity(
+                                                state,
+                                                host,
+                                                req.task_id,
+                                                color,
+                                                format,
+                                            )
+                                        }),
+                                        // TEMP (lab, DRAW_PAR): a secondary
+                                        // slot's alias is the drain's.
+                                        None => {
+                                            if let Some(log) = prep.as_deref_mut() {
+                                                log.bail = Some(Bail::SampledRail);
+                                            }
+                                            None
+                                        }
+                                    }
                                 }
                                 .ok_or({
                                     DrawError::DrawPreparation(
@@ -11547,7 +11725,31 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         }
                         let (lab_resolved, lab_plan_served) = if let Some(hit) = memoed {
                             (Some(hit), false)
+                        } else if acc.is_worker() {
+                            // TEMP (lab, DRAW_PAR): the worker's surface-plan
+                            // twin of the ladder below; any other rung bails.
+                            let Some(log) = prep.as_deref_mut() else {
+                                return Err(WORKER_ERR);
+                            };
+                            match draw_par::resolve_sampled_source_worker(
+                                acc.shared(),
+                                &*host,
+                                log,
+                                req.task_id,
+                                texture_ref,
+                                texture_resource.clone(),
+                                view_swizzle.is_none(),
+                            ) {
+                                Ok(served) => (Some(served), false),
+                                Err(bail) => {
+                                    log.bail = Some(bail);
+                                    return Err(WORKER_ERR);
+                                }
+                            }
                         } else {
+                        let Some(state) = acc.exclusive() else {
+                            return Err(WORKER_ERR);
+                        };
                         // TEMP (lab, REIMS_VGPU_LAB_PAR_PREFETCH): a stream plan
                         // validated here serves the bind (on) or is compared with
                         // the serial ladder (shadow); otherwise the ladder runs.
@@ -11595,6 +11797,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         );
                         lab_resolve_repeat(req.task_id, texture_ref, lab_resolved.as_ref());
                         let Some(loaded) = lab_resolved else {
+                            let Some(state) = acc.exclusive() else {
+                                // TEMP (lab, DRAW_PAR): the detail is the
+                                // drain's; the record goes back to it.
+                                if let Some(log) = prep.as_deref_mut() {
+                                    log.bail = Some(Bail::SampledRail);
+                                }
+                                return Err(WORKER_ERR);
+                            };
                             let detail = sample_miss_detail(state, host, req.task_id, texture_ref);
                             return Err(DrawError::DrawPreparation(
                                 DrawPreparationDecline::TextureResolveMissing {
@@ -11641,15 +11851,24 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 // TEMP (lab, PASS_STAGE): with the runs rail.
                                 SampledSourceRequest::Staged(..) => "guest_runs",
                             };
-                            note_sampled_ref_backing(
-                                state,
-                                req.task_id,
-                                texture_ref,
-                                rw,
-                                rh,
-                                mid,
-                                route,
-                            );
+                            // TEMP (lab, DRAW_PAR): a worker defers the two
+                            // censuses of this bind to the commit.
+                            match acc.exclusive() {
+                                Some(state) => note_sampled_ref_backing(
+                                    state,
+                                    req.task_id,
+                                    texture_ref,
+                                    rw,
+                                    rh,
+                                    mid,
+                                    route,
+                                ),
+                                None => {
+                                    if let Some(log) = prep.as_deref_mut() {
+                                        log.note_sampled(texture_ref, rw, rh, mid, route);
+                                    }
+                                }
+                            }
                             // Which draw consumed a full-screen source, so a
                             // record of what a source held can be joined to the
                             // pass that read it. The plane ring names the refs a
@@ -11684,13 +11903,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             // And what it held: a whole-surface bind reads the
                             // mapping's own geometry, which is the shape every
                             // full-screen compositor layer on this rail takes.
-                            crate::runtime::scanout::note_sampled_surface_field(
-                                state,
-                                &*host,
-                                mid,
-                                texture_ref,
-                                route,
-                            );
+                            if let Some(state) = acc.exclusive() {
+                                crate::runtime::scanout::note_sampled_surface_field(
+                                    state,
+                                    &*host,
+                                    mid,
+                                    texture_ref,
+                                    route,
+                                );
+                            }
                         }
                         (rw, rh, src)
                     }
@@ -11904,6 +12125,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             },
                         ));
                     }
+                    let Some(state) = acc.exclusive() else {
+                        // TEMP (lab, DRAW_PAR): the six-face reload is the drain's.
+                        if let Some(log) = prep.as_deref_mut() {
+                            log.bail = Some(Bail::SampledRail);
+                        }
+                        return Err(WORKER_ERR);
+                    };
                     match texture_view::load_cube_faces(
                         state,
                         host,
@@ -11973,7 +12201,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 });
                 if let Some(levels) = images.last().and_then(|img| {
                     sampled_mip_chain(
-                        state,
+                        acc.shared(),
                         req.task_id,
                         texture_ref,
                         texture_resource.as_deref(),
@@ -12162,7 +12390,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 if sampler_binds.insert(smp_bind) {
                     let mut sampler = if sampler_ref != 0 {
                         sampler_origin.insert(smp_bind, b'g');
-                        load_vulkan_sampler(state, host, req.task_id, sampler_ref, smp_bind)
+                        load_vulkan_sampler(acc.shared(), host, req.task_id, sampler_ref, smp_bind)
                             .map_err(DrawError::DrawPreparation)?
                     } else {
                         sampler_origin.insert(smp_bind, b'd');
@@ -12211,7 +12439,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             "sampler_bind_collided binding={smp_bind} index={index} \
                              stage={} separate_sampled={separate_sampled} \
                              (a second sampler resolved to a binding this draw had \
-                             already provisioned; its state is dropped and the \
+                             already provisioned; its acc.shared() is dropped and the \
                              other stage's is what samples)",
                             if frag_stage { "fragment" } else { "vertex" }
                         ));
@@ -12249,10 +12477,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 for reflected in variant.samplers.iter() {
                     if sampler_binds.insert(reflected.binding) {
                         let binding = reflected.binding;
-                        if let Some(state) = reflected.static_state {
+                        if let Some(static_state) = reflected.static_state {
                             sampler_origin.insert(binding, b'c');
                             samplers.push(
-                                reflected_static_sampler_resource(stage, binding, state)
+                                reflected_static_sampler_resource(stage, binding, static_state)
                                     .map_err(DrawError::DrawPreparation)?,
                             );
                         } else {
@@ -12301,9 +12529,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let span_backing = crate::runtime::chain_phase::CostSpan::new("seedx_backing_us");
         // TEMP (lab, PASS_INVARIANTS): records 2+ reuse draw 0's backing and
         // store identity (guarded; the serial resolution is the fallback).
-        let mapper_ref_texture_guest_backing = pass_inv::guest_backing(state, host, req);
+        let mapper_ref_texture_guest_backing = match acc.exclusive() {
+            Some(state) => pass_inv::guest_backing(state, host, req),
+            // TEMP (lab, DRAW_PAR): reuse or bail, as `gva_alloc_gen` above.
+            None => match pass_inv::reusable_guest_backing(acc.shared(), req) {
+                Some(backing) => backing,
+                None => worker_bail!(Bail::PassInvariants),
+            },
+        };
         let mapper_ref_texture_resident_target =
-            pass_inv::store_identity(state, req, writeback_guest);
+            pass_inv::store_identity(acc.shared(), req, writeback_guest);
         drop(span_backing);
         // TEMP (lab, PASS_INVARIANTS): draw 0's commit records the pass
         // invariants once, for the exec chain loop to harvest into the
@@ -12314,13 +12549,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // read, never a pre-revalidation one paired with a retired alias.
         if pass_inv_mode() && req.pass_invariants.is_none() {
             req.pass_invariants = Some(pass_inv::record_from_commit(
-                state,
+                acc.shared(),
                 req,
                 mapper_ref_texture_guest_backing.clone(),
             ));
             crate::runtime::drain::note_store_route("pass_inv_computed_once");
         }
-        if req.chain_from_resident && pass_inv::chain_identity(state, req).is_some() {
+        if req.chain_from_resident && pass_inv::chain_identity(acc.shared(), req).is_some() {
             // The serialized chain names the resident it intends to load;
             // existence and readiness are engine state and are validated
             // atomically with target acquisition by `execute_draw_request`.
@@ -12332,8 +12567,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // engine still held what the render Store published into its guest
         // pages. Honour that here, or put the seed back.
         let span_gva = crate::runtime::chain_phase::CostSpan::new("seedx_gva_us");
-        let mut gva_load_identity =
-            honour_gva_load_elision(state, host, req, &mut chain_load_from_target);
+        let mut gva_load_identity = match acc.exclusive() {
+            Some(state) => honour_gva_load_elision(state, host, req, &mut chain_load_from_target),
+            // TEMP (lab, DRAW_PAR): a worker prepares only a record that loads
+            // from the chain's resident — every seed door below is the drain's.
+            None => {
+                if !chain_load_from_target {
+                    worker_bail!(Bail::NotDeferrable);
+                }
+                None
+            }
+        };
         drop(span_gva);
         let span_currency = crate::runtime::chain_phase::CostSpan::new("seedx_currency_us");
         // Mapper-ref-texture composite Load. A retained guest-allocation target is the
@@ -12425,10 +12669,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // them: the Store that publishes this pass stamps this, not a
             // generation read after the draws (see `GuestWriteObservation`).
             if let Some(mid) = req.colors.first().map(|c| c.mapping_id).filter(|m| *m != 0) {
-                crate::runtime::mapper::note_pass_guest_observation(state, host, mid);
+                if let Some(state) = acc.exclusive() {
+                    crate::runtime::mapper::note_pass_guest_observation(state, host, mid);
+                }
             }
             if let Some((identity, mapping_epoch)) =
-                mapper_ref_texture_load_currency_query(state, req)
+                mapper_ref_texture_load_currency_query(acc.shared(), req)
             {
                 // Both arms counted, into the same one-second window as
                 // `drain_duty`. An elision count alone cannot tell "the seed was
@@ -12436,7 +12682,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // ratio of the two is a within-boot number — the only kind that
                 // survives the 1.8x `us_per_draw` drift between boots on this rig.
                 let backing = req.colors.first().and_then(|c0| {
-                    state
+                    acc.shared()
                         .constructed_object(req.task_id, c0.texture_ref)
                         .filter(|resource| {
                             resource_type_owns_surface_resident(resource.entry.object_type)
@@ -12454,7 +12700,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         let epoch_current =
                             mapper_ref_texture_resident_is_current(mapping_epoch, resident_epoch);
                         let guest_wrote =
-                            mapper_ref_texture_guest_wrote_since_store(state, host, mapping_id);
+                            mapper_ref_texture_guest_wrote_since_store(acc.shared(), host, mapping_id);
                         // The resident is the surface apart from what the guest
                         // CPU painted since: lay that over it and the LOAD needs
                         // no seed, instead of paying the debt back into the pages
@@ -12463,22 +12709,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             crate::runtime::chain_phase::CostSpan::new("seedx_reconcile_us");
                         let reconciled = epoch_current
                             && guest_wrote
-                            && reconcile_guest_writes_for_load(
-                                state, host, mapping_id, w, h, &identity,
-                            );
+                            && match acc.exclusive() {
+                                Some(state) => reconcile_guest_writes_for_load(
+                                    state, host, mapping_id, w, h, &identity,
+                                ),
+                                None => false,
+                            };
                         drop(span_rec);
                         // TEMP lab diagnostic: why the resident's epoch is behind.
                         if !epoch_current && guest_wrote {
                             use std::sync::atomic::{AtomicU32, Ordering};
                             static SEEN: AtomicU32 = AtomicU32::new(0);
                             if SEEN.fetch_add(1, Ordering::Relaxed) < 40 {
-                                let m = state.mappings.get(&mapping_id);
+                                let m = acc.shared().mappings.get(&mapping_id);
                                 crate::observe::off(format!(
                                     "seedq_stale_diag mid={mapping_id} {w}x{h} map_epoch={:?}                                      res_epoch={:?} presented={} debt={} identity={:?}",
                                     mapping_epoch,
                                     resident_epoch,
                                     m.is_some_and(|m| m.scanout_presented),
-                                    state.pending_writebacks.get(mapping_id).is_some(),
+                                    acc.shared().pending_writebacks.get(mapping_id).is_some(),
                                     identity,
                                 ));
                             }
@@ -12637,13 +12886,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     let native_seed = (c0.mapping_id == 0
                         && gva_store_needs_native_texels(c0.format))
                     .then(|| {
-                        try_gva_target_guest_seed(
-                            state,
-                            host,
-                            req.task_id,
-                            c0,
-                            gva_resident_format(c0.format),
-                        )
+                        acc.exclusive().and_then(|state| {
+                            try_gva_target_guest_seed(
+                                state,
+                                host,
+                                req.task_id,
+                                c0,
+                                gva_resident_format(c0.format),
+                            )
+                        })
                     })
                     .flatten();
                     if let Some(seed) = native_seed {
@@ -12703,25 +12954,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // own the packet's final guest writeback. The Store-only
                         // identity below is deliberately narrower and would
                         // misclassify that record as a pooled RGBA target here.
-                        let target_format = pass_inv::render_identity(state, req)
+                        let target_format = pass_inv::render_identity(acc.shared(), req)
                             .as_ref()
                             .map(|identity| identity.resident_format())
                             .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
-                        match resolve_mapper_ref_texture_load_seed(
-                            state,
-                            host,
-                            c0.mapping_id,
-                            w,
-                            h,
-                            target_format,
-                        ) {
+                        match acc.exclusive().and_then(|state| {
+                            resolve_mapper_ref_texture_load_seed(
+                                state,
+                                host,
+                                c0.mapping_id,
+                                w,
+                                h,
+                                target_format,
+                            )
+                        }) {
                             Some(MapperRefTextureLoadSeed::Host(bytes, order)) => {
-                                lab_seed_trace(state, "mapping", "host", c0.mapping_id, w, h, declared);
+                                lab_seed_trace(acc.shared(), "mapping", "host", c0.mapping_id, w, h, declared);
                                 target_rgba8 = Some(bytes);
                                 seed_order = order;
                             }
                             Some(MapperRefTextureLoadSeed::Guest(seed)) => {
-                                lab_seed_trace(state, "mapping", "guest", c0.mapping_id, w, h, declared);
+                                lab_seed_trace(acc.shared(), "mapping", "guest", c0.mapping_id, w, h, declared);
                                 target_guest_seed = Some(seed)
                             }
                             None => {}
@@ -12766,12 +13019,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         && req.scissors.first().is_some_and(|s| !s.covers(w, h))
                         && crate::runtime::writeback_debt::lab_private_gpu()
                         && crate::runtime::writeback_debt::lab_target_storage_mode(
-                            state,
+                            acc.shared(),
                             req.task_id,
                             c0.texture_ref,
                         ) == Some(2)
                     {
-                        match gva_resident_if_current(
+                        match acc.exclusive().map(|state| gva_resident_if_current(
                             state,
                             host,
                             req.task_id,
@@ -12783,8 +13036,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 height: c0.height,
                                 format: c0.format,
                             },
-                        ) {
-                            Ok(identity) => {
+                        )) {
+                            Some(Ok(identity)) => {
                                 chain_load_from_target = true;
                                 if gva_load_identity.is_none() {
                                     gva_load_identity = Some(identity);
@@ -12796,7 +13049,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                     u64::from(w) * u64::from(h),
                                 );
                             }
-                            Err(_) => {
+                            _ => {
                                 crate::runtime::drain::note_store_route(
                                     "lab_preserve_gva_resident_refused",
                                 );
@@ -12811,7 +13064,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         && (c0.mapping_id != 0 || c0.target_gva != 0)
                         && req.scissors.first().is_some_and(|s| !s.covers(w, h))
                     {
-                        let preserve_format = pass_inv::render_identity(state, req)
+                        let preserve_format = pass_inv::render_identity(acc.shared(), req)
                             .as_ref()
                             .map(|identity| identity.resident_format())
                             .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
@@ -12824,12 +13077,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 "lab_preserve_mapping"
                             } else {
                                 match crate::runtime::writeback_debt::lab_target_storage_mode(
-                                    state,
+                                    acc.shared(),
                                     req.task_id,
                                     c0.texture_ref,
                                 ) {
                                     Some(2)
-                                        if state
+                                        if acc.shared()
                                             .gva_store_witness
                                             .stored_ref(req.task_id, c0.texture_ref) =>
                                     {
@@ -12854,13 +13107,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 u64::from(w) * u64::from(h),
                             );
                         }
-                        match try_preserve_seed_from_guest_window(
-                            state,
-                            host,
-                            req.task_id,
-                            c0,
-                            preserve_format,
-                        ) {
+                        match acc.exclusive().and_then(|state| {
+                            try_preserve_seed_from_guest_window(
+                                state,
+                                host,
+                                req.task_id,
+                                c0,
+                                preserve_format,
+                            )
+                        }) {
                             Some(MapperRefTextureLoadSeed::Host(bytes, order)) => {
                                 target_rgba8 = Some(bytes);
                                 seed_order = order;
@@ -12871,7 +13126,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 );
                             }
                             Some(MapperRefTextureLoadSeed::Guest(seed)) => {
-                                lab_seed_trace(state, "preserve", "guest", c0.mapping_id, w, h, declared);
+                                lab_seed_trace(acc.shared(), "preserve", "guest", c0.mapping_id, w, h, declared);
                                 target_guest_seed = Some(seed);
                                 crate::runtime::drain::note_store_route("preserve_seed_n");
                                 crate::runtime::drain::note_store_route_n(
@@ -13186,10 +13441,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     reason: IndexLoadReason::TypeUnsupported,
                 })
             })?;
-            let content = early_index
-                .take()
-                .unwrap_or_else(|| load_index_content_reason(state, host, req.task_id, idx))
-                .map_err(|reason| {
+            let content = match early_index.take() {
+                Some(content) => content,
+                None => match acc.exclusive() {
+                    Some(state) => load_index_content_reason(state, host, req.task_id, idx),
+                    None => Err(IndexLoadReason::ReadFail),
+                },
+            }
+            .map_err(|reason| {
                     DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad { reason })
                 })?;
             resources.indexed = Some(crate::backend::vulkan::engine::IndexedDrawResource {
@@ -13265,7 +13524,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // caller derive a second one. See `M2vDrawSpan::ResidentSurfaceStore`.
         let mut gva_resident_store: Option<crate::backend::vulkan::engine::TargetIdentity> = None;
         if req.chain_from_resident || (store_is_store && !writeback_guest) {
-            if let Some(identity) = pass_inv::chain_identity(state, req) {
+            if let Some(identity) = pass_inv::chain_identity(acc.shared(), req) {
                 resources.target_identity = Some(identity);
                 if store_is_store && !writeback_guest {
                     resources.skip_readback = true;
@@ -13387,7 +13646,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // resolved from. A GVA or render-chain namespace may legitimately own
         // this draw's primary attachment instead, in which case handing it the
         // surface allocation would bind two unrelated resources together.
-        if resources.target_identity == pass_inv::render_identity(state, req) {
+        if resources.target_identity == pass_inv::render_identity(acc.shared(), req) {
             resources.guest_target_memory = mapper_ref_texture_guest_backing;
             resources.load_guest_target_backing = resources.guest_target_memory.is_some()
                 && req.colors.first().is_some_and(|color| {
@@ -13516,7 +13775,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut depth_test: Option<DepthTest> = None;
         if req.depth_stencil_ref != 0 {
             let ds = match load_depth_stencil_descriptor(
-                state,
+                acc.shared(),
                 host,
                 req.task_id,
                 req.depth_stencil_ref,
@@ -13988,16 +14247,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // on a resident primary; an `Ok(empty)` is the guest's own single-RT
         // draw and is byte-identical to the classic path.
         if let Some(primary_id) = resources.target_identity.clone() {
-            let secs = build_secondary_targets(
-                state,
-                host,
-                req.task_id,
-                &req.colors,
-                pd,
-                &primary_id,
-                w,
-                h,
-            );
+            let secs = match acc.exclusive() {
+                Some(state) => build_secondary_targets(
+                    state,
+                    host,
+                    req.task_id,
+                    &req.colors,
+                    pd,
+                    &primary_id,
+                    w,
+                    h,
+                ),
+                // TEMP (lab, DRAW_PAR): a worker only ever holds one colour.
+                None => Ok(Vec::new()),
+            };
             // Second half of the census: `built` vs `refused` separates "the
             // guest issued an MRT draw and we render every attachment" from
             // "it issued one and an attachment could not be built", which the
@@ -14053,6 +14316,37 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // has already run, whose effects are observations, caches and debt
         // payment, correct on their own.)
         let recorder_on = crate::backend::vulkan::engine::deferred_draws_enabled();
+        // TEMP (lab, DRAW_PAR): a worker ends here. The request is finished;
+        // what remains — the previous deferred draw's failure, the submit — is
+        // the drain's, at the commit, in record order. Only the deferrable
+        // chain intermediate is prepared: everything else runs synchronously
+        // on the drain and reads the engine's answer.
+        if acc.is_worker() {
+            let deferrable = recorder_on
+                && resident_render_chain
+                && req.visibility.is_none()
+                && resources.occlusion_query.is_none()
+                && resources.skip_readback
+                && !resources.record_guest_store;
+            let Some(chain_identity) = resources.target_identity.clone().filter(|_| deferrable)
+            else {
+                worker_bail!(Bail::NotDeferrable);
+            };
+            let log = prep_log!();
+            log.done = Some(draw_par::PreparedRequest {
+                resources: crate::backend::vulkan::engine::recorder::AssertSend(resources),
+                meta: crate::backend::vulkan::engine::DeferredMeta {
+                    pipeline_ref: req.pipeline_ref,
+                    task_id: req.task_id,
+                    width: w,
+                    height: h,
+                    vertex_count,
+                },
+                chain_identity,
+            });
+            req.visibility_samples = None;
+            return Ok(M2vDrawSpan::ResidentChain);
+        }
         if recorder_on || crate::backend::vulkan::engine::deferred_draws_pending() {
             if let Some(failure) = crate::backend::vulkan::engine::take_deferred_failure() {
                 crate::backend::vulkan::engine::report_deferred_failure(&failure);
@@ -14074,7 +14368,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // the request sits in the FIFO a later chunk's scope races.
             pass_stage::arm_seed_stage(&mut resources);
             crate::backend::vulkan::engine::submit_deferred_draw(
-                state,
+                acc.shared(),
                 resources,
                 crate::backend::vulkan::engine::DeferredMeta {
                     pipeline_ref: req.pipeline_ref,
@@ -14109,7 +14403,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // chain arm above.
                 pass_stage::arm_seed_stage(&mut resources);
                 crate::backend::vulkan::engine::submit_deferred_draw(
-                    state,
+                    acc.shared(),
                     resources,
                     crate::backend::vulkan::engine::DeferredMeta {
                         pipeline_ref: req.pipeline_ref,
@@ -14158,7 +14452,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     resources.record_guest_store = false;
                     pass_stage::arm_seed_stage(&mut resources);
                     crate::backend::vulkan::engine::submit_deferred_draw(
-                        state,
+                        acc.shared(),
                         resources,
                         crate::backend::vulkan::engine::DeferredMeta {
                             pipeline_ref: req.pipeline_ref,
@@ -14183,7 +14477,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        let out = crate::backend::vulkan::engine::execute_draw_request(state, &resources)?;
+        let out = crate::backend::vulkan::engine::execute_draw_request(acc.shared(), &resources)?;
         // Carried back on the request so `runtime::exec` can sum the chain's
         // draws into the guest's buffer. The engine reports per draw because a
         // Metal pass whose counter spans several draws is several Vulkan

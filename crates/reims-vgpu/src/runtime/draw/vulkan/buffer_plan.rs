@@ -724,6 +724,78 @@ fn commit_buffer_plan(
     extent_cap: Option<u64>,
     apply: bool,
 ) -> Result<Option<crate::backend::vulkan::engine::BufferContent>, BufferInvalid> {
+    let (content, hold) =
+        match plan_answer(state, plan, task_id, buffer_ref, resource, offset, extent_cap, apply)? {
+            Some(answer) => answer,
+            None => return Ok(None),
+        };
+    if apply {
+        if let Some(hold) = hold {
+            hold.land(state);
+        }
+    }
+    Ok(Some(content))
+}
+
+/// TEMP (lab, DRAW_PAR): a worker's view of [`commit_buffer_plan`] — the
+/// validated answer without landing anything, for a request assembled off the
+/// drain; the drain's [`commit_prepared_buffer`] validates again and lands.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn predict_buffer_plan(
+    state: &DeviceState,
+    plan: &BufferContentPlan,
+    task_id: u32,
+    buffer_ref: u32,
+    resource: Option<&crate::model::TaskResource>,
+    offset: u64,
+    extent_cap: Option<u64>,
+) -> Result<Option<crate::backend::vulkan::engine::BufferContent>, BufferInvalid> {
+    Ok(plan_answer(state, plan, task_id, buffer_ref, resource, offset, extent_cap, false)?
+        .map(|(content, _)| content))
+}
+
+/// TEMP (lab, DRAW_PAR): the drain's commit of a plan a worker served a
+/// prepared draw from (mode-independent: the draw is committed, so the plan is
+/// applied).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn commit_prepared_buffer(
+    state: &mut DeviceState,
+    plan: &BufferContentPlan,
+    task_id: u32,
+    buffer_ref: u32,
+    resource: Option<&crate::model::TaskResource>,
+    offset: u64,
+    extent_cap: Option<u64>,
+) -> Result<Option<crate::backend::vulkan::engine::BufferContent>, BufferInvalid> {
+    commit_buffer_plan(state, plan, task_id, buffer_ref, resource, offset, extent_cap, true)
+}
+
+/// TEMP (lab, DRAW_PAR): whether a bind's window sits below the zero-copy
+/// floor — the population whose serial answer is the CPU read (see
+/// `stage_or_bail`).
+pub(super) fn below_floor(size: u64, offset: u64) -> bool {
+    offset < size && size - offset < ZERO_COPY_BUFFER_MIN_BYTES
+}
+
+/// The validated answer of one plan at one bind, and the hold a `Walked` rail
+/// lands when it is applied. Reads only; `note` gates the census routes.
+#[allow(clippy::too_many_arguments)]
+fn plan_answer<'p>(
+    state: &DeviceState,
+    plan: &'p BufferContentPlan,
+    task_id: u32,
+    buffer_ref: u32,
+    resource: Option<&crate::model::TaskResource>,
+    offset: u64,
+    extent_cap: Option<u64>,
+    apply: bool,
+) -> Result<
+    Option<(
+        crate::backend::vulkan::engine::BufferContent,
+        Option<BoundBufferHold<'p>>,
+    )>,
+    BufferInvalid,
+> {
     if plan.task_id != task_id || plan.buffer_ref != buffer_ref {
         return Err(BufferInvalid::Key);
     }
@@ -774,7 +846,7 @@ fn commit_buffer_plan(
             let span = extent_cap.map_or(full, |cap| full.min(cap));
             let bound = slice_packed_buffer(packed, offset, span).ok_or(BufferInvalid::Packed)?;
             note("zc_buffer_held");
-            Ok(Some(bound_buffer_content(&bound)))
+            Ok(Some((bound_buffer_content(&bound), None)))
         }
         BufferRail::Whole { runs } => {
             // The rail above, repeated: packed would answer if it appeared.
@@ -794,7 +866,7 @@ fn commit_buffer_plan(
                 return Ok(None);
             };
             note("zc_buffer_whole_held");
-            Ok(Some(bound_buffer_content(&bound)))
+            Ok(Some((bound_buffer_content(&bound), None)))
         }
         BufferRail::Held { bound } => {
             if packed_serves(state, task_id, buffer_ref, plan.gva, plan.size, offset)
@@ -816,7 +888,7 @@ fn commit_buffer_plan(
                 return Err(BufferInvalid::Held);
             }
             note("zc_buffer_held");
-            Ok(Some(bound_buffer_content(bound)))
+            Ok(Some((bound_buffer_content(bound), None)))
         }
         BufferRail::Walked { bound, narrowed } => {
             if packed_serves(state, task_id, buffer_ref, plan.gva, plan.size, offset)
@@ -837,7 +909,7 @@ fn commit_buffer_plan(
                     return Err(BufferInvalid::Held);
                 }
                 note("zc_buffer_held");
-                return Ok(Some(bound_buffer_content(bound)));
+                return Ok(Some((bound_buffer_content(bound), None)));
             }
             if let Some(saved) = narrowed {
                 note("zc_buffer_extent_narrowed");
@@ -853,17 +925,14 @@ fn commit_buffer_plan(
             } else {
                 "zc_buffer_gathered"
             });
-            if apply {
-                BoundBufferHold {
-                    task: task_id,
-                    buffer_ref,
-                    offset,
-                    cap: extent_cap,
-                    bound,
-                }
-                .land(state);
-            }
-            Ok(Some(bound_buffer_content(bound)))
+            let hold = BoundBufferHold {
+                task: task_id,
+                buffer_ref,
+                offset,
+                cap: extent_cap,
+                bound,
+            };
+            Ok(Some((bound_buffer_content(bound), Some(hold))))
         }
         // TEMP (lab, PASS_STAGE): the staged window serves the bind it was
         // read for, provided nothing above it would answer now and no device
@@ -889,8 +958,9 @@ fn commit_buffer_plan(
                 return Err(BufferInvalid::UpperRung);
             }
             note("cpu_buffer_staged");
-            Ok(Some(crate::backend::vulkan::engine::BufferContent::Staged(
-                staged.clone(),
+            Ok(Some((
+                crate::backend::vulkan::engine::BufferContent::Staged(staged.clone()),
+                None,
             )))
         }
     }

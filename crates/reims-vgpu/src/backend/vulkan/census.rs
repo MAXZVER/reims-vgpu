@@ -411,6 +411,9 @@ pub(crate) fn emit_engine_lock(win_ms: u64) {
     if let Some(line) = crate::backend::vulkan::engine::take_recorder_census(win_ms) {
         crate::observe::off(line);
     }
+    if let Some(line) = crate::backend::vulkan::engine::take_assembler_census(win_ms) {
+        crate::observe::off(line);
+    }
 }
 /// How much of the workload this rail's two gather caches were asked to hold.
 ///

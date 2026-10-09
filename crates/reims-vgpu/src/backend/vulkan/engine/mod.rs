@@ -7,6 +7,9 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+/// TEMP (lab, DRAW_ASM, 2026-10-09): assembler worker threads that build a
+/// `DrawRequest` off the drain, feeding the recorder FIFO in order.
+pub(crate) mod assembler;
 mod buffer_slab;
 mod caches;
 mod compute_execution;
@@ -307,6 +310,10 @@ impl DeviceObjectCaches {
         // TEMP (lab, S5a): the recorder ends with the device it recorded for. A
         // failure it still held belongs to this device: reported here, so the
         // next device's first draw does not find it.
+        // TEMP (lab, DRAW_ASM): the assemblers first. They run their queue out,
+        // so a recorder job still posted finds its slot filled when the stop
+        // below waits for it.
+        assembler::shutdown();
         match recorder::DRAW.stop() {
             Some(recorder::JobResult::Failed(failure)) => {
                 recorder::DRAW.note_deferred_error();
@@ -1057,6 +1064,11 @@ pub(crate) fn take_engine_lock_census(win_ms: u64) -> Option<String> {
 /// TEMP (lab, S5a): the recorder's window, beside `engine_lock`.
 pub(crate) fn take_recorder_census(win_ms: u64) -> Option<String> {
     recorder::DRAW.take_window(win_ms)
+}
+
+/// TEMP (lab, DRAW_ASM): the assemblers' window, beside the recorder's.
+pub(crate) fn take_assembler_census(win_ms: u64) -> Option<String> {
+    assembler::take_window(win_ms)
 }
 
 /// A held engine lock that reports how long it was held.

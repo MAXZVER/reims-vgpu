@@ -313,6 +313,23 @@ pub(super) fn guest_backing<M: HostMemory + HostOps>(
     super::mapper_ref_texture_guest_target_backing(state, host, req)
 }
 
+/// TEMP (lab, DRAW_PAR): the reusable half of [`gva_alloc_gen`] for a worker,
+/// which cannot recompute — `None` sends the record to the serial path.
+pub(super) fn reusable_gva_alloc_gen(state: &DeviceState, req: &DrawEncodeRequest) -> Option<u64> {
+    let inv = req.pass_invariants.as_ref()?;
+    inv.reusable(state, req).then_some(inv.gva_alloc_gen)
+}
+
+/// TEMP (lab, DRAW_PAR): the reusable half of [`guest_backing`] for a worker.
+/// The outer `None` is "not reusable"; the inner is the pass's own answer.
+pub(super) fn reusable_guest_backing(
+    state: &DeviceState,
+    req: &DrawEncodeRequest,
+) -> Option<Option<GuestTargetMemory>> {
+    let inv = req.pass_invariants.as_ref()?;
+    inv.reusable(state, req).then(|| inv.guest_backing.clone())
+}
+
 /// The pass's [`super::gva_alloc_generation`], answered at the top of every
 /// record. This is the one site every record passes through, so it is where
 /// the reuse census counts.

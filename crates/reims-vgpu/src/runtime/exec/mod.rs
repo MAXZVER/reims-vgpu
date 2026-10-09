@@ -5740,11 +5740,61 @@ fn finish_stream<M: HostMemory + HostOps>(
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
         fin.enter(crate::runtime::drain::FinishPhase::Prelude);
+        // TEMP (lab, DRAW_PAR): records 2+ of a resident chain are prepared
+        // whole on the pool, a chunk at a time, and offered to their encode;
+        // see `runtime::draw::vulkan::draw_par`. Draw 0 stays serial (it
+        // records the pass invariants the later records reuse), so the first
+        // chunk opens at record 1.
+        #[cfg(feature = "backend-vulkan")]
+        let draw_par_active = crate::backend::selected().rail() == crate::backend::Rail::Vulkan
+            && crate::runtime::draw::vulkan::draw_par::draw_par_on()
+            && draw_list.len() > crate::runtime::draw::vulkan::draw_par::MIN_DRAWS;
+        #[cfg(feature = "backend-vulkan")]
+        let draw_par_chunk = crate::runtime::draw::vulkan::draw_par::chunk();
+        #[cfg(feature = "backend-vulkan")]
+        let mut draw_par_slots: Vec<Option<crate::runtime::draw::vulkan::draw_par::PreparedDraw>> =
+            Vec::new();
+        #[cfg(feature = "backend-vulkan")]
+        let mut draw_par_base = 0usize;
+        #[cfg(feature = "backend-vulkan")]
+        let mut draw_par_next = 1usize;
         for (di, pd) in draw_list.iter().enumerate() {
             // TEMP (lab, `REIMS_VGPU_LAB_PREEMPT_RECORD=on`): the control rings,
             // between this stream's records (rate-limited inside).
             if di > 0 {
                 crate::runtime::drain::lab_preempt_between_records(state, host);
+            }
+            // TEMP (lab, DRAW_PAR): at the top of a chunk, prepare the records
+            // of `[di, di + K)` on the pool, against the template they retarget
+            // from, exactly as the loop below builds them. Only while the chain
+            // is resident: a chain that broke has nothing a worker can prepare.
+            #[cfg(feature = "backend-vulkan")]
+            if draw_par_active && di >= 1 && di >= draw_par_next && resident_chain {
+                draw_par_slots.clear();
+                draw_par_base = di;
+                let end = (di + draw_par_chunk).min(draw_list.len());
+                draw_par_next = end;
+                if end - di >= crate::runtime::draw::vulkan::draw_par::MIN_DRAWS {
+                    if let Some(template) = attachment_template.as_ref() {
+                        let reqs: Vec<(draw::DrawEncodeRequest, bool)> = (di..end)
+                            .map(|j| {
+                                let pd = draw_list[j];
+                                let mut r = retarget_render_pass_draw(template, pd);
+                                fill_draw_binds_from_pending(&mut r, pd);
+                                (r.continues_render_pass, r.render_pass_continues) =
+                                    render_pass_chain_position(j, draw_list.len());
+                                for c in &mut r.colors {
+                                    c.load_action = MTL_LOAD_ACTION_LOAD;
+                                }
+                                r.chain_from_resident = true;
+                                let (do_writeback, _) = multi_draw_store_plan(draw_list.len(), j);
+                                (r, do_writeback)
+                            })
+                            .collect();
+                        draw_par_slots =
+                            crate::runtime::draw::vulkan::draw_par::prepare_chunk(&*state, &reqs);
+                    }
+                }
             }
             // TEMP (lab, PASS_PREP): at the top of each record, plan the binds
             // of the chunk this record opens (a no-op inside one already
@@ -5823,6 +5873,21 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
                 let draw_started = std::time::Instant::now();
                 fin.enter(crate::runtime::drain::FinishPhase::Encode);
+                // TEMP (lab, DRAW_PAR): the prepared record, if the workers
+                // made one and the chain still holds, offered to this encode
+                // alone — the offer is cleared right after it, so a record
+                // that never reached the engine door cannot leave it for the
+                // next one.
+                #[cfg(feature = "backend-vulkan")]
+                if draw_par_active && di >= draw_par_base && di < draw_par_base + draw_par_slots.len() {
+                    if resident_chain && req.chain_from_resident {
+                        if let Some(prepared) = draw_par_slots[di - draw_par_base].take() {
+                            crate::runtime::draw::vulkan::draw_par::offer(prepared);
+                        }
+                    } else {
+                        draw_par_slots.clear();
+                    }
+                }
                 let encode = crate::backend::selected().encode_draw_chain(
                     state,
                     host,
@@ -5830,6 +5895,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                     do_writeback,
                     force_full_store,
                 );
+                #[cfg(feature = "backend-vulkan")]
+                if draw_par_active {
+                    crate::runtime::draw::vulkan::draw_par::clear_offer();
+                }
                 // TEMP (lab, PASS_INVARIANTS): draw 0's commit recorded the
                 // pass invariants; move them into the attachment template the
                 // records after it clone from (design 2026-10-03 §6 C3). A
