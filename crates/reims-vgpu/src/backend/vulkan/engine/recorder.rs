@@ -309,15 +309,18 @@ pub(crate) fn depth() -> u32 {
     if let Some(n) = crate::runtime::lab_live::value("RECORDER_DEPTH")
         .and_then(|v| v.trim().parse::<u32>().ok())
     {
-        return n.clamp(1, 64);
+        return n.clamp(1, 512);
     }
     // TEMP (lab, DRAW_PAR): a chunk's commits arrive at ~1 us a record against
     // the recorder's ~5.5; a queue of 8 made the drain wait on it (b120: Weather
     // 11.4 -> 10.8 us a draw at 32).
     #[cfg(not(test))]
     if crate::runtime::draw::vulkan::draw_par::draw_par_on() {
-        // 64 since b126 (light Weather scene, 65 -> 69 fps against 32).
-        return 64;
+        // 64 since b126 (light Weather scene, 65 -> 69 fps against 32); 256
+        // since b130: with the overlapped commit the drain fills 64 in a
+        // stream and waits on it (wait_below 8.9 % of the drain) while the
+        // recorder idles 55 % of the time between streams.
+        return 256;
     }
     static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *DEPTH.get_or_init(|| {
@@ -823,13 +826,56 @@ pub(crate) static DRAW: Handoff = Handoff::new("reims-vgpu-recorder");
 /// for them (see [`settle_unless_pending`]).
 static PENDING_TARGETS: Mutex<Vec<(super::types::TargetIdentity, u32)>> = Mutex::new(Vec::new());
 
+/// TEMP (lab, EPOCH_PREDICT): per identity with a job out, the content epoch
+/// the *last* job queued for it stamps - `None` when the last one is a draw
+/// (which clears the stamp when it readies the resident). Kept beside
+/// `PENDING_TARGETS` and under the same holds.
+static LAST_STAMP: Mutex<Vec<(super::types::TargetIdentity, Option<u32>)>> = Mutex::new(Vec::new());
+
+fn note_last(targets: &[super::types::TargetIdentity], stamp: Option<u32>) {
+    let mut last = LAST_STAMP.lock();
+    for t in targets {
+        match last.iter_mut().find(|(id, _)| id == t) {
+            Some((_, e)) => *e = stamp,
+            None => last.push((t.clone(), stamp)),
+        }
+    }
+}
+
+/// TEMP (lab, EPOCH_PREDICT): `Some(epoch)` when jobs are out for `identity`
+/// and the last of them is a content-epoch stamp: once the queue reaches it the
+/// registry answers `epoch` (the draws before it ready the resident and clear
+/// the stamp; the stamp then writes it), so a drain question about the epoch
+/// need not wait for the queue. A failed draw before it is reported as a
+/// deferred failure and abandons its chain, as it would after the wait.
+pub(crate) fn pending_last_stamp(identity: &super::types::TargetIdentity) -> Option<u32> {
+    if !PENDING_TARGETS.lock().iter().any(|(id, _)| id == identity) {
+        return None;
+    }
+    LAST_STAMP
+        .lock()
+        .iter()
+        .find(|(id, _)| id == identity)
+        .and_then(|(_, e)| *e)
+}
+
 /// The targets one deferred draw writes, held from its submit to the end of its
 /// job (run, failed or panicked - the drop is the release).
 pub(crate) struct PendingTargets(Vec<super::types::TargetIdentity>);
 
 impl PendingTargets {
     pub(crate) fn hold(targets: Vec<super::types::TargetIdentity>) -> Self {
+        Self::hold_as(targets, None)
+    }
+
+    /// TEMP (lab, EPOCH_PREDICT): the hold of a job that stamps `epoch`.
+    pub(crate) fn hold_stamp(target: super::types::TargetIdentity, epoch: u32) -> Self {
+        Self::hold_as(vec![target], Some(epoch))
+    }
+
+    fn hold_as(targets: Vec<super::types::TargetIdentity>, stamp: Option<u32>) -> Self {
         if !targets.is_empty() {
+            note_last(&targets, stamp);
             let mut held = PENDING_TARGETS.lock();
             for t in &targets {
                 match held.iter_mut().find(|(id, _)| id == t) {
@@ -853,6 +899,10 @@ impl Drop for PendingTargets {
                 held[i].1 -= 1;
                 if held[i].1 == 0 {
                     held.swap_remove(i);
+                    let mut last = LAST_STAMP.lock();
+                    if let Some(j) = last.iter().position(|(id, _)| id == t) {
+                        last.swap_remove(j);
+                    }
                 }
             }
         }

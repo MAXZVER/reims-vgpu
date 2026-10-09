@@ -3333,6 +3333,16 @@ pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
     // `REIMS_VGPU_LAB_READINESS_LOCKED=1` keeps the locked read.
     static LOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*LOCKED.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_READINESS_LOCKED").is_some()) {
+        // TEMP (lab, live `EPOCH_PREDICT=off`): the stamp the queue ends on
+        // for this resident, without waiting for it (b130: the wait here was
+        // 7.6 % of the drain - a stream's first record asking about the
+        // surface the previous stream's queued draws were still rendering).
+        if is_drain_thread() && crate::runtime::lab_live::on("EPOCH_PREDICT") != Some(false) {
+            if let Some(epoch) = recorder::pending_last_stamp(identity) {
+                crate::runtime::drain::note_store_route("lab_epoch_predicted");
+                return Some(epoch);
+            }
+        }
         recorder::settle_unless_pending(is_drain_thread(), recorder::JoinSite::Reader, identity);
         return pools::readiness::lookup(identity)?.content_epoch;
     }
@@ -3437,7 +3447,7 @@ pub fn stamp_resident_content_epoch(identity: &TargetIdentity, epoch: u32) -> bo
         && recorder::DRAW.in_flight()
     {
         let identity = identity.clone();
-        let writes = recorder::PendingTargets::hold(vec![identity.clone()]);
+        let writes = recorder::PendingTargets::hold_stamp(identity.clone(), epoch);
         crate::runtime::drain::note_store_route("lab_surface_stamp_deferred");
         recorder::DRAW.submit(Box::new(move || {
             let _writes = writes;
