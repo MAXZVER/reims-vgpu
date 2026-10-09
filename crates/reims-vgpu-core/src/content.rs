@@ -28,6 +28,7 @@
 use crate::access::{BackingId, ByteRange, ContentVersion};
 use crate::coverage::{Applied, Span, VersionCoverage};
 use crate::range_set::RangeSet;
+use crate::fasthash::FxHashMap;
 use std::collections::HashMap;
 
 /// Where a copy of a backing's content lives.
@@ -97,7 +98,7 @@ struct Entry {
 /// The content authority for one session.
 #[derive(Debug, Default)]
 pub struct ContentLedger {
-    backings: HashMap<BackingId, Entry>,
+    backings: FxHashMap<BackingId, Entry>,
     /// The next version any write may reserve. Monotone, and one counter for
     /// the whole ledger.
     ///

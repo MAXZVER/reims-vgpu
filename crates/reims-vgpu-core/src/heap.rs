@@ -74,6 +74,7 @@
 
 use crate::access::{BackingId, ByteRange, HeapId, ResourceKey};
 use crate::identity::ResourceId;
+use crate::fasthash::FxHashMap;
 use std::collections::HashMap;
 
 /// Why a heap operation did not happen.
@@ -271,8 +272,8 @@ struct Retiring {
 /// share a key.
 #[derive(Debug, Default)]
 pub struct Heaps {
-    heaps: HashMap<u64, Heap>,
-    retiring: HashMap<BackingId, Retiring>,
+    heaps: FxHashMap<u64, Heap>,
+    retiring: FxHashMap<BackingId, Retiring>,
     /// Where each placed resource's bytes are, across every heap and every
     /// retirement. The index behind [`Refusal::AlreadyPlaced`]; see the module
     /// doc for why the law is global and why this is not a scan.

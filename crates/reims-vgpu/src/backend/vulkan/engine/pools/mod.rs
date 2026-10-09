@@ -391,7 +391,7 @@ pub(crate) struct ResourcePools {
     /// first. Recency is diagnostic rather than a removal policy.
     compute_storage_order: VecDeque<ComputeStorageResidencyKey>,
     /// Identity-keyed resident target registry (workstream D).
-    registry: HashMap<TargetIdentity, ResidentTargetSlot>,
+    registry: reims_vgpu_core::fasthash::FxHashMap<TargetIdentity, ResidentTargetSlot>,
     /// Insertion order for [`Self::registry`], oldest *created* at the front. A
     /// `VecDeque` because the retired cap-eviction sweep popped and rotated at
     /// the front; pressure recovery and released-resource maintenance only walk

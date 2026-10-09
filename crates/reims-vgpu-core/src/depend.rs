@@ -30,6 +30,7 @@
 
 use crate::access::{requires_edge, AccessIntent, AccessKey, BackingId};
 use crate::identity::{ChannelId, IngressOrdinal};
+use crate::fasthash::FxHashMap;
 use std::collections::HashMap;
 
 /// One live access, and the transaction that declared it.
@@ -91,15 +92,15 @@ pub struct Census {
 #[derive(Debug, Default)]
 pub struct DependencyGraph {
     entries: Vec<Entry>,
-    by_backing: HashMap<BackingId, Vec<usize>>,
+    by_backing: FxHashMap<BackingId, Vec<usize>>,
     /// Keyed by the heap, not by `HeapId`: the membership generation says
     /// which set a record was written against and never which memory exists, so
     /// indexing on it would file one heap's accesses in several buckets that
     /// never meet. `AccessKey::may_alias` asks the same question.
-    by_heap: HashMap<u64, Vec<usize>>,
-    by_domain: HashMap<ChannelId, Vec<usize>>,
-    domain_only: HashMap<ChannelId, Vec<usize>>,
-    by_ordinal: HashMap<IngressOrdinal, Vec<usize>>,
+    by_heap: FxHashMap<u64, Vec<usize>>,
+    by_domain: FxHashMap<ChannelId, Vec<usize>>,
+    domain_only: FxHashMap<ChannelId, Vec<usize>>,
+    by_ordinal: FxHashMap<IngressOrdinal, Vec<usize>>,
     census: Census,
     /// Buffers `admit` refills instead of allocating.
     ///
@@ -122,7 +123,7 @@ pub struct DependencyGraph {
 
 /// Drop every index that maps to no live slot and renumber the rest, in
 /// place, so a rebuild makes no trip into the allocator.
-fn remap_buckets<K>(buckets: &mut HashMap<K, Vec<usize>>, remap: &[usize]) {
+fn remap_buckets<K, S>(buckets: &mut HashMap<K, Vec<usize>, S>, remap: &[usize]) {
     for bucket in buckets.values_mut() {
         bucket.retain_mut(|idx| {
             let new = remap[*idx];

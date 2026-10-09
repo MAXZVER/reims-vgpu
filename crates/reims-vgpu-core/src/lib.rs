@@ -33,6 +33,7 @@ pub mod depend;
 pub mod encoder;
 pub mod exec;
 pub mod executor;
+pub mod fasthash;
 pub mod heap;
 pub mod icb;
 pub mod identity;

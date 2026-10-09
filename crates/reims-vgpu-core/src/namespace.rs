@@ -70,6 +70,7 @@
 
 use crate::access::BackingId;
 use crate::identity::{ObjectListRef, ResourceId, SlotGeneration};
+use crate::fasthash::FxHashMap;
 use std::collections::HashMap;
 
 /// Why a namespace operation did not happen.
@@ -264,7 +265,7 @@ struct Slot {
 /// One session generation's object namespace.
 #[derive(Debug, Default)]
 pub struct Namespace {
-    slots: HashMap<ObjectListRef, Slot>,
+    slots: FxHashMap<ObjectListRef, Slot>,
     /// Backings detached from a slot by a delete or a replacement, still held
     /// by accepted work, counted *per backing* rather than per detachment.
     ///
@@ -273,7 +274,7 @@ pub struct Namespace {
     /// back at a backing it detached earlier. Claims kept per detachment would
     /// be several counters over one piece of storage, each reaching zero on its
     /// own and each handing the same storage back.
-    retiring: HashMap<BackingId, usize>,
+    retiring: FxHashMap<BackingId, usize>,
     /// Live names per backing, so "does another name still answer for this
     /// storage" is a lookup rather than a scan of every slot.
     ///
@@ -284,7 +285,7 @@ pub struct Namespace {
     /// with no live name holds no entry at all rather than an entry of zero —
     /// the count is the membership, and one spelled the other way would make
     /// "present" and "held" different questions.
-    live_by_backing: HashMap<BackingId, usize>,
+    live_by_backing: FxHashMap<BackingId, usize>,
     resolved: usize,
     refused: usize,
 }

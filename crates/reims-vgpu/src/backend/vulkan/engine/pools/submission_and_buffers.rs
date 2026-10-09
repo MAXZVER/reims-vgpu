@@ -306,7 +306,7 @@ impl ResourcePools {
             storage_image_live: Vec::new(),
             compute_storage_registry: HashMap::new(),
             compute_storage_order: VecDeque::new(),
-            registry: HashMap::new(),
+            registry: Default::default(),
             registry_order: VecDeque::new(),
             reclaimed_recent: VecDeque::new(),
             window_published: Vec::new(),
