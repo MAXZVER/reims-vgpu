@@ -3303,6 +3303,16 @@ pub fn resident_absent_after_reclaim(
 /// answer can be unknown — no slot, recycled image, a draw since the stamp —
 /// resolves to `None` and therefore to the seed.
 pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
+    // TEMP (lab, RETAIN_FAST): the readiness table carries the content epoch
+    // (`lab_verify_readiness` compares the two), so the read needs neither the
+    // engine lock nor a join - only the wait for a deferred draw or stamp job
+    // still out on this identity (b089: ~20-45 joins/s at this door).
+    // `REIMS_VGPU_LAB_READINESS_LOCKED=1` keeps the locked read.
+    static LOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*LOCKED.get_or_init(|| std::env::var_os("REIMS_VGPU_LAB_READINESS_LOCKED").is_some()) {
+        recorder::settle_unless_pending(is_drain_thread(), recorder::JoinSite::Reader, identity);
+        return pools::readiness::lookup(identity)?.content_epoch;
+    }
     let guard = lock_engine();
     lab_verify_readiness(&guard.pools, identity);
     guard.pools.registry_get(identity)?.content_epoch
