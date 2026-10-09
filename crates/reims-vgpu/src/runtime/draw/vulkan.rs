@@ -3396,6 +3396,12 @@ fn note_sampled_ref_backing(
     mapping_id: u32,
     route: &str,
 ) {
+    // A lab census line (one per change of backing): off with the route census,
+    // as in the working launcher's ROUTES=off mode (b101: ~0.9 % of Weather's
+    // drain, and ~200 lines a second in its log).
+    if !crate::runtime::drain::census::route_census_on() {
+        return;
+    }
     let now = (mapping_id, width, height);
     let prior = {
         let mut last = SAMPLED_REF_BACKING_LAST
@@ -10986,7 +10992,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             },
         );
         // Stage-in attributes from pipeline vertex block + bound buffer bytes.
-        let mut attrs: Vec<crate::backend::vulkan::engine::VertexAttributeResource> = Vec::new();
+        let mut attrs: Vec<crate::backend::vulkan::engine::VertexAttributeResource> =
+            Vec::with_capacity(pd.vertex_attributes.len());
         let mut stage_in_bufs: std::collections::BTreeSet<u32> = Default::default();
         let attrs_span =
             crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::Attrs);

@@ -3748,7 +3748,7 @@ pub fn note_store_route(route: &'static str) {
 /// draw makes dozens of calls (p062: 2.6-4 % of the drain in the heaviest
 /// frames), so a daily-use boot that nobody analyses can skip them. Latched;
 /// on in the lab and under test.
-fn route_census_on() -> bool {
+pub(crate) fn route_census_on() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
     static STATE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 on, 2 off
     match STATE.load(Relaxed) {
