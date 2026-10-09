@@ -1068,7 +1068,10 @@ pub(crate) fn take_recorder_census(win_ms: u64) -> Option<String> {
 struct EngineGuard {
     guard: parking_lot::MutexGuard<'static, EngineState>,
     site: EngineLockSite,
-    acquired: std::time::Instant,
+    /// `None` with the phase timers off (the working launcher's ROUTES=off):
+    /// the hold is a census figure, and the recorder takes this lock ~50k
+    /// times a second (b113), two clock reads each.
+    acquired: Option<std::time::Instant>,
 }
 
 impl std::ops::Deref for EngineGuard {
@@ -1086,7 +1089,9 @@ impl std::ops::DerefMut for EngineGuard {
 
 impl Drop for EngineGuard {
     fn drop(&mut self) {
-        ENGINE_LOCK.note_hold(self.site, self.acquired.elapsed().as_micros() as u64);
+        if let Some(acquired) = self.acquired {
+            ENGINE_LOCK.note_hold(self.site, acquired.elapsed().as_micros() as u64);
+        }
     }
 }
 
@@ -1114,7 +1119,7 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
     EngineGuard {
         guard,
         site,
-        acquired: std::time::Instant::now(),
+        acquired: crate::lab_clock::timers_on().then(std::time::Instant::now),
     }
 }
 
