@@ -28,7 +28,7 @@ pub(crate) use prefetch::prefetch_stream;
 mod pass_prep;
 #[cfg(test)]
 pub(crate) use pass_prep::test_mode;
-pub(crate) use pass_prep::{pass_prep_mode, DrawTables, PassPrep, PassPrepMode};
+pub(crate) use pass_prep::{pass_prep_mode, sync_ahead_stream, DrawTables, PassPrep, PassPrepMode};
 // TEMP (lab, PASS_PREP step 3): the buffer-bind and Store-page plans.
 mod buffer_plan;
 mod pass_inv;
