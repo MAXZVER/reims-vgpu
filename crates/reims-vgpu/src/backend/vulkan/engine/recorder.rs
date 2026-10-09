@@ -292,7 +292,13 @@ pub(crate) fn depth() -> u32 {
             .and_then(|v| v.parse().ok())
             // 4 since the 5K drag A/B (fq*, interleaved x2): busy 849/840 ->
             // 822/825 ms/s, 14.2 -> 13.4 us a draw, explicit join 80 -> 50 ms/s.
-            .unwrap_or(4u32)
+            // 8 since b086 (2026-10-09, the working launcher's ROUTES=off mode,
+            // after STAMP_DEFER and the timers going off made the drain wait
+            // on a full queue 8.7 % of its busy samples): drain us a draw
+            // Weather 10.67 -> 10.53, reveal-desktop 17.1 -> 16.6, Finder
+            // 20.95 -> 20.25, Safari even; fps in noise. n219/p042 (8 and 16
+            // without signal, 16 worse) predate both changes.
+            .unwrap_or(8u32)
             .clamp(1, 16)
     })
 }
