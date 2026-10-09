@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 pub struct LabInstant(u64);
 
 impl LabInstant {
+    /// A placeholder for a span that never started (timers off).
+    pub const ZERO: Self = Self(0);
+
     #[inline]
     pub fn now() -> Self {
         Self(ticks())
@@ -86,4 +89,41 @@ mod tests {
         let (lab, real) = (a.elapsed().as_micros() as i64, i.elapsed().as_micros() as i64);
         assert!((lab - real).abs() < real / 20 + 200, "lab {lab} us against {real} us");
     }
+}
+
+/// TEMP (lab): whether the census phase timers run - the chain, draw, sampled,
+/// bind and stage spans. Off when `REIMS_VGPU_LAB_TIMERS=off`, or when
+/// `REIMS_VGPU_LAB_ROUTES=off` (the working launcher's "counters only" mode,
+/// which already drops the per-bind route census), or by the live `TIMERS=off`
+/// (refreshed once per drain tranche by [`refresh_timers`]). Each span is a
+/// TSC read, a thread-local and an atomic add, a dozen times a draw on the drain
+/// and as many on the recorder; nothing but the per-second census lines reads
+/// them. Always on under test, where the spans are what is being tested.
+pub(crate) fn timers_on() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    match TIMERS.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            refresh_timers();
+            TIMERS.load(std::sync::atomic::Ordering::Relaxed) == 1
+        }
+    }
+}
+
+static TIMERS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Re-read [`timers_on`]'s answer: the live switch, else the latched launcher
+/// default. Called at each drain tranche's start.
+pub(crate) fn refresh_timers() {
+    static ENV: OnceLock<bool> = OnceLock::new();
+    let on = crate::runtime::lab_live::on("TIMERS").unwrap_or_else(|| {
+        *ENV.get_or_init(|| {
+            let off = |k: &str| std::env::var(k).as_deref() == Ok("off");
+            !(off("REIMS_VGPU_LAB_TIMERS") || off("REIMS_VGPU_LAB_ROUTES"))
+        })
+    });
+    TIMERS.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
 }

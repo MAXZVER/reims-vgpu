@@ -646,11 +646,15 @@ pub(crate) struct DrawTimer {
     /// what was on screen rather than only how long it took.
     geom: (u32, u32),
     readback_bytes: u64,
+    /// False when the timers are off (`lab_clock::timers_on`): nothing is read
+    /// or charged.
+    live: bool,
 }
 
 impl DrawTimer {
     pub(crate) fn start() -> Self {
-        let now = Instant::now();
+        let live = crate::lab_clock::timers_on();
+        let now = if live { Instant::now() } else { Instant::ZERO };
         Self {
             started: now,
             last: now,
@@ -658,11 +662,15 @@ impl DrawTimer {
             ns: [0; PHASES],
             geom: (0, 0),
             readback_bytes: 0,
+            live,
         }
     }
 
     /// Close the open phase and open `next`.
     pub(crate) fn enter(&mut self, next: Phase) {
+        if !self.live {
+            return;
+        }
         let now = Instant::now();
         self.ns[self.open as usize] += charge_ns(now.duration_since(self.last));
         self.last = now;
@@ -678,6 +686,9 @@ impl DrawTimer {
 
 impl Drop for DrawTimer {
     fn drop(&mut self) {
+        if !self.live {
+            return;
+        }
         let now = Instant::now();
         self.ns[self.open as usize] += charge_ns(now.duration_since(self.last));
         let total = charge_ns(now.duration_since(self.started));

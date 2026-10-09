@@ -212,21 +212,23 @@ pub fn note_sampled() {
 /// nothing needs to switch part from inside a call several frames down.
 pub struct Span {
     part: Part,
-    started: Instant,
+    started: Option<Instant>,
 }
 
 impl Span {
     pub fn open(part: Part) -> Self {
         Self {
             part,
-            started: Instant::now(),
+            started: crate::lab_clock::timers_on().then(Instant::now),
         }
     }
 }
 
 impl Drop for Span {
     fn drop(&mut self) {
-        ACC[self.part as usize].fetch_add(charge_ns(self.started.elapsed()), Ordering::Relaxed);
+        if let Some(started) = self.started {
+            ACC[self.part as usize].fetch_add(charge_ns(started.elapsed()), Ordering::Relaxed);
+        }
     }
 }
 

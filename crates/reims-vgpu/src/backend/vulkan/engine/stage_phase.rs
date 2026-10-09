@@ -219,7 +219,7 @@ pub fn take_window() -> Option<StagePhaseWindow> {
 pub(crate) struct Span {
     part: Part,
     bytes: u64,
-    started: Instant,
+    started: Option<Instant>,
 }
 
 impl Span {
@@ -228,7 +228,7 @@ impl Span {
         Self {
             part,
             bytes: 0,
-            started: Instant::now(),
+            started: crate::lab_clock::timers_on().then(Instant::now),
         }
     }
 
@@ -238,16 +238,19 @@ impl Span {
         Self {
             part,
             bytes,
-            started: Instant::now(),
+            started: crate::lab_clock::timers_on().then(Instant::now),
         }
     }
 }
 
 impl Drop for Span {
     fn drop(&mut self) {
+        let Some(started) = self.started else {
+            return;
+        };
         let slot = self.part as usize;
         NS[slot].fetch_add(
-            crate::observe::phase_clock::charge_ns(self.started.elapsed()),
+            crate::observe::phase_clock::charge_ns(started.elapsed()),
             Ordering::Relaxed,
         );
         N[slot].fetch_add(1, Ordering::Relaxed);

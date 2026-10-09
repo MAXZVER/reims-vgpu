@@ -260,6 +260,9 @@ pub(crate) fn pass_prep_mode() -> PassPrepMode {
 /// or with a frame under `off`, takes the serial ladder).
 #[cfg(not(test))]
 fn live_pass_prep_mode() -> Option<PassPrepMode> {
+    if !crate::runtime::lab_live::present() {
+        return None;
+    }
     thread_local! {
         static CACHED: std::cell::Cell<(u64, u8)> = const { std::cell::Cell::new((0, 0)) };
     }

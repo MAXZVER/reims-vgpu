@@ -792,6 +792,8 @@ pub fn device_drain(id: u64) -> bool {
     // answer, so the doorbell's first binds ask for themselves. Free when the
     // switch is off (one relaxed fetch_add).
     crate::runtime::surface_currency::prewarm_new_tranche();
+    // TEMP (lab, TIMERS): the census phase timers follow the live switch.
+    crate::lab_clock::refresh_timers();
     crate::runtime::drain::lab_act(1); // TEMP (lab)
     device.drain(&mut host);
     // TEMP (lab, REIMS_VGPU_LAB_IRQ_BATCH): the gfx pulse held for this tranche.

@@ -351,29 +351,34 @@ fn load_window(take: impl Fn(Phase) -> u64, max_ns: u64, chains: u64) -> ChainPh
 /// the overlap, which is the caller's to arrange.
 pub struct CostSpan {
     name: &'static str,
-    started: Instant,
+    started: Option<Instant>,
 }
 
 impl CostSpan {
     pub fn new(name: &'static str) -> Self {
         Self {
             name,
-            started: Instant::now(),
+            started: crate::lab_clock::timers_on().then(Instant::now),
         }
     }
 }
 
 impl Drop for CostSpan {
     fn drop(&mut self) {
-        crate::runtime::drain::note_store_route_us(
-            self.name,
-            self.started.elapsed().as_micros() as u64,
-        );
+        if let Some(started) = self.started {
+            crate::runtime::drain::note_store_route_us(
+                self.name,
+                started.elapsed().as_micros() as u64,
+            );
+        }
     }
 }
 
 /// Close the open phase and open `next`. Inert when no [`ChainTimer`] is live.
 pub fn enter(next: Phase) {
+    if !crate::lab_clock::timers_on() {
+        return;
+    }
     OPEN.with(|open| {
         let now = Instant::now();
         if let Some((phase, since)) = open.get() {
@@ -400,22 +405,35 @@ pub fn enter(next: Phase) {
 pub struct ChainTimer {
     started: Instant,
     outer: Option<(Phase, Instant)>,
+    /// False when the timers are off (`lab_clock::timers_on`): nothing opened.
+    live: bool,
 }
 
 impl ChainTimer {
     /// Open [`Phase::Prep`] and start the chain's total.
     pub fn start() -> Self {
+        if !crate::lab_clock::timers_on() {
+            return Self {
+                started: Instant::now(),
+                outer: None,
+                live: false,
+            };
+        }
         let now = Instant::now();
         let outer = OPEN.with(|open| open.replace(Some((Phase::Prep, now))));
         Self {
             started: now,
             outer,
+            live: true,
         }
     }
 }
 
 impl Drop for ChainTimer {
     fn drop(&mut self) {
+        if !self.live {
+            return;
+        }
         let now = Instant::now();
         OPEN.with(|open| {
             if let Some((phase, since)) = open.get() {

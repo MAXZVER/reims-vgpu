@@ -87,6 +87,12 @@ pub(crate) fn value(name: &str) -> Option<String> {
     with_value(name, |v| v.to_string())
 }
 
+/// Whether a live file was configured at all - a production boot has none, and a
+/// caller that would do work to ask [`value`] can skip it.
+pub(crate) fn present() -> bool {
+    live().is_some()
+}
+
 /// [`value`] read as a switch: `on` is true, anything else false.
 pub(crate) fn on(name: &str) -> Option<bool> {
     with_value(name, |v| v == "on")
