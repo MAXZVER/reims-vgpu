@@ -316,7 +316,8 @@ pub(crate) fn depth() -> u32 {
     // 11.4 -> 10.8 us a draw at 32).
     #[cfg(not(test))]
     if crate::runtime::draw::vulkan::draw_par::draw_par_on() {
-        return 32;
+        // 64 since b126 (light Weather scene, 65 -> 69 fps against 32).
+        return 64;
     }
     static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *DEPTH.get_or_init(|| {

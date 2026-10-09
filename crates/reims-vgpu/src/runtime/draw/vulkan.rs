@@ -2739,7 +2739,7 @@ pub(crate) fn lab_encoder_begin() {
         });
     }
     {
-        let mut m = RESOLVE_MEMO.lock();
+        let mut m = RESOLVE_MEMO.write();
         if !m.is_empty() {
             m.clear();
         }
@@ -2759,10 +2759,14 @@ type ResolveMemoEntry = (u32, u32, u32, SampledSourceRequest);
 /// bytes cannot change, whichever thread resolved them. The entries carry host
 /// pointers (`GuestRuns`), asserted `Send` by the recorder's argument. Cleared
 /// by the drain at every encoder's start, never inside a scope.
+// A read-write lock: during a chunk seven threads look sources up and almost
+// nothing is filled (the drain primed the chunk's sources before the fork), so
+// the readers share the lock; b126: a helper's job stayed 8.3 us on the
+// performance cores, so the helpers' slowness is contention, not the cores.
 static RESOLVE_MEMO: std::sync::LazyLock<
-    parking_lot::Mutex<reims_vgpu_core::fasthash::FxHashMap<ResolveMemoKey, MemoSlot>>,
+    parking_lot::RwLock<reims_vgpu_core::fasthash::FxHashMap<ResolveMemoKey, MemoSlot>>,
 > = std::sync::LazyLock::new(|| {
-    parking_lot::Mutex::new(reims_vgpu_core::fasthash::FxHashMap::with_hasher(Default::default()))
+    parking_lot::RwLock::new(reims_vgpu_core::fasthash::FxHashMap::with_hasher(Default::default()))
 });
 
 /// TEMP (lab, DRAW_PAR): the memo's entry. (A claim-and-wait slot was tried in
@@ -2865,7 +2869,7 @@ pub(crate) fn lab_resolve_memo_on() -> bool {
 }
 
 fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledSourceRequest)> {
-    let m = RESOLVE_MEMO.lock();
+    let m = RESOLVE_MEMO.read();
     m.get(key).and_then(|MemoSlot::Ready(entry)| {
         let (w, h, mid, src) = &entry.0;
         if !matches!(src, SampledSourceRequest::Bytes(..)) {
@@ -2949,7 +2953,7 @@ fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSou
     }
     match memo_copy(&loaded.3, lab_resolve_memo_all(), false) {
         Some(src) => {
-            RESOLVE_MEMO.lock().insert(
+            RESOLVE_MEMO.write().insert(
                 key,
                 MemoSlot::Ready(crate::backend::vulkan::engine::recorder::AssertSend((
                     loaded.0, loaded.1, loaded.2, src,
