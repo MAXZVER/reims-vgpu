@@ -94,6 +94,15 @@ cfgs = [
     ('hash: due on, every set, ring + hole=tail', dict(NAMED, **RING, **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on', G + 'DIRTY_HASH_DUE': 'on'}), '0'),
     ('hash=off: the queried path, named + exact3', dict(NAMED, **EXACT3, **{G + 'DIRTY_HASH': 'off'}), '0'),
     ('hash=off + wp nopause: ring + hole=tail', dict(NAMED, **RING, **WP0, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_HASH': 'off'}), '0'),
+    # DIRTY_WP_HASHED (the Intel default since 2026-10-09, floor 64): clean hashed sets write-protected and read as
+    # synced with no hash. The floor is lowered to the model's set sizes.
+    ('hash+wp_hashed: every set hashed, wp nopause', dict(WP0, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on', G + 'DIRTY_WP_HASHED': 'on', G + 'DIRTY_WP_HASHED_MIN': '8'}), '0'),
+    ('hash+wp_hashed: every set, named + ring + hole=tail', dict(NAMED, **RING, **WP0, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on', G + 'DIRTY_WP_HASHED': 'on', G + 'DIRTY_WP_HASHED_MIN': '8'}), '0'),
+    ('hash+wp_hashed: cost model (mixed), named + exact3', dict(NAMED, **EXACT3, **WP0, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_HASH': 'on', G + 'DIRTY_WP_HASHED': 'on', G + 'DIRTY_WP_HASHED_MIN': '8'}), '0'),
+    ('hash+wp_hashed: every set, paused protect', dict(WP0, **{G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on', G + 'DIRTY_WP_HASHED': 'on', G + 'DIRTY_WP_HASHED_MIN': '8'}), '0'),
+    # Informational, not a control: unlike the queried path, a hashed set is hashed again once wholly read-only, so a
+    # store that raced the unpaused protect is caught by that hash (2026-10-09: 0 violations, ~480 faults a row).
+    ('hash+wp_hashed: protects without pausing the writers', dict(WP0, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on', G + 'DIRTY_WP_HASHED': 'on', G + 'DIRTY_WP_HASHED_MIN': '8'}), '?'),
     ('CONTROL hash: drain reads lagged', {'STRESS_DRAIN_LAGGED': '1', G + 'DIRTY_HASH': 'on', G + 'DIRTY_HASH_ALL': 'on'}, '>0'),
     ('wp calm=off: wp nopause, ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_CALM': 'off'}), '0'),
     ('wp calm=off: wp nopause + wp_hole, ring + hole=tail', dict(NAMED, **RING, **WP, STRESS_WP_NOPAUSE='1', **{G + 'DIRTY_HOLE': 'tail', G + 'DIRTY_WP_NOPAUSE': 'on', G + 'DIRTY_WP_HOLE': 'on', G + 'DIRTY_WP_CALM': 'off'}), '0'),
