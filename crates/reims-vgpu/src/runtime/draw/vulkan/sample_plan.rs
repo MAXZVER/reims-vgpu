@@ -2657,6 +2657,262 @@ pub(crate) fn commit_memo_plan<M: HostMemory + HostOps>(
     }
 }
 
+/// TEMP (lab, DRAW_PAR): [`commit_ref_view_plan`]'s validation and predicted
+/// serve over a shared state — what a pool worker assembles a request from.
+/// The drain's commit validates again and lands the witness; the request is
+/// used only if the committed outcome equals the predicted one.
+pub(crate) fn predict_ref_view_plan<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    plan: &RefViewPlan,
+    task_id: u32,
+    texture_ref: u32,
+    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
+) -> Result<(u32, u32, u32, SampledSourceRequest), SampleInvalid> {
+    if plan.task_id != task_id || plan.texture_ref != texture_ref {
+        return Err(SampleInvalid::Key);
+    }
+    if !resource.is_some_and(|r| std::sync::Arc::ptr_eq(r, &plan.resource)) {
+        return Err(SampleInvalid::Resource);
+    }
+    let mid = plan.mid;
+    let row_holds = state.mappings.get(&mid).is_some_and(|m| {
+        m.mapped
+            && !m.page_entries.is_empty()
+            && m.has_geom
+            && ref_texture_view_requires_materialization(
+                m.has_geom, m.width, m.height, m.format, plan.view,
+            )
+    });
+    if !row_holds
+        || crate::runtime::mapper::mapping_window_key_readonly(state, mid) != Some(plan.window_key)
+        || ref_view_plane(state, host, mid, plan.view) != Some(plan.plane)
+    {
+        return Err(SampleInvalid::Mapping);
+    }
+    if !state.pending_writebacks.is_empty() && state.pending_writebacks.owes(mid) {
+        return Err(SampleInvalid::Debt);
+    }
+    let (base_off, span) = (plan.plane.base_off, plan.plane.span);
+    let cached = crate::runtime::mapper::mapping_window_cached(state, mid, base_off, span);
+    if !cached.is_some_and(|(gpas, runs)| {
+        std::sync::Arc::ptr_eq(&gpas, &plan.gpas) && std::sync::Arc::ptr_eq(&runs, &plan.runs)
+    }) {
+        return Err(SampleInvalid::Window);
+    }
+    if !crate::runtime::gather_witness::gather_plan_holds(state, host, &plan.gather, &plan.gpas) {
+        return Err(SampleInvalid::Witness);
+    }
+    let view = plan.view;
+    let source = |pages, outcome: crate::runtime::gather_witness::GatherOutcome| {
+        (
+            view.width,
+            view.height,
+            mid,
+            SampledSourceRequest::GuestRuns(
+                crate::backend::vulkan::engine::GuestRunSource {
+                    runs: std::sync::Arc::clone(&plan.runs),
+                    source_offset: 0,
+                    total_len: span,
+                    row_length_texels: plan.plane.row_length_texels,
+                    pages,
+                    direct_image: None,
+                },
+                plan.plane.native,
+                plan.plane.sampled_vk_format,
+                1,
+                Some(LinearSampleIdentity::from(outcome.identity)),
+                outcome.vouch,
+                outcome.evidence,
+                pixel_format::swizzle_identity(),
+            ),
+        )
+    };
+    // TEMP (lab, PASS_STAGE): the staged window, on every arm the closure
+    // below serves.
+    let wrap = |served: (u32, u32, u32, SampledSourceRequest)| match plan.staged.as_ref() {
+        Some(st) => (served.0, served.1, served.2, wrap_staged(served.3, st)),
+        None => served,
+    };
+    Ok(wrap(source(None, plan.gather.predicted())))
+}
+
+
+/// TEMP (lab, DRAW_PAR): [`commit_linear_plan`]'s validation and predicted
+/// serve over a shared state; see [`predict_ref_view_plan`].
+pub(crate) fn predict_linear_plan<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    plan: &LinearPlan,
+    task_id: u32,
+    texture_ref: u32,
+    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
+    may_bind_resident: bool,
+) -> Result<(u32, u32, u32, SampledSourceRequest), SampleInvalid> {
+    if plan.task_id != task_id
+        || plan.texture_ref != texture_ref
+        || plan.may_bind_resident != may_bind_resident
+    {
+        return Err(SampleInvalid::Key);
+    }
+    if !resource.is_some_and(|r| std::sync::Arc::ptr_eq(r, &plan.resource)) {
+        return Err(SampleInvalid::Resource);
+    }
+    // The predicates the plan refused through, repeated: a debt armed since the
+    // plan is the drain's to pay, on the serial rail.
+    if crate::runtime::writeback_debt::owes_texture(state, task_id, texture_ref)
+        || state.pending_writebacks.owes_gva_overlapping(
+            task_id,
+            plan.allocation.gva,
+            plan.allocation.size,
+        )
+    {
+        return Err(SampleInvalid::Debt);
+    }
+    // The rung above, repeated: it became servable since the plan (a Store
+    // armed the witness, a resident turned ready) — the serial answer changed
+    // shape above this rail.
+    let tex = match plan.resource.decoded() {
+        Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => tex,
+        _ => return Err(SampleInvalid::Resource),
+    };
+    if may_bind_resident
+        && linear_resident_rung_above_may_serve(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            plan.gva,
+            u32::try_from(plan.row_stride).map_err(|_| SampleInvalid::Resource)?,
+            plan.w,
+            plan.h,
+            tex.pixel_format,
+        )
+    {
+        return Err(SampleInvalid::UpperRung);
+    }
+    let packed = state
+        .bound_buffers
+        .packed_available(
+            task_id,
+            texture_ref,
+            plan.allocation.gva,
+            plan.allocation.size,
+        )
+        .ok_or(SampleInvalid::Packed)?;
+    if plan.packed_head != packed.head
+        || !std::sync::Arc::ptr_eq(&plan.packed_runs, &packed.runs)
+        || !std::sync::Arc::ptr_eq(&plan.packed_pages, &packed.pages)
+    {
+        return Err(SampleInvalid::Packed);
+    }
+    // Cloned out before the witness commit takes `state` mutably: the serve
+    // below names the same allocation the identity check just proved.
+    let (packed_runs, packed_pages) = (
+        std::sync::Arc::clone(&packed.runs),
+        std::sync::Arc::clone(&packed.pages),
+    );
+    let guest_runs = crate::backend::vulkan::engine::GuestRunSource {
+        runs: packed_runs,
+        source_offset: plan.layout_offset,
+        total_len: plan.span,
+        row_length_texels: plan.row_length_texels,
+        pages: Some(packed_pages),
+        direct_image: None,
+    };
+    if plan.gather.is_none() {
+        // The direct arm: rebuilt from the same borrowed allocation, moving
+        // nothing — the plan serves again for the next bind of the ref.
+        let request = direct_linear_sample_from_packed(
+            packed,
+            plan.layout_offset,
+            plan.row_stride,
+            plan.span,
+            plan.row_length_texels,
+            plan.native,
+            plan.sampled_vk_format,
+            plan.native_components,
+            plan.resource.lifetime_ref(),
+        )
+        .ok_or(SampleInvalid::Packed)?;
+
+        let SampledSourceRequest::GuestRuns(source, ..) = request else {
+            return Err(SampleInvalid::Packed);
+        };
+        // TEMP (lab, PASS_STAGE): the staged window, when one was attached.
+        let served = plan.source(source, None);
+        // TEMP (lab, STAGED_PROVEN): the direct arm moved nothing, and this
+        // commit served the bind — the plan it hands back is proven (its
+        // window, once a worker stages it, serves every later bind).
+        return Ok(wrap_linear(plan, served));
+    }
+    let gather = plan.gather.as_ref().expect("checked above");
+    let run = plan.witness_run.expect("the gather arm carries its run");
+    Ok(wrap_linear(plan, plan.source(guest_runs, Some(gather.predicted()))))
+}
+
+
+/// TEMP (lab, DRAW_PAR): [`commit_mapper_ref_plan`]'s validation and predicted
+/// serve over a shared state; see [`predict_ref_view_plan`].
+pub(crate) fn predict_mapper_ref_plan<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    plan: &MapperRefPlan,
+    task_id: u32,
+    texture_ref: u32,
+    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
+) -> Result<(u32, u32, u32, SampledSourceRequest), SampleInvalid> {
+    if plan.task_id != task_id || plan.texture_ref != texture_ref {
+        return Err(SampleInvalid::Key);
+    }
+    if !resource.is_some_and(|r| std::sync::Arc::ptr_eq(r, &plan.resource)) {
+        return Err(SampleInvalid::Resource);
+    }
+    let mid = plan.mid;
+    let row_holds = state.mappings.get(&mid).is_some_and(|m| {
+        m.mapped
+            && !m.page_entries.is_empty()
+            && m.has_geom
+            && m.width == plan.w
+            && m.height == plan.h
+    });
+    let window_holds = state.mappings.get(&mid).and_then(|m| {
+        let format = if m.format != 0 {
+            m.format
+        } else {
+            pixel_format::MTL_FORMAT_BGRA8_UNORM
+        };
+        crate::runtime::mapping_write::mapper_ref_texture_sample_window(m, plan.w, plan.h, format)
+            .map(|(base_off, bpr, _)| (base_off, u64::from(bpr)))
+    });
+    if !row_holds
+        || window_holds != Some((plan.base_off, plan.bpr))
+        || crate::runtime::mapper::mapping_window_key_readonly(state, mid) != Some(plan.window_key)
+    {
+        return Err(SampleInvalid::Mapping);
+    }
+    if crate::runtime::writeback_debt::owes_mapping(state, mid) {
+        return Err(SampleInvalid::Debt);
+    }
+    if mapper_direct_rung_above_may_serve(state, host, mid) {
+        return Err(SampleInvalid::UpperRung);
+    }
+    // The resident rung above the whole page ladder: the plan fell past it
+    // when the surface ladder planned, and a readiness that appeared since
+    // changes the serial answer's shape above this rail.
+    if surface_resident_appeared(state, &plan.resource, mid, plan.w, plan.h) {
+        return Err(SampleInvalid::UpperRung);
+    }
+    let cached =
+        crate::runtime::mapper::mapping_window_cached(state, mid, plan.base_off, plan.span);
+    if !cached.is_some_and(|(gpas, runs)| {
+        std::sync::Arc::ptr_eq(&gpas, &plan.gpas) && std::sync::Arc::ptr_eq(&runs, &plan.runs)
+    }) {
+        return Err(SampleInvalid::Window);
+    }
+    Ok(wrap_mapper(plan, plan.source(None, plan.gather.predicted())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

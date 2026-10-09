@@ -2871,6 +2871,16 @@ fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledS
 }
 
 fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSourceRequest)) {
+    // TEMP (lab, DRAW_PAR): a pool job's gathered source is a prediction until
+    // the drain commits its witness; it is not what a later bind may reuse.
+    if crate::runtime::par::planning()
+        && matches!(
+            loaded.3,
+            SampledSourceRequest::GuestRuns(..) | SampledSourceRequest::Staged(..)
+        )
+    {
+        return;
+    }
     if let Some(src) = memo_copy(&loaded.3, lab_resolve_memo_all(), false) {
         RESOLVE_MEMO.lock().insert(
             key,

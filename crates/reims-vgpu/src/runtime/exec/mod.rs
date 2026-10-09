@@ -5754,6 +5754,10 @@ fn finish_stream<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         let mut draw_par_slots: Vec<Option<crate::runtime::draw::vulkan::draw_par::PreparedDraw>> =
             Vec::new();
+        // TEMP (lab, DRAW_PAR): the chunk's requests, built once for the
+        // workers and taken by the loop below instead of being built again.
+        #[cfg(feature = "backend-vulkan")]
+        let mut draw_par_reqs: Vec<Option<draw::DrawEncodeRequest>> = Vec::new();
         #[cfg(feature = "backend-vulkan")]
         let mut draw_par_base = 0usize;
         #[cfg(feature = "backend-vulkan")]
@@ -5793,6 +5797,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                             .collect();
                         draw_par_slots =
                             crate::runtime::draw::vulkan::draw_par::prepare_chunk(&*state, &reqs);
+                        draw_par_reqs = reqs.into_iter().map(|(r, _)| Some(r)).collect();
                     }
                 }
             }
@@ -5812,10 +5817,26 @@ fn finish_stream<M: HostMemory + HostOps>(
                 };
                 req
             } else {
-                let Some(template) = attachment_template.as_ref() else {
-                    break;
+                #[cfg(feature = "backend-vulkan")]
+                let prebuilt = if draw_par_active
+                    && di >= draw_par_base
+                    && di < draw_par_base + draw_par_reqs.len()
+                {
+                    draw_par_reqs[di - draw_par_base].take()
+                } else {
+                    None
                 };
-                retarget_render_pass_draw(template, pd)
+                #[cfg(not(feature = "backend-vulkan"))]
+                let prebuilt: Option<draw::DrawEncodeRequest> = None;
+                match prebuilt {
+                    Some(req) => req,
+                    None => {
+                        let Some(template) = attachment_template.as_ref() else {
+                            break;
+                        };
+                        retarget_render_pass_draw(template, pd)
+                    }
+                }
             };
             {
                 fin.enter(crate::runtime::drain::FinishPhase::Binds);

@@ -309,7 +309,14 @@ pub(crate) fn depth() -> u32 {
     if let Some(n) = crate::runtime::lab_live::value("RECORDER_DEPTH")
         .and_then(|v| v.trim().parse::<u32>().ok())
     {
-        return n.clamp(1, 16);
+        return n.clamp(1, 64);
+    }
+    // TEMP (lab, DRAW_PAR): a chunk's commits arrive at ~1 us a record against
+    // the recorder's ~5.5; a queue of 8 made the drain wait on it (b120: Weather
+    // 11.4 -> 10.8 us a draw at 32).
+    #[cfg(not(test))]
+    if crate::runtime::draw::vulkan::draw_par::draw_par_on() {
+        return 32;
     }
     static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *DEPTH.get_or_init(|| {
@@ -325,7 +332,7 @@ pub(crate) fn depth() -> u32 {
             // 20.95 -> 20.25, Safari even; fps in noise. n219/p042 (8 and 16
             // without signal, 16 worse) predate both changes.
             .unwrap_or(8u32)
-            .clamp(1, 16)
+            .clamp(1, 64)
     })
 }
 

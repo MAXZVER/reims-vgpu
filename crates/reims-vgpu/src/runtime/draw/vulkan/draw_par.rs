@@ -102,9 +102,14 @@ pub(crate) enum Bail {
     /// A linear texture whose allocation has a packed alias: the serial
     /// ladder serves it zero-copy from there.
     LinearPacked,
-    /// A linear texture whose window the gather floor admits: the serial
-    /// ladder gathers it on the witness.
+    /// A linear texture whose window the gather floor admits and whose
+    /// zero-copy plan refused: the serial ladder gathers it on the witness.
     LinearFloor,
+    /// A zero-copy plan that did not validate on the worker.
+    ZcPredict,
+    /// A zero-copy plan whose committed outcome differed from the predicted
+    /// one the request was assembled with.
+    ZcOutcome,
     /// The linear rows could not be converted for upload.
     LinearConvert,
     /// A cube map: six faces the drain reloads.
@@ -155,6 +160,8 @@ impl Bail {
             Bail::LinearShape => "draw_par_bail_lin_shape",
             Bail::LinearPacked => "draw_par_bail_lin_packed",
             Bail::LinearFloor => "draw_par_bail_lin_floor",
+            Bail::ZcPredict => "draw_par_bail_zc_predict",
+            Bail::ZcOutcome => "draw_par_commit_zc_outcome",
             Bail::LinearConvert => "draw_par_bail_lin_convert",
             Bail::Cube => "draw_par_bail_cube",
             Bail::AliasSecondary => "draw_par_bail_alias_secondary",
@@ -257,6 +264,40 @@ impl LinearMemoFact {
     }
 }
 
+/// The witness-backed halves of a gathered request — what a commit may change
+/// against the prediction a worker assembled with.
+type GatherMarks = (
+    Option<LinearSampleIdentity>,
+    crate::runtime::gather_witness::GatherVouch,
+    Option<crate::runtime::gather_witness::SkipGuardEvidence>,
+);
+
+fn gather_marks(request: &SampledSourceRequest) -> Option<GatherMarks> {
+    match request {
+        SampledSourceRequest::GuestRuns(_, _, _, _, identity, vouch, evidence, _) => {
+            Some((*identity, *vouch, *evidence))
+        }
+        SampledSourceRequest::Staged(staged) => Some((staged.identity, staged.vouch, staged.evidence)),
+        _ => None,
+    }
+}
+
+/// A zero-copy gather a worker served from a plan's prediction; the commit
+/// validates the plan, lands the witness and checks the outcome.
+pub(crate) struct ZcCommit {
+    plan: ZcPlan,
+    texture_ref: u32,
+    resource: Arc<crate::model::TaskResource>,
+    may_bind_resident: bool,
+    predicted: Option<GatherMarks>,
+}
+
+enum ZcPlan {
+    Linear(sample_plan::LinearPlan),
+    RefView(sample_plan::RefViewPlan),
+    MapperRef(sample_plan::MapperRefPlan),
+}
+
 /// What a fragment-stage sampled bind resolved to, for the two censuses the
 /// serial path notes where it resolves (deferred to the commit so an
 /// uncommitted preparation records nothing).
@@ -275,6 +316,7 @@ pub(crate) struct SampledNote {
 pub(crate) struct PrepareLog {
     pub(super) buffers: Vec<BufferCommit>,
     pub(super) samples: Vec<SampleCommit>,
+    pub(super) gathers: Vec<ZcCommit>,
     pub(super) linear: Vec<LinearMemoFact>,
     pub(super) notes: Vec<SampledNote>,
     pub(super) bail: Option<Bail>,
@@ -316,15 +358,24 @@ pub(crate) fn draw_par_on() -> bool {
     if cfg!(test) {
         return false;
     }
-    if let Some(on) = crate::runtime::lab_live::on("DRAW_PAR") {
+    thread_local! {
+        static CACHED: std::cell::Cell<(u64, bool)> = const { std::cell::Cell::new((0, false)) };
+    }
+    let now = crate::observe::elapsed_us();
+    let (checked, on) = CACHED.with(|c| c.get());
+    if checked != 0 && now.saturating_sub(checked) < 100_000 {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var("REIMS_VGPU_LAB_DRAW_PAR").as_deref() != Ok("off");
-        crate::observe::off(format!("lab_draw_par on={}", u8::from(on)));
-        on
-    })
+    let on = crate::runtime::lab_live::on("DRAW_PAR").unwrap_or_else(|| {
+        *ON.get_or_init(|| {
+            let on = std::env::var("REIMS_VGPU_LAB_DRAW_PAR").as_deref() != Ok("off");
+            crate::observe::off(format!("lab_draw_par on={}", u8::from(on)));
+            on
+        })
+    });
+    CACHED.with(|c| c.set((now.max(1), on)));
+    on
 }
 
 /// Draws per fork. `REIMS_VGPU_LAB_DRAW_PAR_CHUNK=K` (default 32, 4..=256);
@@ -599,9 +650,96 @@ pub(super) fn resolve_sampled_source_worker<M: HostMemory + HostOps>(
             });
             Ok(served)
         }
-        // A linear texture: the serial ladder's `is_linear_tex` branch.
+        // A ref-texture view's plane on the zero-copy rail.
+        Err(sample_plan::SampleBail::RefTextureView) => {
+            let plan = sample_plan::plan_ref_view_zero_copy(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                resource.clone(),
+            )
+            .map_err(|_| Bail::SampledPlan)?;
+            let served = sample_plan::predict_ref_view_plan(
+                state,
+                host,
+                &plan,
+                task_id,
+                texture_ref,
+                Some(&resource),
+            )
+            .map_err(|_| Bail::ZcPredict)?;
+            log.gathers.push(ZcCommit {
+                plan: ZcPlan::RefView(plan),
+                texture_ref,
+                resource,
+                may_bind_resident,
+                predicted: gather_marks(&served.3),
+            });
+            Ok(served)
+        }
+        // A linear texture: the serial ladder's `is_linear_tex` branch — the
+        // zero-copy rail where its plan stands, else the memo rung.
         Err(sample_plan::SampleBail::NotSurface) => {
-            resolve_linear_worker(state, host, log, task_id, texture_ref, &resource)
+            match sample_plan::plan_linear_zero_copy(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                resource.clone(),
+                may_bind_resident,
+            ) {
+                Ok(plan) => {
+                    let served = sample_plan::predict_linear_plan(
+                        state,
+                        host,
+                        &plan,
+                        task_id,
+                        texture_ref,
+                        Some(&resource),
+                        may_bind_resident,
+                    )
+                    .map_err(|_| Bail::ZcPredict)?;
+                    log.gathers.push(ZcCommit {
+                        plan: ZcPlan::Linear(plan),
+                        texture_ref,
+                        resource,
+                        may_bind_resident,
+                        predicted: gather_marks(&served.3),
+                    });
+                    Ok(served)
+                }
+                Err(_) => resolve_linear_worker(state, host, log, task_id, texture_ref, &resource),
+            }
+        }
+        // The surface ladder fell past every host-side copy: the zero-copy
+        // window of the surface's own pages.
+        Err(sample_plan::SampleBail::NoHostCache | sample_plan::SampleBail::LowerRung) => {
+            let plan = sample_plan::plan_mapper_ref_zero_copy(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                resource.clone(),
+            )
+            .map_err(|_| Bail::SampledPlan)?;
+            let served = sample_plan::predict_mapper_ref_plan(
+                state,
+                host,
+                &plan,
+                task_id,
+                texture_ref,
+                Some(&resource),
+            )
+            .map_err(|_| Bail::ZcPredict)?;
+            log.gathers.push(ZcCommit {
+                plan: ZcPlan::MapperRef(plan),
+                texture_ref,
+                resource,
+                may_bind_resident,
+                predicted: gather_marks(&served.3),
+            });
+            Ok(served)
         }
         Err(_) => Err(Bail::SampledPlan),
     }
@@ -824,6 +962,49 @@ fn commit_prepared<M: HostMemory + HostOps>(
             return Err(Bail::PlanInvalid);
         }
         let _ = sample_plan::take_sampled_plan(state, &s.plan, true);
+    }
+    for g in &log.gathers {
+        let served = match &g.plan {
+            ZcPlan::Linear(plan) => sample_plan::commit_linear_plan(
+                state,
+                host,
+                plan,
+                task_id,
+                g.texture_ref,
+                Some(&g.resource),
+                g.may_bind_resident,
+                true,
+            )
+            .map(|(served, _)| served),
+            ZcPlan::RefView(plan) => sample_plan::commit_ref_view_plan(
+                state,
+                host,
+                plan,
+                task_id,
+                g.texture_ref,
+                Some(&g.resource),
+                true,
+            )
+            .map(|(served, _)| served),
+            ZcPlan::MapperRef(plan) => sample_plan::commit_mapper_ref_plan(
+                state,
+                host,
+                plan,
+                task_id,
+                g.texture_ref,
+                Some(&g.resource),
+                true,
+            )
+            .map(|(served, _)| served),
+        };
+        let Ok(served) = served else {
+            return Err(Bail::PlanInvalid);
+        };
+        // The request carries the prediction; a witness that answered
+        // otherwise makes it the wrong request, not a lesser one.
+        if gather_marks(&served.3) != g.predicted {
+            return Err(Bail::ZcOutcome);
+        }
     }
     for fact in log.linear {
         fact.land(state);
