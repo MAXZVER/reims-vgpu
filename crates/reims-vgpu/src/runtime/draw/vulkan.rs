@@ -3370,9 +3370,11 @@ type SampledRefBacking = (u32, u32, u32);
 
 /// The last resolution reported for each `(task, texture ref)`, so a change of
 /// backing is reportable and a steady bind is silent.
+/// Asked once per sampled bind, so keyed through the Fx hasher (b093: the
+/// SipHash insert was most of this report's ~1 % of Weather drain busy).
 static SAMPLED_REF_BACKING_LAST: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<SampledRefKey, SampledRefBacking>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    std::sync::Mutex<reims_vgpu_core::fasthash::FxHashMap<SampledRefKey, SampledRefBacking>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
 
 /// Report what a texture ref resolves to, on every change of backing or extent.
 fn note_sampled_ref_backing(
@@ -11082,7 +11084,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the "blank Safari body text" class. Bind a stage-in buffer as storage
         // too whenever the adopted vertex reflection structurally declares a
         // buffer at that binding (never name-keyed).
-        let mut storage: Vec<crate::backend::vulkan::engine::StorageBufferResource> = Vec::new();
+        // At most every vertex and fragment buffer, in one allocation (b093).
+        let mut storage: Vec<crate::backend::vulkan::engine::StorageBufferResource> =
+            Vec::with_capacity(vtx_storage.len() + frag_storage.len());
         for (idx, content) in &vtx_storage {
             if !vertex_buffer_needs_storage_binding(
                 &v_shader.reflection,
@@ -11269,10 +11273,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // sampler to texture index left sampler 67 empty → black samples.
         // Fragment sampled resources use +FRAG_SAMPLED when either both stages
         // sample or fragment buffers moved into the sampled/static-sampler band.
-        let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> = Vec::new();
+        // Sized from the tables up front: these leave with the draw (to the
+        // recorder), and a default Vec grew through several reallocations per
+        // draw (`grow_one` ~1 % of Weather drain busy, b093).
+        let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> =
+            Vec::with_capacity(req.vertex_textures.len() + req.fragment_textures.len());
         // Guest mip chains the sampled binds read whole; see `sampled_mip_chain`.
         let mut mip_chains: Vec<crate::backend::vulkan::engine::types::SampledPyramid> = Vec::new();
-        let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
+        let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> =
+            Vec::with_capacity(req.vertex_samplers.len() + req.fragment_samplers.len());
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
         // Where each provisioned sampler's state came from, keyed by binding, for
         // the hang trail. A `SamplerResource` cannot be asked this after the
