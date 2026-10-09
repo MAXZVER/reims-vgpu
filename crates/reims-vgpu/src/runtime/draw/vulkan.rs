@@ -7462,7 +7462,7 @@ fn gva_resident_ready(
         .then(|| state.constructed_object(task_id, texture_ref))
         .flatten()
         .filter(|resource| resource_type_owns_gva_resident(resource.entry.object_type))
-        .map(|resource| resource_lease::resident_target_backing(&resource, identity));
+        .map(|resource| resource_lease::resident_target_ready_deferred(&resource, identity));
     let retained = backing.is_some();
     let ready = retained_resident_is_ready(backing, || {
         crate::backend::vulkan::engine::resident_content_ready(identity)

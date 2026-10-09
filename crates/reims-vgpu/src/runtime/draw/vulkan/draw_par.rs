@@ -412,9 +412,12 @@ impl PreparedKind {
     }
 }
 
-/// `REIMS_VGPU_LAB_DRAW_PAR_LAST=off` disables; live `DRAW_PAR_LAST`. On: a
+/// `REIMS_VGPU_LAB_DRAW_PAR_LAST=on` enables; live `DRAW_PAR_LAST`. On: a
 /// stream's last record (its deferred Store) is prepared on the pool too and
 /// committed through the serial encode's door, which then routes the Store.
+/// Off by default since b135: Weather -1 % drain, but the reveal-desktop
+/// transitions ran 137/136 window fps against 154 (mid-transition gaps ~150 ms,
+/// not explained yet).
 pub(crate) fn last_on() -> bool {
     if cfg!(test) {
         return false;
@@ -423,7 +426,7 @@ pub(crate) fn last_on() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_PAR_LAST").as_deref() != Ok("off"))
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_PAR_LAST").as_deref() == Ok("on"))
 }
 
 /// One draw a worker prepared, ready for the drain's commit.

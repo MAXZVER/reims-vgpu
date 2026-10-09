@@ -848,6 +848,20 @@ fn note_last(targets: &[super::types::TargetIdentity], stamp: Option<u32>) {
 /// the stamp; the stamp then writes it), so a drain question about the epoch
 /// need not wait for the queue. A failed draw before it is reported as a
 /// deferred failure and abandons its chain, as it would after the wait.
+/// TEMP (lab, RETAIN_DEFER): whether a job still out writes `identity`.
+pub(crate) fn pending_writer(identity: &super::types::TargetIdentity) -> bool {
+    PENDING_TARGETS.lock().iter().any(|(id, _)| id == identity)
+}
+
+/// TEMP (lab, RETAIN_DEFER): run `f` on the recorder after every job already
+/// queued (a resident's writers included), without holding any target.
+pub(crate) fn submit_after_queued(f: impl FnOnce() + Send + 'static) {
+    DRAW.submit(Box::new(move || {
+        f();
+        JobResult::Done
+    }));
+}
+
 pub(crate) fn pending_last_stamp(identity: &super::types::TargetIdentity) -> Option<u32> {
     if !PENDING_TARGETS.lock().iter().any(|(id, _)| id == identity) {
         return None;

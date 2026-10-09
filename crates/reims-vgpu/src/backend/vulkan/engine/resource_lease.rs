@@ -50,6 +50,47 @@ pub fn resident_target_backing(
 /// A `bool` beside the backing would have said the same thing and would not
 /// have said which of the two the backing came from; the warm arm is the whole
 /// reason this path exists and it is the arm that must stay off the census.
+/// TEMP (lab, live `RETAIN_DEFER=off` restores the drain's retain): whether
+/// `identity`'s resident is (or, once the queue reaches it, will be) ready,
+/// for a caller that reads only readiness (`gva_resident_ready`). When a
+/// deferred draw still out writes the resident and the resource holds no lease
+/// for it, the drain's retain would wait for that writer (b134: 3.2 % of the
+/// drain, the composite stream waiting on the layer stream's recording); the
+/// writer readies the resident, so the answer is "ready", and the retain itself
+/// - the pin and the lease - runs as a recorder job queued behind the writer,
+/// in the order the drain's wait would have run it.
+pub fn resident_target_ready_deferred(
+    resource: &std::sync::Arc<TaskResource>,
+    identity: &TargetIdentity,
+) -> ResidentContentBacking {
+    if let Some(backing) = resident_target_backing_warm(resource, identity) {
+        return backing;
+    }
+    if super::is_drain_thread()
+        && !crate::runtime::par::planning()
+        && crate::runtime::lab_live::on("RETAIN_DEFER") != Some(false)
+        && super::recorder::pending_writer(identity)
+    {
+        let resource = std::sync::Arc::clone(resource);
+        let id = identity.clone();
+        super::recorder::submit_after_queued(move || {
+            let Some(lease) = retain_resident_resource(&id) else {
+                crate::runtime::drain::note_store_route("resident_resource_deferred_unavailable");
+                return;
+            };
+            let _ = resource.with_rail_state(|held: &mut ResidentTargets| {
+                if !held.0.get(&id).is_some_and(|l| l.matches(&id)) {
+                    held.0.insert(id.clone(), lease);
+                }
+            });
+        });
+        crate::runtime::drain::note_store_route("resident_resource_deferred");
+        // Readiness only: the caller does not read the allocation class.
+        return ResidentContentBacking::DeviceAllocation;
+    }
+    resident_target_backing(resource, identity)
+}
+
 /// The backing a resource's lease already holds for `identity`, or `None` when
 /// answering would mean acquiring one.
 ///
