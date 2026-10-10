@@ -472,6 +472,11 @@ impl SamplePlan {
     pub(crate) fn key(&self) -> (u32, u32) {
         (self.task_id, self.texture_ref)
     }
+
+    /// The retained resource the plan was made for.
+    pub(super) fn resource(&self) -> &std::sync::Arc<crate::model::TaskResource> {
+        &self.resource
+    }
 }
 
 /// Plan the sampled source for one bind from state this call only reads.

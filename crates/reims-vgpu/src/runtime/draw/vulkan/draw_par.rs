@@ -204,9 +204,12 @@ fn buffer_bail_route(bail: buffer_plan::BufferBail, index: bool) -> &'static str
 /// A buffer bind a worker served from a plan; the commit validates the plan at
 /// this bind's key and lands its facts.
 pub(crate) struct BufferCommit {
+    /// Holds the bind's resource (`BufferContentPlan::resource`, checked
+    /// against the bind when the worker predicted it): one count per bind,
+    /// not two - a count a helper bumps on a line the drain and the other
+    /// helpers bump too (b176: `Arc` clone and drop ~30 % of a helper's job).
     plan: buffer_plan::BufferContentPlan,
     buffer_ref: u32,
-    resource: Arc<crate::model::TaskResource>,
     offset: u64,
     cap: Option<u64>,
 }
@@ -214,9 +217,9 @@ pub(crate) struct BufferCommit {
 /// A sampled bind a worker served from a surface plan; the commit validates
 /// the plan's reads and notes its routes.
 pub(crate) struct SampleCommit {
+    /// Holds the bind's resource (`SamplePlan::resource`), as `BufferCommit`.
     plan: sample_plan::SamplePlan,
     texture_ref: u32,
-    resource: Option<Arc<crate::model::TaskResource>>,
     may_bind_resident: bool,
 }
 
@@ -695,7 +698,6 @@ pub(super) fn load_buffer_content_worker<M: HostMemory + HostOps>(
                         log.buffers.push(BufferCommit {
                             plan,
                             buffer_ref,
-                            resource: resource.clone(),
                             offset,
                             cap: extent_cap,
                         });
@@ -757,7 +759,6 @@ pub(super) fn load_index_content_worker<M: HostMemory + HostOps>(
                     log.buffers.push(BufferCommit {
                         plan,
                         buffer_ref: info.index_buffer_ref,
-                        resource,
                         offset: info.index_buffer_offset,
                         cap: Some(need as u64),
                     });
@@ -815,7 +816,6 @@ pub(super) fn resolve_sampled_source_worker<M: HostMemory + HostOps>(
             log.samples.push(SampleCommit {
                 plan,
                 texture_ref,
-                resource: Some(resource),
                 may_bind_resident,
             });
             Ok(served)
@@ -1147,7 +1147,7 @@ fn commit_prepared<M: HostMemory + HostOps>(
             &b.plan,
             task_id,
             b.buffer_ref,
-            Some(b.resource.as_ref()),
+            Some(b.plan.resource()),
             b.offset,
             b.cap,
         ) {
@@ -1162,7 +1162,7 @@ fn commit_prepared<M: HostMemory + HostOps>(
             &s.plan,
             task_id,
             s.texture_ref,
-            s.resource.as_ref(),
+            Some(s.plan.resource()),
             s.may_bind_resident,
         )
         .is_err()
@@ -1429,7 +1429,7 @@ pub(crate) fn commit_shared<M: HostMemory + HostOps>(
             &b.plan,
             task_id,
             b.buffer_ref,
-            Some(b.resource.as_ref()),
+            Some(b.plan.resource()),
             b.offset,
             b.cap,
         ) {
@@ -1449,7 +1449,7 @@ pub(crate) fn commit_shared<M: HostMemory + HostOps>(
             &s.plan,
             task_id,
             s.texture_ref,
-            s.resource.as_ref(),
+            Some(s.plan.resource()),
             s.may_bind_resident,
         )
         .is_err()

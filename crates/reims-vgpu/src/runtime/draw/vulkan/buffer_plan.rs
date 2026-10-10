@@ -179,6 +179,11 @@ pub(crate) struct BufferContentPlan {
 }
 
 impl BufferContentPlan {
+    /// The retained resource the plan was made for.
+    pub(super) fn resource(&self) -> &crate::model::TaskResource {
+        &self.resource
+    }
+
     /// TEMP (lab, PASS_STAGE): whether this plan answers one exact bind (and
     /// so merges under its key) rather than every bind of the reference.
     pub(super) fn is_exact(&self) -> bool {
