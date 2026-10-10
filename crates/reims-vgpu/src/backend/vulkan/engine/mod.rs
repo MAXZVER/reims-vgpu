@@ -1614,6 +1614,30 @@ pub fn recorder_outstanding() -> u32 {
     recorder::DRAW.outstanding()
 }
 
+/// TEMP (lab, STAMP_SEQ): recorder jobs posted so far.
+pub fn recorder_posted_seq() -> u64 {
+    recorder::DRAW.posted_seq()
+}
+
+/// TEMP (lab, STAMP_SEQ): recorder jobs finished so far (posting order).
+pub fn recorder_finished_seq() -> u64 {
+    recorder::DRAW.finished_seq()
+}
+
+/// TEMP (lab, STAMP_SEQ): wait until the first `target` recorder jobs are done.
+pub fn settle_recorder_until(target: u64) {
+    if recorder::DRAW.finished_seq() < target {
+        recorder::DRAW.settle_until(recorder::JoinSite::Explicit, || {
+            recorder::DRAW.finished_seq() >= target
+        });
+    }
+}
+
+/// TEMP (lab, STAMP_SEQ): see [`recorder::with_settle_bound`].
+pub fn with_recorder_settle_bound<R>(target: u64, f: impl FnOnce() -> R) -> R {
+    recorder::with_settle_bound(target, f)
+}
+
 /// TEMP (lab, S5a): whether the drain owes the recorder a join — a draw is out,
 /// or its result has not been taken — which is true after the gate is turned off
 /// as well as while it is on.

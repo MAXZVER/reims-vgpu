@@ -3652,8 +3652,9 @@ pub struct DeviceState {
     /// from the DisplaySwap that started the hold to the end of the settle loop.
     pub lab_held_words: Vec<(u32, u32, u32)>,
     /// TEMP (lab, STAMP_DEFER): completion words held until the recorder has
-    /// recorded every draw before them, as `(slot, value)` in publish order.
-    pub lab_deferred_stamps: Vec<(u32, u32)>,
+    /// recorded every draw before them, as `(slot, value, recorder jobs posted
+    /// before it, held since)` in publish order (STAMP_SEQ).
+    pub lab_deferred_stamps: Vec<(u32, u32, u64, std::time::Instant)>,
     pub lab_hold_since: Option<std::time::Instant>,
     pub lab_hold_packets: u32,
     pub lab_hold_exec_us: u64,

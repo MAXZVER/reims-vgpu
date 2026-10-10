@@ -214,6 +214,11 @@ pub(crate) struct Handoff {
     /// slot instead of parking on `done_cv` (written under `inner` alongside it).
     out_n: AtomicU32,
     alive: AtomicBool,
+    /// TEMP (lab, STAMP_SEQ): jobs posted / finished since the start, so a
+    /// waiter can ask for "everything posted before *this* point" instead of
+    /// for an idle worker.
+    posted: AtomicU64,
+    finished: AtomicU64,
     stats: Stats,
 }
 
@@ -363,6 +368,8 @@ impl Handoff {
             in_flight: AtomicBool::new(false),
             out_n: AtomicU32::new(0),
             alive: AtomicBool::new(false),
+            posted: AtomicU64::new(0),
+            finished: AtomicU64::new(0),
             stats: Stats::new(),
         }
     }
@@ -400,6 +407,18 @@ impl Handoff {
     /// encode while the pool planned the next chunk.
     pub(crate) fn outstanding(&self) -> u32 {
         self.inner.lock().outstanding
+    }
+
+    /// TEMP (lab, STAMP_SEQ): jobs posted so far (the sequence number the next
+    /// one finishes at is this plus one).
+    pub(crate) fn posted_seq(&self) -> u64 {
+        self.posted.load(Ordering::Acquire)
+    }
+
+    /// TEMP (lab, STAMP_SEQ): jobs finished so far, in posting order (one
+    /// worker, FIFO), so `finished_seq() >= n` means the first `n` are done.
+    pub(crate) fn finished_seq(&self) -> u64 {
+        self.finished.load(Ordering::Acquire)
     }
 
     /// Called with `lifecycle` held, so no stop is retiring the worker.
@@ -478,6 +497,7 @@ impl Handoff {
                 .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let mut g = self.inner.lock();
             stash_result(&mut g, &self.stash_pending, result);
+            self.finished.fetch_add(1, Ordering::AcqRel);
             g.outstanding -= 1;
             self.out_n.store(g.outstanding, Ordering::Release);
             if g.outstanding == 0 {
@@ -509,9 +529,12 @@ impl Handoff {
                 Err(payload) => JobResult::Panicked(payload),
             };
             stash_result(&mut self.inner.lock(), &self.stash_pending, result);
+            self.posted.fetch_add(1, Ordering::AcqRel);
+            self.finished.fetch_add(1, Ordering::AcqRel);
             return;
         }
         let mut g = self.inner.lock();
+        self.posted.fetch_add(1, Ordering::AcqRel);
         g.jobs.push_back(job);
         g.outstanding += 1;
         self.out_n.store(g.outstanding, Ordering::Release);
@@ -1049,8 +1072,31 @@ pub(crate) fn enabled() -> bool {
 /// `debug_assert!` that no planning thread ever takes them.
 #[inline]
 #[track_caller]
+thread_local! {
+    /// TEMP (lab, STAMP_SEQ): while set, the drain's settles wait only for the
+    /// jobs posted before this sequence number ([`with_settle_bound`]).
+    static SETTLE_BOUND: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// TEMP (lab, STAMP_SEQ): run `f` with the drain's settles bounded to the
+/// first `target` recorder jobs - what a completion word held behind exactly
+/// those jobs owes, rather than an idle recorder.
+pub(crate) fn with_settle_bound<R>(target: u64, f: impl FnOnce() -> R) -> R {
+    let prev = SETTLE_BOUND.with(|b| b.replace(Some(target)));
+    let out = f();
+    SETTLE_BOUND.with(|b| b.set(prev));
+    out
+}
+
 pub(crate) fn settle_if_drain(is_drain: bool, site: JoinSite) {
     if !is_drain {
+        return;
+    }
+    if let Some(target) = SETTLE_BOUND.with(std::cell::Cell::get) {
+        if DRAW.finished_seq() >= target {
+            return;
+        }
+        DRAW.settle_until(site, || DRAW.finished_seq() >= target);
         return;
     }
     // TEMP (lab, PASS_PREP): a planning thread skips the wait and the census

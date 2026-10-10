@@ -4030,7 +4030,12 @@ pub fn write_stamp<H: HostMemory + HostOps>(
         && lab_ctrl_stamp::current() == lab_ctrl_stamp::Kind::None
         && (!state.lab_deferred_stamps.is_empty() || recorder_has_draws_out())
     {
-        state.lab_deferred_stamps.push((stamp_index, stamp_value));
+        state.lab_deferred_stamps.push((
+            stamp_index,
+            stamp_value,
+            recorder_posted_seq(),
+            std::time::Instant::now(),
+        ));
         note_store_route("stamp_deferred_behind_recorder");
         return;
     }
@@ -4090,6 +4095,41 @@ pub(crate) fn flush_deferred_stamps<H: HostMemory + HostOps>(
         return false;
     }
     if recorder_has_draws_out() {
+        // TEMP (lab, live `STAMP_SEQ`): a held word owes the recorder only the
+        // jobs posted before it, not an idle recorder - the drain keeps posting
+        // the next streams' draws, and an idle-only rule held the frame's last
+        // completion behind them. Publish the prefix whose jobs are done, with
+        // the stamp path's own settles bounded to those jobs.
+        #[cfg(feature = "backend-vulkan")]
+        if stamp_seq_on() {
+            let finished = crate::backend::vulkan::engine::recorder_finished_seq();
+            let ready = state
+                .lab_deferred_stamps
+                .iter()
+                .take_while(|h| h.2 <= finished)
+                .count();
+            if ready == 0 && !block {
+                return false;
+            }
+            if ready > 0 {
+                let held: Vec<_> = state.lab_deferred_stamps.drain(..ready).collect();
+                let bound = held.last().map_or(0, |h| h.2);
+                note_store_route_n("stamp_seq_published", held.len() as u64);
+                crate::backend::vulkan::engine::with_recorder_settle_bound(bound, || {
+                    for (slot, value, _, at) in held {
+                        note_stamp_held(at, false);
+                        write_stamp_now(state, host, slot, value);
+                    }
+                });
+                return true;
+            }
+            // Blocking with nothing ready: wait for the oldest word's jobs
+            // only, then publish what that made ready on the next pass.
+            let first = state.lab_deferred_stamps[0].2;
+            crate::backend::vulkan::engine::settle_recorder_until(first);
+            note_store_route("stamp_seq_flush_waited");
+            return true;
+        }
         if !block {
             return false;
         }
@@ -4101,10 +4141,38 @@ pub(crate) fn flush_deferred_stamps<H: HostMemory + HostOps>(
     }
     let held = std::mem::take(&mut state.lab_deferred_stamps);
     note_store_route_n("stamp_deferred_flushed", held.len() as u64);
-    for (slot, value) in held {
+    for (slot, value, _, at) in held {
+        note_stamp_held(at, block);
         write_stamp_now(state, host, slot, value);
     }
     true
+}
+
+/// TEMP (lab, STAMP_SEQ): how long a held completion word waited, split by
+/// whether the drain blocked for it.
+fn note_stamp_held(at: std::time::Instant, blocked: bool) {
+    let us = at.elapsed().as_micros() as u64;
+    note_store_route_us(if blocked { "stamp_held_block_us" } else { "stamp_held_us" }, us);
+    note_store_route(if blocked { "stamp_held_block_n" } else { "stamp_held_n" });
+}
+
+/// TEMP (lab, live `STAMP_SEQ=on|off`, else `REIMS_VGPU_LAB_STAMP_SEQ=on`):
+/// see [`flush_deferred_stamps`].
+pub(crate) fn stamp_seq_on() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("STAMP_SEQ") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_STAMP_SEQ").as_deref() == Ok("on"))
+}
+
+/// TEMP (lab, STAMP_SEQ): recorder jobs posted so far (0 off the Vulkan rail).
+fn recorder_posted_seq() -> u64 {
+    #[cfg(feature = "backend-vulkan")]
+    if crate::backend::selected().rail() == crate::backend::Rail::Vulkan {
+        return crate::backend::vulkan::engine::recorder_posted_seq();
+    }
+    0
 }
 
 fn write_stamp_now<H: HostMemory + HostOps>(
