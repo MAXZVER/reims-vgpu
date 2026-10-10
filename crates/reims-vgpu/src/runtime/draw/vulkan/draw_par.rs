@@ -1324,6 +1324,9 @@ pub(crate) fn prime_stream<M: HostMemory + HostOps>(
 pub(crate) struct RegionOwed {
     holds: Vec<buffer_plan::OwedHold>,
     linear: Vec<LinearMemoFact>,
+    /// What the committed draws left over (their plans, resource clones and
+    /// vectors, built on the helpers), for the reaper thread.
+    rest: Vec<(PrepareLog, TargetIdentity)>,
 }
 
 impl RegionOwed {
@@ -1333,6 +1336,9 @@ impl RegionOwed {
         }
         for fact in self.linear.drain(..) {
             fact.land(state);
+        }
+        if !self.rest.is_empty() {
+            crate::runtime::par::reap::later(std::mem::take(&mut self.rest));
         }
     }
 }
@@ -1371,8 +1377,8 @@ pub(crate) fn commit_shared<M: HostMemory + HostOps>(
     {
         return SharedCommit::Exclusive(prepared);
     }
-    let PreparedDraw { log, task_id } = prepared;
-    let Some(done) = log.done else {
+    let PreparedDraw { mut log, task_id } = prepared;
+    let Some(done) = log.done.take() else {
         return SharedCommit::Invalid(Bail::NotDeferrable);
     };
     if task_id != req.task_id
@@ -1424,15 +1430,17 @@ pub(crate) fn commit_shared<M: HostMemory + HostOps>(
         }
         let _ = sample_plan::take_sampled_plan(state, &s.plan, true);
     }
-    owed.linear.extend(log.linear);
+    owed.linear.append(&mut log.linear);
     for n in &log.notes {
         note_sampled_ref_backing(state, task_id, n.texture_ref, n.rw, n.rh, n.mid, n.route);
         crate::runtime::scanout::note_sampled_surface_field(state, host, n.mid, n.texture_ref, n.route);
     }
-    let mut resources = done.resources.into_inner();
+    let PreparedRequest { resources, meta, chain_identity, kind: _ } = done;
+    let mut resources = resources.into_inner();
     pass_stage::arm_seed_stage(&mut resources);
-    crate::backend::vulkan::engine::submit_deferred_draw(state, resources, done.meta);
+    crate::backend::vulkan::engine::submit_deferred_draw(state, resources, meta);
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
+    owed.rest.push((log, chain_identity));
     SharedCommit::Committed
 }
 

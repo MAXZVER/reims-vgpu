@@ -6053,8 +6053,11 @@ fn finish_stream_g<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         // Shared with the frame's region jobs (TEMP lab, FRAME_GATE), which
         // index it instead of cloning a request each.
-        let mut ov_reqs: std::sync::Arc<Vec<(draw::DrawEncodeRequest, bool)>> =
-            std::sync::Arc::new(Vec::new());
+        // Dropped (and replaced) on the reaper thread: the region's helpers
+        // held clones of it (TEMP lab, b163).
+        let mut ov_reqs: crate::runtime::par::reap::Reaped<
+            std::sync::Arc<Vec<(draw::DrawEncodeRequest, bool)>>,
+        > = crate::runtime::par::reap::Reaped::new(std::sync::Arc::new(Vec::new()));
         #[cfg(feature = "backend-vulkan")]
         let mut ov_base = 0usize;
         #[cfg(feature = "backend-vulkan")]
@@ -6089,7 +6092,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                 if ov_reqs.is_empty() && ov_end - di >= min_draws {
                     if let Some(template) = attachment_template.as_ref() {
                         ov_base = di;
-                        ov_reqs = std::sync::Arc::new((di..ov_end)
+                        ov_reqs = crate::runtime::par::reap::Reaped::new(std::sync::Arc::new((di..ov_end)
                             .map(|j| {
                                 let pd = draw_list[j];
                                 let mut r = retarget_render_pass_draw(template, pd);
@@ -6103,7 +6106,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                                 let (do_writeback, _) = multi_draw_store_plan(draw_list.len(), j);
                                 (r, do_writeback)
                             })
-                            .collect());
+                            .collect()));
                         // The helper that prepared it ahead resolved its sources.
                         if ahead.is_none() {
                             crate::runtime::draw::vulkan::draw_par::prime_stream(state, host, &ov_reqs[..]);

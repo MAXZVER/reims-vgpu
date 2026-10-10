@@ -67,6 +67,7 @@
 pub(crate) mod ahead;
 pub(crate) mod gate;
 mod pool;
+pub(crate) mod reap;
 pub(crate) mod selftest;
 pub(crate) mod staging;
 #[cfg(test)]
