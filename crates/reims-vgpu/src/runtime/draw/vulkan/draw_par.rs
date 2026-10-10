@@ -1608,6 +1608,114 @@ where
     stop
 }
 
+/// TEMP (lab, FRAME_GATE): [`run_region`] on the drain's gate. The records'
+/// preparations are frame jobs (no fork: the helpers are already serving the
+/// frame), the drain commits each in order with the gate open, and the gate
+/// closes only to land what the commits owe. Without a frame, [`run_region`].
+pub(crate) fn run_region_g<M, S>(
+    g: &mut crate::runtime::par::Gate<'_, '_>,
+    host: &mut M,
+    all: &Arc<Vec<(DrawEncodeRequest, bool)>>,
+    from: usize,
+    carried: Vec<Carried>,
+    mut step: S,
+) -> RegionStop
+where
+    M: HostMemory + HostOps,
+    S: FnMut(&DeviceState, &mut M, usize, &DrawEncodeRequest, &bool, PreparedDraw, &mut RegionOwed) -> RegionStep,
+{
+    let reqs = &all[from..];
+    if !g.has_frame() {
+        return run_region(g.st(), host, reqs, carried, step);
+    }
+    let nc = carried.len().min(reqs.len());
+    let jobs = &reqs[nc..];
+    if !jobs.is_empty() {
+        crate::runtime::drain::note_store_route_n("draw_par_offered", jobs.len() as u64);
+    }
+    crate::runtime::drain::note_store_route("draw_par_regions");
+    crate::runtime::drain::note_store_route("draw_par_regions_frame");
+    let tickets: Vec<crate::runtime::par::Ticket<Option<PreparedDraw>>> = (0..jobs.len())
+        .map(|i| {
+            let all = Arc::clone(all);
+            let at = from + nc + i;
+            g.push(move |st, env| prepare_job(st, env, &all[at]))
+        })
+        .collect();
+    g.open();
+    let mut owed = RegionOwed::default();
+    let mut carried: Vec<Option<Carried>> = carried.into_iter().take(nc).map(Some).collect();
+    // The records after `k` the helpers had already attempted, in order; the
+    // rest are cancelled (prepared afresh by the next region).
+    let stop_at = |g: &crate::runtime::par::Gate<'_, '_>,
+                   k: usize,
+                   exclusive: Option<PreparedDraw>,
+                   carried: &mut Vec<Option<Carried>>|
+     -> RegionStop {
+        let mut after: Vec<Carried> = carried
+            .iter_mut()
+            .skip(k + 1)
+            .filter_map(Option::take)
+            .collect();
+        let from_job = (k + 1).saturating_sub(nc);
+        for t in tickets.iter().skip(from_job) {
+            t.cancel();
+        }
+        for t in tickets.iter().skip(from_job) {
+            if t.queued() {
+                break;
+            }
+            match g.wait(t) {
+                Some(Ok(Some(p))) => after.push(Carried::Prepared(p)),
+                Some(_) => after.push(Carried::Bailed),
+                None => break,
+            }
+        }
+        RegionStop {
+            at: k,
+            exclusive,
+            after,
+        }
+    };
+    let mut prepared_n = 0u64;
+    let mut stop = None;
+    for k in 0..reqs.len() {
+        let prepared = if k < nc {
+            match carried[k].take() {
+                Some(Carried::Prepared(p)) => Some(p),
+                _ => None,
+            }
+        } else {
+            match g.wait(&tickets[k - nc]) {
+                Some(Ok(Some(p))) => {
+                    prepared_n += 1;
+                    Some(p)
+                }
+                _ => None,
+            }
+        };
+        let Some(prepared) = prepared else {
+            stop = Some(stop_at(g, k, None, &mut carried));
+            break;
+        };
+        match step(g.sh(), host, k, &reqs[k].0, &reqs[k].1, prepared, &mut owed) {
+            RegionStep::Committed => {}
+            RegionStep::Stop(exclusive) => {
+                stop = Some(stop_at(g, k, exclusive, &mut carried));
+                break;
+            }
+        }
+    }
+    crate::runtime::drain::note_store_route_n("draw_par_prepared", prepared_n);
+    let stop = stop.unwrap_or(RegionStop {
+        at: reqs.len(),
+        exclusive: None,
+        after: Vec::new(),
+    });
+    owed.land(g.st());
+    stop
+}
+
 // ---------------------------------------------------------------------------
 // The fork
 // ---------------------------------------------------------------------------

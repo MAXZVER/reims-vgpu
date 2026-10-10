@@ -126,6 +126,9 @@ struct BackingRead {
 pub(crate) struct Witness {
     names: Vec<NameRead>,
     backings: Vec<BackingRead>,
+    /// The names generation when a probe found no backing for a surface
+    /// (guest object lists read): it must not have moved.
+    no_backing_gen: Option<u64>,
 }
 
 impl Witness {
@@ -136,7 +139,8 @@ impl Witness {
             let now = objects::resolve_resource_peek(state, n.task_id, n.obj_ref)
                 .map(|r| Arc::as_ptr(&r) as usize);
             now == n.resource
-        }) && self.backings.iter().all(|b| {
+        }) && self.no_backing_gen.is_none_or(|g| state.names_gen() == g)
+            && self.backings.iter().all(|b| {
             state.mappings.get(&b.surface_id).is_some_and(|m| {
                 m.owner_task_hint == b.owner_task
                     && m.map_generation == b.map_generation
@@ -149,7 +153,7 @@ impl Witness {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SpecFence {
+pub(super) struct SpecFence {
     task_id: u32,
     domain: FenceDomain,
     fence_ref: u32,
@@ -237,7 +241,10 @@ impl WalkState for SpecWalk<'_> {
                 }
                 true
             }
-            Some(false) => false,
+            Some(false) => {
+                self.witness.no_backing_gen.get_or_insert(self.st.names_gen());
+                false
+            }
             None => {
                 self.abort("cold_backing");
                 false
@@ -302,6 +309,12 @@ pub(crate) fn walk_stream_spec<M: HostMemory + HostOps>(
         }
         super::walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
             if spec.aborted.is_none() {
+                // TEMP (lab, FRAME_GATE): a helper's walk gives way to a
+                // closing gate (the drain walks this stream itself).
+                if crate::runtime::par::gate::job_should_stop() {
+                    spec.aborted = Some("gate_closing");
+                    return;
+                }
                 super::handle_render_record(&mut spec, host, task_id, op, cmd, &mut out, &mut acc);
             }
         });
@@ -311,6 +324,7 @@ pub(crate) fn walk_stream_spec<M: HostMemory + HostOps>(
                 "cold_mapper_ref" => "walk_ahead_abort_cold_mapper_ref",
                 "cold_backing" => "walk_ahead_abort_cold_backing",
                 "indirect_draw" => "walk_ahead_abort_indirect",
+                "gate_closing" => "walk_ahead_abort_gate_closing",
                 _ => "walk_ahead_abort_other",
             });
             return None;
@@ -362,6 +376,51 @@ pub(super) fn take_walk(
     }
     crate::runtime::drain::note_store_route("walk_ahead_used");
     Some(acc)
+}
+
+/// TEMP (lab, FRAME_GATE): [`take_walk`] under the shared state: the
+/// accumulator and the fences still to apply (exclusive, [`apply_fences`]).
+pub(super) fn take_walk_shared(
+    state: &DeviceState,
+    spec: SpecStream,
+    out: &mut ExecResult,
+) -> Option<(StreamAccum, Vec<SpecFence>)> {
+    if !spec.witness.holds(state) {
+        crate::runtime::drain::note_store_route("walk_ahead_stale");
+        return None;
+    }
+    let SpecStream {
+        acc,
+        out: walked,
+        fences,
+        ..
+    } = spec;
+    for r in walked.texture_refs {
+        if !out.texture_refs.contains(&r) {
+            out.texture_refs.push(r);
+        }
+    }
+    for m in walked.mapper_ref_texture_mappings {
+        if !out.mapper_ref_texture_mappings.contains(&m) {
+            out.mapper_ref_texture_mappings.push(m);
+        }
+    }
+    out.buffer_unbinds += walked.buffer_unbinds;
+    out.texture_unbinds += walked.texture_unbinds;
+    out.sampler_unbinds += walked.sampler_unbinds;
+    out.saw_draw |= walked.saw_draw;
+    crate::runtime::drain::note_store_route("walk_ahead_used");
+    if !fences.is_empty() {
+        crate::runtime::drain::note_store_route("walk_ahead_fences");
+    }
+    Some((acc, fences))
+}
+
+/// TEMP (lab, FRAME_GATE): the fences a shared take left to the drain.
+pub(super) fn apply_fences(state: &mut DeviceState, fences: Vec<SpecFence>) {
+    for f in fences {
+        let _ = crate::runtime::fence_exec::execute_fence(state, f.task_id, f.domain, f.fence_ref, f.action);
+    }
 }
 
 /// TEMP (lab, WALK_AHEAD_CHECK): compare a helper's walk with the drain's own

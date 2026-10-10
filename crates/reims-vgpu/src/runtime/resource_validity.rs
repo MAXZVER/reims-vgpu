@@ -83,6 +83,35 @@ pub struct ValidityOutcome {
 /// statement about that object is a statement about both. That candidate set is
 /// [`DeviceState::mappings_named_by`], shared with the render-frame ledger so
 /// the two cannot disagree about which mappings a reference names.
+/// TEMP (lab, FRAME_GATE): [`apply`]'s answer when it would write nothing -
+/// no clear op and every named surface already in the state the set ops ask
+/// for - read under the shared state: `Some(missed)`. `None`: [`apply`] writes.
+pub fn apply_peek(
+    state: &DeviceState,
+    task_id: u32,
+    object_id: u32,
+    ops: InvalidateValidityOps,
+) -> Option<bool> {
+    if object_id == 0 {
+        return Some(false);
+    }
+    if ops.clear_host_valid != 0 || ops.clear_guest_valid != 0 {
+        return None;
+    }
+    let targets = state.mappings_named_by(task_id, object_id);
+    let mut hit = false;
+    for id in targets.iter() {
+        let Some(m) = state.mappings.get(&id) else {
+            continue;
+        };
+        hit = true;
+        if next_validity(m.validity, ops) != m.validity {
+            return None;
+        }
+    }
+    Some(!hit)
+}
+
 pub fn apply(
     state: &mut DeviceState,
     task_id: u32,

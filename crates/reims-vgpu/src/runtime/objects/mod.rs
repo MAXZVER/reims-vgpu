@@ -5945,21 +5945,45 @@ pub fn resolve_backing_peek<M: HostMemory>(
         if entry.object_type != OBJECT_TYPE_BACKING {
             continue;
         }
-        let desc = read_descriptor_small(state, host, task_id, &entry)?;
-        if !state.objects.contains(&(task_id, surface_id)) || state.max_task_id_seen < task_id {
+        let route = crate::runtime::drain::note_store_route;
+        let Some(desc) = read_descriptor_small(state, host, task_id, &entry) else {
+            route("backing_peek_cold_desc");
+            return None;
+        };
+        if !state.objects.contains(&(task_id, surface_id)) {
+            route("backing_peek_cold_not_inserted");
             return None;
         }
-        let surf = decode_backing(&desc)?;
-        let warm = state.mappings.get(&surface_id).is_some_and(|m| {
-            m.mapped
-                && !m.page_entries.is_empty()
-                && m.has_geom
-                && backing_matches_latched_geom(m, &surf)
-                && m.owner_task_hint == task_id
-        });
-        return warm.then_some(true);
+        if state.max_task_id_seen < task_id {
+            route("backing_peek_cold_task_seen");
+            return None;
+        }
+        let Some(surf) = decode_backing(&desc) else {
+            route("backing_peek_cold_decode");
+            return None;
+        };
+        let Some(m) = state.mappings.get(&surface_id) else {
+            route("backing_peek_cold_no_mapping");
+            return None;
+        };
+        if !m.mapped || m.page_entries.is_empty() {
+            route("backing_peek_cold_unmapped");
+            return None;
+        }
+        if !m.has_geom || !backing_matches_latched_geom(m, &surf) {
+            route("backing_peek_cold_geom");
+            return None;
+        }
+        if m.owner_task_hint != task_id {
+            route("backing_peek_cold_hint");
+            return None;
+        }
+        return Some(true);
     }
-    None
+    // No task's list names it as a backing: the drain's search ends the same
+    // way and writes nothing (no probe deferred a failure). The caller
+    // witnesses the lists it read (the names generation).
+    Some(false)
 }
 
 fn resolve_backing_ex<M: HostMemory>(

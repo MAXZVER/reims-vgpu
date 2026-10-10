@@ -816,6 +816,9 @@ pub struct ExecSubmission {
     /// TEMP (lab, WALK_AHEAD): per stream, a walk a pool helper made ahead of
     /// this submission's execution, taken (and checked) by it.
     pub(crate) lab_walks: std::sync::Mutex<Vec<Option<walk_ahead::SpecStream>>>,
+    /// TEMP (lab, FRAME_GATE): its execution began, so a walk still queued
+    /// for it is no longer wanted.
+    pub(crate) lab_exec_started: std::sync::atomic::AtomicBool,
 }
 
 impl ExecSubmission {
@@ -847,13 +850,42 @@ impl ExecSubmission {
             .streams
             .iter()
             .map(|stream| {
-                if closing.load(std::sync::atomic::Ordering::Relaxed) {
+                if closing.load(std::sync::atomic::Ordering::Relaxed)
+                    || crate::runtime::par::gate::job_should_stop()
+                {
                     return None;
                 }
                 walk_ahead::walk_stream_spec(st, host, self.task_id, stream)
             })
             .collect();
         *self.lab_walks.lock().unwrap_or_else(|e| e.into_inner()) = walks;
+    }
+
+    /// TEMP (lab, FRAME_GATE): [`Self::lab_walk_ahead`] as a frame job: stops
+    /// when the gate closes or the submission starts executing.
+    pub(crate) fn lab_walk_ahead_gate<M: HostMemory + HostOps>(&self, st: &DeviceState, host: &M) {
+        let stop = || {
+            crate::runtime::par::gate::job_should_stop()
+                || self.lab_exec_started.load(std::sync::atomic::Ordering::Acquire)
+        };
+        if stop() {
+            crate::runtime::drain::note_store_route("gate_walk_ahead_skipped");
+            return;
+        }
+        let mut walks: Vec<Option<walk_ahead::SpecStream>> = Vec::with_capacity(self.streams.len());
+        for stream in &self.streams {
+            if stop() {
+                crate::runtime::drain::note_store_route("gate_walk_ahead_cut");
+                return;
+            }
+            walks.push(walk_ahead::walk_stream_spec(st, host, self.task_id, stream));
+        }
+        if self.lab_exec_started.load(std::sync::atomic::Ordering::Acquire) {
+            crate::runtime::drain::note_store_route("gate_walk_ahead_late");
+            return;
+        }
+        *self.lab_walks.lock().unwrap_or_else(|e| e.into_inner()) = walks;
+        crate::runtime::drain::note_store_route("gate_walk_ahead_done");
     }
 
     /// A submission stated outright rather than read out of a packet.
@@ -870,6 +902,7 @@ impl ExecSubmission {
             resource_descs: Vec::new(),
             streams,
             lab_walks: std::sync::Mutex::new(Vec::new()),
+            lab_exec_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -966,6 +999,7 @@ fn read_submission<M: HostMemory + HostOps>(
         resource_descs,
         streams,
         lab_walks: std::sync::Mutex::new(Vec::new()),
+            lab_exec_started: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -1057,8 +1091,22 @@ pub fn preflight_submission<M: HostMemory + HostOps>(
 /// Everything here mutates something the guest can see, which is what makes it
 /// the third step rather than part of the second: the resource table is
 /// consumed before the first record, and the records encode.
+#[cfg(test)]
 fn execute_submission<M: HostMemory + HostOps>(
     state: &mut DeviceState,
+    host: &mut M,
+    submission: &ExecSubmission,
+    resolved: Option<&reims_vgpu_core::exec::ExecWork>,
+    out: &mut ExecResult,
+    measured_ns: &mut u64,
+) {
+    let lock = crate::runtime::par::FrameLock::new(state);
+    let mut g = crate::runtime::par::Gate::new(&lock, None);
+    execute_submission_g(&mut g, host, submission, resolved, out, measured_ns);
+}
+
+fn execute_submission_g<M: HostMemory + HostOps>(
+    g: &mut crate::runtime::par::Gate<'_, '_>,
     host: &mut M,
     submission: &ExecSubmission,
     resolved: Option<&reims_vgpu_core::exec::ExecWork>,
@@ -1070,7 +1118,9 @@ fn execute_submission<M: HostMemory + HostOps>(
         resource_descs,
         streams,
         lab_walks,
+        lab_exec_started,
     } = submission;
+    lab_exec_started.store(true, std::sync::atomic::Ordering::Release);
     let mut lab_walks = std::mem::take(&mut *lab_walks.lock().unwrap_or_else(|e| e.into_inner()));
     let task_id = *task_id;
 
@@ -1079,7 +1129,7 @@ fn execute_submission<M: HostMemory + HostOps>(
     // pixels the guest has since overwritten has to go now — landing it later
     // would replace the guest's own bytes with a frame the guest has declared
     // stale.
-    consume_resource_table(state, host, task_id, resource_descs);
+    consume_resource_table_g(g, host, task_id, resource_descs);
 
     // One cursor for the whole packet, not one per buffer: a packet's
     // command-buffer table is one submission and the model resolved all of it
@@ -1092,8 +1142,41 @@ fn execute_submission<M: HostMemory + HostOps>(
         // TEMP (lab, WALK_AHEAD): the helper's walk of this stream, when what it
         // read still holds; `WALK_AHEAD_CHECK` walks anyway and compares.
         let spec = lab_walks.get_mut(si).and_then(Option::take);
+        if spec.is_some() {
+            crate::runtime::drain::note_store_route("gate_walk_ahead_ready");
+        }
+        // TEMP (lab, FRAME_GATE): no helper walk - the drain walks it itself
+        // under the shared state, with the gate open for the frame's jobs.
+        let spec = if spec.is_none() && g.has_frame() && gate_walk_open_on() {
+            g.open();
+            let walked = walk_ahead::walk_stream_spec(g.sh(), &*host, task_id, stream);
+            if walked.is_some() {
+                crate::runtime::drain::note_store_route("gate_walk_open");
+            }
+            walked
+        } else {
+            spec
+        };
         let check = spec.is_some() && walk_ahead_check_on();
-        let mut acc = match spec {
+        // TEMP (lab, FRAME_GATE): a walk whose witness holds is taken shared;
+        // only its recorded fences (if any) take the exclusive phase.
+        let (spec, taken) = match spec {
+            Some(spec) if !check && g.has_frame() => match walk_ahead::take_walk_shared(g.sh(), spec, out) {
+                Some((acc, fences)) => {
+                    if !fences.is_empty() {
+                        walk_ahead::apply_fences(g.st(), fences);
+                    }
+                    resolved = None;
+                    (None, Some(acc))
+                }
+                None => (None, None),
+            },
+            other => (other, None),
+        };
+        let state = g.st();
+        let mut acc = match (spec, taken) {
+            (_, Some(acc)) => acc,
+            (spec, None) => match spec {
             Some(spec) if check => {
                 let mut acc = StreamAccum::default();
                 walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut());
@@ -1118,19 +1201,27 @@ fn execute_submission<M: HostMemory + HostOps>(
                 walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut());
                 acc
             }
+            },
         };
         acc.memo.flush();
         let walk_ns = walk_started.elapsed().as_nanos() as u64;
         *measured_ns += walk_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
         let finish_started = crate::lab_clock::LabInstant::now();
-        finish_stream(state, host, task_id, out, &acc);
+        finish_stream_g(g, host, task_id, out, &acc);
+        let state = g.st();
         let finish_ns = finish_started.elapsed().as_nanos() as u64;
         *measured_ns += finish_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
         // TEMP (lab, `REIMS_VGPU_LAB_PREEMPT_INNER`): the control channels, between streams.
         crate::runtime::drain::lab_preempt_between_streams(state, host);
     }
+}
+
+/// TEMP (lab, live `GATE_WALK_OPEN`, default on with FRAME_GATE): a stream no
+/// helper walked is walked by the drain under the shared state, gate open.
+fn gate_walk_open_on() -> bool {
+    crate::runtime::lab_live::on("GATE_WALK_OPEN").unwrap_or(true)
 }
 
 /// TEMP (lab, live `WALK_AHEAD_CHECK=on`): a helper's walk is compared with the
@@ -1168,6 +1259,18 @@ pub fn execute_planned<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     inputs: RetainedInputs<'_>,
+    out: ExecResult,
+) -> ExecResult {
+    let lock = crate::runtime::par::FrameLock::new(state);
+    let mut g = crate::runtime::par::Gate::new(&lock, None);
+    execute_planned_g(&mut g, host, inputs, out)
+}
+
+/// [`execute_planned`] on the drain's gate (TEMP lab, FRAME_GATE).
+pub fn execute_planned_g<M: HostMemory + HostOps>(
+    g: &mut crate::runtime::par::Gate<'_, '_>,
+    host: &mut M,
+    inputs: RetainedInputs<'_>,
     mut out: ExecResult,
 ) -> ExecResult {
     let started = crate::lab_clock::LabInstant::now();
@@ -1178,8 +1281,8 @@ pub fn execute_planned<M: HostMemory + HostOps>(
     // pure CPU work over bytes the submission already holds, where the read
     // walks the guest's page tables and the execution consumes the resource
     // table.
-    execute_submission(
-        state,
+    execute_submission_g(
+        g,
         host,
         inputs.submission,
         Some(inputs.resolved),
@@ -1293,6 +1396,50 @@ fn note_exec_header(exec_started: crate::lab_clock::LabInstant, measured_ns: u64
 ///
 /// The census that measured it is gone; a correlation with no counter-examples
 /// over 19 135 trials is a finding, not a thing to keep re-deriving per frame.
+/// TEMP (lab, FRAME_GATE): [`consume_resource_table`] on the gate - a table
+/// that changes nothing (the steady state: set ops already true, no clear) is
+/// read shared; anything else takes the exclusive phase.
+fn consume_resource_table_g<M: HostMemory + HostOps>(
+    g: &mut crate::runtime::par::Gate<'_, '_>,
+    host: &mut M,
+    task_id: u32,
+    descs: &[ExecResourceDesc],
+) {
+    if g.has_frame() {
+        let st = g.sh();
+        let mut no_surface = 0u32;
+        let mut unknown = 0u32;
+        let mut shared = true;
+        for d in descs {
+            if d.tail_nonzero_bytes() > 0 {
+                shared = false;
+                break;
+            }
+            match crate::runtime::resource_validity::apply_peek(st, task_id, d.object_id, d.ops) {
+                None => {
+                    shared = false;
+                    break;
+                }
+                Some(false) => {}
+                Some(true) => {
+                    if st.objects.contains(&(task_id, d.object_id)) {
+                        no_surface = no_surface.saturating_add(1);
+                    } else {
+                        unknown = unknown.saturating_add(1);
+                    }
+                }
+            }
+        }
+        if shared {
+            crate::runtime::drain::note_store_route("gate_res_table_shared");
+            crate::runtime::drain::note_store_route_n("validity_no_surface", no_surface as u64);
+            crate::runtime::drain::note_store_route_n("validity_unknown_object", unknown as u64);
+            return;
+        }
+    }
+    consume_resource_table(g.st(), host, task_id, descs);
+}
+
 fn consume_resource_table<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -5388,6 +5535,22 @@ fn finish_stream<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     acc: &StreamAccum,
 ) {
+    let lock = crate::runtime::par::FrameLock::new(state);
+    let mut g = crate::runtime::par::Gate::new(&lock, None);
+    finish_stream_g(&mut g, host, task_id, out, acc);
+}
+
+/// [`finish_stream`] on the drain's gate (TEMP lab, FRAME_GATE): exclusive,
+/// but for its DRAW_PAR regions, which run on the frame's jobs.
+#[allow(unused_assignments)]
+fn finish_stream_g<M: HostMemory + HostOps>(
+    g: &mut crate::runtime::par::Gate<'_, '_>,
+    host: &mut M,
+    task_id: u32,
+    out: &mut ExecResult,
+    acc: &StreamAccum,
+) {
+    let mut state = g.st();
     let draws_at_entry = (out.metal_draws_ok, out.metal_draws_fail);
     let clears_at_entry = out.clears_applied;
     // TEMP (lab, RESOLVE_MEMO): no sampled source outlives the stream.
@@ -5830,7 +5993,10 @@ fn finish_stream<M: HostMemory + HostOps>(
             draw_list.len().saturating_sub(1)
         };
         #[cfg(feature = "backend-vulkan")]
-        let mut ov_reqs: Vec<(draw::DrawEncodeRequest, bool)> = Vec::new();
+        // Shared with the frame's region jobs (TEMP lab, FRAME_GATE), which
+        // index it instead of cloning a request each.
+        let mut ov_reqs: std::sync::Arc<Vec<(draw::DrawEncodeRequest, bool)>> =
+            std::sync::Arc::new(Vec::new());
         #[cfg(feature = "backend-vulkan")]
         let mut ov_base = 0usize;
         #[cfg(feature = "backend-vulkan")]
@@ -5859,7 +6025,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 if ov_reqs.is_empty() && ov_end - di >= crate::runtime::draw::vulkan::draw_par::MIN_DRAWS {
                     if let Some(template) = attachment_template.as_ref() {
                         ov_base = di;
-                        ov_reqs = (di..ov_end)
+                        ov_reqs = std::sync::Arc::new((di..ov_end)
                             .map(|j| {
                                 let pd = draw_list[j];
                                 let mut r = retarget_render_pass_draw(template, pd);
@@ -5873,16 +6039,17 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 let (do_writeback, _) = multi_draw_store_plan(draw_list.len(), j);
                                 (r, do_writeback)
                             })
-                            .collect();
-                        crate::runtime::draw::vulkan::draw_par::prime_stream(state, host, &ov_reqs);
+                            .collect());
+                        crate::runtime::draw::vulkan::draw_par::prime_stream(state, host, &ov_reqs[..]);
                     }
                 }
                 if !ov_reqs.is_empty() && di >= ov_base {
                     let carried = std::mem::take(&mut ov_carried);
-                    let stop = crate::runtime::draw::vulkan::draw_par::run_region(
-                        state,
+                    let stop = crate::runtime::draw::vulkan::draw_par::run_region_g(
+                        g,
                         host,
-                        &ov_reqs[di - ov_base..],
+                        &ov_reqs,
+                        di - ov_base,
                         carried,
                         |st, h, _k, req, writeback, prepared, owed| {
                             use crate::runtime::draw::vulkan::draw_par::{RegionStep, SharedCommit};
@@ -5919,6 +6086,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                             }
                         },
                     );
+                    state = g.st();
                     let stop_di = di + stop.at;
                     ov_carried = stop.after;
                     ov_exclusive = stop.exclusive.map(|p| (stop_di, p));

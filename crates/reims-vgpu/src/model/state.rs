@@ -3138,6 +3138,56 @@ fn note_lifecycle_effects(
     }
 }
 
+/// TEMP (lab, FRAME_GATE): a drain-private word the drain may write while
+/// the frame's helpers hold the state shared (an atomic, so a shared
+/// reference may change it). Nothing but the drain thread writes it.
+#[derive(Debug, Default)]
+pub struct DrainU32(std::sync::atomic::AtomicU32);
+
+impl DrainU32 {
+    pub const fn new(v: u32) -> Self {
+        DrainU32(std::sync::atomic::AtomicU32::new(v))
+    }
+    #[inline]
+    pub fn get(&self) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[inline]
+    pub fn set(&self, v: u32) {
+        self.0.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn or(&self, bits: u32) {
+        self.set(self.get() | bits);
+    }
+    #[inline]
+    pub fn and(&self, bits: u32) {
+        self.set(self.get() & bits);
+    }
+}
+
+/// TEMP (lab, FRAME_GATE): [`DrainU32`]'s 64-bit sibling.
+#[derive(Debug, Default)]
+pub struct DrainU64(std::sync::atomic::AtomicU64);
+
+impl DrainU64 {
+    pub const fn new(v: u64) -> Self {
+        DrainU64(std::sync::atomic::AtomicU64::new(v))
+    }
+    #[inline]
+    pub fn get(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[inline]
+    pub fn bump(&self) {
+        self.0.store(self.get().wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn set(&self, v: u64) {
+        self.0.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Full device model state (backend-independent).
 #[derive(Debug)]
 pub struct DeviceState {
@@ -3194,7 +3244,7 @@ pub struct DeviceState {
     /// nothing on a draw rail parks or runs work — see
     /// [`crate::runtime::parked::ParkedStore`], which owns the identity of a
     /// parked position and deliberately not its readiness.
-    pub parked: crate::runtime::parked::ParkedStore,
+    pub parked: parking_lot::Mutex<crate::runtime::parked::ParkedStore>,
     /// Child channels whose head `EXEC_INDIRECT2` packet is held while an
     /// immutable AIR translation is still loading. The packet head and stamp
     /// remain untouched until retry, so this is scheduler state rather than a
@@ -3580,7 +3630,7 @@ pub struct DeviceState {
     /// `#[cfg(test)]` because in a product boot nothing ever read it, so it grew
     /// for the life of the guest holding the one copy of nothing.
     #[cfg(test)]
-    pub fails: Vec<FailEvent>,
+    pub fails: parking_lot::Mutex<Vec<FailEvent>>,
     /// Last successful directed mapper capture (consumed on matching MAP/UNMAP).
     pub mapper_capture: Option<MapperCapture>,
     /// Cached IOSurfaceParavirtMapperDevice KVA from capture.
@@ -3595,11 +3645,11 @@ pub struct DeviceState {
     pub fence_generations: BTreeMap<(u32, u8, u32), u64>,
     /// Child channel currently being drained (0 = none). Convenience for
     /// single-level skip; prefer [`Self::draining_mask`] for nested drains.
-    pub draining_channel: u32,
+    pub draining_channel: DrainU32,
     /// Bitmask of child channels mid-`drain_child_fifo` (stack). Nested
     /// `drain_other_child_fifos` must skip **all** bits set — otherwise it can
     /// re-enter a mid-packet channel and re-process the same head.
-    pub draining_mask: u32,
+    pub draining_mask: DrainU32,
     /// Contiguous mapping views (`MappingEntry::contig_ptr`) whose page tables
     /// changed. `DeviceState` cannot unmap (no HostOps); the runtime flushes
     /// these via `HostOps::unmap_pages` after retiring the backend objects and
@@ -3657,7 +3707,7 @@ pub struct DeviceState {
     /// it allocated for it. Counting stamps gives every deferred window an
     /// answer to the one question its page-set guard cannot ask: was the guest
     /// told this render was done before we wrote its bytes?
-    pub completion_stamp_seq: u64,
+    pub completion_stamp_seq: DrainU64,
     /// The guest has CPU-written a presented framebuffer under a live resident:
     /// its compositor fills back buffers by copying from the front one with the
     /// CPU. From then on every presented framebuffer's frame is written back
@@ -3667,21 +3717,21 @@ pub struct DeviceState {
     pub guest_copies_framebuffers: bool,
     /// TEMP (lab, REIMS_VGPU_LAB_HOLD_PRESENT_STAMP): completion words held back
     /// from the DisplaySwap that started the hold to the end of the settle loop.
-    pub lab_held_words: Vec<(u32, u32, u32)>,
+    pub lab_held_words: parking_lot::Mutex<Vec<(u32, u32, u32)>>,
     /// TEMP (lab, STAMP_DEFER): completion words held until the recorder has
     /// recorded every draw before them, as `(slot, value, recorder jobs posted
     /// before it, held since)` in publish order (STAMP_SEQ).
-    pub lab_deferred_stamps: Vec<(u32, u32, u64, std::time::Instant)>,
-    pub lab_hold_since: Option<std::time::Instant>,
-    pub lab_hold_packets: u32,
-    pub lab_hold_exec_us: u64,
+    pub lab_deferred_stamps: parking_lot::Mutex<Vec<(u32, u32, u64, std::time::Instant)>>,
+    pub lab_hold_since: parking_lot::Mutex<Option<std::time::Instant>>,
+    pub lab_hold_packets: DrainU32,
+    pub lab_hold_exec_us: DrainU64,
     /// Census only: what this device has stamped, split by whether the value is
     /// still owed by the coalescing rail or already handed to publication.
     ///
     /// Sizes the one repair available for the held-packet cost, and says which
     /// unmet waits are honest. Feeds no verdict — see
     /// [`crate::runtime::drain::StampLedger`].
-    pub stamp_ledger: crate::runtime::drain::StampLedger,
+    pub stamp_ledger: parking_lot::Mutex<crate::runtime::drain::StampLedger>,
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
@@ -3774,7 +3824,7 @@ impl DeviceState {
                 reims_vgpu_core::identity::SessionId(id.0 as u32),
             )),
             lab_shadow: Default::default(),
-            parked: crate::runtime::parked::ParkedStore::new(),
+            parked: parking_lot::Mutex::new(crate::runtime::parked::ParkedStore::new()),
             translation_deferred_mask: 0,
             translation_order_hold_mask: 0,
             translation_order_holds: 0,
@@ -3821,23 +3871,23 @@ impl DeviceState {
             mapper_device_kva: 0,
             display: DisplayHandshake::default(),
             #[cfg(test)]
-            fails: Vec::new(),
+            fails: parking_lot::Mutex::new(Vec::new()),
             fence_generations: BTreeMap::new(),
-            draining_channel: 0,
-            draining_mask: 0,
+            draining_channel: DrainU32::new(0),
+            draining_mask: DrainU32::new(0),
             retired_views: Vec::new(),
             retired_guest_imports: Vec::new(),
             retired_guest_write_tokens: Vec::new(),
             retired_linear_residents: Vec::new(),
             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
-            completion_stamp_seq: 0,
+            completion_stamp_seq: DrainU64::new(0),
             guest_copies_framebuffers: false,
-            lab_held_words: Vec::new(),
-            lab_deferred_stamps: Vec::new(),
-            lab_hold_since: None,
-            lab_hold_packets: 0,
-            lab_hold_exec_us: 0,
-            stamp_ledger: Default::default(),
+            lab_held_words: parking_lot::Mutex::new(Vec::new()),
+            lab_deferred_stamps: parking_lot::Mutex::new(Vec::new()),
+            lab_hold_since: parking_lot::Mutex::new(None),
+            lab_hold_packets: DrainU32::new(0),
+            lab_hold_exec_us: DrainU64::new(0),
+            stamp_ledger: parking_lot::Mutex::new(Default::default()),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
@@ -6510,6 +6560,11 @@ impl DeviceState {
         self.par.as_deref()
     }
 
+    /// TEMP (lab, FRAME_GATE): the pool as the owner a frame keeps alive.
+    pub fn par_arc(&self) -> Option<Arc<crate::runtime::par::Pool>> {
+        self.par.clone()
+    }
+
     /// Give this state the pool its bound device created. Called once, at
     /// device creation, before any guest work exists.
     pub fn install_par_pool(&mut self, pool: Arc<crate::runtime::par::Pool>) {
@@ -6617,7 +6672,7 @@ impl DeviceState {
         }
     }
 
-    pub fn record_fail(&mut self, ev: FailEvent) {
+    pub fn record_fail(&self, ev: FailEvent) {
         // Fail-visible (I2): decode/contract gaps must reach the always-on fail
         // log, not only the in-memory test vec — silently dropped commands
         // (e.g. unknown display-channel opcodes) otherwise leave no trace in a
@@ -6629,7 +6684,7 @@ impl DeviceState {
         // greppable by the vocabulary every other subsystem uses.
         crate::observe::Emit::decline("fail_event", &ev).fail();
         #[cfg(test)]
-        self.fails.push(ev);
+        self.fails.lock().push(ev);
     }
 
     /// [`Self::record_fail`], but the line is emitted only the first time this
@@ -6644,12 +6699,12 @@ impl DeviceState {
     /// The in-memory vec is still appended on every call. It is the tests'
     /// view, and a test asserting that a second packet was declined would
     /// otherwise be asserting the latch instead.
-    pub fn record_fail_once(&mut self, ev: FailEvent, discriminant: u64) {
+    pub fn record_fail_once(&self, ev: FailEvent, discriminant: u64) {
         if crate::observe::first_sight(crate::observe::Decline::slug(&ev), discriminant) {
             crate::observe::Emit::decline("fail_event", &ev).fail();
         }
         #[cfg(test)]
-        self.fails.push(ev);
+        self.fails.lock().push(ev);
         #[cfg(not(test))]
         let _ = ev;
     }

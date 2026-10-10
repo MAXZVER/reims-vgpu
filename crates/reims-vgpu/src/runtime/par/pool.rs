@@ -193,6 +193,8 @@ struct HandOff {
     /// Bumped once per published batch.
     epoch: u64,
     batch: Option<Arc<Batch>>,
+    /// TEMP (lab, FRAME_GATE): the frame the helpers serve, when one is open.
+    frame: Option<Arc<FrameShared>>,
     stopping: bool,
 }
 
@@ -268,6 +270,7 @@ impl Pool {
                 hand_off: Mutex::new(HandOff {
                     epoch: 0,
                     batch: None,
+                    frame: None,
                     stopping: false,
                 }),
                 wake: Condvar::new(),
@@ -1086,10 +1089,13 @@ fn worker_main(shared: &Arc<Shared>, index: usize) {
         ops: &shared.ops,
     };
     let mut seen = 0u64;
-    while let Some((epoch, batch)) = next_batch(shared, seen) {
+    while let Some((epoch, batch, frame)) = next_batch(shared, seen) {
         seen = epoch;
         if let Some(batch) = batch {
             participate(shared, member, &batch, &env);
+        }
+        if let Some(frame) = frame {
+            serve_frame(&frame, &env);
         }
     }
     // Detach as the thread's last act, and count it after, so a test (or the
@@ -1102,7 +1108,11 @@ fn worker_main(shared: &Arc<Shared>, index: usize) {
 ///
 /// Returns the epoch and the batch current at that epoch, which may already be
 /// gone if the coordinator finished alone first.
-fn next_batch(shared: &Shared, seen: u64) -> Option<(u64, Option<Arc<Batch>>)> {
+#[allow(clippy::type_complexity)]
+fn next_batch(
+    shared: &Shared,
+    seen: u64,
+) -> Option<(u64, Option<Arc<Batch>>, Option<Arc<FrameShared>>)> {
     // TEMP (lab, live `PAR_SPIN=us`): the idle helper's spin, overriding the
     // latched `REIMS_VGPU_LAB_PAR_SPIN_US` - a helper still spinning when the
     // next scope publishes needs no wake (see `lab_wake_cap`).
@@ -1125,10 +1135,374 @@ fn next_batch(shared: &Shared, seen: u64) -> Option<(u64, Option<Arc<Batch>>)> {
             return None;
         }
         if hand_off.epoch != seen {
-            return Some((hand_off.epoch, hand_off.batch.clone()));
+            return Some((hand_off.epoch, hand_off.batch.clone(), hand_off.frame.clone()));
         }
         shared.parked.fetch_add(1, Ordering::AcqRel);
         shared.wake.wait(&mut hand_off);
         shared.parked.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TEMP (lab, FRAME_GATE): a frame - the helpers serving one gate's job queue
+// for a whole tranche (see `gate.rs`).
+// ---------------------------------------------------------------------------
+
+const J_QUEUED: u8 = 0;
+const J_RUNNING: u8 = 1;
+const J_DONE: u8 = 2;
+const J_CANCELLED: u8 = 3;
+
+type FrameFn<T> = Box<dyn FnOnce(&crate::model::DeviceState, &WorkerEnv<'_>) -> T + Send>;
+
+/// A frame job, type-erased for the queue.
+pub(crate) trait FrameJob: Send + Sync {
+    /// Queued -> running; `false` when somebody else has it or it was cancelled.
+    fn claim(&self) -> bool;
+    /// Run a claimed job.
+    fn run(&self, st: &crate::model::DeviceState, env: &WorkerEnv<'_>);
+    /// Queued -> cancelled; a running job finishes.
+    fn cancel(&self);
+}
+
+struct TypedJob<T> {
+    status: AtomicU8,
+    f: Mutex<Option<FrameFn<T>>>,
+    out: Mutex<Option<Result<T, JobPanic>>>,
+}
+
+impl<T: Send + 'static> FrameJob for TypedJob<T> {
+    fn claim(&self) -> bool {
+        self.status
+            .compare_exchange(J_QUEUED, J_RUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn run(&self, st: &crate::model::DeviceState, env: &WorkerEnv<'_>) {
+        let f = self.f.lock().take();
+        let outcome = match f {
+            Some(f) => catch_unwind(AssertUnwindSafe(|| f(st, env))).map_err(|payload| {
+                crate::runtime::drain::note_store_route("par_job_panicked");
+                crate::observe::panic::report("frame_job", payload.as_ref());
+                JobPanic {
+                    message: crate::observe::panic::payload_text(payload.as_ref()),
+                }
+            }),
+            None => Err(JobPanic {
+                message: "lost".to_string(),
+            }),
+        };
+        *self.out.lock() = Some(outcome);
+        self.status.store(J_DONE, Ordering::Release);
+    }
+
+    fn cancel(&self) {
+        let _ = self
+            .status
+            .compare_exchange(J_QUEUED, J_CANCELLED, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// The drain's handle on one pushed job.
+pub struct Ticket<T> {
+    job: Arc<TypedJob<T>>,
+}
+
+impl<T: Send + 'static> Ticket<T> {
+    pub(super) fn new(f: FrameFn<T>) -> Self {
+        Ticket {
+            job: Arc::new(TypedJob {
+                status: AtomicU8::new(J_QUEUED),
+                f: Mutex::new(Some(f)),
+                out: Mutex::new(None),
+            }),
+        }
+    }
+
+    pub(super) fn erased(&self) -> Arc<dyn FrameJob> {
+        Arc::clone(&self.job) as Arc<dyn FrameJob>
+    }
+
+    /// Whether a helper (or the drain) has finished it.
+    pub fn done(&self) -> bool {
+        self.job.status.load(Ordering::Acquire) == J_DONE
+    }
+
+    /// Whether nobody has started it yet.
+    pub fn queued(&self) -> bool {
+        self.job.status.load(Ordering::Acquire) == J_QUEUED
+    }
+
+    /// Cancel it if nobody has started it.
+    pub fn cancel(&self) {
+        self.job.cancel();
+    }
+
+    pub(super) fn try_take(&self) -> Option<Result<T, JobPanic>> {
+        if self.done() {
+            self.job.out.lock().take()
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn wait_or_run(
+        &self,
+        st: &crate::model::DeviceState,
+        frame: Option<(&ReimsVgpuHostOps, WorkerId)>,
+    ) -> Option<Result<T, JobPanic>> {
+        let job = &*self.job;
+        if let Some((ops, coordinator)) = frame {
+            if job.claim() {
+                let _planning = super::enter_planning();
+                let env = WorkerEnv {
+                    worker: coordinator,
+                    helper: false,
+                    ops,
+                };
+                job.run(st, &env);
+                crate::runtime::drain::note_store_route("frame_job_ran_here");
+                return job.out.lock().take();
+            }
+        } else {
+            job.cancel();
+        }
+        let t0 = Instant::now();
+        let mut waited = false;
+        loop {
+            match job.status.load(Ordering::Acquire) {
+                J_DONE => break,
+                J_CANCELLED => return None,
+                _ => {}
+            }
+            waited = true;
+            if t0.elapsed() < Duration::from_micros(300) {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        if waited {
+            crate::runtime::drain::note_store_route("frame_job_waited");
+            crate::runtime::drain::note_store_route_us(
+                "frame_job_wait_us",
+                t0.elapsed().as_micros() as u64,
+            );
+        }
+        job.out.lock().take()
+    }
+}
+
+/// The erased pointer to a frame's lock. See `FrameHandle`'s drop.
+struct LockPtr(*const super::gate::FrameLock<'static>);
+
+// SAFETY: the pointee is `Sync` (an `RwLock` over `&mut DeviceState`, which is
+// `Send + Sync`), and it is dereferenced only by a helper counted in `inside`
+// of a frame not yet closed, which `FrameHandle::drop` waits out.
+unsafe impl Send for LockPtr {}
+unsafe impl Sync for LockPtr {}
+
+pub(crate) struct FrameShared {
+    lock: LockPtr,
+    queue: Mutex<std::collections::VecDeque<Arc<dyn FrameJob>>>,
+    queued: AtomicUsize,
+    closed: AtomicBool,
+    /// Helpers inside `serve_frame` (they may dereference `lock`).
+    inside: AtomicUsize,
+    parked: AtomicUsize,
+    park: Mutex<()>,
+    park_cv: Condvar,
+    spin: Duration,
+    helped: AtomicU64,
+    busy_ns: AtomicU64,
+}
+
+/// The gate's handle on its frame: the pool's helpers serve its queue until
+/// this drops.
+pub struct FrameHandle {
+    pool: Arc<Pool>,
+    frame: Arc<FrameShared>,
+    pushed: std::cell::Cell<u64>,
+}
+
+impl Pool {
+    /// Open a frame over `lock`: the helpers serve its queue until the handle
+    /// drops. `None` when the pool has no helpers, was stopped, or a scope is
+    /// in flight. **The handle must drop before `lock`** (the gate owns both
+    /// in that order).
+    pub(crate) fn open_frame(
+        self: &Arc<Self>,
+        lock: &super::gate::FrameLock<'_>,
+    ) -> Option<FrameHandle> {
+        let sh = &self.shared;
+        if sh.workers == 0 || self.state.load(Ordering::Acquire) == STOPPED {
+            return None;
+        }
+        let guard = self.scope_lock.try_lock()?;
+        if !self.ensure_started() {
+            return None;
+        }
+        // Released by the handle's drop (`force_unlock`): a scope or overlap
+        // inside the frame runs serially, as for any second scope.
+        std::mem::forget(guard);
+        let spin = crate::runtime::lab_live::value("FRAME_SPIN")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(Duration::from_micros(200), Duration::from_micros);
+        // Lifetime erasure only; see `LockPtr`.
+        let ptr = lock as *const super::gate::FrameLock<'_> as *const super::gate::FrameLock<'static>;
+        let frame = Arc::new(FrameShared {
+            lock: LockPtr(ptr),
+            queue: Mutex::new(std::collections::VecDeque::new()),
+            queued: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            inside: AtomicUsize::new(0),
+            parked: AtomicUsize::new(0),
+            park: Mutex::new(()),
+            park_cv: Condvar::new(),
+            spin,
+            helped: AtomicU64::new(0),
+            busy_ns: AtomicU64::new(0),
+        });
+        {
+            let mut hand_off = sh.hand_off.lock();
+            hand_off.epoch += 1;
+            hand_off.batch = None;
+            hand_off.frame = Some(Arc::clone(&frame));
+            sh.epoch.store(hand_off.epoch, Ordering::Release);
+        }
+        // No wake here: a tranche that pushes nothing costs no helper, and
+        // the first jobs wake them one at a time (`FrameHandle::push`).
+        Some(FrameHandle {
+            pool: Arc::clone(self),
+            frame,
+            pushed: std::cell::Cell::new(0),
+        })
+    }
+}
+
+impl FrameHandle {
+    pub(super) fn ops(&self) -> (&ReimsVgpuHostOps, WorkerId) {
+        (&self.pool.shared.ops, self.pool.coordinator())
+    }
+
+    pub(super) fn push(&self, job: Arc<dyn FrameJob>, open: bool) {
+        let fr = &*self.frame;
+        fr.queue.lock().push_back(job);
+        let queued = fr.queued.fetch_add(1, Ordering::AcqRel) + 1;
+        self.pushed.set(self.pushed.get() + 1);
+        if open {
+            self.wake_for(queued);
+        }
+    }
+
+    /// Wake one parked helper when the queue holds more jobs than helpers
+    /// are awake in the frame: a frame parker first, else one parked at the
+    /// pool (not yet in this frame).
+    fn wake_for(&self, queued: usize) {
+        let fr = &*self.frame;
+        let sh = &self.pool.shared;
+        let awake = fr.inside.load(Ordering::Acquire) - fr.parked.load(Ordering::Acquire).min(fr.inside.load(Ordering::Acquire));
+        if queued <= awake {
+            return;
+        }
+        if fr.parked.load(Ordering::Acquire) > 0 {
+            let _g = fr.park.lock();
+            fr.park_cv.notify_one();
+        } else if sh.parked.load(Ordering::Acquire) > 0 {
+            sh.wake.notify_one();
+        }
+    }
+
+    /// The gate opened: wake parked helpers for the queued jobs.
+    pub(super) fn wake(&self) {
+        let queued = self.frame.queued.load(Ordering::Acquire);
+        if queued > 0 {
+            self.wake_for(queued);
+        }
+    }
+}
+
+impl Drop for FrameHandle {
+    fn drop(&mut self) {
+        let fr = &*self.frame;
+        fr.closed.store(true, Ordering::SeqCst);
+        // Unstarted jobs are cancelled: their tickets answer `None`.
+        let left: Vec<_> = fr.queue.lock().drain(..).collect();
+        fr.queued.store(0, Ordering::Release);
+        for job in &left {
+            job.cancel();
+        }
+        {
+            let _g = fr.park.lock();
+            fr.park_cv.notify_all();
+        }
+        while fr.inside.load(Ordering::SeqCst) != 0 {
+            std::hint::spin_loop();
+        }
+        {
+            let mut hand_off = self.pool.shared.hand_off.lock();
+            if hand_off.frame.as_ref().is_some_and(|f| Arc::ptr_eq(f, &self.frame)) {
+                hand_off.frame = None;
+            }
+        }
+        // SAFETY: `open_frame` forgot the guard of this lock; this handle is
+        // its only owner.
+        unsafe { self.pool.scope_lock.force_unlock() };
+        use crate::runtime::drain::{note_store_route_n, note_store_route_us};
+        note_store_route_n("frame_pushed", self.pushed.get());
+        note_store_route_n("frame_cancelled", left.len() as u64);
+        note_store_route_n("frame_helped", fr.helped.load(Ordering::Relaxed));
+        note_store_route_us("frame_busy_us", fr.busy_ns.load(Ordering::Relaxed) / 1000);
+    }
+}
+
+/// A helper serving a frame until it closes.
+fn serve_frame(fr: &FrameShared, env: &WorkerEnv<'_>) {
+    struct Out<'a>(&'a AtomicUsize);
+    impl Drop for Out<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    fr.inside.fetch_add(1, Ordering::SeqCst);
+    let _out = Out(&fr.inside);
+    let mut idle_since: Option<Instant> = None;
+    loop {
+        if fr.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        // SAFETY: counted in `inside` and the frame not closed: the handle's
+        // drop has not finished waiting, so the lock is alive.
+        let lock = unsafe { &*fr.lock.0 };
+        if fr.queued.load(Ordering::Acquire) > 0 {
+            if let Some(rg) = lock.try_read() {
+                let job = fr.queue.lock().pop_front();
+                if let Some(job) = job {
+                    fr.queued.fetch_sub(1, Ordering::AcqRel);
+                    if job.claim() {
+                        let t = Instant::now();
+                        let _scope = super::gate::JobScope::enter(lock);
+                        job.run(&rg, env);
+                        fr.busy_ns
+                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        fr.helped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    idle_since = None;
+                    continue;
+                }
+            }
+        }
+        let t0 = *idle_since.get_or_insert_with(Instant::now);
+        if t0.elapsed() < fr.spin {
+            std::hint::spin_loop();
+            continue;
+        }
+        let mut g = fr.park.lock();
+        fr.parked.fetch_add(1, Ordering::AcqRel);
+        if !fr.closed.load(Ordering::SeqCst) {
+            fr.park_cv.wait_for(&mut g, Duration::from_millis(2));
+        }
+        fr.parked.fetch_sub(1, Ordering::AcqRel);
+        idle_since = None;
     }
 }

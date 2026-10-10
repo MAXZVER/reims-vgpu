@@ -530,6 +530,7 @@ fn delete_task_root_clears_active_task() {
     assert!(
         !state
             .fails
+            .lock()
             .iter()
             .any(|e| matches!(e, FailEvent::UnknownRootOpcode { opcode: 0x20, .. })),
         "0x20 must not be UnknownRootOpcode"
@@ -574,6 +575,7 @@ fn replace_physical_drops_the_cached_page_list() {
     assert!(
         !state
             .fails
+            .lock()
             .iter()
             .any(|e| matches!(e, FailEvent::UnknownChildOpcode { opcode: 0x3c, .. })),
         "0x3c must not flood UnknownChildOpcode"
@@ -5113,7 +5115,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
         "the command is counted like every other decoded one"
     );
     assert!(
-        !state.fails.iter().any(|e| matches!(
+        !state.fails.lock().iter().any(|e| matches!(
             e,
             FailEvent::UnknownChildOpcode {
                 opcode: CHILD_OP_NOP,
@@ -5916,6 +5918,7 @@ fn root_opcode_one_sets_up_the_display_shared_state() {
     assert!(
         !state
             .fails
+            .lock()
             .iter()
             .any(|e| matches!(e, FailEvent::UnknownRootOpcode { .. })),
         "opcode 1 has a handler on the root channel"
@@ -6042,7 +6045,7 @@ fn a_packet_whose_stamp_wait_is_unmet_is_parked_until_the_slot_reaches_it() {
          finished that never started"
     );
     assert_eq!(
-        state.parked.len(),
+        state.parked.lock().len(),
         1,
         "the packet is held as a position, with its bytes"
     );
@@ -6056,7 +6059,7 @@ fn a_packet_whose_stamp_wait_is_unmet_is_parked_until_the_slot_reaches_it() {
     // the parked packet, invent a completion, or lose it.
     drain_main_fifo(&mut state, &mut host);
     assert_eq!(read_slot(&host, 0), 0, "still nothing ran");
-    assert_eq!(state.parked.len(), 1, "and the position is still held");
+    assert_eq!(state.parked.lock().len(), 1, "and the position is still held");
 
     // Another timeline publishes the awaited stamp.
     gpa_map::write_u32(&mut host, slot_gpa(AWAITED_SLOT), AWAITED_VALUE, page_size)
@@ -6070,7 +6073,7 @@ fn a_packet_whose_stamp_wait_is_unmet_is_parked_until_the_slot_reaches_it() {
          completion stamp lands exactly once"
     );
     assert!(
-        state.parked.is_empty(),
+        state.parked.lock().is_empty(),
         "the position is gone, because it completed"
     );
     assert!(
@@ -6141,7 +6144,7 @@ fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
          ever decide it"
     );
     assert!(
-        state.parked.is_empty(),
+        state.parked.lock().is_empty(),
         "and nothing is parked on it, because a position waiting on a slot no \
          drain writes would hold its channel's publication head forever"
     );
@@ -6422,18 +6425,19 @@ fn a_dispatched_command_this_device_declines_names_itself() {
             "{opcode:#x}: the stamps still retire, or the guest waits forever"
         );
         assert!(
-            state.fails.iter().any(|e| matches!(
+            state.fails.lock().iter().any(|e| matches!(
                 e,
                 FailEvent::UnimplementedChildCommand { command, opcode: op, .. }
                     if *command == expected && *op == opcode
             )),
             "{opcode:#x} must be reported as {} and not swallowed; got {:?}",
             expected.command(),
-            state.fails
+            state.fails.lock()
         );
         assert!(
             !state
                 .fails
+                .lock()
                 .iter()
                 .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
             "{opcode:#x} is a command with a handler in the host's table, so it \
@@ -7144,7 +7148,7 @@ fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
             ChildPacketDisposition::Complete
         );
         assert!(
-            state.fails.iter().any(|e| matches!(
+            state.fails.lock().iter().any(|e| matches!(
                 e,
                 FailEvent::UnimplementedChildCommand {
                     command: UnimplementedCommand::Deprecated,
@@ -7153,11 +7157,12 @@ fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
                 } if *op == opcode
             )),
             "{opcode:#x} is one of the host's retired slots; got {:?}",
-            state.fails
+            state.fails.lock()
         );
         assert!(
             !state
                 .fails
+                .lock()
                 .iter()
                 .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
             "{opcode:#x} has a handler on the host, so it is not undecodable"
@@ -7212,6 +7217,7 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
         assert!(
             !state
                 .fails
+                .lock()
                 .iter()
                 .any(|e| matches!(e, FailEvent::UnimplementedChildCommand { .. })),
             "{opcode:#x}: a valid discard is fully handled"
@@ -7219,6 +7225,7 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
         assert!(
             !state
                 .fails
+                .lock()
                 .iter()
                 .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
             "{opcode:#x} has a handler on the host and a decoder here"
@@ -7354,7 +7361,7 @@ fn each_map_family_command_takes_its_own_branch() {
             "{opcode:#x}: only the backing delete unmaps the surface"
         );
 
-        let reported = state.fails.iter().find_map(|e| match e {
+        let reported = state.fails.lock().iter().find_map(|e| match e {
             FailEvent::UnimplementedChildCommand { command, .. } => Some(*command),
             _ => None,
         });
@@ -7394,6 +7401,7 @@ fn an_opcode_past_the_dispatch_ceiling_is_reported_apart_from_an_unassigned_slot
     assert!(
         state
             .fails
+            .lock()
             .iter()
             .any(|e| matches!(e, FailEvent::UnknownChildOpcode { opcode: 0x0b, .. })),
         "an unassigned in-range slot is still an unknown opcode"
@@ -7419,6 +7427,7 @@ fn an_opcode_past_the_dispatch_ceiling_is_reported_apart_from_an_unassigned_slot
     assert!(
         state
             .fails
+            .lock()
             .iter()
             .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
         "the guest's work is still lost, so the record it shares with an \
@@ -7744,7 +7753,7 @@ fn owing_a_word_is_not_publishing_it_and_only_the_landing_moves_the_plane() {
     super::note_stamp_no_longer_owed(&mut state, 0, 7);
     assert_eq!(
         state
-            .stamp_ledger
+            .stamp_ledger.lock()
             .classify(super::StampWait { index: 0, value: 7 }),
         super::UnmetSource::Queued,
         "the device's ledger has it: `Queued` is its name for a word that has \
@@ -7969,7 +7978,7 @@ fn a_settle_pass_over_waiting_positions_does_not_allocate() {
             payload: vec![0u8; 8],
             next_head: 0,
         };
-        state.parked.park(
+        state.parked.lock().park(
             IngressOrdinal(n as u64 + 1),
             ParkedWork::new(domain, DeviceEpoch::FIRST, packet),
         );
@@ -7980,7 +7989,7 @@ fn a_settle_pass_over_waiting_positions_does_not_allocate() {
     for _ in 0..3 {
         settle_model_work(&mut state, &mut host);
     }
-    assert_eq!(state.parked.len(), 3, "nothing here can release them");
+    assert_eq!(state.parked.lock().len(), 3, "nothing here can release them");
     assert_ne!(state.pending.child_mask & 0b10, 0, "domain 1 is still owed");
     assert_ne!(
         state.pending.child_mask & 0b100,

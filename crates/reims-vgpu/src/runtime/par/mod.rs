@@ -64,13 +64,15 @@
 //!   tranche that does no device work, to measure the pool itself; see
 //!   [`selftest`].
 
+pub(crate) mod gate;
 mod pool;
 pub(crate) mod selftest;
 pub(crate) mod staging;
 #[cfg(test)]
 mod tests;
 
-pub use pool::{JobPanic, Overlap, Pool, PoolStats, Scoped, WorkerEnv};
+pub use gate::{FrameLock, Gate};
+pub use pool::{FrameHandle, JobPanic, Overlap, Pool, PoolStats, Scoped, Ticket, WorkerEnv};
 
 use std::cell::Cell;
 use std::time::Duration;

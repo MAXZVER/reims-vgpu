@@ -65,7 +65,7 @@ pub struct ParkedWork {
     /// `crate::model::DeviceState::complete_transaction`.
     epoch: DeviceEpoch,
     packet: Packet,
-    submission: Option<ExecSubmission>,
+    submission: Option<std::sync::Arc<ExecSubmission>>,
     /// What the model's ingress walk resolved this packet's records into.
     ///
     /// **Moved out of the transaction `SessionModel::admit` handed back, not
@@ -101,7 +101,7 @@ impl ParkedWork {
     /// Retain an exec packet together with the command buffers already read out
     /// of guest memory for it.
     #[must_use]
-    pub const fn with_submission(
+    pub fn with_submission(
         domain: u32,
         epoch: DeviceEpoch,
         packet: Packet,
@@ -112,7 +112,7 @@ impl ParkedWork {
             domain,
             epoch,
             packet,
-            submission: Some(submission),
+            submission: Some(std::sync::Arc::new(submission)),
             resolved: Some(resolved),
         }
     }
@@ -136,7 +136,14 @@ impl ParkedWork {
 
     /// The command buffers this packet was admitted against, for the exec class.
     #[must_use]
-    pub const fn submission(&self) -> Option<&ExecSubmission> {
+    pub fn submission(&self) -> Option<&ExecSubmission> {
+        self.submission.as_deref()
+    }
+
+    /// TEMP (lab, FRAME_GATE): the command buffers as an owner a helper's
+    /// walk keeps alive.
+    #[must_use]
+    pub fn submission_arc(&self) -> Option<&std::sync::Arc<ExecSubmission>> {
         self.submission.as_ref()
     }
 
@@ -168,7 +175,7 @@ impl ParkedWork {
     #[must_use]
     pub fn retained(&self) -> Option<crate::runtime::exec::RetainedInputs<'_>> {
         Some(crate::runtime::exec::RetainedInputs {
-            submission: self.submission.as_ref()?,
+            submission: self.submission.as_deref()?,
             resolved: self.resolved.as_ref()?,
         })
     }
@@ -186,7 +193,7 @@ impl ParkedWork {
                 * std::mem::size_of::<crate::runtime::drain::StampWait>()
             + self
                 .submission
-                .as_ref()
+                .as_deref()
                 .map_or(0, ExecSubmission::retained_bytes)
             + self.resolved.as_ref().map_or(0, resolved_bytes)
     }
@@ -382,7 +389,7 @@ impl ParkedStore {
     #[must_use]
     pub fn planning(&self, ingress: IngressOrdinal) -> Option<(&ExecSubmission, &ExecWork)> {
         let work = self.work.get(&ingress)?;
-        Some((work.submission.as_ref()?, work.resolved.as_ref()?))
+        Some((work.submission.as_deref()?, work.resolved.as_ref()?))
     }
 
     /// The completion slots a parked position is waiting on.

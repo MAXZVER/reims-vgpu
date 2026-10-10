@@ -118,8 +118,8 @@ impl Device {
     }
 
     #[cfg(test)]
-    pub fn fails(&self) -> &[FailEvent] {
-        &self.state.fails
+    pub fn fails(&self) -> parking_lot::MutexGuard<'_, Vec<FailEvent>> {
+        self.state.fails.lock()
     }
 }
 
@@ -736,7 +736,7 @@ mod tests {
             "a packet the model will not take still frees the ring position it held"
         );
         assert!(
-            d.state.parked.is_empty(),
+            d.state.parked.lock().is_empty(),
             "and nothing is holding bytes for work that was never admitted"
         );
     }
