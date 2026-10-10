@@ -178,3 +178,87 @@ impl StreamMemo {
         }
     }
 }
+
+/// TEMP (lab, live `BACKING_XMEMO=on`, else `REIMS_VGPU_LAB_BACKING_XMEMO=on`;
+/// default off): a texture's positive backing-probe answer kept across streams.
+///
+/// The probe ([`crate::runtime::objects::resolve_backing`]) reads the owning
+/// task's object-list entry and the backing descriptor through the guest's page
+/// tables on every stream that binds the texture - b165 (Weather light scene)
+/// ~6 % of the drain's busy samples. On the warm answer it writes nothing new
+/// (the owner hint it records is the one already there, the object is already
+/// inserted). This keeps that answer, for the drain thread, while nothing it
+/// stands on moved: the names generation (`LAB_NAMES_GEN`: every lifecycle
+/// change, object insert, mapping rebuild and non-EXEC packet - a delete or a
+/// re-point of the surface is a packet), the mapping's `map_generation`, and the
+/// mapping still mapped with its pages, geometry and owner. The window this
+/// adds over the per-stream memo is the same claim as that memo's (a probe is a
+/// snapshot of the guest's lists; a write landing after it reaches a later
+/// probe), stretched from one stream to the streams before the next names
+/// change. Only `true` is kept.
+pub(crate) fn backing_xmemo_on() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("BACKING_XMEMO") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_BACKING_XMEMO").as_deref() == Ok("on"))
+}
+
+#[derive(Clone, Copy)]
+struct XBacking {
+    names_gen: u64,
+    map_generation: u32,
+    owner: u32,
+}
+
+thread_local! {
+    static XMEMO: std::cell::RefCell<reims_vgpu_core::fasthash::FxHashMap<u32, XBacking>> =
+        std::cell::RefCell::new(reims_vgpu_core::fasthash::FxHashMap::default());
+}
+
+/// What the mapping says now, if it is still a warm backing.
+fn xbacking_now(state: &crate::model::DeviceState, surface_id: u32) -> Option<XBacking> {
+    let m = state.mappings.get(&surface_id)?;
+    (m.mapped && m.has_geom && !m.page_entries.is_empty()).then(|| XBacking {
+        names_gen: state.names_gen(),
+        map_generation: m.map_generation,
+        owner: m.owner_task_hint,
+    })
+}
+
+/// Whether a kept answer for `surface_id` still holds.
+pub(super) fn backing_xmemo_hit(state: &crate::model::DeviceState, surface_id: u32) -> bool {
+    if crate::runtime::par::planning() {
+        return false;
+    }
+    let Some(now) = xbacking_now(state, surface_id) else {
+        return false;
+    };
+    let hit = XMEMO.with(|m| {
+        m.borrow().get(&surface_id).is_some_and(|k| {
+            k.names_gen == now.names_gen && k.map_generation == now.map_generation && k.owner == now.owner
+        })
+    });
+    crate::runtime::drain::note_store_route(if hit { "backing_xmemo_hit" } else { "backing_xmemo_miss" });
+    hit
+}
+
+/// Keep a positive answer the probe just gave for `surface_id`.
+pub(super) fn backing_xmemo_remember(state: &crate::model::DeviceState, surface_id: u32) {
+    if crate::runtime::par::planning() {
+        return;
+    }
+    let Some(now) = xbacking_now(state, surface_id) else {
+        return;
+    };
+    XMEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= 4096 {
+            m.clear();
+        }
+        m.insert(surface_id, now);
+    });
+}

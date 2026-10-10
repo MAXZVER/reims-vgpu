@@ -5352,8 +5352,16 @@ fn resolve_backing_memo<M: HostMemory, S: WalkState>(
     if let Some(backed) = memo.backing(obj_ref) {
         return backed;
     }
+    let cross = walk_memo::backing_xmemo_on();
+    if cross && walk_memo::backing_xmemo_hit(state.shared(), obj_ref) {
+        memo.remember_backing(obj_ref, true);
+        return true;
+    }
     let backed = state.walk_backing(host, obj_ref);
     memo.remember_backing(obj_ref, backed);
+    if cross && backed {
+        walk_memo::backing_xmemo_remember(state.shared(), obj_ref);
+    }
     backed
 }
 
