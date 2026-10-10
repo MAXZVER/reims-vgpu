@@ -33,10 +33,6 @@ use crate::identity::{ChannelId, IngressOrdinal};
 use crate::fasthash::FxHashMap;
 use std::collections::HashMap;
 
-/// Dead slots [`DependencyGraph::admit`] tolerates before it compacts, however
-/// small the live set (see the comment there).
-const COMPACT_FLOOR: usize = 256;
-
 /// One live access, and the transaction that declared it.
 #[derive(Clone, Copy, Debug)]
 struct Entry {
@@ -89,9 +85,9 @@ pub struct Census {
 /// session's age rather than with its working set.
 ///
 /// So the graph owns the bound. `admit` compacts once the retired slots
-/// outnumber the live ones (and a small floor), which charges each retirement
-/// a constant amount of rebuild work and keeps every candidate list within
-/// twice the working set or the floor. The rebuild reuses its buffers, so a warm admission still makes no
+/// outnumber the live ones, which charges each retirement a constant amount
+/// of rebuild work and keeps every candidate list within twice the working
+/// set. The rebuild reuses its buffers, so a warm admission still makes no
 /// trip into the allocator beyond the structural ones named on `scratch`.
 #[derive(Debug, Default)]
 pub struct DependencyGraph {
@@ -157,8 +153,7 @@ impl DependencyGraph {
 
     /// Slots held, live and retired, for a test or a report. What every
     /// admission's candidate lists are drawn from, and the figure the
-    /// amortised compaction keeps within twice [`Self::live_accesses`] (or
-    /// the live count plus the compaction floor).
+    /// amortised compaction keeps within twice [`Self::live_accesses`].
     #[must_use]
     pub fn entries(&self) -> usize {
         self.entries.len()
@@ -193,10 +188,8 @@ impl DependencyGraph {
         // completion that retired the slots. Retired slots may only ever
         // reach parity with the live ones, so the rebuild is amortised to a
         // constant per retirement and every candidate list stays within twice
-        // the working set. A floor of 256 dead slots keeps a near-empty graph
-        // (Weather: ~30 accesses a packet, a handful live) from rebuilding
-        // its indexes on almost every admission.
-        if self.dead > self.live_accesses().max(COMPACT_FLOOR) {
+        // the working set.
+        if self.dead > self.live_accesses() {
             self.compact();
         }
         // Taken out so the gathering below can borrow the indexes; put back
@@ -646,10 +639,9 @@ mod tests {
             );
             // The bound holds at admission, which is when candidate lists are
             // walked: the retirements below may push retired slots past the
-            // live ones (or past the floor), and the next admission is what
-            // pays to drop them.
+            // live ones, and the next admission is what pays to drop them.
             assert!(
-                g.entries() <= g.live_accesses() + g.live_accesses().max(COMPACT_FLOOR) + 1,
+                g.entries() <= 2 * g.live_accesses(),
                 "after admitting ordinal {n}: {} slots for {} live accesses",
                 g.entries(),
                 g.live_accesses()
