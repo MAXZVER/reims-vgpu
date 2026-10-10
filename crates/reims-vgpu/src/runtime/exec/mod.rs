@@ -813,6 +813,9 @@ pub struct ExecSubmission {
     resource_descs: Vec<ExecResourceDesc>,
     /// The command buffers the header declares, in the order it declares them.
     streams: Vec<Vec<u8>>,
+    /// TEMP (lab, WALK_AHEAD): per stream, a walk a pool helper made ahead of
+    /// this submission's execution, taken (and checked) by it.
+    pub(crate) lab_walks: std::sync::Mutex<Vec<Option<walk_ahead::SpecStream>>>,
 }
 
 impl ExecSubmission {
@@ -831,6 +834,28 @@ impl ExecSubmission {
         &self.streams
     }
 
+    /// TEMP (lab, LOOKAHEAD): walk every stream on this (helper) thread under
+    /// the shared state, and keep the walks for this submission's execution.
+    /// `closing` cuts it short between streams.
+    pub(crate) fn lab_walk_ahead<M: HostMemory + HostOps>(
+        &self,
+        st: &DeviceState,
+        host: &M,
+        closing: &std::sync::atomic::AtomicBool,
+    ) {
+        let walks: Vec<Option<walk_ahead::SpecStream>> = self
+            .streams
+            .iter()
+            .map(|stream| {
+                if closing.load(std::sync::atomic::Ordering::Relaxed) {
+                    return None;
+                }
+                walk_ahead::walk_stream_spec(st, host, self.task_id, stream)
+            })
+            .collect();
+        *self.lab_walks.lock().unwrap_or_else(|e| e.into_inner()) = walks;
+    }
+
     /// A submission stated outright rather than read out of a packet.
     ///
     /// For the suites that are about what a *read* submission does downstream
@@ -844,6 +869,7 @@ impl ExecSubmission {
             task_id,
             resource_descs: Vec::new(),
             streams,
+            lab_walks: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -939,6 +965,7 @@ fn read_submission<M: HostMemory + HostOps>(
         task_id,
         resource_descs,
         streams,
+        lab_walks: std::sync::Mutex::new(Vec::new()),
     })
 }
 
@@ -1042,7 +1069,9 @@ fn execute_submission<M: HostMemory + HostOps>(
         task_id,
         resource_descs,
         streams,
+        lab_walks,
     } = submission;
+    let mut lab_walks = std::mem::take(&mut *lab_walks.lock().unwrap_or_else(|e| e.into_inner()));
     let task_id = *task_id;
 
     // Before any of this submission's work runs. Each record states what was
@@ -1058,18 +1087,38 @@ fn execute_submission<M: HostMemory + HostOps>(
     // compare the second buffer's records against the first buffer's answers.
     let mut resolved = resolved.map(ResolvedCursor::new);
 
-    for stream in streams {
-        let mut acc = StreamAccum::default();
+    for (si, stream) in streams.iter().enumerate() {
         let walk_started = crate::lab_clock::LabInstant::now();
-        walk_stream(
-            state,
-            host,
-            task_id,
-            stream,
-            out,
-            &mut acc,
-            resolved.as_mut(),
-        );
+        // TEMP (lab, WALK_AHEAD): the helper's walk of this stream, when what it
+        // read still holds; `WALK_AHEAD_CHECK` walks anyway and compares.
+        let spec = lab_walks.get_mut(si).and_then(Option::take);
+        let check = spec.is_some() && walk_ahead_check_on();
+        let mut acc = match spec {
+            Some(spec) if check => {
+                let mut acc = StreamAccum::default();
+                walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut());
+                walk_ahead::check_walk(&*state, spec, &acc);
+                acc
+            }
+            Some(spec) => match walk_ahead::take_walk(state, spec, out) {
+                Some(acc) => {
+                    // The model's cursor is stepped by a drain walk only: it is
+                    // census, so the rest of this packet goes without it.
+                    resolved = None;
+                    acc
+                }
+                None => {
+                    let mut acc = StreamAccum::default();
+                    walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut());
+                    acc
+                }
+            },
+            None => {
+                let mut acc = StreamAccum::default();
+                walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut());
+                acc
+            }
+        };
         acc.memo.flush();
         let walk_ns = walk_started.elapsed().as_nanos() as u64;
         *measured_ns += walk_ns;
@@ -1082,6 +1131,12 @@ fn execute_submission<M: HostMemory + HostOps>(
         // TEMP (lab, `REIMS_VGPU_LAB_PREEMPT_INNER`): the control channels, between streams.
         crate::runtime::drain::lab_preempt_between_streams(state, host);
     }
+}
+
+/// TEMP (lab, live `WALK_AHEAD_CHECK=on`): a helper's walk is compared with the
+/// drain's own instead of replacing it (census `walk_ahead_check_*`).
+fn walk_ahead_check_on() -> bool {
+    crate::runtime::lab_live::on("WALK_AHEAD_CHECK").unwrap_or(false)
 }
 
 /// Run one submission whose plan step has already answered, from the inputs it
@@ -2985,7 +3040,7 @@ fn note_render_record_refused(
 /// update nor a wait — a state `reims_vgpu_protocol::sync::fence_kind` makes
 /// unrepresentable, because the same function decides both that this *is* a
 /// fence and which side of one it is.
-fn handle_render_fence(state: &mut DeviceState, task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+fn handle_render_fence<S: WalkState>(state: &mut S, task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
     let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
         return;
     };
@@ -2998,13 +3053,7 @@ fn handle_render_fence(state: &mut DeviceState, task_id: u32, opcode: u32, cmd_b
                 reims_vgpu_protocol::sync::FenceKind::Update => FenceAction::Update,
                 reims_vgpu_protocol::sync::FenceKind::Wait => FenceAction::Wait,
             };
-            fence_exec::execute_fence(
-                state,
-                task_id,
-                FenceDomain::RenderFence,
-                record.fence_ref,
-                action,
-            );
+            state.walk_fence(task_id, FenceDomain::RenderFence, record.fence_ref, action);
         }
         // `fence_kind` answers for exactly the two fence opcodes on this rail,
         // so the class and the lift agreeing is the protocol crate's invariant.
@@ -3362,8 +3411,8 @@ const fn is_render_bind(kind: ProtoRenderKind) -> bool {
 /// stride field cannot produce a stride of zero and one with no LOD clamp
 /// cannot produce a clamp of zero — the two states the flat command's
 /// `has_attribute_stride`/`has_lod_clamp` flags stood beside.
-fn handle_render_binds<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+fn handle_render_binds<M: HostMemory + HostOps, S: WalkState>(
+    state: &mut S,
     host: &M,
     task_id: u32,
     opcode: u32,
@@ -3498,15 +3547,10 @@ fn handle_render_binds<M: HostMemory + HostOps>(
                         None
                     };
                     let mapper = match &memoized {
-                        Some(resource) => objects::resolve_mapper_ref_texture_resource(
-                            state,
-                            task_id,
-                            texture_ref,
-                            resource,
-                        ),
-                        None => {
-                            objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)
+                        Some(resource) => {
+                            state.walk_mapper_ref_texture_resource(task_id, texture_ref, resource)
                         }
+                        None => state.walk_mapper_ref_texture(host, task_id, texture_ref),
                     };
                     if let Some(m) = mapper {
                         if !out.mapper_ref_texture_mappings.contains(&m) {
@@ -3521,8 +3565,7 @@ fn handle_render_binds<M: HostMemory + HostOps>(
                     let resource = match memoized {
                         Some(resource) => Some(resource),
                         None => {
-                            let resource =
-                                objects::resolve_resource(state, host, task_id, texture_ref).ok();
+                            let resource = state.walk_resource(host, task_id, texture_ref);
                             if let Some(resource) = &resource {
                                 if walk_memo::on() {
                                     acc.memo.remember(texture_ref, resource);
@@ -3755,8 +3798,8 @@ const fn is_render_pass_state(kind: ProtoRenderKind) -> bool {
 /// repo's own fixtures, and a truncated descriptor read as a shorter one is a
 /// pass rendered with attachments the guest did not retire. `render_record`
 /// names it under the row's own opcode.
-fn handle_render_pass_state<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+fn handle_render_pass_state<M: HostMemory + HostOps, S: WalkState>(
+    state: &mut S,
     host: &M,
     task_id: u32,
     opcode: u32,
@@ -3928,10 +3971,8 @@ fn handle_render_pass_state<M: HostMemory + HostOps>(
                     {
                         out.texture_refs.push(att.resolve_texture_ref);
                     }
-                    if let Some(m) =
-                        objects::resolve_mapper_ref_texture(state, host, task_id, published_ref)
-                    {
-                        note_pass_extent_for_slot(state, task_id, slot, m, target_extent);
+                    if let Some(m) = state.walk_mapper_ref_texture(host, task_id, published_ref) {
+                        note_pass_extent_for_slot(state.shared(), task_id, slot, m, target_extent);
                         if !out.mapper_ref_texture_mappings.contains(&m) {
                             out.mapper_ref_texture_mappings.push(m);
                         }
@@ -3940,7 +3981,7 @@ fn handle_render_pass_state<M: HostMemory + HostOps>(
                         // below pushes `att.texture_ref` where the mapper-ref-texture arm
                         // pushes the id it resolved to.
                         note_pass_extent_for_slot(
-                            state,
+                            state.shared(),
                             task_id,
                             slot,
                             published_ref,
@@ -4107,8 +4148,8 @@ fn draw_instances(instances: reims_vgpu_protocol::decode::render::Instancing) ->
 }
 
 /// Record one draw, lifted by the protocol crate.
-fn handle_render_draw<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+fn handle_render_draw<M: HostMemory + HostOps, S: WalkState>(
+    state: &mut S,
     host: &M,
     task_id: u32,
     kind: ProtoRenderKind,
@@ -4157,7 +4198,10 @@ fn handle_render_draw<M: HostMemory + HostOps>(
 
     match record {
         DrawRecord::PrimitivesIndirect(_) | DrawRecord::IndexedIndirect(_) => {
-            return execute_indirect_draw(state, host, task_id, opcode, &record, acc);
+            if !state.walk_indirect_allowed() {
+                return;
+            }
+            return execute_indirect_draw(state.shared(), host, task_id, opcode, &record, acc);
         }
         _ => {}
     }
@@ -4251,8 +4295,8 @@ fn handle_render_draw<M: HostMemory + HostOps>(
     }
 }
 
-fn handle_render_record<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+fn handle_render_record<M: HostMemory + HostOps, S: WalkState>(
+    state: &mut S,
     host: &M,
     task_id: u32,
     opcode: u32,
@@ -5082,39 +5126,39 @@ impl SameBind for SamplerBind {
 
 /// The retained resource a buffer bind keeps, from this stream's memo when the
 /// stream resolved the reference already. See [`walk_memo`].
-fn bind_resource<M: HostMemory>(
-    state: &DeviceState,
+fn bind_resource<M: HostMemory, S: WalkState>(
+    state: &mut S,
     host: &M,
     task_id: u32,
     memo: &mut walk_memo::StreamMemo,
     obj_ref: u32,
 ) -> Option<Arc<crate::model::TaskResource>> {
     if !walk_memo::on() {
-        return objects::resolve_resource(state, host, task_id, obj_ref).ok();
+        return state.walk_resource(host, task_id, obj_ref);
     }
     if let Some(resource) = memo.resource(obj_ref, 1) {
         return Some(resource);
     }
-    let resource = objects::resolve_resource(state, host, task_id, obj_ref).ok()?;
+    let resource = state.walk_resource(host, task_id, obj_ref)?;
     memo.remember(obj_ref, &resource);
     Some(resource)
 }
 
 /// [`objects::resolve_backing`] for a texture bind, skipping the probe for a
 /// reference this stream already asked about. See [`walk_memo`].
-fn resolve_backing_memo<M: HostMemory>(
-    state: &mut DeviceState,
+fn resolve_backing_memo<M: HostMemory, S: WalkState>(
+    state: &mut S,
     host: &M,
     memo: &mut walk_memo::StreamMemo,
     obj_ref: u32,
 ) -> bool {
     if !walk_memo::on() {
-        return objects::resolve_backing(state, host, obj_ref);
+        return state.walk_backing(host, obj_ref);
     }
     if let Some(backed) = memo.backing(obj_ref) {
         return backed;
     }
-    let backed = objects::resolve_backing(state, host, obj_ref);
+    let backed = state.walk_backing(host, obj_ref);
     memo.remember_backing(obj_ref, backed);
     backed
 }
@@ -7163,6 +7207,8 @@ fn lab_cached_clear_image(
 
 pub(crate) mod finish_phase;
 mod walk_memo;
+pub(crate) mod walk_ahead;
+use walk_ahead::WalkState;
 
 mod report;
 use report::{

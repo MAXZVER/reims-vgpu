@@ -42,6 +42,66 @@ pub(crate) fn pin_pool_to_performance_cores(who: &str) {
     pin_to_performance_cores_now(who);
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_EXCL_CORE=on`): the calling thread alone on the
+/// second performance core (QEMU puts the drain on the first and keeps every
+/// other thread off both: `whpx_lab_excl_core_drain`). For the draw recorder.
+pub(crate) fn pin_recorder_excl_core(who: &str) {
+    if !std::env::var("REIMS_VGPU_LAB_EXCL_CORE").is_ok_and(|v| v == "on") {
+        return;
+    }
+    let recs = cpu_set_records_with_core();
+    let max_class = recs.iter().map(|r| r.2).max().unwrap_or(0);
+    let mut cores: Vec<u8> = recs.iter().filter(|r| r.2 == max_class).map(|r| r.3).collect();
+    cores.sort_unstable();
+    cores.dedup();
+    let Some(&core1) = cores.get(1) else {
+        return;
+    };
+    let Some(id) = recs
+        .iter()
+        .filter(|r| r.3 == core1)
+        .min_by_key(|r| r.1)
+        .map(|r| r.0)
+    else {
+        return;
+    };
+    // SAFETY: the pseudo handle of this thread and one id.
+    if unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), &id, 1) } != 0 {
+        crate::observe::off(format!("lab_excl_core {who} core={core1} set={id}"));
+    }
+}
+
+/// (cpu-set id, logical processor, efficiency class, core index) per group-0
+/// CPU set.
+fn cpu_set_records_with_core() -> Vec<(u32, usize, u8, u8)> {
+    let mut need = 0u32;
+    // SAFETY: a size query (null buffer, zero length).
+    unsafe { GetSystemCpuSetInformation(core::ptr::null_mut(), 0, &mut need, core::ptr::null_mut(), 0) };
+    if need == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; need as usize];
+    // SAFETY: the buffer is `need` bytes, as asked.
+    if unsafe { GetSystemCpuSetInformation(buf.as_mut_ptr(), need, &mut need, core::ptr::null_mut(), 0) } == 0 {
+        return Vec::new();
+    }
+    let mut recs = Vec::new();
+    let mut off = 0usize;
+    while off + 19 <= buf.len() {
+        let size = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+        if size == 0 {
+            break;
+        }
+        let id = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
+        let group = u16::from_le_bytes(buf[off + 12..off + 14].try_into().unwrap());
+        if group == 0 {
+            recs.push((id, buf[off + 14] as usize, buf[off + 18], buf[off + 15]));
+        }
+        off += size;
+    }
+    recs
+}
+
 fn pin_to_performance_cores_now(who: &str) {
     let ids = performance_cpu_set_ids();
     if ids.is_empty() {

@@ -662,18 +662,39 @@ pub fn device_packet_ahead<M: crate::runtime::host::HostMemory>(
     drained: &drain::Packet,
     reads: PacketReads<'_>,
 ) -> Option<Result<Packet, Blocked>> {
+    device_packet_ahead_named(state, host, fifo, session, completion_slot, drained, reads)
+        .map(|(built, _)| built)
+}
+
+/// TEMP (lab, LOOKAHEAD): [`device_packet_ahead`], and every name it read -
+/// `(task, ref, name)` - so its user can check they still name the same.
+#[allow(clippy::type_complexity)]
+pub fn device_packet_ahead_named<M: crate::runtime::host::HostMemory>(
+    state: &crate::model::DeviceState,
+    host: &M,
+    fifo: Fifo,
+    session: SessionGeneration,
+    completion_slot: StampSlot,
+    drained: &drain::Packet,
+    reads: PacketReads<'_>,
+) -> Option<(
+    Result<Packet, Blocked>,
+    Vec<(u32, u32, reims_vgpu_core::identity::ResourceId)>,
+)> {
     let names = PeekNames {
         state,
         missed: std::cell::Cell::new(false),
+        read: std::cell::RefCell::new(Vec::new()),
     };
     let built = device_packet_with(state, host, fifo, session, completion_slot, drained, reads, &names);
-    (!names.missed.get()).then_some(built)
+    (!names.missed.get()).then(|| (built, names.read.into_inner()))
 }
 
 /// TEMP (lab, INGRESS_AHEAD): see [`device_packet_ahead`].
 struct PeekNames<'a> {
     state: &'a crate::model::DeviceState,
     missed: std::cell::Cell<bool>,
+    read: std::cell::RefCell<Vec<(u32, u32, reims_vgpu_core::identity::ResourceId)>>,
 }
 
 impl reims_vgpu_core::resolve::TaskNamespaces for PeekNames<'_> {
@@ -683,8 +704,9 @@ impl reims_vgpu_core::resolve::TaskNamespaces for PeekNames<'_> {
         object_ref: u32,
     ) -> Option<reims_vgpu_core::identity::ResourceId> {
         let name = self.state.object_name(task.0, object_ref);
-        if name.is_none() {
-            self.missed.set(true);
+        match name {
+            Some(id) => self.read.borrow_mut().push((task.0, object_ref, id)),
+            None => self.missed.set(true),
         }
         name
     }

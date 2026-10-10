@@ -4017,6 +4017,28 @@ pub fn resolve_mapper_ref_texture<M: HostMemory>(
     resolve_mapper_ref_texture_resource(state, task_id, ref_, &resource)
 }
 
+/// TEMP (lab, WALK_AHEAD): [`resolve_resource`]'s warm answer only - a name the
+/// namespace holds with a constructed resource behind it - for a walk that may
+/// not declare or construct. `None`: the drain's walk would do one of those.
+pub fn resolve_resource_peek(
+    state: &DeviceState,
+    task_id: u32,
+    obj_ref: u32,
+) -> Option<Arc<TaskResource>> {
+    let name = state.object_name(task_id, obj_ref)?;
+    state.task_resources.get(task_id, name)
+}
+
+/// TEMP (lab, WALK_AHEAD): [`resolve_mapper_ref_texture_resource`]'s warm
+/// answer: `Some(None)` not a mapper-ref texture, `Some(Some(id))` already
+/// registered, `None` the drain's call would register it.
+pub fn resolve_mapper_ref_texture_resource_peek(resource: &TaskResource) -> Option<Option<u32>> {
+    if resource.entry.object_type != OBJECT_TYPE_MAPPER_REF_TEXTURE {
+        return Some(None);
+    }
+    resource.registered_mapper_ref_texture_mapping().map(Some)
+}
+
 /// Resolve an already-retained mapper-ref-texture resource to its mapping.
 ///
 /// Draw preparation resolves each bound reference once and threads the
@@ -5894,6 +5916,50 @@ fn win_backing_search<M: HostMemory>(
     record_backing_owner(state, surface_id, task_id);
     note_backing_claimants(state, host, surface_id, task_id);
     true
+}
+
+/// TEMP (lab, WALK_AHEAD): [`resolve_backing`]'s answer when it is the warm one
+/// and writes nothing - the owning task found on the first probe that names a
+/// backing, already recorded as the owner, the object already inserted, and
+/// pages matching the descriptor's geometry - read under the shared state.
+/// `None`: the drain's call would write (record an owner, insert, rebuild,
+/// note a failure), so a walk that meets it is the drain's.
+pub fn resolve_backing_peek<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    surface_id: u32,
+) -> Option<bool> {
+    if !crate::model::is_mapping_id(surface_id) {
+        return Some(false);
+    }
+    let hint = state
+        .mappings
+        .get(&surface_id)
+        .map(|m| m.owner_task_hint)
+        .unwrap_or(0);
+    let mut probe_order = BackingProbeOrder::new(hint);
+    while let Some(task_id) = probe_order.next(&state.tasks) {
+        let Some(entry) = probe_list_entry(state, host, task_id, surface_id) else {
+            continue;
+        };
+        if entry.object_type != OBJECT_TYPE_BACKING {
+            continue;
+        }
+        let desc = read_descriptor_small(state, host, task_id, &entry)?;
+        if !state.objects.contains(&(task_id, surface_id)) || state.max_task_id_seen < task_id {
+            return None;
+        }
+        let surf = decode_backing(&desc)?;
+        let warm = state.mappings.get(&surface_id).is_some_and(|m| {
+            m.mapped
+                && !m.page_entries.is_empty()
+                && m.has_geom
+                && backing_matches_latched_geom(m, &surf)
+                && m.owner_task_hint == task_id
+        });
+        return warm.then_some(true);
+    }
+    None
 }
 
 fn resolve_backing_ex<M: HostMemory>(

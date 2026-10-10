@@ -2399,12 +2399,246 @@ fn lab_exec_write_tokens(
     }
 }
 
-/// TEMP (lab, INGRESS_AHEAD): one EXEC packet's arrival read and model packet,
-/// built by a pool helper before the batch it arrived in was admitted.
-struct AheadParse {
+/// TEMP (lab, INGRESS_AHEAD / LOOKAHEAD): one EXEC packet's arrival read and
+/// model packet, built by a pool helper before its admission.
+pub(crate) struct AheadParse {
     submission: crate::runtime::exec::ExecSubmission,
     built: reims_vgpu_core::session::Packet,
     session: reims_vgpu_core::identity::SessionGeneration,
+    /// LOOKAHEAD: every `(task, ref, name)` the build read; empty for the
+    /// INGRESS_AHEAD fork, which checks the process-wide generation instead.
+    names: Vec<(u32, u32, reims_vgpu_core::identity::ResourceId)>,
+}
+
+/// TEMP (lab, live `LOOKAHEAD=on|off`, else `REIMS_VGPU_LAB_LOOKAHEAD=on`): the
+/// EXECs behind the one being admitted are queued, and DRAW_PAR regions hand
+/// them to their helpers after the region's own records: a helper reads the
+/// packet's command buffers, builds its model packet and walks its streams,
+/// all under the shared state the region already holds - so it costs the drain
+/// nothing but the region's join. The admission of that packet takes the
+/// build when every name it read still names the same (and the session is
+/// unchanged); the execution takes each stream's walk when its witness holds.
+/// Anything else is read, built and walked by the drain, as without this.
+pub(crate) fn lookahead_on() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("LOOKAHEAD") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_LOOKAHEAD").as_deref() == Ok("on"))
+}
+
+/// TEMP (lab, LOOKAHEAD): one queued packet, as a helper needs it.
+pub(crate) struct AheadItem {
+    channel: u32,
+    head: u32,
+    fifo: crate::runtime::ingress::Fifo,
+    completion_slot: u32,
+    session: reims_vgpu_core::identity::SessionGeneration,
+    packet: Packet,
+}
+
+/// TEMP (lab, LOOKAHEAD): the drain's queue of packets to build ahead, and the
+/// builds waiting for their admission, both in ring order.
+#[derive(Default)]
+struct Lookahead {
+    pending: std::collections::VecDeque<AheadItem>,
+    ready: std::collections::VecDeque<(u32, u32, Vec<u8>, AheadParse)>,
+}
+
+thread_local! {
+    static LOOKAHEAD: std::cell::RefCell<Lookahead> = std::cell::RefCell::new(Lookahead::default());
+}
+
+/// TEMP (lab, LOOKAHEAD): set while a region joins, so a helper's lookahead
+/// job stops between streams instead of holding the join.
+pub(crate) static LOOKAHEAD_CLOSING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// TEMP (lab, LOOKAHEAD): how many queued packets a region may take, and how
+/// many may wait.
+fn lookahead_k() -> usize {
+    crate::runtime::lab_live::value("LOOKAHEAD_K")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(8)
+        .clamp(1, 32)
+}
+
+/// TEMP (lab, LOOKAHEAD): how many queued packets one region takes (live
+/// `LOOKAHEAD_REGION`, default 4).
+pub(crate) fn lookahead_region_cap() -> usize {
+    crate::runtime::lab_live::value("LOOKAHEAD_REGION")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(4)
+        .min(32)
+}
+
+/// TEMP (lab, LOOKAHEAD): up to `max` queued packets for a region's helpers.
+pub(crate) fn lookahead_take(max: usize) -> Vec<AheadItem> {
+    if !lookahead_on() {
+        return Vec::new();
+    }
+    LOOKAHEAD.with(|l| {
+        let mut l = l.borrow_mut();
+        let n = l.pending.len().min(max);
+        l.pending.drain(..n).collect()
+    })
+}
+
+/// TEMP (lab, LOOKAHEAD): a helper's job - read, build, walk.
+pub(crate) fn lookahead_job(
+    st: &DeviceState,
+    env: &crate::runtime::par::WorkerEnv<'_>,
+    item: &AheadItem,
+) -> Option<AheadParse> {
+    if LOOKAHEAD_CLOSING.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let host = env.host();
+    let (submission, _exec) = crate::runtime::exec::read_exec_submission(st, &host, &item.packet.payload);
+    let submission = submission?;
+    let built = crate::runtime::ingress::device_packet_ahead_named(
+        st,
+        &host,
+        item.fifo,
+        item.session,
+        reims_vgpu_core::identity::StampSlot(stamp_slot_index(item.completion_slot)),
+        &item.packet,
+        crate::runtime::ingress::PacketReads {
+            submission: Some(&submission),
+            repointed: Err(crate::runtime::objects::RepointStorageRefusal::Unnamed),
+        },
+    );
+    let (built, names) = match built {
+        Some((Ok(built), names)) => (built, names),
+        Some((Err(_), _)) => {
+            note_store_route("lookahead_refused");
+            return None;
+        }
+        None => {
+            note_store_route("lookahead_cold_name");
+            return None;
+        }
+    };
+    submission.lab_walk_ahead(st, &host, &LOOKAHEAD_CLOSING);
+    Some(AheadParse {
+        submission,
+        built,
+        session: item.session,
+        names,
+    })
+}
+
+/// TEMP (lab, LOOKAHEAD): what a region's helpers built, for the admissions.
+pub(crate) fn lookahead_deposit(items: Vec<AheadItem>, built: Vec<Option<AheadParse>>) {
+    LOOKAHEAD.with(|l| {
+        let mut l = l.borrow_mut();
+        let mut n = 0u64;
+        for (item, b) in items.into_iter().zip(built) {
+            if let Some(b) = b {
+                n += 1;
+                l.ready.push_back((item.channel, item.head, item.packet.payload, b));
+            }
+        }
+        while l.ready.len() > 64 {
+            l.ready.pop_front();
+        }
+        note_store_route_n("lookahead_built", n);
+    });
+}
+
+/// TEMP (lab, LOOKAHEAD): at an EXEC's admission, the build a helper made for
+/// it (when every name it read still names the same), and queue the EXECs
+/// behind it that are neither queued nor built.
+#[allow(clippy::too_many_arguments)]
+fn lookahead_admission<H: HostMemory>(
+    state: &DeviceState,
+    host: &H,
+    ring: &Ring<'_>,
+    fifo: crate::runtime::ingress::Fifo,
+    channel_id: u32,
+    completion_slot: u32,
+    packet: &Packet,
+    head: u32,
+    tail: u32,
+) -> Option<AheadParse> {
+    let session = state.session_generation();
+    let built = LOOKAHEAD.with(|l| {
+        let mut l = l.borrow_mut();
+        // Builds behind this head in ring order belong to positions already
+        // admitted without them.
+        let at = l.ready.iter().position(|e| e.0 == channel_id && e.1 == head);
+        let (_, _, payload, b) = match at {
+            Some(i) => {
+                let dropped = i as u64;
+                if dropped > 0 {
+                    note_store_route_n("lookahead_skipped", dropped);
+                }
+                l.ready.drain(..i);
+                l.ready.pop_front()?
+            }
+            None => return None,
+        };
+        if payload != packet.payload {
+            note_store_route("lookahead_payload_changed");
+            return None;
+        }
+        Some(b)
+    });
+    let built = built.and_then(|b| {
+        if b.session != session {
+            note_store_route("lookahead_stale_session");
+            return None;
+        }
+        if !b
+            .names
+            .iter()
+            .all(|&(task, r, id)| state.object_name(task, r) == Some(id))
+        {
+            note_store_route("lookahead_stale_name");
+            return None;
+        }
+        Some(b)
+    });
+    // Queue what follows this packet under this tail read.
+    LOOKAHEAD.with(|l| {
+        let mut l = l.borrow_mut();
+        let known = |l: &Lookahead, h: u32| {
+            l.pending.iter().any(|p| p.channel == channel_id && p.head == h)
+                || l.ready.iter().any(|e| e.0 == channel_id && e.1 == h)
+        };
+        let k = lookahead_k();
+        let mut at = packet.next_head;
+        let mut queued = 0u64;
+        while at != tail && l.pending.len() < k {
+            let Arrival::Packet(p) = arrival(ring, host, at, tail) else {
+                break;
+            };
+            if p.opcode != CHILD_OP_EXEC_INDIRECT2 {
+                break;
+            }
+            let next = p.next_head;
+            if !known(&l, at) {
+                l.pending.push_back(AheadItem {
+                    channel: channel_id,
+                    head: at,
+                    fifo,
+                    completion_slot,
+                    session,
+                    packet: p,
+                });
+                queued += 1;
+            }
+            at = next;
+        }
+        note_store_route_n("lookahead_queued", queued);
+    });
+    if built.is_some() {
+        note_store_route("lookahead_used");
+    }
+    built
 }
 
 /// TEMP (lab, live `INGRESS_AHEAD=on|off`, else `REIMS_VGPU_LAB_INGRESS_AHEAD=on`):
@@ -2582,6 +2816,7 @@ fn ingress_ahead(
                 submission,
                 built,
                 session,
+                names: Vec::new(),
             }),
             Some(Err(_)) => {
                 note_store_route("ingress_ahead_refused");
@@ -2634,8 +2869,8 @@ fn admit_and_park<H: HostMemory + HostOps>(
             "lab_hold_admitted_other"
         });
     }
-    // TEMP (lab, INGRESS_AHEAD): the helper's read and packet, when the
-    // session it was built under is still this one.
+    // TEMP (lab, INGRESS_AHEAD / LOOKAHEAD): the helper's read and packet,
+    // when the session it was built under is still this one.
     let pre = pre.filter(|p| p.session == state.session_generation());
     let (arrived, pre_built) = match pre {
         Some(AheadParse {
@@ -8747,6 +8982,11 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // on the pool together with the EXECs behind it under this tail
                 // read; admission and execution stay one packet at a time.
                 let pre = if ahead_k <= 1
+                    && first.opcode == CHILD_OP_EXEC_INDIRECT2
+                    && lookahead_on()
+                {
+                    lookahead_admission(state, host, &ring, fifo, channel_id, stamp_index, &first, head, tail)
+                } else if ahead_k <= 1
                     && first.opcode == CHILD_OP_EXEC_INDIRECT2
                     && ingress_ahead_on()
                 {
