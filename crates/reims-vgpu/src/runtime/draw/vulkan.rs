@@ -9862,6 +9862,11 @@ fn note_pass_scissor_rect(rect: ScissorRect) {
             let (cx0, cy0, cx1, cy1) = unpack_rect(cur);
             pack_rect(cx0.min(x0), cy0.min(y0), cx1.max(x1), cy1.max(y1))
         };
+        // A union this rect does not grow stays as it is, and the line stays
+        // shared: the drain and the pool's helpers all note every draw here.
+        if next == cur {
+            return;
+        }
         match PASS_SCISSOR_UNION.compare_exchange_weak(
             cur,
             next,
@@ -14514,7 +14519,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 unnormalized: smp.unnormalized_coordinates,
             };
         }
-        crate::runtime::gpu_hang_trail::note_draw(crate::runtime::gpu_hang_trail::DrawNote {
+        let hang_note = crate::runtime::gpu_hang_trail::DrawNote {
             sampled: sampled_notes,
             sampled_count: resources.sampled_images.len() as u32,
             samplers: sampler_notes,
@@ -14540,7 +14545,14 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             frag_provided: frag_layout_bindings.len() as u32,
             frag_gap: frag_gap.0,
             frag_gap_lo: frag_gap.1,
-        });
+        };
+        // TEMP (lab, DRAW_PAR): a worker's draw enters the trail when it is
+        // committed, on the drain (b176: the trail's mutex per draw on the
+        // drain and six helpers; and a preparation that bails was never drawn).
+        match prep.as_deref_mut() {
+            Some(log) => log.hang = Some(hang_note),
+            None => crate::runtime::gpu_hang_trail::note_draw(hang_note),
+        }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.vert_spirv = v_words;
         resources.frag_spirv = f_words;

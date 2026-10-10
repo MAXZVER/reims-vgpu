@@ -367,6 +367,8 @@ pub(crate) struct PrepareLog {
     pub(super) linear: Vec<LinearMemoFact>,
     pub(super) notes: Vec<SampledNote>,
     pub(super) secondaries: Vec<SecondaryWitness>,
+    /// The draw's hang-trail note, entered at the commit.
+    pub(super) hang: Option<crate::runtime::gpu_hang_trail::DrawNote>,
     pub(super) bail: Option<Bail>,
     pub(super) done: Option<PreparedRequest>,
 }
@@ -1225,6 +1227,9 @@ fn commit_prepared<M: HostMemory + HostOps>(
             n.route,
         );
     }
+    if let Some(note) = log.hang {
+        crate::runtime::gpu_hang_trail::note_draw(note);
+    }
     // From here the draw is committed: the serial path's engine door, verbatim.
     if let Some(failure) = crate::backend::vulkan::engine::take_deferred_failure() {
         crate::backend::vulkan::engine::report_deferred_failure(&failure);
@@ -1459,6 +1464,9 @@ pub(crate) fn commit_shared<M: HostMemory + HostOps>(
     for n in &log.notes {
         note_sampled_ref_backing(state, task_id, n.texture_ref, n.rw, n.rh, n.mid, n.route);
         crate::runtime::scanout::note_sampled_surface_field(state, host, n.mid, n.texture_ref, n.route);
+    }
+    if let Some(note) = log.hang.take() {
+        crate::runtime::gpu_hang_trail::note_draw(note);
     }
     laps.lap("commit_ns_notes");
     let PreparedRequest { resources, meta, chain_identity, kind: _ } = done;

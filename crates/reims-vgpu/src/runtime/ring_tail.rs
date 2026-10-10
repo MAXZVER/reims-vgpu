@@ -17,8 +17,36 @@ use std::sync::Mutex;
 
 static TAILS: Mutex<Option<HashMap<(u64, u32), u64>>> = Mutex::new(None);
 
+thread_local! {
+    /// What this thread published last per key. Only a device's drain
+    /// publishes its rings, so an equal value is already in [`TAILS`].
+    static PUBLISHED: std::cell::RefCell<Vec<((u64, u32), u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Record that `device`'s child channel `channel` keeps its tail at `gpa`.
+///
+/// The drain calls this every time it sets a ring up (b176, Weather: ~3k times
+/// a second, ~0.9 % of its busy samples), and the address almost never moves;
+/// a repeat leaves the map - and the mutex the vCPU's doorbell reads it under -
+/// alone.
 pub fn publish(device: u64, channel: u32, gpa: u64) {
+    let repeat = PUBLISHED.with(|p| {
+        let mut p = p.borrow_mut();
+        match p.iter_mut().find(|(k, _)| *k == (device, channel)) {
+            Some((_, last)) if *last == gpa => true,
+            Some((_, last)) => {
+                *last = gpa;
+                false
+            }
+            None => {
+                p.push(((device, channel), gpa));
+                false
+            }
+        }
+    });
+    if repeat {
+        return;
+    }
     let mut tails = TAILS.lock().unwrap_or_else(|e| e.into_inner());
     tails
         .get_or_insert_with(HashMap::new)

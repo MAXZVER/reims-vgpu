@@ -3097,6 +3097,68 @@ fn note_backing_identity(
     }
 }
 
+/// TEMP (lab, live `RES_XMEMO`, default on; `off` disables): a thread's
+/// last answers of [`resolve_resource`], valid while [`DeviceState::names_gen`]
+/// stands.
+///
+/// b176 (Weather, pool helper sampler): `resolve_resource` was 13 % of a
+/// helper's prepare job and `lock_contended` 6 % - every bind takes the
+/// device-wide lifecycle mutex (`object_name`) and the task-resource map's
+/// mutex, on the drain and six helpers at once. Both answers can change only
+/// through a lifecycle change or a resource registered or deleted, and each of
+/// those bumps the names generation, so an answer read under an unchanged
+/// generation is the answer the two locks would give. The map holds weak
+/// references (a deleted resource is not kept alive by a thread that stopped
+/// asking) and is emptied whenever the generation moved.
+fn res_xmemo_on() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    crate::runtime::lab_live::on("RES_XMEMO").unwrap_or(true)
+}
+
+struct ResXmemo {
+    names_gen: u64,
+    map: reims_vgpu_core::fasthash::FxHashMap<(u32, u32), std::sync::Weak<TaskResource>>,
+}
+
+thread_local! {
+    static RES_XMEMO: std::cell::RefCell<ResXmemo> = std::cell::RefCell::new(ResXmemo {
+        names_gen: u64::MAX,
+        map: reims_vgpu_core::fasthash::FxHashMap::default(),
+    });
+}
+
+/// The memo's answer for `(task_id, obj_ref)` under generation `names_gen`.
+fn res_xmemo_get(names_gen: u64, task_id: u32, obj_ref: u32) -> Option<Arc<TaskResource>> {
+    RES_XMEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.names_gen != names_gen {
+            m.map.clear();
+            m.names_gen = names_gen;
+            return None;
+        }
+        m.map.get(&(task_id, obj_ref)).and_then(std::sync::Weak::upgrade)
+    })
+}
+
+/// Keep `resource` as the answer for `(task_id, obj_ref)`, read under
+/// `names_gen` (taken before the lookup, so a change in between empties the
+/// map at the next ask).
+fn res_xmemo_put(names_gen: u64, task_id: u32, obj_ref: u32, resource: &Arc<TaskResource>) {
+    RES_XMEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.names_gen != names_gen {
+            m.map.clear();
+            m.names_gen = names_gen;
+        }
+        if m.map.len() >= 4096 {
+            m.map.clear();
+        }
+        m.map.insert((task_id, obj_ref), Arc::downgrade(resource));
+    });
+}
+
 /// Retrieve or construct the resource named by `task_id` / `obj_ref`.
 ///
 /// A successful construction snapshots the object-list entry and descriptor
@@ -3114,8 +3176,18 @@ pub fn resolve_resource<M: HostMemory>(
     // memo is keyed by its answer. A slot the guest has deleted resolves to
     // nothing, so the retained bytes behind the name it used to have are
     // unreachable here rather than merely unlikely to be reached.
+    let xmemo_gen = res_xmemo_on().then(|| state.names_gen());
+    if let Some(names_gen) = xmemo_gen {
+        if let Some(resource) = res_xmemo_get(names_gen, task_id, obj_ref) {
+            note_stale_task_resource(state, host, task_id, obj_ref, &resource);
+            return Ok(resource);
+        }
+    }
     if let Some(name) = state.object_name(task_id, obj_ref) {
         if let Some(resource) = state.task_resources.get(task_id, name) {
+            if let Some(names_gen) = xmemo_gen {
+                res_xmemo_put(names_gen, task_id, obj_ref, &resource);
+            }
             note_stale_task_resource(state, host, task_id, obj_ref, &resource);
             return Ok(resource);
         }

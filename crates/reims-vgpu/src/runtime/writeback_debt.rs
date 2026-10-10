@@ -1687,6 +1687,18 @@ fn note_gva_payment_skipped_by_name(state: &DeviceState, task_id: u32, texture_r
         return;
     }
     crate::runtime::drain::note_store_route("wbdebt_gva_skipped_candidate");
+    // No other name of this task owed a frame: no peer to find, and no window
+    // to look up or owed set to collect (b176: this note was 14 % of the
+    // drain's source priming on Weather, whose references are aliased and
+    // whose GVA debts are mostly none).
+    if !state
+        .pending_writebacks
+        .gva_debts
+        .keys()
+        .any(|plane| plane.resource.task_id == task_id && plane.resource.texture_ref != texture_ref)
+    {
+        return;
+    }
     let Some((base, _)) = crate::runtime::objects::cached_window(state, task_id, texture_ref)
     else {
         return;
