@@ -6097,6 +6097,17 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                 } else {
                     crate::runtime::draw::vulkan::draw_par::MIN_DRAWS
                 };
+                // TEMP (lab, TIMERS): the region's build / prime / run, as
+                // `region_ns_*` store-route counts.
+                let region_t = crate::lab_clock::timers_on().then(crate::lab_clock::LabInstant::now);
+                let region_lap = |name: &'static str, t: &mut Option<crate::lab_clock::LabInstant>| {
+                    if let Some(last) = t.as_mut() {
+                        let now = crate::lab_clock::LabInstant::now();
+                        crate::runtime::drain::note_store_route_n(name, now.duration_since(*last).as_nanos() as u64);
+                        *last = now;
+                    }
+                };
+                let mut region_t = region_t;
                 if ov_reqs.is_empty() && ov_end - di >= min_draws {
                     if let Some(template) = attachment_template.as_ref() {
                         ov_base = di;
@@ -6115,10 +6126,12 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                                 (r, do_writeback)
                             })
                             .collect()));
+                        region_lap("region_ns_build", &mut region_t);
                         // The helper that prepared it ahead resolved its sources.
                         if ahead.is_none() {
                             crate::runtime::draw::vulkan::draw_par::prime_stream(state, host, &ov_reqs[..]);
                         }
+                        region_lap("region_ns_prime", &mut region_t);
                     }
                 }
                 if !ov_reqs.is_empty() && di >= ov_base {
@@ -6134,6 +6147,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                             ov_end,
                         );
                     }
+                    region_lap("region_ns_pre", &mut region_t);
                     let stop = crate::runtime::draw::vulkan::draw_par::run_region_g(
                         g,
                         host,
@@ -6182,6 +6196,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                             }
                         },
                     );
+                    region_lap("region_ns_run", &mut region_t);
                     state = g.st();
                     let stop_di = di + stop.at;
                     ov_carried = stop.after;
