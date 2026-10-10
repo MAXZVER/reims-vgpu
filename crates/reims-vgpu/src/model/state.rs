@@ -889,6 +889,19 @@ impl TaskResourceLifetimeRef {
 /// device already owns its state, but making the registry itself synchronized
 /// also makes the lifetime rule explicit instead of relying on that outer
 /// serialization.
+/// TEMP (lab, INGRESS_AHEAD / WALK_AHEAD): bumped by every change to what a
+/// packet built or a stream walked ahead of its turn read - lifecycle changes
+/// (declare, alias, storage, retire, task namespace), constructed resources
+/// registered or deleted, objects and mapper-ref registrations inserted,
+/// mapping rebuilds, and every non-EXEC packet. Process-wide: a second device
+/// only invalidates more often.
+pub static LAB_NAMES_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// TEMP (lab): see [`LAB_NAMES_GEN`].
+pub fn bump_names_gen() {
+    LAB_NAMES_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 #[derive(Debug, Default)]
 pub struct TaskResources(Mutex<BTreeMap<(u32, ResourceId), Arc<TaskResource>>>);
 
@@ -908,6 +921,7 @@ impl TaskResources {
         name: ResourceId,
         resource: Arc<TaskResource>,
     ) -> Arc<TaskResource> {
+        bump_names_gen();
         Arc::clone(
             self.0
                 .lock()
@@ -918,6 +932,7 @@ impl TaskResources {
     }
 
     pub fn delete(&self, task_id: u32, name: ResourceId) -> bool {
+        bump_names_gen();
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3163,7 +3178,9 @@ pub struct DeviceState {
     /// `&DeviceState` and cannot take a `&mut` field. A `Mutex` and named doors
     /// keep "which state changes, from where" a list a reader can enumerate,
     /// instead of a public field any call site can reach into.
-    session: Mutex<reims_vgpu_core::session::SessionModel>,
+    /// TEMP (lab, INGRESS_AHEAD): a `RwLock`, read by [`Self::pipeline_usage`]
+    /// for a whole packet walk so helpers can walk several packets at once.
+    session: std::sync::RwLock<reims_vgpu_core::session::SessionModel>,
     /// TEMP (lab, pipeline ids): the pipeline table as it would be named per
     /// task, stepped beside the real one. See
     /// [`crate::model::lab_pipeline_shadow`].
@@ -3753,7 +3770,7 @@ impl DeviceState {
             gfx: GfxRegs::default(),
             iosfc: IosfcRegs::default(),
             gva_store_witness: Default::default(),
-            session: Mutex::new(reims_vgpu_core::session::SessionModel::new(
+            session: std::sync::RwLock::new(reims_vgpu_core::session::SessionModel::new(
                 reims_vgpu_core::identity::SessionId(id.0 as u32),
             )),
             lab_shadow: Default::default(),
@@ -4515,7 +4532,9 @@ impl DeviceState {
             .emit(discriminant);
             return false;
         }
-        self.objects.insert((task_id, ref_));
+        if self.objects.insert((task_id, ref_)) {
+            bump_names_gen();
+        }
         true
     }
 
@@ -4554,7 +4573,7 @@ impl DeviceState {
             if mask & (1u32 << channel) != 0 {
                 let _ = self
                     .session
-                    .lock()
+                    .write()
                     .expect("session")
                     .open_channel(reims_vgpu_core::identity::ChannelId(channel));
             }
@@ -4568,7 +4587,7 @@ impl DeviceState {
     /// [`Self::session`] for why the other two answer a different question.
     pub fn child_domain_open(&self, channel: u32) -> bool {
         self.session
-            .lock()
+            .write()
             .expect("session")
             .channel_open(reims_vgpu_core::identity::ChannelId(channel))
     }
@@ -4583,7 +4602,7 @@ impl DeviceState {
         &self,
         op: reims_vgpu_core::control::ControlOp,
     ) -> Result<(), reims_vgpu_core::session::ControlRefusal> {
-        self.session.lock().expect("session").apply_control(op)
+        self.session.write().expect("session").apply_control(op)
     }
 
     /// Tell the ordering plane that the guest has created a pipeline object.
@@ -4615,7 +4634,7 @@ impl DeviceState {
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
         let (declared, generation) = {
-            let mut session = self.session.lock().expect("session");
+            let mut session = self.session.write().expect("session");
             let generation = session.generation();
             (session.pipelines().declare(id, generation), generation)
         };
@@ -4675,7 +4694,7 @@ impl DeviceState {
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> reims_vgpu_core::session::Ended {
         let id = self.pipeline_id(task_id, pipeline);
-        let ended = self.session.lock().expect("session").pipeline_retired(id);
+        let ended = self.session.write().expect("session").pipeline_retired(id);
         self.lab_shadow.retire(task_id, pipeline, &ended);
         ended
     }
@@ -4704,7 +4723,7 @@ impl DeviceState {
         let id = self.pipeline_id(task_id, pipeline);
         let took = self
             .session
-            .lock()
+            .write()
             .expect("session")
             .pipelines()
             .advance(id, next);
@@ -4725,7 +4744,7 @@ impl DeviceState {
         let id = self.pipeline_id(task_id, pipeline);
         let took = self
             .session
-            .lock()
+            .write()
             .expect("session")
             .pipelines()
             .withdraw(id);
@@ -4757,7 +4776,7 @@ impl DeviceState {
             // real one keeps the first published, which is what it holds when
             // the rail is not asked again.
             self.lab_shadow.publish(task_id, pipeline, &usage);
-            let mut session = self.session.lock().expect("session");
+            let mut session = self.session.write().expect("session");
             if session.pipelines().usage_published(id) {
                 return false;
             }
@@ -4766,7 +4785,7 @@ impl DeviceState {
                 .publish_usage_to(id, usage, self.usage_scope());
         }
         self.session
-            .lock()
+            .write()
             .expect("session")
             .pipelines()
             .publish_usage_to(id, usage, self.usage_scope())
@@ -4787,7 +4806,7 @@ impl DeviceState {
         let id = self.pipeline_id(task_id, pipeline);
         let real = self
             .session
-            .lock()
+            .write()
             .expect("session")
             .pipelines()
             .usage_published(id);
@@ -4807,7 +4826,7 @@ impl DeviceState {
         let id = self.pipeline_id(task_id, pipeline);
         let real = self
             .session
-            .lock()
+            .write()
             .expect("session")
             .pipelines()
             .usage_wanted_by(id, self.usage_scope());
@@ -4840,7 +4859,7 @@ impl DeviceState {
     #[must_use]
     pub fn pipeline_usage(&self, task_id: u32) -> PipelineUsage<'_> {
         PipelineUsage(
-            self.session.lock().expect("session"),
+            self.session.read().expect("session"),
             self.pipeline_scope(task_id),
             task_id,
             &self.lab_shadow,
@@ -4860,11 +4879,11 @@ impl DeviceState {
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
         let waiters = if super::lab_pipeline_shadow::enabled() {
-            self.session.lock().expect("session").pipeline_waiters(id)
+            self.session.write().expect("session").pipeline_waiters(id)
         } else {
             Vec::new()
         };
-        let took = self.session.lock().expect("session").pipeline_ready(id);
+        let took = self.session.write().expect("session").pipeline_ready(id);
         self.lab_shadow.ready(task_id, pipeline, &waiters, took);
         took
     }
@@ -4880,7 +4899,7 @@ impl DeviceState {
             return;
         }
         let (generation, real) = {
-            let session = self.session.lock().expect("session");
+            let session = self.session.write().expect("session");
             let generation = session.generation();
             let real: Vec<reims_vgpu_core::pipeline::Lease> = leases
                 .iter()
@@ -4942,7 +4961,7 @@ impl DeviceState {
         id: reims_vgpu_core::pipeline::PipelineId,
     ) -> Option<&'static str> {
         self.session
-            .lock()
+            .write()
             .expect("session")
             .pipelines()
             .get(id)
@@ -4961,7 +4980,7 @@ impl DeviceState {
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
         self.session
-            .lock()
+            .write()
             .expect("session")
             .release_past_ended_pipeline(ingress, id)
     }
@@ -4974,7 +4993,7 @@ impl DeviceState {
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
         self.session
-            .lock()
+            .write()
             .expect("session")
             .pipelines()
             .get(id)
@@ -4997,7 +5016,7 @@ impl DeviceState {
         let id = self.pipeline_id(task_id, pipeline);
         let ended = self
             .session
-            .lock()
+            .write()
             .expect("session")
             .pipeline_refused(id, reason);
         self.lab_shadow.refuse(task_id, pipeline, reason, &ended);
@@ -5026,7 +5045,7 @@ impl DeviceState {
         &self,
         packet: &reims_vgpu_core::session::Packet,
     ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
-        let mut session = self.session.lock().expect("session");
+        let mut session = self.session.write().expect("session");
         let admitted = session.admit(packet)?;
         Ok(Admission {
             epoch: session.epoch(),
@@ -5044,7 +5063,7 @@ impl DeviceState {
         &self,
         packet: reims_vgpu_core::session::Packet,
     ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
-        let mut session = self.session.lock().expect("session");
+        let mut session = self.session.write().expect("session");
         let admitted = session.admit_owned(packet)?;
         Ok(Admission {
             epoch: session.epoch(),
@@ -5063,7 +5082,7 @@ impl DeviceState {
     /// [`reims_vgpu_core::session::Packet::session`].
     #[must_use]
     pub fn session_generation(&self) -> reims_vgpu_core::identity::SessionGeneration {
-        self.session.lock().expect("session").generation()
+        self.session.write().expect("session").generation()
     }
 
     /// The positions the model has released to run since the last ask.
@@ -5074,7 +5093,7 @@ impl DeviceState {
     /// unrepresentable — see `crate::runtime::parked::ParkedStore::release`.
     #[must_use = "a position taken off the ready list and not run is a packet that never runs"]
     pub fn take_ready(&self) -> Vec<reims_vgpu_core::identity::IngressOrdinal> {
-        self.session.lock().expect("session").take_ready()
+        self.session.write().expect("session").take_ready()
     }
 
     /// A transaction finished on the host.
@@ -5099,7 +5118,7 @@ impl DeviceState {
         ingress: reims_vgpu_core::identity::IngressOrdinal,
     ) -> Result<Vec<reims_vgpu_core::publish::Release>, reims_vgpu_core::session::Refusal> {
         self.session
-            .lock()
+            .write()
             .expect("session")
             .complete(epoch, ingress)
     }
@@ -5115,7 +5134,7 @@ impl DeviceState {
         &self,
         ingress: reims_vgpu_core::identity::IngressOrdinal,
     ) -> Vec<reims_vgpu_core::publish::Release> {
-        self.session.lock().expect("session").withdraw(ingress)
+        self.session.write().expect("session").withdraw(ingress)
     }
 
     /// The guest's completion word for `slot` has moved to `value`.
@@ -5133,7 +5152,7 @@ impl DeviceState {
         slot: reims_vgpu_core::identity::StampSlot,
         value: reims_vgpu_core::identity::StampValue,
     ) -> StampPublication {
-        let mut session = self.session.lock().expect("session");
+        let mut session = self.session.write().expect("session");
         let before = session.published_stamp(slot);
         session.stamp_published(reims_vgpu_core::identity::CompletionStamp { slot, value });
         let after = session.published_stamp(slot);
@@ -5152,13 +5171,13 @@ impl DeviceState {
         &self,
         slot: reims_vgpu_core::identity::StampSlot,
     ) -> Option<reims_vgpu_core::identity::StampValue> {
-        self.session.lock().expect("session").published_stamp(slot)
+        self.session.write().expect("session").published_stamp(slot)
     }
 
     /// What the ordering plane holds about the pipelines this session declared.
     #[must_use]
     pub fn pipeline_census(&self) -> reims_vgpu_core::pipeline::Census {
-        self.session.lock().expect("session").pipelines().census()
+        self.session.write().expect("session").pipelines().census()
     }
 
     /// The census line for what the ordering plane's pipeline table is holding
@@ -5190,7 +5209,7 @@ impl DeviceState {
         if now.saturating_sub(last) < WINDOW_MS {
             return None;
         }
-        let resting = self.session.lock().expect("session").pipelines().resting();
+        let resting = self.session.write().expect("session").pipelines().resting();
         if resting.total() == 0 {
             return None;
         }
@@ -5234,7 +5253,7 @@ impl DeviceState {
             return None;
         }
         let (census, live, slots) = {
-            let session = self.session.lock().expect("session");
+            let session = self.session.write().expect("session");
             let graph = session.graph();
             (graph.census(), graph.live_accesses(), graph.entries())
         };
@@ -5298,6 +5317,16 @@ impl DeviceState {
     /// answer. A task the owner does not hold answers `None`, which is the same
     /// answer an empty slot gives and is right for both.
     #[must_use]
+    /// TEMP (lab, INGRESS_AHEAD): see [`LAB_NAMES_GEN`].
+    pub fn names_gen(&self) -> u64 {
+        LAB_NAMES_GEN.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// TEMP (lab, INGRESS_AHEAD): see [`LAB_NAMES_GEN`].
+    pub fn bump_names_gen(&self) {
+        bump_names_gen();
+    }
+
     pub fn object_name(&self, task_id: u32, obj_ref: u32) -> Option<ResourceId> {
         use reims_vgpu_core::resolve::TaskNamespaces as _;
         self.lifecycle
@@ -5384,6 +5413,7 @@ impl DeviceState {
         obj_ref: u32,
         storage: reims_vgpu_core::lifecycle::Storage,
     ) -> Result<Declaration, reims_vgpu_core::lifecycle::Refusal> {
+        self.bump_names_gen();
         use reims_vgpu_core::identity::TaskId;
         use reims_vgpu_core::lifecycle::LifecycleOp;
         use reims_vgpu_core::resolve::TaskNamespaces as _;
@@ -5433,6 +5463,7 @@ impl DeviceState {
         name: reims_vgpu_core::identity::ResourceId,
         alias: reims_vgpu_core::lifecycle::Aliasing,
     ) -> Result<bool, reims_vgpu_core::lifecycle::Refusal> {
+        self.bump_names_gen();
         self.lifecycle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -5454,6 +5485,7 @@ impl DeviceState {
         name: reims_vgpu_core::identity::ResourceId,
         storage: reims_vgpu_core::lifecycle::Storage,
     ) -> Result<bool, reims_vgpu_core::lifecycle::Refusal> {
+        self.bump_names_gen();
         self.lifecycle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -5496,6 +5528,7 @@ impl DeviceState {
     /// that does not exist is a name that resolves to nothing.
     #[must_use]
     pub fn retire_object_name(&self, task_id: u32, name: ResourceId) -> Option<Teardown> {
+        self.bump_names_gen();
         use reims_vgpu_core::lifecycle::LifecycleOp;
         let effects = self
             .lifecycle
@@ -5528,6 +5561,7 @@ impl DeviceState {
     /// case at a first definition, where there is no previous address space to
     /// end.
     fn delete_task_namespace(&self, task_id: u32) {
+        self.bump_names_gen();
         use reims_vgpu_core::lifecycle::LifecycleOp;
         let applied = self
             .lifecycle
@@ -5563,7 +5597,7 @@ impl DeviceState {
         }
         let ended = self
             .session
-            .lock()
+            .write()
             .expect("session")
             .task_ended(reims_vgpu_core::identity::TaskId(task_id));
         if ended.removed > 0 {
@@ -5608,6 +5642,7 @@ impl DeviceState {
         op: &reims_vgpu_core::lifecycle::LifecycleOp,
         site: &'static str,
     ) -> Option<Acted> {
+        self.bump_names_gen();
         match self
             .lifecycle
             .lock()
@@ -5647,6 +5682,7 @@ impl DeviceState {
         task_id: u32,
         directory_pfn: u32,
     ) -> Option<reims_vgpu_core::lifecycle::Redefinition> {
+        self.bump_names_gen();
         use reims_vgpu_core::lifecycle::LifecycleOp;
         let effects = self
             .lifecycle
@@ -5700,6 +5736,7 @@ impl DeviceState {
         if removed || resource_removed {
             self.invalidate_object_host_copies(task_id, ref_);
             self.texture_to_mapping.remove(&(task_id, ref_));
+            bump_names_gen();
             // The incarnation is deliberately not advanced here. Releasing a
             // *name* is not a statement about storage: other storage at this
             // reference is a different window and is distinct already, and the
@@ -5997,6 +6034,7 @@ impl DeviceState {
     /// zone freelist; the next Store must re-resolve before any host write or
     /// import-present DMA (freelist `0xff000000ff000000` class).
     pub fn invalidate_mapping_pages(&mut self, mapping_id: u32) -> bool {
+        bump_names_gen();
         // The cached BGRA frame is a host-side copy of the pages this call is
         // invalidating, and it is the only such copy whose key does not carry
         // `map_generation`: the resident's does (`surface_identity`), the
@@ -6089,6 +6127,7 @@ impl DeviceState {
     }
 
     pub fn map_surface(&mut self, mapping_id: u32) -> bool {
+        bump_names_gen();
         self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
         if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::MapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
@@ -6143,6 +6182,7 @@ impl DeviceState {
     }
 
     pub fn unmap_surface(&mut self, mapping_id: u32) -> bool {
+        bump_names_gen();
         self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
         if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::UnmapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
@@ -6258,6 +6298,7 @@ impl DeviceState {
         height: u32,
         format: u16,
     ) -> bool {
+        bump_names_gen();
         if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::MappingGeomIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
@@ -8220,7 +8261,7 @@ mod slot_table_reach_tests {
 /// See [`DeviceState::pipeline_usage`] for why this is a guard and not a
 /// lookup.
 pub struct PipelineUsage<'a>(
-    std::sync::MutexGuard<'a, reims_vgpu_core::session::SessionModel>,
+    std::sync::RwLockReadGuard<'a, reims_vgpu_core::session::SessionModel>,
     reims_vgpu_core::pipeline::PipelineScope,
     u32,
     &'a super::lab_pipeline_shadow::LabShadow,

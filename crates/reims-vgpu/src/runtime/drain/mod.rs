@@ -2399,6 +2399,220 @@ fn lab_exec_write_tokens(
     }
 }
 
+/// TEMP (lab, INGRESS_AHEAD): one EXEC packet's arrival read and model packet,
+/// built by a pool helper before the batch it arrived in was admitted.
+struct AheadParse {
+    submission: crate::runtime::exec::ExecSubmission,
+    built: reims_vgpu_core::session::Packet,
+    session: reims_vgpu_core::identity::SessionGeneration,
+}
+
+/// TEMP (lab, live `INGRESS_AHEAD=on|off`, else `REIMS_VGPU_LAB_INGRESS_AHEAD=on`):
+/// an ADMIT_AHEAD batch of EXECs has its command buffers read and its model
+/// packets built on the pool, all at once, before the drain admits them in
+/// ring order; see [`ingress_ahead`].
+fn ingress_ahead_on() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("INGRESS_AHEAD") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_INGRESS_AHEAD").as_deref() == Ok("on"))
+}
+
+/// TEMP (lab, INGRESS_AHEAD): the arrival read and the model packet of every
+/// packet of a batch, built in parallel under the shared state.
+///
+/// Sound because nothing runs between this and the batch's admissions:
+/// admission declares pipelines and readies leases (a packet walked before an
+/// earlier one published a usage is walked again by admission's own
+/// `access_rewalked` arm, exactly as when it is walked serially) and parks
+/// positions; no packet of the batch executes before all are admitted. A cold
+/// object name would be a declaration, and declarations are the drain's, in
+/// ring order, so a packet that meets one gets `None` and is read and built by
+/// its admission exactly as without this - and so does any packet a helper
+/// could not read or the bridge refused, so that refusal is reported once, from
+/// the drain.
+/// TEMP (lab, INGRESS_AHEAD): helper-built packets for the EXECs behind the one
+/// being admitted, by ring position, and the device facts they were built
+/// against.
+struct AheadCache {
+    channel: u32,
+    session: Option<reims_vgpu_core::identity::SessionGeneration>,
+    names_gen: u64,
+    /// `(head of the packet, its payload, what a helper built)`, in ring order.
+    entries: std::collections::VecDeque<(u32, Vec<u8>, Option<AheadParse>)>,
+}
+
+thread_local! {
+    static AHEAD_CACHE: std::cell::RefCell<AheadCache> = const {
+        std::cell::RefCell::new(AheadCache {
+            channel: u32::MAX,
+            session: None,
+            names_gen: 0,
+            entries: std::collections::VecDeque::new(),
+        })
+    };
+}
+
+/// TEMP (lab, INGRESS_AHEAD): how many EXECs one fork builds (the one being
+/// admitted and those behind it under the same tail read).
+fn ingress_ahead_k() -> usize {
+    if let Some(v) = crate::runtime::lab_live::value("INGRESS_AHEAD_K") {
+        return v.trim().parse::<usize>().unwrap_or(8).clamp(2, 32);
+    }
+    8
+}
+
+/// TEMP (lab, INGRESS_AHEAD): the helper-built read and packet for the EXEC at
+/// `head`, from the cache when the packets behind an earlier one were built
+/// with it and nothing they read has changed since (`names_gen`: every
+/// lifecycle change, mapping rebuild and non-EXEC packet bumps it; the session
+/// generation), else from a fresh fork over this packet and the EXECs behind
+/// it. `None`: the drain reads and builds it itself, as without this.
+#[allow(clippy::too_many_arguments)]
+fn ingress_ahead_take<H: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &H,
+    ring: &Ring<'_>,
+    fifo: crate::runtime::ingress::Fifo,
+    channel_id: u32,
+    completion_slot: u32,
+    packet: &Packet,
+    head: u32,
+    tail: u32,
+) -> Option<AheadParse> {
+    let names_gen = state.names_gen();
+    let session = state.session_generation();
+    let hit = AHEAD_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.channel != channel_id || c.session != Some(session) || c.names_gen != names_gen {
+            if !c.entries.is_empty() {
+                note_store_route_n("ingress_ahead_dropped", c.entries.len() as u64);
+            }
+            c.entries.clear();
+            return None;
+        }
+        while let Some(front) = c.entries.front() {
+            if front.0 == head {
+                break;
+            }
+            note_store_route("ingress_ahead_skipped");
+            c.entries.pop_front();
+        }
+        let (_, payload, built) = c.entries.pop_front()?;
+        if payload != packet.payload {
+            note_store_route("ingress_ahead_payload_changed");
+            c.entries.clear();
+            return None;
+        }
+        Some(built)
+    });
+    if let Some(built) = hit {
+        note_store_route(if built.is_some() { "ingress_ahead_hit" } else { "ingress_ahead_hit_none" });
+        return built;
+    }
+    // A fresh fork: this packet and the EXECs behind it.
+    let k = ingress_ahead_k();
+    let mut packets = vec![packet.clone()];
+    let mut heads = vec![head];
+    let mut at = packet.next_head;
+    while packets.len() < k && at != tail {
+        match arrival(ring, host, at, tail) {
+            Arrival::Packet(p) if p.opcode == CHILD_OP_EXEC_INDIRECT2 => {
+                heads.push(at);
+                at = p.next_head;
+                packets.push(p);
+            }
+            _ => break,
+        }
+    }
+    if packets.len() < 2 {
+        note_store_route("ingress_ahead_alone");
+        return None;
+    }
+    let mut built = ingress_ahead(state, fifo, completion_slot, &packets).into_iter();
+    let first = built.next().flatten();
+    AHEAD_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.channel = channel_id;
+        c.session = Some(session);
+        c.names_gen = names_gen;
+        c.entries.clear();
+        for ((h, p), b) in heads.into_iter().zip(packets).skip(1).zip(built) {
+            c.entries.push_back((h, p.payload, b));
+        }
+    });
+    first
+}
+
+fn ingress_ahead(
+    state: &DeviceState,
+    fifo: crate::runtime::ingress::Fifo,
+    completion_slot: u32,
+    packets: &[Packet],
+) -> Vec<Option<AheadParse>> {
+    let none = || (0..packets.len()).map(|_| None).collect();
+    let Some(pool) = state.par() else {
+        return none();
+    };
+    let session = state.session_generation();
+    let slot = reims_vgpu_core::identity::StampSlot(stamp_slot_index(completion_slot));
+    let scoped = pool.scope(state, packets, |st, env, packet| {
+        let host = env.host();
+        let (submission, _exec) =
+            crate::runtime::exec::read_exec_submission(st, &host, &packet.payload);
+        let submission = submission?;
+        let built = crate::runtime::ingress::device_packet_ahead(
+            st,
+            &host,
+            fifo,
+            session,
+            slot,
+            packet,
+            crate::runtime::ingress::PacketReads {
+                submission: Some(&submission),
+                repointed: Err(crate::runtime::objects::RepointStorageRefusal::Unnamed),
+            },
+        );
+        match built {
+            Some(Ok(built)) => Some(AheadParse {
+                submission,
+                built,
+                session,
+            }),
+            Some(Err(_)) => {
+                note_store_route("ingress_ahead_refused");
+                None
+            }
+            None => {
+                note_store_route("ingress_ahead_cold_name");
+                None
+            }
+        }
+    });
+    note_store_route("ingress_ahead_batches");
+    note_store_route_n("ingress_ahead_packets", packets.len() as u64);
+    note_store_route_us("ingress_ahead_fork_us", scoped.fork_us);
+    note_store_route_us("ingress_ahead_wait_us", scoped.wait_us);
+    note_store_route_n("ingress_ahead_helped", scoped.helped as u64);
+    if scoped.serial {
+        note_store_route("ingress_ahead_serial");
+    }
+    let out: Vec<Option<AheadParse>> = scoped
+        .results
+        .into_iter()
+        .map(|r| r.ok().flatten())
+        .collect();
+    note_store_route_n(
+        "ingress_ahead_ready",
+        out.iter().filter(|p| p.is_some()).count() as u64,
+    );
+    out
+}
+
 fn admit_and_park<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2406,6 +2620,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
     completion_slot: u32,
     packet: Packet,
     ahead: Option<&mut AheadNames>,
+    pre: Option<AheadParse>,
 ) {
     use reims_vgpu_core::identity::StampSlot;
 
@@ -2419,7 +2634,25 @@ fn admit_and_park<H: HostMemory + HostOps>(
             "lab_hold_admitted_other"
         });
     }
-    let arrived = arrival_work(state, host, fifo, &packet);
+    // TEMP (lab, INGRESS_AHEAD): the helper's read and packet, when the
+    // session it was built under is still this one.
+    let pre = pre.filter(|p| p.session == state.session_generation());
+    let (arrived, pre_built) = match pre {
+        Some(AheadParse {
+            submission, built, ..
+        }) => {
+            note_store_route("ingress_ahead_used");
+            (
+                Arrived {
+                    submission: Some(submission),
+                    exec: crate::runtime::exec::ExecResult::default(),
+                    repointed: Err(crate::runtime::objects::RepointStorageRefusal::Unnamed),
+                },
+                Some(built),
+            )
+        }
+        None => (arrival_work(state, host, fifo, &packet), None),
+    };
     lab_chan::note_admit(fifo.domain().0, arrived.submission.as_ref().map(|s| s.task_id()), packet.opcode);
     lab_chan::lat_opcode(fifo.domain().0, packet.opcode);
     lab_chan::lat_admit(
@@ -2429,18 +2662,21 @@ fn admit_and_park<H: HostMemory + HostOps>(
         arrived.submission.as_ref().map(|s| s.task_id()),
     );
     let session = state.session_generation();
-    let built = crate::runtime::ingress::device_packet(
-        state,
-        host,
-        fifo,
-        session,
-        StampSlot(stamp_slot_index(completion_slot)),
-        &packet,
-        crate::runtime::ingress::PacketReads {
-            submission: arrived.submission.as_ref(),
-            repointed: arrived.repointed,
-        },
-    );
+    let built = match pre_built {
+        Some(built) => Ok(built),
+        None => crate::runtime::ingress::device_packet(
+            state,
+            host,
+            fifo,
+            session,
+            StampSlot(stamp_slot_index(completion_slot)),
+            &packet,
+            crate::runtime::ingress::PacketReads {
+                submission: arrived.submission.as_ref(),
+                repointed: arrived.repointed,
+            },
+        ),
+    };
     let mut built = match built {
         Ok(built) => built,
         Err(blocked) => {
@@ -3468,6 +3704,7 @@ fn run_parked_packet<H: HostMemory + HostOps>(
         crate::runtime::draw::vulkan::lanes::note_exec_started(task_id);
     }
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
+        state.bump_names_gen();
         process_root_packet(state, host, work.packet());
     } else {
         // The re-entry guard this packet used to be run under. A child packet's
@@ -3494,6 +3731,11 @@ fn run_parked_packet<H: HostMemory + HostOps>(
             } else {
                 "lab_packet_scope_all"
             });
+        }
+        // TEMP (lab, INGRESS_AHEAD): anything but an EXEC may change the names,
+        // storage or mappings a helper-built packet read.
+        if work.packet().opcode != CHILD_OP_EXEC_INDIRECT2 {
+            state.bump_names_gen();
         }
         let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
         lab_act(lab_prev_act);
@@ -5357,6 +5599,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                     crate::runtime::ingress::Fifo::ROOT,
                     ROOT_STAMP_SLOT,
                     packet,
+                    None,
                     None,
                 );
                 settle_model_work(state, host);
@@ -8500,8 +8743,19 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 };
                 let mut names = (ahead_k > 1).then(AheadNames::default);
                 let mut batch = 0usize;
-                let mut next = Some(first);
-                while let Some(packet) = next.take() {
+                // TEMP (lab, INGRESS_AHEAD): this EXEC's read and packet, built
+                // on the pool together with the EXECs behind it under this tail
+                // read; admission and execution stay one packet at a time.
+                let pre = if ahead_k <= 1
+                    && first.opcode == CHILD_OP_EXEC_INDIRECT2
+                    && ingress_ahead_on()
+                {
+                    ingress_ahead_take(state, host, &ring, fifo, channel_id, stamp_index, &first, head, tail)
+                } else {
+                    None
+                };
+                let mut next = Some((first, pre));
+                while let Some((packet, pre)) = next.take() {
                     host.note_work_scope(crate::runtime::host::WorkScope::PacketRead(channel_id));
                     // The census the model's own stamp plane now acts on. Asked for
                     // the reading and not for a verdict: a wait that is not yet met
@@ -8540,7 +8794,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                         });
                     }
 
-                    admit_and_park(state, host, fifo, stamp_index, packet, names.as_mut());
+                    admit_and_park(state, host, fifo, stamp_index, packet, names.as_mut(), pre);
                     batch += 1;
                     // Only another EXEC joins the batch, and only one this read
                     // already covers: anything else is read again, after the
@@ -8548,7 +8802,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     if names.is_some() && batch < ahead_k && head != tail {
                         if let Arrival::Packet(p) = arrival(&ring, host, head, tail) {
                             if p.opcode == CHILD_OP_EXEC_INDIRECT2 {
-                                next = Some(p);
+                                next = Some((p, None));
                             }
                         }
                     }

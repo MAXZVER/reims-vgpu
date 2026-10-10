@@ -4106,6 +4106,7 @@ pub fn resolve_mapper_ref_texture_resource(
         return None;
     }
     state.texture_to_mapping.insert((task_id, ref_), mapping_id);
+    crate::model::bump_names_gen();
     let mapping_id = resource.register_mapper_ref_texture_mapping(mapping_id);
     // Resolved: re-arm so a later genuine failure on this ref logs again.
     clear_mapper_ref_texture_fail(task_id, ref_);
@@ -4178,6 +4179,8 @@ fn apply_backing<M: HostMemory>(
     surface_id: u32,
     surf: &BackingRecord,
 ) -> bool {
+    // TEMP (lab, INGRESS_AHEAD): a rebuilt mapping is what an alias resolves to.
+    state.bump_names_gen();
     if !crate::model::is_mapping_id(surface_id) {
         defer_backing_fail(
             surface_id,

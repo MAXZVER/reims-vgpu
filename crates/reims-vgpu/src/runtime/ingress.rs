@@ -644,6 +644,63 @@ pub fn device_packet<M: crate::runtime::host::HostMemory>(
     drained: &drain::Packet,
     reads: PacketReads<'_>,
 ) -> Result<Packet, Blocked> {
+    let names = crate::runtime::objects::TaskNames::new(state, host);
+    device_packet_with(state, host, fifo, session, completion_slot, drained, reads, &names)
+}
+
+/// TEMP (lab, INGRESS_AHEAD): [`device_packet`] for a pool helper, ahead of
+/// the packet's admission: the object namespace answers only names already
+/// declared (a cold name would be a declaration, which belongs to the drain in
+/// ring order), and `None` says one was missing - the drain then builds the
+/// packet itself, exactly as without this.
+pub fn device_packet_ahead<M: crate::runtime::host::HostMemory>(
+    state: &crate::model::DeviceState,
+    host: &M,
+    fifo: Fifo,
+    session: SessionGeneration,
+    completion_slot: StampSlot,
+    drained: &drain::Packet,
+    reads: PacketReads<'_>,
+) -> Option<Result<Packet, Blocked>> {
+    let names = PeekNames {
+        state,
+        missed: std::cell::Cell::new(false),
+    };
+    let built = device_packet_with(state, host, fifo, session, completion_slot, drained, reads, &names);
+    (!names.missed.get()).then_some(built)
+}
+
+/// TEMP (lab, INGRESS_AHEAD): see [`device_packet_ahead`].
+struct PeekNames<'a> {
+    state: &'a crate::model::DeviceState,
+    missed: std::cell::Cell<bool>,
+}
+
+impl reims_vgpu_core::resolve::TaskNamespaces for PeekNames<'_> {
+    fn resource(
+        &self,
+        task: reims_vgpu_core::identity::TaskId,
+        object_ref: u32,
+    ) -> Option<reims_vgpu_core::identity::ResourceId> {
+        let name = self.state.object_name(task.0, object_ref);
+        if name.is_none() {
+            self.missed.set(true);
+        }
+        name
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn device_packet_with<M: crate::runtime::host::HostMemory>(
+    state: &crate::model::DeviceState,
+    host: &M,
+    fifo: Fifo,
+    session: SessionGeneration,
+    completion_slot: StampSlot,
+    drained: &drain::Packet,
+    reads: PacketReads<'_>,
+    objects: &dyn reims_vgpu_core::resolve::TaskNamespaces,
+) -> Result<Packet, Blocked> {
     let PacketReads {
         submission,
         repointed,
@@ -665,7 +722,7 @@ pub fn device_packet<M: crate::runtime::host::HostMemory>(
     let names = crate::runtime::objects::TaskNames::new(state, host);
     let resolvers = Resolvers {
         mappings: state,
-        objects: &names,
+        objects,
         storage: &names,
         replies: &names,
     };
