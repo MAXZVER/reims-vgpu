@@ -12,6 +12,7 @@
 pub(crate) mod assembler;
 mod buffer_slab;
 mod caches;
+mod cmd_sink;
 mod compute_execution;
 mod compute_validation;
 mod context;
@@ -1765,7 +1766,11 @@ fn execute_draw_request_with(
         ref counters,
         ..
     } = &mut *guard;
+    // TEMP (lab, REC_LANE): the draw's `vkCmd*` calls go to the recording
+    // lane; the guard hands them over before the engine lock is released.
+    let lane = owner.ctx.as_ref().map(cmd_sink::activate);
     let result = unsafe { exec::execute_draw_inner(owner, caches, pools, counters, req) };
+    drop(lane);
     if result.is_err() {
         // A draw can abandon after staging a gathered window and before the copy
         // that fills it is recorded — `SampledResidentNotReady` and its two
@@ -2899,7 +2904,7 @@ unsafe fn snapshot_window_source(
     };
     let device = &ctx.device;
     unsafe {
-        device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&device, 
             cb,
             src_stage,
             ash::vk::PipelineStageFlags::TRANSFER,
@@ -2914,7 +2919,7 @@ unsafe fn snapshot_window_source(
                 ash::vk::AccessFlags::TRANSFER_READ,
             )],
         );
-        device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&device, 
             cb,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::PipelineStageFlags::TRANSFER,
@@ -2929,7 +2934,7 @@ unsafe fn snapshot_window_source(
                 ash::vk::AccessFlags::TRANSFER_WRITE,
             )],
         );
-        device.cmd_copy_image(
+        crate::backend::vulkan::engine::cmd_sink::copy_image(&device, 
             cb,
             resolved.image,
             ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -2954,7 +2959,7 @@ unsafe fn snapshot_window_source(
         );
         // The resident rests in the transfer-read state, exactly as the
         // readback rails leave it...
-        device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&device, 
             cb,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::PipelineStageFlags::TRANSFER,
@@ -2973,7 +2978,7 @@ unsafe fn snapshot_window_source(
         // to every later transfer reader by this barrier. First use only:
         // after this the image rests in TRANSFER_SRC_OPTIMAL, and the next
         // copy's in-barrier is a no-op layout pair.
-        device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&device, 
             cb,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::PipelineStageFlags::TRANSFER,
@@ -2992,6 +2997,7 @@ unsafe fn snapshot_window_source(
     if own_cb {
         unsafe {
             pools.gpu_span_seal_current(ctx, cb);
+            crate::backend::vulkan::engine::cmd_sink::sync();
             device
                 .end_command_buffer(cb)
                 .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))
@@ -4213,7 +4219,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         .new_layout(read_layout)
         .image(image)
         .subresource_range(color_subresource_range())];
-    ctx.device.cmd_pipeline_barrier(
+    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
         cb,
         ash::vk::PipelineStageFlags::ALL_COMMANDS,
         ash::vk::PipelineStageFlags::TRANSFER,
@@ -4258,8 +4264,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // open draw batch before claiming a slot (`batch_readback_joins` is 58.8%
     // of all batch flushes). Collapsing those two is the lever; see
     // `pools::BATCH_MAX_DRAWS`.
-    ctx.device
-        .cmd_copy_image_to_buffer(cb, image, read_layout, readback.buffer, &region);
+    crate::backend::vulkan::engine::cmd_sink::copy_image_to_buffer(&ctx.device, cb, image, read_layout, readback.buffer, &region);
     unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
     if appended.is_some() {
         // `batch_flush` ends the command buffer, submits it with the fence
@@ -4269,6 +4274,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         pools.batch_flush(ctx, counters)?;
     } else {
         unsafe { pools.gpu_span_seal_current(ctx, cb) };
+        crate::backend::vulkan::engine::cmd_sink::sync();
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
@@ -4607,6 +4613,7 @@ unsafe fn page_diff_submit(
         pools.batch_flush(ctx, counters)?;
     } else {
         unsafe { pools.gpu_span_seal_current(ctx, cb) };
+        crate::backend::vulkan::engine::cmd_sink::sync();
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
@@ -5111,7 +5118,7 @@ fn read_target_changed_pages_inner(
                                 vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
                             )
                             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)];
-                        d.cmd_pipeline_barrier(
+                        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                             cb,
                             vk::PipelineStageFlags::ALL_COMMANDS,
                             vk::PipelineStageFlags::TRANSFER,
@@ -5120,7 +5127,7 @@ fn read_target_changed_pages_inner(
                             &[],
                             &[],
                         );
-                        d.cmd_copy_buffer(cb, flags_b, fd, &flags_bytes);
+                        crate::backend::vulkan::engine::cmd_sink::copy_buffer(&d, cb, flags_b, fd, &flags_bytes);
                         // Its own barrier rather than a term of the image barrier
                         // below, which may carry a feedback-loop dependency flag.
                         let flags_filled = [vk::MemoryBarrier::default()
@@ -5128,7 +5135,7 @@ fn read_target_changed_pages_inner(
                             .dst_access_mask(
                                 vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
                             )];
-                        d.cmd_pipeline_barrier(
+                        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                             cb,
                             vk::PipelineStageFlags::TRANSFER,
                             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -5148,7 +5155,7 @@ fn read_target_changed_pages_inner(
                         .new_layout(vk::ImageLayout::GENERAL)
                         .image(snap.image)
                         .subresource_range(color_subresource_range())];
-                    d.cmd_pipeline_barrier(
+                    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                         cb,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -5157,8 +5164,8 @@ fn read_target_changed_pages_inner(
                         &[],
                         &to_shader,
                     );
-                    d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pl);
-                    d.cmd_bind_descriptor_sets(
+                    crate::backend::vulkan::engine::cmd_sink::bind_pipeline(&d, cb, vk::PipelineBindPoint::COMPUTE, pl);
+                    crate::backend::vulkan::engine::cmd_sink::bind_descriptor_sets(&d, 
                         cb,
                         vk::PipelineBindPoint::COMPUTE,
                         pl_layout,
@@ -5166,7 +5173,7 @@ fn read_target_changed_pages_inner(
                         &[set],
                         &[],
                     );
-                    d.cmd_push_constants(
+                    crate::backend::vulkan::engine::cmd_sink::push_constants(&d, 
                         cb,
                         pl_layout,
                         vk::ShaderStageFlags::COMPUTE,
@@ -5184,7 +5191,7 @@ fn read_target_changed_pages_inner(
                             .dst_access_mask(
                                 vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
                             )];
-                        d.cmd_pipeline_barrier(
+                        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                             cb,
                             vk::PipelineStageFlags::COMPUTE_SHADER,
                             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -5222,7 +5229,7 @@ fn read_target_changed_pages_inner(
                     } else {
                         &[]
                     };
-                    d.cmd_pipeline_barrier(
+                    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                         cb,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::PipelineStageFlags::TRANSFER,
@@ -5233,7 +5240,7 @@ fn read_target_changed_pages_inner(
                     );
                     let (host_src_stage, host_src_access) = match flags_dev_b {
                         Some(fd) => {
-                            d.cmd_copy_buffer(cb, fd, flags_b, &flags_bytes);
+                            crate::backend::vulkan::engine::cmd_sink::copy_buffer(&d, cb, fd, flags_b, &flags_bytes);
                             (
                                 vk::PipelineStageFlags::COMPUTE_SHADER
                                     | vk::PipelineStageFlags::TRANSFER,
@@ -5248,7 +5255,7 @@ fn read_target_changed_pages_inner(
                     let to_host = [vk::MemoryBarrier::default()
                         .src_access_mask(host_src_access)
                         .dst_access_mask(vk::AccessFlags::HOST_READ)];
-                    d.cmd_pipeline_barrier(
+                    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                         cb,
                         host_src_stage,
                         vk::PipelineStageFlags::HOST,
@@ -5266,7 +5273,7 @@ fn read_target_changed_pages_inner(
                     .new_layout(read_access.layout())
                     .image(snap.image)
                     .subresource_range(color_subresource_range())];
-                d.cmd_pipeline_barrier(
+                crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                     cb,
                     vk::PipelineStageFlags::ALL_COMMANDS,
                     vk::PipelineStageFlags::TRANSFER,
@@ -5282,7 +5289,7 @@ fn read_target_changed_pages_inner(
                         height: h,
                         depth: 1,
                     })];
-                d.cmd_copy_image_to_buffer(cb, snap.image, read_access.layout(), cur_b, &region);
+                crate::backend::vulkan::engine::cmd_sink::copy_image_to_buffer(&d, cb, snap.image, read_access.layout(), cur_b, &region);
                 // Each branch names only the accesses its destination stage
                 // performs (`VUID-vkCmdPipelineBarrier-dstAccessMask-02816`,
                 // p056 validation: shader accesses at a transfer stage).
@@ -5298,7 +5305,7 @@ fn read_target_changed_pages_inner(
                     )];
                 if fresh {
                     // The whole frame goes to the guest, and the shadow becomes it.
-                    d.cmd_pipeline_barrier(
+                    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                         cb,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::PipelineStageFlags::TRANSFER,
@@ -5308,13 +5315,13 @@ fn read_target_changed_pages_inner(
                         &[],
                     );
                     let whole = [vk::BufferCopy::default().size(frame_bytes)];
-                    d.cmd_copy_buffer(cb, cur_b, prev_b, &whole);
-                    d.cmd_copy_buffer(cb, cur_b, out_b, &whole);
+                    crate::backend::vulkan::engine::cmd_sink::copy_buffer(&d, cb, cur_b, prev_b, &whole);
+                    crate::backend::vulkan::engine::cmd_sink::copy_buffer(&d, cb, cur_b, out_b, &whole);
                 } else {
                     if !one_trip {
-                        d.cmd_fill_buffer(cb, flags_b, 0, pages * 4, 0);
+                        crate::backend::vulkan::engine::cmd_sink::fill_buffer(&d, cb, flags_b, 0, pages * 4, 0);
                     }
-                    d.cmd_pipeline_barrier(
+                    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                         cb,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -5323,8 +5330,8 @@ fn read_target_changed_pages_inner(
                         &[],
                         &[],
                     );
-                    d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pl);
-                    d.cmd_bind_descriptor_sets(
+                    crate::backend::vulkan::engine::cmd_sink::bind_pipeline(&d, cb, vk::PipelineBindPoint::COMPUTE, pl);
+                    crate::backend::vulkan::engine::cmd_sink::bind_descriptor_sets(&d, 
                         cb,
                         vk::PipelineBindPoint::COMPUTE,
                         pl_layout,
@@ -5334,8 +5341,8 @@ fn read_target_changed_pages_inner(
                     );
                     let push = [pages as u32, page_diff::WORDS_PER_PAGE];
                     let bytes: &[u8] = std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 8);
-                    d.cmd_push_constants(cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
-                    d.cmd_dispatch(cb, pages as u32, 1, 1);
+                    crate::backend::vulkan::engine::cmd_sink::push_constants(&d, cb, pl_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+                    crate::backend::vulkan::engine::cmd_sink::dispatch(&d, cb, pages as u32, 1, 1);
                 }
                 if let Some(cmd) = verify_cmd {
                     // TEMP (lab, `REIMS_VGPU_LAB_PAY_HASH=verify`): the hash compare
@@ -5356,7 +5363,7 @@ fn read_target_changed_pages_inner(
                         .dst_access_mask(
                             vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
                         )];
-                    d.cmd_pipeline_barrier(
+                    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                         cb,
                         vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -5375,7 +5382,7 @@ fn read_target_changed_pages_inner(
                         .new_layout(read_access.layout())
                         .image(snap.image)
                         .subresource_range(color_subresource_range())];
-                    d.cmd_pipeline_barrier(
+                    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                         cb,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::PipelineStageFlags::TRANSFER,
@@ -5390,7 +5397,7 @@ fn read_target_changed_pages_inner(
                         vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
                     )
                     .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::TRANSFER_READ)];
-                d.cmd_pipeline_barrier(
+                crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                     cb,
                     vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                     vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TRANSFER,
@@ -5539,11 +5546,11 @@ unsafe fn finish_compare_locked(
                 || {},
                 |cb| {
                     let d = &ctx.device;
-                    d.cmd_copy_buffer(cb, cur_b, out_b, &regions);
+                    crate::backend::vulkan::engine::cmd_sink::copy_buffer(&d, cb, cur_b, out_b, &regions);
                     let to_host = [vk::MemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                         .dst_access_mask(vk::AccessFlags::HOST_READ)];
-                    d.cmd_pipeline_barrier(
+                    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&d, 
                         cb,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::PipelineStageFlags::HOST,
@@ -5587,10 +5594,10 @@ unsafe fn lab_dispatch_pages(
 ) {
     unsafe {
         match ranges {
-            None => d.cmd_dispatch(cb, pages, 1, 1),
+            None => crate::backend::vulkan::engine::cmd_sink::dispatch(&d, cb, pages, 1, 1),
             Some(ranges) => {
                 for r in ranges {
-                    d.cmd_dispatch_base(cb, r.start, 0, 0, r.end - r.start, 1, 1);
+                    crate::backend::vulkan::engine::cmd_sink::dispatch_base(&d, cb, r.start, 0, 0, r.end - r.start, 1, 1);
                 }
             }
         }
@@ -5615,9 +5622,9 @@ unsafe fn lab_dispatch_hash(
 ) {
     use ash::vk;
     unsafe {
-        d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
-        d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
-        d.cmd_push_constants(cb, layout, vk::ShaderStageFlags::COMPUTE, 0, push);
+        crate::backend::vulkan::engine::cmd_sink::bind_pipeline(&d, cb, vk::PipelineBindPoint::COMPUTE, pipeline);
+        crate::backend::vulkan::engine::cmd_sink::bind_descriptor_sets(&d, cb, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+        crate::backend::vulkan::engine::cmd_sink::push_constants(&d, cb, layout, vk::ShaderStageFlags::COMPUTE, 0, push);
         lab_dispatch_pages(d, cb, pages, ranges);
     }
 }
@@ -6218,7 +6225,7 @@ pub fn overlay_guest_bytes_onto_resident(
             .new_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(snap.image)
             .subresource_range(color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             ash::vk::PipelineStageFlags::ALL_COMMANDS,
             ash::vk::PipelineStageFlags::TRANSFER,
@@ -6227,7 +6234,7 @@ pub fn overlay_guest_bytes_onto_resident(
             &[],
             &to_transfer,
         );
-        ctx.device.cmd_copy_buffer_to_image(
+        crate::backend::vulkan::engine::cmd_sink::copy_buffer_to_image(&ctx.device, 
             cb,
             staging.buffer,
             snap.image,
@@ -6241,7 +6248,7 @@ pub fn overlay_guest_bytes_onto_resident(
             .new_layout(snap.layout)
             .image(snap.image)
             .subresource_range(color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::PipelineStageFlags::ALL_COMMANDS,
@@ -6252,6 +6259,7 @@ pub fn overlay_guest_bytes_onto_resident(
         );
         if appended.is_none() {
             pools.gpu_span_seal_current(ctx, cb);
+            crate::backend::vulkan::engine::cmd_sink::sync();
             ctx.device
                 .end_command_buffer(cb)
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentOverlayEndCb, e)))?;
@@ -6405,7 +6413,7 @@ pub fn clear_resident(
             .new_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(image)
             .subresource_range(color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             src_stage | ash::vk::PipelineStageFlags::ALL_COMMANDS,
             ash::vk::PipelineStageFlags::TRANSFER,
@@ -6414,7 +6422,7 @@ pub fn clear_resident(
             &[],
             &to_transfer,
         );
-        ctx.device.cmd_clear_color_image(
+        crate::backend::vulkan::engine::cmd_sink::clear_color_image(&ctx.device, 
             cb,
             image,
             ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -6428,7 +6436,7 @@ pub fn clear_resident(
             .new_layout(final_layout)
             .image(image)
             .subresource_range(color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::PipelineStageFlags::ALL_COMMANDS,
@@ -6439,6 +6447,7 @@ pub fn clear_resident(
         );
         if appended.is_none() {
             pools.gpu_span_seal_current(ctx, cb);
+            crate::backend::vulkan::engine::cmd_sink::sync();
             ctx.device
                 .end_command_buffer(cb)
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentClearEndCb, e)))?;
@@ -6595,7 +6604,7 @@ pub fn copy_resident_spans(
                 .image(d.image)
                 .subresource_range(color_subresource_range()),
         ];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             ash::vk::PipelineStageFlags::ALL_COMMANDS,
             ash::vk::PipelineStageFlags::TRANSFER,
@@ -6604,7 +6613,7 @@ pub fn copy_resident_spans(
             &[],
             &to_transfer,
         );
-        ctx.device.cmd_copy_image(
+        crate::backend::vulkan::engine::cmd_sink::copy_image(&ctx.device, 
             cb,
             s.image,
             ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -6628,7 +6637,7 @@ pub fn copy_resident_spans(
                 .image(d.image)
                 .subresource_range(color_subresource_range()),
         ];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             ash::vk::PipelineStageFlags::TRANSFER,
             ash::vk::PipelineStageFlags::ALL_COMMANDS,
@@ -6639,6 +6648,7 @@ pub fn copy_resident_spans(
         );
         if appended.is_none() {
             pools.gpu_span_seal_current(ctx, cb);
+            crate::backend::vulkan::engine::cmd_sink::sync();
             ctx.device
                 .end_command_buffer(cb)
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentOverlayEndCb, e)))?;
@@ -7610,7 +7620,7 @@ unsafe fn copy_image_level0_to_buffer(
         .new_layout(read_access.layout())
         .image(snap.image)
         .subresource_range(color_subresource_range())];
-    ctx.device.cmd_pipeline_barrier(
+    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
         cb,
         ash::vk::PipelineStageFlags::ALL_COMMANDS,
         ash::vk::PipelineStageFlags::TRANSFER,
@@ -7640,6 +7650,7 @@ unsafe fn copy_image_level0_to_buffer(
         pools.batch_flush(ctx, counters)?;
     } else {
         unsafe { pools.gpu_span_seal_current(ctx, cb) };
+        crate::backend::vulkan::engine::cmd_sink::sync();
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;
@@ -7690,8 +7701,7 @@ unsafe fn record_guest_copy_plan(
         match plan {
             GuestCopyPlan::Rectangles(groups) => {
                 for (buffer, regions) in groups {
-                    ctx.device
-                        .cmd_copy_image_to_buffer(cb, src_image, src_layout, *buffer, regions);
+                    crate::backend::vulkan::engine::cmd_sink::copy_image_to_buffer(&ctx.device, cb, src_image, src_layout, *buffer, regions);
                 }
             }
             GuestCopyPlan::Linear {
@@ -7700,8 +7710,7 @@ unsafe fn record_guest_copy_plan(
                 scatter,
             } => {
                 let one = [*detile];
-                ctx.device
-                    .cmd_copy_image_to_buffer(cb, src_image, src_layout, *scratch, &one);
+                crate::backend::vulkan::engine::cmd_sink::copy_image_to_buffer(&ctx.device, cb, src_image, src_layout, *scratch, &one);
                 // The scatter reads what the detile just wrote, and nothing in one
                 // command buffer orders the two by itself. A global memory barrier
                 // rather than a buffer one because there is exactly one buffer in
@@ -7711,7 +7720,7 @@ unsafe fn record_guest_copy_plan(
                         let detiled = [ash::vk::MemoryBarrier::default()
                             .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
                             .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)];
-                        ctx.device.cmd_pipeline_barrier(
+                        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
                             cb,
                             ash::vk::PipelineStageFlags::TRANSFER,
                             ash::vk::PipelineStageFlags::TRANSFER,
@@ -7721,7 +7730,7 @@ unsafe fn record_guest_copy_plan(
                             &[],
                         );
                         for (buffer, regions) in groups {
-                            ctx.device.cmd_copy_buffer(cb, *scratch, *buffer, regions);
+                            crate::backend::vulkan::engine::cmd_sink::copy_buffer(&ctx.device, cb, *scratch, *buffer, regions);
                         }
                     }
                     ScatterForm::Dispatches(groups) => {
@@ -7735,7 +7744,7 @@ unsafe fn record_guest_copy_plan(
                                     | ash::vk::AccessFlags::HOST_WRITE,
                             )
                             .dst_access_mask(ash::vk::AccessFlags::SHADER_READ)];
-                        ctx.device.cmd_pipeline_barrier(
+                        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
                             cb,
                             ash::vk::PipelineStageFlags::TRANSFER
                                 | ash::vk::PipelineStageFlags::HOST,
@@ -7807,7 +7816,7 @@ unsafe fn release_guest_copy_to_host(
         let host_visible = [ash::vk::MemoryBarrier::default()
             .src_access_mask(wrote_access)
             .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             wrote_stage,
             ash::vk::PipelineStageFlags::HOST,

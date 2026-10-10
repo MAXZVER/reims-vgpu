@@ -1213,6 +1213,7 @@ impl ResourcePools {
         reset_op: VkOp,
         begin_op: VkOp,
     ) -> Result<(), DrawError> {
+        crate::backend::vulkan::engine::cmd_sink::sync();
         ctx.device
             .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
             .map_err(|e| DrawError::VkCall(VkCall::new(reset_op, e)))?;
@@ -1263,10 +1264,8 @@ impl ResourcePools {
             gpu_span::note_unread();
         }
         let base = DrawSpanProbe::base(slot);
-        ctx.device
-            .cmd_reset_query_pool(cb, probe.pool, base, DrawSpanProbe::PER_SLOT);
-        ctx.device
-            .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
+        crate::backend::vulkan::engine::cmd_sink::reset_query_pool(&ctx.device, cb, probe.pool, base, DrawSpanProbe::PER_SLOT);
+        crate::backend::vulkan::engine::cmd_sink::write_timestamp(&ctx.device, cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
         self.slots[slot].span = gpu_span::SlotSpan::Armed(kind);
         gpu_span::note_armed();
     }
@@ -1289,7 +1288,7 @@ impl ResourcePools {
         let gpu_span::SlotSpan::Armed(kind) = self.slots[slot].span else {
             return;
         };
-        ctx.device.cmd_write_timestamp(
+        crate::backend::vulkan::engine::cmd_sink::write_timestamp(&ctx.device, 
             cb,
             vk::PipelineStageFlags::BOTTOM_OF_PIPE,
             probe.pool,
@@ -1335,10 +1334,8 @@ impl ResourcePools {
         };
         let slot = self.cur;
         let base = TimestampProbe::base(slot);
-        ctx.device
-            .cmd_reset_query_pool(cb, probe.pool, base, TimestampProbe::PER_SLOT);
-        ctx.device
-            .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
+        crate::backend::vulkan::engine::cmd_sink::reset_query_pool(&ctx.device, cb, probe.pool, base, TimestampProbe::PER_SLOT);
+        crate::backend::vulkan::engine::cmd_sink::write_timestamp(&ctx.device, cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
         self.slots[slot].readback_span_armed = true;
     }
 
@@ -1366,7 +1363,7 @@ impl ResourcePools {
         if !self.slots[self.cur].readback_span_armed {
             return;
         }
-        ctx.device.cmd_write_timestamp(
+        crate::backend::vulkan::engine::cmd_sink::write_timestamp(&ctx.device, 
             cb,
             stage,
             probe.pool,
@@ -1985,7 +1982,7 @@ impl ResourcePools {
             open.cb, cb,
             "open render pass belongs to another command buffer"
         );
-        unsafe { device.cmd_end_render_pass(open.cb) };
+        unsafe { crate::backend::vulkan::engine::cmd_sink::end_render_pass(&device, open.cb) };
     }
 
     /// Forget everything remembered about the command buffer that was
@@ -2140,6 +2137,7 @@ impl ResourcePools {
         );
         let submit = (|| -> Result<(), DrawError> {
             let end_started = std::time::Instant::now();
+            crate::backend::vulkan::engine::cmd_sink::sync();
             let end_result = ctx.device.end_command_buffer(batch.cb);
             counters
                 .batch_flush_end_us
@@ -2471,7 +2469,7 @@ impl ResourcePools {
         g.blend_constants = None;
         g.depth_bias_set = false;
         g.line_width = None;
-        unsafe { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline) };
+        unsafe { crate::backend::vulkan::engine::cmd_sink::bind_pipeline(&device, cb, vk::PipelineBindPoint::GRAPHICS, pipeline) };
     }
 
     /// The scratch arrays a draw builds its viewport and scissor lists into,
@@ -2509,7 +2507,7 @@ impl ResourcePools {
                 .fetch_add(1, Ordering::Relaxed);
         } else {
             std::mem::swap(&mut g.viewports, &mut g.vp_scratch);
-            unsafe { device.cmd_set_viewport(cb, 0, &g.viewports) };
+            unsafe { crate::backend::vulkan::engine::cmd_sink::set_viewport(&device, cb, 0, &g.viewports) };
         }
         if super::scissors_match(&g.sc_scratch, &g.scissors) {
             counters
@@ -2517,7 +2515,7 @@ impl ResourcePools {
                 .fetch_add(1, Ordering::Relaxed);
         } else {
             std::mem::swap(&mut g.scissors, &mut g.sc_scratch);
-            unsafe { device.cmd_set_scissor(cb, 0, &g.scissors) };
+            unsafe { crate::backend::vulkan::engine::cmd_sink::set_scissor(&device, cb, 0, &g.scissors) };
         }
     }
 
@@ -2587,7 +2585,7 @@ impl ResourcePools {
         while start < vertex_scratch.len() {
             let end = super::vertex_binding_run_end(vertex_scratch, start);
             unsafe {
-                device.cmd_bind_vertex_buffers(
+                crate::backend::vulkan::engine::cmd_sink::bind_vertex_buffers(&device, 
                     cb,
                     vertex_scratch[start].binding,
                     &vertex_buffers[start..end],
@@ -2751,8 +2749,8 @@ impl ResourcePools {
         }
         g.stencil = Some((front, back));
         unsafe {
-            device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT, front);
-            device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::BACK, back);
+            crate::backend::vulkan::engine::cmd_sink::set_stencil_reference(&device, cb, vk::StencilFaceFlags::FRONT, front);
+            crate::backend::vulkan::engine::cmd_sink::set_stencil_reference(&device, cb, vk::StencilFaceFlags::BACK, back);
         }
     }
 
@@ -2790,7 +2788,7 @@ impl ResourcePools {
             return;
         }
         g.depth_bias_set = true;
-        unsafe { device.cmd_set_depth_bias(cb, 0.0, 0.0, 0.0) };
+        unsafe { crate::backend::vulkan::engine::cmd_sink::set_depth_bias(&device, cb, 0.0, 0.0, 0.0) };
     }
 
     /// Record whichever rasterization members this host supplies per draw,
@@ -2828,18 +2826,18 @@ impl ResourcePools {
         g.raster = Some(values);
         if let Some(eds) = ctx.extended_dynamic_state.as_ref() {
             if let Some(cull) = values.cull_mode {
-                unsafe { eds.cmd_set_cull_mode(cb, cull) };
+                unsafe { crate::backend::vulkan::engine::cmd_sink::set_cull_mode(&eds, cb, cull) };
             }
             if let Some(front) = values.front_face {
-                unsafe { eds.cmd_set_front_face(cb, front) };
+                unsafe { crate::backend::vulkan::engine::cmd_sink::set_front_face(&eds, cb, front) };
             }
         }
         if let Some(eds3) = ctx.extended_dynamic_state3.as_ref() {
             if let Some(mode) = values.polygon_mode {
-                unsafe { eds3.cmd_set_polygon_mode(cb, mode) };
+                unsafe { crate::backend::vulkan::engine::cmd_sink::set_polygon_mode(&eds3, cb, mode) };
             }
             if let Some(clamp) = values.depth_clamp_enable {
-                unsafe { eds3.cmd_set_depth_clamp_enable(cb, clamp) };
+                unsafe { crate::backend::vulkan::engine::cmd_sink::set_depth_clamp_enable(&eds3, cb, clamp) };
             }
         }
     }
@@ -2883,7 +2881,7 @@ impl ResourcePools {
             return;
         }
         g.line_width = Some(width.to_bits());
-        unsafe { device.cmd_set_line_width(cb, width) };
+        unsafe { crate::backend::vulkan::engine::cmd_sink::set_line_width(&device, cb, width) };
     }
 
     /// Record the guest's whole `MTLDepthStencilState` unless this command
@@ -2929,18 +2927,18 @@ impl ResourcePools {
             return;
         };
         unsafe {
-            eds.cmd_set_depth_test_enable(cb, state.depth_test_enable);
-            eds.cmd_set_depth_write_enable(cb, state.depth_write_enable);
-            eds.cmd_set_depth_compare_op(cb, state.depth_compare_op);
-            eds.cmd_set_depth_bounds_test_enable(cb, state.depth_bounds_test_enable);
-            eds.cmd_set_stencil_test_enable(cb, state.stencil_test_enable);
+            crate::backend::vulkan::engine::cmd_sink::set_depth_test_enable(&eds, cb, state.depth_test_enable);
+            crate::backend::vulkan::engine::cmd_sink::set_depth_write_enable(&eds, cb, state.depth_write_enable);
+            crate::backend::vulkan::engine::cmd_sink::set_depth_compare_op(&eds, cb, state.depth_compare_op);
+            crate::backend::vulkan::engine::cmd_sink::set_depth_bounds_test_enable(&eds, cb, state.depth_bounds_test_enable);
+            crate::backend::vulkan::engine::cmd_sink::set_stencil_test_enable(&eds, cb, state.stencil_test_enable);
         }
         for (faces, face) in [
             (vk::StencilFaceFlags::FRONT, state.front),
             (vk::StencilFaceFlags::BACK, state.back),
         ] {
             unsafe {
-                eds.cmd_set_stencil_op(
+                crate::backend::vulkan::engine::cmd_sink::set_stencil_op(&eds, 
                     cb,
                     faces,
                     face.fail_op,
@@ -2948,10 +2946,8 @@ impl ResourcePools {
                     face.depth_fail_op,
                     face.compare_op,
                 );
-                ctx.device
-                    .cmd_set_stencil_compare_mask(cb, faces, face.compare_mask);
-                ctx.device
-                    .cmd_set_stencil_write_mask(cb, faces, face.write_mask);
+                crate::backend::vulkan::engine::cmd_sink::set_stencil_compare_mask(&ctx.device, cb, faces, face.compare_mask);
+                crate::backend::vulkan::engine::cmd_sink::set_stencil_write_mask(&ctx.device, cb, faces, face.write_mask);
             }
         }
     }
@@ -2990,7 +2986,7 @@ impl ResourcePools {
         }
         g.topology = Some(wanted);
         if let (Some(eds), Some(topology)) = (ctx.extended_dynamic_state.as_ref(), wanted) {
-            unsafe { eds.cmd_set_primitive_topology(cb, topology) };
+            unsafe { crate::backend::vulkan::engine::cmd_sink::set_primitive_topology(&eds, cb, topology) };
         }
     }
 
@@ -3021,7 +3017,7 @@ impl ResourcePools {
             return;
         }
         g.blend_constants = Some(bits);
-        unsafe { device.cmd_set_blend_constants(cb, &constants) };
+        unsafe { crate::backend::vulkan::engine::cmd_sink::set_blend_constants(&device, cb, &constants) };
     }
 
     /// Clear the guest-read debt and answer whether there was one.
@@ -3668,6 +3664,9 @@ impl ResourcePools {
         // serial loop's.
         let split = total >= super::par_stage::PAR_STAGE_MIN_BYTES && super::par_stage::on();
         let mut segs: Vec<super::par_stage::Segment> = Vec::new();
+        // TEMP (lab, REC_LANE_COPY): inside a draw the copies go to the
+        // recording lane, which makes them before this command buffer ends.
+        let defer = !split && crate::backend::vulkan::engine::cmd_sink::defer_host_copies();
         unsafe {
             for run in runs {
                 if off >= total {
@@ -3691,6 +3690,18 @@ impl ResourcePools {
                         dst: ptr.add(off),
                         n,
                     });
+                } else if defer {
+                    // SAFETY: guest-RAM aliases live for the VM; the slot is
+                    // this command buffer's until it completes, and every
+                    // reuse of it (recycle, end, reset) syncs with the lane
+                    // first.
+                    crate::backend::vulkan::engine::cmd_sink::host_copy(
+                        crate::backend::vulkan::engine::cmd_sink::HostSeg {
+                            src: (run.host_ptr() as *const u8).add(within),
+                            dst: ptr.add(off),
+                            n,
+                        },
+                    );
                 } else {
                     std::ptr::copy_nonoverlapping(
                         (run.host_ptr() as *const u8).add(within),
@@ -3715,6 +3726,9 @@ impl ResourcePools {
     }
 
     pub(crate) fn recycle_staging(&mut self) {
+        // TEMP (lab, REC_LANE_COPY): the lane may still owe copies into these
+        // slots.
+        crate::backend::vulkan::engine::cmd_sink::sync();
         self.forget_cb_bound_buffers("bindmap_clear_recycle", "bindmap_clear_recycle_entries");
         // TEMP (lab, PASS_STAGE): a recycled entry (device loss, a draw that
         // never sealed) releases its arena windows here rather than at a

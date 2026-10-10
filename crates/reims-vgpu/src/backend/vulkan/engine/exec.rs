@@ -2189,7 +2189,7 @@ unsafe fn upload_buffer_to_sampled_image(
         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
         .image(image)
         .subresource_range(range)];
-    ctx.device.cmd_pipeline_barrier(
+    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
         cb,
         vk::PipelineStageFlags::TOP_OF_PIPE,
         vk::PipelineStageFlags::TRANSFER,
@@ -2212,7 +2212,7 @@ unsafe fn upload_buffer_to_sampled_image(
             height,
             depth: extent_depth,
         })];
-    ctx.device.cmd_copy_buffer_to_image(
+    crate::backend::vulkan::engine::cmd_sink::copy_buffer_to_image(&ctx.device, 
         cb,
         src,
         image,
@@ -2226,7 +2226,7 @@ unsafe fn upload_buffer_to_sampled_image(
         .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
         .image(image)
         .subresource_range(range)];
-    ctx.device.cmd_pipeline_barrier(
+    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
         cb,
         vk::PipelineStageFlags::TRANSFER,
         vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
@@ -4900,7 +4900,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(image.image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             vk::PipelineStageFlags::TOP_OF_PIPE,
             vk::PipelineStageFlags::TRANSFER,
@@ -4917,7 +4917,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 height: image.height,
                 depth: 1,
             })];
-        ctx.device.cmd_copy_image(
+        crate::backend::vulkan::engine::cmd_sink::copy_image(&ctx.device, 
             cb,
             *source_image,
             next_access.layout(),
@@ -4932,7 +4932,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image(image.image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
@@ -4969,7 +4969,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(image.image)
             .subresource_range(range)];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             vk::PipelineStageFlags::TOP_OF_PIPE,
             vk::PipelineStageFlags::TRANSFER,
@@ -4998,7 +4998,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     height: level.height,
                     depth: 1,
                 })];
-            ctx.device.cmd_copy_image(
+            crate::backend::vulkan::engine::cmd_sink::copy_image(&ctx.device, 
                 cb,
                 level.image,
                 level.next_access.layout(),
@@ -5014,7 +5014,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image(image.image)
             .subresource_range(range)];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
@@ -5040,7 +5040,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             src_stage,
             vk::PipelineStageFlags::TRANSFER,
@@ -5060,7 +5060,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 height: req.height,
                 depth: 1,
             })];
-        ctx.device.cmd_copy_buffer_to_image(
+        crate::backend::vulkan::engine::cmd_sink::copy_buffer_to_image(&ctx.device, 
             cb,
             seed.buffer(),
             target_image,
@@ -5074,7 +5074,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(target_pass_layout)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             vk::PipelineStageFlags::TRANSFER,
             target_dst_stage,
@@ -5110,7 +5110,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             dst_stage,
             vk::PipelineStageFlags::TRANSFER,
@@ -5127,7 +5127,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 height: req.height,
                 depth: 1,
             })];
-        ctx.device.cmd_copy_image(
+        crate::backend::vulkan::engine::cmd_sink::copy_image(&ctx.device, 
             cb,
             seed_image,
             seed_next_access.layout(),
@@ -5142,7 +5142,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(target_pass_layout)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             vk::PipelineStageFlags::TRANSFER,
             target_dst_stage,
@@ -5179,7 +5179,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(target_pass_layout)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             src_stage,
             target_dst_stage,
@@ -5215,7 +5215,7 @@ pub(crate) unsafe fn execute_draw_inner(
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             src_stage,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
@@ -5297,7 +5297,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(next_access.layout())
             .image(*image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             src_stage,
             vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
@@ -5337,7 +5337,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(vk::ImageLayout::GENERAL)
             .image(*image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             vk::PipelineStageFlags::HOST,
             vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
@@ -5417,7 +5417,7 @@ pub(crate) unsafe fn execute_draw_inner(
     if !gather_dispatched {
         for gather in &guest_gathers {
             for (source, copies) in &gather.sources {
-                ctx.device.cmd_copy_buffer(cb, *source, gather.dst, copies);
+                crate::backend::vulkan::engine::cmd_sink::copy_buffer(&ctx.device, cb, *source, gather.dst, copies);
             }
         }
     }
@@ -5458,7 +5458,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     | vk::AccessFlags::SHADER_READ
                     | vk::AccessFlags::TRANSFER_READ,
             )];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             src_stage,
             vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::TRANSFER,
@@ -5493,7 +5493,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             src_stage,
             vk::PipelineStageFlags::TRANSFER,
@@ -5502,7 +5502,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &barrier,
         );
-        ctx.device.cmd_clear_color_image(
+        crate::backend::vulkan::engine::cmd_sink::clear_color_image(&ctx.device, 
             cb,
             target_image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -5516,7 +5516,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(target_pass_layout)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             vk::PipelineStageFlags::TRANSFER,
             target_dst_stage,
@@ -5539,7 +5539,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .image(target_image)
                 .subresource_range(super::color_subresource_range())];
-            ctx.device.cmd_pipeline_barrier(
+            crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
                 cb,
                 src_stage,
                 vk::PipelineStageFlags::TRANSFER,
@@ -5557,7 +5557,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     height: req.height,
                     depth: 1,
                 })];
-            ctx.device.cmd_copy_buffer_to_image(
+            crate::backend::vulkan::engine::cmd_sink::copy_buffer_to_image(&ctx.device, 
                 cb,
                 source.buffer(),
                 target_image,
@@ -5571,7 +5571,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 .new_layout(target_pass_layout)
                 .image(target_image)
                 .subresource_range(super::color_subresource_range())];
-            ctx.device.cmd_pipeline_barrier(
+            crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
                 cb,
                 vk::PipelineStageFlags::TRANSFER,
                 target_dst_stage,
@@ -5655,7 +5655,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(pass_key.color_layout(attachment_index))
             .image(*image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             src_stage,
             dst_stage,
@@ -5708,7 +5708,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecCreateQueryPool, e)))?;
             counters.note_create(CreateSite::QueryPool);
             unsafe { outside_pass.before_record(PassObstacle::QueryReset, pools, &ctx.device, cb) };
-            ctx.device.cmd_reset_query_pool(cb, pool, 0, 1);
+            crate::backend::vulkan::engine::cmd_sink::reset_query_pool(&ctx.device, cb, pool, 0, 1);
             Some((pool, flags))
         }
     };
@@ -5809,8 +5809,7 @@ pub(crate) unsafe fn execute_draw_inner(
         } else {
             "passbegin_color0_resident"
         });
-        ctx.device
-            .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
+        crate::backend::vulkan::engine::cmd_sink::begin_render_pass(&ctx.device, cb, &rp_begin, vk::SubpassContents::INLINE);
         pools.note_pass_opened(echo);
     }
     if pass_key.feedback_colors != 0 {
@@ -5828,7 +5827,7 @@ pub(crate) unsafe fn execute_draw_inner(
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(dst_access)];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             src_stage,
             dst_stage,
@@ -5845,7 +5844,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // is what invalidates them. See `super::pools::CbGraphicsState`.
     unsafe { pools.bind_graphics_pipeline(&ctx.device, cb, counters, pipeline, pipeline_layout) };
     if let Some((pool, flags)) = occlusion {
-        ctx.device.cmd_begin_query(cb, pool, 0, flags);
+        crate::backend::vulkan::engine::cmd_sink::begin_query(&ctx.device, cb, pool, 0, flags);
     }
 
     // Dynamic viewport/scissor. Metal NDC is Y-up and Vulkan's is Y-down, so
@@ -5960,7 +5959,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 pools.push_descriptor_echo(),
                 vk::DescriptorSet::null(),
                 |writes| {
-                    push_entry.cmd_push_descriptor_set(
+                    crate::backend::vulkan::engine::cmd_sink::push_descriptor_set(&push_entry, 
                         cb,
                         vk::PipelineBindPoint::GRAPHICS,
                         pipeline_layout,
@@ -5972,7 +5971,7 @@ pub(crate) unsafe fn execute_draw_inner(
             counters.descriptor_pushes.fetch_add(1, Ordering::Relaxed);
         }
     } else if let Some(dset) = dset {
-        ctx.device.cmd_bind_descriptor_sets(
+        crate::backend::vulkan::engine::cmd_sink::bind_descriptor_sets(&ctx.device, 
             cb,
             vk::PipelineBindPoint::GRAPHICS,
             pipeline_layout,
@@ -5988,9 +5987,8 @@ pub(crate) unsafe fn execute_draw_inner(
     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters) };
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
-            ctx.device
-                .cmd_bind_index_buffer(cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk());
-            ctx.device.cmd_draw_indexed(
+            crate::backend::vulkan::engine::cmd_sink::bind_index_buffer(&ctx.device, cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk());
+            crate::backend::vulkan::engine::cmd_sink::draw_indexed(&ctx.device, 
                 cb,
                 indexed.index_count,
                 req.instance_count.unwrap_or(1),
@@ -6000,7 +5998,7 @@ pub(crate) unsafe fn execute_draw_inner(
             );
         }
         _ => {
-            ctx.device.cmd_draw(
+            crate::backend::vulkan::engine::cmd_sink::draw(&ctx.device, 
                 cb,
                 req.vertex_count,
                 req.instance_count.unwrap_or(1),
@@ -6013,7 +6011,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // everything after it are the part of recording no sub-phase names.
     phase.enter(super::draw_phase::Phase::Record);
     if let Some((pool, _)) = occlusion {
-        ctx.device.cmd_end_query(cb, pool, 0);
+        crate::backend::vulkan::engine::cmd_sink::end_query(&ctx.device, cb, pool, 0);
     }
     let keep_pass_open = req.render_pass_continues
         && batch_eligible
@@ -6062,7 +6060,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(target_pass_layout)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
@@ -6071,9 +6069,8 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &back,
         );
-        ctx.device
-            .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
-        ctx.device.cmd_end_render_pass(cb);
+        crate::backend::vulkan::engine::cmd_sink::begin_render_pass(&ctx.device, cb, &rp_begin, vk::SubpassContents::INLINE);
+        crate::backend::vulkan::engine::cmd_sink::end_render_pass(&ctx.device, cb);
     }
     if layout_churn_probe_enabled() && !target_feedback && !target_guest_backed {
         // PROBE — `REIMS_VGPU_LAYOUT_CHURN=on`. One round trip of the colour
@@ -6104,7 +6101,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::PipelineStageFlags::TRANSFER,
@@ -6120,7 +6117,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(super::caches::color0_pass_exit_layout())
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
@@ -6160,7 +6157,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(target_read_layout)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             target_dst_stage,
             vk::PipelineStageFlags::TRANSFER,
@@ -6176,7 +6173,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 height: req.height,
                 depth: 1,
             })];
-        ctx.device.cmd_copy_image_to_buffer(
+        crate::backend::vulkan::engine::cmd_sink::copy_image_to_buffer(&ctx.device, 
             cb,
             target_image,
             target_read_layout,
@@ -6190,7 +6187,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .new_layout(target_pass_layout)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
             cb,
             vk::PipelineStageFlags::TRANSFER,
             target_dst_stage,
@@ -6210,6 +6207,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // copy this submission recorded. A deferred draw is sealed by
         // `batch_flush` instead, on the same slot.
         unsafe { pools.gpu_span_seal_current(ctx, cb) };
+        crate::backend::vulkan::engine::cmd_sink::sync();
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)))?;
@@ -7164,7 +7162,7 @@ pub(super) unsafe fn barrier_resident_for_transfer_read(
         .image(image)
         .subresource_range(super::color_subresource_range())];
     unsafe {
-        device.cmd_pipeline_barrier(
+        crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&device, 
             cb,
             src_stage,
             vk::PipelineStageFlags::TRANSFER,

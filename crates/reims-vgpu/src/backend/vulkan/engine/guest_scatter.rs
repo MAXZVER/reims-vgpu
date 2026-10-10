@@ -563,7 +563,7 @@ impl ScatterPipeline {
     ///
     /// `cb` must be recording.
     pub(crate) unsafe fn bind(&self, device: &ash::Device, cb: vk::CommandBuffer) {
-        unsafe { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline) };
+        unsafe { crate::backend::vulkan::engine::cmd_sink::bind_pipeline(&device, cb, vk::PipelineBindPoint::COMPUTE, self.pipeline) };
     }
 
     /// Bind the set, push the run count and dispatch one workgroup per run.
@@ -581,7 +581,7 @@ impl ScatterPipeline {
         run_count: u32,
     ) {
         unsafe {
-            device.cmd_bind_descriptor_sets(
+            crate::backend::vulkan::engine::cmd_sink::bind_descriptor_sets(&device, 
                 cb,
                 vk::PipelineBindPoint::COMPUTE,
                 self.layout,
@@ -589,7 +589,7 @@ impl ScatterPipeline {
                 &[set],
                 &[],
             );
-            device.cmd_push_constants(
+            crate::backend::vulkan::engine::cmd_sink::push_constants(&device, 
                 cb,
                 self.layout,
                 vk::ShaderStageFlags::COMPUTE,
@@ -598,7 +598,7 @@ impl ScatterPipeline {
             );
             // One workgroup per run: the kernel strides its own run by its own
             // `local_size_x`, so no size from this side enters the arithmetic.
-            device.cmd_dispatch(cb, run_count, 1, 1);
+            crate::backend::vulkan::engine::cmd_sink::dispatch(&device, cb, run_count, 1, 1);
         }
     }
 }
