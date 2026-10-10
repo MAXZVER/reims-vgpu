@@ -138,7 +138,7 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<StorageImageSlot, DrawError> {
         if let Some(slot) = self.storage_image_free.take(&key) {
-            self.storage_image_live.push(StorageImageSlot {
+            self.entry.storage_image_live.push(StorageImageSlot {
                 image: slot.image,
                 memory: slot.memory,
                 view: slot.view,
@@ -269,12 +269,12 @@ impl ResourcePools {
             view,
             key,
         };
-        self.storage_image_live.push(slot);
+        self.entry.storage_image_live.push(slot);
         Ok(slot)
     }
 
     pub(crate) fn recycle_storage_images(&mut self) {
-        for slot in self.storage_image_live.drain(..) {
+        for slot in self.entry.storage_image_live.drain(..) {
             self.storage_image_free.push_uncapped(slot.key, slot);
         }
     }
@@ -349,7 +349,7 @@ impl ResourcePools {
             }
             Err(error) => return Err(error),
         };
-        let live = self.storage_image_live.pop().ok_or({
+        let live = self.entry.storage_image_live.pop().ok_or({
             DrawError::ComputeExecution(ComputeExecutionDecline::ResidentAllocatorLiveSlotMissing {
                 identity,
                 width: key.width,

@@ -211,12 +211,12 @@ impl ResourcePools {
     }
 
     pub(crate) fn guest_reset_counts(&self) -> (usize, usize, usize, usize) {
-        let sampled = self.sampled_live.len()
+        let sampled = self.entry.sampled_live.len()
             + self.sampled_free.len()
             + self.sampled_cache.len()
-            + self.attachment_snapshot_live.len()
+            + self.entry.attachment_snapshot_live.len()
             + self.attachment_snapshot_free.len();
-        let storage = self.storage_image_live.len()
+        let storage = self.entry.storage_image_live.len()
             + self.storage_image_free.len()
             + self.compute_storage_registry.len();
         (self.registry.len(), self.targets.len(), sampled, storage)
@@ -267,14 +267,9 @@ impl ResourcePools {
     pub(crate) fn new() -> Self {
         super::super::publish_batch_open(false);
         Self {
+            entry: super::EntryState::default(),
             staging_free: HashMap::new(),
-            staging_live: Vec::new(),
-            staged_reads: Vec::new(),
             gather_free: HashMap::new(),
-            gather_live: Vec::new(),
-            cb_bound_buffers: std::collections::HashMap::new(),
-            cb_gather_owed: Vec::new(),
-            cb_graphics: super::CbGraphicsState::default(),
             staging_hits: 0,
             staging_misses: 0,
             staging_miss_bins: [0; STAGING_BUCKET_BINS],
@@ -285,16 +280,12 @@ impl ResourcePools {
             multisample_target: None,
             ad_hoc_framebuffers: HashMap::new(),
             readback_free: HashMap::new(),
-            readback_live: None,
-            readback_multi_live: Vec::new(),
             readback_leased: Vec::new(),
             sampled_free: FreePool::new(SAMPLED_FREE_CAP_PER_KEY, SAMPLED_FREE_CAP_TOTAL),
-            sampled_live: Vec::new(),
             attachment_snapshot_free: FreePool::new(
                 ATTACHMENT_SNAPSHOT_FREE_CAP_PER_KEY,
                 ATTACHMENT_SNAPSHOT_FREE_CAP_TOTAL,
             ),
-            attachment_snapshot_live: Vec::new(),
             sampled_cache: super::sampled_cache::SampledCache::new(),
             sampled_cache_bytes: 0,
             guest_sampled: HashMap::new(),
@@ -303,7 +294,6 @@ impl ResourcePools {
                 STORAGE_IMAGE_FREE_CAP_PER_KEY,
                 STORAGE_IMAGE_FREE_CAP_TOTAL,
             ),
-            storage_image_live: Vec::new(),
             compute_storage_registry: HashMap::new(),
             compute_storage_order: VecDeque::new(),
             registry: Default::default(),
@@ -325,7 +315,6 @@ impl ResourcePools {
             desc_arena: DescriptorArena::empty(),
             scatter: None,
             scatter_refused: false,
-            scatter_dsets: Vec::new(),
             scatter_dset_free: Vec::new(),
             slots: Vec::new(),
             cur: 0,
@@ -334,15 +323,11 @@ impl ResourcePools {
             target_free: FreePool::new(TARGET_FREE_CAP_PER_KEY, TARGET_FREE_CAP_TOTAL),
             open_batch: None,
             batch_max_draws: BATCH_MAX_DRAWS,
-            last_pass: None,
-            open_pass: None,
             slab: slab::SlabPool::new(),
             slabs: buffer_slab::BufferSlabs::new(),
             host_ram_imports: host_ram::HostRamImports::default(),
             guest_reads_in_flight: false,
             guest_writes_in_flight: false,
-            guest_write_pins_live: Vec::new(),
-            compute_write_pins_live: Vec::new(),
             initialized: false,
         }
     }
@@ -743,7 +728,7 @@ impl ResourcePools {
     /// lifetime, so their recycle budget is derived here rather than retaining
     /// the largest topology's population on every host.
     fn configure_batch_capacity(&mut self, draws: u64) {
-        debug_assert!(self.attachment_snapshot_live.is_empty());
+        debug_assert!(self.entry.attachment_snapshot_live.is_empty());
         debug_assert_eq!(self.attachment_snapshot_free.len(), 0);
         self.batch_max_draws = draws;
         let snapshot_cap = attachment_snapshot_batch_cap(draws);
@@ -836,7 +821,7 @@ impl ResourcePools {
             Some(recycled) => recycled,
             None => unsafe { self.alloc_descriptor_set(device, dsl, counters) }?,
         };
-        self.scatter_dsets.push((set, pool));
+        self.entry.scatter_dsets.push((set, pool));
         Ok(set)
     }
 
@@ -1685,9 +1670,9 @@ impl ResourcePools {
         // The slots the map names are about to be handed to the cleanup, so
         // nothing recorded after this may bind one.
         self.forget_cb_bound_buffers("bindmap_clear_seal", "bindmap_clear_seal_entries");
-        let mut readback: Vec<BufferSlot> = self.readback_live.take().into_iter().collect();
-        readback.append(&mut self.readback_multi_live);
-        let mut sampled = std::mem::take(&mut self.sampled_live);
+        let mut readback: Vec<BufferSlot> = self.entry.readback_live.take().into_iter().collect();
+        readback.append(&mut self.entry.readback_multi_live);
+        let mut sampled = std::mem::take(&mut self.entry.sampled_live);
         let admissions = take_retained_slots(&mut sampled, sampled_retains);
         // Both seal points reach here, which is the whole reason the scatter's
         // sets are parked on `self` instead of travelling with its plan. They
@@ -1696,16 +1681,16 @@ impl ResourcePools {
         SealedEntry {
             cleanup: PendingGpuCleanup {
                 dsets,
-                scatter_dsets: std::mem::take(&mut self.scatter_dsets),
-                staging: std::mem::take(&mut self.staging_live),
-                gather: std::mem::take(&mut self.gather_live),
+                scatter_dsets: std::mem::take(&mut self.entry.scatter_dsets),
+                staging: std::mem::take(&mut self.entry.staging_live),
+                gather: std::mem::take(&mut self.entry.gather_live),
                 readback,
                 sampled,
-                attachment_snapshots: std::mem::take(&mut self.attachment_snapshot_live),
-                storage_images: std::mem::take(&mut self.storage_image_live),
-                unpin_residents: std::mem::take(&mut self.guest_write_pins_live),
-                unpin_compute_residents: std::mem::take(&mut self.compute_write_pins_live),
-                staged: std::mem::take(&mut self.staged_reads),
+                attachment_snapshots: std::mem::take(&mut self.entry.attachment_snapshot_live),
+                storage_images: std::mem::take(&mut self.entry.storage_image_live),
+                unpin_residents: std::mem::take(&mut self.entry.guest_write_pins_live),
+                unpin_compute_residents: std::mem::take(&mut self.entry.compute_write_pins_live),
+                staged: std::mem::take(&mut self.entry.staged_reads),
             },
             admissions,
         }
@@ -1724,7 +1709,7 @@ impl ResourcePools {
         if !ring.retain(window) {
             return false;
         }
-        self.staged_reads.push(StagedRead { ring, window });
+        self.entry.staged_reads.push(StagedRead { ring, window });
         true
     }
 
@@ -1911,7 +1896,7 @@ impl ResourcePools {
     /// answers "no" without a special case, which is correct: it has no
     /// predecessor to continue.
     pub(crate) fn pass_echoes(&self, echo: &PassEcho) -> bool {
-        self.last_pass.as_ref() == Some(echo)
+        self.entry.last_pass.as_ref() == Some(echo)
     }
 
     /// Which field of the echo stopped this draw continuing, or `None` when it
@@ -1956,7 +1941,7 @@ impl ResourcePools {
     /// belong to is therefore the ranking question, and each one names a
     /// different repair.
     pub(crate) fn pass_echo_delta(&self, echo: &PassEcho) -> Option<PassEchoField> {
-        let Some(last) = self.last_pass.as_ref() else {
+        let Some(last) = self.entry.last_pass.as_ref() else {
             return Some(PassEchoField::Nothing);
         };
         if last.cb != echo.cb {
@@ -1980,20 +1965,20 @@ impl ResourcePools {
     /// Record the pass a draw just opened. Called at the `vkCmdBeginRenderPass`
     /// and nowhere else, so the echo always names a pass that is standing.
     pub(crate) fn note_pass_opened(&mut self, echo: PassEcho) {
-        self.last_pass = Some(echo);
-        self.open_pass = Some(echo);
+        self.entry.last_pass = Some(echo);
+        self.entry.open_pass = Some(echo);
     }
 
     /// Whether `echo` is the render pass that is actually still open.
     pub(crate) fn open_pass_echoes(&self, echo: &PassEcho) -> bool {
-        self.open_pass.as_ref() == Some(echo)
+        self.entry.open_pass.as_ref() == Some(echo)
     }
 
     /// End the pass in `cb` before recording a command that cannot live inside
     /// it or ending the command buffer. No-op when the preceding draw ended its
     /// pass normally.
     pub(crate) unsafe fn close_open_pass(&mut self, device: &ash::Device, cb: vk::CommandBuffer) {
-        let Some(open) = self.open_pass.take() else {
+        let Some(open) = self.entry.open_pass.take() else {
             return;
         };
         debug_assert_eq!(
@@ -2021,10 +2006,10 @@ impl ResourcePools {
     /// The handle comparison inside that struct is the second lock on the same
     /// door, not the first.
     pub(crate) fn forget_pass_echo(&mut self) {
-        debug_assert!(self.open_pass.is_none(), "forgetting an open render pass");
-        self.last_pass = None;
-        self.cb_graphics.cb = None;
-        self.cb_graphics.forget_recorded();
+        debug_assert!(self.entry.open_pass.is_none(), "forgetting an open render pass");
+        self.entry.last_pass = None;
+        self.entry.cb_graphics.cb = None;
+        self.entry.cb_graphics.forget_recorded();
     }
 
     fn install_open_batch(&mut self, batch: OpenBatch) {
@@ -2108,7 +2093,7 @@ impl ResourcePools {
                 counters.batch_opens.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let admissions = take_retained_slots(&mut self.sampled_live, sampled_retains);
+        let admissions = take_retained_slots(&mut self.entry.sampled_live, sampled_retains);
         self.admit_recorded_sampled(device, admissions);
     }
 
@@ -2307,7 +2292,7 @@ impl ResourcePools {
         &self,
         key: (usize, u64, u64),
     ) -> Option<super::super::exec::BoundBuffer> {
-        self.cb_bound_buffers.get(&key).map(|(b, _)| *b)
+        self.entry.cb_bound_buffers.get(&key).map(|(b, _)| *b)
     }
 
     /// Remember that `bind`'s bytes are in `bound` for the rest of this command
@@ -2324,7 +2309,7 @@ impl ResourcePools {
         bound: super::super::exec::BoundBuffer,
     ) {
         let (key, owner) = bind.into_parts();
-        self.cb_bound_buffers.insert(key, (bound, owner));
+        self.entry.cb_bound_buffers.insert(key, (bound, owner));
     }
 
     /// Record that the bind just published is backed by a **recycled slot whose
@@ -2334,7 +2319,7 @@ impl ResourcePools {
     /// it has not filled. Everything published without this call is answerable
     /// the moment it is published.
     pub(crate) fn note_cb_bind_owes_gather(&mut self, key: (usize, u64, u64)) {
-        self.cb_gather_owed.push(key);
+        self.entry.cb_gather_owed.push(key);
     }
 
     /// The owed gathers have been recorded into the command buffer, so every
@@ -2344,7 +2329,7 @@ impl ResourcePools {
     /// after both forms — the compute dispatches and the transfer copies — and
     /// after the barrier that orders them before the draw.
     pub(crate) fn note_cb_gathers_recorded(&mut self) {
-        self.cb_gather_owed.clear();
+        self.entry.cb_gather_owed.clear();
     }
 
     /// A draw abandoned before its gathers were recorded: forget exactly the
@@ -2355,9 +2340,9 @@ impl ResourcePools {
     /// Returns how many were forgotten so a boot can say whether the window this
     /// closes was ever open.
     pub(crate) fn discard_cb_binds_owed_a_gather(&mut self) -> usize {
-        let n = self.cb_gather_owed.len();
-        for key in self.cb_gather_owed.drain(..) {
-            self.cb_bound_buffers.remove(&key);
+        let n = self.entry.cb_gather_owed.len();
+        for key in self.entry.cb_gather_owed.drain(..) {
+            self.entry.cb_bound_buffers.remove(&key);
         }
         n
     }
@@ -2404,14 +2389,14 @@ impl ResourcePools {
     /// mean Stores had started landing while binds are live, and the
     /// unconditional clear would have become a real cost.
     fn forget_cb_bound_buffers(&mut self, why: &'static str, entries_slug: &'static str) {
-        let n = self.cb_bound_buffers.len() as u64;
+        let n = self.entry.cb_bound_buffers.len() as u64;
         crate::runtime::drain::note_store_route(why);
         crate::runtime::drain::note_store_route_n(entries_slug, n);
-        self.cb_bound_buffers.clear();
+        self.entry.cb_bound_buffers.clear();
         // The owed list names keys in the map that just went, so it cannot
         // outlive it — a surviving key would later remove whatever unrelated
         // bind the next command buffer published under the same address.
-        self.cb_gather_owed.clear();
+        self.entry.cb_gather_owed.clear();
     }
 
     /// Bind the graphics pipeline unless this command buffer already carries it.
@@ -2432,7 +2417,7 @@ impl ResourcePools {
         pipeline: vk::Pipeline,
         pipeline_layout: vk::PipelineLayout,
     ) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.entry.cb_graphics;
         if g.cb != Some(cb) {
             // A recycled handle: everything the previous user of it bound was
             // made undefined by the `vkBeginCommandBuffer` in between. Every
@@ -2497,7 +2482,7 @@ impl ResourcePools {
     /// comparison in [`Self::set_dynamic_viewport_scissor`] needs them in a
     /// buffer it can swap rather than copy.
     pub(crate) fn dynamic_scratch(&mut self) -> (&mut Vec<vk::Viewport>, &mut Vec<vk::Rect2D>) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.entry.cb_graphics;
         g.vp_scratch.clear();
         g.sc_scratch.clear();
         (&mut g.vp_scratch, &mut g.sc_scratch)
@@ -2517,7 +2502,7 @@ impl ResourcePools {
         cb: vk::CommandBuffer,
         counters: &EngineCounters,
     ) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.entry.cb_graphics;
         if super::viewports_match(&g.vp_scratch, &g.viewports) {
             counters
                 .dynstate_viewport_held
@@ -2544,7 +2529,7 @@ impl ResourcePools {
     /// array already there is bit-for-bit what it would have sent. A consumer
     /// that kept its own copy would be a second spelling of the same rects.
     pub(crate) fn bound_scissors(&self) -> &[vk::Rect2D] {
-        &self.cb_graphics.scissors
+        &self.entry.cb_graphics.scissors
     }
 
     /// Record the draw's vertex buffers as maximal consecutive binding runs,
@@ -2575,7 +2560,7 @@ impl ResourcePools {
             vertex_buffers,
             vertex_offsets,
             ..
-        } = &mut self.cb_graphics;
+        } = &mut self.entry.cb_graphics;
         counters
             .vertex_buffer_bind_slots
             .fetch_add(vertex_binds.len() as u64, Ordering::Relaxed);
@@ -2622,7 +2607,7 @@ impl ResourcePools {
     /// [`Self::bind_vertex_buffers`]. The list stays here between draws so its
     /// capacity survives; only its contents are per draw.
     pub(crate) fn begin_vertex_binds(&mut self) {
-        self.cb_graphics.vertex_binds.clear();
+        self.entry.cb_graphics.vertex_binds.clear();
     }
 
     /// Record that the recording draw binds `bound` at `binding`.
@@ -2631,7 +2616,7 @@ impl ResourcePools {
         binding: u32,
         bound: super::super::exec::BoundBuffer,
     ) {
-        self.cb_graphics.vertex_binds.push((binding, bound));
+        self.entry.cb_graphics.vertex_binds.push((binding, bound));
     }
 
     /// Begin a draw's vertex-attribute list, discarding the previous draw's,
@@ -2639,13 +2624,13 @@ impl ResourcePools {
     pub(in crate::backend::vulkan::engine) fn attr_keys_scratch(
         &mut self,
     ) -> &mut Vec<super::super::caches::AttrKey> {
-        self.cb_graphics.attr_keys.clear();
-        &mut self.cb_graphics.attr_keys
+        self.entry.cb_graphics.attr_keys.clear();
+        &mut self.entry.cb_graphics.attr_keys
     }
 
     /// The vertex-attribute keys the recording draw declared, for interning.
     pub(in crate::backend::vulkan::engine) fn attr_keys(&self) -> &[super::super::caches::AttrKey] {
-        &self.cb_graphics.attr_keys
+        &self.entry.cb_graphics.attr_keys
     }
 
     /// Begin a draw's layout-binding list, discarding the previous draw's, and
@@ -2657,8 +2642,8 @@ impl ResourcePools {
     pub(in crate::backend::vulkan::engine) fn layout_bindings_scratch(
         &mut self,
     ) -> &mut Vec<super::super::caches::BindingSig> {
-        self.cb_graphics.layout_bindings.clear();
-        &mut self.cb_graphics.layout_bindings
+        self.entry.cb_graphics.layout_bindings.clear();
+        &mut self.entry.cb_graphics.layout_bindings
     }
 
     /// The canonical bindings the recording draw declared, for the layout
@@ -2666,12 +2651,12 @@ impl ResourcePools {
     pub(in crate::backend::vulkan::engine) fn layout_bindings(
         &self,
     ) -> &[super::super::caches::BindingSig] {
-        &self.cb_graphics.layout_bindings
+        &self.entry.cb_graphics.layout_bindings
     }
 
     /// Begin a draw's storage-bind list, discarding the previous draw's.
     pub(crate) fn begin_storage_binds(&mut self) {
-        self.cb_graphics.storage_binds.clear();
+        self.entry.cb_graphics.storage_binds.clear();
     }
 
     /// Record that the recording draw binds `bound` at `binding`, with `len`
@@ -2682,7 +2667,7 @@ impl ResourcePools {
         bound: super::super::exec::BoundBuffer,
         len: u64,
     ) {
-        self.cb_graphics.storage_binds.push((binding, bound, len));
+        self.entry.cb_graphics.storage_binds.push((binding, bound, len));
     }
 
     /// The cleared descriptor scratch and this draw's storage binds, together.
@@ -2701,7 +2686,7 @@ impl ResourcePools {
             push_scratch,
             storage_binds,
             ..
-        } = &mut self.cb_graphics;
+        } = &mut self.entry.cb_graphics;
         push_scratch.clear();
         (push_scratch, storage_binds)
     }
@@ -2711,7 +2696,7 @@ impl ResourcePools {
     /// Shared, so the caller cannot change what the comparison below will
     /// read.
     pub(crate) fn push_descriptor_scratch_ref(&self) -> &[super::PushDescriptorBinding] {
-        &self.cb_graphics.push_scratch
+        &self.entry.cb_graphics.push_scratch
     }
 
     /// The list this command buffer is *known to carry*, which after
@@ -2720,7 +2705,7 @@ impl ResourcePools {
     /// not copied — and reading it here rather than the scratch is what keeps
     /// "what was recorded" and "what was asked for" one value.
     pub(crate) fn push_descriptor_echo(&self) -> &[super::PushDescriptorBinding] {
-        &self.cb_graphics.push_bindings
+        &self.entry.cb_graphics.push_bindings
     }
 
     /// Return whether this draw must record its push descriptors, retaining a
@@ -2730,7 +2715,7 @@ impl ResourcePools {
         layout: vk::PipelineLayout,
         counters: &EngineCounters,
     ) -> bool {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.entry.cb_graphics;
         if super::push_descriptors_match(g.push_layout, &g.push_bindings, layout, &g.push_scratch) {
             counters
                 .descriptor_push_held
@@ -2757,7 +2742,7 @@ impl ResourcePools {
         front: u32,
         back: u32,
     ) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.entry.cb_graphics;
         if g.stencil == Some((front, back)) {
             counters
                 .dynstate_stencil_held
@@ -2797,7 +2782,7 @@ impl ResourcePools {
         cb: vk::CommandBuffer,
         counters: &EngineCounters,
     ) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.entry.cb_graphics;
         if g.depth_bias_set {
             counters
                 .dynstate_depth_bias_held
@@ -2833,7 +2818,7 @@ impl ResourcePools {
         counters: &EngineCounters,
         values: reims_vgpu_vulkan::raster::DynamicRaster,
     ) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.entry.cb_graphics;
         if g.raster == Some(values) {
             counters
                 .dynstate_raster_held
@@ -2890,7 +2875,7 @@ impl ResourcePools {
         counters: &EngineCounters,
         width: f32,
     ) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.entry.cb_graphics;
         if g.line_width == Some(width.to_bits()) {
             counters
                 .dynstate_line_width_held
@@ -2932,7 +2917,7 @@ impl ResourcePools {
         counters: &EngineCounters,
         wanted: Option<reims_vgpu_vulkan::depth_stencil::DynamicDepthStencil>,
     ) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.entry.cb_graphics;
         if g.depth_stencil == Some(wanted) {
             counters
                 .dynstate_depth_stencil_held
@@ -2996,7 +2981,7 @@ impl ResourcePools {
         counters: &EngineCounters,
         wanted: Option<vk::PrimitiveTopology>,
     ) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.entry.cb_graphics;
         if g.topology == Some(wanted) {
             counters
                 .dynstate_topology_held
@@ -3028,7 +3013,7 @@ impl ResourcePools {
         constants: [f32; 4],
     ) {
         let bits = constants.map(f32::to_bits);
-        let g = &mut self.cb_graphics;
+        let g = &mut self.entry.cb_graphics;
         if g.blend_constants == Some(bits) {
             counters
                 .dynstate_blend_constants_held
@@ -3095,7 +3080,7 @@ impl ResourcePools {
         match source {
             super::super::GuestWriteSource::ResidentTarget(identity) => {
                 if self.pin_resident_target(identity, true) {
-                    self.guest_write_pins_live.push(identity.clone());
+                    self.entry.guest_write_pins_live.push(identity.clone());
                 }
             }
             // Same ledger discipline, the other registry. Recorded separately
@@ -3103,7 +3088,7 @@ impl ResourcePools {
             // the registry that holds the image.
             super::super::GuestWriteSource::ResidentStorage(identity) => {
                 if self.pin_resident_storage(identity, true) {
-                    self.compute_write_pins_live.push(*identity);
+                    self.entry.compute_write_pins_live.push(*identity);
                 }
             }
             // Nothing to pin: the ring entry this submission sealed already owns
@@ -3365,7 +3350,7 @@ impl ResourcePools {
             "staging_pool hits={} misses={} live={} free_slots={free_slots} free_mb={} miss_bins={} miss_us_bins={us_bins} free_bins={}",
             self.staging_hits,
             self.staging_misses,
-            self.staging_live.len(),
+            self.entry.staging_live.len(),
             free_bytes >> 20,
             bins(&self.staging_miss_bins),
             bins(&free_bins),
@@ -3386,7 +3371,7 @@ impl ResourcePools {
         if let Some(list) = self.staging_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
                 self.note_staging_hit();
-                self.staging_live.push(slot);
+                self.entry.staging_live.push(slot);
                 return Ok(slot);
             }
         }
@@ -3449,7 +3434,7 @@ impl ResourcePools {
             // it is the readback slots that decide anything on it.
             cached: ctx.mapped_memory_kind(mt).cached,
         };
-        self.staging_live.push(slot);
+        self.entry.staging_live.push(slot);
         self.note_staging_miss(bucket, miss_started.elapsed().as_micros() as u64);
         Ok(slot)
     }
@@ -3472,7 +3457,7 @@ impl ResourcePools {
     /// submitted copy was still reading it.
     fn take_free_gather(&mut self, bucket: u64) -> Option<BufferSlot> {
         let slot = self.gather_free.get_mut(&bucket)?.pop()?;
-        self.gather_live.push(slot);
+        self.entry.gather_live.push(slot);
         Some(slot)
     }
 
@@ -3541,7 +3526,7 @@ impl ResourcePools {
             coherent: false,
             cached: false,
         };
-        self.gather_live.push(slot);
+        self.entry.gather_live.push(slot);
         Ok(slot)
     }
 
@@ -3734,10 +3719,10 @@ impl ResourcePools {
         // TEMP (lab, PASS_STAGE): a recycled entry (device loss, a draw that
         // never sealed) releases its arena windows here rather than at a
         // retire that will not come.
-        for read in self.staged_reads.drain(..) {
+        for read in self.entry.staged_reads.drain(..) {
             read.ring.release(read.window);
         }
-        for slot in self.staging_live.drain(..) {
+        for slot in self.entry.staging_live.drain(..) {
             let bucket = Self::bucket(slot.size);
             self.staging_free.entry(bucket).or_default().push(slot);
         }
@@ -3870,7 +3855,7 @@ impl ResourcePools {
         let bucket = Self::bucket(size.max(4));
         if let Some(list) = self.readback_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
-                self.readback_live = Some(slot);
+                self.entry.readback_live = Some(slot);
                 return Ok(slot);
             }
         }
@@ -3884,7 +3869,7 @@ impl ResourcePools {
             VkOp::PoolsBindReadback,
             VkOp::PoolsMapReadback,
         )?;
-        self.readback_live = Some(slot);
+        self.entry.readback_live = Some(slot);
         Ok(slot)
     }
 
@@ -3901,7 +3886,7 @@ impl ResourcePools {
     /// Must be called before [`Self::seal_entry`], which is what would
     /// otherwise move the slot into the submitted entry's cleanup.
     pub(crate) fn lease_readback(&mut self) -> Option<ReadbackLease> {
-        let slot = self.readback_live.take()?;
+        let slot = self.entry.readback_live.take()?;
         // Two refusals, and both send the caller to the copying path rather
         // than to a failure.
         //
@@ -3917,7 +3902,7 @@ impl ResourcePools {
         // of a scattered walk, so where the cached type was unavailable the
         // copy is genuinely the faster shape and the lease declines.
         if slot.mapped == 0 || !slot.cached {
-            self.readback_live = Some(slot);
+            self.entry.readback_live = Some(slot);
             return None;
         }
         let token = NEXT_READBACK_LEASE_TOKEN.fetch_add(1, Ordering::Relaxed);
@@ -3956,11 +3941,11 @@ impl ResourcePools {
     }
 
     pub(crate) fn recycle_readback(&mut self) {
-        if let Some(slot) = self.readback_live.take() {
+        if let Some(slot) = self.entry.readback_live.take() {
             let bucket = Self::bucket(slot.size);
             self.readback_free.entry(bucket).or_default().push(slot);
         }
-        for slot in self.readback_multi_live.drain(..) {
+        for slot in self.entry.readback_multi_live.drain(..) {
             let bucket = Self::bucket(slot.size);
             self.readback_free.entry(bucket).or_default().push(slot);
         }
@@ -3976,7 +3961,7 @@ impl ResourcePools {
         let bucket = Self::bucket(size.max(4));
         if let Some(list) = self.readback_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
-                self.readback_multi_live.push(slot);
+                self.entry.readback_multi_live.push(slot);
                 return Ok(slot);
             }
         }
@@ -3990,7 +3975,7 @@ impl ResourcePools {
             VkOp::PoolsBindReadbackExtra,
             VkOp::PoolsMapReadbackExtra,
         )?;
-        self.readback_multi_live.push(slot);
+        self.entry.readback_multi_live.push(slot);
         Ok(slot)
     }
 
@@ -4393,8 +4378,8 @@ impl ResourcePools {
         if let Some(slot) = recycled {
             let handles = slot.handles();
             match use_ {
-                SampledTransientUse::Upload => self.sampled_live.push(slot),
-                SampledTransientUse::AttachmentSnapshot => self.attachment_snapshot_live.push(slot),
+                SampledTransientUse::Upload => self.entry.sampled_live.push(slot),
+                SampledTransientUse::AttachmentSnapshot => self.entry.attachment_snapshot_live.push(slot),
             }
             return Ok(handles);
         }
@@ -4495,8 +4480,8 @@ impl ResourcePools {
         };
         let handles = slot.handles();
         match use_ {
-            SampledTransientUse::Upload => self.sampled_live.push(slot),
-            SampledTransientUse::AttachmentSnapshot => self.attachment_snapshot_live.push(slot),
+            SampledTransientUse::Upload => self.entry.sampled_live.push(slot),
+            SampledTransientUse::AttachmentSnapshot => self.entry.attachment_snapshot_live.push(slot),
         }
         Ok(handles)
     }
@@ -4714,7 +4699,7 @@ impl ResourcePools {
             SampledRetainContent::Gathered { len } => {
                 if identity.is_none() || !sampled_identity_enabled() {
                     crate::runtime::drain::note_store_route("sampled_admit_no_identity");
-                    self.sampled_live.push(slot);
+                    self.entry.sampled_live.push(slot);
                     return Vec::new();
                 }
                 (SampledFingerprint::Gathered, None, *len)
@@ -4722,7 +4707,7 @@ impl ResourcePools {
         };
         if content_len > SAMPLED_CACHE_BYTE_CAP {
             crate::runtime::drain::note_store_route("sampled_admit_oversize");
-            self.sampled_live.push(slot);
+            self.entry.sampled_live.push(slot);
             return Vec::new();
         }
         // Deduplication asks the same question a lookup does, so it has to
@@ -4752,7 +4737,7 @@ impl ResourcePools {
             if let Some(id) = identity {
                 self.sampled_cache.adopt_identity(existing, id);
             }
-            self.sampled_live.push(slot);
+            self.entry.sampled_live.push(slot);
             return Vec::new();
         }
         crate::runtime::drain::note_store_route("sampled_admit_kept");
@@ -4786,11 +4771,11 @@ impl ResourcePools {
     }
 
     pub(crate) fn recycle_sampled(&mut self) {
-        for slot in self.sampled_live.drain(..) {
+        for slot in self.entry.sampled_live.drain(..) {
             let sk = slot.key();
             self.sampled_free.push_uncapped(sk, slot);
         }
-        for slot in self.attachment_snapshot_live.drain(..) {
+        for slot in self.entry.attachment_snapshot_live.drain(..) {
             let sk = slot.key();
             self.attachment_snapshot_free.push_uncapped(sk, slot);
         }
@@ -5572,7 +5557,7 @@ mod recycle_tests {
         let key = slot.key();
         let image = slot.image;
         // What `acquire_sampled` leaves behind for a cold guest gather.
-        pools.sampled_live.push(slot);
+        pools.entry.sampled_live.push(slot);
         assert!(
             pools
                 .find_gathered_sampled(key, Some(identity), &counters)
@@ -6657,7 +6642,7 @@ mod recycle_tests {
         // Sealing transfers the pins to the exact submission that references
         // them. Model that slot's fence retirement without a Vulkan device.
         let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
-        assert!(pools.guest_write_pins_live.is_empty());
+        assert!(pools.entry.guest_write_pins_live.is_empty());
         for held in cleanup.unpin_residents.drain(..) {
             pools.pin_resident_target(&held, false);
         }
@@ -6712,7 +6697,7 @@ mod recycle_tests {
             "a ring-owned source pins no resident"
         );
         assert!(
-            pools.guest_write_pins_live.is_empty(),
+            pools.entry.guest_write_pins_live.is_empty(),
             "and leaves the ledger nothing to release"
         );
         let cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
@@ -6758,14 +6743,14 @@ mod recycle_tests {
             "the copy is submitted and not waited, so the image must be held"
         );
         assert_eq!(
-            pools.compute_write_pins_live,
+            pools.entry.compute_write_pins_live,
             vec![id],
             "and the ledger records the pin it actually took"
         );
 
         let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
         assert!(
-            pools.compute_write_pins_live.is_empty(),
+            pools.entry.compute_write_pins_live.is_empty(),
             "sealing hands the pin to the slot rather than copying it"
         );
         assert_eq!(cleanup.unpin_compute_residents, vec![id]);
@@ -6797,7 +6782,7 @@ mod recycle_tests {
             pools.take_guest_write_debt(),
             "the pages are still being written, so the debt is still owed"
         );
-        assert!(pools.compute_write_pins_live.is_empty());
+        assert!(pools.entry.compute_write_pins_live.is_empty());
         assert!(pools
             .seal_entry(Vec::new(), Vec::new())
             .cleanup
@@ -6862,7 +6847,7 @@ mod recycle_tests {
         // No slot at all: nothing to pin, and nothing for a reclaim to take.
         pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert!(
-            pools.guest_write_pins_live.is_empty(),
+            pools.entry.guest_write_pins_live.is_empty(),
             "no pin was taken, so none may be released"
         );
         assert!(
@@ -7276,7 +7261,7 @@ mod gather_slots_do_not_alias {
             first.buffer, second.buffer,
             "two live gather slots must not be one buffer"
         );
-        assert_eq!(pools.gather_live.len(), 2, "both must be recorded live");
+        assert_eq!(pools.entry.gather_live.len(), 2, "both must be recorded live");
     }
 
     /// A slot that has been handed out is gone from the free list, so it cannot
@@ -7298,7 +7283,7 @@ mod gather_slots_do_not_alias {
             "the only slot was handed out; the list must be empty"
         );
         assert!(
-            !pools.gather_live.is_empty(),
+            !pools.entry.gather_live.is_empty(),
             "and the live list is what keeps it alive until its fence retires"
         );
     }

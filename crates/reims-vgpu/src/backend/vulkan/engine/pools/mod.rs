@@ -195,16 +195,12 @@ pub(crate) fn readback_leases_outstanding() -> usize {
 }
 
 pub(crate) struct ResourcePools {
+    /// TEMP (lab, parallel recorder S1): the state that lives for one command
+    /// buffer entry (claimed at `begin_entry`, drained at `seal_entry`), kept
+    /// together so a recording lane can own it.
+    entry: EntryState,
     /// Size-bucketed free host-visible buffers (TRANSFER_SRC | VERTEX | INDEX | STORAGE).
     staging_free: HashMap<u64, Vec<BufferSlot>>,
-    /// In-use staging slots returned after submit/wait.
-    staging_live: Vec<BufferSlot>,
-    /// TEMP (lab, PASS_STAGE): worker-arena windows the command buffer now
-    /// recording reads — one reference each, sealed with the entry and
-    /// released at its retire, exactly the lifetime `staging_live` gives a
-    /// pooled slot. A window may appear here that an earlier entry of an open
-    /// batch already sealed: the joiner takes its own reference.
-    staged_reads: Vec<StagedRead>,
     /// Size-bucketed free DEVICE_LOCAL buffers the draw-time guest gather
     /// assembles scattered windows into, and the in-use ones the ring returns
     /// after submit/wait.
@@ -215,95 +211,6 @@ pub(crate) struct ResourcePools {
     /// destination in system RAM, which is the arrangement
     /// `gather_guest_buffer_window` exists to avoid.
     gather_free: HashMap<u64, Vec<BufferSlot>>,
-    gather_live: Vec<BufferSlot>,
-    /// Buffer binds the command buffer now recording has already staged or
-    /// gathered, keyed by the content that produced them.
-    ///
-    /// The key is `(Arc` address`, length)` of the bind's content, and the entry
-    /// **holds that `Arc`** — see [`CbBind`]. Two binds of the same content are
-    /// then the same pointer, and two different contents cannot collide however
-    /// their bytes compare, because neither allocation can be freed while an
-    /// entry names it.
-    ///
-    /// The holding is the whole safety argument and it was once absent. The map
-    /// stored a bare [`super::exec::BoundBuffer`], which is `Copy` and owns
-    /// nothing, on the justification that "the runtime holds one `Arc` per
-    /// resolved `(task, reference, offset)`". That is true of the `GuestRuns`
-    /// arm, whose `Arc` lives in the bound-buffer registry, and false of the
-    /// `Bytes` arm, which is `Arc::new`-ed per bind from a freshly read `Vec`
-    /// and dropped with the `DrawRequest` that asked for it — while this map
-    /// survives to the end of the command buffer, up to `BATCH_MAX_DRAWS`
-    /// draws later. `ArcInner<Vec<u8>>` is a fixed 40-byte allocation whatever
-    /// the payload, so the allocator hands the address straight back, and the
-    /// next draw's unrelated read of the same length was served the previous
-    /// draw's bytes and counted as a reuse win.
-    ///
-    /// This crate states the rule correctly in two other places —
-    /// `caches.rs`'s `ShaderDigestIndex` ("drop the `Arc` from the entry and
-    /// this becomes a use-after-free dressed as a cache hit") and
-    /// [`buffer_gather_working_set`], which is keyed the same way and says it
-    /// does not owe the `Arc` because it is measure-only. This map is looked up
-    /// for a *bind* and does owe it.
-    ///
-    /// # Why the command buffer and not the draw
-    ///
-    /// This was a local in `execute_draw_inner`, so it deduplicated the ~5 binds
-    /// of one draw and nothing across the batch that draw joins. A window bound
-    /// by four consecutive draws was copied into device-local memory four times,
-    /// and a driven Safari drag moved **4.46 GB per second** that way.
-    ///
-    /// One copy per command buffer is what the guest's own model gives it. The
-    /// bytes are read when the command buffer executes, so a guest that rewrote
-    /// the window between two draws of one command buffer would already be
-    /// racing itself: nothing tells it when either draw runs. Copying twice does
-    /// not make that guest correct, it only makes this device slower.
-    ///
-    /// Same probe after the move, busiest census second:
-    ///
-    /// ```text
-    /// buffer_guest_gathers       19 372 ->  11 894
-    /// buffer_guest_gather_bytes    4.46 GB ->   2.71 GB
-    /// buffer_bind_reuses                -    23 947
-    /// batch_flush_draws           3 913 ->   4 635
-    /// ```
-    ///
-    /// Two binds in three are served from a copy this command buffer already
-    /// holds. Bus traffic per draw — this, plus the surface writeback going the
-    /// other way — went 2.25 MB to 1.69 MB while the drag ran 18 % more draws a
-    /// second, and its peak present rate went 68 Hz to 76 Hz.
-    ///
-    /// # What ends an entry's life
-    ///
-    /// The slots named here live in `staging_live` / `gather_live`, so the map
-    /// is cleared wherever those are handed away or recycled —
-    /// [`ResourcePools::seal_entry`] and [`ResourcePools::recycle_staging`] —
-    /// and additionally whenever this device records a write **into guest
-    /// pages** ([`ResourcePools::note_guest_write_recorded`]). That last one is
-    /// the correctness edge: a bind after a Store into the same pages must see
-    /// what the Store wrote, and reusing a copy taken before it would not.
-    cb_bound_buffers: HashMap<(usize, u64, u64), (super::exec::BoundBuffer, CbBindOwner)>,
-    /// Keys in `cb_bound_buffers` whose slot is **not yet filled**: a GPU gather
-    /// was planned for them and the copy or dispatch that lands it has not been
-    /// recorded into the command buffer.
-    ///
-    /// Every other arm of `stage_buffer_content` publishes a bind whose bytes
-    /// are already where the descriptor points — a `Bytes` bind is a CPU write
-    /// into mapped memory and a direct import binds the guest's own pages. The
-    /// gather arm is the exception: it hands back a **recycled** device-local
-    /// slot and owes a copy that `execute_draw_inner` records hundreds of lines
-    /// later, past every recoverable refusal the sampled rungs can raise. A draw
-    /// that abandons in between drops the owed copy — it lives in a local `Vec`
-    /// — and leaves the memo behind, so the next draw of the same command buffer
-    /// hits the memo, records no copy, and binds the slot's **previous tenant**
-    /// as its constant buffer or vertex stream.
-    ///
-    /// Tracked rather than solved by clearing the whole memo, because the entries
-    /// published by draws that did complete are still correct and this rail is
-    /// ~4.8 binds a draw.
-    cb_gather_owed: Vec<(usize, u64, u64)>,
-    /// Graphics state the command buffer now recording already carries — see
-    /// [`CbGraphicsState`].
-    cb_graphics: CbGraphicsState,
     /// Staging free-list hits / misses and the miss bucket histogram; see
     /// `note_staging_miss`. Measure-only.
     staging_hits: u64,
@@ -340,9 +247,6 @@ pub(crate) struct ResourcePools {
     ad_hoc_framebuffers: HashMap<AdHocFramebufferKey, vk::Framebuffer>,
     /// Readback buffers by size.
     readback_free: HashMap<u64, Vec<BufferSlot>>,
-    readback_live: Option<BufferSlot>,
-    /// Extra live readbacks (compute multi-image / multi-buffer).
-    readback_multi_live: Vec<BufferSlot>,
     /// Readback slots handed to a reader that is consuming their mapping with
     /// the engine unlocked; see [`ResourcePools::lease_readback`].
     ///
@@ -354,14 +258,12 @@ pub(crate) struct ResourcePools {
     readback_leased: Vec<LeasedReadback>,
     /// Transient sampled-image pool, keyed by exact image and view geometry.
     sampled_free: FreePool<SampledKey, SampledSlot>,
-    sampled_live: Vec<SampledSlot>,
     /// Attachment-feedback snapshots have a command-buffer working set rather
     /// than a content-cache working set. Keeping them separate prevents the
     /// general sampled cap from destroying the snapshots a full batch returns,
     /// while preventing those large, contentless images from displacing upload
     /// slots that are reusable for a different reason.
     attachment_snapshot_free: FreePool<SampledKey, SampledSlot>,
-    attachment_snapshot_live: Vec<SampledSlot>,
     /// Exact-content sampled images retained across draw calls. Hash narrows
     /// candidates only; a hit always requires full byte equality.
     sampled_cache: sampled_cache::SampledCache,
@@ -376,7 +278,6 @@ pub(crate) struct ResourcePools {
     sampled_victims: std::collections::VecDeque<SampledVictim>,
     /// Storage-image pool for compute.
     storage_image_free: FreePool<StorageImageKey, StorageImageSlot>,
-    storage_image_live: Vec<StorageImageSlot>,
     /// Protocol-identity keyed compute storage images retained across calls.
     compute_storage_registry: HashMap<ComputeStorageResidencyKey, ResidentStorageImageSlot>,
     /// Insertion order for [`Self::compute_storage_registry`], oldest *created*
@@ -515,18 +416,6 @@ pub(crate) struct ResourcePools {
     /// fallback costs one flag rather than a `vkCreateComputePipelines` per
     /// writeback on a host that will never serve one.
     scatter_refused: bool,
-    /// Descriptor sets a guest-scatter dispatch has allocated and not yet
-    /// handed to a fence.
-    ///
-    /// Held here rather than returned to the writeback because the writeback has
-    /// two seal points — its own [`ResourcePools::seal_entry`] and the
-    /// [`ResourcePools::batch_flush`] it takes when it joined an open batch —
-    /// and threading the sets through both is how one of them ends up double
-    /// -freeing or leaking. [`ResourcePools::seal_entry`] drains this, and both
-    /// paths reach it. A writeback that allocated a set and then failed before
-    /// submitting anything leaves it here for the next seal, which is correct:
-    /// no submitted command buffer ever named it, so any later fence will do.
-    scatter_dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     /// Guest-scatter descriptor sets whose fence has retired, ready to be
     /// rewritten and handed out again.
     ///
@@ -588,16 +477,6 @@ pub(crate) struct ResourcePools {
     /// function's doc promises it is pure and testable without a device and a
     /// process-global environment read is neither.
     batch_max_draws: u64,
-    /// The render pass the last recorded draw opened — see [`PassEcho`].
-    ///
-    /// Observation only: nothing branches on it. It exists because "could this
-    /// draw have continued the previous one's pass" is not answerable from any
-    /// counter this device had, and the answer is the size of the merge.
-    last_pass: Option<PassEcho>,
-    /// Render pass currently open in the deferred batch command buffer.
-    /// Unlike `last_pass`, this is executable state: every outside-pass command
-    /// and every command-buffer end must close it first.
-    open_pass: Option<PassEcho>,
     /// Offset suballocator for DEVICE_LOCAL optimal images (targets, sampled,
     /// storage, resident registry). Sub-allocates many image binds from a few
     /// large `VkDeviceMemory` blocks to collapse the per-image
@@ -647,6 +526,142 @@ pub(crate) struct ResourcePools {
     /// waits into one and lets the copies pipeline against each other on the
     /// GPU instead of stopping the queue between them.
     guest_writes_in_flight: bool,
+    initialized: bool,
+}
+
+/// TEMP (lab, parallel recorder S1, design journal/2026-10-10-parallel-recorder-design.md):
+/// every field of [`ResourcePools`] whose life is one command-buffer entry - what
+/// the entry recorded against (live staging, gathers, sampled and storage slots,
+/// readbacks, write pins, descriptor sets for scatter dispatches), the per-CB bind
+/// and graphics-state memos, and the pass echo. Moved here unchanged, behind one
+/// field, so the entry can later move to the lane that records it.
+#[derive(Default)]
+pub(crate) struct EntryState {
+    /// In-use staging slots returned after submit/wait.
+    staging_live: Vec<BufferSlot>,
+    /// TEMP (lab, PASS_STAGE): worker-arena windows the command buffer now
+    /// recording reads — one reference each, sealed with the entry and
+    /// released at its retire, exactly the lifetime `staging_live` gives a
+    /// pooled slot. A window may appear here that an earlier entry of an open
+    /// batch already sealed: the joiner takes its own reference.
+    staged_reads: Vec<StagedRead>,
+    gather_live: Vec<BufferSlot>,
+    /// Buffer binds the command buffer now recording has already staged or
+    /// gathered, keyed by the content that produced them.
+    ///
+    /// The key is `(Arc` address`, length)` of the bind's content, and the entry
+    /// **holds that `Arc`** — see [`CbBind`]. Two binds of the same content are
+    /// then the same pointer, and two different contents cannot collide however
+    /// their bytes compare, because neither allocation can be freed while an
+    /// entry names it.
+    ///
+    /// The holding is the whole safety argument and it was once absent. The map
+    /// stored a bare [`super::exec::BoundBuffer`], which is `Copy` and owns
+    /// nothing, on the justification that "the runtime holds one `Arc` per
+    /// resolved `(task, reference, offset)`". That is true of the `GuestRuns`
+    /// arm, whose `Arc` lives in the bound-buffer registry, and false of the
+    /// `Bytes` arm, which is `Arc::new`-ed per bind from a freshly read `Vec`
+    /// and dropped with the `DrawRequest` that asked for it — while this map
+    /// survives to the end of the command buffer, up to `BATCH_MAX_DRAWS`
+    /// draws later. `ArcInner<Vec<u8>>` is a fixed 40-byte allocation whatever
+    /// the payload, so the allocator hands the address straight back, and the
+    /// next draw's unrelated read of the same length was served the previous
+    /// draw's bytes and counted as a reuse win.
+    ///
+    /// This crate states the rule correctly in two other places —
+    /// `caches.rs`'s `ShaderDigestIndex` ("drop the `Arc` from the entry and
+    /// this becomes a use-after-free dressed as a cache hit") and
+    /// [`buffer_gather_working_set`], which is keyed the same way and says it
+    /// does not owe the `Arc` because it is measure-only. This map is looked up
+    /// for a *bind* and does owe it.
+    ///
+    /// # Why the command buffer and not the draw
+    ///
+    /// This was a local in `execute_draw_inner`, so it deduplicated the ~5 binds
+    /// of one draw and nothing across the batch that draw joins. A window bound
+    /// by four consecutive draws was copied into device-local memory four times,
+    /// and a driven Safari drag moved **4.46 GB per second** that way.
+    ///
+    /// One copy per command buffer is what the guest's own model gives it. The
+    /// bytes are read when the command buffer executes, so a guest that rewrote
+    /// the window between two draws of one command buffer would already be
+    /// racing itself: nothing tells it when either draw runs. Copying twice does
+    /// not make that guest correct, it only makes this device slower.
+    ///
+    /// Same probe after the move, busiest census second:
+    ///
+    /// ```text
+    /// buffer_guest_gathers       19 372 ->  11 894
+    /// buffer_guest_gather_bytes    4.46 GB ->   2.71 GB
+    /// buffer_bind_reuses                -    23 947
+    /// batch_flush_draws           3 913 ->   4 635
+    /// ```
+    ///
+    /// Two binds in three are served from a copy this command buffer already
+    /// holds. Bus traffic per draw — this, plus the surface writeback going the
+    /// other way — went 2.25 MB to 1.69 MB while the drag ran 18 % more draws a
+    /// second, and its peak present rate went 68 Hz to 76 Hz.
+    ///
+    /// # What ends an entry's life
+    ///
+    /// The slots named here live in `staging_live` / `gather_live`, so the map
+    /// is cleared wherever those are handed away or recycled —
+    /// [`ResourcePools::seal_entry`] and [`ResourcePools::recycle_staging`] —
+    /// and additionally whenever this device records a write **into guest
+    /// pages** ([`ResourcePools::note_guest_write_recorded`]). That last one is
+    /// the correctness edge: a bind after a Store into the same pages must see
+    /// what the Store wrote, and reusing a copy taken before it would not.
+    cb_bound_buffers: HashMap<(usize, u64, u64), (super::exec::BoundBuffer, CbBindOwner)>,
+    /// Keys in `cb_bound_buffers` whose slot is **not yet filled**: a GPU gather
+    /// was planned for them and the copy or dispatch that lands it has not been
+    /// recorded into the command buffer.
+    ///
+    /// Every other arm of `stage_buffer_content` publishes a bind whose bytes
+    /// are already where the descriptor points — a `Bytes` bind is a CPU write
+    /// into mapped memory and a direct import binds the guest's own pages. The
+    /// gather arm is the exception: it hands back a **recycled** device-local
+    /// slot and owes a copy that `execute_draw_inner` records hundreds of lines
+    /// later, past every recoverable refusal the sampled rungs can raise. A draw
+    /// that abandons in between drops the owed copy — it lives in a local `Vec`
+    /// — and leaves the memo behind, so the next draw of the same command buffer
+    /// hits the memo, records no copy, and binds the slot's **previous tenant**
+    /// as its constant buffer or vertex stream.
+    ///
+    /// Tracked rather than solved by clearing the whole memo, because the entries
+    /// published by draws that did complete are still correct and this rail is
+    /// ~4.8 binds a draw.
+    cb_gather_owed: Vec<(usize, u64, u64)>,
+    /// Graphics state the command buffer now recording already carries — see
+    /// [`CbGraphicsState`].
+    cb_graphics: CbGraphicsState,
+    readback_live: Option<BufferSlot>,
+    /// Extra live readbacks (compute multi-image / multi-buffer).
+    readback_multi_live: Vec<BufferSlot>,
+    sampled_live: Vec<SampledSlot>,
+    attachment_snapshot_live: Vec<SampledSlot>,
+    storage_image_live: Vec<StorageImageSlot>,
+    /// Descriptor sets a guest-scatter dispatch has allocated and not yet
+    /// handed to a fence.
+    ///
+    /// Held here rather than returned to the writeback because the writeback has
+    /// two seal points — its own [`ResourcePools::seal_entry`] and the
+    /// [`ResourcePools::batch_flush`] it takes when it joined an open batch —
+    /// and threading the sets through both is how one of them ends up double
+    /// -freeing or leaking. [`ResourcePools::seal_entry`] drains this, and both
+    /// paths reach it. A writeback that allocated a set and then failed before
+    /// submitting anything leaves it here for the next seal, which is correct:
+    /// no submitted command buffer ever named it, so any later fence will do.
+    scatter_dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
+    /// The render pass the last recorded draw opened — see [`PassEcho`].
+    ///
+    /// Observation only: nothing branches on it. It exists because "could this
+    /// draw have continued the previous one's pass" is not answerable from any
+    /// counter this device had, and the answer is the size of the merge.
+    last_pass: Option<PassEcho>,
+    /// Render pass currently open in the deferred batch command buffer.
+    /// Unlike `last_pass`, this is executable state: every outside-pass command
+    /// and every command-buffer end must close it first.
+    open_pass: Option<PassEcho>,
     /// Residents pinned by guest-page copies in the command buffer currently
     /// being recorded. [`ResourcePools::seal_entry`] transfers them to that
     /// submission's [`PendingGpuCleanup`].
@@ -666,7 +681,6 @@ pub(crate) struct ResourcePools {
     /// holds the image; identical in discipline, and it travels to the same ring
     /// slot in the same `seal_entry`.
     compute_write_pins_live: Vec<crate::model::ComputeStorageResidencyKey>,
-    initialized: bool,
 }
 
 /// State of the deferred-submit draw batch (draw-batching increment 1): the

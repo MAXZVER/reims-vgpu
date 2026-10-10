@@ -19,7 +19,7 @@ impl ResourcePools {
         // No command from this CB will be submitted now. Destroying its command
         // pool discards the unfinished recording, including an open pass, so
         // there is neither a legal nor a useful cmd_end_render_pass to emit.
-        self.open_pass = None;
+        self.entry.open_pass = None;
         self.forget_pass_echo();
         // Best-effort quiesce: wait every in-flight fence so no CB references
         // what we are about to destroy. On device loss the waits fail — the
@@ -38,13 +38,13 @@ impl ResourcePools {
                 // The descriptor pool is destroyed below (frees every set);
                 // move the owed transients into the live lists so the drains
                 // below destroy them.
-                self.staging_live.extend(pending.staging);
-                self.gather_live.extend(pending.gather);
-                self.readback_multi_live.extend(pending.readback);
-                self.sampled_live.extend(pending.sampled);
-                self.attachment_snapshot_live
+                self.entry.staging_live.extend(pending.staging);
+                self.entry.gather_live.extend(pending.gather);
+                self.entry.readback_multi_live.extend(pending.readback);
+                self.entry.sampled_live.extend(pending.sampled);
+                self.entry.attachment_snapshot_live
                     .extend(pending.attachment_snapshots);
-                self.storage_image_live.extend(pending.storage_images);
+                self.entry.storage_image_live.extend(pending.storage_images);
                 // TEMP (lab, PASS_STAGE): the fences above were waited (or
                 // died with a lost device), so the arena windows they read
                 // are nobody's anymore.
@@ -74,7 +74,7 @@ impl ResourcePools {
                 release_buffer_slot(device, &mut self.slabs, s);
             }
         }
-        for s in self.staging_live.drain(..) {
+        for s in self.entry.staging_live.drain(..) {
             release_buffer_slot(device, &mut self.slabs, s);
         }
         for list in self.gather_free.values_mut() {
@@ -82,7 +82,7 @@ impl ResourcePools {
                 release_buffer_slot(device, &mut self.slabs, s);
             }
         }
-        for s in self.gather_live.drain(..) {
+        for s in self.entry.gather_live.drain(..) {
             release_buffer_slot(device, &mut self.slabs, s);
         }
         for list in self.readback_free.values_mut() {
@@ -90,10 +90,10 @@ impl ResourcePools {
                 release_buffer_slot(device, &mut self.slabs, s);
             }
         }
-        if let Some(s) = self.readback_live.take() {
+        if let Some(s) = self.entry.readback_live.take() {
             release_buffer_slot(device, &mut self.slabs, s);
         }
-        for s in self.readback_multi_live.drain(..) {
+        for s in self.entry.readback_multi_live.drain(..) {
             release_buffer_slot(device, &mut self.slabs, s);
         }
         // Leased slots are the one class here whose memory a live borrow may
@@ -148,11 +148,11 @@ impl ResourcePools {
             device.destroy_image_view(img.view, None);
             device.destroy_image(img.image, None);
         }
-        for s in self.sampled_live.drain(..) {
+        for s in self.entry.sampled_live.drain(..) {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
-        for s in self.attachment_snapshot_live.drain(..) {
+        for s in self.entry.attachment_snapshot_live.drain(..) {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
@@ -170,7 +170,7 @@ impl ResourcePools {
             device.destroy_image(s.image, None);
             device.free_memory(s.memory, None);
         }
-        for s in self.storage_image_live.drain(..) {
+        for s in self.entry.storage_image_live.drain(..) {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
             device.free_memory(s.memory, None);
@@ -231,7 +231,7 @@ impl ResourcePools {
         // before the arena because its sets were allocated against this layout.
         // Freed before the arena that owns their blocks. Anything still here was
         // never submitted, or its fence has already retired above.
-        let mut owed = std::mem::take(&mut self.scatter_dsets);
+        let mut owed = std::mem::take(&mut self.entry.scatter_dsets);
         // The recycle list holds only sets from entries whose fence retired,
         // which is the same "nothing can still name it" state this relies on.
         owed.append(&mut self.scatter_dset_free);
