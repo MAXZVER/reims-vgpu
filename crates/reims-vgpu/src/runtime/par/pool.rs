@@ -215,6 +215,13 @@ struct Shared {
     /// one between batches, sees the new epoch without a `notify_one` (~1.2 us
     /// each on Windows, the bulk of a fork's cost).
     parked: AtomicUsize,
+    /// TEMP (lab, PREWAKE): the drain is inside a stream that will fork
+    /// regions; idle helpers spin (bounded) instead of parking. See
+    /// [`Pool::prewake`].
+    hot: AtomicBool,
+    /// TEMP (lab, PREWAKE): parked helpers still to be woken by the helpers a
+    /// prewake already woke (each wakes up to two: a tree, not a chain).
+    chain: AtomicUsize,
     batch_seq: AtomicU64,
     attached: AtomicUsize,
     detached: AtomicUsize,
@@ -275,6 +282,8 @@ impl Pool {
                 }),
                 wake: Condvar::new(),
                 epoch: AtomicU64::new(0),
+                hot: AtomicBool::new(false),
+                chain: AtomicUsize::new(0),
                 executor: Mutex::new(FixedExecutor::with_population(population)),
                 parked: AtomicUsize::new(0),
                 batch_seq: AtomicU64::new(0),
@@ -661,6 +670,54 @@ impl Pool {
         out
     }
 
+    /// TEMP (lab, PREWAKE, live `PREWAKE=us`, default off; 300 was the arm
+    /// measured): the drain
+    /// is about to run a stream whose regions fork on this pool. b172 (Weather,
+    /// 1.14k regions a second of ~42 records): a region's fork cost 8.5 us
+    /// (six `notify_one`, ~1.2 us each on Windows) and the drain then waited
+    /// 25.7 us for the first preparations while it prepared none itself -
+    /// helpers park between regions (b176: helper 0 parked 97 % of the time),
+    /// so every region paid their wake latency after its build and prime.
+    ///
+    /// Here the drain wakes one parked helper, that helper wakes two more and
+    /// so on (`chain`), and until [`Pool::cool`] an idle helper spins on the
+    /// batch epoch for up to the live bound before it parks - so draw 0's
+    /// encode, the region's build and its prime hide the wake, and the fork
+    /// finds no one parked (no `notify_one` on the drain). The stream stays
+    /// hot until the returned guard drops; `None` when nothing was armed.
+    ///
+    /// b177 (Weather, live A/B in one boot): the region's fork 8.8 -> 0.95 ms
+    /// a second and its wait -0.13 us a record, but the drain's total equal
+    /// (work mode 6.0-6.2 against 6.0 us a draw, s5 equal) and the helpers'
+    /// job 7.4 -> 8.0 us - the spinning siblings slow the work, and what the
+    /// region still waits for is the helpers' throughput, not their wake.
+    pub fn prewake(&self) -> Option<Hot> {
+        if cfg!(test) || prewake_spin().is_zero() || !self.ensure_started() {
+            return None;
+        }
+        let sh = &*self.shared;
+        sh.hot.store(true, Ordering::Release);
+        let hot = Hot(Arc::clone(&self.shared));
+        let parked = sh.parked.load(Ordering::Acquire);
+        if parked == 0 {
+            return Some(hot);
+        }
+        {
+            let mut hand_off = sh.hand_off.lock();
+            // A frame (FRAME_GATE) owns the epoch while it is open.
+            if hand_off.frame.is_some() || hand_off.stopping {
+                return Some(hot);
+            }
+            hand_off.epoch += 1;
+            hand_off.batch = None;
+            sh.epoch.store(hand_off.epoch, Ordering::Release);
+        }
+        sh.chain.store(parked.saturating_sub(1), Ordering::Release);
+        sh.wake.notify_one();
+        crate::runtime::drain::note_store_route("par_prewakes");
+        Some(hot)
+    }
+
     /// Start the helper threads on first use. `false` when they cannot run:
     /// the pool was stopped, or a thread failed to spawn.
     fn ensure_started(&self) -> bool {
@@ -767,6 +824,27 @@ impl Drop for Pool {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// TEMP (lab, PREWAKE): a hot stream; dropping it lets idle helpers park
+/// again. See [`Pool::prewake`].
+pub struct Hot(Arc<Shared>);
+
+impl Drop for Hot {
+    fn drop(&mut self) {
+        self.0.hot.store(false, Ordering::Release);
+    }
+}
+
+/// TEMP (lab, live `PREWAKE=us`): how long an idle helper spins while the
+/// drain's stream is hot (see [`Pool::prewake`]); zero turns prewake off.
+fn prewake_spin() -> Duration {
+    if cfg!(test) {
+        return Duration::ZERO;
+    }
+    crate::runtime::lab_live::value("PREWAKE")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(Duration::ZERO, |us| Duration::from_micros(us.min(5_000)))
 }
 
 /// TEMP (lab, live `PAR_WAKE=N`, else `REIMS_VGPU_LAB_PAR_WAKE=N`; unset: no
@@ -1075,6 +1153,10 @@ impl Drop for ItemDone<'_> {
 fn worker_main(shared: &Arc<Shared>, index: usize) {
     crate::lab_cores::device_thread_priority("par-pool");
     crate::lab_cores::pin_pool_to_performance_cores("par-pool");
+    #[cfg(windows)]
+    if index == 0 {
+        crate::qemu::lab_sampler::start_helper_once(); // TEMP (lab)
+    }
     let attachment = shared.registrar.attach();
     shared.attached.fetch_add(1, Ordering::AcqRel);
     let member = WorkerId(index as u16);
@@ -1091,6 +1173,21 @@ fn worker_main(shared: &Arc<Shared>, index: usize) {
     let mut seen = 0u64;
     while let Some((epoch, batch, frame)) = next_batch(shared, seen) {
         seen = epoch;
+        // TEMP (lab, PREWAKE): an epoch with nothing in it is a prewake; pass
+        // the wake on (up to two more) and go back to spinning for the batch.
+        if batch.is_none() && frame.is_none() {
+            for _ in 0..2 {
+                let took = shared
+                    .chain
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                    .is_ok();
+                if !took || shared.parked.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                shared.wake.notify_one();
+            }
+            continue;
+        }
         if let Some(batch) = batch {
             participate(shared, member, &batch, &env);
         }
@@ -1123,10 +1220,20 @@ fn next_batch(
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(shared.worker_spin, Duration::from_micros)
     };
+    // TEMP (lab, PREWAKE): while the drain's stream is hot, the longer spin.
+    let worker_spin = if shared.hot.load(Ordering::Acquire) {
+        worker_spin.max(prewake_spin())
+    } else {
+        worker_spin
+    };
     if !worker_spin.is_zero() {
         let spin_until = Instant::now() + worker_spin;
         while shared.epoch.load(Ordering::Acquire) == seen && Instant::now() < spin_until {
             std::hint::spin_loop();
+            // A stream that ended stops the spin early.
+            if !shared.hot.load(Ordering::Relaxed) && worker_spin > shared.worker_spin {
+                break;
+            }
         }
     }
     let mut hand_off = shared.hand_off.lock();

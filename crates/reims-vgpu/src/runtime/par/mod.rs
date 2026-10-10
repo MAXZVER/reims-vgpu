@@ -74,7 +74,7 @@ pub(crate) mod staging;
 mod tests;
 
 pub use gate::{FrameLock, Gate};
-pub use pool::{FrameHandle, JobPanic, Overlap, Pool, PoolStats, Scoped, Ticket, WorkerEnv};
+pub use pool::{FrameHandle, Hot, JobPanic, Overlap, Pool, PoolStats, Scoped, Ticket, WorkerEnv};
 pub(crate) use pool::push_followup;
 
 use std::cell::Cell;

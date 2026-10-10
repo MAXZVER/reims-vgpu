@@ -134,6 +134,15 @@ pub(crate) fn start_recorder_once() {
     ONCE.call_once(|| start_for_current_thread("REIMS_VGPU_LAB_SAMPLER_REC"));
 }
 
+/// TEMP (lab): called on the parallel pool's first helper;
+/// `REIMS_VGPU_LAB_SAMPLER_PAR=<out file>` samples that thread the same way
+/// (gate and rate are shared). Idle samples (parked, spinning) are part of the
+/// stream; filter on `prepare_job` offline.
+pub(crate) fn start_helper_once() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| start_for_current_thread("REIMS_VGPU_LAB_SAMPLER_PAR"));
+}
+
 fn start_for_current_thread(var: &str) {
     {
         let Ok(out) = std::env::var(var) else {

@@ -6077,6 +6077,18 @@ fn finish_stream_g<M: HostMemory + HostOps>(
             None;
         #[cfg(feature = "backend-vulkan")]
         let mut ov_skip_until = 0usize;
+        // TEMP (lab, PREWAKE): wake the pool's helpers now, so draw 0's encode
+        // and the first region's build and prime hide their wake latency, and
+        // keep them spinning between this stream's regions (`Pool::prewake`).
+        #[cfg(feature = "backend-vulkan")]
+        let _prewake = if draw_par_overlap
+            && ahead.is_none()
+            && ov_end > crate::runtime::draw::vulkan::draw_par::MIN_DRAWS
+        {
+            state.par().and_then(crate::runtime::par::Pool::prewake)
+        } else {
+            None
+        };
         for (di, pd) in draw_list.iter().enumerate() {
             // TEMP (lab, DRAW_PAR v9): records a region committed.
             #[cfg(feature = "backend-vulkan")]
