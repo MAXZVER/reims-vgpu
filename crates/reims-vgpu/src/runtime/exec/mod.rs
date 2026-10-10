@@ -6149,6 +6149,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                             }
                             let draw_started = crate::lab_clock::LabInstant::now();
                             fin.enter(crate::runtime::drain::FinishPhase::Encode);
+                            let step_timed = crate::lab_clock::timers_on();
                             match crate::runtime::draw::vulkan::draw_par::commit_shared(
                                 st, &*h, req, prepared, owed,
                             ) {
@@ -6165,6 +6166,12 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                                     );
                                     out.metal_draws_ok += 1;
                                     resident_chain = true;
+                                    if step_timed {
+                                        crate::runtime::drain::note_store_route_n(
+                                            "commit_ns_step",
+                                            draw_started.elapsed().as_nanos() as u64,
+                                        );
+                                    }
                                     RegionStep::Committed
                                 }
                                 SharedCommit::Exclusive(p) => RegionStep::Stop(Some(p)),

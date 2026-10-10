@@ -1343,6 +1343,26 @@ impl RegionOwed {
     }
 }
 
+/// TEMP (lab, TIMERS): where a shared commit's time goes, by stage, as
+/// `commit_ns_*` store-route counts (nanoseconds; laps on the TSC clock).
+/// Off with the census phase timers.
+struct CommitLaps(Option<crate::lab_clock::LabInstant>);
+
+impl CommitLaps {
+    fn start() -> Self {
+        CommitLaps(crate::lab_clock::timers_on().then(crate::lab_clock::LabInstant::now))
+    }
+
+    #[inline]
+    fn lap(&mut self, name: &'static str) {
+        if let Some(last) = self.0.as_mut() {
+            let now = crate::lab_clock::LabInstant::now();
+            crate::runtime::drain::note_store_route_n(name, now.duration_since(*last).as_nanos() as u64);
+            *last = now;
+        }
+    }
+}
+
 /// The outcome of one shared-state commit.
 pub(crate) enum SharedCommit {
     /// Submitted to the recorder.
@@ -1377,6 +1397,7 @@ pub(crate) fn commit_shared<M: HostMemory + HostOps>(
     {
         return SharedCommit::Exclusive(prepared);
     }
+    let mut laps = CommitLaps::start();
     let PreparedDraw { mut log, task_id } = prepared;
     let Some(done) = log.done.take() else {
         return SharedCommit::Invalid(Bail::NotDeferrable);
@@ -1387,6 +1408,7 @@ pub(crate) fn commit_shared<M: HostMemory + HostOps>(
     {
         return SharedCommit::Invalid(Bail::ChainMoved);
     }
+    laps.lap("commit_ns_identity");
     if !log
         .secondaries
         .iter()
@@ -1394,6 +1416,7 @@ pub(crate) fn commit_shared<M: HostMemory + HostOps>(
     {
         return SharedCommit::Invalid(Bail::PlanInvalid);
     }
+    laps.lap("commit_ns_witness");
     let first_hold = owed.holds.len();
     for b in &log.buffers {
         match buffer_plan::commit_prepared_buffer_shared(
@@ -1413,6 +1436,7 @@ pub(crate) fn commit_shared<M: HostMemory + HostOps>(
             }
         }
     }
+    laps.lap("commit_ns_buffers");
     for s in &log.samples {
         if sample_plan::validate_sampled_plan(
             state,
@@ -1430,16 +1454,19 @@ pub(crate) fn commit_shared<M: HostMemory + HostOps>(
         }
         let _ = sample_plan::take_sampled_plan(state, &s.plan, true);
     }
+    laps.lap("commit_ns_samples");
     owed.linear.append(&mut log.linear);
     for n in &log.notes {
         note_sampled_ref_backing(state, task_id, n.texture_ref, n.rw, n.rh, n.mid, n.route);
         crate::runtime::scanout::note_sampled_surface_field(state, host, n.mid, n.texture_ref, n.route);
     }
+    laps.lap("commit_ns_notes");
     let PreparedRequest { resources, meta, chain_identity, kind: _ } = done;
     let mut resources = resources.into_inner();
     pass_stage::arm_seed_stage(&mut resources);
     crate::backend::vulkan::engine::submit_deferred_draw(state, resources, meta);
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
+    laps.lap("commit_ns_submit");
     owed.rest.push((log, chain_identity));
     SharedCommit::Committed
 }
