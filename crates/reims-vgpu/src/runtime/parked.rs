@@ -105,14 +105,14 @@ impl ParkedWork {
         domain: u32,
         epoch: DeviceEpoch,
         packet: Packet,
-        submission: ExecSubmission,
+        submission: impl Into<std::sync::Arc<ExecSubmission>>,
         resolved: ExecWork,
     ) -> Self {
         Self {
             domain,
             epoch,
             packet,
-            submission: Some(std::sync::Arc::new(submission)),
+            submission: Some(submission.into()),
             resolved: Some(resolved),
         }
     }

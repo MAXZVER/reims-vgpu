@@ -110,7 +110,7 @@ impl Drop for TestModeGuard {
 /// they do not: `load_action` is absent because records 2+ force LOAD while
 /// the identities never consult it, and the seeds are absent because they are
 /// per-record content, not per-pass identity.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct PassTargetKey {
     pub mapping_id: u32,
     pub texture_ref: u32,
@@ -123,7 +123,7 @@ pub(crate) struct PassTargetKey {
 }
 
 impl PassTargetKey {
-    fn of(req: &DrawEncodeRequest) -> Self {
+    pub(crate) fn of(req: &DrawEncodeRequest) -> Self {
         let c0 = req.colors.first();
         Self {
             mapping_id: c0.map_or(0, |c| c.mapping_id),
@@ -221,6 +221,41 @@ impl PassInvariants {
 /// post-revalidation incarnation, exactly the one the serial sites below the
 /// backing call read. `guest_backing` is the value already resolved for this
 /// draw; the identities are read here, once, for the pass.
+/// TEMP (lab, FRAME_GATE + AHEAD): the invariants a pass recorded, by its
+/// target, for the next stream that renders into the same target to start its
+/// ahead preparation from (a commit then compares them with its own draw 0's).
+static CACHE: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<PassTargetKey, PassInvariants>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// TEMP (lab, FRAME_GATE + AHEAD): remember a pass's invariants.
+pub(crate) fn cache_put(inv: &PassInvariants) {
+    let mut c = CACHE.lock();
+    if c.len() >= 1024 && !c.contains_key(&inv.key) {
+        c.clear();
+    }
+    c.insert(inv.key.clone(), inv.clone());
+}
+
+/// TEMP (lab, FRAME_GATE + AHEAD): the invariants last recorded for `req`'s
+/// target.
+pub(crate) fn cache_for(req: &DrawEncodeRequest) -> Option<PassInvariants> {
+    CACHE.lock().get(&PassTargetKey::of(req)).cloned()
+}
+
+/// TEMP (lab, FRAME_GATE + AHEAD): whether two recordings of one target's
+/// invariants agree on every fact a prepared record reused.
+pub(crate) fn same_facts(a: &PassInvariants, b: &PassInvariants) -> bool {
+    a.key == b.key
+        && a.gva_alloc_gen == b.gva_alloc_gen
+        && a.chain_identity == b.chain_identity
+        && a.render_identity == b.render_identity
+        && match (&a.guest_backing, &b.guest_backing) {
+            (None, None) => true,
+            (Some(x), Some(y)) => x.backing == y.backing && std::sync::Arc::ptr_eq(&x.import, &y.import),
+            _ => false,
+        }
+}
+
 pub(super) fn record_from_commit(
     state: &DeviceState,
     req: &DrawEncodeRequest,

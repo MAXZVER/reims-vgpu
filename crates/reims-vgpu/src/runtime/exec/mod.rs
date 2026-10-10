@@ -819,6 +819,10 @@ pub struct ExecSubmission {
     /// TEMP (lab, FRAME_GATE): its execution began, so a walk still queued
     /// for it is no longer wanted.
     pub(crate) lab_exec_started: std::sync::atomic::AtomicBool,
+    /// TEMP (lab, FRAME_GATE + AHEAD): per stream, its records `1..` prepared
+    /// by the helper that walked it.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) lab_ahead: std::sync::Mutex<Vec<Option<crate::runtime::draw::vulkan::draw_par::AheadDraws>>>,
 }
 
 impl ExecSubmission {
@@ -859,6 +863,28 @@ impl ExecSubmission {
             })
             .collect();
         *self.lab_walks.lock().unwrap_or_else(|e| e.into_inner()) = walks;
+    }
+
+    /// TEMP (lab, FRAME_GATE + AHEAD): prepare each walked stream's records
+    /// `1..` on this helper (see `draw_par::prepare_ahead`); live `AHEAD_DRAWS`
+    /// (default on with FRAME_GATE).
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn lab_prepare_ahead(&self, st: &DeviceState, env: &crate::runtime::par::WorkerEnv<'_>) {
+        if crate::runtime::lab_live::on("AHEAD_DRAWS") == Some(false) {
+            return;
+        }
+        let walks = self.lab_walks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::with_capacity(walks.len());
+        for walk in walks.iter() {
+            if crate::runtime::par::gate::job_should_stop()
+                || self.lab_exec_started.load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            out.push(walk.as_ref().and_then(|w| ahead_draws(st, env, self.task_id, w.accum())));
+        }
+        drop(walks);
+        *self.lab_ahead.lock().unwrap_or_else(|e| e.into_inner()) = out;
     }
 
     /// TEMP (lab, FRAME_GATE): [`Self::lab_walk_ahead`] as a frame job: stops
@@ -903,6 +929,8 @@ impl ExecSubmission {
             streams,
             lab_walks: std::sync::Mutex::new(Vec::new()),
             lab_exec_started: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "backend-vulkan")]
+            lab_ahead: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1000,6 +1028,8 @@ fn read_submission<M: HostMemory + HostOps>(
         streams,
         lab_walks: std::sync::Mutex::new(Vec::new()),
             lab_exec_started: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "backend-vulkan")]
+            lab_ahead: std::sync::Mutex::new(Vec::new()),
     })
 }
 
@@ -1119,9 +1149,13 @@ fn execute_submission_g<M: HostMemory + HostOps>(
         streams,
         lab_walks,
         lab_exec_started,
+        #[cfg(feature = "backend-vulkan")]
+        lab_ahead,
     } = submission;
     lab_exec_started.store(true, std::sync::atomic::Ordering::Release);
     let mut lab_walks = std::mem::take(&mut *lab_walks.lock().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(feature = "backend-vulkan")]
+    let mut lab_ahead = std::mem::take(&mut *lab_ahead.lock().unwrap_or_else(|e| e.into_inner()));
     let task_id = *task_id;
 
     // Before any of this submission's work runs. Each record states what was
@@ -1173,6 +1207,10 @@ fn execute_submission_g<M: HostMemory + HostOps>(
             },
             other => (other, None),
         };
+        // TEMP (lab, FRAME_GATE + AHEAD): the records prepared ahead belong to
+        // the walk they were built from; only a taken walk keeps them.
+        #[cfg(feature = "backend-vulkan")]
+        let ahead = lab_ahead.get_mut(si).and_then(Option::take).filter(|_| taken.is_some());
         let state = g.st();
         let mut acc = match (spec, taken) {
             (_, Some(acc)) => acc,
@@ -1197,6 +1235,7 @@ fn execute_submission_g<M: HostMemory + HostOps>(
                 }
             },
             None => {
+                crate::runtime::par::ahead::note_all();
                 let mut acc = StreamAccum::default();
                 walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut());
                 acc
@@ -1208,7 +1247,15 @@ fn execute_submission_g<M: HostMemory + HostOps>(
         *measured_ns += walk_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
         let finish_started = crate::lab_clock::LabInstant::now();
-        finish_stream_g(g, host, task_id, out, &acc);
+        finish_stream_g(
+            g,
+            host,
+            task_id,
+            out,
+            &acc,
+            #[cfg(feature = "backend-vulkan")]
+            ahead,
+        );
         let state = g.st();
         let finish_ns = finish_started.elapsed().as_nanos() as u64;
         *measured_ns += finish_ns;
@@ -5537,7 +5584,15 @@ fn finish_stream<M: HostMemory + HostOps>(
 ) {
     let lock = crate::runtime::par::FrameLock::new(state);
     let mut g = crate::runtime::par::Gate::new(&lock, None);
-    finish_stream_g(&mut g, host, task_id, out, acc);
+    finish_stream_g(
+        &mut g,
+        host,
+        task_id,
+        out,
+        acc,
+        #[cfg(feature = "backend-vulkan")]
+        None,
+    );
 }
 
 /// [`finish_stream`] on the drain's gate (TEMP lab, FRAME_GATE): exclusive,
@@ -5549,6 +5604,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
     task_id: u32,
     out: &mut ExecResult,
     acc: &StreamAccum,
+    #[cfg(feature = "backend-vulkan")] mut ahead: Option<crate::runtime::draw::vulkan::draw_par::AheadDraws>,
 ) {
     let mut state = g.st();
     let draws_at_entry = (out.metal_draws_ok, out.metal_draws_fail);
@@ -5595,6 +5651,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
             }
         }
         for att in acc.clears_reaching_guest_pages() {
+            crate::runtime::par::ahead::note_all();
             if apply_clear(state, host, task_id, att) {
                 out.clears_applied += 1;
             }
@@ -5955,7 +6012,8 @@ fn finish_stream_g<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         let draw_par_active = crate::backend::selected().rail() == crate::backend::Rail::Vulkan
             && crate::runtime::draw::vulkan::draw_par::draw_par_on()
-            && draw_list.len() > crate::runtime::draw::vulkan::draw_par::MIN_DRAWS;
+            && (draw_list.len() > crate::runtime::draw::vulkan::draw_par::MIN_DRAWS
+                || ahead.is_some());
         #[cfg(feature = "backend-vulkan")]
         let draw_par_chunk = crate::runtime::draw::vulkan::draw_par::chunk();
         #[cfg(feature = "backend-vulkan")]
@@ -6022,7 +6080,13 @@ fn finish_stream_g<M: HostMemory + HostOps>(
             // TEMP (lab, DRAW_PAR v9): an overlap region from this record.
             #[cfg(feature = "backend-vulkan")]
             if draw_par_overlap && di >= 1 && di >= ov_next && di < ov_end && resident_chain {
-                if ov_reqs.is_empty() && ov_end - di >= crate::runtime::draw::vulkan::draw_par::MIN_DRAWS {
+                // TEMP (lab, FRAME_GATE + AHEAD): prepared ahead, any length.
+                let min_draws = if ahead.is_some() {
+                    1
+                } else {
+                    crate::runtime::draw::vulkan::draw_par::MIN_DRAWS
+                };
+                if ov_reqs.is_empty() && ov_end - di >= min_draws {
                     if let Some(template) = attachment_template.as_ref() {
                         ov_base = di;
                         ov_reqs = std::sync::Arc::new((di..ov_end)
@@ -6040,11 +6104,25 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                                 (r, do_writeback)
                             })
                             .collect());
-                        crate::runtime::draw::vulkan::draw_par::prime_stream(state, host, &ov_reqs[..]);
+                        // The helper that prepared it ahead resolved its sources.
+                        if ahead.is_none() {
+                            crate::runtime::draw::vulkan::draw_par::prime_stream(state, host, &ov_reqs[..]);
+                        }
                     }
                 }
                 if !ov_reqs.is_empty() && di >= ov_base {
-                    let carried = std::mem::take(&mut ov_carried);
+                    let mut carried = std::mem::take(&mut ov_carried);
+                    // TEMP (lab, FRAME_GATE + AHEAD): the first region starts
+                    // from the records a helper prepared ahead, where they hold.
+                    if carried.is_empty() && di == ov_base {
+                        carried = crate::runtime::draw::vulkan::draw_par::ahead_carried(
+                            &mut ahead,
+                            attachment_template.as_ref().unwrap_or_else(|| unreachable!()),
+                            attachment_template.as_ref().and_then(|t| t.pass_invariants.as_ref()),
+                            di,
+                            ov_end,
+                        );
+                    }
                     let stop = crate::runtime::draw::vulkan::draw_par::run_region_g(
                         g,
                         host,
@@ -6224,6 +6302,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                 let (do_writeback, force_full_store) = multi_draw_store_plan(draw_list.len(), di);
                 if do_writeback {
                     out.render_guest_stores = out.render_guest_stores.saturating_add(1);
+                    note_store_windows(state, &req);
                 }
                 let draw_started = std::time::Instant::now();
                 fin.enter(crate::runtime::drain::FinishPhase::Encode);
@@ -6266,6 +6345,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                 // does — and inert for every record but the first.
                 #[cfg(feature = "backend-vulkan")]
                 if di == 0 {
+                    crate::runtime::draw::vulkan::draw_par::remember_pass_invariants(&req);
                     if let (Some(template), Some(inv)) =
                         (attachment_template.as_mut(), req.pass_invariants.take())
                     {
@@ -6448,6 +6528,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
         let stream_draws = stream_draw_delta(out, draws_at_entry);
         if stream_draws.ok == 0 && !acc.clears.is_empty() {
             for att in acc.clears_reaching_guest_pages() {
+                crate::runtime::par::ahead::note_all();
                 if apply_clear(state, host, task_id, att) {
                     out.clears_applied = out.clears_applied.saturating_add(1);
                 }
@@ -6606,6 +6687,90 @@ impl crate::observe::Decline for ChainAbandonDecline {
 /// Position one draw in the decoded Metal render encoder that owns it.
 /// A one-draw encoder has neither edge; longer encoders expose exactly one
 /// start, one end, and a continuation on both sides of every middle draw.
+/// TEMP (lab, FRAME_GATE + AHEAD): a stream's records `1..` prepared on a
+/// frame helper from its spec walk: the requests the drain's region builds
+/// (`finish_stream`, DRAW_PAR v9 overlap), from a first request resolved
+/// read-only and a template carrying the target's last recorded invariants.
+#[cfg(feature = "backend-vulkan")]
+fn ahead_draws(
+    st: &DeviceState,
+    env: &crate::runtime::par::WorkerEnv<'_>,
+    task_id: u32,
+    acc: &StreamAccum,
+) -> Option<crate::runtime::draw::vulkan::draw_par::AheadDraws> {
+    use crate::runtime::draw::vulkan::draw_par;
+    if !acc.saw_draw || acc.color_slots.is_empty() || !acc.execute_icb.is_empty() {
+        return None;
+    }
+    let draw_list: Vec<&PendingDraw> = acc
+        .draws
+        .iter()
+        .filter(|pd| pd.pipeline_ref != 0 && pd.draw.vertex_count > 0)
+        .collect();
+    let ov_end = if draw_par::last_on() {
+        draw_list.len()
+    } else {
+        draw_list.len().saturating_sub(1)
+    };
+    if ov_end < 2 || !draw_par::draw_par_on() || !draw_par::overlap_on() {
+        return None;
+    }
+    let first = draw_list[0];
+    let mut host = env.host();
+    let mut spec = walk_ahead::SpecWalk::reader(st);
+    let first_req = draw::mrt_draw_request_with(
+        &mut spec,
+        &mut host,
+        task_id,
+        first.pipeline_ref,
+        &acc.color_slots,
+        &acc.clears,
+        first.draw,
+    );
+    if let Some(why) = spec.aborted() {
+        crate::runtime::drain::note_store_route(why);
+        return None;
+    }
+    let first_req = first_req?;
+    let mut template = render_pass_attachment_template(&first_req);
+    if !draw_par::seed_pass_invariants(&mut template) {
+        crate::runtime::drain::note_store_route("ahead_draws_no_invariants");
+        return None;
+    }
+    let reqs: Vec<(draw::DrawEncodeRequest, bool)> = (1..ov_end)
+        .map(|j| {
+            let pd = draw_list[j];
+            let mut r = retarget_render_pass_draw(&template, pd);
+            fill_draw_binds_from_pending(&mut r, pd);
+            (r.continues_render_pass, r.render_pass_continues) =
+                render_pass_chain_position(j, draw_list.len());
+            for c in &mut r.colors {
+                c.load_action = MTL_LOAD_ACTION_LOAD;
+            }
+            r.chain_from_resident = true;
+            let (do_writeback, _) = multi_draw_store_plan(draw_list.len(), j);
+            (r, do_writeback)
+        })
+        .collect();
+    draw_par::prepare_ahead(st, env, &template, &reqs)
+}
+
+/// TEMP (lab, FRAME_GATE + AHEAD): the guest windows a record's Store is
+/// about to write (GVA targets; surfaces are witnessed by their epochs), for
+/// the write-note log draws prepared ahead are checked against.
+fn note_store_windows(state: &DeviceState, req: &draw::DrawEncodeRequest) {
+    let Some(space) = state.tasks.get(req.task_id).map(|t| t.directory_pfn) else {
+        crate::runtime::par::ahead::note_all();
+        return;
+    };
+    for c in &req.colors {
+        if c.mapping_id == 0 && c.target_gva != 0 {
+            let span = u64::from(c.row_stride.max(c.width.saturating_mul(4))) * u64::from(c.height);
+            crate::runtime::par::ahead::note_gva(space, c.target_gva, span);
+        }
+    }
+}
+
 fn render_pass_chain_position(index: usize, len: usize) -> (bool, bool) {
     debug_assert!(index < len);
     (index > 0, index + 1 < len)

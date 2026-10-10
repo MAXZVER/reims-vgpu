@@ -1456,8 +1456,43 @@ impl Drop for FrameHandle {
     }
 }
 
+thread_local! {
+    /// The frame this helper serves, for jobs that queue a follow-up.
+    static CURRENT_FRAME: std::cell::RefCell<Option<Arc<FrameShared>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// TEMP (lab, FRAME_GATE): queue `f` on the frame the calling helper serves,
+/// behind what is queued (nobody waits for it). `false` outside a frame job
+/// or when the frame is closing: the caller does the work itself.
+pub(crate) fn push_followup(f: Box<dyn FnOnce(&crate::model::DeviceState, &WorkerEnv<'_>) + Send>) -> bool {
+    CURRENT_FRAME.with(|c| {
+        let c = c.borrow();
+        let Some(fr) = c.as_ref() else {
+            return false;
+        };
+        if fr.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        let ticket: Ticket<()> = Ticket::new(Box::new(move |st, env| f(st, env)));
+        fr.queue.lock().push_back(ticket.erased());
+        fr.queued.fetch_add(1, Ordering::AcqRel);
+        crate::runtime::drain::note_store_route("frame_followups");
+        true
+    })
+}
+
 /// A helper serving a frame until it closes.
-fn serve_frame(fr: &FrameShared, env: &WorkerEnv<'_>) {
+fn serve_frame(frame: &Arc<FrameShared>, env: &WorkerEnv<'_>) {
+    struct Current;
+    impl Drop for Current {
+        fn drop(&mut self) {
+            CURRENT_FRAME.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    CURRENT_FRAME.with(|c| *c.borrow_mut() = Some(Arc::clone(frame)));
+    let _current = Current;
+    let fr: &FrameShared = frame;
     struct Out<'a>(&'a AtomicUsize);
     impl Drop for Out<'_> {
         fn drop(&mut self) {

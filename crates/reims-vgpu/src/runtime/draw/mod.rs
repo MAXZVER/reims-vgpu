@@ -2719,6 +2719,20 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     clears: &[crate::runtime::render_pass::ColorAttachment],
     draw: crate::protocol::draw::DrawArgs,
 ) -> Option<DrawEncodeRequest> {
+    mrt_draw_request_with(state, host, task_id, pipeline_ref, color_slots, clears, draw)
+}
+
+/// [`mrt_draw_request`] over a walk state (TEMP lab, FRAME_GATE: a spec
+/// request ahead of execution answers only warm targets).
+pub fn mrt_draw_request_with<M: HostMemory + HostOps, S: crate::runtime::exec::walk_ahead::WalkState>(
+    state: &mut S,
+    host: &mut M,
+    task_id: u32,
+    pipeline_ref: u32,
+    color_slots: &[(u32, crate::runtime::render_pass::ColorAttachment)],
+    clears: &[crate::runtime::render_pass::ColorAttachment],
+    draw: crate::protocol::draw::DrawArgs,
+) -> Option<DrawEncodeRequest> {
     if color_slots.is_empty() {
         return None;
     }
@@ -2728,7 +2742,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     // must match its raster sample count. Resolve that before LOAD/CLEAR seed
     // policy and before this request is cloned by either encoder.
     let pipeline_sample_count =
-        crate::backend::selected().pipeline_raster_sample_count(state, host, task_id, pipeline_ref);
+        crate::backend::selected().pipeline_raster_sample_count(state.shared(), host, task_id, pipeline_ref);
     let mut colors = Vec::new();
     let mut base_w = 0u32;
     let mut base_h = 0u32;
@@ -2892,6 +2906,15 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 seed = Some(solid_rgba8(mw, mh, &att.clear_color));
             }
         } else if att.load_action == MTL_LOAD_ACTION_LOAD && mapping_id == 0 {
+            // TEMP (lab, FRAME_GATE): the GVA Load seed is the drain's (a
+            // guest read now and the surface cache); a spec request gives up.
+            if state.exclusive_state().is_none() {
+                state.spec_abort("rt_gva_load");
+                return None;
+            }
+            let Some(state) = state.exclusive_state() else {
+                return None;
+            };
             // # This arm compares an ordinal, and the contract term is wider
             //
             // `MTLLoadActionDontCare` also promises the prior contents --

@@ -2069,7 +2069,7 @@ fn publish_word<H: HostMemory + HostOps>(
 ///   `crate::runtime::objects::repointed_storage`: an earlier answer is the old
 ///   one, so the incarnation move is arrival work by construction.
 struct Arrived {
-    submission: Option<crate::runtime::exec::ExecSubmission>,
+    submission: Option<std::sync::Arc<crate::runtime::exec::ExecSubmission>>,
     /// The exec result the reading produced, carrying whatever it refused.
     exec: crate::runtime::exec::ExecResult,
     repointed: Result<
@@ -2091,7 +2091,7 @@ fn arrival_work_g<H: HostMemory + HostOps>(
         let (submission, exec) =
             crate::runtime::exec::read_exec_submission(g.sh(), host, &packet.payload);
         return Arrived {
-            submission,
+            submission: submission.map(std::sync::Arc::new),
             exec,
             repointed: Err(crate::runtime::objects::RepointStorageRefusal::Unnamed),
         };
@@ -2118,7 +2118,7 @@ fn arrival_work<H: HostMemory + HostOps>(
             let (submission, exec) =
                 crate::runtime::exec::read_exec_submission(state, host, &packet.payload);
             arrived.exec = exec;
-            arrived.submission = submission;
+            arrived.submission = submission.map(std::sync::Arc::new);
         }
         CHILD_OP_REPLACE_PHYSICAL => {
             arrived.repointed = repoint_at_arrival(state, host, &packet.payload);
@@ -2422,7 +2422,7 @@ fn lab_exec_write_tokens(
 /// TEMP (lab, INGRESS_AHEAD / LOOKAHEAD): one EXEC packet's arrival read and
 /// model packet, built by a pool helper before its admission.
 pub(crate) struct AheadParse {
-    submission: crate::runtime::exec::ExecSubmission,
+    submission: std::sync::Arc<crate::runtime::exec::ExecSubmission>,
     built: reims_vgpu_core::session::Packet,
     session: reims_vgpu_core::identity::SessionGeneration,
     /// LOOKAHEAD: every `(task, ref, name)` the build read; empty for the
@@ -2545,7 +2545,21 @@ pub(crate) fn lookahead_job(
             return None;
         }
     };
-    submission.lab_walk_ahead(st, &host, &LOOKAHEAD_CLOSING);
+    // TEMP (lab, FRAME_GATE): the build goes back at once; the walk and the
+    // records' preparation follow as a job of their own, so an admission that
+    // waits for this build waits for the build only.
+    let submission = std::sync::Arc::new(submission);
+    let follow = std::sync::Arc::clone(&submission);
+    let pushed = crate::runtime::par::push_followup(Box::new(move |st, env| {
+        follow.lab_walk_ahead_gate(st, &env.host());
+        #[cfg(feature = "backend-vulkan")]
+        follow.lab_prepare_ahead(st, env);
+    }));
+    if !pushed {
+        submission.lab_walk_ahead(st, &host, &LOOKAHEAD_CLOSING);
+        #[cfg(feature = "backend-vulkan")]
+        submission.lab_prepare_ahead(st, env);
+    }
     Some(AheadParse {
         submission,
         built,
@@ -2994,7 +3008,7 @@ fn ingress_ahead(
         );
         match built {
             Some(Ok(built)) => Some(AheadParse {
-                submission,
+                submission: std::sync::Arc::new(submission),
                 built,
                 session,
                 names: Vec::new(),
@@ -3088,7 +3102,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
             StampSlot(stamp_slot_index(completion_slot)),
             &packet,
             crate::runtime::ingress::PacketReads {
-                submission: arrived.submission.as_ref(),
+                submission: arrived.submission.as_deref(),
                 repointed: arrived.repointed,
             },
         ),
@@ -3211,7 +3225,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
                 StampSlot(stamp_slot_index(completion_slot)),
                 &packet,
                 crate::runtime::ingress::PacketReads {
-                    submission: arrived.submission.as_ref(),
+                    submission: arrived.submission.as_deref(),
                     repointed: arrived.repointed,
                 },
             ) {
@@ -4231,6 +4245,7 @@ fn run_parked_packet_g<H: HostMemory + HostOps>(
     }
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
         g.sh().bump_names_gen();
+        crate::runtime::par::ahead::note_all();
         process_root_packet(g.st(), host, work.packet());
     } else {
         // The re-entry guard this packet used to be run under. A child packet's
@@ -4262,6 +4277,7 @@ fn run_parked_packet_g<H: HostMemory + HostOps>(
         // storage or mappings a helper-built packet read.
         if work.packet().opcode != CHILD_OP_EXEC_INDIRECT2 {
             g.sh().bump_names_gen();
+            crate::runtime::par::ahead::note_all();
         }
         // TEMP (lab, FRAME_GATE): an EXEC on a gate with helpers keeps the gate
         // down to its walk; everything else is the exclusive path as before.

@@ -2869,6 +2869,11 @@ pub(crate) fn lab_resolve_memo_on() -> bool {
 }
 
 fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledSourceRequest)> {
+    // TEMP (lab, FRAME_GATE + AHEAD): the memo is one encoder's; an ahead
+    // job prepares a later encoder's draws.
+    if crate::runtime::par::ahead::logging() {
+        return None;
+    }
     let m = RESOLVE_MEMO.read();
     m.get(key).and_then(|MemoSlot::Ready(entry)| {
         let (w, h, mid, src) = &entry.0;
@@ -2941,6 +2946,9 @@ pub(super) fn lab_resolve_memo_prime<M: HostMemory + HostOps>(
 }
 
 fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSourceRequest)) {
+    if crate::runtime::par::ahead::logging() {
+        return;
+    }
     // TEMP (lab, DRAW_PAR): a pool job's gathered source is a prediction until
     // the drain commits its witness; it is not what a later bind may reuse.
     if crate::runtime::par::planning()

@@ -30,7 +30,7 @@ use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use reims_vgpu_protocol::segment::{SegmentBody, SegmentKind, SegmentStream};
 
 /// What a render walk does to the device beyond reading it.
-pub(super) trait WalkState {
+pub(crate) trait WalkState {
     fn shared(&self) -> &DeviceState;
     fn walk_resource<M: HostMemory>(
         &mut self,
@@ -55,12 +55,37 @@ pub(super) trait WalkState {
     /// Whether an indirect draw may run here (it reads guest argument memory
     /// a preceding writeback may still owe).
     fn walk_indirect_allowed(&mut self) -> bool;
+    /// TEMP (lab, FRAME_GATE): a render target's resolve drops a stale
+    /// mapper-ref entry for a ref whose live type moved.
+    fn rt_forget_texture_mapping(&mut self, task_id: u32, texture_ref: u32);
+    /// TEMP (lab, FRAME_GATE): [`crate::runtime::mapper::ensure_resolved_for_scanout`].
+    fn rt_ensure_resolved_for_scanout<M: HostMemory + HostOps>(&mut self, host: &M, mapping_id: u32) -> bool;
+    /// TEMP (lab, FRAME_GATE): the exclusive state, for the work only the
+    /// drain does (`None` on a spec walk, which then gives up).
+    fn exclusive_state(&mut self) -> Option<&mut DeviceState>;
+    /// TEMP (lab, FRAME_GATE): a spec walk gives up (`why` is its census
+    /// route); a no-op on the drain.
+    fn spec_abort(&mut self, why: &'static str);
 }
 
 impl WalkState for DeviceState {
     fn shared(&self) -> &DeviceState {
         self
     }
+
+    fn rt_forget_texture_mapping(&mut self, task_id: u32, texture_ref: u32) {
+        self.texture_to_mapping.remove(&(task_id, texture_ref));
+    }
+
+    fn rt_ensure_resolved_for_scanout<M: HostMemory + HostOps>(&mut self, host: &M, mapping_id: u32) -> bool {
+        crate::runtime::mapper::ensure_resolved_for_scanout(self, host, mapping_id)
+    }
+
+    fn exclusive_state(&mut self) -> Option<&mut DeviceState> {
+        Some(self)
+    }
+
+    fn spec_abort(&mut self, _why: &'static str) {}
 
     fn walk_resource<M: HostMemory>(
         &mut self,
@@ -161,14 +186,33 @@ pub(super) struct SpecFence {
 }
 
 /// A walk on a helper: shared state, warm answers only.
-pub(super) struct SpecWalk<'a> {
+pub(crate) struct SpecWalk<'a> {
     st: &'a DeviceState,
     aborted: Option<&'static str>,
     fences: Vec<SpecFence>,
     witness: Witness,
 }
 
-impl SpecWalk<'_> {
+impl<'a> SpecWalk<'a> {
+    /// TEMP (lab, FRAME_GATE): a spec reader outside a walk (a render
+    /// target's resolve ahead of execution).
+    pub(crate) fn reader(st: &'a DeviceState) -> Self {
+        SpecWalk {
+            st,
+            aborted: None,
+            fences: Vec::new(),
+            witness: Witness::default(),
+        }
+    }
+
+    pub(crate) fn aborted(&self) -> Option<&'static str> {
+        self.aborted
+    }
+
+    pub(crate) fn into_witness(self) -> Witness {
+        self.witness
+    }
+
     fn abort(&mut self, why: &'static str) {
         if self.aborted.is_none() {
             self.aborted = Some(why);
@@ -187,6 +231,36 @@ impl SpecWalk<'_> {
 impl WalkState for SpecWalk<'_> {
     fn shared(&self) -> &DeviceState {
         self.st
+    }
+
+    fn rt_forget_texture_mapping(&mut self, task_id: u32, texture_ref: u32) {
+        if self.st.texture_to_mapping.contains_key(&(task_id, texture_ref)) {
+            self.abort("rt_stale_mapping");
+        }
+    }
+
+    fn rt_ensure_resolved_for_scanout<M: HostMemory + HostOps>(&mut self, _host: &M, mapping_id: u32) -> bool {
+        let Some(m) = self.st.mappings.get(&mapping_id) else {
+            return false;
+        };
+        let needs = m.mapped
+            && m.mapping_internal != 0
+            && (m.page_entries.is_empty()
+                || !m.has_geom
+                || !crate::runtime::mapper::pages_cover_geom(self.st, mapping_id));
+        if needs {
+            self.abort("rt_scanout_resolve");
+            return false;
+        }
+        m.mapped && !m.page_entries.is_empty()
+    }
+
+    fn exclusive_state(&mut self) -> Option<&mut DeviceState> {
+        None
+    }
+
+    fn spec_abort(&mut self, why: &'static str) {
+        self.abort(why);
     }
 
     fn walk_resource<M: HostMemory>(
@@ -274,6 +348,13 @@ pub(crate) struct SpecStream {
     out: ExecResult,
     fences: Vec<SpecFence>,
     witness: Witness,
+}
+
+impl SpecStream {
+    /// TEMP (lab, FRAME_GATE + AHEAD): the walk's accumulator.
+    pub(crate) fn accum(&self) -> &StreamAccum {
+        &self.acc
+    }
 }
 
 /// Walk one stream's render records under the shared state, or `None` when

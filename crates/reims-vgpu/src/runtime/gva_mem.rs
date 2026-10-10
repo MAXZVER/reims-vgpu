@@ -72,6 +72,11 @@ pub fn read_task_gva<M: HostMemory>(
     if buf.is_empty() {
         return Ok(());
     }
+    // TEMP (lab, FRAME_GATE + AHEAD): an ahead job's guest reads, for the
+    // commit's write-note check.
+    if crate::runtime::par::ahead::logging() {
+        crate::runtime::par::ahead::note_read(task.directory_pfn, gva, buf.len() as u64);
+    }
     if !task.active || task.directory_pfn == 0 {
         return Err(MemError::NoTaskDirectory);
     }
@@ -758,6 +763,13 @@ pub fn visit_task_gva_page_gpas<M: HostMemory>(
     page_shift: u32,
     visit: &mut dyn FnMut(u64) -> bool,
 ) {
+    // TEMP (lab, FRAME_GATE + AHEAD): pages named for a later read count as
+    // read.
+    if crate::runtime::par::ahead::logging() {
+        if let Some(t) = tasks.get(task_id) {
+            crate::runtime::par::ahead::note_read(t.directory_pfn, gva, span);
+        }
+    }
     visit_task_gva_pages(
         host,
         tasks,

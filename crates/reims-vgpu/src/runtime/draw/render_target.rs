@@ -735,8 +735,8 @@ impl crate::observe::Decline for RenderTargetRefusal {
 /// which `AGENTS.md` names as the canonical thing that must stay quiet. It is
 /// handled here rather than in [`resolve_render_target`] so that everything the
 /// resolver can return is a genuine loss, and every one of them is reported.
-pub(super) fn lookup_render_target<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+pub(super) fn lookup_render_target<M: HostMemory + HostOps, S: crate::runtime::exec::walk_ahead::WalkState>(
+    state: &mut S,
     host: &M,
     task_id: u32,
     att: crate::runtime::render_pass::ColorAttachment,
@@ -769,8 +769,8 @@ pub(super) fn lookup_render_target<M: HostMemory + HostOps>(
 /// particular: it is 240 lines with ~30 exits, it grew every one of them one
 /// bug at a time, and a source-scanning gate over it would have to understand
 /// four rungs of control flow to say anything.
-fn resolve_render_target<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+fn resolve_render_target<M: HostMemory + HostOps, S: crate::runtime::exec::walk_ahead::WalkState>(
+    state: &mut S,
     host: &M,
     task_id: u32,
     att: crate::runtime::render_pass::ColorAttachment,
@@ -779,7 +779,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     let texture_ref = att.texture_ref;
     // Texture-view view → base (archive resource_resolve_texture view chain).
     let (resolved_ref, view_fmt_override, view_level) =
-        if let Some(view) = resolve_texture_view(state, host, task_id, texture_ref) {
+        if let Some(view) = resolve_texture_view(state.shared(), host, task_id, texture_ref) {
             // Archive resolve_texture rejects swizzled views for linear resolve.
             if let Some(plan) = view.swizzle.as_ref() {
                 if !pixel_format::swizzle_is_identity(plan) {
@@ -816,17 +816,17 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     //    descriptor, not prefer the latch. Preferring latch routed dual-mid
     //    full-screen desktop composites onto only one mid (mid=3 nz=6M vs
     //    mid=4 stuck logo nz=1.97M; damage rects then preserved logo via Load).
-    let live = objects::lookup_list_entry(state, host, task_id, resolved_ref);
+    let live = objects::lookup_list_entry(state.shared(), host, task_id, resolved_ref);
     let live_type = live.as_ref().map(|e| e.object_type);
     if let Some(ot) = live_type {
         if ot != OBJECT_TYPE_MAPPER_REF_TEXTURE {
             // Live list says not mapper-ref-texture — drop any recycled-ref latch.
-            state.texture_to_mapping.remove(&(task_id, resolved_ref));
+            state.rt_forget_texture_mapping(task_id, resolved_ref);
         }
     }
     let try_mapper_ref_texture = live_type == Some(OBJECT_TYPE_MAPPER_REF_TEXTURE)
         || (live_type.is_none()
-            && state
+            && state.shared()
                 .texture_to_mapping
                 .contains_key(&(task_id, resolved_ref)));
     if try_mapper_ref_texture {
@@ -839,21 +839,21 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         // Latch is only a fallback when the list entry is transiently missing
         // (resolve_mapper_ref_texture refreshes the latch from the live descriptor).
         let mapping_id = if live_type == Some(OBJECT_TYPE_MAPPER_REF_TEXTURE) {
-            objects::resolve_mapper_ref_texture(state, host, task_id, resolved_ref).or_else(|| {
-                state
+            state.walk_mapper_ref_texture(host, task_id, resolved_ref).or_else(|| {
+                state.shared()
                     .texture_to_mapping
                     .get(&(task_id, resolved_ref))
                     .copied()
             })
         } else {
-            state
+            state.shared()
                 .texture_to_mapping
                 .get(&(task_id, resolved_ref))
                 .copied()
-                .or_else(|| objects::resolve_mapper_ref_texture(state, host, task_id, resolved_ref))
+                .or_else(|| state.walk_mapper_ref_texture(host, task_id, resolved_ref))
         }
         .ok_or(C::MapperRefTextureUnresolved.at(resolved_ref))?;
-        let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
+        let _ = state.rt_ensure_resolved_for_scanout(host, mapping_id);
         // This rung is terminal either way, and both directions were already
         // true before it said so. A live mapper-ref-texture that fails geometry must not
         // be decoded as normal-texture — that is the sticky-latch bug above. And in
@@ -861,7 +861,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         // (`try_mapper_ref_texture` admits nothing else), so every rung below ends at
         // `NoListEntry`: falling through reported the ladder's least specific
         // refusal for a failure the mapper-ref-texture rung had already diagnosed.
-        let m = state
+        let m = state.shared()
             .mappings
             .get(&mapping_id)
             .ok_or(C::MapperRefTextureNoMapping { mapping_id }.at(resolved_ref))?;
@@ -907,7 +907,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     let backing_sid = match live.as_ref() {
         Some(e) if e.object_type == objects::OBJECT_TYPE_BACKING => Some(resolved_ref),
         Some(e) if e.object_type == objects::OBJECT_TYPE_REF_TEXTURE => {
-            let desc = objects::read_descriptor(state, host, task_id, e)
+            let desc = objects::read_descriptor(state.shared(), host, task_id, e)
                 .ok_or(C::RefTextureDescRead.at(resolved_ref))?;
             let sid = reims_vgpu_wire::device_desc::ref_texture_header(&desc)
                 .map_err(|_| C::RefTextureDescDecode { len: desc.len() }.at(resolved_ref))?
@@ -925,14 +925,14 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         if level != 0 {
             return Err(C::BackingMipView { surface_id, level }.at(resolved_ref));
         }
-        if !objects::resolve_backing(state, host, surface_id) {
+        if !state.walk_backing(host, surface_id) {
             return Err(C::BackingUnresolved {
                 surface_id,
                 live_type,
             }
             .at(resolved_ref));
         }
-        let m = state
+        let m = state.shared()
             .mappings
             .get(&surface_id)
             .ok_or(C::BackingNoMapping { surface_id }.at(resolved_ref))?;
@@ -987,7 +987,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         }
         .at(resolved_ref));
     }
-    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)
+    let desc_bytes = objects::read_descriptor(state.shared(), host, task_id, &entry)
         .ok_or(C::LinearDescRead.at(resolved_ref))?;
     let tex = decode_texture_descriptor(&desc_bytes).map_err(|status| {
         C::LinearDescDecode {
@@ -1022,7 +1022,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     // compositor blur/backdrop pyramids render into successive levels).
     let (gva, w, h, bpr) = if level != 0 {
         let (level_gva, layout) = tex
-            .level_gva(level, state.page_shift)
+            .level_gva(level, state.shared().page_shift)
             .ok_or(C::LinearLevelGva { level }.at(resolved_ref))?;
         if layout.row_stride > u32::MAX as u64 {
             return Err(C::LinearLevelStride {
@@ -1062,7 +1062,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             layout.row_stride as u32,
         )
     } else {
-        let (gva, alloc) = tex.backing_gva_size(state.page_shift).ok_or(
+        let (gva, alloc) = tex.backing_gva_size(state.shared().page_shift).ok_or(
             C::LinearBackingGva {
                 allocation_size: tex.allocation_size,
                 handle: tex.handle,

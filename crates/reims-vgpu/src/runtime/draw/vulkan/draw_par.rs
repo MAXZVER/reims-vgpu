@@ -1463,7 +1463,7 @@ pub(crate) struct RegionStop {
     pub(crate) after: Vec<Carried>,
 }
 
-fn prepare_job(
+pub(crate) fn prepare_job(
     st: &DeviceState,
     env: &crate::runtime::par::WorkerEnv<'_>,
     item: &(DrawEncodeRequest, bool),
@@ -1714,6 +1714,124 @@ where
     });
     owed.land(g.st());
     stop
+}
+
+/// TEMP (lab, FRAME_GATE + AHEAD): a stream's records prepared by a frame
+/// helper ahead of the stream's execution.
+pub(crate) struct AheadDraws {
+    /// The pass target the requests were built for.
+    key: super::pass_inv::PassTargetKey,
+    /// The invariants the requests carried (the target's last recorded).
+    inv: super::pass_inv::PassInvariants,
+    /// The write-note sequence before the first preparation started.
+    seq: u64,
+    /// Record `1 + i`'s preparation and the guest windows it read.
+    prepared: Vec<Option<(PreparedDraw, Vec<crate::runtime::par::ahead::Window>)>>,
+}
+
+impl std::fmt::Debug for AheadDraws {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AheadDraws").field("records", &self.prepared.len()).finish_non_exhaustive()
+    }
+}
+
+/// TEMP (lab, FRAME_GATE + AHEAD): the invariants last recorded for `req`'s
+/// target, set on it; `false` when none are known.
+pub(crate) fn seed_pass_invariants(req: &mut DrawEncodeRequest) -> bool {
+    match super::pass_inv::cache_for(req) {
+        Some(inv) => {
+            req.pass_invariants = Some(inv);
+            true
+        }
+        None => false,
+    }
+}
+
+/// TEMP (lab, FRAME_GATE + AHEAD): remember draw 0's invariants for the next
+/// stream into the same target.
+pub(crate) fn remember_pass_invariants(req: &DrawEncodeRequest) {
+    if let Some(inv) = req.pass_invariants.as_ref() {
+        super::pass_inv::cache_put(inv);
+    }
+}
+
+/// TEMP (lab, FRAME_GATE + AHEAD): prepare `reqs` (records `1..` of a stream,
+/// built from `first` and the template whose invariants they carry) on this
+/// helper, each logging the guest windows it reads.
+pub(crate) fn prepare_ahead(
+    st: &DeviceState,
+    env: &crate::runtime::par::WorkerEnv<'_>,
+    first: &DrawEncodeRequest,
+    reqs: &[(DrawEncodeRequest, bool)],
+) -> Option<AheadDraws> {
+    let inv = reqs.first()?.0.pass_invariants.clone()?;
+    let seq = crate::runtime::par::ahead::seq();
+    let mut prepared = Vec::with_capacity(reqs.len());
+    for item in reqs {
+        if crate::runtime::par::gate::job_should_stop() {
+            crate::runtime::drain::note_store_route("ahead_draws_stopped");
+            break;
+        }
+        let scope = crate::runtime::par::ahead::ReadScope::begin();
+        let p = prepare_job(st, env, item);
+        let reads = scope.finish();
+        prepared.push(p.map(|p| (p, reads)));
+    }
+    crate::runtime::drain::note_store_route_n(
+        "ahead_draws_prepared",
+        prepared.iter().filter(|p| p.is_some()).count() as u64,
+    );
+    Some(AheadDraws {
+        key: super::pass_inv::PassTargetKey::of(first),
+        inv,
+        seq,
+        prepared,
+    })
+}
+
+/// TEMP (lab, FRAME_GATE + AHEAD): the ahead preparations of records
+/// `from..to` for a region, as its carried prefix: only while the stream's
+/// pass is the one they were built for (target, invariants) and nothing the
+/// drain wrote since intersects what they read. The prefix ends at the first
+/// record that does not hold; the region prepares the rest itself.
+pub(crate) fn ahead_carried(
+    ahead: &mut Option<AheadDraws>,
+    first: &DrawEncodeRequest,
+    template_inv: Option<&super::pass_inv::PassInvariants>,
+    from: usize,
+    to: usize,
+) -> Vec<Carried> {
+    let Some(a) = ahead.as_mut() else {
+        return Vec::new();
+    };
+    let route = crate::runtime::drain::note_store_route;
+    if a.key != super::pass_inv::PassTargetKey::of(first) {
+        route("ahead_draws_key_moved");
+        *ahead = None;
+        return Vec::new();
+    }
+    if !template_inv.is_some_and(|t| super::pass_inv::same_facts(t, &a.inv)) {
+        route("ahead_draws_inv_moved");
+        *ahead = None;
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for k in from..to {
+        let Some(slot) = k.checked_sub(1).and_then(|i| a.prepared.get_mut(i)) else {
+            break;
+        };
+        let Some((p, reads)) = slot.take() else {
+            route("ahead_draws_missing");
+            break;
+        };
+        if !crate::runtime::par::ahead::clean_since(a.seq, &reads) {
+            route("ahead_draws_stale");
+            break;
+        }
+        out.push(Carried::Prepared(p));
+    }
+    crate::runtime::drain::note_store_route_n("ahead_draws_carried", out.len() as u64);
+    out
 }
 
 // ---------------------------------------------------------------------------
