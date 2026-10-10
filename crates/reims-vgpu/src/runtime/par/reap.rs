@@ -11,9 +11,12 @@
 //! hold the owning references), so a reaper thread may run them whenever.
 //!
 //! [`later`] hands a value over (a channel send, batched by the callers per
-//! region); without the thread (tests, or it failed to start) the value drops
-//! where it is, as before. `REIMS_VGPU_LAB_REAP=off` keeps every drop on the
-//! drain.
+//! region); without the thread the value drops where it is, as before.
+//!
+//! Opt-in (`REIMS_VGPU_LAB_REAP=on`), off by default: b164 (Weather light
+//! scene, ABBA by boot) drain 6.5-6.7 us a draw with it against 6.4-6.5
+//! without. The count lines sit beside the data they guard, so the drain
+//! pays the miss at its next read of the resource instead of at the drop.
 
 use std::sync::mpsc::{channel, Sender};
 use std::sync::OnceLock;
@@ -23,7 +26,7 @@ type Garbage = Box<dyn Send>;
 fn reaper() -> Option<&'static Sender<Garbage>> {
     static TX: OnceLock<Option<Sender<Garbage>>> = OnceLock::new();
     TX.get_or_init(|| {
-        if cfg!(test) || std::env::var("REIMS_VGPU_LAB_REAP").as_deref() == Ok("off") {
+        if cfg!(test) || std::env::var("REIMS_VGPU_LAB_REAP").as_deref() != Ok("on") {
             return None;
         }
         let (tx, rx) = channel::<Garbage>();
