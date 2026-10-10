@@ -791,10 +791,12 @@ pub fn device_drain(id: u64) -> bool {
     // Split the tranche's two phases: guest work, then our host-window export.
     // Both hold the device lock, and which one owns the worker's wall clock is
     // the question `drain_duty` exists to answer.
-    let tranche_started = std::time::Instant::now();
+    let tranche_started = crate::lab_clock::LabInstant::now();
     // The same instant on the crate's own clock, so a lookup inside the drain
     // can say how late in this tranche it happened without threading a start
     // time through every call. See `census::tranche_elapsed_us`.
+    // TEMP (lab): the live switch file, looked at once a tranche.
+    crate::runtime::lab_live::tick();
     crate::runtime::drain::note_tranche_started(crate::observe::elapsed_us());
     // TEMP (lab, MONSTER_PREWARM): a new tranche retires every held currency
     // answer, so the doorbell's first binds ask for themselves. Free when the
@@ -844,20 +846,20 @@ pub fn device_drain(id: u64) -> bool {
     // `drain_us` against 604 of `draw_us` on a driven `blur=40` boot. A gap that
     // size on the one thread every guest packet serializes through cannot be
     // left to inference.
-    let tail_started = std::time::Instant::now();
+    let tail_started = crate::lab_clock::LabInstant::now();
     crate::runtime::drain::lab_act(5);
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
     crate::backend::selected().flush_deferred_submissions(&device.state);
     let tail_us = tail_started.elapsed().as_micros() as u64;
-    let boundary_started = std::time::Instant::now();
+    let boundary_started = crate::lab_clock::LabInstant::now();
     if !early_publish {
         publish_present_boundary(&slot, device.state.present.frame_flush_seen);
     }
     crate::runtime::drain::note_drain_tail(tail_us, boundary_started.elapsed().as_micros() as u64);
     let drain_us = tranche_started.elapsed().as_micros() as u64;
-    let publish_started = std::time::Instant::now();
+    let publish_started = crate::lab_clock::LabInstant::now();
     // Push the finished present frame to the host-owned window (if running).
     // Off the QEMU main loop; a small dedicated mutex, never the render lock.
     crate::runtime::drain::lab_act(6);
@@ -1031,7 +1033,7 @@ pub fn device_poll(id: u64) -> bool {
         return true;
     };
     lab_held(4);
-    let lab_t = std::time::Instant::now(); // TEMP (lab, b041): parts under `inner`
+    let lab_t = crate::lab_clock::LabInstant::now(); // TEMP (lab, b041): parts under `inner`
     let Some(ops) = slot.ops else {
         return true;
     };

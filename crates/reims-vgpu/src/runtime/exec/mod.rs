@@ -6136,7 +6136,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                             if req.visibility.is_some() || !resident_chain || *writeback {
                                 return RegionStep::Stop(Some(prepared));
                             }
-                            let draw_started = std::time::Instant::now();
+                            let draw_started = crate::lab_clock::LabInstant::now();
                             fin.enter(crate::runtime::drain::FinishPhase::Encode);
                             match crate::runtime::draw::vulkan::draw_par::commit_shared(
                                 st, &*h, req, prepared, owed,
@@ -6304,7 +6304,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                     out.render_guest_stores = out.render_guest_stores.saturating_add(1);
                     note_store_windows(state, &req);
                 }
-                let draw_started = std::time::Instant::now();
+                let draw_started = crate::lab_clock::LabInstant::now();
                 fin.enter(crate::runtime::drain::FinishPhase::Encode);
                 // TEMP (lab, DRAW_PAR): the prepared record, if the workers
                 // made one and the chain still holds, offered to this encode

@@ -3531,7 +3531,13 @@ pub fn note_drain_exit(busy_end_us: u64, skipped: bool) {
 }
 
 /// Attribute elapsed time since `started` to one phase of the current tranche.
-pub fn note_drain_phase(phase: DrainPhase, started: std::time::Instant) {
+pub fn note_drain_phase(phase: DrainPhase, started: crate::lab_clock::LabInstant) {
+    DRAIN_DUTY.note_phase(phase, started.elapsed().as_micros() as u64);
+}
+
+/// [`note_drain_phase`] for a span timed on `Instant` (the readback flush,
+/// whose start rides through its job; rare enough that the clock is cheap).
+pub fn note_drain_phase_instant(phase: DrainPhase, started: std::time::Instant) {
     DRAIN_DUTY.note_phase(phase, started.elapsed().as_micros() as u64);
 }
 

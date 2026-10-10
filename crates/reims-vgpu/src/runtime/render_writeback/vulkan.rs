@@ -1340,7 +1340,7 @@ fn finish(
     } else {
         crate::runtime::drain::note_store_route("shared_store_registry_handoff_elided");
     }
-    crate::runtime::drain::note_drain_phase(
+    crate::runtime::drain::note_drain_phase_instant(
         crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Render),
         started,
     );

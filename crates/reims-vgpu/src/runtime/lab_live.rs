@@ -81,6 +81,15 @@ fn refresh(l: &Live) {
     st.0 = mtime;
 }
 
+/// Look at the live file again if 200 ms have passed since the last look. The
+/// drain calls this at each tranche's start; the switches read the copy it
+/// leaves, so a change reaches every thread by the next tranche.
+pub(crate) fn tick() {
+    if let Some(l) = live() {
+        refresh(l);
+    }
+}
+
 /// The live value of lab switch `name` (without the `REIMS_VGPU_LAB_` prefix),
 /// or `None` when the live file is unset, missing, or does not name it.
 pub(crate) fn value(name: &str) -> Option<String> {
@@ -102,9 +111,15 @@ pub(crate) fn on(name: &str) -> Option<bool> {
 /// the shared state only when its generation moved. Some switches are asked
 /// per draw or per bind (b069: `value` ~1.5 % of the drain's busy samples when
 /// it took the state lock and cloned a string each time).
+///
+/// The file itself is looked at by [`tick`] (each drain tranche's start), not
+/// here: b157 put the per-call clock check at ~2 % of the drain's busy samples
+/// in the working mode. A reader before the first tick loads it once.
 fn with_value<T>(name: &str, f: impl FnOnce(&str) -> T) -> Option<T> {
     let l = live()?;
-    refresh(l);
+    if l.checked_us.load(Relaxed) == 0 {
+        refresh(l);
+    }
     thread_local! {
         static COPY: std::cell::RefCell<(u64, Vec<(String, String)>)> =
             const { std::cell::RefCell::new((u64::MAX, Vec::new())) };

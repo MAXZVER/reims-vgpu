@@ -792,7 +792,7 @@ pub fn apply_record<M: HostMemory + HostOps>(
     record: &ComputeRecord<'_>,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) -> Option<ComputeStatus> {
-    let started = std::time::Instant::now();
+    let started = crate::lab_clock::LabInstant::now();
     let out = apply_record_inner(state, host, task_id, record, seg);
     crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Compute, started);
     out
@@ -813,7 +813,7 @@ pub fn apply_sequencing_record<M: HostMemory + HostOps>(
     cmd: &ComputeCommand,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) -> ComputeStatus {
-    let started = std::time::Instant::now();
+    let started = crate::lab_clock::LabInstant::now();
     let out = crate::runtime::compute_session::apply_sequencing(state, host, task_id, cmd, seg);
     crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Compute, started);
     out

@@ -1884,7 +1884,7 @@ fn decode_packet(
     available: u32,
     ring_capacity: u32,
 ) -> Result<Packet, PacketError> {
-    let started = std::time::Instant::now();
+    let started = crate::lab_clock::LabInstant::now();
     let out = decode_packet_inner(bytes, head, available, ring_capacity);
     census::note_drain_decode(started.elapsed().as_nanos() as u64);
     out
@@ -4259,7 +4259,7 @@ fn run_parked_packet_g<H: HostMemory + HostOps>(
         let prev_channel = g.sh().draining_channel.get();
         g.sh().draining_channel.set(domain);
         g.sh().draining_mask.or(bit);
-        let started = std::time::Instant::now();
+        let started = crate::lab_clock::LabInstant::now();
         let lab_prev_act = lab_act(0x100 | u32::from(work.packet().opcode));
         if lab_packet_scope() {
             host.note_work_scope(if work.packet().stamp_waits.is_empty() {
@@ -4623,7 +4623,7 @@ fn read_ring_bytes<M: HostMemory>(
     absolute: u32,
     len: u32,
 ) -> Result<Vec<u8>, MemError> {
-    let started = std::time::Instant::now();
+    let started = crate::lab_clock::LabInstant::now();
     let out = read_ring_bytes_inner(mem, base_gpa, ring_size, absolute, len);
     census::note_drain_ring(started.elapsed().as_nanos() as u64);
     out
@@ -6264,7 +6264,7 @@ fn read_child_ring_bytes<M: HostMemory>(
     len: u32,
     page_shift: u32,
 ) -> Result<Vec<u8>, MemError> {
-    let started = std::time::Instant::now();
+    let started = crate::lab_clock::LabInstant::now();
     let out = read_child_ring_bytes_inner(mem, page_gpas, ring_length, absolute, len, page_shift);
     census::note_drain_ring(started.elapsed().as_nanos() as u64);
     out
@@ -9229,7 +9229,7 @@ fn drain_child_fifo_g<H: HostMemory + HostOps>(
     if hold_undefined_child_g(g, host, channel_id) {
         return;
     }
-    let setup_started = std::time::Instant::now();
+    let setup_started = crate::lab_clock::LabInstant::now();
     let regs_gpa = g.sh().pfn_gpa(g.sh().gfx.root_page) + regs_off;
     // Where the shim's doorbell for this channel reads the tail before it opens
     // its dirty-tracking epoch (`reims_vgpu_qemu_child_tail_gpa`).
@@ -9300,7 +9300,7 @@ fn drain_child_fifo_g<H: HostMemory + HostOps>(
         if framed {
             g.open();
         }
-        let regs_started = std::time::Instant::now();
+        let regs_started = crate::lab_clock::LabInstant::now();
         let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
         census::note_drain_regs(
             census::RegsOp::TailRead,
@@ -9415,7 +9415,7 @@ fn drain_child_fifo_g<H: HostMemory + HostOps>(
                     // run yet holds an ordering position instead of a consumer
                     // pointer, and the packets behind it are not behind anything.
                     head = packet.next_head;
-                    let head_started = std::time::Instant::now();
+                    let head_started = crate::lab_clock::LabInstant::now();
                     let head_write = gpa_map::write_u32(
                         host,
                         regs_gpa + CHILD_REG_HEAD,
@@ -10930,7 +10930,7 @@ fn drain_pending_inner_g<H: HostMemory + HostOps>(g: &mut crate::runtime::par::G
             if mask & bit != 0 {
                 remaining &= !bit;
                 served |= bit;
-                let lab_t = std::time::Instant::now();
+                let lab_t = crate::lab_clock::LabInstant::now();
                 let lab_wait = census::tranche_elapsed_us();
                 drain_child_fifo_g(g, host, ch);
                 state = g.st();
