@@ -7,7 +7,7 @@
 //! four-arm queue was boot - and every boot re-rolled the windowed-glass
 //! scene's heavy/light mode, which made arms of one queue less comparable than
 //! two phases of one boot. Here the host writes `NAME=value` lines into one
-//! file and the switches that consult it follow, re-read at most every 200 ms
+//! file and the switches that consult it follow, re-read every 200 ms by a watcher thread
 //! and only when the file's modification time moved.
 //!
 //! A switch asks [`value`] (or [`on`]) first and falls back to its own latched
@@ -47,17 +47,26 @@ fn live() -> Option<&'static Live> {
         })
     })
     .as_ref()
+    .inspect(|l| {
+        // The first reader loads the file and starts the watcher; the
+        // watcher's own first look then finds it unchanged.
+        static WATCH: std::sync::Once = std::sync::Once::new();
+        WATCH.call_once(|| {
+            refresh(l);
+            let _ = std::thread::Builder::new()
+                .name("reims-lab-live".into())
+                .spawn(|| loop {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    if let Some(l) = live() {
+                        refresh(l);
+                    }
+                });
+        });
+    })
 }
 
 fn refresh(l: &Live) {
-    let now = crate::observe::elapsed_us();
-    let last = l.checked_us.load(Relaxed);
-    if last != 0 && now.saturating_sub(last) < 200_000 {
-        return;
-    }
-    if l.checked_us.compare_exchange(last, now.max(1), Relaxed, Relaxed).is_err() {
-        return; // another reader is looking at the file this round
-    }
+    l.checked_us.store(crate::observe::elapsed_us().max(1), Relaxed);
     let mtime = std::fs::metadata(&l.path).and_then(|m| m.modified()).ok();
     let mut st = l.state.lock().unwrap_or_else(|e| e.into_inner());
     if mtime == st.0 {
@@ -79,15 +88,6 @@ fn refresh(l: &Live) {
         st.1 = pairs;
     }
     st.0 = mtime;
-}
-
-/// Look at the live file again if 200 ms have passed since the last look. The
-/// drain calls this at each tranche's start; the switches read the copy it
-/// leaves, so a change reaches every thread by the next tranche.
-pub(crate) fn tick() {
-    if let Some(l) = live() {
-        refresh(l);
-    }
 }
 
 /// The live value of lab switch `name` (without the `REIMS_VGPU_LAB_` prefix),
@@ -112,14 +112,11 @@ pub(crate) fn on(name: &str) -> Option<bool> {
 /// per draw or per bind (b069: `value` ~1.5 % of the drain's busy samples when
 /// it took the state lock and cloned a string each time).
 ///
-/// The file itself is looked at by [`tick`] (each drain tranche's start), not
-/// here: b157 put the per-call clock check at ~2 % of the drain's busy samples
-/// in the working mode. A reader before the first tick loads it once.
+/// The file itself is looked at by a watcher thread every 200 ms, not here:
+/// b157 put the per-call check at ~2 % of the drain's busy samples in the
+/// working mode (and a file `metadata` call on the drain every 200 ms ~1.4 %).
 fn with_value<T>(name: &str, f: impl FnOnce(&str) -> T) -> Option<T> {
     let l = live()?;
-    if l.checked_us.load(Relaxed) == 0 {
-        refresh(l);
-    }
     thread_local! {
         static COPY: std::cell::RefCell<(u64, Vec<(String, String)>)> =
             const { std::cell::RefCell::new((u64::MAX, Vec::new())) };

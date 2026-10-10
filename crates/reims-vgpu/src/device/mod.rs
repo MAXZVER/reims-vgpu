@@ -795,8 +795,6 @@ pub fn device_drain(id: u64) -> bool {
     // The same instant on the crate's own clock, so a lookup inside the drain
     // can say how late in this tranche it happened without threading a start
     // time through every call. See `census::tranche_elapsed_us`.
-    // TEMP (lab): the live switch file, looked at once a tranche.
-    crate::runtime::lab_live::tick();
     crate::runtime::drain::note_tranche_started(crate::observe::elapsed_us());
     // TEMP (lab, MONSTER_PREWARM): a new tranche retires every held currency
     // answer, so the doorbell's first binds ask for themselves. Free when the
