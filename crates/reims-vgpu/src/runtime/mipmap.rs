@@ -120,6 +120,14 @@ fn downsample_rgba8_box(
     let dst_need = (dst_w as usize)
         .checked_mul(dst_h as usize)?
         .checked_mul(RGBA8_BPP as usize)?;
+    // An exact halving in both axes - every level of a power-of-two chain - is a
+    // 2x2 box per texel: the general loop below with count 4, whose half-up
+    // rounding is (sum + 2) / 4. Same bytes, without the per-texel grid
+    // arithmetic (b217: the general loop was 49 % of the drain on a page that
+    // regenerates a 2560x1440 canvas's mips every frame).
+    if src_w == dst_w * 2 && src_h == dst_h * 2 {
+        return Some(halve_rgba8_2x2(src, src_w as usize, dst_w as usize, dst_h as usize, dst_need));
+    }
     let mut dst = vec![0u8; dst_need];
     for dy in 0..dst_h {
         let y0 = ((dy as u64) * (src_h as u64) / (dst_h as u64)) as u32;
@@ -153,6 +161,29 @@ fn downsample_rgba8_box(
         }
     }
     Some(dst)
+}
+
+/// [`downsample_rgba8_box`] for `src = 2 * dst` in both axes: each destination
+/// texel is the half-up mean of its 2x2 source block, per channel.
+fn halve_rgba8_2x2(src: &[u8], src_w: usize, dst_w: usize, dst_h: usize, dst_need: usize) -> Vec<u8> {
+    let mut dst = vec![0u8; dst_need];
+    let src_row = src_w * 4;
+    let dst_row = dst_w * 4;
+    for (dy, out) in dst.chunks_exact_mut(dst_row).take(dst_h).enumerate() {
+        let r0 = &src[2 * dy * src_row..2 * dy * src_row + src_row];
+        let r1 = &src[(2 * dy + 1) * src_row..(2 * dy + 1) * src_row + src_row];
+        for ((o, a), b) in out
+            .chunks_exact_mut(4)
+            .zip(r0.chunks_exact(8))
+            .zip(r1.chunks_exact(8))
+        {
+            for c in 0..4 {
+                let sum = u16::from(a[c]) + u16::from(a[c + 4]) + u16::from(b[c]) + u16::from(b[c + 4]);
+                o[c] = ((sum + 2) >> 2) as u8;
+            }
+        }
+    }
+    dst
 }
 
 struct ResolvedTexture {
@@ -382,6 +413,28 @@ fn generate_via_box_filter(
         .ok_or(MipmapStatus::Capacity)?;
     if level0_native.len() < need0 {
         return Err(MipmapStatus::Capacity);
+    }
+    // Four-byte 8-bit formats whose row rail is only a byte order (RGBA8,
+    // BGRA8, either sRGB ordinal): a per-channel box filter commutes with a
+    // permutation of the channels, so filtering the native bytes gives exactly
+    // the bytes the convert-filter-convert-back path below stores.
+    if matches!(
+        pixel_format::RowToRgba8::for_format(fmt),
+        Some(pixel_format::RowToRgba8::Rgba8 | pixel_format::RowToRgba8::Bgra8)
+    ) && tight0 as usize == width as usize * RGBA8_BPP as usize
+    {
+        let mut out: Vec<(u32, u32, Vec<u8>)> = Vec::with_capacity(levels);
+        out.push((width, height, level0_native[..need0].to_vec()));
+        for level in 1..levels {
+            let dw = reims_vgpu_protocol::extent::mip_extent(width, level as u32);
+            let dh = reims_vgpu_protocol::extent::mip_extent(height, level as u32);
+            let (pw, ph, prev) = out.last().map(|(w, h, b)| (*w, *h, b.as_slice())).unwrap_or_default();
+            let Some(next) = downsample_rgba8_box(prev, pw, ph, dw, dh) else {
+                return Err(MipmapStatus::IncompleteLayout);
+            };
+            out.push((dw, dh, next));
+        }
+        return Ok(out);
     }
     // Convert L0 native → tight RGBA8.
     let rgba_need = (width as usize)
@@ -621,6 +674,59 @@ mod tests {
     fn box_filter_rejects_upsized() {
         let src = [1u8, 2, 3, 4];
         assert!(downsample_rgba8_box(&src, 1, 1, 2, 2).is_none());
+    }
+
+    #[test]
+    fn bgra8_chains_filter_the_native_bytes_as_the_rgba_round_trip_would() {
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        let (w, h) = (16u32, 6u32);
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        for (i, b) in bgra.iter_mut().enumerate() {
+            *b = (i * 37 % 251) as u8;
+        }
+        let chain = generate_via_box_filter(MTL_FORMAT_BGRA8_UNORM, w, h, 3, &bgra).unwrap();
+        // The reference: swizzle to RGBA, filter, swizzle back.
+        let to_rgba = |v: &[u8]| v.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect::<Vec<u8>>();
+        let mut prev = to_rgba(&bgra);
+        let (mut pw, mut ph) = (w, h);
+        for level in 1..3u32 {
+            let dw = reims_vgpu_protocol::extent::mip_extent(w, level);
+            let dh = reims_vgpu_protocol::extent::mip_extent(h, level);
+            let next = downsample_rgba8_box(&prev, pw, ph, dw, dh).unwrap();
+            assert_eq!(chain[level as usize].2, to_rgba(&next), "level {level}");
+            prev = next;
+            pw = dw;
+            ph = dh;
+        }
+    }
+
+    #[test]
+    fn the_2x2_halving_matches_the_general_box_filter_bit_for_bit() {
+        // A halving always takes the fast path, so it is checked against the
+        // general loop's own formula for a 2x2 block: (sum + count/2) / count.
+        let (sw, sh) = (34u32, 18u32);
+        let mut src = vec![0u8; (sw * sh * 4) as usize];
+        let mut x = 0x1234_5678u32;
+        for b in &mut src {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = (x >> 24) as u8;
+        }
+        let fast = downsample_rgba8_box(&src, sw, sh, sw / 2, sh / 2).unwrap();
+        for dy in 0..sh / 2 {
+            for dx in 0..sw / 2 {
+                for c in 0..4usize {
+                    let at = |x: u32, y: u32| u64::from(src[((y * sw + x) * 4) as usize + c]);
+                    let sum = at(2 * dx, 2 * dy)
+                        + at(2 * dx + 1, 2 * dy)
+                        + at(2 * dx, 2 * dy + 1)
+                        + at(2 * dx + 1, 2 * dy + 1);
+                    let want = ((sum + 2) / 4) as u8;
+                    assert_eq!(fast[((dy * (sw / 2) + dx) * 4) as usize + c], want);
+                }
+            }
+        }
     }
 
     #[test]

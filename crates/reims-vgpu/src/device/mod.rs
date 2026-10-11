@@ -996,6 +996,7 @@ pub fn device_poll(id: u64) -> bool {
         return false;
     };
     lab_stamp_rewake_tick(&slot);
+    ring_ingest_tick(&slot, id);
     // TEMP (lab, POLL_YIELD, b041): the drain worker is taking or holding
     // `inner`. b041: the poll held `inner` only ~160 ms a phase (a few
     // microseconds a tick, 1000 ticks a second), yet the drain waited 0.9-1.3 s
@@ -1121,6 +1122,31 @@ fn lab_poll_parts(parts: [std::time::Duration; 4]) {
         line.push_str(&format!(" p{i}={s}/{m}us"));
     }
     crate::observe::off(line);
+}
+
+/// TEMP (lab, RING_INGEST): the heartbeat takes whole published packets out of
+/// every armed child ring into the device's queue without the device lock, so a
+/// guest ring keeps moving while the drain runs a long EXEC (Maps fills ch1 and
+/// the guest's driver resets the channel - b196, b207). Channels it moved are
+/// rung the way the lock-free doorbell rings them.
+fn ring_ingest_tick(slot: &BoundDevice, id: u64) {
+    if !crate::runtime::ring_ingest::enabled() {
+        return;
+    }
+    let Some(ops) = slot.ops else {
+        return;
+    };
+    let page_size = slot.vbl_page_size.load(Ordering::Acquire);
+    if page_size == 0 {
+        return;
+    }
+    let mut scratch = VecDeque::new();
+    let mut host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
+    let moved = crate::runtime::ring_ingest::heartbeat(id, &mut host, page_size as usize);
+    if moved != 0 {
+        slot.child_doorbell_rung.fetch_or(moved, Ordering::AcqRel);
+        schedule_device(slot);
+    }
 }
 
 /// Lock-free VBL pulse for a `device_poll` that could not take `inner`.

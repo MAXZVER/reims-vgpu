@@ -727,6 +727,7 @@ fn forget_child_channel(state: &mut DeviceState, channel: u32, bit: u32) {
     state.translation_order_hold_mask &= !bit;
     state.present_translation_hold_mask &= !bit;
     state.child_rings[channel as usize] = Default::default();
+    crate::runtime::ring_ingest::reset(state.id.0, channel);
 }
 
 /// `CmdDeleteTask` (0x20), from either FIFO.
@@ -2339,6 +2340,26 @@ fn lab_admit_ahead() -> usize {
     })
 }
 
+/// TEMP (lab, `TRANCHE_MS`, live): the most one channel's drain runs before it
+/// hands the rest of its ring to the next wakeup; 0 (the default) is no limit.
+fn lab_tranche_budget_us() -> u64 {
+    if cfg!(test) {
+        return 0;
+    }
+    if let Some(v) = crate::runtime::lab_live::value("TRANCHE_MS") {
+        return v.trim().parse::<u64>().unwrap_or(0) * 1000;
+    }
+    static K: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let ms = std::env::var("REIMS_VGPU_LAB_TRANCHE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        crate::observe::off(format!("lab_tranche_budget ms={ms}"));
+        ms * 1000
+    })
+}
+
 /// TEMP (lab, ADMIT_AHEAD): the write-tracking tokens an admission batch has
 /// named so far, and the `(task, ref)` pairs already looked at.
 #[derive(Default)]
@@ -3946,7 +3967,7 @@ fn lab_preempt_control_g<H: HostMemory + HostOps>(g: &mut crate::runtime::par::G
         ) else {
             continue;
         };
-        if head == tail {
+        if head == tail && !crate::runtime::ring_ingest::pending(g.sh().id.0, ch) {
             continue;
         }
         note_store_route("lab_ctrl_preempt");
@@ -4519,6 +4540,10 @@ pub enum Ring<'a> {
         capacity: u32,
         page_shift: u32,
     },
+    /// TEMP (lab, RING_INGEST): a child ring's packets already taken into the
+    /// device's queue ([`crate::runtime::ring_ingest`]) - `bytes` start at queue
+    /// position `base`.
+    Queue { bytes: &'a [u8], base: u32 },
 }
 
 impl Ring<'_> {
@@ -4527,6 +4552,7 @@ impl Ring<'_> {
     pub const fn capacity(&self) -> u32 {
         match *self {
             Self::Root { capacity, .. } | Self::Child { capacity, .. } => capacity,
+            Self::Queue { .. } => crate::runtime::ring_ingest::QUEUE_SPAN,
         }
     }
 
@@ -4540,6 +4566,13 @@ impl Ring<'_> {
                 capacity,
                 page_shift,
             } => read_child_ring_bytes(mem, page_gpas, capacity, absolute, len, page_shift),
+            Self::Queue { bytes, base } => {
+                let off = absolute.wrapping_sub(base) as usize;
+                bytes
+                    .get(off..off.saturating_add(len as usize))
+                    .map(<[u8]>::to_vec)
+                    .ok_or(MemError::Overflow)
+            }
         }
     }
 
@@ -4548,7 +4581,9 @@ impl Ring<'_> {
     const fn read_faults(&self) -> (PacketFault, PacketFault) {
         match *self {
             Self::Root { .. } => (PacketFault::RootHeaderRead, PacketFault::RootSnapRead),
-            Self::Child { .. } => (PacketFault::ChildHeaderRead, PacketFault::ChildSnapRead),
+            Self::Child { .. } | Self::Queue { .. } => {
+                (PacketFault::ChildHeaderRead, PacketFault::ChildSnapRead)
+            }
         }
     }
 }
@@ -6283,17 +6318,22 @@ fn read_child_ring_bytes_inner<M: HostMemory>(
     if ring_length == 0 || page_gpas.is_empty() {
         return Ok(out);
     }
-    for i in 0..len {
+    // A page run at a time - the run up to the end of the page or of the ring,
+    // whichever is first - instead of one `read_gpa` (an FFI call into the
+    // shim) per byte. Bytes on a page the list does not hold stay zero, as
+    // they did byte by byte.
+    let mut i = 0u32;
+    while i < len {
         let off = absolute.wrapping_add(i) % ring_length;
         let page = (off as u64) >> page_shift;
         let page_off = (off as u64) & (page_size - 1);
-        if page as usize >= page_gpas.len() {
-            out[i as usize] = 0;
-            continue;
+        let run = ((page_size - page_off) as u32)
+            .min(ring_length - off)
+            .min(len - i);
+        if let Some(&gpa) = page_gpas.get(page as usize) {
+            mem.read_gpa(gpa + page_off, &mut out[i as usize..(i + run) as usize])?;
         }
-        let mut b = [0u8; 1];
-        mem.read_gpa(page_gpas[page as usize] + page_off, &mut b)?;
-        out[i as usize] = b[0];
+        i += run;
     }
     Ok(out)
 }
@@ -9283,6 +9323,29 @@ fn drain_child_fifo_g<H: HostMemory + HostOps>(
         return;
     };
     let page_gpas = g.sh().child_rings[channel_id as usize].page_gpas.clone();
+    // TEMP (lab, RING_INGEST): packets come out of the device's queue for this
+    // ring, which the heartbeat and this drain fill from the guest ring; `head`
+    // and `tail` are queue positions from here on.
+    let ingest_queue = crate::runtime::ring_ingest::enabled()
+        .then(|| crate::runtime::ring_ingest::queue(g.sh().id.0, channel_id));
+    let mut q_bytes: Vec<u8> = Vec::new();
+    let mut q_base: u32 = 0;
+    let mut q_guest_tail: u32 = 0;
+    if let Some(q) = &ingest_queue {
+        let mut qg = q.lock();
+        qg.arm(crate::runtime::ring_ingest::GuestRing {
+            regs_gpa,
+            page_gpas: page_gpas.clone(),
+            page_shift: g.sh().page_shift,
+            length: ring_length,
+        });
+        let n = qg.ingest(host, g.sh().page_size() as usize);
+        crate::runtime::ring_ingest::note_drain_moved(n);
+        head = qg.head;
+        q_base = qg.head;
+        q_bytes = qg.snapshot();
+        q_guest_tail = qg.guest_tail;
+    }
     census::note_drain_setup(setup_started.elapsed().as_nanos() as u64);
 
     // Nested drain_other must skip this channel (no re-enter head).
@@ -9301,7 +9364,23 @@ fn drain_child_fifo_g<H: HostMemory + HostOps>(
             g.open();
         }
         let regs_started = crate::lab_clock::LabInstant::now();
-        let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
+        let tail_read = if let Some(q) = &ingest_queue {
+            // The packets taken so far are read; commit them, take what the
+            // guest has published since, and read on from a fresh copy.
+            if head == q_base.wrapping_add(q_bytes.len() as u32) {
+                let mut qg = q.lock();
+                qg.consume_to(head);
+                let n = qg.ingest(host, g.sh().page_size() as usize);
+                crate::runtime::ring_ingest::note_drain_moved(n);
+                q_base = qg.head;
+                q_bytes = qg.snapshot();
+                q_guest_tail = qg.guest_tail;
+                head = q_base;
+            }
+            Ok(q_base.wrapping_add(q_bytes.len() as u32))
+        } else {
+            crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL)
+        };
         census::note_drain_regs(
             census::RegsOp::TailRead,
             regs_started.elapsed().as_nanos() as u64,
@@ -9336,17 +9415,80 @@ fn drain_child_fifo_g<H: HostMemory + HostOps>(
                 Some(_) => {}
             }
         }
+        if ingest_queue.is_none() {
+            lab_chan::note_fill(channel_id, head, tail, ring_length);
+        }
         // Before the scope: a tail no doorbell's epoch covers gets one opened
         // after this read, and the scope below then makes the reads owe it.
-        host.note_ring_tail(channel_id, tail);
+        // In queue mode that is the guest tail the last ingest read.
+        host.note_ring_tail(channel_id, if ingest_queue.is_some() { q_guest_tail } else { tail });
         host.note_work_scope(crate::runtime::host::WorkScope::All);
-        let ring = Ring::Child {
-            page_gpas: &page_gpas,
-            capacity: ring_length,
-            page_shift: g.sh().page_shift,
+        let ring = if ingest_queue.is_some() {
+            Ring::Queue { bytes: &q_bytes, base: q_base }
+        } else {
+            Ring::Child {
+                page_gpas: &page_gpas,
+                capacity: ring_length,
+                page_shift: g.sh().page_shift,
+            }
         };
         match arrival(&ring, host, head, tail) {
             Arrival::Nothing => {
+                // TEMP (lab): a ring more than half full that yields no packet.
+                // Maps fills ch1 (b207: 65480/65536) while the drain sits idle
+                // before the guest's channel-reset panic; this names what the
+                // packet at the head looked like when the drain stopped there.
+                let fill = (tail % ring_length + ring_length - head % ring_length) % ring_length;
+                // Queue mode: what the ingest left in the guest ring is a
+                // partial packet (owed nothing) or a malformed one, which this
+                // reader reports - the ingest only moves whole packets.
+                if ingest_queue.is_some() {
+                    if let (Ok(gh), Ok(gt)) = (
+                        crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_HEAD),
+                        crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL),
+                    ) {
+                        if gh != gt {
+                            let guest = Ring::Child {
+                                page_gpas: &page_gpas,
+                                capacity: ring_length,
+                                page_shift: g.sh().page_shift,
+                            };
+                            match arrival(&guest, host, gh, gt) {
+                                Arrival::Fault(fault) => {
+                                    g.sh().record_fail(FailEvent::MalformedChildPacket {
+                                        channel: channel_id,
+                                        fault,
+                                        head: gh,
+                                    });
+                                }
+                                // Completed since the ingest looked: the next
+                                // pass takes it.
+                                Arrival::Packet(_) => g.st().pending.child_mask |= bit,
+                                Arrival::Nothing => {}
+                            }
+                        }
+                    }
+                } else if fill > ring_length / 2 {
+                    note_store_route("lab_ring_nothing_at_fill");
+                    if crate::observe::first_sight(
+                        "lab_ring_nothing_at_fill",
+                        (u64::from(channel_id) << 32) | u64::from(head),
+                    ) {
+                        let hdr = ring.read(host, head, PACKET_HEADER_LEN).ok();
+                        let (op, total) = hdr.as_deref().map_or((u32::MAX, u32::MAX), |h| {
+                            (
+                                u32::from(ld16(&h[PACKET_OPCODE..])),
+                                ld32(&h[PACKET_TOTAL_SIZE..]),
+                            )
+                        });
+                        crate::observe::fail(format!(
+                            "lab_ring_nothing_at_fill ch={channel_id} head={head:#x} tail={tail:#x} \
+                             len={ring_length:#x} fill={fill} available={:?} op={op:#x} total={total} \
+                             (a ring more than half full gave no packet)",
+                            published_byte_count(head, tail, ring_length)
+                        ));
+                    }
+                }
                 host.note_work_scope(if lab_consumed {
                     crate::runtime::host::WorkScope::RingDrained(channel_id)
                 } else {
@@ -9416,12 +9558,19 @@ fn drain_child_fifo_g<H: HostMemory + HostOps>(
                     // pointer, and the packets behind it are not behind anything.
                     head = packet.next_head;
                     let head_started = crate::lab_clock::LabInstant::now();
-                    let head_write = gpa_map::write_u32(
-                        host,
-                        regs_gpa + CHILD_REG_HEAD,
-                        head,
-                        g.sh().page_size() as usize,
-                    );
+                    // Queue mode: the guest's head moved when the packet was
+                    // taken into the queue; the queue's own head is committed
+                    // when the copy runs out and when this drain leaves.
+                    let head_write = if ingest_queue.is_some() {
+                        Ok(())
+                    } else {
+                        gpa_map::write_u32(
+                            host,
+                            regs_gpa + CHILD_REG_HEAD,
+                            head,
+                            g.sh().page_size() as usize,
+                        )
+                    };
                     census::note_drain_regs(
                         census::RegsOp::HeadWrite,
                         head_started.elapsed().as_nanos() as u64,
@@ -9466,11 +9615,32 @@ fn drain_child_fifo_g<H: HostMemory + HostOps>(
                     }
                     break;
                 }
+                // TEMP (lab, TRANCHE_MS): a channel served longer than the
+                // budget hands the rest of its ring to the next wakeup, so the
+                // tranche ends and the device lock is let go between packets.
+                // Maps' full-screen tranches ran 120-275 ms and the guest reset
+                // the channel; windowed (<= 60 ms) it did not (b213).
+                let budget_us = lab_tranche_budget_us();
+                if budget_us > 0 && setup_started.elapsed().as_micros() as u64 >= budget_us {
+                    note_store_route("lab_tranche_budget_break");
+                    if head != tail {
+                        g.st().pending.child_mask |= bit;
+                    }
+                    break;
+                }
             }
         }
     }
 
     lab_chan::defer_exit(lab_defer_prev);
+    if let Some(q) = &ingest_queue {
+        let mut qg = q.lock();
+        qg.consume_to(head);
+        if !qg.is_empty() {
+            // Taken but not read (a snapshot or yield break): owed a drain.
+            g.st().pending.child_mask |= bit;
+        }
+    }
     // Every `break` above lands here, and what it owes is the same thing a
     // drain that ran the ring dry owes: a last look at what the model has
     // released. A drain that stopped on a decode fault or a host-action yield
@@ -11249,7 +11419,7 @@ fn lab_preempt_control<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
         ) else {
             continue;
         };
-        if head == tail {
+        if head == tail && !crate::runtime::ring_ingest::pending(state.id.0, ch) {
             continue;
         }
         note_store_route("lab_ctrl_preempt");
@@ -11352,6 +11522,24 @@ mod lab_chan {
     static WAIT_MAX: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
     static COMPOSITOR: AtomicU32 = AtomicU32::new(0);
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    /// Fullest the ring was (bytes between head and tail) when a drain read its
+    /// tail, and the ring's length — how close the guest came to a full ring.
+    static FILL_MAX: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
+    static FILL_LEN: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
+
+    /// TEMP (lab): the occupancy a drain found on arriving at `channel`'s ring.
+    /// Maps panics the guest in its paravirt channel reset (b196) while EXECs
+    /// hold the drain 100+ ms; whether the guest's ring for that channel was
+    /// full at the time is the question this answers.
+    pub(super) fn note_fill(channel: u32, head: u32, tail: u32, len: u32) {
+        let c = channel as usize;
+        if c >= N || len == 0 {
+            return;
+        }
+        let fill = (tail % len + len - head % len) % len;
+        FILL_MAX[c].fetch_max(fill, Relaxed);
+        FILL_LEN[c].store(len, Relaxed);
+    }
 
     /// TEMP (lab, `REIMS_VGPU_LAB_DEFER_EXEC=on`): while one child channel's
     /// ring is being read, a released EXEC of *another* channel waits for that
@@ -11520,12 +11708,14 @@ mod lab_chan {
                 continue;
             }
             line.push_str(&format!(
-                " ch{i}=task{}:runs{runs}:busy{}:wait{}:wmax{}:pres{}",
+                " ch{i}=task{}:runs{runs}:busy{}:wait{}:wmax{}:pres{}:fill{}/{}",
                 TASK[i].load(Relaxed) as i64,
                 BUSY_US[i].swap(0, Relaxed),
                 WAIT_US[i].swap(0, Relaxed),
                 WAIT_MAX[i].swap(0, Relaxed),
                 PRESENTS[i].swap(0, Relaxed),
+                FILL_MAX[i].swap(0, Relaxed),
+                FILL_LEN[i].load(Relaxed),
             ));
         }
         crate::observe::off(line);
