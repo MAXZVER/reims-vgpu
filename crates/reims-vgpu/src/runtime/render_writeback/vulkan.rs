@@ -40,6 +40,78 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     stored
 }
 
+/// TEMP (lab, live `T2T_COPY`, on unless `=off`): land a resident's pixels in a
+/// *different* mapping's guest pages with one readback - the copying arm of a
+/// whole-plane texture-to-texture blit out of a resident on a host that cannot
+/// import guest RAM.
+///
+/// Without it such a blit pays the source's debt (readback into the source's
+/// guest pages, with their dirty bookkeeping), then reads those pages and writes
+/// the destination's: full-screen 5K Maps spends ~36 % of the busy drain there
+/// (b250 sampler). Here the frame crosses once, straight into the destination,
+/// and the source's debt stays armed for its next genuine guest-byte reader -
+/// the same contract the GPU-direct arm of the blit keeps.
+///
+/// Deliberately not [`store_render_frame`]: its `finish` stamps the resident as
+/// the current mirror of the mapping it landed in, which is true for a Store into
+/// the resident's own surface and false here - the resident mirrors the
+/// *source*, and an epoch of the destination's would make it look current for a
+/// surface it never was.
+///
+/// `true` when the destination's pages hold the frame; `false` is a fall-through
+/// (nothing was written) and the caller takes the host path.
+pub(crate) fn copy_resident_into_mapping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+) -> bool {
+    let bpr = width.saturating_mul(4);
+    if let Ok(Some(leased)) = crate::backend::vulkan::engine::read_target_leased(identity) {
+        if leased.bgra {
+            let ok = crate::runtime::mapping_write::write_bgra8_uncached(
+                state,
+                host,
+                mapping_id,
+                leased.bytes(),
+                bpr,
+                width,
+                height,
+            );
+            drop(leased);
+            crate::runtime::drain::note_store_route(if ok { "t2t_copy_leased" } else { "t2t_copy_write_refused" });
+            return ok;
+        }
+        drop(leased);
+    }
+    let Ok(rb) = crate::backend::vulkan::engine::read_target(identity) else {
+        crate::runtime::drain::note_store_route("t2t_copy_unreadable");
+        return false;
+    };
+    let Some(scanout) = rb.into_bgra8() else {
+        crate::runtime::drain::note_store_route("t2t_copy_not_scanout");
+        return false;
+    };
+    let bytes = std::sync::Arc::new(scanout);
+    let ok = crate::runtime::mapping_write::write_bgra8_owned(state, host, mapping_id, &bytes, bpr, width, height);
+    crate::runtime::drain::note_store_route(if ok { "t2t_copy_copied" } else { "t2t_copy_write_refused" });
+    ok
+}
+
+/// TEMP (lab): whether [`copy_resident_into_mapping`] serves whole-plane blits.
+pub(crate) fn lab_t2t_copy_on() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("T2T_COPY") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_T2T_COPY").as_deref() != Ok("off"))
+}
+
 /// TEMP (lab): what the guest will read back from a small surface (icon-sized)
 /// right after this device landed a frame in it — once per mapping for an
 /// all-zero landing and once for a non-zero one.

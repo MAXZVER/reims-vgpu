@@ -161,10 +161,34 @@ pub(crate) fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
             // comparison in particular, which is the one that can refuse every
             // payment on one texture and leave a canvas black.
             note_store_route("sl_gpu_engine_declined");
-            crate::observe::off(format!(
-                "blit_gpu_plane mid={mapping_id} {}x{} decline={decline:?}",
-                plane.width, plane.height
-            ));
+            // TEMP (lab, T2T_COPY): a host that cannot import guest RAM declines
+            // every one of these; land the resident in the destination with one
+            // readback instead of paying the source and copying guest pages.
+            if crate::runtime::render_writeback::vulkan::lab_t2t_copy_on()
+                && crate::runtime::render_writeback::vulkan::copy_resident_into_mapping(
+                    state,
+                    host,
+                    mapping_id,
+                    &identity,
+                    plane.width,
+                    plane.height,
+                )
+            {
+                note_store_route("sl_gpu_copied");
+                if crate::observe::first_sight("lab_t2t_copy", u64::from(mapping_id)) {
+                    crate::observe::off(format!(
+                        "lab_t2t_copy mid={mapping_id} {}x{} (resident landed in the destination, source debt kept)",
+                        plane.width, plane.height
+                    ));
+                }
+                return Some(BlitStatus::Ok);
+            }
+            if crate::observe::first_sight("blit_gpu_plane_decline", u64::from(mapping_id)) {
+                crate::observe::off(format!(
+                    "blit_gpu_plane mid={mapping_id} {}x{} decline={decline:?}",
+                    plane.width, plane.height
+                ));
+            }
             None
         }
     }
