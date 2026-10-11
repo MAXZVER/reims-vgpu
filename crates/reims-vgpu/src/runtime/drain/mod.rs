@@ -9506,6 +9506,7 @@ fn drain_child_fifo_g<H: HostMemory + HostOps>(
             }
             Arrival::Packet(first) => {
                 lab_consumed = true;
+                lab_chan::note_packet(channel_id, first.opcode, first.total_size);
                 // TEMP (lab, ADMIT_AHEAD): the EXECs right behind an EXEC under
                 // this same tail read are admitted before any of them runs, and
                 // their surfaces named to the tracker's sync workers; see
@@ -11526,6 +11527,24 @@ mod lab_chan {
     /// tail, and the ring's length — how close the guest came to a full ring.
     static FILL_MAX: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
     static FILL_LEN: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
+    /// Largest packet (`total_size`, header included) a drain took off the
+    /// ring this census second, and its opcode.
+    static PKT_MAX: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
+    static PKT_OP: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
+
+    /// TEMP (lab): full-screen Maps resets the guest's channel within a second
+    /// of entering full screen, with ch1 51 KB of 64 KB. Whether a single
+    /// submission comes near the ring's whole length (the guest could then never
+    /// fit it) is the question this answers.
+    pub(super) fn note_packet(channel: u32, opcode: u16, total: u32) {
+        let c = channel as usize;
+        if c >= N {
+            return;
+        }
+        if PKT_MAX[c].fetch_max(total, Relaxed) < total {
+            PKT_OP[c].store(u32::from(opcode), Relaxed);
+        }
+    }
 
     /// TEMP (lab): the occupancy a drain found on arriving at `channel`'s ring.
     /// Maps panics the guest in its paravirt channel reset (b196) while EXECs
@@ -11708,7 +11727,7 @@ mod lab_chan {
                 continue;
             }
             line.push_str(&format!(
-                " ch{i}=task{}:runs{runs}:busy{}:wait{}:wmax{}:pres{}:fill{}/{}",
+                " ch{i}=task{}:runs{runs}:busy{}:wait{}:wmax{}:pres{}:fill{}/{}:pkt{}@{:#x}",
                 TASK[i].load(Relaxed) as i64,
                 BUSY_US[i].swap(0, Relaxed),
                 WAIT_US[i].swap(0, Relaxed),
@@ -11716,6 +11735,8 @@ mod lab_chan {
                 PRESENTS[i].swap(0, Relaxed),
                 FILL_MAX[i].swap(0, Relaxed),
                 FILL_LEN[i].load(Relaxed),
+                PKT_MAX[i].swap(0, Relaxed),
+                PKT_OP[i].load(Relaxed),
             ));
         }
         crate::observe::off(line);
