@@ -119,6 +119,32 @@ pub struct DependencyGraph {
     dead: usize,
     /// Old slot index to new, filled by `compact` and kept for its capacity.
     remap: Vec<usize>,
+    /// The `(domain, key)` pairs one admission has already compared and filed,
+    /// with whether the filed one writes. Cleared per admission, kept for its
+    /// capacity. See [`covered_by_earlier_access`].
+    seen: FxHashMap<(ChannelId, AccessKey), bool>,
+}
+
+/// Whether an access a transaction has already filed under the same domain and
+/// key makes this one redundant: `filed_writes` is whether that earlier access
+/// writes.
+///
+/// [`requires_edge`] reads three things off an access — its domain, whether it
+/// writes, and its key — so an access with the same domain and key that writes
+/// whenever this one does meets every earlier access this one meets, and every
+/// later access will meet it wherever it would meet this one. Comparing and
+/// filing the second one again produces no edge the first did not and leaves no
+/// entry a later admission needs: the transaction's own entries never make an
+/// edge against it ([`DependencyGraph::admit`] skips its own ordinal), and the
+/// two retire together.
+///
+/// The case is not hypothetical. A command buffer whose resources the model
+/// cannot bound declares one `DomainOnly` access per such record, and every one
+/// of them is the same access; full-screen 5K Maps admits ~46 of them per
+/// transaction, and each was compared against the domain's whole live list and
+/// filed into it again — 60-100 million comparisons a second for a few edges.
+fn covered_by_earlier_access(filed_writes: Option<bool>, writes: bool) -> bool {
+    filed_writes.is_some_and(|filed| filed || !writes)
 }
 
 /// Drop every index that maps to no live slot and renumber the rest, in
@@ -198,8 +224,19 @@ impl DependencyGraph {
         // panicking assertion above must not leave stale contents behind.
         let mut waits = std::mem::take(&mut self.waits);
         let mut scratch = std::mem::take(&mut self.scratch);
+        let mut seen = std::mem::take(&mut self.seen);
         waits.clear();
+        seen.clear();
         for intent in accesses {
+            let writes = intent.mode.writes();
+            let filed = seen.get(&(intent.domain, intent.key)).copied();
+            if covered_by_earlier_access(filed, writes) {
+                // Counted as admitted - it was - but neither compared nor filed.
+                self.census.accesses += 1;
+                self.census.by_rung[usize::from(intent.key.rung()) - 1] += 1;
+                continue;
+            }
+            seen.insert((intent.domain, intent.key), writes || filed.unwrap_or(false));
             scratch.clear();
             self.gather(intent, &mut scratch);
             for &candidate in &scratch {
@@ -232,6 +269,7 @@ impl DependencyGraph {
             self.insert(ordinal, *intent);
         }
         self.scratch = scratch;
+        self.seen = seen;
         let out = waits.clone();
         self.waits = waits;
         out
@@ -852,6 +890,28 @@ mod tests {
         }
     }
 
+    /// A transaction repeating one access files it once and waits exactly as
+    /// it would have: the full-screen Maps shape, dozens of identical
+    /// `DomainOnly` reads per command buffer, and a write after reads of the
+    /// same key that must still be filed because it covers more.
+    #[test]
+    fn repeated_accesses_of_one_transaction_are_filed_once_and_change_no_wait() {
+        let mut g = DependencyGraph::new();
+        let w = intent(AccessKey::Whole(res(1)), AccessMode::Write);
+        assert!(g.admit(ord(1), &[w]).is_empty());
+        let reads = vec![intent(AccessKey::DomainOnly, AccessMode::Read); 46];
+        assert_eq!(g.admit(ord(2), &reads), vec![ord(1)]);
+        assert_eq!(g.live_accesses(), 2, "46 identical reads are one entry");
+        assert_eq!(g.census().accesses, 47, "all of them still count as admitted");
+        // A read then a write of one key: the write is not covered by the read.
+        let r = intent(AccessKey::Whole(res(7)), AccessMode::Read);
+        let w7 = intent(AccessKey::Whole(res(7)), AccessMode::Write);
+        assert!(g.admit(ord(3), &[r, w7, r, w7]).iter().all(|o| *o < ord(3)));
+        assert_eq!(g.live_accesses(), 4, "the read and the write, once each");
+        // A later reader of key 7 waits on the writer.
+        assert!(g.admit(ord(4), &[r]).contains(&ord(3)));
+    }
+
     /// **Every edge points backwards, the indexes find exactly what an
     /// all-pairs scan would, and compacting changes no answer.**
     ///
@@ -879,6 +939,10 @@ mod tests {
             // Shadow: every access ever admitted, and whether it is still live.
             let mut shadow: Vec<(IngressOrdinal, AccessIntent, bool)> = Vec::new();
             let mut live_ordinals: Vec<IngressOrdinal> = Vec::new();
+            // The entries the graph files: the shadow's accesses less those an
+            // earlier access of the same transaction covers. Only `live_accesses`
+            // reads it; the edges are checked against the whole shadow.
+            let mut filed: Vec<(IngressOrdinal, bool)> = Vec::new();
             let mut ordinal = 0u64;
 
             for _ in 0..40 {
@@ -891,6 +955,11 @@ mod tests {
                     for e in &mut shadow {
                         if e.0 == retired {
                             e.2 = false;
+                        }
+                    }
+                    for e in &mut filed {
+                        if e.0 == retired {
+                            e.1 = false;
                         }
                     }
                     retirements += 1;
@@ -908,7 +977,17 @@ mod tests {
                     // an access of this transaction is visible to its own later
                     // accesses and never produces an edge against itself.
                     let mut expected: BTreeSet<IngressOrdinal> = BTreeSet::new();
+                    let mut seen_here: Vec<((ChannelId, AccessKey), bool)> = Vec::new();
                     for intent in &intents {
+                        let k = (intent.domain, intent.key);
+                        let prior = seen_here.iter().find(|(sk, _)| *sk == k).map(|(_, w)| *w);
+                        if !covered_by_earlier_access(prior, intent.mode.writes()) {
+                            filed.push((at, true));
+                            match seen_here.iter_mut().find(|(sk, _)| *sk == k) {
+                                Some(e) => e.1 = true,
+                                None => seen_here.push((k, intent.mode.writes())),
+                            }
+                        }
                         for (o, other, live) in &shadow {
                             if *live && *o != at && requires_edge(other, intent) {
                                 expected.insert(*o);
@@ -940,7 +1019,7 @@ mod tests {
                 // The observers agree with the shadow after every step.
                 assert_eq!(
                     g.live_accesses(),
-                    shadow.iter().filter(|(_, _, live)| *live).count(),
+                    filed.iter().filter(|(_, live)| *live).count(),
                     "seed {seed}: live_accesses"
                 );
                 assert_eq!(
