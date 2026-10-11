@@ -6754,6 +6754,9 @@ fn each_render_state_record_writes_the_one_field_it_names_and_no_other() {
             unrepresentable,
             // TEMP (lab): the pass-extent probe's field; not a render-state field.
             lab_target_extent: _,
+            // TEMP (lab): the dropped-draw diagnostic and the encoder-carry latch.
+            lab_ops: _,
+            lab_inherited: _,
             // What the walk resolved for itself; not a render-state field.
             memo: _,
         } = acc;

@@ -642,9 +642,12 @@ pub(super) fn note_stream_draw_drops(task_id: u32, acc: &StreamAccum) {
             crate::observe::Decline::slug(&d),
             u64::from(acc.dropped_no_pipeline.next_power_of_two()),
         ) {
+            let ops: Vec<String> = acc.lab_ops.iter().map(|o| format!("{o:#x}")).collect();
             crate::observe::Emit::decline("stream_draw", &d)
                 .field("task", task_id)
                 .field("kept", kept)
+                .field("first_ops", ops.join("/"))
+                .field("icb", acc.execute_icb.len())
                 .fail();
         }
     }

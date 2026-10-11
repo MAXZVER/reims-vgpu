@@ -122,6 +122,14 @@ struct PendingDraw {
 #[derive(Clone, Debug, Default)]
 struct StreamAccum {
     pipeline_ref: u32,
+    /// TEMP (lab): the first record opcodes of the stream, for the line that
+    /// reports draws dropped with no pipeline latched (Maps full screen loses
+    /// hundreds a stream; which record should have set the pipeline?).
+    lab_ops: Vec<u32>,
+    /// TEMP (lab, ENCODER_CARRY): this stream already took the encoder state the
+    /// previous render stream of its task ended with (see
+    /// [`lab_inherit_encoder_state`]).
+    lab_inherited: bool,
     /// Every colour attachment whose `load_action` is `Clear`, in stream order.
     ///
     /// Membership is the **load** action alone, because this is the pass's
@@ -237,6 +245,148 @@ struct StreamAccum {
 fn lab_pass_extent() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PASS_EXTENT").is_ok_and(|v| v == "on"))
+}
+
+/// TEMP (lab, `ENCODER_CARRY`, live, default on): the guest splits one render
+/// encoder across consecutive streams and does not re-state the encoder in the
+/// continuation - Maps full screen sends streams whose first record is a draw
+/// (`0x06`), with `SetRenderPipelineState` (`0x74`) only further on, and this
+/// device dropped every draw before it as `stream_draw_dropped_unbound`
+/// (b221: 370 and 916 of a stream). Encoder state - pipeline, bind tables,
+/// raster and depth-stencil state, viewports, scissors, visibility arming - is
+/// the encoder's, not the stream's; a stream reaching a draw with no pipeline
+/// of its own takes what the previous render stream of its task ended with,
+/// slot by slot where it has set nothing itself. The pass (attachments, load
+/// actions) stays the stream's own: it comes with the stream's descriptor.
+fn lab_encoder_carry_on() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("ENCODER_CARRY") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_ENCODER_CARRY").as_deref() != Ok("off"))
+}
+
+thread_local! {
+    /// TEMP (lab, ENCODER_CARRY): the encoder state each task's last render
+    /// stream ended with. Streams are walked and finished in guest order on the
+    /// drain, so the previous one is always here before the next is walked.
+    static LAB_CARRY: std::cell::RefCell<std::collections::HashMap<u32, StreamAccum>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Keep the encoder state `acc` ends with as `task_id`'s carry.
+fn lab_store_encoder_state(task_id: u32, acc: &StreamAccum) {
+    if acc.pipeline_ref == 0 || !lab_encoder_carry_on() {
+        return;
+    }
+    let carry = StreamAccum {
+        pipeline_ref: acc.pipeline_ref,
+        vertex_buffers: acc.vertex_buffers.clone(),
+        fragment_buffers: acc.fragment_buffers.clone(),
+        vertex_textures: acc.vertex_textures.clone(),
+        fragment_textures: acc.fragment_textures.clone(),
+        vertex_samplers: acc.vertex_samplers.clone(),
+        fragment_samplers: acc.fragment_samplers.clone(),
+        viewports: acc.viewports.clone(),
+        scissors: acc.scissors.clone(),
+        blend_color: acc.blend_color,
+        cull_mode: acc.cull_mode,
+        front_facing: acc.front_facing,
+        fill_mode: acc.fill_mode,
+        depth_clip_mode: acc.depth_clip_mode,
+        line_width: acc.line_width,
+        depth_bias: acc.depth_bias,
+        depth_stencil_ref: acc.depth_stencil_ref,
+        stencil_ref: acc.stencil_ref,
+        visibility: acc.visibility,
+        ..StreamAccum::default()
+    };
+    LAB_CARRY.with(|c| {
+        c.borrow_mut().insert(task_id, carry);
+    });
+}
+
+/// Slot-wise: the stream's own binds win, the carry fills the slots it has not
+/// touched.
+fn lab_merge_binds<B: Clone>(own: &mut BindTable<B>, carry: &BindTable<B>, index: impl Fn(&B) -> u32) {
+    if carry.is_empty() {
+        return;
+    }
+    if own.is_empty() {
+        *own = carry.clone();
+        return;
+    }
+    let mut merged: Vec<B> = (**own).clone();
+    for b in carry.iter() {
+        if !own.iter().any(|o| index(o) == index(b)) {
+            merged.push(b.clone());
+        }
+    }
+    *own = Arc::new(merged);
+}
+
+#[cfg(test)]
+mod lab_carry_tests {
+    use super::*;
+
+    #[test]
+    fn the_streams_own_binds_win_and_the_carry_fills_the_rest() {
+        let b = |index, buffer_ref| BufferBind { index, buffer_ref, ..BufferBind::default() };
+        let carry: BindTable<BufferBind> = Arc::new(vec![b(0, 10), b(1, 11), b(3, 13)]);
+        let mut own: BindTable<BufferBind> = Arc::new(vec![b(1, 21)]);
+        lab_merge_binds(&mut own, &carry, |x| x.index);
+        let mut got: Vec<(u32, u32)> = own.iter().map(|x| (x.index, x.buffer_ref)).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(0, 10), (1, 21), (3, 13)]);
+        let mut empty: BindTable<BufferBind> = Arc::new(Vec::new());
+        lab_merge_binds(&mut empty, &carry, |x| x.index);
+        assert_eq!(empty.len(), 3);
+    }
+}
+
+/// A stream about to drop a draw for want of a pipeline takes its task's carried
+/// encoder state, once.
+fn lab_inherit_encoder_state(task_id: u32, acc: &mut StreamAccum) {
+    if acc.pipeline_ref != 0 || acc.lab_inherited || !lab_encoder_carry_on() {
+        return;
+    }
+    acc.lab_inherited = true;
+    LAB_CARRY.with(|c| {
+        let c = c.borrow();
+        let Some(from) = c.get(&task_id) else {
+            crate::runtime::drain::note_store_route("lab_encoder_carry_none");
+            return;
+        };
+        crate::runtime::drain::note_store_route("lab_encoder_carry_inherited");
+        acc.pipeline_ref = from.pipeline_ref;
+        lab_merge_binds(&mut acc.vertex_buffers, &from.vertex_buffers, |b| b.index);
+        lab_merge_binds(&mut acc.fragment_buffers, &from.fragment_buffers, |b| b.index);
+        lab_merge_binds(&mut acc.vertex_textures, &from.vertex_textures, |b| b.index);
+        lab_merge_binds(&mut acc.fragment_textures, &from.fragment_textures, |b| b.index);
+        lab_merge_binds(&mut acc.vertex_samplers, &from.vertex_samplers, |b| b.index);
+        lab_merge_binds(&mut acc.fragment_samplers, &from.fragment_samplers, |b| b.index);
+        if acc.viewports.is_empty() {
+            acc.viewports = from.viewports.clone();
+        }
+        if acc.scissors.is_empty() {
+            acc.scissors = from.scissors.clone();
+        }
+        acc.blend_color = acc.blend_color.or(from.blend_color);
+        acc.cull_mode = acc.cull_mode.or(from.cull_mode);
+        acc.front_facing = acc.front_facing.or(from.front_facing);
+        acc.fill_mode = acc.fill_mode.or(from.fill_mode);
+        acc.depth_clip_mode = acc.depth_clip_mode.or(from.depth_clip_mode);
+        acc.line_width = acc.line_width.or(from.line_width);
+        acc.depth_bias = acc.depth_bias.or(from.depth_bias);
+        if acc.depth_stencil_ref == 0 {
+            acc.depth_stencil_ref = from.depth_stencil_ref;
+        }
+        acc.stencil_ref = acc.stencil_ref.or(from.stencil_ref);
+        acc.visibility = acc.visibility.or(from.visibility);
+    });
 }
 
 impl StreamAccum {
@@ -4467,6 +4617,7 @@ fn handle_render_draw<M: HostMemory + HostOps, S: WalkState>(
         return;
     };
 
+    lab_inherit_encoder_state(task_id, acc);
     if acc.pipeline_ref == 0 {
         acc.dropped_no_pipeline = acc.dropped_no_pipeline.saturating_add(1);
     } else if count == 0 {
@@ -4498,6 +4649,9 @@ fn handle_render_record<M: HostMemory + HostOps, S: WalkState>(
     out: &mut ExecResult,
     acc: &mut StreamAccum,
 ) {
+    if acc.lab_ops.len() < 24 {
+        acc.lab_ops.push(opcode);
+    }
     // **Which class of record this is, is the closure ledger's answer.** The
     // render rail carries the widest set on this device: the encoder's own
     // records, the fence pair, the barriers, the indirect-command executions,
@@ -5625,6 +5779,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
     // [`finish_phase`] for what the split is for.
     let mut fin = finish_phase::FinishTimer::open();
     note_stream_draw_drops(task_id, acc);
+    lab_store_encoder_state(task_id, acc);
     // Archive ApplePVGPUDrawJob: clear/load seed is private initial_rgba for the
     // async job; guest pages are written once at completion. Apply clear-to-guest
     // only for clear-only streams (no draws). When draws run, CLEAR is the Metal
@@ -6973,6 +7128,7 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
     // a legal empty draw rather than a record this device failed to decode — so
     // it takes the zero-count counter the way a zero-count direct draw does, and
     // the unlatched-pipeline reading beside it stays a loss on both arms.
+    lab_inherit_encoder_state(task_id, acc);
     if acc.pipeline_ref == 0 {
         acc.dropped_no_pipeline = acc.dropped_no_pipeline.saturating_add(1);
         return;
