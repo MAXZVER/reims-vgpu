@@ -2202,6 +2202,13 @@ pub(crate) fn arm_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
     if c0.texture_ref == 0 || window.generation == 0 {
         return false;
     }
+    // TEMP (lab, READ_REQUESTED): the guest already asked to read this resource
+    // and nothing was owed then - this Store's frame is what it will read, so it
+    // lands now (the caller's eager rail) rather than as a debt.
+    if take_read_requested(task_id, c0.texture_ref) {
+        crate::runtime::drain::note_store_route("gvadebt_read_requested_eager");
+        return false;
+    }
     // The switch that narrows the surface rail to the eager Store narrows this
     // one too: a GVA debt is the same deferral into a different ledger, and a
     // guest CPU reader that never synchronizes sees the same stale pages
@@ -3077,6 +3084,43 @@ fn pay<M: HostMemory + HostOps>(
         ));
     }
     crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
+}
+
+/// TEMP (lab, READ_REQUESTED 2026-10-12): resources the guest signalled it is
+/// about to read (`clear_guest_valid`) while this device owed them nothing.
+///
+/// b329-b336: a fresh process rendering into a managed texture, synchronizing
+/// and waiting read back zeros on its first round in every boot. The read
+/// signal reached the drain before the Store that produced the frame armed its
+/// GVA debt (`guest_read_unowed` then `armed`, a millisecond apart): the signal
+/// found nothing to pay, the debt was armed after it, the completion word went
+/// out unpaid, and the next round's Store superseded the debt. Paying again at
+/// the end of the signalling submission did not close it - the Store's debt is
+/// armed outside that submission - so the producing Store itself lands eagerly
+/// when its resource has an outstanding read request. Taken once; bounded.
+static READ_REQUESTED: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+const READ_REQUESTED_CAP: usize = 512;
+
+pub(crate) fn note_read_requested(task_id: u32, object_id: u32) {
+    let mut list = READ_REQUESTED.lock().unwrap_or_else(|e| e.into_inner());
+    if list.iter().any(|&(t, o)| t == task_id && o == object_id) {
+        return;
+    }
+    if list.len() >= READ_REQUESTED_CAP {
+        list.remove(0);
+    }
+    list.push((task_id, object_id));
+}
+
+fn take_read_requested(task_id: u32, object_id: u32) -> bool {
+    let mut list = READ_REQUESTED.lock().unwrap_or_else(|e| e.into_inner());
+    match list.iter().position(|&(t, o)| t == task_id && o == object_id) {
+        Some(i) => {
+            list.swap_remove(i);
+            true
+        }
+        None => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1413,6 +1413,24 @@ fn execute_submission_g<M: HostMemory + HostOps>(
         // TEMP (lab, `REIMS_VGPU_LAB_PREEMPT_INNER`): the control channels, between streams.
         crate::runtime::drain::lab_preempt_between_streams(state, host);
     }
+
+    // The guest's read signal (`clear_guest_valid`) arrives in this
+    // submission's own resource table, which is consumed before its streams
+    // run - so a frame this submission's draws Store into a resource the guest
+    // then reads is owed only *after* the table was paid. b329-b335: a fresh
+    // process drawing into a managed texture, synchronizing and waiting read
+    // back zeros whenever the Store's debt was armed after the table (the
+    // completion word went out, the next round's Store superseded the unpaid
+    // debt). Paid again here, after the streams and before the completion
+    // word; free when nothing is owed.
+    let state = g.st();
+    if !state.pending_writebacks.is_empty() {
+        for d in resource_descs.iter() {
+            if d.ops.clear_guest_valid != 0 {
+                pay_owed_before_guest_read(state, host, task_id, d.object_id, d.ops);
+            }
+        }
+    }
 }
 
 /// TEMP (lab, live `GATE_WALK_OPEN`, default on with FRAME_GATE): a stream no
@@ -1688,6 +1706,20 @@ pub(crate) fn pay_owed_before_guest_read<M: HostMemory + HostOps>(
     object_id: u32,
     ops: crate::protocol::fifo::InvalidateValidityOps,
 ) {
+    // TEMP (lab, READ_REQUESTED): a read signal for a resource this device owes
+    // nothing yet is remembered, so the Store that produces its frame - which
+    // can reach the drain after the signal - lands eagerly instead of arming a
+    // debt nobody will pay before the completion word (see
+    // `writeback_debt::note_read_requested`).
+    if ops.clear_guest_valid != 0
+        && object_id != 0
+        && !state.pending_writebacks.has_gva(crate::runtime::writeback_debt::GvaResourceKey {
+            task_id,
+            texture_ref: object_id,
+        })
+    {
+        crate::runtime::writeback_debt::note_read_requested(task_id, object_id);
+    }
     if ops.clear_guest_valid == 0 || object_id == 0 || state.pending_writebacks.is_empty() {
         return;
     }
