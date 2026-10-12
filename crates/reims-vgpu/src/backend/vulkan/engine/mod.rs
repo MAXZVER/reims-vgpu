@@ -5753,6 +5753,215 @@ fn read_target_leased_inner(identity: &TargetIdentity) -> Result<Option<LeasedFr
     }
 }
 
+/// TEMP (lab T2T_DEFER): a whole-frame readback of a resident into a leased
+/// staging slot, submitted and not waited - everything
+/// [`finish_target_read_leased`] needs to answer as [`read_target_leased`] would
+/// have at its submit.
+///
+/// Only the leased form defers. A slot the pool owns is sealed into a ring
+/// entry's cleanup and returned to the free list when that entry retires, which
+/// any later wait may do before this ticket is finished; a leased slot belongs to
+/// no ring entry and goes back only when its lease does - by this ticket's drop
+/// or by the [`LeasedFrame`] the finish hands out.
+pub struct TargetReadTicket {
+    token: pools::SubmissionToken,
+    device: u64,
+    readback: pools::BufferSlot,
+    lease_token: u64,
+    lease_ptr: usize,
+    len: usize,
+    bgra: bool,
+    /// Handed to the frame on finish; while it is set this ticket owns the lease.
+    armed: bool,
+}
+
+impl Drop for TargetReadTicket {
+    fn drop(&mut self) {
+        if self.armed {
+            // The pool takes the slot back only once its lease returns and puts
+            // it on the free list at its next reclaim; a teardown waits for
+            // outstanding leases first. A ticket dropped unfinished is a frame
+            // abandoned (its mapping moved on), never a slot handed out under a
+            // copy the ring has not retired: the free list is refilled from
+            // returned leases only by `reclaim_returned_readback_leases`, which
+            // runs under the engine lock beside the ring's own waits.
+            pools::return_readback_lease(self.lease_token);
+        }
+    }
+}
+
+impl TargetReadTicket {
+    /// Whether the frame will come out in the guest's scanout order.
+    pub fn bgra(&self) -> bool {
+        self.bgra
+    }
+}
+
+/// TEMP (lab T2T_DEFER): [`read_target_leased`] up to and including the copy's
+/// submit. `Ok(None)` is a routing answer - no lease to be had - and the caller
+/// takes the synchronous rail.
+pub fn submit_target_read_leased(identity: &TargetIdentity) -> Result<Option<TargetReadTicket>, DrawError> {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let (snap, layout) = readback_snapshot(pools, identity)?;
+    if !layout.is_four_byte_color() {
+        return Err(DrawError::TargetRead(
+            reason::TargetReadDecline::TexelNotFourBytes {
+                format: snap.format,
+            },
+        ));
+    }
+    let rb_size =
+        (snap.width as u64) * (snap.height as u64) * u64::from(RESIDENT_READ_BYTES_PER_TEXEL);
+    let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
+    let ops = target_readback_ops();
+    unsafe {
+        // The submit half of `copy_image_level0_to_host_delivered`, with the
+        // lease required: see the ticket's doc for why an owned slot cannot wait.
+        let appended = pools.batch_open_recording();
+        let (cb, fence) = match appended {
+            Some(pair) => {
+                counters.batch_readback_joins.fetch_add(1, Ordering::Relaxed);
+                pair
+            }
+            None => pools.begin_entry(ctx, counters)?,
+        };
+        let readback = pools.acquire_readback(ctx, rb_size, counters)?;
+        let lease = pools.lease_readback();
+        let fits = lease
+            .as_ref()
+            .is_some_and(|l| pools::slot_span_fits(rb_size, l.slot_size));
+        let mut guard_lease = ReadbackLeaseGuard::new(lease);
+        if appended.is_none() {
+            pools.begin_slot_recording(ctx, cb, gpu_span::Kind::Readback, ops.reset_cb, ops.begin_cb)?;
+        }
+        if fits {
+            pools.close_open_pass(&ctx.device, cb);
+            pools.readback_span_arm(ctx, cb);
+            let barrier = [ash::vk::ImageMemoryBarrier::default()
+                .src_access_mask(RESIDENT_READ_SRC_ACCESS)
+                .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
+                .old_layout(snap.layout)
+                .new_layout(read_access.layout())
+                .image(snap.image)
+                .subresource_range(color_subresource_range())];
+            crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(
+                &ctx.device,
+                cb,
+                ash::vk::PipelineStageFlags::ALL_COMMANDS,
+                ash::vk::PipelineStageFlags::TRANSFER,
+                feedback_transition_dependency(snap.layout),
+                &[],
+                &[],
+                &barrier,
+            );
+            pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1);
+            let region = [ash::vk::BufferImageCopy::default()
+                .image_subresource(color_subresource_layers())
+                .image_extent(ash::vk::Extent3D {
+                    width: snap.width,
+                    height: snap.height,
+                    depth: 1,
+                })];
+            crate::backend::vulkan::engine::cmd_sink::copy_image_to_buffer(
+                &ctx.device,
+                cb,
+                snap.image,
+                read_access.layout(),
+                readback.buffer,
+                &region,
+            );
+            pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2);
+        }
+        // Submitted either way: the entry is begun (or the batch carries draws),
+        // and an unleased answer still has to end what it began.
+        if appended.is_some() {
+            pools.batch_flush(ctx, counters)?;
+        } else {
+            pools.gpu_span_seal_current(ctx, cb);
+            crate::backend::vulkan::engine::cmd_sink::sync();
+            ctx.device
+                .end_command_buffer(cb)
+                .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
+            ctx.submit_queue_work(&[cb], &[], &[], &[], fence)
+                .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
+            let sealed = pools.seal_entry(Vec::new(), Vec::new());
+            pools.finish_entry_async(&ctx.device, sealed);
+        }
+        if !fits {
+            return Ok(None); // the guard returns any lease taken
+        }
+        let token = pools.last_submission();
+        pools.registry_note_access(identity, read_access);
+        counters.note_target_read(rb_size, TargetReadDelivery::Host);
+        let lease = guard_lease.disarm().expect("fits implies a lease");
+        Ok(Some(TargetReadTicket {
+            token,
+            device: ash::vk::Handle::as_raw(ctx.device.handle()),
+            readback,
+            lease_token: lease.token,
+            lease_ptr: lease.ptr,
+            len: rb_size as usize,
+            bgra: snap.bgra(),
+            armed: true,
+        }))
+    }
+}
+
+/// TEMP (lab T2T_DEFER): whether `ticket`'s copy has finished (true too when the
+/// device it ran on is gone - nothing is left to wait for).
+pub fn target_read_done(ticket: &TargetReadTicket) -> bool {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let Ok(ctx) = owner.ensure(counters) else {
+        return true;
+    };
+    if ash::vk::Handle::as_raw(ctx.device.handle()) != ticket.device {
+        return true;
+    }
+    unsafe { pools.submission_done(ctx, counters, ticket.token) }.unwrap_or(true)
+}
+
+/// TEMP (lab T2T_DEFER): wait `ticket`'s copy and hand its frame out as
+/// [`read_target_leased`] would have. `Ok(None)`: the device it ran on is gone.
+pub fn finish_target_read_leased(mut ticket: TargetReadTicket) -> Result<Option<LeasedFrame>, DrawError> {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    if ash::vk::Handle::as_raw(ctx.device.handle()) != ticket.device {
+        return Ok(None);
+    }
+    let ops = target_readback_ops();
+    unsafe {
+        pools.wait_submission(ctx, counters, ticket.token)?;
+        pools::invalidate_slot_for_read(ctx, &ticket.readback, ops.invalidate)?;
+    }
+    ticket.armed = false;
+    Ok(Some(LeasedFrame {
+        token: ticket.lease_token,
+        ptr: ticket.lease_ptr,
+        len: ticket.len,
+        bgra: ticket.bgra,
+    }))
+}
+
 /// Where in the guest's own pages a resident's frame lands, as a bounded
 /// reference the engine can bind.
 ///

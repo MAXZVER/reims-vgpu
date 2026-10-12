@@ -552,6 +552,27 @@ use crate::model::DeviceState;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 
+/// TEMP (lab T2T_DEFER): whether any deferred blit frame is owed.
+#[inline]
+pub fn vulkan_t2t_pending() -> bool {
+    #[cfg(feature = "backend-vulkan")]
+    return vulkan::T2T_PENDING_N.load(std::sync::atomic::Ordering::Acquire) != 0;
+    #[cfg(not(feature = "backend-vulkan"))]
+    false
+}
+
+/// TEMP (lab T2T_DEFER): land the deferred whole-plane blit frames owed to
+/// `only` (or to every mapping). Free when none is owed: one atomic load.
+#[inline]
+pub fn land_t2t<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(state: &mut DeviceState, host: &mut M, only: Option<u32>) {
+    #[cfg(feature = "backend-vulkan")]
+    if vulkan::T2T_PENDING_N.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        vulkan::land_t2t(state, host, only);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = (state, host, only);
+}
+
 /// Declare the settle sites once, and derive both census route names from one
 /// slug each: `concat!` builds `<slug>_us` from `<slug>`, so the count route
 /// and the cost route cannot drift into naming different sites.

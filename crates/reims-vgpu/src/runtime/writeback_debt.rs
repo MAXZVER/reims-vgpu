@@ -1489,6 +1489,7 @@ pub fn pay_for_mapping<M: HostMemory + HostOps>(
     host: &mut M,
     mapping_id: u32,
 ) {
+    crate::runtime::render_writeback::land_t2t(state, host, Some(mapping_id)); // TEMP (lab T2T_DEFER)
     if state.pending_writebacks.is_empty() {
         return;
     }
@@ -1529,6 +1530,7 @@ pub fn pay_for_mapping<M: HostMemory + HostOps>(
 /// rail must not do. [`note_unnamed_reach`] is the instrument that says whether
 /// it would be worth it; read its doc before building one.
 pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
+    crate::runtime::render_writeback::land_t2t(state, host, None); // TEMP (lab T2T_DEFER)
     if state.pending_writebacks.is_empty() {
         return;
     }
@@ -1902,6 +1904,12 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
 ) {
+    // TEMP (lab T2T_DEFER): a reader of either surface spelling of this texture.
+    if crate::runtime::render_writeback::vulkan_t2t_pending() {
+        for mapping_id in state.mappings_named_by(task_id, texture_ref).iter() {
+            crate::runtime::render_writeback::land_t2t(state, host, Some(mapping_id));
+        }
+    }
     if state.pending_writebacks.is_empty() {
         return;
     }

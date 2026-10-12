@@ -165,6 +165,19 @@ pub(crate) fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
             // every one of these; land the resident in the destination with one
             // readback instead of paying the source and copying guest pages.
             if crate::runtime::render_writeback::vulkan::lab_t2t_copy_on()
+                && crate::runtime::render_writeback::vulkan::lab_t2t_defer_on()
+                && crate::runtime::render_writeback::vulkan::defer_resident_into_mapping(
+                    state,
+                    mapping_id,
+                    &identity,
+                    plane.width,
+                    plane.height,
+                )
+            {
+                note_store_route("sl_gpu_deferred");
+                return Some(BlitStatus::Ok);
+            }
+            if crate::runtime::render_writeback::vulkan::lab_t2t_copy_on()
                 && crate::runtime::render_writeback::vulkan::copy_resident_into_mapping(
                     state,
                     host,

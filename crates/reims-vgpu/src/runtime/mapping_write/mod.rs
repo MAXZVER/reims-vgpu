@@ -808,6 +808,10 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     height: u32,
     skip: SkipRanges<'_>,
 ) -> bool {
+    // TEMP (lab T2T_DEFER): an older blit frame owed to this mapping lands first,
+    // so it cannot land on top of this one later. The landing's own write took
+    // its entry out before writing, so this finds nothing for it.
+    crate::runtime::render_writeback::land_t2t(state, host, Some(mapping_id));
     if !scanout_extent_ok(width, height) {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }

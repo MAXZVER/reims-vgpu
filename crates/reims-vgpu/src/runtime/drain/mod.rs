@@ -7624,6 +7624,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
     // DeleteIOSurfaceBacking2, the two places the GPU-direct writebacks settle too
     // (`settle_released_span`, `settle_released_mapping`). Waiting on every map for
     // the landing was 36 % of this function on full-screen transitions (n185 fsz0).
+    crate::runtime::render_writeback::land_t2t(state, host, None); // TEMP (lab T2T_DEFER)
     if family != MapFamily::MapMemory2 || crate::runtime::writeback_debt::lab_map_land_all() {
         if lab_land_reach() && deferred_landing_disjoint(state, &*host, packet, family) {
             note_store_route("lab_land_reach_skipped");

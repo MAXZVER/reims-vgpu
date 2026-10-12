@@ -100,6 +100,159 @@ pub(crate) fn copy_resident_into_mapping<M: HostMemory + HostOps>(
     ok
 }
 
+/// TEMP (lab T2T_DEFER): a whole-plane texture blit's frame, read back off the
+/// queue and not landed yet - see [`defer_resident_into_mapping`].
+struct PendingT2t {
+    mapping_id: u32,
+    map_generation: u32,
+    width: u32,
+    height: u32,
+    ticket: crate::backend::vulkan::engine::TargetReadTicket,
+}
+
+static PENDING_T2T: std::sync::Mutex<Vec<PendingT2t>> = std::sync::Mutex::new(Vec::new());
+
+/// TEMP (lab, live `T2T_DEFER`, on unless `=off`; b265: full-screen Maps s5 33.8/38.8 ->
+/// 22.3/25.1 ms, worst 183/181 -> 137/128 ms, fps 24.0/20.7 -> 25.1/24.2): land a T2T_COPY frame later
+/// instead of waiting the GPU for it inside the blit.
+///
+/// [`copy_resident_into_mapping`] waits the copy's fence where the blit is, and
+/// in full-screen 5K Maps that wait is ~10 % of the busy drain (b264) on a host
+/// GPU that is idle four fifths of the time (b258): the drain waits for the draws
+/// it has just submitted. Here the readback is submitted into a leased slot and
+/// the frame lands at the first point that needs it - a device reader of the
+/// mapping (`pay_for_mapping`, `pay_for_texture`, `pay_all`), a device write into
+/// it (`mapping_write`), a map-family packet, or the tranche end - the same set
+/// of points the deferred payment of a presented frame lands at (PAY_DEFER).
+pub(crate) fn lab_t2t_defer_on() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("T2T_DEFER") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_T2T_DEFER").as_deref() != Ok("off"))
+}
+
+/// TEMP (lab T2T_DEFER): submit `identity`'s readback for `mapping_id` and owe
+/// the landing. `false` is a fall-through: nothing was submitted that the caller
+/// must account for, and the synchronous [`copy_resident_into_mapping`] serves.
+///
+/// What a debt's arm does for the same reason is done here, because the frame is
+/// in the same state a debt's is - published by the device, not yet in the
+/// guest's pages: the content is published (`note_surface_content_published`
+/// orders it against a later guest claim, which the landing reads back through
+/// `licence_of`), and the host surface cache, which would otherwise serve the
+/// previous frame, is dropped.
+pub(crate) fn defer_resident_into_mapping(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+) -> bool {
+    let Some(map_generation) = state.mappings.get(&mapping_id).map(|m| m.map_generation) else {
+        return false;
+    };
+    let ticket = match crate::backend::vulkan::engine::submit_target_read_leased(identity) {
+        Ok(Some(t)) if t.bgra() => t,
+        Ok(Some(t)) => {
+            drop(t);
+            crate::runtime::drain::note_store_route("t2t_defer_not_bgra");
+            return false;
+        }
+        Ok(None) => {
+            crate::runtime::drain::note_store_route("t2t_defer_no_lease");
+            return false;
+        }
+        Err(_) => {
+            crate::runtime::drain::note_store_route("t2t_defer_submit_failed");
+            return false;
+        }
+    };
+    state.note_surface_content_published(mapping_id);
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    let mut pending = PENDING_T2T.lock().unwrap_or_else(|e| e.into_inner());
+    // A whole-plane copy into the same mapping supersedes an older one nobody
+    // has read: no reader landed it, and this frame replaces all of it.
+    let before = pending.len();
+    pending.retain(|p| p.mapping_id != mapping_id);
+    if pending.len() != before {
+        crate::runtime::drain::note_store_route("t2t_defer_superseded");
+    }
+    pending.push(PendingT2t {
+        mapping_id,
+        map_generation,
+        width,
+        height,
+        ticket,
+    });
+    T2T_PENDING_N.store(pending.len(), std::sync::atomic::Ordering::Release);
+    crate::runtime::drain::note_store_route("t2t_deferred");
+    true
+}
+
+/// TEMP (lab T2T_DEFER): land the owed T2T frames - those for `only`, or all.
+pub(crate) fn land_t2t<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, only: Option<u32>) {
+    let taken: Vec<PendingT2t> = {
+        let mut pending = PENDING_T2T.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < pending.len() {
+            if only.is_none_or(|m| pending[i].mapping_id == m) {
+                out.push(pending.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        T2T_PENDING_N.store(pending.len(), std::sync::atomic::Ordering::Release);
+        out
+    };
+    for p in taken {
+        let live = state.mappings.get(&p.mapping_id).is_some_and(|m| {
+            m.map_generation == p.map_generation
+                && crate::runtime::resource_validity::licence_of(m.validity)
+                    != crate::runtime::resource_validity::WritebackLicence::Superseded
+        });
+        if !live {
+            crate::runtime::drain::note_store_route("t2t_defer_dropped");
+            continue; // the ticket's drop returns the lease
+        }
+        match crate::backend::vulkan::engine::finish_target_read_leased(p.ticket) {
+            Ok(Some(frame)) => {
+                let ok = crate::runtime::mapping_write::write_bgra8_uncached(
+                    state,
+                    host,
+                    p.mapping_id,
+                    frame.bytes(),
+                    p.width.saturating_mul(4),
+                    p.width,
+                    p.height,
+                );
+                drop(frame);
+                crate::runtime::drain::note_store_route(if ok { "t2t_defer_landed" } else { "t2t_defer_write_refused" });
+                if !ok {
+                    crate::observe::fail(format!(
+                        "t2t_defer_lost mapping={} {}x{} reason=write_refused",
+                        p.mapping_id, p.width, p.height
+                    ));
+                }
+            }
+            Ok(None) => crate::runtime::drain::note_store_route("t2t_defer_device_gone"),
+            Err(e) => {
+                crate::observe::Emit::decline("t2t_defer_lost", &e)
+                    .field("mapping", p.mapping_id)
+                    .fail();
+            }
+        }
+    }
+}
+
+/// TEMP (lab T2T_DEFER): how many frames are owed - the cheap test every landing
+/// point makes before taking the lock.
+pub(crate) static T2T_PENDING_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// TEMP (lab): whether [`copy_resident_into_mapping`] serves whole-plane blits.
 pub(crate) fn lab_t2t_copy_on() -> bool {
     if cfg!(test) {
