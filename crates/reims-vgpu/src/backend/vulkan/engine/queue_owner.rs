@@ -29,6 +29,9 @@ struct OwnedSubmit {
     fence: vk::Fence,
     timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
     async_queued_at: Option<std::time::Instant>,
+    /// TEMP (lab, REC_LANE_END): the recording lane's list that ends these
+    /// command buffers; the submit waits for it (and refuses on a lane failure).
+    gate: Option<super::cmd_sink::Gate>,
 }
 
 /// Completion of one ordered submit-plus-present transaction.
@@ -211,11 +214,14 @@ impl QueueOwner {
             .unwrap_or(Err(vk::Result::ERROR_DEVICE_LOST))
     }
 
-    pub(crate) fn submit_sync(
+    /// Submit and wait for the owner's reply. TEMP (lab, REC_LANE_END): behind
+    /// `gate`, the recording lane's list that ends these command buffers.
+    pub(crate) fn submit_sync_gated(
         &self,
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
         timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
+        gate: Option<super::cmd_sink::Gate>,
     ) -> Result<(), vk::Result> {
         let submit = OwnedSubmit {
             command_buffers: command_buffers.to_vec(),
@@ -225,6 +231,7 @@ impl QueueOwner {
             fence,
             timeline,
             async_queued_at: None,
+            gate,
         };
         self.unsubmitted.insert(submit.fence);
         self.send_sync(|reply| Request::Submit {
@@ -239,6 +246,18 @@ impl QueueOwner {
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
         timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
+    ) -> Result<(), vk::Result> {
+        self.submit_async_gated(command_buffers, fence, timeline, None)
+    }
+
+    /// TEMP (lab, REC_LANE_END): [`Self::submit_async`] of command buffers a
+    /// recording lane ends: the owner waits `gate` before `vkQueueSubmit`.
+    pub(crate) fn submit_async_gated(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        fence: vk::Fence,
+        timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
+        gate: Option<super::cmd_sink::Gate>,
     ) -> Result<(), vk::Result> {
         if let Some(result) = self.failure.get() {
             return Err(result);
@@ -257,6 +276,7 @@ impl QueueOwner {
                     fence,
                     timeline,
                     async_queued_at: Some(std::time::Instant::now()),
+                    gate,
                 },
                 reply: None,
             })
@@ -283,6 +303,7 @@ impl QueueOwner {
             fence,
             timeline: None,
             async_queued_at: None,
+            gate: None,
         };
         self.unsubmitted.insert(submit.fence);
         self.send_sync(|reply| Request::Submit {
@@ -315,6 +336,7 @@ impl QueueOwner {
             fence: transaction.fence,
             timeline: None,
             async_queued_at: None,
+            gate: None,
         };
         let (reply, receiver) = mpsc::sync_channel(1);
         self.unsubmitted.insert(submit.fence);
@@ -397,10 +419,14 @@ fn run(
             Request::Submit { submit, reply } => {
                 let async_queued_at = submit.async_queued_at;
                 let fence = submit.fence;
+                // TEMP (lab, REC_LANE_END): a lane still recording these
+                // buffers finishes first; one that failed refuses them.
+                let gated = submit.gate.map_or(Ok(()), super::cmd_sink::wait_gate);
                 let driver_started = std::time::Instant::now();
-                let result = failure
-                    .get()
-                    .map_or_else(|| unsafe { execute_submit(device, queue, submit) }, Err);
+                let result = match (failure.get(), gated) {
+                    (Some(e), _) | (None, Err(e)) => Err(e),
+                    (None, Ok(())) => unsafe { execute_submit(device, queue, submit) },
+                };
                 // Passed (or refused): either way no later `vkQueueSubmit` will
                 // touch the fence, so other threads may.
                 unsubmitted.remove(fence);

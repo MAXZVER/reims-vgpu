@@ -805,11 +805,12 @@ impl Handoff {
             format!(
                 "recorder win_ms={win_ms} deferred={submitted} busy_us={} wakes={wakes} \
                  prewakes={prewakes} deferred_err={err} submit_declined={declined}{body} \
-                 lab_below_n={} lab_below_depth={} lab_below_out_max={} top={}",
+                 lab_below_n={} lab_below_depth={} lab_below_out_max={}{} top={}",
                 busy / 1000,
                 LAB_BELOW_N.swap(0, Ordering::Relaxed),
                 LAB_BELOW_DEPTH.load(Ordering::Relaxed),
                 LAB_BELOW_OUT_MAX.swap(0, Ordering::Relaxed),
+                super::cmd_sink::take_window_text(),
                 if top.is_empty() {
                     "-".to_string()
                 } else {

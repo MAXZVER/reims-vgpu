@@ -311,7 +311,7 @@ impl ResourcePools {
             idle_clock_ms: 0,
             last_maintenance_ms: 0,
             settled_maintenance_passes: 0,
-            cmd_pool: vk::CommandPool::null(),
+            cmd_pools: Vec::new(),
             desc_arena: DescriptorArena::empty(),
             scatter: None,
             scatter_refused: false,
@@ -655,33 +655,51 @@ impl ResourcePools {
             return Ok(());
         }
         self.configure_batch_capacity(super::batch_max_draws(ctx.caps.memory.topology));
-        let cmd_pool = ctx
-            .device
-            .create_command_pool(
+        // TEMP (lab, REC_LANES): a pool per slot, so two recording lanes can
+        // record two slots' command buffers at once.
+        let destroy_pools = |pools: &[vk::CommandPool]| {
+            for pool in pools {
+                ctx.device.destroy_command_pool(*pool, None);
+            }
+        };
+        let mut cmd_pools = Vec::with_capacity(RING_DEPTH);
+        let mut cmd_bufs = Vec::with_capacity(RING_DEPTH);
+        for _ in 0..RING_DEPTH {
+            let pool = match ctx.device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
                     .queue_family_index(ctx.gq)
                     .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
                 None,
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateCommandPool, e)))?;
-        counters.note_create(CreateSite::CommandPool);
-        let cmd_bufs = ctx
-            .device
-            .allocate_command_buffers(
+            ) {
+                Ok(pool) => pool,
+                Err(e) => {
+                    destroy_pools(&cmd_pools);
+                    return Err(DrawError::VkCall(VkCall::new(VkOp::PoolsCreateCommandPool, e)));
+                }
+            };
+            counters.note_create(CreateSite::CommandPool);
+            cmd_pools.push(pool);
+            match ctx.device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(cmd_pool)
+                    .command_pool(pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(RING_DEPTH as u32),
-            )
-            .map_err(|e| {
-                ctx.device.destroy_command_pool(cmd_pool, None);
-                DrawError::VkCall(VkCall::new(VkOp::PoolsAllocCommandBuffers, e))
-            })?;
+                    .command_buffer_count(1),
+            ) {
+                Ok(cbs) => cmd_bufs.push(cbs[0]),
+                Err(e) => {
+                    destroy_pools(&cmd_pools);
+                    return Err(DrawError::VkCall(VkCall::new(VkOp::PoolsAllocCommandBuffers, e)));
+                }
+            }
+        }
+        for (slot, cb) in cmd_bufs.iter().enumerate() {
+            crate::backend::vulkan::engine::cmd_sink::register_cb(*cb, slot);
+        }
         // Growable descriptor arena: block 0 up front, more blocks on demand.
         // Free sets after each draw/dispatch; exhaustion grows rather than drops.
         let mut desc_arena = DescriptorArena::empty();
         if let Err(e) = desc_arena.create_first_block(&ctx.device) {
-            ctx.device.destroy_command_pool(cmd_pool, None);
+            destroy_pools(&cmd_pools);
             return Err(e);
         }
         counters.note_create(CreateSite::DescriptorPool);
@@ -709,12 +727,12 @@ impl ResourcePools {
                         ctx.device.destroy_fence(slot.fence, None);
                     }
                     desc_arena.destroy(&ctx.device);
-                    ctx.device.destroy_command_pool(cmd_pool, None);
+                    destroy_pools(&cmd_pools);
                     return Err(DrawError::VkCall(VkCall::new(VkOp::PoolsCreateFence, e)));
                 }
             }
         }
-        self.cmd_pool = cmd_pool;
+        self.cmd_pools = cmd_pools;
         self.desc_arena = desc_arena;
         self.slots = slots;
         self.cur = 0;
@@ -1213,6 +1231,14 @@ impl ResourcePools {
         reset_op: VkOp,
         begin_op: VkOp,
     ) -> Result<(), DrawError> {
+        // TEMP (lab, REC_LANE_END): inside a draw the reset and begin are the
+        // first commands of the buffer's lane list - nothing to wait for; a
+        // failure there poisons the context and refuses the buffer's submit.
+        if crate::backend::vulkan::engine::cmd_sink::defer_lifecycle() {
+            crate::backend::vulkan::engine::cmd_sink::begin(cb);
+            unsafe { self.gpu_span_arm(ctx, cb, kind) };
+            return Ok(());
+        }
         crate::backend::vulkan::engine::cmd_sink::sync();
         ctx.device
             .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
@@ -2115,6 +2141,10 @@ impl ResourcePools {
         let Some(mut batch) = self.take_open_batch() else {
             return Ok(());
         };
+        // TEMP (lab, REC_LANE_END): the closing commands and the end go to the
+        // buffer's lane, from the drain's flush as well as a draw's, and the
+        // submission waits for them at the queue owner.
+        let _lane_scope = crate::backend::vulkan::engine::cmd_sink::scope();
         let close_started = std::time::Instant::now();
         // The CB is about to be ended and submitted, so no pass inside it is
         // still open to continue.
@@ -2137,15 +2167,20 @@ impl ResourcePools {
         );
         let submit = (|| -> Result<(), DrawError> {
             let end_started = std::time::Instant::now();
-            crate::backend::vulkan::engine::cmd_sink::sync();
-            let end_result = ctx.device.end_command_buffer(batch.cb);
+            let gate = if crate::backend::vulkan::engine::cmd_sink::defer_lifecycle() {
+                Some(crate::backend::vulkan::engine::cmd_sink::end(batch.cb))
+            } else {
+                crate::backend::vulkan::engine::cmd_sink::sync();
+                let end_result = ctx.device.end_command_buffer(batch.cb);
+                end_result.map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsEndCbBatch, e)))?;
+                None
+            };
             counters
                 .batch_flush_end_us
                 .fetch_add(end_started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            end_result.map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsEndCbBatch, e)))?;
             let cbs = [batch.cb];
             let submit_started = std::time::Instant::now();
-            let result = ctx.submit_guest_work_async(&cbs, batch.fence);
+            let result = ctx.submit_guest_work_async_gated(&cbs, batch.fence, gate);
             counters.batch_flush_submit_us.fetch_add(
                 submit_started.elapsed().as_micros() as u64,
                 Ordering::Relaxed,

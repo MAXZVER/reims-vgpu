@@ -16,6 +16,17 @@
 //! lane may still copy into, and every `vkCmd*` made outside a draw (each one
 //! syncs first, so order and exclusive use of the pool both hold).
 //!
+//! TEMP (lab, REC_LANES / REC_LANE_END, 2026-10-12): there are N lanes
+//! (`REIMS_VGPU_LAB_REC_LANES`, default 1), each fixed for a share of the ring's
+//! command buffers, each of which comes from its own pool, so lanes record
+//! different buffers at once. Inside a draw (and in the drain's batch flush,
+//! [`scope`]) the buffer's reset/begin and end are lane commands too, and the
+//! submission carries a [`Gate`] - the list holding the end - which the queue
+//! owner waits for before `vkQueueSubmit`. Submit order stays the order the
+//! submissions were handed to the owner, and the recorder no longer waits for a
+//! lane at a batch boundary while it holds the engine lock (b270/b274: ~18 % of
+//! its busy time on heavy Maps, and the drain blocked on that lock ~160 ms/s).
+//!
 //! A list is an arena: the commands name ranges of typed side arrays, and lists
 //! come back from the lane cleared, so a steady stream allocates nothing. The
 //! lane spins briefly before it parks, and the recorder wakes it only from a
@@ -28,7 +39,7 @@ use ash::vk;
 use parking_lot::{Condvar, Mutex};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -164,6 +175,12 @@ enum Cmd {
     ),
     /// Host copies into a mapped staging span (`write_staging_from_runs`).
     HostCopy(R),
+    /// TEMP (lab, REC_LANE_END): `vkResetCommandBuffer` + `vkBeginCommandBuffer`
+    /// (one-time submit) of a ring slot's command buffer.
+    Begin(vk::CommandBuffer),
+    /// TEMP (lab, REC_LANE_END): `vkEndCommandBuffer`; the submission that
+    /// carries the buffer waits for it at the queue owner ([`Gate`]).
+    End(vk::CommandBuffer),
 }
 
 /// A push-descriptor write; its infos are a range of `iinfos` or `binfos`.
@@ -270,22 +287,214 @@ struct Lane {
     pushed: AtomicU64,
     done: AtomicU64,
     waiters: AtomicU32,
-    loaders: OnceLock<LoadersCell>,
+    busy_ns: AtomicU64,
+    lists: AtomicU64,
 }
 
-static LANE: Lane = Lane {
-    queue: Mutex::new(None),
-    work: Condvar::new(),
-    idle: Condvar::new(),
-    pushed: AtomicU64::new(0),
-    done: AtomicU64::new(0),
-    waiters: AtomicU32::new(0),
-    loaders: OnceLock::new(),
+impl Lane {
+    const fn new() -> Self {
+        Self {
+            queue: Mutex::new(None),
+            work: Condvar::new(),
+            idle: Condvar::new(),
+            pushed: AtomicU64::new(0),
+            done: AtomicU64::new(0),
+            waiters: AtomicU32::new(0),
+            busy_ns: AtomicU64::new(0),
+            lists: AtomicU64::new(0),
+        }
+    }
+}
+
+/// TEMP (lab, REC_LANES): the most lanes [`lane_count`] may ask for.
+const MAX_LANES: usize = 4;
+
+/// TEMP (lab, REC_LANES): one lane per group of ring slots. A command buffer
+/// always replays on the same lane ([`register_cb`]), so a lane is the only
+/// thread recording into it; the ring's command buffers each come from their
+/// own pool, so two lanes recording two of them at once touch no pool in
+/// common. Lists for different command buffers have no order between them but
+/// the submit order, which the queue owner keeps ([`Gate`]).
+static LANES: [Lane; MAX_LANES] = [const { Lane::new() }; MAX_LANES];
+static LOADERS: OnceLock<LoadersCell> = OnceLock::new();
+/// Lanes running (0 until the first [`activate`]).
+static RUNNING: AtomicUsize = AtomicUsize::new(0);
+
+/// TEMP (lab, REC_LANES): the command buffers a lane is fixed for, as raw
+/// handles, and its index. Read only when a thread's commands move to a
+/// different command buffer than its previous command named (~once a batch).
+static CB_LANES: Mutex<Vec<(u64, u8)>> = Mutex::new(Vec::new());
+/// Bumped by every [`register_cb`], so a thread's cached routing (`CUR_CB`)
+/// cannot outlive a re-registration of the same handle.
+static CB_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// TEMP (lab, REC_LANES, `REIMS_VGPU_LAB_REC_LANES=N`, 1..=4, default 1): how many
+/// lanes replay. Read once; the ring's command buffers are dealt to them in
+/// slot order. b284: with the lifecycle on the lanes one lane is ~20 % busy on
+/// heavy Maps and two were no faster, so one is the default (a lane spins
+/// between lists, a cost on a host the 24 vCPUs share).
+pub(crate) fn lane_count() -> usize {
+    if cfg!(test) {
+        return 1;
+    }
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_REC_LANES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, MAX_LANES)
+    })
+}
+
+/// TEMP (lab, REC_LANES): fix the lane `cb` replays on - `slot % lane_count()`.
+/// Called when the ring's command buffers are allocated (a handle reused by a
+/// later ring simply takes its new slot's lane: the old ring was drained).
+pub(crate) fn register_cb(cb: vk::CommandBuffer, slot: usize) {
+    use ash::vk::Handle;
+    let lane = (slot % lane_count()) as u8;
+    let raw = cb.as_raw();
+    let mut map = CB_LANES.lock();
+    match map.iter_mut().find(|(h, _)| *h == raw) {
+        Some(e) => e.1 = lane,
+        None => map.push((raw, lane)),
+    }
+    CB_GEN.fetch_add(1, Ordering::AcqRel);
+}
+
+fn lane_of(cb: vk::CommandBuffer) -> u8 {
+    use ash::vk::Handle;
+    let raw = cb.as_raw();
+    CB_LANES
+        .lock()
+        .iter()
+        .find(|(h, _)| *h == raw)
+        .map_or(0, |(_, lane)| *lane)
+        .min((RUNNING.load(Ordering::Acquire).max(1) - 1) as u8)
+}
+
+/// TEMP (lab, REC_LANE_END): the first `vkReset/Begin/EndCommandBuffer` a lane
+/// saw fail. Every submission waits its gate and then reads this: a buffer
+/// that did not record must not reach the queue, and the failure poisons the
+/// context like an asynchronous submit failure does.
+static LANE_FAILURE: Mutex<Option<vk::Result>> = Mutex::new(None);
+
+fn note_lane_failure(what: &str, e: vk::Result) {
+    let mut f = LANE_FAILURE.lock();
+    if f.is_none() {
+        *f = Some(e);
+        crate::observe::fail(format!(
+            "vk_rec_lane_failed reason=vk_rec_lane_failed op={what} result={e:?}"
+        ));
+        super::device_lost::note_device_lost_seen();
+    }
+}
+
+/// TEMP (lab, REC_LANE_END): the point a submission waits for - lane `lane`
+/// has replayed its first `seq` lists, the last of which ends the command
+/// buffer being submitted.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Gate {
+    lane: u8,
+    seq: u64,
+}
+
+/// TEMP (lab, REC_LANE_END): wait at the queue owner until `gate`'s list has
+/// been replayed, then refuse the submission if any lane failed to record.
+pub(crate) fn wait_gate(gate: Gate) -> Result<(), vk::Result> {
+    let lane = &LANES[gate.lane as usize];
+    if lane.done.load(Ordering::Acquire) < gate.seq {
+        let started = Instant::now();
+        wait_done(lane, gate.seq);
+        STATS
+            .gate_wait_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        STATS.gate_waits.fetch_add(1, Ordering::Relaxed);
+    }
+    match *LANE_FAILURE.lock() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Spin, then sleep, until `lane` has replayed `target` lists.
+fn wait_done(lane: &Lane, target: u64) {
+    let started = Instant::now();
+    let mut polls = 0u32;
+    while lane.done.load(Ordering::Acquire) < target {
+        std::hint::spin_loop();
+        polls += 1;
+        if polls % 64 == 0 && started.elapsed() >= SYNC_SPIN {
+            break;
+        }
+    }
+    if lane.done.load(Ordering::SeqCst) < target {
+        lane.waiters.fetch_add(1, Ordering::SeqCst);
+        let mut q = lane.queue.lock();
+        while lane.done.load(Ordering::SeqCst) < target {
+            lane.idle.wait_for(&mut q, Duration::from_micros(200));
+        }
+        drop(q);
+        lane.waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// TEMP (lab, REC_LANES): what the lanes did, for the recorder census line.
+struct Stats {
+    sync_ns: AtomicU64,
+    syncs: AtomicU64,
+    gate_wait_ns: AtomicU64,
+    gate_waits: AtomicU64,
+    deferred_ends: AtomicU64,
+    copy_bytes: AtomicU64,
+}
+
+static STATS: Stats = Stats {
+    sync_ns: AtomicU64::new(0),
+    syncs: AtomicU64::new(0),
+    gate_wait_ns: AtomicU64::new(0),
+    gate_waits: AtomicU64::new(0),
+    deferred_ends: AtomicU64::new(0),
+    copy_bytes: AtomicU64::new(0),
 };
+
+/// TEMP (lab, REC_LANES): the lanes' window, as the recorder census's tail
+/// (`lanes=N lane_busy_us=a/b.. lane_lists=.. sync_n= sync_us= gate_n=
+/// gate_us= ends= copy_mb=`), or empty before the lanes run.
+pub(crate) fn take_window_text() -> String {
+    let n = RUNNING.load(Ordering::Acquire);
+    if n == 0 {
+        return String::new();
+    }
+    let busy: Vec<String> = LANES[..n]
+        .iter()
+        .map(|l| (l.busy_ns.swap(0, Ordering::Relaxed) / 1000).to_string())
+        .collect();
+    let lists: u64 = LANES[..n]
+        .iter()
+        .map(|l| l.lists.swap(0, Ordering::Relaxed))
+        .sum();
+    format!(
+        " lanes={n} lane_busy_us={} lane_lists={lists} lane_sync_n={} lane_sync_us={} \
+         lane_gate_n={} lane_gate_us={} lane_ends={} lane_copy_mb={}",
+        busy.join("/"),
+        STATS.syncs.swap(0, Ordering::Relaxed),
+        STATS.sync_ns.swap(0, Ordering::Relaxed) / 1000,
+        STATS.gate_waits.swap(0, Ordering::Relaxed),
+        STATS.gate_wait_ns.swap(0, Ordering::Relaxed) / 1000,
+        STATS.deferred_ends.swap(0, Ordering::Relaxed),
+        STATS.copy_bytes.swap(0, Ordering::Relaxed) >> 20,
+    )
+}
 
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
     static LOCAL: RefCell<List> = RefCell::new(List::default());
+    /// The lane this thread's pending list goes to.
+    static LOCAL_LANE: Cell<u8> = const { Cell::new(0) };
+    /// The command buffer this thread's last command named (raw handle), and
+    /// the [`CB_GEN`] its lane was looked up at.
+    static CUR_CB: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 }
 
 /// Whether the lane is on (`REIMS_VGPU_LAB_REC_LANE=off` / live `REC_LANE=off`).
@@ -300,6 +509,24 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_REC_LANE").as_deref() != Ok("off"))
 }
 
+/// TEMP (lab, REC_LANE_END, live `REC_LANE_END`, else
+/// `REIMS_VGPU_LAB_REC_LANE_END=off`): whether a command buffer's reset, begin
+/// and end go to its lane too, so the recorder never waits for a lane: the
+/// submission waits instead, on the queue owner's thread ([`Gate`]).
+fn lifecycle_on() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("REC_LANE_END") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_REC_LANE_END").as_deref() != Ok("off"))
+}
+
+/// TEMP (lab, REC_LANE_END): whether this thread defers a command buffer's
+/// reset/begin ([`begin`]) and end ([`end`]) to its lane.
+pub(crate) fn defer_lifecycle() -> bool {
+    active() && lifecycle_on()
+}
+
 /// Defer this thread's `vkCmd*` calls to the lane until the guard drops (which
 /// hands the list over). A no-op when the lane is off. `ctx` provides the
 /// loaders the lane replays with, cloned once.
@@ -307,20 +534,45 @@ pub(crate) fn activate(ctx: &super::context::DeviceContext) -> ActiveGuard {
     if !enabled() {
         return ActiveGuard(false);
     }
-    LANE.loaders.get_or_init(|| {
-        *LANE.queue.lock() = Some(Queue::default());
+    LOADERS.get_or_init(|| {
+        let n = lane_count();
+        for lane in &LANES[..n] {
+            *lane.queue.lock() = Some(Queue::default());
+        }
         let cell = LoadersCell(Loaders {
             device: ctx.device.clone(),
             push: ctx.push_descriptor.clone(),
             eds: ctx.extended_dynamic_state.clone(),
             eds3: ctx.extended_dynamic_state3.clone(),
         });
-        std::thread::Builder::new()
-            .name("reims-vgpu-rec-lane".into())
-            .spawn(lane_main)
-            .expect("spawn the recording lane");
+        for i in 0..n {
+            let name = if i == 0 {
+                "reims-vgpu-rec-lane".to_string()
+            } else {
+                format!("reims-vgpu-rec-lane{i}")
+            };
+            std::thread::Builder::new()
+                .name(name)
+                .spawn(move || lane_main(i))
+                .expect("spawn a recording lane");
+        }
+        RUNNING.store(n, Ordering::Release);
         cell
     });
+    if ACTIVE.with(Cell::get) {
+        return ActiveGuard(false);
+    }
+    ACTIVE.with(|a| a.set(true));
+    ActiveGuard(true)
+}
+
+/// TEMP (lab, REC_LANE_END): [`activate`] for a caller that ends a command
+/// buffer outside a draw (the drain's batch flush) - a no-op unless the lanes
+/// already run and the lifecycle goes to them, or when this thread is active.
+pub(crate) fn scope() -> ActiveGuard {
+    if LOADERS.get().is_none() || !enabled() || !lifecycle_on() || ACTIVE.with(Cell::get) {
+        return ActiveGuard(false);
+    }
     ACTIVE.with(|a| a.set(true));
     ActiveGuard(true)
 }
@@ -349,18 +601,37 @@ pub(crate) fn defer_host_copies() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_REC_LANE_COPY").as_deref() != Ok("off"))
 }
 
-/// Hand the lane a host copy to make before the command buffer ends.
+/// Hand the lane a host copy to make before the command buffer ends. It goes
+/// to the lane of the command buffer this thread last recorded into - the one
+/// whose staging it fills.
 ///
 /// # Safety
 ///
 /// The source stays readable and the destination writable and unaliased
-/// until the next [`sync`] returns.
+/// until the next [`sync`] returns, or until the submission of the command
+/// buffer it is recorded with has passed its gate.
 pub(crate) unsafe fn host_copy(seg: HostSeg) {
     debug_assert!(active());
-    rec(|l| {
+    LOCAL.with(|l| {
+        let mut l = l.borrow_mut();
         let r = R::put(&mut l.segs, &[seg]);
         l.cmds.push(Cmd::HostCopy(r));
     });
+}
+
+/// TEMP (lab, REC_LANE_END): reset and begin `cb` on its lane.
+pub(crate) fn begin(cb: vk::CommandBuffer) {
+    debug_assert!(defer_lifecycle());
+    rec(cb, |l| l.cmds.push(Cmd::Begin(cb)));
+}
+
+/// TEMP (lab, REC_LANE_END): end `cb` on its lane and hand the list over now;
+/// the returned gate is what its submission waits for.
+pub(crate) fn end(cb: vk::CommandBuffer) -> Gate {
+    debug_assert!(defer_lifecycle());
+    rec(cb, |l| l.cmds.push(Cmd::End(cb)));
+    STATS.deferred_ends.fetch_add(1, Ordering::Relaxed);
+    hand_over().expect("a list holding the end")
 }
 
 /// A command about to be recorded on the caller's thread: the lane must be
@@ -374,69 +645,76 @@ fn active() -> bool {
     ACTIVE.with(Cell::get)
 }
 
-fn rec(f: impl FnOnce(&mut List)) {
+/// Append to this thread's list for `cb`'s lane; a list for another lane is
+/// handed over first.
+fn rec(cb: vk::CommandBuffer, f: impl FnOnce(&mut List)) {
+    use ash::vk::Handle;
+    let key = (cb.as_raw(), CB_GEN.load(Ordering::Acquire));
+    if CUR_CB.with(Cell::get) != key {
+        CUR_CB.with(|c| c.set(key));
+        let lane = lane_of(cb);
+        if LOCAL_LANE.with(Cell::get) != lane {
+            hand_over();
+            LOCAL_LANE.with(|c| c.set(lane));
+        }
+    }
     LOCAL.with(|l| f(&mut l.borrow_mut()));
 }
 
-/// Give the lane this thread's pending list, taking a cleared one back.
-fn hand_over() {
+/// Give this thread's pending list to its lane, taking a cleared one back:
+/// the lane and the list's sequence number there, or `None` when it was empty.
+fn hand_over() -> Option<Gate> {
     LOCAL.with(|l| {
         let mut local = l.borrow_mut();
         if local.cmds.is_empty() {
-            return;
+            return None;
         }
-        let mut guard = LANE.queue.lock();
+        let index = LOCAL_LANE.with(Cell::get);
+        let lane = &LANES[index as usize];
+        let mut guard = lane.queue.lock();
         let q = guard.as_mut().expect("lane queue before a hand-over");
         let fresh = q.free.pop().unwrap_or_default();
         let full = std::mem::replace(&mut *local, fresh);
         q.ready.push_back(full);
-        LANE.pushed.fetch_add(1, Ordering::SeqCst);
+        let seq = lane.pushed.fetch_add(1, Ordering::SeqCst) + 1;
         if q.parked {
-            LANE.work.notify_one();
+            lane.work.notify_one();
         }
-    });
+        Some(Gate { lane: index, seq })
+    })
 }
 
 /// Everything recorded so far is in its command buffer: hand over this
-/// thread's list and wait for the lane to replay all it holds. Cheap when the
-/// lane is idle; a no-op when it never started.
+/// thread's list and wait for every lane to replay all it holds. Cheap when
+/// the lanes are idle; a no-op when they never started.
 pub(crate) fn sync() {
-    if LANE.loaders.get().is_none() {
+    if LOADERS.get().is_none() {
         return;
     }
     hand_over();
-    let target = LANE.pushed.load(Ordering::SeqCst);
-    if LANE.done.load(Ordering::SeqCst) >= target {
-        return;
-    }
-    let started = Instant::now();
-    let mut polls = 0u32;
-    while LANE.done.load(Ordering::Acquire) < target {
-        std::hint::spin_loop();
-        polls += 1;
-        if polls % 64 == 0 && started.elapsed() >= SYNC_SPIN {
-            break;
+    let n = RUNNING.load(Ordering::Acquire);
+    let mut started: Option<Instant> = None;
+    for lane in &LANES[..n] {
+        let target = lane.pushed.load(Ordering::SeqCst);
+        if lane.done.load(Ordering::SeqCst) >= target {
+            continue;
         }
+        started.get_or_insert_with(Instant::now);
+        wait_done(lane, target);
     }
-    if LANE.done.load(Ordering::SeqCst) < target {
-        LANE.waiters.fetch_add(1, Ordering::SeqCst);
-        let mut q = LANE.queue.lock();
-        while LANE.done.load(Ordering::SeqCst) < target {
-            LANE.idle.wait_for(&mut q, Duration::from_micros(200));
-        }
-        drop(q);
-        LANE.waiters.fetch_sub(1, Ordering::SeqCst);
+    if let Some(started) = started {
+        let ns = started.elapsed().as_nanos() as u64;
+        STATS.sync_ns.fetch_add(ns, Ordering::Relaxed);
+        STATS.syncs.fetch_add(1, Ordering::Relaxed);
+        crate::runtime::drain::note_store_route_us("rec_lane_sync_wait_us", ns / 1000);
+        crate::runtime::drain::note_store_route("rec_lane_sync_waits");
     }
-    crate::runtime::drain::note_store_route_us(
-        "rec_lane_sync_wait_us",
-        started.elapsed().as_micros() as u64,
-    );
-    crate::runtime::drain::note_store_route("rec_lane_sync_waits");
 }
 
-fn lane_main() {
+fn lane_main(index: usize) {
     super::recorder::apply_thread_priority(super::recorder::current_thread_priority());
-    let loaders = &LANE.loaders.get().expect("loaders before the lane").0;
+    let lane = &LANES[index];
+    let loaders = &LOADERS.get().expect("loaders before the lane").0;
     let mut taken = 0u64;
     let mut spent: Option<List> = None;
     let mut busy = Duration::ZERO;
@@ -444,10 +722,10 @@ fn lane_main() {
     loop {
         // Poll a little before taking the lock: a burst of draws hands over a
         // list every few microseconds.
-        if LANE.pushed.load(Ordering::Acquire) == taken {
+        if lane.pushed.load(Ordering::Acquire) == taken {
             let started = Instant::now();
             let mut polls = 0u32;
-            while LANE.pushed.load(Ordering::Acquire) == taken {
+            while lane.pushed.load(Ordering::Acquire) == taken {
                 std::hint::spin_loop();
                 polls += 1;
                 if polls % 64 == 0 && started.elapsed() >= LANE_SPIN {
@@ -456,7 +734,7 @@ fn lane_main() {
             }
         }
         let mut list = {
-            let mut guard = LANE.queue.lock();
+            let mut guard = lane.queue.lock();
             if let Some(mut done) = spent.take() {
                 done.clear();
                 guard.as_mut().expect("lane queue").free.push(done);
@@ -473,10 +751,12 @@ fn lane_main() {
                         busy.as_micros() as u64,
                     );
                     crate::runtime::drain::note_store_route_n("rec_lane_lists", lists);
+                    lane.busy_ns.fetch_add(busy.as_nanos() as u64, Ordering::Relaxed);
+                    lane.lists.fetch_add(lists, Ordering::Relaxed);
                     busy = Duration::ZERO;
                     lists = 0;
                 }
-                LANE.work.wait(&mut guard);
+                lane.work.wait(&mut guard);
                 guard.as_mut().expect("lane queue").parked = false;
                 crate::runtime::drain::note_store_route("rec_lane_wakes");
             }
@@ -488,11 +768,20 @@ fn lane_main() {
         unsafe { replay(loaders, &mut list) };
         busy += started.elapsed();
         lists += 1;
+        if busy >= Duration::from_millis(2) {
+            // A lane that never parks (a long burst) still reports.
+            lane.busy_ns.fetch_add(busy.as_nanos() as u64, Ordering::Relaxed);
+            lane.lists.fetch_add(lists, Ordering::Relaxed);
+            crate::runtime::drain::note_store_route_us("rec_lane_busy_us", busy.as_micros() as u64);
+            crate::runtime::drain::note_store_route_n("rec_lane_lists", lists);
+            busy = Duration::ZERO;
+            lists = 0;
+        }
         spent = Some(list);
-        LANE.done.fetch_add(1, Ordering::SeqCst);
-        if LANE.waiters.load(Ordering::SeqCst) > 0 {
-            let _q = LANE.queue.lock();
-            LANE.idle.notify_all();
+        lane.done.fetch_add(1, Ordering::SeqCst);
+        if lane.waiters.load(Ordering::SeqCst) > 0 {
+            let _q = lane.queue.lock();
+            lane.idle.notify_all();
         }
     }
 }
@@ -656,8 +945,26 @@ unsafe fn replay(lo: &Loaders, l: &mut List) {
                 }
                 Cmd::FillBuffer(cb, b, o, size, data) => d.cmd_fill_buffer(cb, b, o, size, data),
                 Cmd::HostCopy(r) => {
+                    let bytes: usize = r.of(&l.segs).iter().map(|s| s.n).sum();
+                    STATS.copy_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
                     for seg in r.of(&l.segs) {
                         std::ptr::copy_nonoverlapping(seg.src, seg.dst, seg.n)
+                    }
+                }
+                Cmd::Begin(cb) => {
+                    if let Err(e) = d.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty()) {
+                        note_lane_failure("reset", e);
+                    } else if let Err(e) = d.begin_command_buffer(
+                        cb,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    ) {
+                        note_lane_failure("begin", e);
+                    }
+                }
+                Cmd::End(cb) => {
+                    if let Err(e) = d.end_command_buffer(cb) {
+                        note_lane_failure("end", e);
                     }
                 }
             }
@@ -720,7 +1027,7 @@ pub(crate) unsafe fn pipeline_barrier(
     img: &[vk::ImageMemoryBarrier<'_>],
 ) {
     if active() {
-        rec(|l| {
+        rec(cb, |l| {
             let m = put_mapped(&mut l.mem, mem, own_mem);
             let b = put_mapped(&mut l.buf, buf, own_buf);
             let i = put_mapped(&mut l.img, img, own_img);
@@ -749,7 +1056,7 @@ pub(crate) unsafe fn begin_render_pass(
                     std::slice::from_raw_parts(info.p_clear_values, info.clear_value_count as usize)
                 }
             };
-        rec(|l| {
+        rec(cb, |l| {
             let c = R::put(&mut l.clears, clears);
             l.cmds.push(Cmd::BeginPass(
                 cb,
@@ -770,7 +1077,7 @@ macro_rules! simple {
     ($name:ident, $call:ident, ($($arg:ident : $ty:ty),*), $variant:expr) => {
         pub(crate) unsafe fn $name(d: &ash::Device, cb: vk::CommandBuffer $(, $arg: $ty)*) {
             if active() {
-                rec(|l| l.cmds.push($variant(cb $(, $arg)*)));
+                rec(cb, |l| l.cmds.push($variant(cb $(, $arg)*)));
             } else {
                 direct();
                 unsafe { d.$call(cb $(, $arg)*) }
@@ -807,7 +1114,7 @@ pub(crate) unsafe fn bind_descriptor_sets(
     offsets: &[u32],
 ) {
     if active() {
-        rec(|l| {
+        rec(cb, |l| {
             let s = R::put(&mut l.sets, sets);
             let o = R::put(&mut l.u32s, offsets);
             l.cmds
@@ -828,7 +1135,7 @@ pub(crate) unsafe fn push_descriptor_set(
     writes: &[vk::WriteDescriptorSet<'_>],
 ) {
     if active() {
-        rec(|l| {
+        rec(cb, |l| {
             let start = l.writes.len() as u32;
             for w in writes {
                 debug_assert!(w.p_next.is_null() && w.p_texel_buffer_view.is_null());
@@ -876,7 +1183,7 @@ pub(crate) unsafe fn push_constants(
     bytes: &[u8],
 ) {
     if active() {
-        rec(|l| {
+        rec(cb, |l| {
             let r = R::put(&mut l.bytes, bytes);
             l.cmds
                 .push(Cmd::PushConstants(cb, layout, stages, offset, r));
@@ -895,7 +1202,7 @@ pub(crate) unsafe fn bind_vertex_buffers(
     offsets: &[vk::DeviceSize],
 ) {
     if active() {
-        rec(|l| {
+        rec(cb, |l| {
             let b = R::put(&mut l.buffers, buffers);
             let o = R::put(&mut l.sizes, offsets);
             l.cmds.push(Cmd::BindVertex(cb, first, b, o));
@@ -914,7 +1221,7 @@ pub(crate) unsafe fn copy_buffer(
     r: &[vk::BufferCopy],
 ) {
     if active() {
-        rec(|l| {
+        rec(cb, |l| {
             let x = R::put(&mut l.bcopies, r);
             l.cmds.push(Cmd::CopyBuffer(cb, s, t, x));
         });
@@ -933,7 +1240,7 @@ pub(crate) unsafe fn copy_buffer_to_image(
     r: &[vk::BufferImageCopy],
 ) {
     if active() {
-        rec(|l| {
+        rec(cb, |l| {
             let x = R::put(&mut l.bicopies, r);
             l.cmds.push(Cmd::CopyBufferToImage(cb, s, i, il, x));
         });
@@ -953,7 +1260,7 @@ pub(crate) unsafe fn copy_image(
     r: &[vk::ImageCopy],
 ) {
     if active() {
-        rec(|l| {
+        rec(cb, |l| {
             let x = R::put(&mut l.icopies, r);
             l.cmds.push(Cmd::CopyImage(cb, s, sl, t, tl, x));
         });
@@ -972,7 +1279,7 @@ pub(crate) unsafe fn copy_image_to_buffer(
     r: &[vk::BufferImageCopy],
 ) {
     if active() {
-        rec(|l| {
+        rec(cb, |l| {
             let x = R::put(&mut l.bicopies, r);
             l.cmds.push(Cmd::CopyImageToBuffer(cb, i, il, b, x));
         });
@@ -991,7 +1298,7 @@ pub(crate) unsafe fn clear_color_image(
     r: &[vk::ImageSubresourceRange],
 ) {
     if active() {
-        rec(|l| {
+        rec(cb, |l| {
             let x = R::put(&mut l.ranges, r);
             l.cmds.push(Cmd::ClearColor(cb, i, il, *c, x));
         });
@@ -1008,7 +1315,7 @@ pub(crate) unsafe fn set_viewport(
     v: &[vk::Viewport],
 ) {
     if active() {
-        rec(|l| {
+        rec(cb, |l| {
             let x = R::put(&mut l.viewports, v);
             l.cmds.push(Cmd::Viewport(cb, first, x));
         });
@@ -1025,7 +1332,7 @@ pub(crate) unsafe fn set_scissor(
     r: &[vk::Rect2D],
 ) {
     if active() {
-        rec(|l| {
+        rec(cb, |l| {
             let x = R::put(&mut l.rects, r);
             l.cmds.push(Cmd::Scissor(cb, first, x));
         });
@@ -1037,7 +1344,7 @@ pub(crate) unsafe fn set_scissor(
 
 pub(crate) unsafe fn set_blend_constants(d: &ash::Device, cb: vk::CommandBuffer, c: &[f32; 4]) {
     if active() {
-        rec(|l| l.cmds.push(Cmd::BlendConstants(cb, *c)));
+        rec(cb, |l| l.cmds.push(Cmd::BlendConstants(cb, *c)));
     } else {
         direct();
         unsafe { d.cmd_set_blend_constants(cb, c) }
@@ -1048,7 +1355,7 @@ macro_rules! eds {
     ($name:ident, $call:ident, $loader:ty, ($($arg:ident : $ty:ty),*), $variant:expr) => {
         pub(crate) unsafe fn $name(e: &$loader, cb: vk::CommandBuffer $(, $arg: $ty)*) {
             if active() {
-                rec(|l| l.cmds.push($variant(cb $(, $arg)*)));
+                rec(cb, |l| l.cmds.push($variant(cb $(, $arg)*)));
             } else {
                 direct();
                 unsafe { e.$call(cb $(, $arg)*) }

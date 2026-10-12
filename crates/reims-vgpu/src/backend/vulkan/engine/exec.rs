@@ -6201,16 +6201,23 @@ pub(crate) unsafe fn execute_draw_inner(
     // in recording state for same-target successors and is submitted by
     // pools.batch_flush (next begin_entry / retire / explicit flush).
     let defer_submit = batch_eligible;
+    let mut lane_gate: Option<crate::backend::vulkan::engine::cmd_sink::Gate> = None;
     phase.enter(super::draw_phase::Phase::Submit);
     if !defer_submit {
         // Last command before the CB ends, so the stamp bounds every draw and
         // copy this submission recorded. A deferred draw is sealed by
         // `batch_flush` instead, on the same slot.
         unsafe { pools.gpu_span_seal_current(ctx, cb) };
-        crate::backend::vulkan::engine::cmd_sink::sync();
-        ctx.device
-            .end_command_buffer(cb)
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)))?;
+        // TEMP (lab, REC_LANE_END): ended on the buffer's lane; the submit
+        // below waits for it at the queue owner.
+        if crate::backend::vulkan::engine::cmd_sink::defer_lifecycle() {
+            lane_gate = Some(crate::backend::vulkan::engine::cmd_sink::end(cb));
+        } else {
+            crate::backend::vulkan::engine::cmd_sink::sync();
+            ctx.device
+                .end_command_buffer(cb)
+                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)))?;
+        }
     }
 
     if force_loss {
@@ -6235,9 +6242,9 @@ pub(crate) unsafe fn execute_draw_inner(
         // recorder's busy time on transitions, and the drain sat in
         // `wait_below` (recorder queue full) for 8.5 % of its samples.
         let submitted = if lab_draw_submit_async() {
-            ctx.submit_guest_work_async(&cbs, fence)
+            ctx.submit_guest_work_async_gated(&cbs, fence, lane_gate)
         } else {
-            ctx.submit_guest_work(&cbs, fence)
+            ctx.submit_guest_work_gated(&cbs, fence, lane_gate)
         };
         match submitted {
             Ok(()) => {}

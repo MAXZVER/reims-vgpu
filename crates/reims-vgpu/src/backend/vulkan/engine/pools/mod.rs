@@ -399,8 +399,11 @@ pub(crate) struct ResourcePools {
     /// steal a 64 MiB staging buffer and spike the next upload's latency. The
     /// image/slab trims stay ungated — they refill via cheap slab suballocation.
     settled_maintenance_passes: u32,
-    /// Persistent command pool; each ring slot owns one primary CB.
-    cmd_pool: vk::CommandPool,
+    /// Persistent command pools, one per ring slot, each owning that slot's one
+    /// primary CB. TEMP (lab, REC_LANES): one pool per buffer rather than one
+    /// for the ring, so recording lanes can record two slots' buffers at once
+    /// (a pool is externally synchronized across all of its buffers).
+    cmd_pools: Vec<vk::CommandPool>,
     /// Growable descriptor-pool arena (FREE_DESCRIPTOR_SET blocks). Grows a new
     /// block on exhaustion instead of hard-failing the draw; sets are freed
     /// per entry, paired with their owning block. See [`DescriptorArena`].
@@ -611,7 +614,7 @@ pub(crate) struct EntryState {
     /// pages** ([`ResourcePools::note_guest_write_recorded`]). That last one is
     /// the correctness edge: a bind after a Store into the same pages must see
     /// what the Store wrote, and reusing a copy taken before it would not.
-    cb_bound_buffers: HashMap<(usize, u64, u64), (super::exec::BoundBuffer, CbBindOwner)>,
+    cb_bound_buffers: reims_vgpu_core::fasthash::FxHashMap<(usize, u64, u64), (super::exec::BoundBuffer, CbBindOwner)>,
     /// Keys in `cb_bound_buffers` whose slot is **not yet filled**: a GPU gather
     /// was planned for them and the copy or dispatch that lands it has not been
     /// recorded into the command buffer.

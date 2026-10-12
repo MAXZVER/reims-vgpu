@@ -1959,12 +1959,27 @@ impl DeviceContext {
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
     ) -> Result<(), vk::Result> {
+        unsafe { self.submit_guest_work_gated(command_buffers, fence, None) }
+    }
+
+    /// TEMP (lab, REC_LANE_END): [`Self::submit_guest_work`] of command buffers
+    /// a recording lane ends - the submit waits `gate` first, on the queue
+    /// owner's thread (or here, without one).
+    pub(crate) unsafe fn submit_guest_work_gated(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        fence: vk::Fence,
+        gate: Option<super::cmd_sink::Gate>,
+    ) -> Result<(), vk::Result> {
         let timeline = self
             .stamp_completion
             .as_ref()
             .map(|completion| completion.reserve_submission());
         if let Some(owner) = self.queue_owner.as_ref() {
-            return owner.submit_sync(command_buffers, fence, timeline);
+            return owner.submit_sync_gated(command_buffers, fence, timeline, gate);
+        }
+        if let Some(gate) = gate {
+            super::cmd_sink::wait_gate(gate)?;
         }
         unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) }
     }
@@ -1972,19 +1987,26 @@ impl DeviceContext {
     /// Hand an ended draw batch to the ordered queue owner without waiting for
     /// the host driver's `vkQueueSubmit` call.  A host that could not start the
     /// owner retains the synchronous contract.
-    pub(crate) unsafe fn submit_guest_work_async(
+    ///
+    /// TEMP (lab, REC_LANE_END): behind `gate`, the recording lane's list that
+    /// ends these command buffers (`None` for buffers ended on this thread).
+    pub(crate) unsafe fn submit_guest_work_async_gated(
         &self,
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
+        gate: Option<super::cmd_sink::Gate>,
     ) -> Result<(), vk::Result> {
         let timeline = self
             .stamp_completion
             .as_ref()
             .map(|completion| completion.reserve_submission());
         let Some(owner) = self.queue_owner.as_ref() else {
+            if let Some(gate) = gate {
+                super::cmd_sink::wait_gate(gate)?;
+            }
             return unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) };
         };
-        owner.submit_async(command_buffers, fence, timeline)
+        owner.submit_async_gated(command_buffers, fence, timeline, gate)
     }
 
     unsafe fn submit_guest_work_reserved(

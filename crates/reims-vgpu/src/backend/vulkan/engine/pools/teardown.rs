@@ -12,6 +12,9 @@ use super::*;
 
 impl ResourcePools {
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        // TEMP (lab, REC_LANES): no lane may still be recording into a buffer
+        // of the pools destroyed below.
+        crate::backend::vulkan::engine::cmd_sink::sync();
         // An open (never-submitted) batch dies with the pool: its CB belongs
         // to cmd_pool (destroyed below) and its dsets to desc_pool; the
         // accumulated transients are already in the live lists.
@@ -241,9 +244,8 @@ impl ResourcePools {
         }
         self.scatter_refused = false;
         self.desc_arena.destroy(device);
-        if self.cmd_pool != vk::CommandPool::null() {
-            device.destroy_command_pool(self.cmd_pool, None);
-            self.cmd_pool = vk::CommandPool::null();
+        for pool in self.cmd_pools.drain(..) {
+            device.destroy_command_pool(pool, None);
         }
         // TEMP (lab, PASS_STAGE): the worker arenas, after every fence above,
         // so no submission can still name a buffer being destroyed.

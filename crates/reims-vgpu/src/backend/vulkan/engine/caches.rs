@@ -3,7 +3,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use ash::vk;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 
@@ -99,7 +99,7 @@ struct SliceIntern<T> {
     /// Indexed by id. Never removed except by [`Self::clear`], so an id held in
     /// a cache key cannot name a hole.
     entries: Vec<Vec<T>>,
-    buckets: HashMap<Digest128, Vec<u32>>,
+    buckets: reims_vgpu_core::fasthash::FxHashMap<Digest128, Vec<u32>>,
     /// Last hit. Consecutive draws overwhelmingly repeat one set.
     front: Option<u32>,
 }
@@ -108,7 +108,7 @@ impl<T: Clone + Eq + std::hash::Hash> SliceIntern<T> {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
-            buckets: HashMap::new(),
+            buckets: Default::default(),
             front: None,
         }
     }
@@ -240,7 +240,7 @@ struct LayoutTable {
     /// Digest of `(push_constant, bindings)` to the ids that digest could name.
     /// A bucket with more than one entry is a digest collision between
     /// different layouts, which the comparison below resolves.
-    buckets: HashMap<Digest128, Vec<u32>>,
+    buckets: reims_vgpu_core::fasthash::FxHashMap<Digest128, Vec<u32>>,
     /// Last positive resolve, for the same reason [`ObjectCache::front`] exists:
     /// a render encoder repeats one layout for long runs, and the front hit
     /// costs one slice comparison instead of a hash.
@@ -255,7 +255,7 @@ impl LayoutTable {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
-            buckets: HashMap::new(),
+            buckets: Default::default(),
             front: None,
             negative: VecDeque::new(),
         }
@@ -1062,12 +1062,12 @@ const NEGATIVE_CAP: usize = 1024;
 /// [`ObjectCache::insert_negative`] for why a refusal about this instant must not
 /// outlive the instant.
 struct ObjectCache<K, V> {
-    map: HashMap<K, V>,
+    map: reims_vgpu_core::fasthash::FxHashMap<K, V>,
     /// Last positive lookup, retained as the exact key and value. Render
     /// encoders commonly repeat one pipeline for long runs; equality against
     /// that key avoids hashing the same composite state on every draw.
     front: Option<(K, V)>,
-    negative: HashMap<K, DrawError>,
+    negative: reims_vgpu_core::fasthash::FxHashMap<K, DrawError>,
     /// FIFO order for `negative`, bounded by [`NEGATIVE_CAP`]. Negative entries
     /// are only added on create failures that a second identical attempt would
     /// meet again — a Vulkan create call refusing for a reason inherent to the
@@ -1089,9 +1089,9 @@ impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
 
     fn with_negative_cap(negative_cap: usize) -> Self {
         Self {
-            map: HashMap::new(),
+            map: Default::default(),
             front: None,
-            negative: HashMap::new(),
+            negative: Default::default(),
             negative_order: VecDeque::new(),
             negative_cap,
         }
@@ -1312,13 +1312,13 @@ pub(crate) struct ObjectCaches {
 }
 
 struct ObjectVariantIndex<K, V> {
-    map: HashMap<std::num::NonZeroU64, (std::sync::Weak<super::types::PipelineObjectLife>, K, V)>,
+    map: reims_vgpu_core::fasthash::FxHashMap<std::num::NonZeroU64, (std::sync::Weak<super::types::PipelineObjectLife>, K, V)>,
 }
 
 impl<K, V> Default for ObjectVariantIndex<K, V> {
     fn default() -> Self {
         Self {
-            map: HashMap::new(),
+            map: Default::default(),
         }
     }
 }

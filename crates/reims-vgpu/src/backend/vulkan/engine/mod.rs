@@ -991,9 +991,29 @@ struct EngineLockCensus {
     /// Wall clock from acquire to release, over every acquire.
     hold_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
     hold_max_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
+    /// TEMP (lab, MAINT_TRY): where the blocked `Device` acquires came from
+    /// (call site, acquires, wait) - b274: ~200 a second waited ~700 us each
+    /// on heavy Maps, about the mutex's 0.5 ms fairness interval.
+    device_by_caller: parking_lot::Mutex<Vec<((&'static str, u32), (u64, u64))>>,
 }
 
 static ENGINE_LOCK: EngineLockCensus = EngineLockCensus::new();
+
+/// TEMP (lab, MAINT_TRY): see `maintain_resources`.
+fn lab_maint_try() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(on) = crate::runtime::lab_live::on("MAINT_TRY") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_MAINT_TRY").as_deref() != Ok("off"))
+}
+
+/// TEMP (lab, MAINT_TRY): heartbeat maintenance ticks skipped (engine busy).
+static LAB_MAINT_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 
 impl EngineLockCensus {
     #[allow(clippy::declare_interior_mutable_const)]
@@ -1007,15 +1027,27 @@ impl EngineLockCensus {
             wait_max_us: [Self::ZERO; EngineLockSite::ALL.len()],
             hold_us: [Self::ZERO; EngineLockSite::ALL.len()],
             hold_max_us: [Self::ZERO; EngineLockSite::ALL.len()],
+            device_by_caller: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
-    fn note_wait(&self, site: EngineLockSite, us: u64) {
+    fn note_wait(&self, site: EngineLockSite, us: u64, caller: &'static std::panic::Location<'static>) {
         use std::sync::atomic::Ordering::Relaxed;
         let i = site.index();
         self.contended[i].fetch_add(1, Relaxed);
         self.wait_us[i].fetch_add(us, Relaxed);
         self.wait_max_us[i].fetch_max(us, Relaxed);
+        if site == EngineLockSite::Device {
+            let key = (caller.file(), caller.line());
+            let mut by = self.device_by_caller.lock();
+            match by.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, (n, total))) => {
+                    *n += 1;
+                    *total += us;
+                }
+                None => by.push((key, (1, us))),
+            }
+        }
     }
 
     fn note_uncontended(&self, site: EngineLockSite) {
@@ -1052,6 +1084,23 @@ impl EngineLockCensus {
                 free + blocked
             ));
         }
+        let mut by = std::mem::take(&mut *self.device_by_caller.lock());
+        by.sort_by_key(|(_, (_, us))| std::cmp::Reverse(*us));
+        let top: Vec<String> = by
+            .iter()
+            .take(5)
+            .map(|((file, line), (n, us))| {
+                let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
+                format!("{name}:{line}={n}/{us}us")
+            })
+            .collect();
+        if !top.is_empty() {
+            body.push_str(&format!(" device_top={}", top.join(",")));
+        }
+        body.push_str(&format!(
+            " maint_skipped={}",
+            LAB_MAINT_SKIPPED.swap(0, Relaxed)
+        ));
         any.then(|| format!("engine_lock win_ms={win_ms}{body}"))
     }
 }
@@ -1117,6 +1166,7 @@ impl Drop for EngineGuard {
 /// timer needs: `try_lock` decides whether a wait happened, so an acquire that
 /// did not block costs a failed-then-taken atomic and nothing else.
 #[inline]
+#[track_caller]
 fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
     let guard = match ENGINE.try_lock() {
         Some(guard) => {
@@ -1126,7 +1176,11 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
         None => {
             let blocked_at = std::time::Instant::now();
             let guard = ENGINE.lock();
-            ENGINE_LOCK.note_wait(site, blocked_at.elapsed().as_micros() as u64);
+            ENGINE_LOCK.note_wait(
+                site,
+                blocked_at.elapsed().as_micros() as u64,
+                std::panic::Location::caller(),
+            );
             guard
         }
     };
@@ -1696,12 +1750,13 @@ pub fn submit_deferred_draw(
         // caches belong to for the whole tranche and settles this job before it
         // ends.
         let caches = unsafe { &*caches };
-        match caches.with(|caches| execute_draw_request_with(caches, &req)) {
+        let result = match caches.with(|caches| execute_draw_request_with(caches, &req)) {
             Ok(_) => recorder::JobResult::Done,
             Err(error) => {
                 recorder::JobResult::Failed(Box::new(recorder::DeferredFailure { error, meta }))
             }
-        }
+        };
+        result
     });
     recorder::DRAW.submit(job);
 }
@@ -8700,7 +8755,35 @@ pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawErro
 /// Live residency is controlled by resource lifetime and allocation pressure,
 /// never by this clock.
 pub fn maintain_resources(now_ms: u64) {
-    let mut guard = lock_engine();
+    // TEMP (lab, MAINT_TRY, live `MAINT_TRY`, else `REIMS_VGPU_LAB_MAINT_TRY=off`
+    // to disable): the heartbeat skips its maintenance while the engine is busy,
+    // for at most `MAINT_SKIP_MS` in a row. b284: on heavy Maps this caller was
+    // ~all of the `device` waits for the engine lock (~200 a second, 70-120 ms/s)
+    // - the poll tick of the QEMU main loop, parked behind the recorder.
+    static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    const MAINT_SKIP_MS: u64 = 50;
+    let mut guard = if lab_maint_try() {
+        match ENGINE.try_lock() {
+            Some(g) => {
+                ENGINE_LOCK.note_uncontended(EngineLockSite::Device);
+                EngineGuard {
+                    guard: g,
+                    site: EngineLockSite::Device,
+                    acquired: crate::lab_clock::timers_on().then(std::time::Instant::now),
+                }
+            }
+            None if now_ms.saturating_sub(LAST_MS.load(std::sync::atomic::Ordering::Relaxed))
+                < MAINT_SKIP_MS =>
+            {
+                LAB_MAINT_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            None => lock_engine(),
+        }
+    } else {
+        lock_engine()
+    };
+    LAST_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
     let EngineState {
         ref mut owner,
         ref mut pools,
@@ -9352,9 +9435,9 @@ mod engine_lock_census_tests {
     fn each_site_keeps_its_own_waits_and_holds() {
         let census = EngineLockCensus::new();
         census.note_uncontended(EngineLockSite::Worker);
-        census.note_wait(EngineLockSite::Worker, 40);
+        census.note_wait(EngineLockSite::Worker, 40, std::panic::Location::caller());
         census.note_hold(EngineLockSite::Worker, 900);
-        census.note_wait(EngineLockSite::Window, 7000);
+        census.note_wait(EngineLockSite::Window, 7000, std::panic::Location::caller());
         census.note_hold(EngineLockSite::Window, 120);
         let line = census.take(1000).expect("a taken lock emits");
         assert!(
@@ -9377,7 +9460,7 @@ mod engine_lock_census_tests {
     fn the_max_columns_are_maxima_not_totals() {
         let census = EngineLockCensus::new();
         for us in [3_u64, 30_000, 12] {
-            census.note_wait(EngineLockSite::Window, us);
+            census.note_wait(EngineLockSite::Window, us, std::panic::Location::caller());
             census.note_hold(EngineLockSite::Worker, us);
         }
         let line = census.take(1000).expect("a taken lock emits");
