@@ -3338,6 +3338,38 @@ pub fn resident_readiness(identity: &TargetIdentity) -> Option<ResidentReadiness
     pools::readiness::lookup(identity)
 }
 
+/// TEMP (lab, T2T_ALIAS): `identity`'s readiness version, read from the
+/// lock-free table without a join - for the drain right after the call that
+/// settled the recorder for this identity (a target read).
+pub fn resident_version_nowait(identity: &TargetIdentity) -> Option<u64> {
+    pools::readiness::lookup(identity).map(|r| r.version)
+}
+
+/// TEMP (lab, T2T_ALIAS): the resident (and its version) each landed T2T frame
+/// was read from, by alias.
+static T2T_ALIAS_SRC: Mutex<Vec<(u64, TargetIdentity, u64)>> = Mutex::new(Vec::new());
+
+/// TEMP (lab, T2T_ALIAS): name a landed frame; the alias it returns is what the
+/// witness confirms a generation under.
+pub(crate) fn t2t_alias_register(identity: TargetIdentity, version: u64) -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let alias = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut src = T2T_ALIAS_SRC.lock();
+    src.push((alias, identity, version));
+    if src.len() > 16 {
+        src.remove(0);
+    }
+    alias
+}
+
+pub(crate) fn t2t_alias_source(alias: u64) -> Option<(TargetIdentity, u64)> {
+    T2T_ALIAS_SRC
+        .lock()
+        .iter()
+        .find(|(a, _, _)| *a == alias)
+        .map(|(_, id, v)| (id.clone(), *v))
+}
+
 pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
     resident_content_backing(identity) != ResidentContentBacking::NotReady
 }

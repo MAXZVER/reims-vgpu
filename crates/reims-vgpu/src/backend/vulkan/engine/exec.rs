@@ -1076,6 +1076,13 @@ enum GuestTexels {
     /// where the window sits inside the arena's buffer, the one bound
     /// `GuestTexels` arm whose offset is not zero or an import's.
     Staged(super::pass_stage::StagedSlice),
+    /// TEMP (lab, T2T_ALIAS): the window's bytes are a resident's, landed there
+    /// by this device and not touched since; the image is filled by a GPU copy
+    /// of the resident, which then goes back to the layout it was found in.
+    Resident {
+        image: vk::Image,
+        access: super::pools::ResidentAccess,
+    },
 }
 
 impl GuestTexels {
@@ -1084,6 +1091,7 @@ impl GuestTexels {
             Self::Imported { buffer, .. } => *buffer,
             Self::Gathered(slot) | Self::Scratch(slot) => slot.buffer,
             Self::Staged(slice) => slice.buffer,
+            Self::Resident { .. } => vk::Buffer::null(),
         }
     }
 
@@ -1095,8 +1103,164 @@ impl GuestTexels {
             Self::Gathered(_) | Self::Scratch(_) => 0,
             // A carved window sits wherever the arena's bump pointer was.
             Self::Staged(slice) => slice.window.offset,
+            Self::Resident { .. } => 0,
         }
     }
+}
+
+/// TEMP (lab, T2T_ALIAS): the resident a Fresh guest-runs window may be filled
+/// from instead of its guest pages - see `gather_witness::t2t_alias`. Every
+/// condition under which the copy and the gather would not move the same bytes
+/// into the same texels declines: the resident moved on (version), or the
+/// shapes differ (extent, one plane, no MSAA, a 4-byte BGRA8 resident, a tight
+/// window from byte zero).
+fn t2t_alias_texels(
+    pools: &ResourcePools,
+    resource: &super::types::SampledImageResource,
+    src: &super::types::GuestRunSource,
+) -> Option<GuestTexels> {
+    let identity = resource.identity?;
+    let alias = crate::runtime::gather_witness::t2t_alias::confirmed(identity.generation)?;
+    let (rid, version) = super::t2t_alias_source(alias)?;
+    let Some(slot) = pools.registry_get(&rid) else {
+        crate::runtime::drain::note_store_route("t2t_alias_gone");
+        crate::runtime::gather_witness::t2t_alias::DECLINED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
+    if super::pools::readiness::lookup(&rid).map(|r| r.version) != Some(version) || !slot.content_ready {
+        crate::runtime::drain::note_store_route("t2t_alias_stale");
+        crate::runtime::gather_witness::t2t_alias::DECLINED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    let bgra = matches!(
+        slot.format.allocation(),
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB
+    );
+    let four = matches!(
+        resource.format,
+        vk::Format::B8G8R8A8_UNORM
+            | vk::Format::B8G8R8A8_SRGB
+            | vk::Format::R8G8B8A8_UNORM
+            | vk::Format::R8G8B8A8_SRGB
+    );
+    let tight = u64::from(resource.width) * u64::from(resource.height) * 4;
+    if !bgra
+        || !four
+        || slot.sample_count > 1
+        || slot.width != resource.width
+        || slot.height != resource.height
+        || resource.layers != 1
+        || resource.multisampled
+        || resource.kind.is_volume()
+        || resource.kind.is_cube()
+        || src.source_offset != 0
+        || (src.row_length_texels != 0 && src.row_length_texels != resource.width)
+        || src.total_len != tight
+    {
+        crate::runtime::drain::note_store_route("t2t_alias_shape");
+        crate::runtime::gather_witness::t2t_alias::DECLINED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    Some(GuestTexels::Resident {
+        image: slot.image,
+        access: slot.access,
+    })
+}
+
+/// TEMP (lab, T2T_ALIAS): fill a sampled image from a resident by a GPU copy -
+/// the bytes the guest-runs gather of the landed window would have moved - and
+/// put the resident back in the layout it was found in.
+unsafe fn copy_resident_to_sampled_image(
+    ctx: &super::context::DeviceContext,
+    cb: vk::CommandBuffer,
+    src: vk::Image,
+    access: super::pools::ResidentAccess,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+) {
+    let range = super::color_subresource_range();
+    let (src_stage, src_access) = access.source_scope();
+    let found = access.layout();
+    let before = [
+        vk::ImageMemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(found)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(src)
+            .subresource_range(range),
+        vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(image)
+            .subresource_range(range),
+    ];
+    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(
+        &ctx.device,
+        cb,
+        src_stage | vk::PipelineStageFlags::TOP_OF_PIPE,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &before,
+    );
+    let layers = vk::ImageSubresourceLayers {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        mip_level: 0,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let copy = [vk::ImageCopy::default()
+        .src_subresource(layers)
+        .dst_subresource(layers)
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })];
+    crate::backend::vulkan::engine::cmd_sink::copy_image(
+        &ctx.device,
+        cb,
+        src,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &copy,
+    );
+    let after = [
+        vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(image)
+            .subresource_range(range),
+        vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(if found == vk::ImageLayout::UNDEFINED {
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+            } else {
+                found
+            })
+            .image(src)
+            .subresource_range(range),
+    ];
+    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(
+        &ctx.device,
+        cb,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::ALL_COMMANDS,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &after,
+    );
 }
 
 /// Where a CPU Load seed's bytes sit, once staged.
@@ -2644,6 +2808,27 @@ unsafe fn sample_guest_runs(
     // content nor a vouchable identity, so `Fresh` correctly names
     // the required conservative gather.
     counters.note_sampled_gather_unskipped(vouch);
+    // TEMP (lab, T2T_ALIAS): a window this device landed a resident's frame in,
+    // untouched since, is filled from the resident on the GPU.
+    if vouch == crate::runtime::gather_witness::GatherVouch::Fresh {
+        if let Some(texels) = t2t_alias_texels(pools, resource, src) {
+            let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
+            crate::runtime::drain::note_store_route("t2t_alias_copied");
+            crate::runtime::gather_witness::t2t_alias::COPIED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::runtime::drain::note_store_route_n("t2t_alias_copied_kb", src.total_len / 1024);
+            sampled.push(PreparedSampled::GuestGather {
+                binding: resource.binding,
+                array_element: resource.array_element,
+                image: img,
+                source: texels,
+                row_length_texels: 0,
+                volume: false,
+                layers: 1,
+                gathered_len: src.total_len as usize,
+            });
+            return Ok(());
+        }
+    }
     let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
     // Everything from here to the end of this arm moves bytes;
     // everything above it in `AcquireSampled` decides which image
@@ -5606,6 +5791,12 @@ pub(crate) unsafe fn execute_draw_inner(
             continue;
         };
         unsafe { outside_pass.before_record(PassObstacle::SampledUpload, pools, &ctx.device, cb) };
+        if let GuestTexels::Resident { image: src_image, access } = source {
+            unsafe {
+                copy_resident_to_sampled_image(ctx, cb, *src_image, *access, img.image, img.width, img.height)
+            };
+            continue;
+        }
         upload_buffer_to_sampled_image(
             ctx,
             cb,

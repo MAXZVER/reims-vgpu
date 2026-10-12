@@ -712,6 +712,35 @@ pub fn resident_gpu_plane(m: &MappingEntry, width: u32, height: u32) -> Option<(
 /// Factored out because the writeback and the pre-flush above must resolve it
 /// identically — a pre-flush computed at a different extent than the write
 /// would leave exactly the windows the write is about to land on.
+/// TEMP (lab, T2T_ALIAS): the guest pages and byte span a `width`x`height`
+/// BGRA8 frame lands in byte for byte - the mapping's plane is BGRA8 (no
+/// conversion), its rows are tight and it starts at the mapping's first byte -
+/// or `None` when the landing is anything else.
+pub(crate) fn lab_t2t_alias_window(state: &DeviceState, mapping_id: u32, width: u32, height: u32) -> Option<(Vec<u64>, u64)> {
+    let m = state.mappings.get(&mapping_id)?;
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
+    if mw != width
+        || mh != height
+        || (format != MTL_FORMAT_BGRA8_UNORM && format != pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB)
+    {
+        return None;
+    }
+    let (base_off, bpr, _) = mapper_ref_texture_sample_window(m, mw, mh, format)?;
+    if base_off != 0 || u64::from(bpr) != u64::from(width) * u64::from(RGBA8_BPP) {
+        return None;
+    }
+    let span = u64::from(bpr) * u64::from(height);
+    let shift = state.page_shift;
+    let pages = span.div_ceil(1u64 << shift) as usize;
+    let gpas: Option<Vec<u64>> = m
+        .page_entries
+        .get(..pages)?
+        .iter()
+        .map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, shift))
+        .collect();
+    Some((gpas?, span))
+}
+
 fn mapping_write_geometry(m: &MappingEntry, width: u32, height: u32) -> (u32, u32, u16) {
     if m.has_geom {
         (m.width, m.height, mapping_store_format(m))

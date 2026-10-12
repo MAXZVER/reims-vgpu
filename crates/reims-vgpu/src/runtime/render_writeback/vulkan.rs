@@ -108,6 +108,12 @@ struct PendingT2t {
     width: u32,
     height: u32,
     ticket: crate::backend::vulkan::engine::TargetReadTicket,
+    /// TEMP (lab, T2T diagnosis): when the readback was submitted.
+    deferred_at: std::time::Instant,
+    /// TEMP (lab, T2T_ALIAS): the resident the frame is read from, and its
+    /// version as the readback was submitted.
+    source: crate::backend::vulkan::engine::TargetIdentity,
+    source_version: Option<u64>,
 }
 
 static PENDING_T2T: std::sync::Mutex<Vec<PendingT2t>> = std::sync::Mutex::new(Vec::new());
@@ -181,12 +187,22 @@ pub(crate) fn defer_resident_into_mapping(
     if pending.len() != before {
         crate::runtime::drain::note_store_route("t2t_defer_superseded");
     }
+    if let Some(m) = state.mappings.get(&mapping_id) {
+        let first = m
+            .page_entries
+            .first()
+            .and_then(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, state.page_shift));
+        crate::runtime::gather_witness::lab_t2t_diag::note_defer(first, m.page_entries.len(), mapping_id);
+    }
     pending.push(PendingT2t {
         mapping_id,
         map_generation,
         width,
         height,
         ticket,
+        deferred_at: std::time::Instant::now(),
+        source: identity.clone(),
+        source_version: crate::backend::vulkan::engine::resident_version_nowait(identity),
     });
     T2T_PENDING_N.store(pending.len(), std::sync::atomic::Ordering::Release);
     crate::runtime::drain::note_store_route("t2t_deferred");
@@ -194,7 +210,9 @@ pub(crate) fn defer_resident_into_mapping(
 }
 
 /// TEMP (lab T2T_DEFER): land the owed T2T frames - those for `only`, or all.
+#[track_caller]
 pub(crate) fn land_t2t<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, only: Option<u32>) {
+    let lab_site = std::panic::Location::caller();
     let taken: Vec<PendingT2t> = {
         let mut pending = PENDING_T2T.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
@@ -219,7 +237,11 @@ pub(crate) fn land_t2t<M: HostMemory + HostOps>(state: &mut DeviceState, host: &
             crate::runtime::drain::note_store_route("t2t_defer_dropped");
             continue; // the ticket's drop returns the lease
         }
-        match crate::backend::vulkan::engine::finish_target_read_leased(p.ticket) {
+        let lab_age = p.deferred_at.elapsed().as_micros() as u64;
+        let lab_t0 = std::time::Instant::now();
+        let finished = crate::backend::vulkan::engine::finish_target_read_leased(p.ticket);
+        let lab_wait = lab_t0.elapsed().as_micros() as u64;
+        match finished {
             Ok(Some(frame)) => {
                 let ok = crate::runtime::mapping_write::write_bgra8_uncached(
                     state,
@@ -231,6 +253,23 @@ pub(crate) fn land_t2t<M: HostMemory + HostOps>(state: &mut DeviceState, host: &
                     p.height,
                 );
                 drop(frame);
+                // TEMP (lab, T2T_ALIAS): name the landed pages and the frame in them.
+                if ok && crate::runtime::gather_witness::t2t_alias::on() {
+                    if let (Some(version), Some((gpas, span))) = (
+                        p.source_version,
+                        crate::runtime::mapping_write::lab_t2t_alias_window(state, p.mapping_id, p.width, p.height),
+                    ) {
+                        let alias = crate::backend::vulkan::engine::t2t_alias_register(p.source.clone(), version);
+                        crate::runtime::gather_witness::t2t_alias::note_landed(gpas, span, alias);
+                        crate::runtime::drain::note_store_route("t2t_alias_landed");
+                    }
+                }
+                crate::runtime::gather_witness::lab_t2t_diag::note_land(
+                    lab_site,
+                    lab_age,
+                    lab_wait,
+                    (lab_t0.elapsed().as_micros() as u64).saturating_sub(lab_wait),
+                );
                 crate::runtime::drain::note_store_route(if ok { "t2t_defer_landed" } else { "t2t_defer_write_refused" });
                 if !ok {
                     crate::observe::fail(format!(

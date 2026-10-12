@@ -1390,6 +1390,7 @@ pub(crate) fn commit_gather<M: crate::runtime::host::HostOps>(
         note_store_route(route);
     }
     note_observation(&plan.seen, plan.key, plan.span);
+    t2t_alias::note_decided(plan.seen.verdict, plan.seen.generation, gpas, plan.span); // TEMP (lab, T2T_ALIAS)
     // TEMP (lab, STRIPE_HUNT): the planned-commit twin of `note_gather`'s hook,
     // so a drain-planned bind is counted under the same per-present columns.
     crate::runtime::stripe_hunt::note_gather_bind(
@@ -1549,6 +1550,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     let (rail_count, rail_kb) = rail.names();
     note_store_route(rail_count);
     note_store_route_n(rail_kb, span / 1024);
+    lab_t2t_diag::note_gather_window(window.gpas, span);
 
     // Both writers' accounts, taken before the witness is touched: the
     // page-exact question needs the epoch recorded at the *previous* bind, which
@@ -1580,8 +1582,10 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     // touched for the same reason the host-write epoch is: it has to describe the
     // moment the inferred half is asked about, not a moment after it.
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_ng_observe_us"); // TEMP (lab)
+    let lab_gpas = window.gpas;
     let seen = observe(&mut state.gather_witness, host, key, window, counts, fresh);
     drop(lab_span);
+    t2t_alias::note_decided(seen.verdict, seen.generation, lab_gpas, span); // TEMP (lab, T2T_ALIAS)
     // TEMP (lab, STRIPE_HUNT): the witness answered — a vouch serves the
     // retained image without reading a byte (the false-quiet population), a
     // refusal spends the generation and gathers.
@@ -1827,6 +1831,280 @@ pub fn install_skip_guard(ops: &crate::qemu::host_ops::ReimsVgpuHostOps) {
 /// TEMP (lab, SKIP_GUARD, tests): install a fake generation read over
 /// whatever is there (a `device_create` in another test may have installed the
 /// real table first), and return the previous one so the caller can restore it.
+/// TEMP (lab, T2T diagnosis 2026-10-12): where a deferred T2T frame lands, how
+/// old it is then, what its landing waits and writes, and whether the large
+/// gathers of the frame read the pages a T2T frame was just landed in (the
+/// full-screen compositor samples Maps' surface by guest pages, not by the
+/// mapping the frame lands in). One `lab_t2t_diag` line a second.
+/// TEMP (lab, T2T_ALIAS, live `T2T_ALIAS`, else `REIMS_VGPU_LAB_T2T_ALIAS=off` to
+/// disable): the guest pages a T2T frame was just landed in, so the bind that
+/// gathers them back can copy the frame from the GPU instead.
+///
+/// b291 (full-screen 5K Maps): ~30 T2T frames a second are read back from the
+/// GPU and landed in the guest's pages, and 20-43 a second of the compositor's
+/// binds then gather exactly those pages (44 MB each) back up - the window is
+/// re-pointed by our own write, the witness spends a generation, and the engine
+/// re-reads the bytes it wrote. When the witness refuses a window *only* because
+/// this device wrote it (the guest half quiet) and the window is exactly the
+/// pages a landing filled from a resident, the generation it mints names those
+/// bytes, and those bytes are the resident's as of the landing; the engine
+/// copies the resident into the image it retains under that identity if the
+/// resident is still at that version (`sample_guest_runs`), and gathers
+/// otherwise. Everything after the fill - retention, the next quiet bind's hit,
+/// the skip guard - is the gather's own.
+pub(crate) mod t2t_alias {
+    use super::GatherVerdict;
+    use std::sync::Mutex;
+
+    struct Landed {
+        gpas: Vec<u64>,
+        span: u64,
+        alias: u64,
+    }
+
+    static LANDED: Mutex<Vec<Landed>> = Mutex::new(Vec::new());
+    /// Census for the `lab_t2t_diag` line: generations confirmed, windows
+    /// filled from the resident, and confirmed windows the engine declined.
+    pub(crate) static CONFIRMED_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static COPIED_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static DECLINED_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Large (1 MB+) windows' witness decisions: rearmed, unarmed, vouched,
+    /// guest wrote, host only, both - and their kilobytes.
+    pub(crate) static BIG_VERDICTS: [std::sync::atomic::AtomicU64; 6] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+    pub(crate) static BIG_VERDICT_KB: [std::sync::atomic::AtomicU64; 6] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+    /// `(generation, alias)`: a generation the witness minted for a landed
+    /// window refused only for this device's write. Generations are issued once
+    /// device-wide, so the generation alone names the identity.
+    static CONFIRMED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn on() -> bool {
+        if cfg!(test) {
+            return false;
+        }
+        if let Some(on) = crate::runtime::lab_live::on("T2T_ALIAS") {
+            return on;
+        }
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_T2T_ALIAS").as_deref() != Ok("off"))
+    }
+
+    /// A landing filled `gpas` (the window's pages, in order) with `span` bytes
+    /// of the frame `alias` names.
+    pub(crate) fn note_landed(gpas: Vec<u64>, span: u64, alias: u64) {
+        if gpas.is_empty() {
+            return;
+        }
+        let mut landed = LANDED.lock().unwrap_or_else(|e| e.into_inner());
+        landed.retain(|l| l.gpas.first() != gpas.first());
+        landed.push(Landed { gpas, span, alias });
+        if landed.len() > 8 {
+            landed.remove(0);
+        }
+    }
+
+    /// A witness decision: confirm the generation it minted when the window is a
+    /// landed one and only this device wrote it.
+    pub(crate) fn note_decided(verdict: GatherVerdict, generation: u64, gpas: &[u64], span: u64) {
+        if span >= (1 << 20) {
+            let i = match verdict {
+                GatherVerdict::Rearmed => 0,
+                GatherVerdict::Unarmed => 1,
+                GatherVerdict::Vouched => 2,
+                GatherVerdict::Refused { guest_wrote: true, host_wrote_pages: false } => 3,
+                GatherVerdict::Refused { guest_wrote: false, host_wrote_pages: true } => 4,
+                GatherVerdict::Refused { .. } => 5,
+            };
+            BIG_VERDICTS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            BIG_VERDICT_KB[i].fetch_add(span / 1024, std::sync::atomic::Ordering::Relaxed);
+        }
+        if !matches!(
+            verdict,
+            GatherVerdict::Refused {
+                guest_wrote: false,
+                host_wrote_pages: true
+            }
+        ) || gpas.is_empty()
+            || !on()
+        {
+            return;
+        }
+        let alias = {
+            let landed = LANDED.lock().unwrap_or_else(|e| e.into_inner());
+            landed
+                .iter()
+                .find(|l| l.span == span && l.gpas.as_slice() == gpas)
+                .map(|l| l.alias)
+        };
+        let Some(alias) = alias else {
+            return;
+        };
+        let mut confirmed = CONFIRMED.lock().unwrap_or_else(|e| e.into_inner());
+        confirmed.push((generation, alias));
+        if confirmed.len() > 32 {
+            confirmed.remove(0);
+        }
+        crate::runtime::drain::note_store_route("t2t_alias_confirmed");
+        CONFIRMED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The frame a confirmed generation names, if any.
+    pub(crate) fn confirmed(generation: u64) -> Option<u64> {
+        if !on() {
+            return None;
+        }
+        CONFIRMED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|(g, _)| *g == generation)
+            .map(|(_, a)| *a)
+    }
+}
+
+pub(crate) mod lab_t2t_diag {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    #[derive(Default)]
+    struct Diag {
+        /// The page-0 guest address and page count of the last T2T destinations.
+        recent: Vec<(u64, usize, u32)>,
+        sites: Vec<((&'static str, u32), u64)>,
+        land_n: u64,
+        age_us: u64,
+        wait_us: u64,
+        write_us: u64,
+        gather_t2t_n: u64,
+        gather_t2t_kb: u64,
+        gather_t2t_first: u64,
+        gather_big_n: u64,
+        gather_big_kb: u64,
+        last: Option<Instant>,
+    }
+
+    static DIAG: Mutex<Diag> = Mutex::new(Diag {
+        recent: Vec::new(),
+        sites: Vec::new(),
+        land_n: 0,
+        age_us: 0,
+        wait_us: 0,
+        write_us: 0,
+        gather_t2t_n: 0,
+        gather_t2t_kb: 0,
+        gather_t2t_first: 0,
+        gather_big_n: 0,
+        gather_big_kb: 0,
+        last: None,
+    });
+
+    fn flush(d: &mut Diag) {
+        let now = Instant::now();
+        let due = d.last.is_none_or(|t| now.duration_since(t).as_millis() >= 1000);
+        if !due {
+            return;
+        }
+        d.last = Some(now);
+        if d.land_n == 0 && d.gather_t2t_n == 0 && d.gather_big_n == 0 {
+            return;
+        }
+        let sites: Vec<String> = d
+            .sites
+            .iter()
+            .map(|((f, l), n)| format!("{}:{l}={n}", f.rsplit(['/', '\\']).next().unwrap_or(f)))
+            .collect();
+        crate::observe::off(format!(
+            "lab_t2t_diag land_n={} age_us={} wait_us={} write_us={} sites={} gather_t2t_n={} gather_t2t_kb={} \
+             gather_t2t_first={} gather_big_other_n={} gather_big_other_kb={} alias_confirmed={} alias_copied={} \
+             alias_declined={} big_verdicts={}",
+            d.land_n,
+            d.age_us,
+            d.wait_us,
+            d.write_us,
+            if sites.is_empty() { "-".to_string() } else { sites.join(",") },
+            d.gather_t2t_n,
+            d.gather_t2t_kb,
+            d.gather_t2t_first,
+            d.gather_big_n,
+            d.gather_big_kb,
+            super::t2t_alias::CONFIRMED_N.swap(0, std::sync::atomic::Ordering::Relaxed),
+            super::t2t_alias::COPIED_N.swap(0, std::sync::atomic::Ordering::Relaxed),
+            super::t2t_alias::DECLINED_N.swap(0, std::sync::atomic::Ordering::Relaxed),
+            (0..6)
+                .map(|i| format!(
+                    "{}/{}",
+                    super::t2t_alias::BIG_VERDICTS[i].swap(0, std::sync::atomic::Ordering::Relaxed),
+                    super::t2t_alias::BIG_VERDICT_KB[i].swap(0, std::sync::atomic::Ordering::Relaxed) >> 10
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+        ));
+        d.sites.clear();
+        d.land_n = 0;
+        d.age_us = 0;
+        d.wait_us = 0;
+        d.write_us = 0;
+        d.gather_t2t_n = 0;
+        d.gather_t2t_kb = 0;
+        d.gather_t2t_first = 0;
+        d.gather_big_n = 0;
+        d.gather_big_kb = 0;
+    }
+
+    pub(crate) fn note_defer(first_gpa: Option<u64>, pages: usize, mapping_id: u32) {
+        if cfg!(test) {
+            return;
+        }
+        let Some(first) = first_gpa else { return };
+        let mut d = DIAG.lock().unwrap_or_else(|e| e.into_inner());
+        d.recent.retain(|r| r.0 != first);
+        d.recent.push((first, pages, mapping_id));
+        if d.recent.len() > 8 {
+            d.recent.remove(0);
+        }
+    }
+
+    pub(crate) fn note_land(site: &'static std::panic::Location<'static>, age_us: u64, wait_us: u64, write_us: u64) {
+        if cfg!(test) {
+            return;
+        }
+        let mut d = DIAG.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (site.file(), site.line());
+        match d.sites.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += 1,
+            None => d.sites.push((key, 1)),
+        }
+        d.land_n += 1;
+        d.age_us += age_us;
+        d.wait_us += wait_us;
+        d.write_us += write_us;
+        flush(&mut d);
+    }
+
+    pub(crate) fn note_gather_window(gpas: &[u64], span: u64) {
+        if cfg!(test) {
+            return;
+        }
+        if span < (1 << 20) || gpas.is_empty() {
+            return;
+        }
+        let mut d = DIAG.lock().unwrap_or_else(|e| e.into_inner());
+        let hit = d.recent.iter().any(|r| gpas.contains(&r.0));
+        let first = d.recent.iter().any(|r| gpas[0] == r.0);
+        if hit {
+            d.gather_t2t_n += 1;
+            d.gather_t2t_kb += span / 1024;
+            d.gather_t2t_first += u64::from(first);
+        } else {
+            d.gather_big_n += 1;
+            d.gather_big_kb += span / 1024;
+        }
+        flush(&mut d);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn install_skip_guard_for_test(read: SkipGuardGen) -> Option<SkipGuardGen> {
     skip_guard_gen_slot()
