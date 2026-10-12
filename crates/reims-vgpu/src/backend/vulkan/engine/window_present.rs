@@ -219,6 +219,10 @@ enum StagingError {
     NoUploadMemoryType {
         type_bits: u32,
     },
+    NoBridgeMemoryType {
+        type_bits: u32,
+    },
+    UnsupportedBlit(reims_vgpu_vulkan::scanout_staging::Unsupported),
 }
 
 impl crate::observe::Decline for StagingError {
@@ -226,6 +230,8 @@ impl crate::observe::Decline for StagingError {
         match self {
             Self::Call(call) => call.slug(),
             Self::NoUploadMemoryType { .. } => "window_staging_no_upload_memory_type",
+            Self::NoBridgeMemoryType { .. } => "window_staging_no_bridge_memory_type",
+            Self::UnsupportedBlit(..) => "window_staging_no_blit_source",
         }
     }
 
@@ -234,16 +240,28 @@ impl crate::observe::Decline for StagingError {
     fn owner(&self) -> &'static str {
         match self {
             Self::Call(call) => call.owner(),
-            Self::NoUploadMemoryType { .. } => std::any::type_name::<Self>(),
+            Self::NoUploadMemoryType { .. }
+            | Self::NoBridgeMemoryType { .. }
+            | Self::UnsupportedBlit(..) => std::any::type_name::<Self>(),
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::Call(call) => call.fields(),
-            Self::NoUploadMemoryType { type_bits } => {
+            Self::NoUploadMemoryType { type_bits } | Self::NoBridgeMemoryType { type_bits } => {
                 vec![("type_bits", format!("{type_bits:#x}"))]
             }
+            Self::UnsupportedBlit(features) => vec![
+                (
+                    "linear_features",
+                    format!("{:#x}", features.linear.as_raw()),
+                ),
+                (
+                    "optimal_features",
+                    format!("{:#x}", features.optimal.as_raw()),
+                ),
+            ],
         }
     }
 }
@@ -285,7 +303,8 @@ struct MappedStaging(*mut u8);
 unsafe impl Send for MappedStaging {}
 
 /// Host-visible LINEAR image the CPU fallback frame is copied into, then
-/// scale-blitted into the acquired swapchain image.
+/// scale-blitted into the acquired swapchain image, through an OPTIMAL bridge
+/// when the host's LINEAR format supports copies but not filtered blits.
 ///
 /// LINEAR because the copy is a host write through a persistent map, and a host
 /// write to an OPTIMAL image has no defined layout. Row pitch comes from the
@@ -306,10 +325,22 @@ struct StagingImage {
     /// [`WindowCpuFrame::seq`] of the bytes currently held, or `None` for a
     /// freshly created image that holds no frame.
     staged_seq: Option<u64>,
+    /// A LINEAR image may be transfer-only. Copy it into this OPTIMAL image
+    /// before the filtered blit instead of treating copy support as blit support.
+    bridge: Option<StagingBridge>,
+}
+
+struct StagingBridge {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
 }
 
 impl StagingImage {
     unsafe fn destroy(self, device: &ash::Device) {
+        if let Some(bridge) = self.bridge {
+            device.destroy_image(bridge.image, None);
+            device.free_memory(bridge.memory, None);
+        }
         device.unmap_memory(self.memory);
         device.destroy_image(self.image, None);
         device.free_memory(self.memory, None);
@@ -321,9 +352,9 @@ impl StagingImage {
 /// A resident lives in whatever layout its last draw left it and moves to
 /// `TRANSFER_SRC_OPTIMAL`. The staging image is host-written through a
 /// persistent map, so it must stay in a layout that permits host access —
-/// `GENERAL` — and needs a `HOST_WRITE → TRANSFER_READ` barrier instead of a
-/// layout transition. Reading a host-written image from `TRANSFER_SRC_OPTIMAL`
-/// is the defect this distinction exists to prevent.
+/// `GENERAL` — and needs a `HOST_WRITE → TRANSFER_READ` barrier. When LINEAR
+/// blits are unsupported, that transfer is a copy into the OPTIMAL bridge,
+/// which then moves to `TRANSFER_SRC_OPTIMAL` for the blit.
 #[derive(Clone, Copy)]
 enum BlitSource {
     Resident {
@@ -335,6 +366,7 @@ enum BlitSource {
     },
     Staged {
         image: vk::Image,
+        bridge: Option<vk::Image>,
         /// The image has never left `PREINITIALIZED`, so that is the layout the
         /// barrier must declare — only `PREINITIALIZED` and `GENERAL` preserve
         /// contents, and declaring the wrong one discards the frame just
@@ -348,7 +380,8 @@ enum BlitSource {
 impl BlitSource {
     fn image(&self) -> vk::Image {
         match self {
-            Self::Resident { image, .. } | Self::Staged { image, .. } => *image,
+            Self::Resident { image, .. } => *image,
+            Self::Staged { image, bridge, .. } => bridge.unwrap_or(*image),
         }
     }
 
@@ -384,7 +417,11 @@ impl BlitSource {
                 next_access.layout()
             }
             Self::Staged {
-                image, first_use, ..
+                image,
+                bridge,
+                first_use,
+                width,
+                height,
             } => {
                 let old = if *first_use {
                     vk::ImageLayout::PREINITIALIZED
@@ -402,7 +439,59 @@ impl BlitSource {
                     vk::PipelineStageFlags::HOST,
                     vk::PipelineStageFlags::TRANSFER,
                 );
-                vk::ImageLayout::GENERAL
+                if let Some(bridge) = bridge {
+                    image_barrier(
+                        device,
+                        cmd,
+                        *bridge,
+                        if *first_use {
+                            vk::ImageLayout::UNDEFINED
+                        } else {
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                        },
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        if *first_use {
+                            vk::AccessFlags::empty()
+                        } else {
+                            vk::AccessFlags::TRANSFER_READ
+                        },
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                    );
+                    let layers = vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1);
+                    device.cmd_copy_image(
+                        cmd,
+                        *image,
+                        vk::ImageLayout::GENERAL,
+                        *bridge,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[vk::ImageCopy::default()
+                            .src_subresource(layers)
+                            .dst_subresource(layers)
+                            .extent(vk::Extent3D {
+                                width: *width,
+                                height: *height,
+                                depth: 1,
+                            })],
+                    );
+                    image_barrier(
+                        device,
+                        cmd,
+                        *bridge,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                    );
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                } else {
+                    vk::ImageLayout::GENERAL
+                }
             }
         }
     }
@@ -1421,10 +1510,9 @@ impl WindowPresenter {
         // leaves the slot for the next attempt.
         self.frame_ix = (frame_ix + 1) % self.frames.len();
         if matches!(blit, Some(BlitSource::Staged { .. })) {
-            // The barrier that leaves the staging image in GENERAL is now
-            // queued. Recorded only after the submit succeeds: a failed submit
-            // never executes it, and declaring GENERAL as the old layout of an
-            // image still in PREINITIALIZED discards the frame it holds.
+            // The LINEAR source's GENERAL transition and, if present, the
+            // bridge's TRANSFER_SRC transition are queued. A failed submit
+            // executes neither, so both first-use layouts advance together.
             if let Some(staging) = self.staging.as_mut() {
                 staging.transitioned = true;
             }
@@ -1556,6 +1644,7 @@ impl WindowPresenter {
         }
         Some(BlitSource::Staged {
             image: staging.image,
+            bridge: staging.bridge.as_ref().map(|bridge| bridge.image),
             first_use: !staging.transitioned,
             width: staging.width,
             height: staging.height,
@@ -1583,6 +1672,11 @@ impl WindowPresenter {
         if let Some(old) = self.staging.take() {
             old.destroy(&ctx.device);
         }
+        let properties = ctx
+            .instance
+            .get_physical_device_format_properties(ctx.pd, translate::pixel::SCANOUT_FORMAT);
+        let plan = reims_vgpu_vulkan::scanout_staging::cpu_blit_source(properties)
+            .map_err(StagingError::UnsupportedBlit)?;
         let image = ctx
             .device
             .create_image(
@@ -1667,7 +1761,20 @@ impl WindowPresenter {
             offset: layout.offset,
             transitioned: false,
             staged_seq: None,
+            bridge: None,
         });
+        if plan == reims_vgpu_vulkan::scanout_staging::CpuBlitSource::CopyToOptimal {
+            match create_staging_bridge(ctx, width, height) {
+                Ok(bridge) => self.staging.as_mut().expect("created above").bridge = Some(bridge),
+                Err(error) => {
+                    self.staging
+                        .take()
+                        .expect("created above")
+                        .destroy(&ctx.device);
+                    return Err(error);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1857,6 +1964,69 @@ fn swapchain_recreated_line(
          present_mode={mode} images={images}",
         from.width, from.height, to.width, to.height
     )
+}
+
+/// The copy destination used only when the CPU image cannot be a blit source.
+unsafe fn create_staging_bridge(
+    ctx: &DeviceContext,
+    width: u32,
+    height: u32,
+) -> Result<StagingBridge, StagingError> {
+    let image = ctx
+        .device
+        .create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(translate::pixel::SCANOUT_FORMAT)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+                .initial_layout(vk::ImageLayout::UNDEFINED),
+            None,
+        )
+        .map_err(|error| StagingError::Call(VkCall::new(VkOp::WindowCreateStagingImage, error)))?;
+    let requirements = ctx.device.get_image_memory_requirements(image);
+    let Some(memory_type) = ctx.memory_type_for(
+        requirements.memory_type_bits,
+        requirements.size,
+        crate::backend::vulkan::caps::MemoryClass::DeviceLocal,
+    ) else {
+        ctx.device.destroy_image(image, None);
+        return Err(StagingError::NoBridgeMemoryType {
+            type_bits: requirements.memory_type_bits,
+        });
+    };
+    let memory = match ctx.device.allocate_memory(
+        &vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type),
+        None,
+    ) {
+        Ok(memory) => memory,
+        Err(error) => {
+            ctx.device.destroy_image(image, None);
+            return Err(StagingError::Call(VkCall::new(
+                VkOp::WindowAllocateStagingMemory,
+                error,
+            )));
+        }
+    };
+    if let Err(error) = ctx.device.bind_image_memory(image, memory, 0) {
+        ctx.device.destroy_image(image, None);
+        ctx.device.free_memory(memory, None);
+        return Err(StagingError::Call(VkCall::new(
+            VkOp::WindowBindStagingMemory,
+            error,
+        )));
+    }
+    Ok(StagingBridge { image, memory })
 }
 
 /// The three gates that can refuse a present, kept apart because they have

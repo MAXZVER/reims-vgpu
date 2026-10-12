@@ -113,6 +113,7 @@ pub mod recording;
 pub mod renderpass;
 pub mod resident;
 pub mod sampler;
+pub mod scanout_staging;
 pub mod staging;
 pub mod submission;
 pub mod swapchain;
