@@ -702,6 +702,12 @@ impl Handoff {
     #[track_caller]
     fn wait_below(&self, depth: u32) {
         let started = Instant::now();
+        // TEMP (lab): the depth this wait was asked for and the queue it found -
+        // the recorder idles ~80 % of full-screen Maps (b270) while the drain
+        // waits here 10 % of its busy time, which only a small depth explains.
+        LAB_BELOW_DEPTH.store(depth, Ordering::Relaxed);
+        LAB_BELOW_OUT_MAX.fetch_max(self.out_n.load(Ordering::Acquire), Ordering::Relaxed);
+        LAB_BELOW_N.fetch_add(1, Ordering::Relaxed);
         // A slot frees within one job (~5 us a draw), while a park on
         // `done_cv` costs a Windows wake (20-50 us) and makes the worker pay a
         // notify per job: spin for it first, as a settle does.
@@ -798,8 +804,12 @@ impl Handoff {
         any.then(|| {
             format!(
                 "recorder win_ms={win_ms} deferred={submitted} busy_us={} wakes={wakes} \
-                 prewakes={prewakes} deferred_err={err} submit_declined={declined}{body} top={}",
+                 prewakes={prewakes} deferred_err={err} submit_declined={declined}{body} \
+                 lab_below_n={} lab_below_depth={} lab_below_out_max={} top={}",
                 busy / 1000,
+                LAB_BELOW_N.swap(0, Ordering::Relaxed),
+                LAB_BELOW_DEPTH.load(Ordering::Relaxed),
+                LAB_BELOW_OUT_MAX.swap(0, Ordering::Relaxed),
                 if top.is_empty() {
                     "-".to_string()
                 } else {
@@ -846,6 +856,11 @@ pub(super) fn apply_thread_priority(_priority: Option<i32>) {}
 
 /// The process's recorder: draws only.
 pub(crate) static DRAW: Handoff = Handoff::new("reims-vgpu-recorder");
+
+// TEMP (lab): see `wait_below`.
+static LAB_BELOW_DEPTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static LAB_BELOW_OUT_MAX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static LAB_BELOW_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// TEMP (lab, live `RETAIN_FAST`): the resident identities the deferred draws
 /// still out will register or write - each job's colour targets and depth -
