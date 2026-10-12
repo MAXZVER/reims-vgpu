@@ -841,6 +841,8 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // so it cannot land on top of this one later. The landing's own write took
     // its entry out before writing, so this finds nothing for it.
     crate::runtime::render_writeback::land_t2t(state, host, Some(mapping_id));
+    // TEMP (lab, T2T_PARK): and one owed to these pages through another mapping.
+    crate::runtime::render_writeback::land_t2t_over_mapping(state, host, mapping_id);
     if !scanout_extent_ok(width, height) {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }

@@ -114,6 +114,11 @@ struct PendingT2t {
     /// version as the readback was submitted.
     source: crate::backend::vulkan::engine::TargetIdentity,
     source_version: Option<u64>,
+    /// TEMP (lab, T2T_PARK): the window the frame is owed to, when it parks.
+    window: Option<std::sync::Arc<t2t_park::Window>>,
+    /// TEMP (lab, T2T_PARK): the witness generation it was last bound to.
+    served_gen: Option<u64>,
+    served: Option<std::sync::Arc<t2t_park::Served>>,
 }
 
 static PENDING_T2T: std::sync::Mutex<Vec<PendingT2t>> = std::sync::Mutex::new(Vec::new());
@@ -151,8 +156,9 @@ pub(crate) fn lab_t2t_defer_on() -> bool {
 /// orders it against a later guest claim, which the landing reads back through
 /// `licence_of`), and the host surface cache, which would otherwise serve the
 /// previous frame, is dropped.
-pub(crate) fn defer_resident_into_mapping(
+pub(crate) fn defer_resident_into_mapping<M: HostMemory + HostOps>(
     state: &mut DeviceState,
+    host: &mut M,
     mapping_id: u32,
     identity: &crate::backend::vulkan::engine::TargetIdentity,
     width: u32,
@@ -179,13 +185,30 @@ pub(crate) fn defer_resident_into_mapping(
     };
     state.note_surface_content_published(mapping_id);
     crate::runtime::surface_cache::forget(state, mapping_id);
+    // TEMP (lab, T2T_PARK): the window it is owed to, when it may park.
+    let window = if t2t_park::on() {
+        crate::runtime::mapping_write::lab_t2t_alias_window(state, mapping_id, width, height)
+            .map(|(gpas, span)| std::sync::Arc::new(t2t_park::Window::new(gpas, span)))
+    } else {
+        None
+    };
+    // TEMP (lab, T2T_PARK): the frame is the surface's content from here, as
+    // though it had landed: stamp the guest-write generation now, so a guest
+    // store after this point is one the landing writes around (it would sit on
+    // top of the landed frame), and one before it is one the frame covers.
+    if window.is_some() {
+        let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);
+        crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
+    }
     let mut pending = PENDING_T2T.lock().unwrap_or_else(|e| e.into_inner());
     // A whole-plane copy into the same mapping supersedes an older one nobody
     // has read: no reader landed it, and this frame replaces all of it.
     let before = pending.len();
+    let parked_before = pending.iter().filter(|p| p.mapping_id == mapping_id && p.window.is_some()).count();
     pending.retain(|p| p.mapping_id != mapping_id);
     if pending.len() != before {
         crate::runtime::drain::note_store_route("t2t_defer_superseded");
+        t2t_park::SUPERSEDED_N.fetch_add(parked_before as u64, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(m) = state.mappings.get(&mapping_id) {
         let first = m
@@ -203,31 +226,354 @@ pub(crate) fn defer_resident_into_mapping(
         deferred_at: std::time::Instant::now(),
         source: identity.clone(),
         source_version: crate::backend::vulkan::engine::resident_version_nowait(identity),
+        window: window.clone(),
+        served_gen: None,
+        served: None,
     });
+    if window.is_some() {
+        t2t_park::PARKED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     T2T_PENDING_N.store(pending.len(), std::sync::atomic::Ordering::Release);
+    t2t_park::PARKED_N.store(
+        pending.iter().filter(|p| p.window.is_some()).count(),
+        std::sync::atomic::Ordering::Release,
+    );
     crate::runtime::drain::note_store_route("t2t_deferred");
     true
+}
+
+/// TEMP (lab, T2T_PARK, live `T2T_PARK`, else `REIMS_VGPU_LAB_T2T_PARK=off` to
+/// disable): a deferred T2T frame whose window is the plain one (a tight BGRA8
+/// plane from byte zero) *parks* - the tranche end does not land it.
+///
+/// b308 (A/B x4, full-screen 5K Maps): 28.7 -> 31.1 fps, better in 4/4 pairs, iv
+/// p50 30-33 -> 22-29 ms; b307 (sampler): landing 8.4 -> 1.3 % of the drain.
+///
+/// b290/b291 (full-screen 5K Maps): 33 frames a second land at the tranche end,
+/// ~2 ms waiting the GPU and ~4 ms writing 44 MB plus the rebase hash each
+/// (~12 % of the busy drain after REBASE_SPLIT), and their one reader is the
+/// compositor, which gathers exactly those pages back (`gw_rail_t11`, 28/s).
+/// Parked, the frame is owed to its pages exactly as a deferred one is, and:
+///
+/// * a sampled gather of exactly its window is bound to it by the witness
+///   ([`crate::runtime::gather_witness::note_gather`]): a Fresh generation the
+///   engine fills from the frame's source resident (unchanged since) or from
+///   its readback slot - never from the pages, which do not hold it yet;
+/// * any other reader of its pages lands it first - the named readers
+///   (`pay_for_mapping`, `pay_for_texture`, a device write, a delete or an
+///   invalidate/synchronize packet, as for every deferred frame) and, through another mapping or a
+///   GVA, any gather or pay over overlapping pages ([`t2t_park_before_gather`],
+///   [`land_t2t_over_mapping`]); a planned (pool-side) read over them is
+///   declined (`writes_pending_over`); a GPU address-space map or unmap does
+///   not land it (its pages are its surface backing's - only a delete gives
+///   them back, and a delete lands every frame);
+/// * a newer whole-plane frame into the same mapping supersedes it unlanded;
+/// * the tranche end lands it once it is [`MAX_AGE`] old, so a guest CPU
+///   reader of a surface that stopped changing sees it.
+pub(crate) mod t2t_park {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    /// The tranche end lands a parked frame this old.
+    pub(crate) const MAX_AGE: std::time::Duration = std::time::Duration::from_millis(200);
+
+    pub(crate) fn on() -> bool {
+        if cfg!(test) {
+            return false;
+        }
+        if let Some(on) = crate::runtime::lab_live::on("T2T_PARK") {
+            return on;
+        }
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_T2T_PARK").as_deref() != Ok("off"))
+    }
+
+    /// The pages a parked frame is owed to: the window's page list in order, as
+    /// a set for overlap questions, and its byte length.
+    ///
+    /// b304/b306: an overlap test over a hash set of the window's pages was
+    /// 5-14 % of the busy drain (every gather and named pay asks it while a
+    /// frame is parked, which is nearly always) and building the set per parked
+    /// frame was a fifth of that. A bit per page number (modulo `BITS`, ~1 %
+    /// full for a 5K window) answers nearly every page with one test; a set bit
+    /// is confirmed by binary search in the sorted page list.
+    pub(crate) struct Window {
+        pub(crate) gpas: Vec<u64>,
+        sorted: Vec<u64>,
+        bits: Vec<u64>,
+        pub(crate) span: u64,
+    }
+
+    const BITS: u64 = 1 << 20;
+
+    fn bit(gpa: u64) -> (usize, u64) {
+        let k = (gpa >> 12) & (BITS - 1);
+        ((k >> 6) as usize, 1u64 << (k & 63))
+    }
+
+    impl Window {
+        pub(crate) fn new(gpas: Vec<u64>, span: u64) -> Self {
+            let mut sorted = gpas.clone();
+            sorted.sort_unstable();
+            let mut bits = vec![0u64; (BITS / 64) as usize];
+            for &g in &gpas {
+                let (i, m) = bit(g);
+                bits[i] |= m;
+            }
+            Self { gpas, sorted, bits, span }
+        }
+
+        pub(crate) fn contains(&self, gpa: u64) -> bool {
+            let (i, m) = bit(gpa);
+            self.bits[i] & m != 0 && self.sorted.binary_search(&gpa).is_ok()
+        }
+
+        pub(crate) fn overlaps(&self, mut gpas: impl Iterator<Item = u64>) -> bool {
+            gpas.any(|g| self.contains(g))
+        }
+    }
+
+    /// What a witness generation bound to a parked frame names: the frame's
+    /// source resident and its version as the readback was submitted, and the
+    /// readback slot.
+    pub(crate) struct Served {
+        pub(crate) source: crate::backend::vulkan::engine::TargetIdentity,
+        pub(crate) version: Option<u64>,
+        pub(crate) readback: crate::backend::vulkan::engine::ParkedReadback,
+    }
+
+    /// Generations bound to a parked frame, newest last. Each holds the slot's
+    /// lease, so the list is short: a bind that is never recorded keeps a slot
+    /// out only until four newer binds push it off.
+    static SERVED: Mutex<Vec<(u64, Arc<Served>)>> = Mutex::new(Vec::new());
+    const SERVED_CAP: usize = 4;
+
+    /// Parked frames now - the one atomic every overlap question opens with.
+    pub(crate) static PARKED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    /// Census for the `lab_t2t_diag` line.
+    pub(crate) static PARKED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static SUPERSEDED_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static BOUND_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static KEPT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static LANDED_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static SERVED_RES_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static SERVED_RB_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Parked frames landed by a map-family command, by the drain's arm: map,
+    /// unmap, unmap with no resolved page (all three land none), delete,
+    /// invalidate, synchronize.
+    pub(crate) static MAP_LANDED: [std::sync::atomic::AtomicU64; 6] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+    pub(crate) fn any() -> bool {
+        PARKED_N.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    /// The frame a generation was bound to, if it is still listed.
+    pub(crate) fn served(generation: u64) -> Option<Arc<Served>> {
+        if !any() && SERVED.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return None;
+        }
+        let served = SERVED.lock().unwrap_or_else(|e| e.into_inner());
+        served.iter().rev().find(|(g, _)| *g == generation).map(|(_, s)| Arc::clone(s))
+    }
+
+    pub(super) fn list_served(generation: u64, served: Arc<Served>) {
+        let mut list = SERVED.lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|(g, _)| *g != generation);
+        list.push((generation, served));
+        while list.len() > SERVED_CAP {
+            list.remove(0);
+        }
+    }
+
+    /// Whether any parked frame is owed to one of `gpas`.
+    pub(crate) fn over(gpas: &[u64]) -> bool {
+        if !any() {
+            return false;
+        }
+        let pending = super::PENDING_T2T.lock().unwrap_or_else(|e| e.into_inner());
+        pending
+            .iter()
+            .any(|p| p.window.as_ref().is_some_and(|w| w.overlaps(gpas.iter().copied())))
+    }
+}
+
+/// TEMP (lab, T2T_PARK): before a sampled gather of `gpas` (`span` bytes) is
+/// judged - land every parked frame owed to any of these pages except one owed
+/// to exactly this window, and say whether that one exists (`servable`: only
+/// the mapper-ref-texture rail's whole-surface window is served).
+#[track_caller]
+pub(crate) fn t2t_park_before_gather<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    gpas: &[u64],
+    span: u64,
+    servable: bool,
+) -> bool {
+    if !t2t_park::any() {
+        return false;
+    }
+    let mut exact = false;
+    let mut land = Vec::new();
+    {
+        let pending = PENDING_T2T.lock().unwrap_or_else(|e| e.into_inner());
+        for p in pending.iter() {
+            let Some(w) = p.window.as_ref() else { continue };
+            if servable && w.span == span && w.gpas.as_slice() == gpas {
+                exact = true;
+            } else if w.overlaps(gpas.iter().copied()) {
+                land.push(p.mapping_id);
+            }
+        }
+    }
+    if !land.is_empty() {
+        let site = std::panic::Location::caller();
+        land_where(state, host, site, |p| p.window.is_some() && land.contains(&p.mapping_id));
+    }
+    exact
+}
+
+/// TEMP (lab, T2T_PARK): bind this gather of `gpas` to the parked frame owed to
+/// exactly that window. `None`: keep the witness's answer (no such frame, or a
+/// vouched generation this frame was already served into). `Some(generation)`:
+/// the bind is Fresh under that generation - `seen_generation` when the witness
+/// already refused (it minted it), else `fresh` (the caller moves the entry to
+/// it) - and the engine fills it from the frame.
+pub(crate) fn t2t_park_bind(gpas: &[u64], span: u64, seen_generation: u64, vouched: bool, fresh: u64) -> Option<u64> {
+    let mut pending = PENDING_T2T.lock().unwrap_or_else(|e| e.into_inner());
+    let p = pending
+        .iter_mut()
+        .find(|p| p.window.as_ref().is_some_and(|w| w.span == span && w.gpas.as_slice() == gpas))?;
+    let generation = if vouched {
+        if p.served_gen == Some(seen_generation) {
+            // The retained image is this frame's; keep it named in case the
+            // cache lost it and the engine has to fill it again.
+            t2t_park::list_served(seen_generation, std::sync::Arc::clone(p.served.as_ref()?));
+            t2t_park::KEPT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        fresh
+    } else {
+        seen_generation
+    };
+    let served = std::sync::Arc::new(t2t_park::Served {
+        source: p.source.clone(),
+        version: p.source_version,
+        readback: p.ticket.parked(),
+    });
+    p.served_gen = Some(generation);
+    p.served = Some(std::sync::Arc::clone(&served));
+    t2t_park::list_served(generation, served);
+    t2t_park::BOUND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::runtime::drain::note_store_route("t2t_park_bound");
+    Some(generation)
+}
+
+/// TEMP (lab, T2T_PARK): the tranche end's landing - every owed frame but a
+/// parked one younger than [`t2t_park::MAX_AGE`].
+#[track_caller]
+pub(crate) fn land_t2t_tranche_end<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
+    let site = std::panic::Location::caller();
+    land_where(state, host, site, |p| {
+        p.window.is_none() || p.deferred_at.elapsed() >= t2t_park::MAX_AGE
+    });
+}
+
+/// TEMP (lab, T2T_PARK): `mapping_id`'s owed frame unless it is parked - the
+/// pay of a sampled gather, whose witness lands or serves a parked one.
+#[track_caller]
+pub(crate) fn land_t2t_unparked<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, mapping_id: u32) {
+    let site = std::panic::Location::caller();
+    land_where(state, host, site, |p| p.mapping_id == mapping_id && p.window.is_none());
+}
+
+/// TEMP (lab, T2T_PARK): every owed frame but the parked ones.
+#[track_caller]
+pub(crate) fn land_t2t_unparked_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
+    let site = std::panic::Location::caller();
+    land_where(state, host, site, |p| p.window.is_none());
+}
+
+/// TEMP (lab, T2T_PARK): the parked frame owed to exactly this window.
+#[track_caller]
+pub(crate) fn land_t2t_window<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, gpas: &[u64], span: u64) {
+    let site = std::panic::Location::caller();
+    land_where(state, host, site, |p| {
+        p.window.as_ref().is_some_and(|w| w.span == span && w.gpas.as_slice() == gpas)
+    });
+}
+
+/// TEMP (lab, T2T_PARK): every parked frame owed to a page of `mapping_id`'s -
+/// a reader or writer of the pages through a mapping other than the one the
+/// frame is owed through (that one lands it by name).
+#[track_caller]
+pub(crate) fn land_t2t_over_mapping<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, mapping_id: u32) {
+    if !t2t_park::any() {
+        return;
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return;
+    };
+    let shift = state.page_shift;
+    // Asked on every named pay while a frame is parked: decided under the lock
+    // without collecting the mapping's pages, which nearly always miss.
+    let pages = || {
+        m.page_entries
+            .iter()
+            .filter_map(move |&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, shift))
+    };
+    let hits: Vec<u32> = {
+        let pending = PENDING_T2T.lock().unwrap_or_else(|e| e.into_inner());
+        pending
+            .iter()
+            .filter(|p| p.mapping_id != mapping_id && p.window.as_ref().is_some_and(|w| w.overlaps(pages())))
+            .map(|p| p.mapping_id)
+            .collect()
+    };
+    if hits.is_empty() {
+        return;
+    }
+    let site = std::panic::Location::caller();
+    land_where(state, host, site, |p| p.window.is_some() && hits.contains(&p.mapping_id));
 }
 
 /// TEMP (lab T2T_DEFER): land the owed T2T frames - those for `only`, or all.
 #[track_caller]
 pub(crate) fn land_t2t<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, only: Option<u32>) {
     let lab_site = std::panic::Location::caller();
+    land_where(state, host, lab_site, |p| only.is_none_or(|m| p.mapping_id == m));
+}
+
+/// TEMP (lab T2T_DEFER): land the owed T2T frames `pick` selects.
+fn land_where<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    lab_site: &'static std::panic::Location<'static>,
+    pick: impl Fn(&PendingT2t) -> bool,
+) {
     let taken: Vec<PendingT2t> = {
         let mut pending = PENDING_T2T.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         let mut i = 0;
         while i < pending.len() {
-            if only.is_none_or(|m| pending[i].mapping_id == m) {
+            if pick(&pending[i]) {
                 out.push(pending.swap_remove(i));
             } else {
                 i += 1;
             }
         }
         T2T_PENDING_N.store(pending.len(), std::sync::atomic::Ordering::Release);
+        t2t_park::PARKED_N.store(
+            pending.iter().filter(|p| p.window.is_some()).count(),
+            std::sync::atomic::Ordering::Release,
+        );
         out
     };
     for p in taken {
+        if p.window.is_some() {
+            t2t_park::LANDED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::runtime::drain::note_store_route("t2t_park_landed");
+        }
         let live = state.mappings.get(&p.mapping_id).is_some_and(|m| {
             m.map_generation == p.map_generation
                 && crate::runtime::resource_validity::licence_of(m.validity)
@@ -243,15 +589,44 @@ pub(crate) fn land_t2t<M: HostMemory + HostOps>(state: &mut DeviceState, host: &
         let lab_wait = lab_t0.elapsed().as_micros() as u64;
         match finished {
             Ok(Some(frame)) => {
-                let ok = crate::runtime::mapping_write::write_bgra8_uncached(
-                    state,
-                    host,
-                    p.mapping_id,
-                    frame.bytes(),
-                    p.width.saturating_mul(4),
-                    p.width,
-                    p.height,
-                );
+                // TEMP (lab, T2T_PARK): a parked frame lands around what the
+                // guest stored since it parked (see the stamp at the defer).
+                let guest_owned = if p.window.is_some() {
+                    match crate::runtime::surface_currency::surface_currency(state, &*host, p.mapping_id, p.width, p.height) {
+                        crate::runtime::surface_currency::SurfaceCurrency::WrotePixels(owned) => {
+                            crate::runtime::drain::note_store_route("t2t_park_landed_around_guest");
+                            Some(owned.ranges)
+                        }
+                        crate::runtime::surface_currency::SurfaceCurrency::WroteUnknown => {
+                            crate::runtime::drain::note_store_route("t2t_park_guest_unnamed");
+                            None
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let ok = match guest_owned {
+                    Some(skip) => crate::runtime::mapping_write::write_bgra8_skipping_uncached(
+                        state,
+                        host,
+                        p.mapping_id,
+                        frame.bytes(),
+                        p.width.saturating_mul(4),
+                        p.width,
+                        p.height,
+                        &skip,
+                    ),
+                    None => crate::runtime::mapping_write::write_bgra8_uncached(
+                        state,
+                        host,
+                        p.mapping_id,
+                        frame.bytes(),
+                        p.width.saturating_mul(4),
+                        p.width,
+                        p.height,
+                    ),
+                };
                 drop(frame);
                 // TEMP (lab, T2T_ALIAS): name the landed pages and the frame in them.
                 if ok && crate::runtime::gather_witness::t2t_alias::on() {

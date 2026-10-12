@@ -7611,6 +7611,92 @@ fn deferred_landing_disjoint<H: HostMemory + HostOps>(
     !released.iter().any(|gpa| owed.contains(gpa))
 }
 
+/// TEMP (lab, T2T_PARK): the deferred T2T frames a map-family command lands -
+/// every unparked one, as before; a parked one only when the command deletes a
+/// backing (any: rare) or names resources (Invalidate/Synchronize: any - the
+/// list is not resolved here). A GPU address-space map or unmap moves none of a
+/// parked frame's pages (see the arms).
+fn lab_park_land_for_map_family<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    packet: &Packet,
+    family: MapFamily,
+) {
+    if !crate::runtime::render_writeback::vulkan_t2t_pending() {
+        return;
+    }
+    let reach: Option<Vec<u64>> = match family {
+        MapFamily::MapMemory2 | MapFamily::UnmapMemory => crate::protocol::fifo::decode_map_memory(&packet.payload)
+            .ok()
+            .map(|cmd| {
+                let mut pages = Vec::new();
+                crate::runtime::gva_mem::visit_task_gva_page_gpas(
+                    &*host,
+                    &state.tasks,
+                    cmd.task_id,
+                    cmd.gva,
+                    cmd.length,
+                    state.page_shift,
+                    &mut |gpa| {
+                        pages.push(gpa);
+                        true
+                    },
+                );
+                pages
+            })
+            .filter(|pages| !pages.is_empty()),
+        _ => None,
+    };
+    #[cfg(feature = "backend-vulkan")]
+    let lab_before = crate::runtime::render_writeback::vulkan::t2t_park::LANDED_N.load(std::sync::atomic::Ordering::Relaxed);
+    let lab_idx = match (family, &reach) {
+        // A GPU address-space map: no page moves and no CPU view is made, and
+        // every device reader of the pages lands or serves the frame itself.
+        //
+        // b301: most of Maps' maps name a range with no page in the task's
+        // tables yet - whatever it resolves to, a map moves no page.
+        (MapFamily::MapMemory2, _) => {
+            crate::runtime::render_writeback::land_t2t_unparked_all(state, host);
+            0
+        }
+        // A GPU address-space unmap: a parked frame's pages are its surface
+        // backing's, which only `DeleteIOSurfaceBacking2` gives back (below,
+        // landing every frame), and a landing re-checks the mapping's
+        // generation. b302: most of Maps' unmaps resolve to no page (the
+        // tables are already cleared), and landing on them landed every frame.
+        (MapFamily::UnmapMemory, Some(_)) => {
+            crate::runtime::render_writeback::land_t2t_unparked_all(state, host);
+            1
+        }
+        (MapFamily::UnmapMemory, None) => {
+            crate::runtime::render_writeback::land_t2t_unparked_all(state, host);
+            2
+        }
+        (MapFamily::DeleteIOSurfaceBacking2, _) => {
+            crate::runtime::render_writeback::land_t2t(state, host, None);
+            3
+        }
+        (MapFamily::InvalidateResources, _) => {
+            crate::runtime::render_writeback::land_t2t(state, host, None);
+            4
+        }
+        (MapFamily::SynchronizeResources | MapFamily::SynchronizeAndDiscardResources, _) => {
+            crate::runtime::render_writeback::land_t2t(state, host, None);
+            5
+        }
+    };
+    #[cfg(feature = "backend-vulkan")]
+    {
+        use crate::runtime::render_writeback::vulkan::t2t_park;
+        let landed = t2t_park::LANDED_N
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(lab_before);
+        t2t_park::MAP_LANDED[lab_idx].fetch_add(landed, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = lab_idx;
+}
+
 /// The shared body of the six lifecycle commands named by [`MapFamily`].
 fn apply_map_family<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -7624,7 +7710,10 @@ fn apply_map_family<H: HostMemory + HostOps>(
     // DeleteIOSurfaceBacking2, the two places the GPU-direct writebacks settle too
     // (`settle_released_span`, `settle_released_mapping`). Waiting on every map for
     // the landing was 36 % of this function on full-screen transitions (n185 fsz0).
-    crate::runtime::render_writeback::land_t2t(state, host, None); // TEMP (lab T2T_DEFER)
+    // TEMP (lab, T2T_PARK): a parked frame lands only when the command reaches
+    // its pages (b298: landing every parked frame on every map-family command
+    // landed all of them ~10 ms later, on the commands WindowServer waits for).
+    lab_park_land_for_map_family(state, host, packet, family);
     if family != MapFamily::MapMemory2 || crate::runtime::writeback_debt::lab_map_land_all() {
         if lab_land_reach() && deferred_landing_disjoint(state, &*host, packet, family) {
             note_store_route("lab_land_reach_skipped");

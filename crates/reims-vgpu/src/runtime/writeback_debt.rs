@@ -1490,6 +1490,26 @@ pub fn pay_for_mapping<M: HostMemory + HostOps>(
     mapping_id: u32,
 ) {
     crate::runtime::render_writeback::land_t2t(state, host, Some(mapping_id)); // TEMP (lab T2T_DEFER)
+    // TEMP (lab, T2T_PARK): a parked frame owed to these pages through another mapping.
+    crate::runtime::render_writeback::land_t2t_over_mapping(state, host, mapping_id);
+    pay_for_mapping_debt(state, host, mapping_id);
+}
+
+/// TEMP (lab, T2T_PARK): [`pay_for_mapping`] for a sampled gather of the
+/// mapping's window - a parked T2T frame is left to the gather's witness, which
+/// serves the frame to exactly its window and lands it for any other.
+#[track_caller]
+pub fn pay_for_mapping_gathered<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    crate::runtime::render_writeback::land_t2t_unparked(state, host, mapping_id);
+    pay_for_mapping_debt(state, host, mapping_id);
+}
+
+#[track_caller]
+fn pay_for_mapping_debt<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, mapping_id: u32) {
     if state.pending_writebacks.is_empty() {
         return;
     }
@@ -1908,6 +1928,8 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
     if crate::runtime::render_writeback::vulkan_t2t_pending() {
         for mapping_id in state.mappings_named_by(task_id, texture_ref).iter() {
             crate::runtime::render_writeback::land_t2t(state, host, Some(mapping_id));
+            // TEMP (lab, T2T_PARK): the same pages through another mapping.
+            crate::runtime::render_writeback::land_t2t_over_mapping(state, host, mapping_id);
         }
     }
     if state.pending_writebacks.is_empty() {

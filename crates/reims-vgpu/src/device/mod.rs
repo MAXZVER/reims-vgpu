@@ -822,8 +822,9 @@ pub fn device_drain(id: u64) -> bool {
     // TEMP (lab, REIMS_VGPU_LAB_PAY_AFTER): the replayed presented frame, paid
     // now that the guest has its completion.
     crate::runtime::drain::lab_act(3);
-    // TEMP (lab T2T_DEFER): the tranche's deferred blit frames land before it ends.
-    crate::runtime::render_writeback::land_t2t(&mut device.state, &mut host, None);
+    // TEMP (lab T2T_DEFER): the tranche's deferred blit frames land before it
+    // ends - all but the parked ones (T2T_PARK), which their readers land.
+    crate::runtime::render_writeback::land_t2t_tranche_end(&mut device.state, &mut host);
     crate::runtime::writeback_debt::lab_pay_after_stamp(
         &mut device.state,
         &mut host,

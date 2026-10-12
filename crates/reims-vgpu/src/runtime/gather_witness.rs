@@ -922,7 +922,9 @@ impl PendingWrites {
 /// settles (waits) first. Reads only: one atomic load when nothing is
 /// outstanding, the same gate the settle path opens with.
 pub(crate) fn writes_pending_over(gpas: &[u64]) -> bool {
-    !PendingWrites::over(gpas).settled()
+    // TEMP (lab, T2T_PARK): a parked frame owed to these pages is a write the
+    // serial reader lands (or serves) first.
+    !PendingWrites::over(gpas).settled() || crate::runtime::render_writeback::t2t_park_over(gpas)
 }
 
 /// The resolved window one gather will read.
@@ -1324,6 +1326,10 @@ pub(crate) fn plan_gather<M: crate::runtime::host::HostOps>(
     if entry.gpas != window.gpas || entry.span != window.span {
         return None;
     }
+    // TEMP (lab, T2T_PARK): the serial path lands or serves a parked frame.
+    if crate::runtime::render_writeback::t2t_park_over(window.gpas) {
+        return None;
+    }
     let readings = witness_readings(state, &key, window.gpas);
     let fresh = state.next_sampled_content_generation();
     let mut next = entry.clone();
@@ -1439,6 +1445,10 @@ pub(crate) fn gather_plan_holds<M: crate::runtime::host::HostOps>(
     plan: &PlannedGather,
     gpas: &[u64],
 ) -> bool {
+    // TEMP (lab, T2T_PARK): a frame parked over the pages since the plan.
+    if crate::runtime::render_writeback::t2t_park_over(gpas) {
+        return false;
+    }
     let Some(entry) = state.gather_witness.entries.get(&plan.key) else {
         return false;
     };
@@ -1537,7 +1547,7 @@ impl PlannedGather {
 /// through this return value at all; [`GatherVouch`] is where the verdict lives.
 #[must_use = "the identity is what lets the engine skip the gather; dropping it \
               silently keeps the copy"]
-pub fn note_gather<M: crate::runtime::host::HostOps>(
+pub fn note_gather<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
     state: &mut crate::model::DeviceState,
     host: &mut M,
     rail: GatherRail,
@@ -1545,6 +1555,17 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     window: GatherWindow<'_>,
 ) -> GatherOutcome {
     use crate::runtime::drain::{note_store_route, note_store_route_n};
+
+    // TEMP (lab, T2T_PARK): parked frames owed to these pages land before the
+    // witness looks - except one owed to exactly this window of the
+    // mapper-ref-texture rail (the whole surface), which the bind below serves.
+    let park_exact = crate::runtime::render_writeback::t2t_park_before_gather(
+        state,
+        host,
+        window.gpas,
+        window.span,
+        rail == GatherRail::MapperRefTexture && matches!(key, GatherKey::Mapping { base_off: 0, .. }),
+    );
 
     let span = window.span;
     let (rail_count, rail_kb) = rail.names();
@@ -1583,8 +1604,58 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     // moment the inferred half is asked about, not a moment after it.
     let lab_span = crate::runtime::chain_phase::CostSpan::new("lab_ng_observe_us"); // TEMP (lab)
     let lab_gpas = window.gpas;
-    let seen = observe(&mut state.gather_witness, host, key, window, counts, fresh);
+    let (lab_runs, lab_page_size) = (window.runs, window.page_size);
+    let mut seen = observe(&mut state.gather_witness, host, key, window, counts, fresh);
     drop(lab_span);
+    // TEMP (lab, T2T_PARK): bind the window to the parked frame owed to it - a
+    // Fresh generation the engine fills from the frame, never from the pages.
+    //
+    // A guest store into pages a frame is still owed to: unparked, the frame
+    // would have landed at its tranche end, before the store, and the store
+    // would sit on top of it (b309: full-screen Maps, ~0.6 % of the frames; the
+    // eager witness sees the same stores on these windows every second). So
+    // the frame lands now - around the ranges the guest stored since the frame
+    // parked (the defer stamped its guest-write generation) - and the bind is
+    // judged again over the landed pages.
+    let park_guest_wrote = matches!(seen.verdict, GatherVerdict::Refused { guest_wrote: true, .. });
+    if park_exact && park_guest_wrote {
+        crate::runtime::drain::note_store_route("t2t_park_guest_wrote");
+        crate::observe::off(format!(
+            "t2t_park_guest_wrote span={span} first_gpa={:#x}",
+            lab_gpas.first().copied().unwrap_or(0)
+        ));
+        crate::runtime::render_writeback::land_t2t_window(state, host, lab_gpas, span);
+        return note_gather(
+            state,
+            host,
+            rail,
+            key,
+            GatherWindow {
+                gpas: lab_gpas,
+                runs: lab_runs,
+                span,
+                page_size: lab_page_size,
+            },
+        );
+    }
+    if park_exact {
+        if let Some(generation) = crate::runtime::render_writeback::t2t_park_bind(
+            lab_gpas,
+            span,
+            seen.generation,
+            seen.vouch == GatherVouch::Vouched,
+            fresh,
+        ) {
+            if generation != seen.generation {
+                if let Some(entry) = state.gather_witness.entries.get_mut(&key) {
+                    entry.generation = generation;
+                }
+            }
+            seen.generation = generation;
+            seen.vouch = GatherVouch::Fresh;
+            seen.evidence = None;
+        }
+    }
     t2t_alias::note_decided(seen.verdict, seen.generation, lab_gpas, span); // TEMP (lab, T2T_ALIAS)
     // TEMP (lab, STRIPE_HUNT): the witness answered — a vouch serves the
     // retained image without reading a byte (the false-quiet population), a
@@ -2018,7 +2089,7 @@ pub(crate) mod lab_t2t_diag {
         crate::observe::off(format!(
             "lab_t2t_diag land_n={} age_us={} wait_us={} write_us={} sites={} gather_t2t_n={} gather_t2t_kb={} \
              gather_t2t_first={} gather_big_other_n={} gather_big_other_kb={} alias_confirmed={} alias_copied={} \
-             alias_declined={} big_verdicts={}",
+             alias_declined={} big_verdicts={} park={}",
             d.land_n,
             d.age_us,
             d.wait_us,
@@ -2040,6 +2111,7 @@ pub(crate) mod lab_t2t_diag {
                 ))
                 .collect::<Vec<_>>()
                 .join(","),
+            lab_park_counts(),
         ));
         d.sites.clear();
         d.land_n = 0;
@@ -2051,6 +2123,33 @@ pub(crate) mod lab_t2t_diag {
         d.gather_t2t_first = 0;
         d.gather_big_n = 0;
         d.gather_big_kb = 0;
+    }
+
+    /// TEMP (lab, T2T_PARK): parked/superseded/bound/kept/landed/served from
+    /// the resident/served from the readback slot, since the last line.
+    fn lab_park_counts() -> String {
+        #[cfg(feature = "backend-vulkan")]
+        {
+            use crate::runtime::render_writeback::vulkan::t2t_park as p;
+            use std::sync::atomic::Ordering::Relaxed;
+            format!(
+                "{}/{}/{}/{}/{}/{}/{}/m={}",
+                p::PARKED_TOTAL.swap(0, Relaxed),
+                p::SUPERSEDED_N.swap(0, Relaxed),
+                p::BOUND_N.swap(0, Relaxed),
+                p::KEPT_N.swap(0, Relaxed),
+                p::LANDED_N.swap(0, Relaxed),
+                p::SERVED_RES_N.swap(0, Relaxed),
+                p::SERVED_RB_N.swap(0, Relaxed),
+                p::MAP_LANDED
+                    .iter()
+                    .map(|a| a.swap(0, Relaxed).to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        String::from("-")
     }
 
     pub(crate) fn note_defer(first_gpa: Option<u64>, pages: usize, mapping_id: u32) {

@@ -574,6 +574,130 @@ pub fn land_t2t<M: crate::runtime::host::HostMemory + crate::runtime::host::Host
     let _ = (state, host, only);
 }
 
+/// TEMP (lab, T2T_PARK): see `vulkan::t2t_park_before_gather`. Free when no
+/// frame is parked: one atomic load.
+#[inline]
+#[track_caller]
+pub fn t2t_park_before_gather<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    gpas: &[u64],
+    span: u64,
+    servable: bool,
+) -> bool {
+    #[cfg(feature = "backend-vulkan")]
+    return vulkan::t2t_park::any() && vulkan::t2t_park_before_gather(state, host, gpas, span, servable);
+    #[cfg(not(feature = "backend-vulkan"))]
+    {
+        let _ = (state, host, gpas, span, servable);
+        false
+    }
+}
+
+/// TEMP (lab, T2T_PARK): see `vulkan::t2t_park_bind`.
+#[inline]
+pub fn t2t_park_bind(gpas: &[u64], span: u64, seen_generation: u64, vouched: bool, fresh: u64) -> Option<u64> {
+    #[cfg(feature = "backend-vulkan")]
+    return vulkan::t2t_park_bind(gpas, span, seen_generation, vouched, fresh);
+    #[cfg(not(feature = "backend-vulkan"))]
+    {
+        let _ = (gpas, span, seen_generation, vouched, fresh);
+        None
+    }
+}
+
+/// TEMP (lab, T2T_PARK): whether a parked frame is owed to any of `gpas`.
+#[inline]
+pub fn t2t_park_over(gpas: &[u64]) -> bool {
+    #[cfg(feature = "backend-vulkan")]
+    return vulkan::t2t_park::over(gpas);
+    #[cfg(not(feature = "backend-vulkan"))]
+    {
+        let _ = gpas;
+        false
+    }
+}
+
+/// TEMP (lab, T2T_PARK): the tranche end's landing (parked frames stay).
+#[inline]
+#[track_caller]
+pub fn land_t2t_tranche_end<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) {
+    #[cfg(feature = "backend-vulkan")]
+    if vulkan::T2T_PENDING_N.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        vulkan::land_t2t_tranche_end(state, host);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = (state, host);
+}
+
+/// TEMP (lab, T2T_PARK): `mapping_id`'s owed frame unless it is parked.
+#[inline]
+#[track_caller]
+pub fn land_t2t_unparked<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    #[cfg(feature = "backend-vulkan")]
+    if vulkan::T2T_PENDING_N.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        vulkan::land_t2t_unparked(state, host, mapping_id);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = (state, host, mapping_id);
+}
+
+/// TEMP (lab, T2T_PARK): parked frames owed to a page of `mapping_id`'s through
+/// another mapping.
+#[inline]
+#[track_caller]
+pub fn land_t2t_over_mapping<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    #[cfg(feature = "backend-vulkan")]
+    if vulkan::t2t_park::any() {
+        vulkan::land_t2t_over_mapping(state, host, mapping_id);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = (state, host, mapping_id);
+}
+
+/// TEMP (lab, T2T_PARK): every owed frame but the parked ones.
+#[inline]
+#[track_caller]
+pub fn land_t2t_unparked_all<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) {
+    #[cfg(feature = "backend-vulkan")]
+    if vulkan::T2T_PENDING_N.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        vulkan::land_t2t_unparked_all(state, host);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = (state, host);
+}
+
+/// TEMP (lab, T2T_PARK): the parked frame owed to exactly this window.
+#[inline]
+#[track_caller]
+pub fn land_t2t_window<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    gpas: &[u64],
+    span: u64,
+) {
+    #[cfg(feature = "backend-vulkan")]
+    if vulkan::t2t_park::any() {
+        vulkan::land_t2t_window(state, host, gpas, span);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = (state, host, gpas, span);
+}
+
 /// Declare the settle sites once, and derive both census route names from one
 /// slug each: `concat!` builds `<slug>_us` from `<slug>`, so the count route
 /// and the cost route cannot drift into naming different sites.

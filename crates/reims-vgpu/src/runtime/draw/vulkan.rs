@@ -8449,7 +8449,10 @@ pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
     //
     // Free when nothing is owed — `pay_for_mapping` is one emptiness check on
     // the ledger, which is the answer on nearly every call.
-    crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
+    //
+    // TEMP (lab, T2T_PARK): a parked frame is the witness's below (served to
+    // exactly its window, landed for any other); a direct image lands it.
+    crate::runtime::writeback_debt::pay_for_mapping_gathered(state, host, mid);
     if let Some(source) = mapped_sampled_source(
         state,
         host,
@@ -8468,6 +8471,9 @@ pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
         if span < SAMPLED_GATHER_MIN_BYTES {
             crate::runtime::drain::note_store_route("zc_t11_direct_under_floor_span");
         }
+        // TEMP (lab, T2T_PARK): the GPU reads these pages directly.
+        crate::runtime::render_writeback::land_t2t(state, host, Some(mid));
+        crate::runtime::render_writeback::land_t2t_over_mapping(state, host, mid);
         return Some(SampledSourceRequest::GuestRuns(
             source,
             native,

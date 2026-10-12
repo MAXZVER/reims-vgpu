@@ -1083,6 +1083,10 @@ enum GuestTexels {
         image: vk::Image,
         access: super::pools::ResidentAccess,
     },
+    /// TEMP (lab, T2T_PARK): the window's bytes are a parked T2T frame's, owed
+    /// to these pages and not written there yet; the image is filled from the
+    /// frame's readback slot (the entry holds its lease until retire).
+    Parked(vk::Buffer),
 }
 
 impl GuestTexels {
@@ -1092,6 +1096,7 @@ impl GuestTexels {
             Self::Gathered(slot) | Self::Scratch(slot) => slot.buffer,
             Self::Staged(slice) => slice.buffer,
             Self::Resident { .. } => vk::Buffer::null(),
+            Self::Parked(buffer) => *buffer,
         }
     }
 
@@ -1103,9 +1108,82 @@ impl GuestTexels {
             Self::Gathered(_) | Self::Scratch(_) => 0,
             // A carved window sits wherever the arena's bump pointer was.
             Self::Staged(slice) => slice.window.offset,
-            Self::Resident { .. } => 0,
+            Self::Resident { .. } | Self::Parked(_) => 0,
         }
     }
+}
+
+/// TEMP (lab, T2T_PARK): a Fresh window the witness bound to a parked T2T frame
+/// (`render_writeback::vulkan::t2t_park`) - the frame is owed to exactly these
+/// pages and has not been written to them. Filled from the frame's source
+/// resident when it has not moved on (a device-local copy), else from the
+/// frame's readback slot. `None` only for a shape the copy cannot honour, which
+/// the witness never binds (it checked the same window) - reported, and the
+/// caller gathers.
+fn t2t_park_texels(
+    ctx: &super::context::DeviceContext,
+    pools: &mut ResourcePools,
+    resource: &super::types::SampledImageResource,
+    src: &super::types::GuestRunSource,
+) -> Option<GuestTexels> {
+    let identity = resource.identity?;
+    let served = crate::runtime::render_writeback::vulkan::t2t_park::served(identity.generation)?;
+    let four = matches!(
+        resource.format,
+        vk::Format::B8G8R8A8_UNORM
+            | vk::Format::B8G8R8A8_SRGB
+            | vk::Format::R8G8B8A8_UNORM
+            | vk::Format::R8G8B8A8_SRGB
+    );
+    let tight = u64::from(resource.width) * u64::from(resource.height) * 4;
+    if !four
+        || resource.layers != 1
+        || resource.multisampled
+        || resource.kind.is_volume()
+        || resource.kind.is_cube()
+        || src.source_offset != 0
+        || (src.row_length_texels != 0 && src.row_length_texels != resource.width)
+        || src.total_len != tight
+        || served.readback.len as u64 != tight
+    {
+        crate::runtime::drain::note_store_route("t2t_park_serve_shape");
+        crate::observe::fail(format!(
+            "t2t_park_serve_shape generation={} {}x{} len={} want={tight}",
+            identity.generation, resource.width, resource.height, served.readback.len
+        ));
+        return None;
+    }
+    if let Some(slot) = pools.registry_get(&served.source) {
+        let current = super::pools::readiness::lookup(&served.source).map(|r| r.version) == served.version
+            && served.version.is_some()
+            && slot.content_ready;
+        let bgra = matches!(
+            slot.format.allocation(),
+            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB
+        );
+        if current
+            && bgra
+            && slot.sample_count == 1
+            && slot.width == resource.width
+            && slot.height == resource.height
+        {
+            crate::runtime::drain::note_store_route("t2t_park_served_resident");
+            crate::runtime::render_writeback::vulkan::t2t_park::SERVED_RES_N
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(GuestTexels::Resident {
+                image: slot.image,
+                access: slot.access,
+            });
+        }
+    }
+    if served.readback.device != vk::Handle::as_raw(ctx.device.handle()) {
+        crate::runtime::drain::note_store_route("t2t_park_serve_device_gone");
+        return None;
+    }
+    pools.note_parked_read(std::sync::Arc::clone(&served.readback.hold));
+    crate::runtime::drain::note_store_route("t2t_park_served_readback");
+    crate::runtime::render_writeback::vulkan::t2t_park::SERVED_RB_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(GuestTexels::Parked(served.readback.buffer))
 }
 
 /// TEMP (lab, T2T_ALIAS): the resident a Fresh guest-runs window may be filled
@@ -2809,9 +2887,17 @@ unsafe fn sample_guest_runs(
     // the required conservative gather.
     counters.note_sampled_gather_unskipped(vouch);
     // TEMP (lab, T2T_ALIAS): a window this device landed a resident's frame in,
-    // untouched since, is filled from the resident on the GPU.
-    if vouch == crate::runtime::gather_witness::GatherVouch::Fresh {
-        if let Some(texels) = t2t_alias_texels(pools, resource, src) {
+    // untouched since, is filled from the resident on the GPU. TEMP (lab,
+    // T2T_PARK): a window a parked frame is owed to, from that frame - asked
+    // for a vouched identity too: a bound generation the cache lost must not
+    // be gathered from pages that do not hold the frame.
+    let parked = t2t_park_texels(ctx, pools, resource, src);
+    if parked.is_some() || vouch == crate::runtime::gather_witness::GatherVouch::Fresh {
+        let texels = match parked {
+            Some(t) => Some(t),
+            None => t2t_alias_texels(pools, resource, src),
+        };
+        if let Some(texels) = texels {
             let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
             crate::runtime::drain::note_store_route("t2t_alias_copied");
             crate::runtime::gather_witness::t2t_alias::COPIED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5796,6 +5882,25 @@ pub(crate) unsafe fn execute_draw_inner(
                 copy_resident_to_sampled_image(ctx, cb, *src_image, *access, img.image, img.width, img.height)
             };
             continue;
+        }
+        if let GuestTexels::Parked(_) = source {
+            // TEMP (lab, T2T_PARK): the readback that filled the slot is an
+            // earlier submission on this queue; make its write visible here.
+            let barrier = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+            unsafe {
+                crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(
+                    &ctx.device,
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &barrier,
+                    &[],
+                    &[],
+                )
+            };
         }
         upload_buffer_to_sampled_image(
             ctx,

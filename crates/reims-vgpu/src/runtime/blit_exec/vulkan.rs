@@ -168,6 +168,7 @@ pub(crate) fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
                 && crate::runtime::render_writeback::vulkan::lab_t2t_defer_on()
                 && crate::runtime::render_writeback::vulkan::defer_resident_into_mapping(
                     state,
+                    host,
                     mapping_id,
                     &identity,
                     plane.width,

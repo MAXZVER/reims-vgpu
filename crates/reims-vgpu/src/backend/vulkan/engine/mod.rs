@@ -4595,7 +4595,9 @@ impl TargetReadback {
 /// the engine should end the lease first. Ending it is device-free and cannot
 /// block on anything the holder owns.
 pub struct LeasedFrame {
-    token: u64,
+    /// TEMP (lab, T2T_PARK): the lease, shared - a parked T2T frame's slot may
+    /// also be read by a GPU copy, which holds it until its submission retires.
+    _hold: std::sync::Arc<LeaseHold>,
     ptr: usize,
     len: usize,
     /// BGRA8 when true, semantic RGBA8 otherwise. Reported by the registry slot
@@ -4616,9 +4618,22 @@ impl LeasedFrame {
     }
 }
 
-impl Drop for LeasedFrame {
+/// TEMP (lab, T2T_PARK): one readback lease, returned when the last holder
+/// lets go - the CPU reader ([`LeasedFrame`], [`TargetReadTicket`]) or a
+/// recorded GPU copy out of the slot (kept on its ring entry until retire).
+pub(crate) struct LeaseHold {
+    token: u64,
+}
+
+impl Drop for LeaseHold {
     fn drop(&mut self) {
         pools::return_readback_lease(self.token);
+    }
+}
+
+impl LeaseHold {
+    fn new(token: u64) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { token })
     }
 }
 
@@ -5826,7 +5841,7 @@ fn read_target_leased_inner(identity: &TargetIdentity) -> Result<Option<LeasedFr
         counters.note_target_read(rb_size, TargetReadDelivery::Host);
         Ok(match delivered {
             ReadbackResult::Leased { token, ptr, len } => Some(LeasedFrame {
-                token,
+                _hold: LeaseHold::new(token),
                 ptr,
                 len,
                 bgra: snap.bgra(),
@@ -5854,27 +5869,18 @@ pub struct TargetReadTicket {
     token: pools::SubmissionToken,
     device: u64,
     readback: pools::BufferSlot,
-    lease_token: u64,
+    /// The lease, handed to the frame on finish. Dropping the ticket unfinished
+    /// drops this holder: the pool takes the slot back only once every holder
+    /// is gone and puts it on the free list at its next reclaim; a teardown
+    /// waits for outstanding leases first. A ticket dropped unfinished is a
+    /// frame abandoned (its mapping moved on), never a slot handed out under a
+    /// copy the ring has not retired: the free list is refilled from returned
+    /// leases only by `reclaim_returned_readback_leases`, which runs under the
+    /// engine lock beside the ring's own waits.
+    hold: std::sync::Arc<LeaseHold>,
     lease_ptr: usize,
     len: usize,
     bgra: bool,
-    /// Handed to the frame on finish; while it is set this ticket owns the lease.
-    armed: bool,
-}
-
-impl Drop for TargetReadTicket {
-    fn drop(&mut self) {
-        if self.armed {
-            // The pool takes the slot back only once its lease returns and puts
-            // it on the free list at its next reclaim; a teardown waits for
-            // outstanding leases first. A ticket dropped unfinished is a frame
-            // abandoned (its mapping moved on), never a slot handed out under a
-            // copy the ring has not retired: the free list is refilled from
-            // returned leases only by `reclaim_returned_readback_leases`, which
-            // runs under the engine lock beside the ring's own waits.
-            pools::return_readback_lease(self.lease_token);
-        }
-    }
 }
 
 impl TargetReadTicket {
@@ -5882,6 +5888,30 @@ impl TargetReadTicket {
     pub fn bgra(&self) -> bool {
         self.bgra
     }
+
+    /// TEMP (lab, T2T_PARK): the slot as a GPU copy source, holding the lease.
+    pub(crate) fn parked(&self) -> ParkedReadback {
+        ParkedReadback {
+            hold: std::sync::Arc::clone(&self.hold),
+            buffer: self.readback.buffer,
+            device: self.device,
+            len: self.len,
+        }
+    }
+}
+
+/// TEMP (lab, T2T_PARK): a deferred T2T frame's readback slot, named for a GPU
+/// copy out of it - a sampled window over the pages the frame is owed to is
+/// filled from here instead of from those (not yet written) pages. The copy is
+/// recorded after the readback's submission on the same queue, so queue order
+/// plus a transfer barrier make the frame visible to it; the recording entry
+/// keeps `hold` until it retires, so the slot is not reused under the copy.
+#[derive(Clone)]
+pub(crate) struct ParkedReadback {
+    pub(crate) hold: std::sync::Arc<LeaseHold>,
+    pub(crate) buffer: ash::vk::Buffer,
+    pub(crate) device: u64,
+    pub(crate) len: usize,
 }
 
 /// TEMP (lab T2T_DEFER): [`read_target_leased`] up to and including the copy's
@@ -5993,11 +6023,10 @@ pub fn submit_target_read_leased(identity: &TargetIdentity) -> Result<Option<Tar
             token,
             device: ash::vk::Handle::as_raw(ctx.device.handle()),
             readback,
-            lease_token: lease.token,
+            hold: LeaseHold::new(lease.token),
             lease_ptr: lease.ptr,
             len: rb_size as usize,
             bgra: snap.bgra(),
-            armed: true,
         }))
     }
 }
@@ -6023,7 +6052,7 @@ pub fn target_read_done(ticket: &TargetReadTicket) -> bool {
 
 /// TEMP (lab T2T_DEFER): wait `ticket`'s copy and hand its frame out as
 /// [`read_target_leased`] would have. `Ok(None)`: the device it ran on is gone.
-pub fn finish_target_read_leased(mut ticket: TargetReadTicket) -> Result<Option<LeasedFrame>, DrawError> {
+pub fn finish_target_read_leased(ticket: TargetReadTicket) -> Result<Option<LeasedFrame>, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -6040,9 +6069,8 @@ pub fn finish_target_read_leased(mut ticket: TargetReadTicket) -> Result<Option<
         pools.wait_submission(ctx, counters, ticket.token)?;
         pools::invalidate_slot_for_read(ctx, &ticket.readback, ops.invalidate)?;
     }
-    ticket.armed = false;
     Ok(Some(LeasedFrame {
-        token: ticket.lease_token,
+        _hold: ticket.hold,
         ptr: ticket.lease_ptr,
         len: ticket.len,
         bgra: ticket.bgra,

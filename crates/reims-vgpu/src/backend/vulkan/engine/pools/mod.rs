@@ -548,6 +548,9 @@ pub(crate) struct EntryState {
     /// pooled slot. A window may appear here that an earlier entry of an open
     /// batch already sealed: the joiner takes its own reference.
     staged_reads: Vec<StagedRead>,
+    /// TEMP (lab, T2T_PARK): leases the command buffer now recording copies
+    /// out of, held until the entry retires.
+    keep: Vec<std::sync::Arc<crate::backend::vulkan::engine::LeaseHold>>,
     gather_live: Vec<BufferSlot>,
     /// Buffer binds the command buffer now recording has already staged or
     /// gathered, keyed by the content that produced them.
@@ -1479,6 +1482,8 @@ pub(crate) struct PendingGpuCleanup {
     /// each with the reference its record took. The retire that drains this
     /// cleanup releases them — the arena's own "timeline".
     staged: Vec<StagedRead>,
+    /// TEMP (lab, T2T_PARK): readback leases this submission copies out of.
+    keep: Vec<std::sync::Arc<crate::backend::vulkan::engine::LeaseHold>>,
 }
 
 /// TEMP (lab, PASS_STAGE): one worker-arena window a sealed submission reads.

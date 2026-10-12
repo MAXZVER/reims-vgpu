@@ -1714,6 +1714,7 @@ impl ResourcePools {
                 unpin_residents: std::mem::take(&mut self.entry.guest_write_pins_live),
                 unpin_compute_residents: std::mem::take(&mut self.entry.compute_write_pins_live),
                 staged: std::mem::take(&mut self.entry.staged_reads),
+                keep: std::mem::take(&mut self.entry.keep),
             },
             admissions,
         }
@@ -1734,6 +1735,12 @@ impl ResourcePools {
         }
         self.entry.staged_reads.push(StagedRead { ring, window });
         true
+    }
+
+    /// TEMP (lab, T2T_PARK): a draw is recording a GPU copy out of a leased
+    /// readback slot; the entry holds the lease until it retires.
+    pub(crate) fn note_parked_read(&mut self, hold: std::sync::Arc<crate::backend::vulkan::engine::LeaseHold>) {
+        self.entry.keep.push(hold);
     }
 
     /// Park the sealed cleanup on the current slot and give the content cache
@@ -3296,6 +3303,8 @@ impl ResourcePools {
         for read in pending.staged.drain(..) {
             read.ring.release(read.window);
         }
+        // TEMP (lab, T2T_PARK): the copies out of these slots have run.
+        pending.keep.clear();
     }
 
     fn bucket(size: u64) -> u64 {
@@ -3771,6 +3780,7 @@ impl ResourcePools {
         for read in self.entry.staged_reads.drain(..) {
             read.ring.release(read.window);
         }
+        self.entry.keep.clear();
         for slot in self.entry.staging_live.drain(..) {
             let bucket = Self::bucket(slot.size);
             self.staging_free.entry(bucket).or_default().push(slot);
@@ -3816,7 +3826,11 @@ impl ResourcePools {
                 &vk::BufferCreateInfo::default()
                     .size(bucket)
                     .usage(
-                        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+                        // TEMP (lab, T2T_PARK): TRANSFER_SRC - a parked T2T
+                        // frame's slot is copied into a sampled image.
+                        vk::BufferUsageFlags::TRANSFER_DST
+                            | vk::BufferUsageFlags::TRANSFER_SRC
+                            | vk::BufferUsageFlags::STORAGE_BUFFER,
                     )
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
@@ -6451,6 +6465,7 @@ mod recycle_tests {
                 scatter_dsets: Vec::new(),
                 staging: Vec::new(),
                 staged: Vec::new(),
+                keep: Vec::new(),
                 gather: Vec::new(),
                 readback: Vec::new(),
                 sampled: Vec::new(),
