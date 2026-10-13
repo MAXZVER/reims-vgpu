@@ -946,6 +946,10 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
         state.retire_bound_buffers_for_task(task_id),
     );
     let applied = state.set_object_list(task_id, pfn, count);
+    crate::observe::fail(format!(
+        "DEV_SET_OBJECT_LIST site={} task={task_id} pfn={pfn:#x} count={count} applied={applied}",
+        packet_site(channel)
+    ));
     // The binding, in the model that owns what a reference resolves to. It
     // retires nothing — a new table changes what an *unresolved* reference
     // constructs, and the objects already declared keep their own deletes —
@@ -1010,6 +1014,11 @@ fn apply_define_task2<H: HostMemory + HostOps>(
         state.retire_bound_buffers_for_task(task_id),
     );
     state.define_task(task_id, length, dir);
+    crate::observe::fail(format!(
+        "DEV_TASK_DEFINE site={} task={task_id} raw={raw_id:#x} kernel={} len={length:#x} dir={dir:#x}",
+        packet_site(channel),
+        kernel_task as u8,
+    ));
     // Capture directory + root/depth so one boot shows the page-table identity.
     let Some(slot) = state.tasks.get(task_id) else {
         return;
@@ -2156,8 +2165,14 @@ fn admit_and_park<H: HostMemory + HostOps>(
 ) {
     use reims_vgpu_core::identity::StampSlot;
 
+    let arrival_started = std::time::Instant::now();
     let arrived = arrival_work(state, host, fifo, &packet);
+    note_store_route_us(
+        "admission_arrival_us",
+        arrival_started.elapsed().as_micros() as u64,
+    );
     let session = state.session_generation();
+    let bridge_started = std::time::Instant::now();
     let built = crate::runtime::ingress::device_packet(
         state,
         host,
@@ -2169,6 +2184,10 @@ fn admit_and_park<H: HostMemory + HostOps>(
             submission: arrived.submission.as_ref(),
             repointed: arrived.repointed,
         },
+    );
+    note_store_route_us(
+        "admission_bridge_us",
+        bridge_started.elapsed().as_micros() as u64,
     );
     let mut built = match built {
         Ok(built) => built,
@@ -2269,7 +2288,13 @@ fn admit_and_park<H: HostMemory + HostOps>(
         }
     }
 
-    let admission = match state.admit_packet(&built) {
+    let model_started = std::time::Instant::now();
+    let admission = state.admit_packet(&built);
+    note_store_route_us(
+        "admission_model_us",
+        model_started.elapsed().as_micros() as u64,
+    );
+    let admission = match admission {
         Ok(admission) => admission,
         Err(refusal) => {
             note_unadmitted(
@@ -2311,6 +2336,17 @@ fn admit_and_park<H: HostMemory + HostOps>(
         ),
         _ => crate::runtime::parked::ParkedWork::new(fifo.domain().0, admission.epoch, packet),
     };
+    if let Some(submission) = work.submission() {
+        for &lease in work.leases() {
+            state.trace_lifetime(
+                crate::runtime::lifetime_trace::Phase::Admit,
+                submission.task_id(),
+                Some(lease),
+                Some(ingress),
+                None,
+            );
+        }
+    }
     state.parked.park(ingress, work);
 }
 
@@ -2416,8 +2452,18 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     // this device is next entered. A guest that ordered a packet behind a fence
     // this very drain published would wait on a doorbell instead.
     loop {
+        let observe_started = std::time::Instant::now();
         observe_awaited_stamps(state, host);
+        note_store_route_us(
+            "settle_observe_us",
+            observe_started.elapsed().as_micros() as u64,
+        );
+        let translations_started = std::time::Instant::now();
         pump_translations(state, host);
+        note_store_route_us(
+            "settle_translations_us",
+            translations_started.elapsed().as_micros() as u64,
+        );
         for ingress in state.take_ready() {
             // `false` is a position the model released and this device holds no
             // bytes for. `mark_ready` has already named it; there is nothing
@@ -2640,6 +2686,17 @@ fn run_parked<H: HostMemory + HostOps>(
     work: &crate::runtime::parked::ParkedWork,
 ) {
     let domain = work.domain();
+    if let Some(submission) = work.submission() {
+        for &lease in work.leases() {
+            state.trace_lifetime(
+                crate::runtime::lifetime_trace::Phase::Execute,
+                submission.task_id(),
+                Some(lease),
+                Some(ingress),
+                None,
+            );
+        }
+    }
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
         process_root_packet(state, host, work.packet());
     } else {
@@ -2662,7 +2719,14 @@ fn run_parked<H: HostMemory + HostOps>(
         }
         state.draining_channel = prev_channel;
     }
-    match state.complete_transaction(work.epoch(), ingress) {
+    let complete_started = std::time::Instant::now();
+    let completion = state.complete_transaction(work.epoch(), ingress);
+    note_store_route_us(
+        "settle_complete_us",
+        complete_started.elapsed().as_micros() as u64,
+    );
+    let publish_started = std::time::Instant::now();
+    match completion {
         Ok(released) => {
             for release in released {
                 // **Counted here because the model cannot count it, and a
@@ -2698,6 +2762,10 @@ fn run_parked<H: HostMemory + HostOps>(
         // is nothing to publish and the name is the whole of what is owed.
         Err(refusal) => note_store_route(refusal.slug()),
     }
+    note_store_route_us(
+        "settle_publish_us",
+        publish_started.elapsed().as_micros() as u64,
+    );
 }
 
 /// Take back the promise that a lease is usable, because this rail no longer
@@ -4788,6 +4856,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     } else {
         channel_id
     };
+    let rescue_started = std::time::Instant::now();
     drain_other_child_fifos(state, host, skip);
     drain_other_child_fifos(state, host, skip);
     // Main-ring Dekker only (not full drain_stranded): guest may
@@ -4806,6 +4875,10 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         drain_other_child_fifos(state, host, skip);
     }
 
+    note_store_route_us(
+        "present_rescue_us",
+        rescue_started.elapsed().as_micros() as u64,
+    );
     // Preflight translation keeps an EXEC packet at its channel head. If one
     // is still held after all rescue drains, accepting this display packet
     // would publish the prior +0x188 retain before the earlier render packet
@@ -4844,10 +4917,13 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     // A presented framebuffer is what WindowServer copies from with the CPU,
     // unannounced, to fill the next back buffer. Its frame has to be in its
     // pages before anything after this swap can reach the guest.
+    let pay_started = std::time::Instant::now();
     crate::runtime::writeback_debt::pay_cpu_shared_mapping(state, host, mapping);
+    note_store_route_us("present_pay_us", pay_started.elapsed().as_micros() as u64);
     // x86: present surface_id → backing object-list slot (heap index =
     // IOSurface getSurfaceID). Arm: MappingInternal page-table resolve.
     // Always attempt backing when pages empty; then iosfc/mapper path.
+    let resolve_started = std::time::Instant::now();
     let _ = crate::runtime::objects::ensure_surface_for_present(state, host, mapping);
     let force = state
         .mappings
@@ -4857,6 +4933,10 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     if force {
         let _ = crate::runtime::mapper::resolve_mapping_backing(state, host, mapping);
     }
+    note_store_route_us(
+        "present_resolve_us",
+        resolve_started.elapsed().as_micros() as u64,
+    );
     // Paint only from the presented surface's own geom — never the
     // previous console size fallback (that freezes mode switches).
     // Re-read gen after wait_surface (writebacks may have landed).
@@ -6367,7 +6447,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     || result.compute_control_fail > 0
                     || result.compute_icb_fail > 0;
                 if packet_failed {
-                    crate::observe::fail(exec_summary(channel_id, &result, packet.payload.len()));
+                    crate::observe::fail(format!(
+                        "DEV_PACKET_FAILED {}",
+                        exec_summary(channel_id, &result, packet.payload.len())
+                    ));
                 } else {
                     crate::observe::verbose(|| {
                         exec_summary(channel_id, &result, packet.payload.len())

@@ -691,7 +691,17 @@ pub fn device_poll(id: u64) -> bool {
     // lock-free ring lands in only once folded. Without this the Dekker rescue
     // could not see the very channels the doorbell rail is responsible for.
     crate::runtime::drain::fold_rung_child_doorbells(&mut device.state);
-    crate::runtime::drain::publish_stranded_fifos(&mut device.state, &mut host);
+    static DEKKER_POLL_DIV: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if (DEKKER_POLL_DIV.fetch_add(1, Ordering::Relaxed) & 7 == 0)
+        || device.state.pending.main_drain
+        || device.state.pending.child_mask != 0
+        || device.state.translation_deferred_mask != 0
+        || (device.state.gfx.control_fifo != 0
+            && device.state.gfx.fifo_read.load(Ordering::Acquire) != device.state.gfx.fifo_written)
+        || device.state.iosfc.consumer != device.state.iosfc.producer
+    {
+        crate::runtime::drain::publish_stranded_fifos(&mut device.state, &mut host);
+    }
     crate::runtime::drain::try_display_online(&mut device.state, &mut host);
     // After ONLINE, pulse VBL so the guest compositor has a display time base
     //. Missing VBL → clear-only dual-mid present thrash.

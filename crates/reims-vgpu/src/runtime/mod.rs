@@ -93,6 +93,7 @@ pub mod draw;
 /// From a drained packet to the packet the semantic model admits.
 pub mod ingress;
 pub mod input;
+pub(crate) mod lifetime_trace;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
 /// IOSurface mapper capture + page-table resolve.
@@ -123,6 +124,7 @@ pub mod render_writeback;
 /// A rail's own name for a resident render target, opaque to the layers that
 /// carry it. See the module doc for the ledger this exists for.
 pub mod resident_target;
+pub(crate) mod resolve_profile;
 /// The guest's per-resource validity quad, from both of its producers.
 pub mod resource_validity;
 /// The split of [`chain_phase`]'s largest *undivided* column, `sampled_us`.

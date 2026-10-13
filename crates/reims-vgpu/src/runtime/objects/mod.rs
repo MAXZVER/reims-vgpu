@@ -3380,13 +3380,6 @@ pub fn resolve_descriptor<M: HostMemory>(
     if !object_type_is_resource(entry.object_type) {
         return Ok((entry, Arc::from(bytes)));
     }
-    // Construction is [`resolve_resource`]'s, and this delegates rather than
-    // registering a second time. It used to build and publish its own
-    // `TaskResource`, which made two sites that could put an object into this
-    // device's hands — and only one of them can be the place a name is issued.
-    // The cost is re-reading the entry and the descriptor, on a path that is
-    // taken once per object lifetime; the alternative is an object with retained
-    // bytes and no name.
     let resource = resolve_resource(state, host, task_id, obj_ref)?;
     if !want.contains(&resource.entry.object_type) {
         return Err(LadderRung::WrongType {

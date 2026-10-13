@@ -55,6 +55,7 @@ pub(crate) struct HostPhys<'a, M: HostMemory>(pub &'a M);
 
 impl<M: HostMemory> GuestMemory for HostPhys<'_, M> {
     fn read_at(&self, gpa: u64, dst: &mut [u8]) -> bool {
+        crate::runtime::resolve_profile::walk_read(dst.len());
         self.0.read_gpa(gpa, dst).is_ok()
     }
 }
@@ -86,10 +87,22 @@ pub fn read_task_gva<M: HostMemory>(
     // which most of them do — would otherwise allocate a one-element Vec per
     // row. The write path cannot do the same, because the walk holds the host
     // shared and the write needs it exclusively.
+    let profile = crate::runtime::resolve_profile::active();
+    let started = profile.then(std::time::Instant::now);
+    let mut copy_ns = 0u64;
+    let mut bytes = 0usize;
     let mut result: Result<(), MemError> = Ok(());
-    visit_span_chunks(&reader, geom, &gr_task, gva, buf.len(), &mut |chunk| {
-        match host.read_gpa(chunk.gpa, &mut buf[chunk.range()]) {
-            Ok(()) => true,
+    let walked = visit_span_chunks(&reader, geom, &gr_task, gva, buf.len(), &mut |chunk| {
+        let copying = profile.then(std::time::Instant::now);
+        let read = host.read_gpa(chunk.gpa, &mut buf[chunk.range()]);
+        if let Some(copying) = copying {
+            copy_ns += crate::observe::phase_clock::charge_ns(copying.elapsed());
+        }
+        match read {
+            Ok(()) => {
+                bytes += chunk.range().len();
+                true
+            }
             Err(e) => {
                 // The host's own error, not a walk status: the address resolved
                 // and the transaction is what failed, and which transaction it
@@ -99,7 +112,16 @@ pub fn read_task_gva<M: HostMemory>(
             }
         }
     })
-    .map_err(span_refusal_error)?;
+    .map_err(span_refusal_error);
+    if let Some(started) = started {
+        crate::runtime::resolve_profile::read_done(
+            crate::observe::phase_clock::charge_ns(started.elapsed()),
+            copy_ns,
+            bytes,
+            walked.is_err() || result.is_err(),
+        );
+    }
+    walked?;
     result
 }
 
@@ -313,8 +335,10 @@ pub fn write_task_gva<M: HostMemory>(
 #[track_caller]
 fn via_caller() -> String {
     let loc = std::panic::Location::caller();
-    let file = loc.file();
-    let tail = file.rfind("/src/").map_or(file, |i| &file[i + 5..]);
+    let file = loc.file().replace('\\', "/");
+    let tail = file
+        .rfind("/src/")
+        .map_or(file.as_str(), |i| &file[i + 5..]);
     format!("{tail}:{}", loc.line())
 }
 

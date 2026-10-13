@@ -3019,6 +3019,7 @@ fn emit_sampled_phase() {
     let Some(w) = crate::runtime::sampled_phase::take_window() else {
         return;
     };
+    crate::runtime::resolve_profile::emit();
     crate::observe::off(format!(
         "sampled_phase sampled={} lookup_us={} alias_us={} resolve_us={} samplers_us={} \
          reflect_us={}",

@@ -2171,7 +2171,7 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
     crate::runtime::guest_ram::GuestPageFootprint,
 )> {
-    if !host.map_pages_stable() {
+    if !host.map_pages_stable() || crate::runtime::guest_ram::granularity().is_none() {
         return None;
     }
     let (ptr, len, _pages) = ensure_contig_view_with_pages(state, host, mapping_id)?;

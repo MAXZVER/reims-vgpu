@@ -1057,6 +1057,20 @@ pub unsafe fn query(
 
 #[cfg(test)]
 mod tests {
+    // Vulkan requires the extension spelling, not pointer identity. Rust may
+    // promote identical CStr constants to different addresses at each use.
+    trait ExtensionNames {
+        fn contains_extension(&self, expected: *const std::os::raw::c_char) -> bool;
+    }
+    impl ExtensionNames for Vec<*const std::os::raw::c_char> {
+        fn contains_extension(&self, expected: *const std::os::raw::c_char) -> bool {
+            self.iter().any(|&actual| {
+                // Both pointers come from ash's static, terminated names.
+                unsafe { std::ffi::CStr::from_ptr(actual) == std::ffi::CStr::from_ptr(expected) }
+            })
+        }
+    }
+
     use super::*;
 
     fn all_supported() -> DeviceFeatures {
@@ -1178,8 +1192,8 @@ mod tests {
         let eds3 = vk::EXT_EXTENDED_DYNAMIC_STATE3_NAME.as_ptr();
 
         let all = all_supported();
-        assert!(all.required_extensions().contains(&eds));
-        assert!(all.required_extensions().contains(&eds3));
+        assert!(all.required_extensions().contains_extension(eds));
+        assert!(all.required_extensions().contains_extension(eds3));
         assert_eq!(
             all.enabled_extended_dynamic_state().extended_dynamic_state,
             vk::TRUE
@@ -1205,8 +1219,8 @@ mod tests {
                 ..all_supported()
             };
             let names = caps.required_extensions();
-            assert_eq!(names.contains(&eds), cull);
-            assert_eq!(names.contains(&eds3), polygon || clamp);
+            assert_eq!(names.contains_extension(eds), cull);
+            assert_eq!(names.contains_extension(eds3), polygon || clamp);
             assert_eq!(caps.wants_extended_dynamic_state3(), polygon || clamp);
             assert_eq!(
                 caps.enabled_extended_dynamic_state().extended_dynamic_state == vk::TRUE,
@@ -1232,8 +1246,8 @@ mod tests {
                 dynamic_primitive_topology_unrestricted: unrestricted,
                 ..all_supported()
             };
-            assert!(!caps.required_extensions().contains(&eds));
-            assert!(!caps.required_extensions().contains(&eds3));
+            assert!(!caps.required_extensions().contains_extension(eds));
+            assert!(!caps.required_extensions().contains_extension(eds3));
             assert!(!caps.wants_extended_dynamic_state3());
         }
 
@@ -1245,8 +1259,8 @@ mod tests {
         assert!(!none.dynamic_polygon_mode);
         assert!(!none.dynamic_depth_clamp);
         assert!(!none.wants_extended_dynamic_state3());
-        assert!(!none.required_extensions().contains(&eds));
-        assert!(!none.required_extensions().contains(&eds3));
+        assert!(!none.required_extensions().contains_extension(eds));
+        assert!(!none.required_extensions().contains_extension(eds3));
         assert!(!none.dynamic_primitive_topology_unrestricted);
     }
 
@@ -1286,7 +1300,7 @@ mod tests {
         );
         assert!(!caps
             .required_extensions()
-            .contains(&vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr()));
+            .contains_extension(vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr()));
     }
 
     /// The extension rung is the mirror image: extension string, no core bit.
@@ -1305,7 +1319,7 @@ mod tests {
         );
         assert!(caps
             .required_extensions()
-            .contains(&vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr()));
+            .contains_extension(vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr()));
     }
 
     /// Neither rung: nothing is requested. The sampler path must decline the
@@ -1323,7 +1337,7 @@ mod tests {
         );
         assert!(!caps
             .required_extensions()
-            .contains(&vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr()));
+            .contains_extension(vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr()));
         assert!(!caps.mirror_clamp_to_edge.is_available());
     }
 
@@ -1347,7 +1361,7 @@ mod tests {
             vk::TRUE
         );
         assert!(
-            !core13.required_extensions().contains(&ext_name),
+            !core13.required_extensions().contains_extension(ext_name),
             "promoted to core at 1.3, so the string would be redundant"
         );
 
@@ -1357,7 +1371,7 @@ mod tests {
         };
         assert_eq!(ext.enabled_image_robustness().robust_image_access, vk::TRUE);
         assert!(
-            ext.required_extensions().contains(&ext_name),
+            ext.required_extensions().contains_extension(ext_name),
             "the 1.2-baseline rung has to name the extension it is chaining"
         );
 
@@ -1367,7 +1381,7 @@ mod tests {
             vk::FALSE,
             "asking for a feature the host declined fails vkCreateDevice"
         );
-        assert!(!none.required_extensions().contains(&ext_name));
+        assert!(!none.required_extensions().contains_extension(ext_name));
         assert!(!none.image_robustness.is_available());
     }
 
@@ -1387,7 +1401,7 @@ mod tests {
                 .attachment_feedback_loop_layout,
             vk::TRUE
         );
-        assert!(on.required_extensions().contains(&name));
+        assert!(on.required_extensions().contains_extension(name));
 
         let off = DeviceFeatures::default();
         assert_eq!(
@@ -1395,7 +1409,7 @@ mod tests {
                 .attachment_feedback_loop_layout,
             vk::FALSE
         );
-        assert!(!off.required_extensions().contains(&name));
+        assert!(!off.required_extensions().contains_extension(name));
     }
 
     #[test]
@@ -1405,10 +1419,10 @@ mod tests {
             image_drm_format_modifier: true,
             ..Default::default()
         };
-        assert!(on.required_extensions().contains(&name));
+        assert!(on.required_extensions().contains_extension(name));
         assert!(!DeviceFeatures::default()
             .required_extensions()
-            .contains(&name));
+            .contains_extension(name));
     }
 
     /// A feature the device declines is never enabled — the enable list is a

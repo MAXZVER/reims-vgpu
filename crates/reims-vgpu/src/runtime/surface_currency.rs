@@ -212,7 +212,12 @@ pub fn surface_currency<M: HostOps>(
     width: u32,
     height: u32,
 ) -> SurfaceCurrency {
-    let verdict = mapper::mapping_guest_write_verdict(state, host, mapping_id);
+    let verdict = {
+        let _span = crate::runtime::resolve_profile::Span::open(
+            crate::runtime::resolve_profile::Part::CurrencyVerdict,
+        );
+        mapper::mapping_guest_write_verdict(state, host, mapping_id)
+    };
     if !matches!(verdict, GuestWriteVerdict::Wrote) {
         return SurfaceCurrency::Unwritten(verdict);
     }
@@ -243,12 +248,26 @@ fn narrow_to_window<M: HostOps>(
     // Observed before the list: `guest_written_pages` names every page moved
     // past the stamp up to at least this generation, so a copy that adopts the
     // list may stamp this and nothing later.
-    let seen = mapper::observe_current_guest_write_gen(state, host, mapping_id);
-    let Some(pages) = host.guest_written_pages(m.guest_write_token, m.guest_write_gen_at_store)
-    else {
+    let seen = {
+        let _span = crate::runtime::resolve_profile::Span::open(
+            crate::runtime::resolve_profile::Part::CurrencyObservation,
+        );
+        mapper::observe_current_guest_write_gen(state, host, mapping_id)
+    };
+    let Some(pages) = ({
+        let _span = crate::runtime::resolve_profile::Span::open(
+            crate::runtime::resolve_profile::Part::WrittenPages,
+        );
+        host.guest_written_pages(m.guest_write_token, m.guest_write_gen_at_store)
+    }) else {
         return SurfaceCurrency::WroteUnknown;
     };
-    let ranges = mapper::mapping_offsets_of_pages(state, mapping_id, &pages);
+    let ranges = {
+        let _span = crate::runtime::resolve_profile::Span::open(
+            crate::runtime::resolve_profile::Part::PageOffsets,
+        );
+        mapper::mapping_offsets_of_pages(state, mapping_id, &pages)
+    };
     if ranges.is_empty() {
         // The set-wide generation moved, so some page of this list was written,
         // yet none of them mapped back to an offset. That is a disagreement

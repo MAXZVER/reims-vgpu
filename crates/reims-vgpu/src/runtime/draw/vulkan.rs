@@ -790,6 +790,13 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 state.pipeline_state(id).unwrap_or("unleased")
             });
         crate::observe::fail(format!(
+            "DEV_DRAW_SKIPPED task={} pipe={} model_pipeline={model_pipeline} vtx={} refused_by={} {target} clear={clear}",
+            req.task_id,
+            req.pipeline_ref,
+            req.vertex_count,
+            engine_outcome.slug()
+        ));
+        crate::observe::fail(format!(
             "linux_clear_store draws_skipped reason=draws_skipped_after_engine_refusal \
              pipe={} model_pipeline={model_pipeline} vtx={} refused_by={} {target} clear={clear}",
             req.pipeline_ref,
@@ -1238,6 +1245,10 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         return None;
     }
 
+    let _profile = crate::runtime::resolve_profile::Scope::open();
+    use crate::runtime::resolve_profile::{Part as RP, Span as RS};
+    let classify = RS::open(RP::Classify);
+
     // Opcode-9 buffer-backed texture (texture-view): the sampled bytes are an MTLBuffer's
     // guest storage, not a view over another texture. Resolve it directly before
     // the view/surface paths (which would mis-decode the opcode-9 descriptor).
@@ -1250,6 +1261,8 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         // RGBA8 order and decodes nothing, so the transfer function the guest
         // declared is still the one these bytes carry.
         let source = bt.desc.pixel_format;
+        drop(classify);
+        let _linear = RS::open(RP::Linear);
         let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)?;
         return Some((
             w,
@@ -1318,6 +1331,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         });
     }
 
+    drop(classify);
     if let Some(mid) = surface {
         // Ensure backing pages exist for this surface id.
         let _ = objects::ensure_surface_for_texture_bind(state, host, mid);
@@ -1340,6 +1354,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 })
                 .unwrap_or(true);
             if needs_materialization {
+                let _view = RS::open(RP::View);
                 // What this bind reads, before either arm decides how to carry
                 // it. The window is the *view's* -- a plane of a multiplanar
                 // surface has its own format, extent and offset, and the
@@ -1492,7 +1507,10 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // enumerated to say whether it wrote the *pixels*. The second
                 // stage costs a page-list walk and is paid on the minority of
                 // binds the first stage flags.
-                let currency = surface_currency(state, host, mid, w, h);
+                let currency = {
+                    let _span = RS::open(RP::Currency);
+                    surface_currency(state, host, mid, w, h)
+                };
                 // The coarse column the rung census reports under. Taken from
                 // the same answer the serving decision uses, so the two cannot
                 // describe different asks.
@@ -1856,6 +1874,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
 
     // normal-texture: GVA-keyed encode, then texture_ref with **descriptor** geom match.
     if is_linear_tex {
+        let _linear = RS::open(RP::Linear);
         // Zero-copy gather for large Vulkan-native linear textures: replaces
         // the CPU host-cache/memo byte paths below for eligible formats (the
         // lin_memo full-window re-read + memcmp per bind was the dominant
@@ -1925,6 +1944,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // the rung a `RGBA16Float` display-profile LUT actually lands on, because
     // the three rungs above are reached only for a resource the draw already
     // knows is a linear texture.
+    let _generic = RS::open(RP::Generic);
     let (mut bytes, layout) = load_sampled_rgba_static(
         state,
         host,
@@ -4735,6 +4755,9 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
     texture_ref: u32,
     tex: &TextureDescriptor,
 ) -> Option<(u32, u32, SampledSourceRequest)> {
+    let _profile_span = crate::runtime::resolve_profile::Span::open(
+        crate::runtime::resolve_profile::Part::Resident,
+    );
     use crate::runtime::drain::note_store_route;
 
     let (gva, layout) = tex.level_gva(0, state.page_shift)?;
@@ -5639,6 +5662,8 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     // one this reader cannot rule out.
     // Census, pay, settle — the whole obligation of a CPU read of one named
     // resource's guest bytes. See `writeback_debt::settle_for_texture`.
+    let settle =
+        crate::runtime::resolve_profile::Span::open(crate::runtime::resolve_profile::Part::Settle);
     crate::runtime::writeback_debt::settle_for_texture(
         state,
         host,
@@ -5648,6 +5673,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         span,
         crate::runtime::render_writeback::SettleSite::LinearMemoRead,
     );
+    drop(settle);
     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
     scratch.resize(native_len, 0);
     let read = gva_mem::read_task_gva_by_id(
@@ -5693,6 +5719,8 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     // answer is workload-dependent — a guest that rewrites its planes every
     // frame would push `changed` up and invert the conclusion — so this is a
     // ratio worth re-reading, not a settled fact worth deleting.
+    let compare =
+        crate::runtime::resolve_profile::Span::open(crate::runtime::resolve_profile::Part::Compare);
     let hit = match state.guest_linear_memo.get_touch(&key) {
         None => {
             crate::runtime::drain::note_store_route("lin_memo_absent");
@@ -5708,6 +5736,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
             None
         }
     };
+    drop(compare);
     if let Some((rgba, generation, fmt)) = hit {
         state.guest_linear_scratch = scratch;
         return Some((
@@ -5723,12 +5752,15 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         ));
     }
     // First sight or native bytes changed: convert fresh, new generation.
+    let convert =
+        crate::runtime::resolve_profile::Span::open(crate::runtime::resolve_profile::Part::Convert);
     let Some((rgba, fmt)) =
         native_scratch_to_upload(&scratch, w, h, planes, bpr, sample_fmt, tight)
     else {
         state.guest_linear_scratch = scratch;
         return None;
     };
+    drop(convert);
     let generation = state.next_sampled_content_generation();
     let rgba = std::sync::Arc::new(rgba);
     let entry_bytes = scratch.len() + rgba.len();
@@ -5909,6 +5941,9 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     texture_ref: u32,
     tex: &TextureDescriptor,
 ) -> Option<LoadedLinearSample> {
+    let _profile_span = crate::runtime::resolve_profile::Span::open(
+        crate::runtime::resolve_profile::Part::HostCache,
+    );
     // The descriptor is resolved+decoded once by the caller
     // (`resolve_sampled_source`'s linear branch) and threaded in; the zero-copy
     // attempt above shares the same decode.

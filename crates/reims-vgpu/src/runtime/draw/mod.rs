@@ -873,6 +873,9 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
     ) {
         Ok(found) => found,
         Err(rung) => {
+            crate::observe::fail(format!(
+                "DEV_LOAD_PIPELINE_FAIL task={task_id} pipe_ref={pipeline_ref} reason=resolve_descriptor_failed rung={rung:?}"
+            ));
             report.rung(task_id, pipeline_ref, rung);
             return None;
         }
@@ -888,6 +891,10 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
             // logic-op tags were found and is not a step the next reader should
             // have to repeat.
             use crate::observe::Decline;
+            crate::observe::fail(format!(
+                "DEV_LOAD_PIPELINE_FAIL task={task_id} pipe_ref={pipeline_ref} reason=decode_failed desc_len={} status={}",
+                desc.len(), status.slug()
+            ));
             report.reason(
                 task_id,
                 pipeline_ref,
@@ -900,6 +907,9 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
     // A vertex stage is required to build a pipeline — the compute sibling
     // names its one stage the same way, as `kernel_func_zero`.
     if p.vertex_func_ref == 0 {
+        crate::observe::fail(format!(
+            "DEV_LOAD_PIPELINE_FAIL task={task_id} pipe_ref={pipeline_ref} reason=vertex_func_zero"
+        ));
         report.reason(task_id, pipeline_ref, "vertex_func_zero", "");
         return None;
     }

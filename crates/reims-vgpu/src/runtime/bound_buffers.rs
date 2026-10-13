@@ -235,10 +235,10 @@ pub fn note_registry_levels(state: &crate::model::DeviceState) {
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     static PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
-    let shape = state.bound_buffers.shape();
+    let entries = state.bound_buffers.len();
     let peak = PEAK_ENTRIES
-        .fetch_max(shape.entries as u64, Ordering::Relaxed)
-        .max(shape.entries as u64);
+        .fetch_max(entries as u64, Ordering::Relaxed)
+        .max(entries as u64);
 
     let now = crate::observe::elapsed_ms() as u64;
     let last = LAST_MS.load(Ordering::Relaxed);
@@ -252,6 +252,7 @@ pub fn note_registry_levels(state: &crate::model::DeviceState) {
     {
         return;
     }
+    let shape = state.bound_buffers.shape();
     crate::observe::off(format!(
         "bound_buffers (levels, not per-interval) entries={} peak={} pairs={} \
          multi_offset_pairs={} max_offsets={}",
