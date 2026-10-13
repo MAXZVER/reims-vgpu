@@ -234,6 +234,7 @@ fn from_records(count: u64) -> Vec<DeviceTransaction> {
     // whatever `n - 1` reserved. A registry per transaction would hand every
     // one of them version 1 and leave the trace with nothing to disagree about.
     let mut model = crate::testing::registry(TASK, SLOTS);
+    let refs = crate::testing::registry_refs(&model, TASK, SLOTS);
     (1..=count)
         .map(|n| {
             let bytes = crate::testing::blit_stream(&[
@@ -242,7 +243,7 @@ fn from_records(count: u64) -> Vec<DeviceTransaction> {
             ]);
             let work = crate::walk::exec(
                 &bytes,
-                &crate::testing::Everything,
+                &refs,
                 &mut model.task_access(TASK, ChannelId(1)),
                 crate::exec::ExecBuilder::new(),
             )
@@ -273,6 +274,7 @@ fn from_render_records(count: u64) -> Vec<DeviceTransaction> {
     const TASK: crate::identity::TaskId = crate::identity::TaskId(1);
     const SLOTS: &[u32] = &[1, 2, 3, 10, 11];
     let mut model = crate::testing::registry(TASK, SLOTS);
+    let refs = crate::testing::registry_refs(&model, TASK, SLOTS);
     (1..=count)
         .map(|n| {
             let bytes = crate::testing::render_stream(&[
@@ -281,7 +283,7 @@ fn from_render_records(count: u64) -> Vec<DeviceTransaction> {
             ]);
             let work = crate::walk::exec(
                 &bytes,
-                &crate::testing::Everything,
+                &refs,
                 &mut model.task_access(TASK, ChannelId(1)),
                 crate::exec::ExecBuilder::new(),
             )

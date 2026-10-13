@@ -333,6 +333,19 @@ impl Namespace {
         let existing = self.slots.get(&slot).copied();
         let generation =
             existing.map_or_else(|| SlotGeneration::default().next(), |e| e.generation.next());
+        self.declare_with_generation(slot, backing, generation)
+    }
+
+    /// Publish a name minted by the session owner. Task namespaces cannot mint
+    /// session identities themselves: two tasks can use the same slot, and a
+    /// replacement task must not restart identities held by admitted work.
+    pub(crate) fn declare_with_generation(
+        &mut self,
+        slot: ObjectListRef,
+        backing: Option<BackingId>,
+        generation: SlotGeneration,
+    ) -> Declared {
+        let existing = self.slots.get(&slot).copied();
         // Only a *live* occupant is displaced. A deleted one already handed its
         // backing over.
         let displaced = existing.filter(|e| !e.deleted);

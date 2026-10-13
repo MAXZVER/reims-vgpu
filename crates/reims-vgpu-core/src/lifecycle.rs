@@ -1392,6 +1392,9 @@ pub enum Refusal {
     NoSuchTask {
         task: TaskId,
     },
+    /// No fresh session resource identity remains. Refuse before publishing or
+    /// displacing any name rather than aliasing one still held by old work.
+    ResourceGenerationExhausted,
 
     Namespace {
         task: TaskId,
@@ -1414,6 +1417,7 @@ impl Refusal {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::NoSuchTask { .. } => "lifecycle_no_such_task",
+            Self::ResourceGenerationExhausted => "lifecycle_resource_generation_exhausted",
             Self::Namespace { .. } => "lifecycle_namespace",
             Self::Heap { .. } => "lifecycle_heap",
             Self::PlacedResourceHasNoPhysical { .. } => "lifecycle_placed_resource_has_no_physical",
@@ -1581,6 +1585,10 @@ impl Task {
 pub struct Lifecycle {
     tasks: HashMap<TaskId, Task>,
     content: ContentLedger,
+    /// ResourceId is also a session-table key, without a task component. Mint
+    /// its generation once here, across all slots and task incarnations. The
+    /// counter survives task deletion and uses constant space.
+    resource_generation: u64,
 }
 
 impl Lifecycle {
@@ -2125,7 +2133,16 @@ impl Lifecycle {
             // Nothing to admit and nothing to look up: the object owns no bytes.
             Storage::NoBytes => None,
         };
-        let crate::namespace::Declared { id, displaced } = t.namespace.declare(slot, backing);
+        let generation = self
+            .resource_generation
+            .checked_add(1)
+            .ok_or(Refusal::ResourceGenerationExhausted)?;
+        self.resource_generation = generation;
+        let crate::namespace::Declared { id, displaced } = t.namespace.declare_with_generation(
+            slot,
+            backing,
+            crate::identity::SlotGeneration(generation),
+        );
         // The guest wrote over a slot that still held an object. There is no
         // delete packet for that — see `Namespace::declare` — so the delete's
         // obligations are this declaration's, and they are exactly the ones
@@ -2529,6 +2546,69 @@ mod tests {
     /// obligation nobody holds.
     fn apply_inert(l: &mut Lifecycle, op: &LifecycleOp) {
         assert_eq!(l.apply(op).expect("resolves"), Effects::default());
+    }
+
+    #[test]
+    fn resource_names_do_not_alias_across_tasks_or_task_reuse() {
+        use crate::resolve::TaskNamespaces as _;
+        let mut l = Lifecycle::new();
+        let define = |task, directory| LifecycleOp::DefineTask {
+            task: TaskId(task),
+            kernel: false,
+            directory: DirectoryFrame(directory),
+        };
+        let create = |task| LifecycleOp::CreateResource {
+            task: TaskId(task),
+            slot: ObjectListRef(7),
+            storage: Storage::NoBytes,
+        };
+        let _ = l.apply(&define(1, 10)).unwrap();
+        let _ = l.apply(&define(2, 10)).unwrap();
+        let _ = l.apply(&create(1)).unwrap();
+        let _ = l.apply(&create(2)).unwrap();
+        let first = l.resource(TaskId(1), 7).unwrap();
+        let peer = l.resource(TaskId(2), 7).unwrap();
+        assert_ne!(
+            first, peer,
+            "the session pipeline table receives these names without a task key"
+        );
+        for directory in [10, 11] {
+            let _ = l.apply(&define(1, directory)).unwrap();
+            assert!(l.resource(TaskId(1), 7).is_none());
+            let _ = l.apply(&create(1)).unwrap();
+            let replacement = l.resource(TaskId(1), 7).unwrap();
+            assert_ne!(first, replacement);
+            assert!(
+                l.resolve(TaskId(1), first).is_err(),
+                "old admission must not resolve through the new namespace"
+            );
+            assert_eq!(l.resource(TaskId(2), 7), Some(peer));
+        }
+        let _ = l
+            .apply(&LifecycleOp::DeleteTask { task: TaskId(1) })
+            .unwrap();
+        let _ = l.apply(&define(1, 10)).unwrap();
+        let _ = l.apply(&create(1)).unwrap();
+        assert_ne!(l.resource(TaskId(1), 7), Some(first));
+    }
+
+    #[test]
+    fn exhausted_resource_identity_refuses_before_displacing_a_live_name() {
+        use crate::resolve::TaskNamespaces as _;
+        let (mut l, original) = with_one_resource(256);
+        l.resource_generation = u64::MAX;
+        let before = format!("{:?}", l.content());
+        assert_eq!(
+            l.apply(&LifecycleOp::CreateResource {
+                task: TASK,
+                slot: original.slot,
+                storage: Storage::NoBytes,
+            }),
+            Err(Refusal::ResourceGenerationExhausted)
+        );
+        assert_eq!(l.resource(TASK, original.slot.0), Some(original));
+        assert_eq!(l.resolve(TASK, original), Ok(range(0, 256)));
+        assert_eq!(format!("{:?}", l.content()), before);
     }
 
     fn name(slot: u32) -> ResourceId {
@@ -3153,14 +3233,9 @@ mod tests {
             // the four commands would be inert for a reason that has nothing to
             // do with the rule under test.
             for slot in 0..3u32 {
-                l.record_write(
-                    TASK,
-                    name(slot),
-                    LENGTH / 2,
-                    LENGTH / 2,
-                    Replica::DeviceOwned,
-                )
-                .expect("inside the resource");
+                let resource = crate::resolve::TaskNamespaces::resource(&l, TASK, slot).unwrap();
+                l.record_write(TASK, resource, LENGTH / 2, LENGTH / 2, Replica::DeviceOwned)
+                    .expect("inside the resource");
             }
             l
         };
@@ -3218,8 +3293,11 @@ mod tests {
             // all cannot be read as a command that refused cleanly.
             let mut moves = build();
             let before = snapshot(&moves);
+            let names = (0..3)
+                .map(|slot| crate::resolve::TaskNamespaces::resource(&moves, TASK, slot).unwrap())
+                .collect();
             let effects = moves
-                .apply(&command(TASK, (0..3).map(name).collect()))
+                .apply(&command(TASK, names))
                 .expect("three live names resolve");
             let kind = command(TASK, Vec::new()).kind();
             assert!(
@@ -3229,9 +3307,11 @@ mod tests {
             );
 
             for position in 0..4 {
-                let mut resources: Vec<ResourceId> = (0..3).map(name).collect();
-                resources.insert(position, stale);
                 let mut l = build();
+                let mut resources: Vec<ResourceId> = (0..3)
+                    .map(|slot| crate::resolve::TaskNamespaces::resource(&l, TASK, slot).unwrap())
+                    .collect();
+                resources.insert(position, stale);
                 let before = snapshot(&l);
                 assert_eq!(
                     l.apply(&command(TASK, resources))
@@ -3595,6 +3675,7 @@ mod tests {
                 storage: dedicated(11, 128),
             },
         );
+        let untouched = crate::resolve::TaskNamespaces::resource(&l, TASK, 2).unwrap();
         let effects = l
             .apply(&LifecycleOp::DeleteBacking {
                 task: TASK,
@@ -3604,7 +3685,7 @@ mod tests {
             .expect("live task");
         assert_eq!(effects.teardowns.len(), 2, "and only those two");
         assert_eq!(
-            l.resolve(TASK, name(2)),
+            l.resolve(TASK, untouched),
             Ok(range(0, 128)),
             "the resource on the other backing is untouched"
         );
@@ -5344,7 +5425,7 @@ mod tests {
             let mut live: HashMap<TaskId, HashMap<ObjectListRef, (ResourceId, BackingId)>> =
                 HashMap::new();
             let mut storage: HashMap<TaskId, HashMap<u64, BackingId>> = HashMap::new();
-            let mut generations: HashMap<(TaskId, ObjectListRef), SlotGeneration> = HashMap::new();
+            let mut generation = SlotGeneration::default();
             let mut handed: Vec<Handed> = Vec::new();
             // Backings the ledger knew at the previous step. A backing
             // something still holds may not stop being known.
@@ -5509,7 +5590,7 @@ mod tests {
                             &op,
                             &mut live,
                             &mut storage,
-                            &mut generations,
+                            &mut generation,
                             &mut handed,
                             &mut census,
                         );
@@ -5607,7 +5688,7 @@ mod tests {
         op: &LifecycleOp,
         live: &mut HashMap<TaskId, HashMap<ObjectListRef, (ResourceId, BackingId)>>,
         storage: &mut HashMap<TaskId, HashMap<u64, BackingId>>,
-        generations: &mut HashMap<(TaskId, ObjectListRef), SlotGeneration>,
+        generation: &mut SlotGeneration,
         handed: &mut Vec<Handed>,
         census: &mut Census,
     ) {
@@ -5616,30 +5697,24 @@ mod tests {
                 if live.insert(*task, HashMap::new()).is_some() {
                     census.redefinitions += 1;
                 }
-                // A new namespace and new heaps: the generations restart with
-                // them, which is what makes a name from the previous
-                // definition refuse rather than resolve to its successor.
+                // Namespace and heaps end here. Session identities do not
+                // restart: a stale name must never resolve to a successor.
                 storage.insert(*task, HashMap::new());
-                generations.retain(|(t, _), _| t != task);
             }
             LifecycleOp::DeleteTask { task } => {
                 census.deleted_tasks += 1;
                 live.remove(task);
                 storage.remove(task);
-                generations.retain(|(t, _), _| t != task);
             }
             LifecycleOp::CreateResource {
                 task,
                 slot,
                 storage: what,
             } => {
-                let generation = generations
-                    .get(&(*task, *slot))
-                    .map_or_else(|| SlotGeneration::default().next(), |g| g.next());
-                generations.insert((*task, *slot), generation);
+                *generation = generation.next();
                 let id = ResourceId {
                     slot: *slot,
-                    generation,
+                    generation: *generation,
                 };
                 let backing = match what {
                     Storage::Dedicated { backing, .. } => *backing,
@@ -5847,6 +5922,7 @@ mod tests {
             },
         );
 
+        let no_bytes = crate::resolve::TaskNamespaces::resource(&l, TASK, 1).unwrap();
         let bytes = l
             .access(
                 TASK,
@@ -5864,7 +5940,7 @@ mod tests {
                 TASK,
                 ChannelId(2),
                 &Participation {
-                    resource: name(1),
+                    resource: no_bytes,
                     extent: ParticipationExtent::Whole,
                     mode: AccessMode::Read,
                     api_stages: 0,

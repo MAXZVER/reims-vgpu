@@ -268,3 +268,31 @@ pub(crate) fn registry(
     }
     model
 }
+
+/// Resolve the actual names published by a lifecycle fixture. A synthetic
+/// generation-one resolver is suitable for record decoding in isolation, but
+/// cannot represent multiple session resources at an access-owner boundary.
+pub(crate) struct RegistryRefs(std::collections::HashMap<u32, crate::identity::ResourceId>);
+impl crate::resolve::RefResolver for RegistryRefs {
+    fn resource(&self, object_ref: u32) -> Option<crate::identity::ResourceId> {
+        self.0.get(&object_ref).copied()
+    }
+}
+pub(crate) fn registry_refs(
+    model: &crate::lifecycle::Lifecycle,
+    task: crate::identity::TaskId,
+    slots: &[u32],
+) -> RegistryRefs {
+    RegistryRefs(
+        slots
+            .iter()
+            .map(|&slot| {
+                (
+                    slot,
+                    crate::resolve::TaskNamespaces::resource(model, task, slot)
+                        .expect("fixture declared"),
+                )
+            })
+            .collect(),
+    )
+}

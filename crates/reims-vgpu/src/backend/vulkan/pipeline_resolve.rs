@@ -414,6 +414,13 @@ pub fn resolve<M: HostMemory + HostOps>(
     let mut resolved = resolve_uncached(state, host, task_id, pipeline_ref)?;
     resolved.pipeline_object = Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new());
     let registered = states.register(task_id, pipeline_ref, Arc::new(resolved));
+    state.trace_lifetime(
+        crate::runtime::lifetime_trace::Phase::RetainPipeline,
+        task_id,
+        state.object_name(task_id, pipeline_ref),
+        None,
+        registered.pipeline_object.as_ref().map(|o| o.id().get()),
+    );
     ready(state, host, task_id, pipeline_ref, &registered);
     Ok(registered)
 }
@@ -455,6 +462,18 @@ fn resolve_uncached<M: HostMemory + HostOps>(
     pipeline_ref: u32,
 ) -> Result<ResolvedRenderPipeline, DrawPreparationDecline> {
     resolve_uncached_inner(state, host, task_id, pipeline_ref).inspect_err(|decline| {
+        state.trace_lifetime(
+            crate::runtime::lifetime_trace::Phase::Missing,
+            task_id,
+            state.object_name(task_id, pipeline_ref),
+            None,
+            None,
+        );
+        state.dump_lifetime(task_id);
+        crate::observe::fail(format!(
+            "DEV_PIPELINE_DECLINE task={task_id} pipe={pipeline_ref} decline={:?}",
+            decline
+        ));
         // A decline here is terminal for the pipeline, not for the draw that
         // happened to ask: none of the seven inputs below is re-read on a later
         // draw with a different answer, so retrying costs one guest walk per
@@ -878,11 +897,25 @@ mod tests {
             first_id,
             "reusing a guest reference constructs a new pipeline object"
         );
-        state.define_task(3, 1 << 20, 8);
-        assert!(
-            !pipelines(&state).contains(3, 9),
-            "task redefinition ends the old task namespace"
-        );
+        for root in [7, 8] {
+            let queued = pipelines(&state).register(3, 9, retained_pipeline_for_test());
+            let peer = pipelines(&state).register(4, 9, retained_pipeline_for_test());
+            let owners = Arc::strong_count(&queued);
+            state.define_task(3, 1 << 20, root);
+            assert!(
+                !pipelines(&state).contains(3, 9),
+                "both roots end the old namespace"
+            );
+            assert_eq!(
+                Arc::strong_count(&queued),
+                owners - 1,
+                "accepted encoder lease survives retirement"
+            );
+            assert!(
+                Arc::ptr_eq(&peer, &pipelines(&state).get(4, 9).unwrap()),
+                "the same ref in another task is separate"
+            );
+        }
 
         pipelines(&state).register(3, 9, retained_pipeline_for_test());
         assert!(state.delete_task(3));

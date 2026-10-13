@@ -3139,6 +3139,7 @@ pub struct DeviceState {
     pub pending: PendingWork,
     pub child_rings: [ChannelRing; MAX_CHANNELS],
     pub tasks: TaskTable,
+    lifetime_trace: Mutex<crate::runtime::lifetime_trace::Trace>,
     /// Highest task id the guest has ever named.
     ///
     /// # It measured a bound, and the bound is gone
@@ -3664,6 +3665,7 @@ impl DeviceState {
             max_task_id_seen: 0,
             max_mapping_id_seen: 0,
             tasks: TaskTable::new(),
+            lifetime_trace: Mutex::new(Default::default()),
             map_family_events: 0,
             map_audit: std::collections::BTreeMap::new(),
             node_guard: std::collections::BTreeMap::new(),
@@ -4128,6 +4130,36 @@ impl DeviceState {
         }
     }
 
+    pub(crate) fn trace_lifetime(
+        &self,
+        phase: crate::runtime::lifetime_trace::Phase,
+        task: u32,
+        resource: Option<ResourceId>,
+        ordinal: Option<reims_vgpu_core::identity::IngressOrdinal>,
+        host_object: Option<u64>,
+    ) {
+        let entry = self.tasks.get(task);
+        self.lifetime_trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(crate::runtime::lifetime_trace::Event {
+                phase,
+                task,
+                incarnation: u64::from(self.storage_incarnation(task, 0).epoch),
+                directory: entry.map_or(0, |e| e.directory_pfn),
+                list: entry.map_or(0, |e| e.object_list_pfn),
+                list_count: entry.map_or(0, |e| e.object_list_count),
+                resource,
+                ordinal,
+                host_object,
+            });
+    }
+    pub(crate) fn dump_lifetime(&self, task: u32) {
+        self.lifetime_trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dump(task);
+    }
     /// Install the guest's task under `task_id`, replacing any previous one.
     ///
     /// Returns nothing: it used to return `bool`, and the only `false` it could
@@ -4137,6 +4169,13 @@ impl DeviceState {
     /// false — the shape that makes a later real failure easy to add and easy to
     /// ignore.
     pub fn define_task(&mut self, task_id: u32, length: u64, directory_pfn: u32) {
+        self.trace_lifetime(
+            crate::runtime::lifetime_trace::Phase::Define,
+            task_id,
+            None,
+            None,
+            None,
+        );
         self.max_task_id_seen = self.max_task_id_seen.max(task_id);
         // Redefining a *live* task is the one shape here that can lose published
         // guest state: the objects below are dropped, and if the new directory
@@ -4166,6 +4205,9 @@ impl DeviceState {
         if self.tasks.is_active(task_id) {
             self.bump_task_storage_incarnations(task_id);
         }
+        // The lifecycle owner has ended the old namespace. Drop its lookup
+        // entries on every definition; admitted Arc leases retain their own
+        // objects, independently of whether new work can resolve them.
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
         self.task_sampler_states.delete_task(task_id);
@@ -4217,6 +4259,13 @@ impl DeviceState {
     /// PVG `CmdDeleteTask` (op `0x20`): drop task directory + object list entries.
     /// Guest reuses task ids; leaving stale active tasks corrupts GVA walks.
     pub fn delete_task(&mut self, task_id: u32) -> bool {
+        self.trace_lifetime(
+            crate::runtime::lifetime_trace::Phase::DeleteTask,
+            task_id,
+            None,
+            None,
+            None,
+        );
         self.max_task_id_seen = self.max_task_id_seen.max(task_id);
         if !self.tasks.is_active(task_id) {
             return false;
@@ -4264,6 +4313,13 @@ impl DeviceState {
         };
         task.object_list_pfn = pfn;
         task.object_list_count = count;
+        self.trace_lifetime(
+            crate::runtime::lifetime_trace::Phase::BindList,
+            task_id,
+            None,
+            None,
+            None,
+        );
         true
     }
 
@@ -4975,6 +5031,13 @@ impl DeviceState {
             .resource(task, obj_ref)
             .expect("the declaration published this slot");
         drop(owner);
+        self.trace_lifetime(
+            crate::runtime::lifetime_trace::Phase::Create,
+            task_id,
+            Some(id),
+            None,
+            None,
+        );
         Ok(Declaration {
             id,
             acted: note_lifecycle_effects(effects, "declare_object"),
@@ -5135,6 +5198,13 @@ impl DeviceState {
     }
 
     pub fn delete_object(&mut self, task_id: u32, ref_: u32) -> bool {
+        self.trace_lifetime(
+            crate::runtime::lifetime_trace::Phase::DeleteObject,
+            task_id,
+            self.object_name(task_id, ref_),
+            None,
+            None,
+        );
         let removed = self.objects.remove(&(task_id, ref_));
         // The namespace first, because it is what decides the reference still
         // names anything; the memo behind that name goes with it. A name it has
