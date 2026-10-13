@@ -3383,6 +3383,23 @@ const fn batch_default_draws(
 /// The chosen cap is then a field on that pool, so neither the environment nor
 /// topology is re-read on the draw path.
 fn batch_max_draws(topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology) -> u64 {
+    // TEMP (lab, b366, `REIMS_VGPU_LAB_BATCH_WIDE=N`, 1..=BATCH_MAX_DRAWS): the cap
+    // set outright, past the discrete default too. The 32 above was swept on a
+    // Linux discrete host; on the Windows/WHPX RTX 4060 full-screen Maps the
+    // recorder spends ~13 % of a draw submitting batches and ~27 % staging guest
+    // buffers a wider command buffer would bind again, while the drain waits on
+    // it (`wait_below`, 8 % of the busy drain).
+    if let Some(n) = std::env::var("REIMS_VGPU_LAB_BATCH_WIDE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| (1..=BATCH_MAX_DRAWS).contains(n))
+    {
+        crate::observe::off(format!(
+            "batch_draws cap={n} topology={} lab_wide=1",
+            topology.slug()
+        ));
+        return n;
+    }
     let default = batch_default_draws(topology);
     let cap = match crate::config::count(crate::config::BATCH_DRAWS, default) {
         crate::config::Count::Narrowed(n) => n,
