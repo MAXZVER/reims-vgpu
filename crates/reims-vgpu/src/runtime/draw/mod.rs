@@ -3294,7 +3294,7 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
     }
     crate::runtime::drain::note_store_route("sync_store_bound");
     Some(StoreTargetPages {
-        set: ordered.iter().copied().collect(),
+        set: std::sync::OnceLock::new(),
         ordered,
         span,
     })
@@ -3321,7 +3321,11 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
 #[derive(Clone)]
 pub(crate) struct StoreTargetPages {
     ordered: Vec<u64>,
-    set: std::collections::HashSet<u64>,
+    /// The membership form, built from `ordered` on first ask. TEMP (lab,
+    /// 2026-10-14 b425): a 5K target is 10 800 pages, and building the set on
+    /// every walk was ~19 % of Maps' encode while the GPU-direct writer, which
+    /// reads only `ordered`, took most Stores.
+    set: std::sync::OnceLock<std::collections::HashSet<u64>>,
     span: u64,
 }
 
@@ -3337,7 +3341,7 @@ impl StoreTargetPages {
     pub(crate) fn from_ordered(ordered: &[u64], span: u64) -> Self {
         Self {
             ordered: ordered.to_vec(),
-            set: ordered.iter().copied().collect(),
+            set: std::sync::OnceLock::new(),
             span,
         }
     }
@@ -3352,7 +3356,7 @@ impl StoreTargetPages {
     pub(crate) fn empty() -> Self {
         Self {
             ordered: Vec::new(),
-            set: std::collections::HashSet::new(),
+            set: std::sync::OnceLock::new(),
             span: 0,
         }
     }
@@ -3360,7 +3364,7 @@ impl StoreTargetPages {
     /// The same pages as a membership test, which is the bound
     /// [`write_gva_rgba8_within`] takes.
     pub(crate) fn membership(&self) -> &std::collections::HashSet<u64> {
-        &self.set
+        self.set.get_or_init(|| self.ordered.iter().copied().collect())
     }
 
     /// Page GPAs in GVA order, **only** when the walk resolved every page of

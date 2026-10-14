@@ -7142,11 +7142,7 @@ fn a_short_pre_submit_walk_takes_the_ordered_page_list_away() {
     let span = PAGE * 3;
     let complete = vec![0x10 * PAGE, 0x11 * PAGE, 0x12 * PAGE];
 
-    let whole = StoreTargetPages {
-        set: complete.iter().copied().collect(),
-        ordered: complete.clone(),
-        span,
-    };
+    let whole = StoreTargetPages::from_ordered(&complete, span);
     assert_eq!(
         whole.ordered_complete(gva, PAGE),
         Some(&complete[..]),
@@ -7155,11 +7151,7 @@ fn a_short_pre_submit_walk_takes_the_ordered_page_list_away() {
 
     // The middle page dropped, which is what `task_gva_page_gpas` leaves behind
     // for a span with an unmapped page in it.
-    let short = StoreTargetPages {
-        set: [complete[0], complete[2]].into_iter().collect(),
-        ordered: vec![complete[0], complete[2]],
-        span,
-    };
+    let short = StoreTargetPages::from_ordered(&[complete[0], complete[2]], span);
     assert!(
         short.ordered_complete(gva, PAGE).is_none(),
         "a hole must take the whole list, not hand back a shifted one"
