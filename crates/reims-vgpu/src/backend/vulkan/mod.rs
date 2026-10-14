@@ -529,9 +529,22 @@ impl Backend for VulkanBackend {
         let Some(identity) = target.get::<engine::TargetIdentity>() else {
             return false;
         };
+        // TEMP (lab, PAY_ALIAS): the resident's version before the store settles it.
+        let lab_alias_v0 = if crate::runtime::gather_witness::t2t_alias::pay_alias_on() {
+            engine::resident_version_nowait(identity)
+        } else {
+            None
+        };
         let paid = crate::runtime::render_writeback::vulkan::store_render_frame(
             state, host, mapping_id, identity, width, height,
         );
+        if paid {
+            if let Some(v0) = lab_alias_v0 {
+                crate::runtime::render_writeback::vulkan::lab_pay_alias_landed(
+                    state, host, mapping_id, identity, v0, width, height,
+                );
+            }
+        }
         if !paid {
             // The hold ends either way: a frame nothing will ask for again must
             // not keep its image alive to the next device reset.

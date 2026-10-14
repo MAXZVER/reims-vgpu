@@ -1396,7 +1396,7 @@ pub(crate) fn commit_gather<M: crate::runtime::host::HostOps>(
         note_store_route(route);
     }
     note_observation(&plan.seen, plan.key, plan.span);
-    t2t_alias::note_decided(plan.seen.verdict, plan.seen.generation, gpas, plan.span); // TEMP (lab, T2T_ALIAS)
+    t2t_alias::note_decided(host, plan.seen.verdict, plan.seen.generation, gpas, plan.span); // TEMP (lab, T2T_ALIAS)
     // TEMP (lab, STRIPE_HUNT): the planned-commit twin of `note_gather`'s hook,
     // so a drain-planned bind is counted under the same per-present columns.
     crate::runtime::stripe_hunt::note_gather_bind(
@@ -1656,7 +1656,8 @@ pub fn note_gather<M: crate::runtime::host::HostMemory + crate::runtime::host::H
             seen.evidence = None;
         }
     }
-    t2t_alias::note_decided(seen.verdict, seen.generation, lab_gpas, span); // TEMP (lab, T2T_ALIAS)
+    t2t_alias::note_decided(&*host, seen.verdict, seen.generation, lab_gpas, span); // TEMP (lab, T2T_ALIAS)
+    t2t_alias::release_untracked(host); // TEMP (lab, PAY_ALIAS)
     // TEMP (lab, STRIPE_HUNT): the witness answered — a vouch serves the
     // retained image without reading a byte (the false-quiet population), a
     // refusal spends the generation and gathers.
@@ -1931,6 +1932,74 @@ pub(crate) mod t2t_alias {
         gpas: Vec<u64>,
         span: u64,
         alias: u64,
+        /// TEMP (lab, PAY_ALIAS): a guest-write tracking token taken right after
+        /// the landing and its generation then (0/0 for a T2T landing): a window
+        /// re-pointed onto exactly these pages (`Rearmed`, no previous bind to
+        /// vouch from) still holds the landed frame while the generation stands.
+        token: u64,
+        gen: u64,
+    }
+
+    /// TEMP (lab, PAY_ALIAS, live `PAY_ALIAS`, else `REIMS_VGPU_LAB_PAY_ALIAS=on`):
+    /// a named synchronize's payment (`0x35`, the guest is about to read the
+    /// surface) names the frame it landed, as a T2T landing does, and a window
+    /// re-pointed onto those pages is filled from the resident while the guest has
+    /// not stored into them since. b4z2 (ZCode's v6e, canvas 5K): ~125 1 MB
+    /// gathers a second, every one `Rearmed` - CA unwires each surface after the
+    /// synchronize (`0x36`) and wires it again, so the window is new each frame.
+    pub(crate) fn pay_alias_on() -> bool {
+        if cfg!(test) {
+            return false;
+        }
+        if let Some(on) = crate::runtime::lab_live::on("PAY_ALIAS") {
+            return on;
+        }
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PAY_ALIAS").as_deref() == Ok("on"))
+    }
+
+    /// Tokens of landings dropped from the list, for the next caller with a host
+    /// to release.
+    static UNTRACK: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+    fn push_landed(landed: &mut Vec<Landed>, l: Landed) {
+        let mut gone = Vec::new();
+        landed.retain(|o| {
+            let keep = o.gpas.first() != l.gpas.first();
+            if !keep && o.token != 0 {
+                gone.push(o.token);
+            }
+            keep
+        });
+        landed.push(l);
+        if landed.len() > 8 {
+            let o = landed.remove(0);
+            if o.token != 0 {
+                gone.push(o.token);
+            }
+        }
+        if !gone.is_empty() {
+            UNTRACK.lock().unwrap_or_else(|e| e.into_inner()).extend(gone);
+        }
+    }
+
+    /// Release the tokens of dropped landings.
+    pub(crate) fn release_untracked<M: crate::runtime::host::HostOps + ?Sized>(host: &mut M) {
+        let gone = std::mem::take(&mut *UNTRACK.lock().unwrap_or_else(|e| e.into_inner()));
+        for token in gone {
+            host.untrack_guest_writes(token);
+        }
+    }
+
+    /// TEMP (lab, PAY_ALIAS): a payment filled `gpas` with `span` bytes of the
+    /// frame `alias` names; `token` tracks guest stores into them from now, at
+    /// generation `gen`.
+    pub(crate) fn note_landed_tracked(gpas: Vec<u64>, span: u64, alias: u64, token: u64, gen: u64) {
+        if gpas.is_empty() {
+            return;
+        }
+        let mut landed = LANDED.lock().unwrap_or_else(|e| e.into_inner());
+        push_landed(&mut landed, Landed { gpas, span, alias, token, gen });
     }
 
     static LANDED: Mutex<Vec<Landed>> = Mutex::new(Vec::new());
@@ -1968,16 +2037,18 @@ pub(crate) mod t2t_alias {
             return;
         }
         let mut landed = LANDED.lock().unwrap_or_else(|e| e.into_inner());
-        landed.retain(|l| l.gpas.first() != gpas.first());
-        landed.push(Landed { gpas, span, alias });
-        if landed.len() > 8 {
-            landed.remove(0);
-        }
+        push_landed(&mut landed, Landed { gpas, span, alias, token: 0, gen: 0 });
     }
 
     /// A witness decision: confirm the generation it minted when the window is a
     /// landed one and only this device wrote it.
-    pub(crate) fn note_decided(verdict: GatherVerdict, generation: u64, gpas: &[u64], span: u64) {
+    pub(crate) fn note_decided<M: crate::runtime::host::HostOps + ?Sized>(
+        host: &M,
+        verdict: GatherVerdict,
+        generation: u64,
+        gpas: &[u64],
+        span: u64,
+    ) {
         if span >= (1 << 20) {
             let i = match verdict {
                 GatherVerdict::Rearmed => 0,
@@ -1990,15 +2061,16 @@ pub(crate) mod t2t_alias {
             BIG_VERDICTS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             BIG_VERDICT_KB[i].fetch_add(span / 1024, std::sync::atomic::Ordering::Relaxed);
         }
-        if !matches!(
+        let host_only = matches!(
             verdict,
             GatherVerdict::Refused {
                 guest_wrote: false,
                 host_wrote_pages: true
             }
-        ) || gpas.is_empty()
-            || !on()
-        {
+        );
+        // TEMP (lab, PAY_ALIAS): a re-pointed window over pages a payment landed.
+        let rearmed = matches!(verdict, GatherVerdict::Rearmed) && span >= 4096 && pay_alias_on();
+        if !(host_only || rearmed) || gpas.is_empty() || !on() {
             return;
         }
         let alias = {
@@ -2006,7 +2078,23 @@ pub(crate) mod t2t_alias {
             landed
                 .iter()
                 .find(|l| l.span == span && l.gpas.as_slice() == gpas)
-                .map(|l| l.alias)
+                .and_then(|l| {
+                    if host_only {
+                        return Some(l.alias);
+                    }
+                    // Re-pointed: no previous bind vouches for the pages, so the
+                    // landing's own token must say the guest has not stored since.
+                    if l.token == 0 {
+                        return None;
+                    }
+                    if host.guest_write_gen(l.token) == Some(l.gen) {
+                        crate::runtime::drain::note_store_route("pay_alias_rearm_quiet");
+                        Some(l.alias)
+                    } else {
+                        crate::runtime::drain::note_store_route("pay_alias_rearm_guest_wrote");
+                        None
+                    }
+                })
         };
         let Some(alias) = alias else {
             return;

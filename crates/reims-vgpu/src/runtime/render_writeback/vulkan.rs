@@ -25,6 +25,44 @@ use crate::runtime::host::{HostMemory, HostOps};
 /// `true` when the guest's pages hold the frame. `false` is a real loss and is
 /// reported on the failure channel by the arm that refused — the caller has no
 /// second copy to fall back to, because this rail never made one.
+/// TEMP (lab, PAY_ALIAS): a payment landed `identity`'s frame in `mapping_id`;
+/// name the pages for the gather witness when the frame is exactly the
+/// resident at `v0` (no draw moved it while the store ran) and lands byte for
+/// byte (`lab_t2t_alias_window`). See `gather_witness::t2t_alias::pay_alias_on`.
+pub(crate) fn lab_pay_alias_landed<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    v0: u64,
+    width: u32,
+    height: u32,
+) {
+    use crate::runtime::drain::note_store_route;
+    if crate::backend::vulkan::engine::resident_version_nowait(identity) != Some(v0) {
+        note_store_route("pay_alias_moved");
+        return;
+    }
+    let Some((gpas, span)) = crate::runtime::mapping_write::lab_t2t_alias_window(state, mapping_id, width, height) else {
+        note_store_route("pay_alias_shape");
+        return;
+    };
+    crate::runtime::gather_witness::lab_t2t_diag::note_defer(gpas.first().copied(), gpas.len(), mapping_id);
+    let token = host.track_guest_writes(&gpas, 1usize << state.page_shift).unwrap_or(0);
+    let gen = if token == 0 { None } else { host.guest_write_gen(token) };
+    let Some(gen) = gen else {
+        if token != 0 {
+            host.untrack_guest_writes(token);
+        }
+        note_store_route("pay_alias_untracked");
+        return;
+    };
+    let alias = crate::backend::vulkan::engine::t2t_alias_register(identity.clone(), v0);
+    crate::runtime::gather_witness::t2t_alias::note_landed_tracked(gpas, span, alias, token, gen);
+    crate::runtime::gather_witness::t2t_alias::release_untracked(host);
+    note_store_route("pay_alias_landed");
+}
+
 pub fn store_render_frame<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
