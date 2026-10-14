@@ -455,6 +455,40 @@ pub fn surface_write_refusal() -> Option<MapRefusal> {
         .then(|| report_once(MapRefusal::WritesNarrowed))
 }
 
+/// Narrowing check evaluated per mapping: if narrowing is set to [`ReleasedOnly`],
+/// only transient / released / condemned / unmapped IOSurface mappings take the copying rail,
+/// while active persistent surfaces (such as the iOS Simulator composite or window framebuffers)
+/// stay direct.
+pub fn surface_write_refusal_for_mapping(
+    state: &crate::model::DeviceState,
+    mapping_id: u32,
+) -> Option<MapRefusal> {
+    use crate::backend::vulkan::caps::host_pointer::SurfaceWritesNarrowing;
+    match crate::backend::vulkan::caps::host_pointer::surface_writes_narrowing_mode() {
+        SurfaceWritesNarrowing::None => None,
+        SurfaceWritesNarrowing::All => Some(report_once(MapRefusal::WritesNarrowed)),
+        SurfaceWritesNarrowing::ReleasedOnly => {
+            let Some(m) = state.mappings.get(&mapping_id) else {
+                return Some(report_once(MapRefusal::WritesNarrowed));
+            };
+            if m.ever_released || state.released_mappings.contains(&mapping_id) {
+                return Some(report_once(MapRefusal::WritesNarrowed));
+            }
+            if m.condemned_entries.is_some() || !m.mapped {
+                return Some(report_once(MapRefusal::WritesNarrowed));
+            }
+            if m.scanout_presented {
+                return None;
+            }
+            // Require content_generation >= 2 to prove persistence before allowing direct GPU write
+            if m.content_generation < 2 {
+                return Some(report_once(MapRefusal::WritesNarrowed));
+            }
+            None
+        }
+    }
+}
+
 /// The whole admission rule for a packed-alias import, in one place.
 ///
 /// The alias rails do something the RAMBlock map does not: they build a *new*

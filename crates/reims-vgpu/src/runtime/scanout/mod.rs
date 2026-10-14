@@ -166,7 +166,6 @@ pub fn capture_present_frame(
         .get(&mapping_id)
         .map(|m| m.surface_content_epoch)
         .unwrap_or(0);
-    state.advance_present_epoch();
     // --- Capture readback elision ---
     // When the previous present's window publish handed the window an engine
     // resident (`display_from_resident` — the macOS engine-swapchain handoff), the
@@ -222,6 +221,7 @@ pub fn capture_present_frame(
         state.present.frame_generation = generation;
         state.present.frame_content_epoch = content_epoch;
         state.present.frame_valid = true;
+        state.advance_present_epoch();
         // First host paint after a present blits +0x188 (mirror the full path).
         state.present.frame_encode_pending = true;
         state.present.light_captures = state.present.light_captures.wrapping_add(1);
@@ -346,6 +346,7 @@ pub fn capture_present_frame(
     state.present.frame_generation = generation;
     state.present.frame_content_epoch = content_epoch;
     state.present.frame_valid = true;
+    state.advance_present_epoch();
     // Force the next host paint to blit +0x188. Early pre-boundary paints may
     // have latched painted_mapping/generation (live mapper-ref-texture paint_mapping or
     // paint_efi_console) to the same mid+gen; with encode_pending=false that made

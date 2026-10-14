@@ -896,7 +896,12 @@ fn capture_fail_keeps_prior_frame() {
     // Mid2 never mapped — capture fails; prior retain intact.
     assert!(state.map_surface(2));
     assert!(state.set_mapping_geom(2, 2, 2, MTL_FORMAT_BGRA8_UNORM));
+    let retained_epoch = state.present.present_epoch;
     assert!(!capture_present_frame(&mut state, 2, 2, 2, 1));
+    assert_eq!(
+        state.present.present_epoch, retained_epoch,
+        "a failed capture cannot publish a fresh retained frame"
+    );
     assert_eq!(&state.present.frame_bgra[..], &content[..]);
     assert_eq!(state.present.frame_mapping, 1);
 }

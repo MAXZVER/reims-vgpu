@@ -33,10 +33,6 @@ type WindowFrameKey = (u32, u32, u32, u64);
 /// and fails only on the arm64 macOS pathway. It did.
 #[cfg(feature = "host-window")]
 pub(super) fn window_frame_key(present: &crate::model::PresentState) -> WindowFrameKey {
-    #[cfg(target_os = "macos")]
-    let present_epoch = present.present_epoch;
-    #[cfg(not(target_os = "macos"))]
-    let present_epoch = 0;
     (
         present.frame_mapping,
         present.frame_generation,
@@ -45,7 +41,7 @@ pub(super) fn window_frame_key(present: &crate::model::PresentState) -> WindowFr
         // still across frames that genuinely differ and this is the only term
         // that moves — see `PresentState::frame_content_epoch`.
         present.frame_content_epoch,
-        present_epoch,
+        present.present_epoch,
     )
 }
 
@@ -66,10 +62,10 @@ pub(crate) struct WindowLink {
     ///
     /// The resource generation alone is insufficient: the guest can update a
     /// resident in place and present it again without changing that identity.
-    /// On macOS, `present_epoch` advances once per accepted capture, so those
-    /// frames publish while drain passes with no new DisplaySwap remain
-    /// deduplicated. It remains zero on Linux, preserving the verified
-    /// `(mapping_id, generation)` publication contract there.
+    /// `present_epoch` advances once per successful capture on every host.
+    /// An in-place resident update is a new accepted frame even when its
+    /// mapping and page-generation stamps repeat. Polls without a capture
+    /// remain deduplicated.
     last: WindowFrameKey,
     /// Monotonic frame sequence stamped onto each published [`Frame`] so the
     /// window uploads only new frames (skips the per-vblank re-upload of

@@ -564,7 +564,7 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
     // used to walk the whole page list before finding that out.
     if let Some(refusal) = crate::runtime::guest_ram_map::standing_refusal(host)
         .or_else(crate::runtime::guest_ram_map::write_refusal)
-        .or_else(crate::runtime::guest_ram_map::surface_write_refusal)
+        .or_else(|| crate::runtime::guest_ram_map::surface_write_refusal_for_mapping(state, mapping_id))
     {
         return Err(GpuWritebackDecline::GuestRefRefused { refusal });
     }
@@ -1035,6 +1035,7 @@ mod tests {
         use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         const PAGE: u64 = 1 << PAGE_SHIFT_X86;
 
+        crate::runtime::guest_ram_map::reset();
         let mut state = DeviceState::new(DeviceId(9), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
         let base_pfn = 0x40u32;

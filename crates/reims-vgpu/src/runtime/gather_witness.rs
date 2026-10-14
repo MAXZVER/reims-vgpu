@@ -663,6 +663,10 @@ pub(crate) unsafe fn fold_runs(runs: &[crate::runtime::guest_ram::GuestRun], spa
     let mut a: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut b: u64 = 0xc2b2_ae3d_27d4_eb4f;
     let mut remaining = span;
+    let _audit_span = crate::runtime::resolve_profile::Span::open(
+        crate::runtime::resolve_profile::Part::ContentAudit,
+    )
+    .bytes(fold_read_bytes(span));
     let stride = fold_block_stride(span);
     // Offset of the current run's first byte within the window, so the sampled
     // blocks are the same window positions however the pages split into runs.
@@ -1137,6 +1141,10 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
 ) -> GatherOutcome {
     use crate::runtime::drain::{note_store_route, note_store_route_n};
 
+    let _span = crate::runtime::resolve_profile::Span::open(
+        crate::runtime::resolve_profile::Part::GatherWitness,
+    )
+    .bytes(window.span);
     let span = window.span;
     let (rail_count, rail_kb) = rail.names();
     note_store_route(rail_count);
@@ -1399,7 +1407,12 @@ fn observe<M: crate::runtime::host::HostOps>(
         let gen = if token == 0 {
             0
         } else {
-            host.guest_write_gen(token).unwrap_or(0)
+            {
+                let _query = crate::runtime::resolve_profile::Span::open(
+                    crate::runtime::resolve_profile::Part::DirtyGeneration,
+                );
+                host.guest_write_gen(token).unwrap_or(0)
+            }
         };
         witness.entries.insert(
             key,
@@ -1449,7 +1462,12 @@ fn observe<M: crate::runtime::host::HostOps>(
     let gen = if entry.token == 0 {
         0
     } else {
-        host.guest_write_gen(entry.token).unwrap_or(0)
+        {
+            let _query = crate::runtime::resolve_profile::Span::open(
+                crate::runtime::resolve_profile::Part::DirtyGeneration,
+            );
+            host.guest_write_gen(entry.token).unwrap_or(0)
+        }
     };
     // A generation of 0 on either side is "cannot tell": the token is unarmed,
     // was released with its pages, or has not survived the two harvests the

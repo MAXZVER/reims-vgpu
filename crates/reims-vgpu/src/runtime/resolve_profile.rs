@@ -22,9 +22,18 @@ pub(crate) enum Part {
     CurrencyObservation,
     WrittenPages,
     PageOffsets,
+    ViewMapping,
+    ViewWriteback,
+    ViewRuns,
+    GatherWitness,
+    DirtyGeneration,
+    ContentAudit,
+    ViewCpu,
 }
-const PARTS: usize = Part::PageOffsets as usize + 1;
+const PARTS: usize = Part::ViewCpu as usize + 1;
 static NS: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
+static MAX_NS: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
+static SPAN_BYTES: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
 static CALLS: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
 static READS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
@@ -51,19 +60,28 @@ impl Drop for Scope {
 pub(crate) struct Span {
     part: Part,
     started: Option<Instant>,
+    bytes: u64,
 }
 impl Span {
     pub(crate) fn open(part: Part) -> Self {
         Self {
             part,
             started: active().then(Instant::now),
+            bytes: 0,
         }
+    }
+    pub(crate) fn bytes(mut self, bytes: u64) -> Self {
+        self.bytes = bytes;
+        self
     }
 }
 impl Drop for Span {
     fn drop(&mut self) {
         if let Some(started) = self.started {
-            NS[self.part as usize].fetch_add(charge_ns(started.elapsed()), Ordering::Relaxed);
+            let ns = charge_ns(started.elapsed());
+            NS[self.part as usize].fetch_add(ns, Ordering::Relaxed);
+            MAX_NS[self.part as usize].fetch_max(ns, Ordering::Relaxed);
+            SPAN_BYTES[self.part as usize].fetch_add(self.bytes, Ordering::Relaxed);
             CALLS[self.part as usize].fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -97,13 +115,25 @@ pub(crate) fn emit() {
         "currency_observation",
         "written_pages",
         "page_offsets",
+        "view_mapping",
+        "view_writeback",
+        "view_runs",
+        "gather_witness",
+        "dirty_generation",
+        "content_audit",
+        "view_cpu",
     ];
     let mut line = String::from("sampled_subphase");
     use std::fmt::Write as _;
     for (i, name) in NAMES.iter().enumerate() {
         let n = CALLS[i].swap(0, Ordering::Relaxed);
         let us = to_us(NS[i].swap(0, Ordering::Relaxed));
-        let _ = write!(line, " {name}_n={n} {name}_us={us}");
+        let max_us = to_us(MAX_NS[i].swap(0, Ordering::Relaxed));
+        let bytes = SPAN_BYTES[i].swap(0, Ordering::Relaxed);
+        let _ = write!(
+            line,
+            " {name}_n={n} {name}_us={us} {name}_max_us={max_us} {name}_bytes={bytes}"
+        );
     }
     for (name, counter) in [
         ("gva_reads", &READS),

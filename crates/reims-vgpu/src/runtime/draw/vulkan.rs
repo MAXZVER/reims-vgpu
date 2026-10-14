@@ -2684,6 +2684,8 @@ pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
     mapping_id: u32,
     view: objects::RefTextureView,
 ) -> Option<LoadedRefTextureView> {
+    let _cpu_span =
+        crate::runtime::resolve_profile::Span::open(crate::runtime::resolve_profile::Part::ViewCpu);
     let fail = |d: RefTextureViewDecline| -> Option<LoadedRefTextureView> {
         crate::observe::Emit::decline("ref_texture_draw_view", &d)
             .field("task", task_id)
@@ -5314,6 +5316,9 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
     if w == 0 || h == 0 || view.depth != 1 {
         return None;
     }
+    let mapping_span = crate::runtime::resolve_profile::Span::open(
+        crate::runtime::resolve_profile::Part::ViewMapping,
+    );
     // Match the CPU path's resolution before reading the plane pages.
     if !mapper::ensure_resolved_for_scanout(state, host, mid) {
         return None;
@@ -5347,13 +5352,24 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
         (native, sampled_vk_format, bpp, base_off, bpr_u32 as u64)
     };
     let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, bpr)?;
+    drop(mapping_span);
     // Same rule as the linear rail's floor: a cost threshold may only turn a
     // plane away onto a CPU arm that produces the same pixels. The mapper-ref-texture rail
     // needs no such qualifier because `is_four_byte_color` already fixes what
     // reaches its floor; this one admits every layout the translation names.
     // The owed frame, for the reason `try_mapper_ref_texture_sample_zero_copy` states: a
     // debt is not a submitted writeback and queue order cannot order it.
-    crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
+    {
+        let _span = crate::runtime::resolve_profile::Span::open(
+            crate::runtime::resolve_profile::Part::ViewWriteback,
+        )
+        .bytes(span);
+        crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
+    }
+    let runs_span = crate::runtime::resolve_profile::Span::open(
+        crate::runtime::resolve_profile::Part::ViewRuns,
+    )
+    .bytes(span);
     if let Some(source) = mapped_sampled_source(
         state,
         host,
@@ -5386,6 +5402,7 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
         return None;
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
+    drop(runs_span);
     let page = state.page_size() as usize;
     let seen = crate::runtime::gather_witness::note_gather(
         state,

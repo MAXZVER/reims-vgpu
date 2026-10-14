@@ -101,7 +101,7 @@ use crate::runtime::host::HostAction;
 /// before the loop looked, which is latest-wins working rather than a frame
 /// lost.
 const WINDOW_REDRAW_BACKSTOP: std::time::Duration =
-    std::time::Duration::from_millis(GUEST_RESIZE_WARN_AFTER.as_millis() as u64 / 10);
+    std::time::Duration::from_millis(8);
 /// How many rebuilds of the presenter may go unproven before the window stops
 /// trying — asked of the running rail, which is what gets lost.
 ///
@@ -824,6 +824,10 @@ struct LoopCensus {
     draws_held: u64,
     /// Draws that reached the presenter with a new frame.
     draws_fresh: u64,
+    last_fresh: Option<std::time::Instant>,
+    intervals_us: [u64; 256],
+    intervals_len: usize,
+    intervals_dropped: u64,
 }
 
 impl LoopCensus {
@@ -836,7 +840,29 @@ impl LoopCensus {
             draws_stale: 0,
             draws_held: 0,
             draws_fresh: 0,
+            last_fresh: None,
+            intervals_us: [0; 256],
+            intervals_len: 0,
+            intervals_dropped: 0,
         }
+    }
+
+    // Successful presents with a changed content sequence only. Forced redraws,
+    // busy outcomes, and failed presents never contribute a fresh interval.
+    fn presented_fresh(&mut self, now: std::time::Instant) {
+        if let Some(previous) = self.last_fresh {
+            let us = now
+                .duration_since(previous)
+                .as_micros()
+                .min(u64::MAX as u128) as u64;
+            if self.intervals_len < self.intervals_us.len() {
+                self.intervals_us[self.intervals_len] = us;
+                self.intervals_len += 1;
+            } else {
+                self.intervals_dropped += 1;
+            }
+        }
+        self.last_fresh = Some(now);
     }
 
     /// Emit and reset once a second, counting this tick first.
@@ -863,7 +889,21 @@ impl LoopCensus {
             self.draws_stale,
             self.draws_held,
         ));
+        let intervals = self.intervals_us[..self.intervals_len]
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        crate::observe::off(format!(
+            "host_fresh_intervals win_ms={} n={} dropped={} intervals_us={}",
+            elapsed.as_millis(),
+            self.intervals_len,
+            self.intervals_dropped,
+            intervals,
+        ));
+        let last_fresh = self.last_fresh;
         *self = Self::new();
+        self.last_fresh = last_fresh;
     }
 }
 
@@ -1423,6 +1463,9 @@ impl App {
                 // lifetime cap and a rail that recovers eight times is left dark
                 // after the third. See [`presenter_rebuild_budget`].
                 self.presenter_rebuilds = 0;
+                if incoming_seq.is_some() && incoming_seq != self.last_presented_seq {
+                    self.loop_census.presented_fresh(std::time::Instant::now());
+                }
                 self.last_presented_seq = incoming_seq;
                 // A suboptimal present armed a swapchain recreation; redraw
                 // promptly so the corrected drawable replaces this one even if
@@ -1542,6 +1585,32 @@ impl App {
 #[cfg(test)]
 mod loop_census_tests {
     use super::*;
+
+    #[test]
+    fn fresh_intervals_preserve_long_gaps_across_report_windows() {
+        let mut census = LoopCensus::new();
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        census.presented_fresh(start);
+        census.presented_fresh(start + std::time::Duration::from_millis(12));
+        assert_eq!(census.intervals_us[0], 12_000);
+        census.window_started = start;
+        census.tick();
+        assert_eq!(census.intervals_len, 0);
+        census.presented_fresh(start + std::time::Duration::from_secs(2));
+        assert_eq!(census.intervals_us[0], 1_988_000);
+    }
+
+    #[test]
+    fn fresh_interval_overflow_is_bounded_and_reported() {
+        let mut census = LoopCensus::new();
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        for i in 0..258 {
+            census.presented_fresh(start + std::time::Duration::from_micros(i));
+        }
+        assert_eq!(census.intervals_len, 256);
+        assert_eq!(census.intervals_dropped, 1);
+        assert!(census.intervals_us.iter().all(|us| *us == 1));
+    }
 
     /// A loop that has run for less than its window emits nothing and keeps
     /// counting. Emitting on every tick would be one line per wake, and a wake

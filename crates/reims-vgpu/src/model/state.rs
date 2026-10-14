@@ -2073,6 +2073,8 @@ pub struct MappingEntry {
     /// (bump + drop condemned windows). Cleared by every explicit lifecycle
     /// event (fresh MAP, unmap, MappingInternal reattach, ReplacePhysical).
     pub condemned_entries: Option<Vec<u32>>,
+    /// Whether this mapping has ever had its backing condemned, unmapped, or deleted.
+    pub ever_released: bool,
     /// Guest KVA of MappingInternal (from capture or recover).
     pub mapping_internal: u64,
     pub page_table_kva: u64,
@@ -2605,12 +2607,11 @@ pub struct PresentState {
     /// Monotonic source for [`Self::dense_frame_seq`] (one bump per full-frame
     /// Store). Never reset except on device reset.
     pub dense_frame_counter: u64,
-    /// Monotonic present counter, advanced exactly once per present cycle at the
-    /// present boundary ([`DeviceState::advance_present_epoch`]). Its only
-    /// consumer is the macOS window-publish dedup key, which includes it so that
-    /// every present republishes the frame even when the mapping id and resource
-    /// generation repeat (an in-place update of the same resident). Never reset
-    /// except on device reset.
+    /// Monotonic accepted-capture counter. Advanced exactly once after a
+    /// successful present capture commits its retain. Failed captures keep
+    /// the prior retain and its epoch. Every host window includes this in its
+    /// publication key, so an in-place resident update remains publishable.
+    /// Never reset except on device reset.
     pub present_epoch: u64,
     /// Latest presentFrame retain (PGDisplay +0x188) — most recent DisplaySwap.
     /// Tight packed BGRA8, stride = `frame_width * 4`.
@@ -3268,6 +3269,8 @@ pub struct DeviceState {
     /// Cleared with the task, alongside every other per-window fact.
     aliased_references: Mutex<BTreeSet<(u32, u32)>>,
     pub mappings: BTreeMap<u32, MappingEntry>,
+    /// Mapping IDs that have been explicitly released or condemned by the guest.
+    pub released_mappings: BTreeSet<u32>,
     /// Host render-cache keyed by surface_id / mapping_id (Linux/Vulkan rail).
     /// See [`crate::runtime::surface_cache`] and kb tahoe-x86-host-reims_vgpu §8.5.
     /// **Surface_id namespace only** — never texture_ref (object list ids collide).
@@ -3681,6 +3684,7 @@ impl DeviceState {
             aliased_references: Mutex::new(BTreeSet::new()),
             task_storage_epochs: BTreeMap::new(),
             mappings: BTreeMap::new(),
+            released_mappings: BTreeSet::new(),
             host_surfaces: BTreeMap::new(),
             host_texture_surfaces: BTreeMap::new(),
             host_gva_surfaces: BTreeMap::new(),
@@ -3906,7 +3910,7 @@ impl DeviceState {
     }
 
     /// Advance the per-present epoch counter and return the new value. Call
-    /// EXACTLY ONCE per present cycle (see [`PresentState::present_epoch`]).
+    /// EXACTLY ONCE per successful capture (see [`PresentState::present_epoch`]).
     pub fn advance_present_epoch(&mut self) -> u64 {
         self.present.present_epoch = self.present.present_epoch.saturating_add(1);
         self.present.present_epoch
@@ -4284,7 +4288,26 @@ impl DeviceState {
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         self.host_texture_surfaces.retain(|&(t, _), _| t != task_id);
-        // Clear texture→mapping latches for this task.
+        // Clear texture→mapping latches for this task, marking mappings and their pages released.
+        let task_mids: Vec<u32> = self
+            .texture_to_mapping
+            .iter()
+            .filter_map(|(&(t, _), &mid)| if t == task_id { Some(mid) } else { None })
+            .collect();
+        let page_shift = self.page_shift;
+        for mid in task_mids {
+            self.released_mappings.insert(mid);
+            let pfns = if let Some(m) = self.mappings.get_mut(&mid) {
+                m.ever_released = true;
+                m.page_entries.clone()
+            } else {
+                Vec::new()
+            };
+            for pfn in pfns {
+                let gpa = (pfn as u64) << page_shift;
+                self.host_writes.release_page(gpa);
+            }
+        }
         self.texture_to_mapping.retain(|&(t, _), _| t != task_id);
         self.bump_task_storage_incarnations(task_id);
         // GVA encode cache retained until Unmap of that range.
@@ -5567,11 +5590,13 @@ impl DeviceState {
     /// plan) or bumps + drops (different plan). Returns whether a fingerprint
     /// was stashed; on `false` the caller should fall back to full teardown.
     pub fn condemn_surface_backing(&mut self, mapping_id: u32) -> bool {
+        self.released_mappings.insert(mapping_id);
         self.forget_compositor_mapping(mapping_id);
         self.host_surfaces.remove(&mapping_id);
         let Some(e) = self.mappings.get_mut(&mapping_id) else {
             return false;
         };
+        e.ever_released = true;
         if e.page_entries.is_empty() {
             return false;
         }
@@ -5607,6 +5632,12 @@ impl DeviceState {
             return false;
         }
         let e = self.mappings.entry(mapping_id).or_default();
+        if !e.page_entries.is_empty()
+            || e.condemned_entries.is_some()
+            || self.released_mappings.contains(&mapping_id)
+        {
+            e.ever_released = true;
+        }
         e.mapped = true;
         // Fresh MAP invalidates any previous page table / geom for this slot.
         // Stale has_geom after 1920→1440 remap blocks writebacks (size mismatch)
@@ -5655,6 +5686,7 @@ impl DeviceState {
     }
 
     pub fn unmap_surface(&mut self, mapping_id: u32) -> bool {
+        self.released_mappings.insert(mapping_id);
         self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
         if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::UnmapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
@@ -5662,6 +5694,7 @@ impl DeviceState {
         }
         self.forget_compositor_mapping(mapping_id);
         if let Some(e) = self.mappings.get_mut(&mapping_id) {
+            e.ever_released = true;
             e.mapped = false;
             // The surface is gone; a recycled id has presented nothing yet.
             e.scanout_presented = false;

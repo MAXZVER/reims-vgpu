@@ -262,25 +262,65 @@ pub fn guest_writes_allowed() -> bool {
     )
 }
 
+/// Narrowing policy for GPU writes into IOSurface mappings ([`crate::config::GUEST_IMPORT_SURFACE_WRITES`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceWritesNarrowing {
+    /// No narrowing: allow GPU direct writes for all surfaces.
+    None,
+    /// Narrow only the IOSurface mappings that get released (transient/scratch surfaces,
+    /// condemned/unmapped backings, or recycled mappings). Active persistent surfaces
+    /// (such as window framebuffers and the iOS Simulator screen) stay GPU-direct.
+    ReleasedOnly,
+    /// Force narrowing for all IOSurface mappings unconditionally.
+    All,
+}
+
+/// The active narrowing policy for IOSurface mapping writes.
+pub fn surface_writes_narrowing_mode() -> SurfaceWritesNarrowing {
+    static MODE: std::sync::OnceLock<SurfaceWritesNarrowing> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if !guest_writes_allowed() {
+            return SurfaceWritesNarrowing::All;
+        }
+        let (sw, raw) = crate::config::read(crate::config::GUEST_IMPORT_SURFACE_WRITES);
+        let raw_str = raw.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+        let mode = match sw {
+            crate::config::Switch::On => SurfaceWritesNarrowing::None,
+            crate::config::Switch::Off => {
+                // When off/0/false, narrow only released/transient surfaces to avoid the #70/#100 panic
+                // while keeping persistent framebuffers and iOS Simulator screen fast.
+                SurfaceWritesNarrowing::ReleasedOnly
+            }
+            crate::config::Switch::Unset => SurfaceWritesNarrowing::None,
+            crate::config::Switch::Unrecognized => {
+                if raw_str == "all" || raw_str == "all_off" || raw_str == "force" {
+                    SurfaceWritesNarrowing::All
+                } else if raw_str == "released" || raw_str == "transient" || raw_str == "narrow_released" {
+                    SurfaceWritesNarrowing::ReleasedOnly
+                } else {
+                    crate::observe::fail(format!(
+                        "vk_guest_import_surface_writes_env_unrecognized var={} value={:?} (expected off, released, all, or on)",
+                        crate::config::GUEST_IMPORT_SURFACE_WRITES,
+                        raw
+                    ));
+                    SurfaceWritesNarrowing::ReleasedOnly
+                }
+            }
+        };
+        crate::observe::off(format!(
+            "vk_guest_import_surface_writes mode={:?} var={}",
+            mode,
+            crate::config::GUEST_IMPORT_SURFACE_WRITES
+        ));
+        mode
+    })
+}
+
 /// Whether the GPU may write an IOSurface mapping directly, as
 /// [`crate::config::GUEST_IMPORT_SURFACE_WRITES`] narrows it; implies
 /// [`guest_writes_allowed`]. Latched for the same reason.
 pub fn guest_surface_writes_allowed() -> bool {
-    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    guest_writes_allowed()
-        && *ALLOWED.get_or_init(|| {
-            let narrowed = matches!(
-                crate::config::read(crate::config::GUEST_IMPORT_SURFACE_WRITES).0,
-                crate::config::Switch::Off
-            );
-            if narrowed {
-                crate::observe::off(format!(
-                    "vk_guest_import_surface_writes narrowed=1 var={} (Stores into IOSurface                      mappings take the copying rail; other GPU writes stay direct)",
-                    crate::config::GUEST_IMPORT_SURFACE_WRITES
-                ));
-            }
-            !narrowed
-        })
+    surface_writes_narrowing_mode() == SurfaceWritesNarrowing::None
 }
 
 /// What [`crate::config::GUEST_IMPORT`] says about running this rail at all.

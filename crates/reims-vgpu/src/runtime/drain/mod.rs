@@ -5660,6 +5660,19 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // resolve proves which incarnation this delete was for
         // (fingerprint compare in mapper::resolve). A second delete
         // with no resolve between is genuinely dead: tear down fully.
+        state.released_mappings.insert(object_id);
+        if let Some(m) = state.mappings.get_mut(&object_id) {
+            m.ever_released = true;
+        }
+        if let Some(m) = state.mappings.get(&object_id) {
+            let page_shift = state.page_shift;
+            let entries = m.condemned_entries.as_ref().unwrap_or(&m.page_entries);
+            for &entry in entries {
+                if let Some(gpa) = crate::protocol::iosurface_pages::entry_gpa_shift(entry, page_shift) {
+                    state.host_writes.release_page(gpa);
+                }
+            }
+        }
         let mode = if state.mapping_backing_condemned(object_id) {
             let _ = state.unmap_surface(object_id);
             "dead"

@@ -81,7 +81,7 @@ fn drain_without_ops_is_ok() {
     assert!(device_destroy(id));
 }
 
-#[cfg(all(feature = "host-window", target_os = "macos"))]
+#[cfg(feature = "host-window")]
 #[test]
 fn window_publish_key_advances_for_in_place_present() {
     use super::window_publish::window_frame_key;
@@ -96,14 +96,19 @@ fn window_publish_key_advances_for_in_place_present() {
         first,
         "a repeated resource generation still represents a new DisplaySwap"
     );
+    let accepted = window_frame_key(&state.present);
+    assert_eq!(
+        window_frame_key(&state.present),
+        accepted,
+        "polling without another accepted capture stays deduplicated"
+    );
 }
 
 /// A lazy mapper-ref-texture Store publishes new pixels without writing a guest page, so
 /// the mapping's `content_generation` holds still across frames that genuinely
 /// differ — and the host window's publish key must move anyway.
 ///
-/// Ungated, unlike its `present_epoch` sibling above: that term is macOS-only
-/// and this one is not, and the arm that measured the defect is x86/Vulkan.
+/// Both content and accepted-capture epochs are shared across hosts.
 /// Without `frame_content_epoch` in the key, a driven macos-13 boot with
 /// `REIMS_VGPU_LAZY_WRITEBACK=on` published 60 fresh frames a second against 314
 /// `same_key`, where the eager arm published 81 against 131 — real frames
