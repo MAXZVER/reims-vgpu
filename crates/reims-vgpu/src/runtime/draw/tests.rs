@@ -2869,6 +2869,18 @@ fn each_bind_slot_bound_equals_its_own_basis() {
     assert_eq!(host_alloc_len(0), Some(0));
 }
 
+/// A guest length above any guest object is refused, not allocated: the two
+/// lengths that aborted QEMU (`handle_alloc_error`) under Maps.
+#[test]
+fn host_alloc_len_refuses_lengths_above_any_guest_object() {
+    assert_eq!(host_alloc_len(0x0000_4000_0000_c104), None);
+    assert_eq!(host_alloc_len(0x000e_dfff_ffce_aaac), None);
+    assert_eq!(host_alloc_len(u64::MAX), None);
+    let max = super::GUEST_OBJECT_MAX_BYTES;
+    assert_eq!(host_alloc_len(max), usize::try_from(max).ok());
+    assert_eq!(host_alloc_len(max + 1), None);
+}
+
 /// Each class's bound reaches every consumer through one accessor.
 ///
 /// The value is not the assertion — [`each_bind_slot_bound_equals_its_own_basis`]

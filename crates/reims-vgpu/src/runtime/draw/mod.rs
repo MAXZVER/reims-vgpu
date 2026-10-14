@@ -323,15 +323,51 @@ pub fn first_bind_past_table(req: &DrawEncodeRequest) -> Option<PastTableBind> {
     None
 }
 
+/// The largest byte length any guest object can have: no buffer, descriptor or
+/// command stream outgrows the guest's RAM, and the largest guest these hosts
+/// run has 40 GB. A physical bound, not a product budget.
+///
+/// TEMP (lab, 2026-10-14): before it the bound was `isize::MAX`, and two QEMU
+/// aborts under Maps (2026-10-12, 2026-10-14 b413) were Rust's
+/// `handle_alloc_error` on a guest length read from a record the guest was
+/// rewriting: "memory allocation of 70368744227076 bytes failed"
+/// (0x0000_4000_0000_c104 - a plausible 49 KB length under garbage high bits)
+/// and 0xedfffffceaaac. The process died for one stale record.
+pub const GUEST_OBJECT_MAX_BYTES: u64 = 64 << 30;
+
 /// Convert a guest-declared byte length to a host allocation size.
 ///
-/// Only fails when the length does not fit `usize` (process addressability) —
-/// **not** an arbitrary product MiB budget.
+/// Fails when the length does not fit `usize` (process addressability) or
+/// exceeds [`GUEST_OBJECT_MAX_BYTES`] - **not** an arbitrary product MiB budget.
+/// Every caller already fails closed on `None` (skips the object with its own
+/// line); a refusal also logs the caller's site and the length, so a torn or
+/// stale guest record names where it was read.
 #[inline]
+#[track_caller]
 pub fn host_alloc_len(bytes: u64) -> Option<usize> {
+    if bytes > GUEST_OBJECT_MAX_BYTES {
+        note_host_alloc_refused(bytes, std::panic::Location::caller());
+        return None;
+    }
     usize::try_from(bytes)
         .ok()
         .filter(|&n| n <= isize::MAX as usize)
+}
+
+#[cold]
+fn note_host_alloc_refused(bytes: u64, at: &'static std::panic::Location<'static>) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Relaxed) + 1;
+    // Every one of the first 32, then each power of two: a flood stays readable.
+    if n <= 32 || n.is_power_of_two() {
+        crate::observe::fail(format!(
+            "host_alloc_refused n={n} bytes={bytes:#x} max={GUEST_OBJECT_MAX_BYTES:#x} at={}:{} \
+             (a guest length above any guest object - a torn or stale record; skipped, not allocated)",
+            at.file(),
+            at.line()
+        ));
+    }
 }
 
 /// The vertex fetch stride in force for one buffer index.
