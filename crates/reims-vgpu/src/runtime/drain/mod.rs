@@ -4397,12 +4397,18 @@ fn run_parked_packet_g<H: HostMemory + HostOps>(
 ///
 /// The other half of [`ready_lease`], and the half the table had no step for
 /// until `77f5bd88`. `Ready` used to mean "was translated once", which is not
-/// the question a transaction about to bind it is asking: the guest rewrites
-/// the shader behind a live pipeline ref **in place**, so no delete arrives, no
-/// generation is minted, the [`reims_vgpu_core::identity::ResourceId`] is
-/// unchanged — and the rail's translate cache, being keyed by the shader's
-/// content, stops holding one. Four refs a driven macos-15 desktop, named by
-/// `m2v_pipe_content_changed`.
+/// the question a transaction about to bind it is asking: were the guest to
+/// rewrite the shader behind a live pipeline ref **in place**, no delete would
+/// arrive, no generation would be minted, the
+/// [`reims_vgpu_core::identity::ResourceId`] would be unchanged — and the
+/// rail's translate cache, being keyed by the shader's content, would stop
+/// holding one.
+///
+/// That case is a hazard this step closes, not a population anyone has
+/// measured. The census this doc once cited for it, `m2v_pipe_content_changed`,
+/// keyed its record by pipeline reference without the task, and references are
+/// per task: what it counted was two tasks naming one number, not one pipeline
+/// changing. It is keyed by task now and reports on the off channel.
 ///
 /// Silent when the lease was already waiting, which is the common case by three
 /// orders of magnitude: this runs for every pending ref of every pre-scan, and

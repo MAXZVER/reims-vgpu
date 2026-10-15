@@ -118,10 +118,12 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
         let translated = crate::runtime::m2v_cache::ensure_cached_async(
             v_air,
             metal2vulkan::passes::Stage::Vertex,
+            task_id,
             pipeline_ref,
         ) & crate::runtime::m2v_cache::ensure_cached_async(
             f_air,
             metal2vulkan::passes::Stage::Fragment,
+            task_id,
             pipeline_ref,
         );
         note_preflight_part(
@@ -257,8 +259,12 @@ pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
             continue;
         };
         let cache_started = std::time::Instant::now();
-        let cached =
-            crate::runtime::m2v_cache::ensure_cached_kernel_async(air, local_size, pipeline_ref);
+        let cached = crate::runtime::m2v_cache::ensure_cached_kernel_async(
+            air,
+            local_size,
+            task_id,
+            pipeline_ref,
+        );
         note_preflight_part(
             PreflightPart::Cache,
             cache_started.elapsed().as_nanos() as u64,
