@@ -515,11 +515,12 @@ struct Cache {
     ///
     /// What is left after that is one task naming different AIR under a ref it
     /// used before: a delete followed by a reuse of the number, which is
-    /// legitimate guest behaviour. The only caller asks after
+    /// legitimate guest behaviour. The render pre-scan asks only after
     /// `pipeline_resolve::translations_ready` answered "not retained", so the
     /// retained pipeline registry holds nothing for that ref when this fires
-    /// and no stale shader is served. The line is a census on the off
-    /// channel, not a failure, and nothing reads this map to decide anything.
+    /// and no stale shader is served; the compute pre-scan has no retained
+    /// state to consult at all. The line is a census on the off channel, not a
+    /// failure, and nothing reads this map to decide anything.
     ///
     /// The value is the digest of the AIR alone: a kernel's cache digest also
     /// carries its dispatch geometry, and one kernel dispatched at two
@@ -1689,11 +1690,12 @@ fn ensure_cached_async_keyed(
         id.air.len()
     ));
     // Once per `(task, ref, stage)` rather than once per event. OFF, not a
-    // failure: the only caller asks after the retained pipeline registry
-    // answered "not retained" for this `(task, ref)`, so the guest naming
-    // different AIR under a number it used before (a delete, then a reuse) has
-    // nothing stale to be served and loses no work. The magnitude still shows
-    // as `seen:m2v_pipe_content_changed` in `refusal_census`.
+    // failure: the render pre-scan asks only after the retained pipeline
+    // registry answered "not retained" for this `(task, ref)` (the compute one
+    // has no registry), so the guest naming different AIR under a number it
+    // used before (a delete, then a reuse) has nothing stale to be served and
+    // loses no work. The magnitude still shows as
+    // `seen:m2v_pipe_content_changed` in `refusal_census`.
     if let Some((previous, now)) = changed {
         if crate::observe::first_sight(
             "m2v_pipe_content_changed",
