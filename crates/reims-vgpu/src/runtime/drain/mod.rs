@@ -8833,6 +8833,24 @@ fn process_child_packet<H: HostMemory + HostOps>(
                             ) {
                                 note_store_route(refusal.no_bytes_kind_route());
                             }
+                            // The guest's list holds nothing at this reference
+                            // any more, so the object it re-pointed is gone and
+                            // the model's name for the slot has outlived it. The
+                            // packet itself was admitted as a re-point with no
+                            // storage to move; this is the one thing it owes the
+                            // model. Only for a slot that reads as cleared — an
+                            // unreadable list is not a deleted object.
+                            if matches!(
+                                refusal,
+                                crate::runtime::objects::RepointStorageRefusal::NoListEntry
+                            ) {
+                                let _ = crate::runtime::objects::retire_name_of_cleared_slot(
+                                    state,
+                                    host,
+                                    cmd.task_id,
+                                    cmd.object_id,
+                                );
+                            }
                             if refusal.leaves_authority_stale()
                                 && crate::observe::first_sight(
                                     "replace_physical_storage_undescribable",

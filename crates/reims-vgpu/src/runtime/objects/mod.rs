@@ -4870,6 +4870,71 @@ impl RepointStorageRefusal {
     pub const fn leaves_authority_stale(self) -> bool {
         matches!(self, Self::Refused(_))
     }
+
+    /// Whether the re-pointed reference has no storage this device could have
+    /// moved, so the announcement changes nothing the semantic model holds.
+    ///
+    /// The four arms whose own documentation calls the announcement a no-op:
+    /// a reference that resolves to no name, a name whose slot the guest's list
+    /// no longer holds, a heap placement (the heap's event, not the
+    /// reference's), and an object that owns no bytes. A packet carrying one of
+    /// these is well-formed guest work with nothing to apply, and its ordering
+    /// position and completion word are owed in full. See
+    /// `reims_vgpu_core::lifecycle::LifecycleOp::ReplacePhysicalNoStorage`.
+    ///
+    /// **Not the complement of [`Self::leaves_authority_stale`].**
+    /// [`Self::DescriptorUnread`] is in neither: the entry exists and so does
+    /// its storage, and what failed was this device reading the descriptor out
+    /// of guest memory, so whether authority went stale is unknown rather than
+    /// answered. An unknown is a refusal, not a no-op.
+    #[must_use]
+    pub const fn moves_no_storage(self) -> bool {
+        matches!(
+            self,
+            Self::Unnamed | Self::NoListEntry | Self::Placed | Self::NoBytes { .. }
+        )
+    }
+}
+
+/// Retire the model's name for a re-pointed reference whose slot the guest has
+/// cleared, and say whether there was one to retire.
+///
+/// A re-point of a reference the guest's list no longer holds
+/// ([`RepointStorageRefusal::NoListEntry`]) is the guest announcing a change to
+/// an object it has already deleted, and this model can still hold a name for
+/// that slot because the delete's own packet is the only other thing that
+/// retires one. Left standing, the stale name resolves the next occupant of the
+/// slot to the dead object's resource. [`DeviceState::retire_object_name`] stops
+/// it resolving and leaves accepted work alone.
+///
+/// **Only for a slot that read and is empty** ([`ListMiss::SlotEmpty`]).
+/// `NoListEntry` is also what an unreadable list, a reset task or a ref past
+/// the declared count look like from the caller, and none of those says the
+/// object is gone — retiring a live object's name because this device could not
+/// read the list would cost it its resource. The lookup is asked again here,
+/// quietly, so the decision rests on the miss itself and not on the summary
+/// the caller kept.
+pub fn retire_name_of_cleared_slot<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+) -> bool {
+    if !matches!(
+        list_entry_or_miss(state, host, task_id, obj_ref, ListLookup::Probe),
+        Err(ListMiss::SlotEmpty)
+    ) {
+        return false;
+    }
+    let Some(name) = state.object_name(task_id, obj_ref) else {
+        return false;
+    };
+    let teardown = state.retire_object_name(task_id, name);
+    crate::runtime::drain::note_store_route(match teardown {
+        Some(_) => "replace_physical_cleared_slot_name_retired",
+        None => "replace_physical_cleared_slot_name_not_retired",
+    });
+    teardown.is_some()
 }
 
 /// `REIMS_VGPU_REPOINT_PAY` (opt-in for now): a frame this device owes a mapping
