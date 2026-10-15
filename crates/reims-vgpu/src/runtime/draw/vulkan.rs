@@ -357,8 +357,8 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut gva_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         record_plane_draw(req);
-        lab_tile_draw(req);
         lab_resolve_memo_record(req);
+        lab_tile_draw_with(state, req);
         lab_draw_sig(req);
         req.chain_resident_established = false;
         let engine = try_metal2vulkan_draw(state, host, req, writeback_guest);
@@ -3593,6 +3593,295 @@ static SAMPLED_REF_BACKING_LAST: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
 
 /// Report what a texture ref resolves to, on every change of backing or extent.
+/// TEMP (lab, `REIMS_VGPU_LAB_STALE_WATCH=1`): what a LOAD seeded from a mapping's
+/// guest pages actually finds there - per page, whether its first 256 bytes hold
+/// anything. A surface the guest just allocated reads all zero; one whose pages the
+/// guest moved under a live surface carries content - and that content is whatever
+/// the pages held, which is stale if this device never wrote the GPU's frames back.
+fn lab_guest_seed_content<M: HostMemory + HostOps>(
+    state: &crate::model::DeviceState,
+    host: &M,
+    task_id: u32,
+    mapping_id: u32,
+    w: u32,
+    h: u32,
+) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_STALE_WATCH").as_deref() == Ok("1")) {
+        return;
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return;
+    };
+    let mut pages = 0u32;
+    let mut nonzero = 0u32;
+    let mut buf = [0u8; 256];
+    for &e in m.page_entries.iter() {
+        let Some(gpa) = crate::protocol::iosurface_pages::entry_gpa_shift(e, state.page_shift)
+        else {
+            continue;
+        };
+        pages += 1;
+        if host.read_gpa(gpa, &mut buf).is_ok() && buf.iter().any(|b| *b != 0) {
+            nonzero += 1;
+        }
+    }
+    crate::observe::off(format!(
+        "lab_guest_seed_content task={task_id} mid={mapping_id} {w}x{h} mapgen={} nonzero_pages={nonzero}/{pages} t={}",
+        m.map_generation,
+        crate::observe::elapsed_us() / 1000
+    ));
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_STALE_WATCH=1`): does the window server composite an
+/// app's surface *after* the app's last draw into it? Per mapping, the last time a
+/// non-window-server task drew into it and the last time the window server (task 1)
+/// sampled it; once a second, every mapping drawn more than 300 ms ago and not sampled
+/// by the window server since is named (`lab_stale_composite`, once per draw time).
+/// Stale tiles after an Electron resize are either drawn wrong or composited before
+/// their last draw; this tells the two apart.
+pub(crate) mod stale_watch {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    struct W {
+        ident: HashMap<u32, (u64, crate::backend::vulkan::engine::TargetIdentity)>,
+        dumped: HashMap<u32, u64>,
+        dumps: u32,
+        draw: HashMap<u32, (u64, u32)>,
+        ws: HashMap<u32, u64>,
+        reported: HashMap<u32, u64>,
+        last_scan: u64,
+        hist: HashMap<u32, std::collections::VecDeque<(String, u32, Vec<u32>)>>,
+        ws_dumps: u32,
+        // The last 48 draws into every app render target by (task, ref), surfaces
+        // and private targets alike: the sources an on-screen tile copies from.
+        ref_hist: HashMap<(u32, u32), std::collections::VecDeque<String>>,
+        // Window-server-owned surfaces up to 2048 a side (window caches), and
+        // how many of them were dumped.
+        ws_ident: HashMap<u32, crate::backend::vulkan::engine::TargetIdentity>,
+        ws_own_dumps: u32,
+        // Final-set reports since the last app draw, and when the last one ran.
+        final_emits: u32,
+        last_final: u64,
+    }
+    static W: Mutex<Option<W>> = Mutex::new(None);
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_STALE_WATCH").as_deref() == Ok("1"))
+    }
+    fn with(f: impl FnOnce(&mut W, u64)) {
+        let now = crate::observe::elapsed_us() / 1000;
+        let mut g = W.lock().unwrap_or_else(|p| p.into_inner());
+        let w = g.get_or_insert_with(|| W {
+            ident: HashMap::new(),
+            dumped: HashMap::new(),
+            dumps: 0,
+            draw: HashMap::new(),
+            ws: HashMap::new(),
+            reported: HashMap::new(),
+            last_scan: now,
+            hist: HashMap::new(),
+            ws_dumps: 0,
+            ref_hist: HashMap::new(),
+            ws_ident: HashMap::new(),
+            ws_own_dumps: 0,
+            final_emits: 0,
+            last_final: 0,
+        });
+        f(w, now);
+        if now.saturating_sub(w.last_scan) >= 1000 {
+            w.last_scan = now;
+            let mut lines = Vec::new();
+            for (&mid, &(t_draw, task)) in &w.draw {
+                let seen = w.ws.get(&mid).copied().unwrap_or(0);
+                if seen < t_draw
+                    && now.saturating_sub(t_draw) > 300
+                    && w.reported.get(&mid) != Some(&t_draw)
+                {
+                    lines.push((mid, t_draw, task, seen));
+                }
+            }
+            // At rest: what the resident of every app surface drawn > 2 s ago holds,
+            // once per draw time, into E:/tmp-c/tiledump (w, h, 0, 0 as u32 LE, RGBA8).
+            // Only when every app surface has been quiet for 1.5 s: the state the
+            // screen rests on, not each pause of an animation.
+            let newest = w.ident.values().map(|(t, _)| *t).max().unwrap_or(0);
+            let quiet = now.saturating_sub(newest) > 1500;
+            let due: Vec<(u32, u64, crate::backend::vulkan::engine::TargetIdentity)> = w
+                .ident
+                .iter()
+                .filter(|(mid, (t, _))| quiet && w.dumped.get(mid) != Some(t))
+                .map(|(mid, (t, id))| (*mid, *t, id.clone()))
+                .collect();
+            // The window server's last composite at rest: every surface it
+            // sampled within 300 ms of its newest sample, with that surface's
+            // last app draw (once per quiet period).
+            // Four reports, 2 s apart, after each burst of app draws: the window
+            // server may settle (cache a window) after the app stops drawing.
+            if quiet && w.final_emits < 4 && now.saturating_sub(w.last_final) >= 2000 {
+                w.final_emits += 1;
+                w.last_final = now;
+                let newest_ws = w.ws.values().copied().max().unwrap_or(0);
+                for (&mid, &t_ws) in &w.ws {
+                    if newest_ws.saturating_sub(t_ws) <= 300 {
+                        let (t_draw, task) = w.draw.get(&mid).copied().unwrap_or((0, 0));
+                        crate::observe::off(format!(
+                            "lab_ws_final mid={mid} app_task={task} last_draw={t_draw} last_ws={t_ws} t={now}"
+                        ));
+                        if task == 0 {
+                            for (l, _, _) in w.hist.get(&mid).into_iter().flatten() {
+                                crate::observe::off(format!("lab_ws_final_hist mid={mid} {l}"));
+                            }
+                            if let Some(id) = w.ws_ident.get(&mid) {
+                                if w.ws_own_dumps < 40 {
+                                    w.ws_own_dumps += 1;
+                                    dump(mid, t_ws, id, "wsown-", now);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (mid, t, id) in due {
+                w.dumped.insert(mid, t);
+                // A surface the window server sampled after its last draw is on
+                // screen: dump it past the general cap (300 more) with the draws
+                // that last wrote it.
+                let on_screen = w.ws.get(&mid).is_some_and(|&s| s >= t);
+                if on_screen && w.ws_dumps < 300 {
+                    w.ws_dumps += 1;
+                    let mut srcs: Vec<(u32, u32)> = Vec::new();
+                    for (l, task, tex) in w.hist.get(&mid).into_iter().flatten() {
+                        crate::observe::off(format!("lab_ws_tile_hist mid={mid} {l}"));
+                        for r in tex {
+                            if !srcs.contains(&(*task, *r)) {
+                                srcs.push((*task, *r));
+                            }
+                        }
+                    }
+                    for (task, r) in srcs {
+                        for l in w.ref_hist.get(&(task, r)).into_iter().flatten() {
+                            crate::observe::off(format!("lab_ws_src_hist mid={mid} src={task}:{r} {l}"));
+                        }
+                    }
+                } else if w.dumps >= 400 {
+                    continue;
+                } else {
+                    w.dumps += 1;
+                }
+                dump(mid, t, &id, if on_screen { "ws-" } else { "" }, now);
+            }
+            for (mid, t_draw, task, seen) in lines {
+                w.reported.insert(mid, t_draw);
+                crate::observe::off(format!(
+                    "lab_stale_composite mid={mid} task={task} last_draw={t_draw} last_ws_sample={seen} t={now}"
+                ));
+            }
+        }
+    }
+    /// What a resident holds, into E:/tmp-c/tiledump (w, h, 0, 0 as u32 LE, RGBA8).
+    fn dump(mid: u32, t: u64, id: &crate::backend::vulkan::engine::TargetIdentity, tag: &str, now: u64) {
+        let Ok(rb) = crate::backend::vulkan::engine::read_target(id) else {
+            crate::observe::off(format!("lab_tile_dump mid={mid} unreadable"));
+            return;
+        };
+        let (iw, ih) = (id.width(), id.height());
+        if let Some(rgba) = rb.into_rgba8() {
+            let dir = std::path::Path::new("E:/tmp-c/tiledump");
+            let _ = std::fs::create_dir_all(dir);
+            let mut out = Vec::with_capacity(16 + rgba.len());
+            for v in [iw, ih, 0, 0] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&rgba);
+            let _ = std::fs::write(dir.join(format!("{tag}m{mid}-t{t}-{iw}x{ih}.rgba")), out);
+            crate::observe::off(format!("lab_tile_dump {tag}mid={mid} {iw}x{ih} last_draw={t} t={now}"));
+        }
+    }
+    pub(crate) fn ws_identity(mapping_id: u32, id: Option<crate::backend::vulkan::engine::TargetIdentity>) {
+        if !on() || mapping_id == 0 {
+            return;
+        }
+        if let Some(id) = id.filter(|id| id.width() <= 2048 && id.height() <= 2048) {
+            with(|w, _| {
+                w.ws_ident.insert(mapping_id, id);
+            });
+        }
+    }
+    pub(crate) fn draw(task_id: u32, mapping_id: u32) {
+        if !on() || mapping_id == 0 || task_id == 1 {
+            return;
+        }
+        with(|w, now| {
+            w.draw.insert(mapping_id, (now, task_id));
+        });
+    }
+    pub(crate) fn identity(
+        task_id: u32,
+        mapping_id: u32,
+        id: Option<crate::backend::vulkan::engine::TargetIdentity>,
+    ) {
+        if !on() || mapping_id == 0 || task_id == 1 {
+            return;
+        }
+        if let Some(id) = id {
+            with(|w, now| {
+                w.ident.insert(mapping_id, (now, id));
+                w.final_emits = 0;
+            });
+        }
+    }
+    /// The last 48 draws into an app surface, emitted when it is dumped on screen.
+    pub(crate) fn note(
+        task_id: u32,
+        mapping_id: u32,
+        target_ref: u32,
+        tex: Vec<u32>,
+        line: impl FnOnce() -> String,
+    ) {
+        if !on() {
+            return;
+        }
+        let line = line();
+        with(|w, _| {
+            let h = w.ref_hist.entry((task_id, target_ref)).or_default();
+            if h.len() >= 160 {
+                h.pop_front();
+            }
+            h.push_back(line.clone());
+            if mapping_id != 0 {
+                let h = w.hist.entry(mapping_id).or_default();
+                if h.len() >= 160 {
+                    h.pop_front();
+                }
+                h.push_back((line, task_id, tex));
+            }
+        });
+    }
+    pub(crate) fn tick() {
+        if on() {
+            with(|_, _| {});
+        }
+    }
+    pub(crate) fn ws_sample(task_id: u32, mapping_id: u32) {
+        if !on() || mapping_id == 0 || task_id != 1 {
+            return;
+        }
+        with(|w, now| {
+            let prev = w.ws.insert(mapping_id, now).unwrap_or(0);
+            // Which app surfaces each window-server composite reads, once per
+            // mapping per 500 ms: the set the screen rests on is the last batch.
+            if now.saturating_sub(prev) > 500 {
+                if let Some((t_draw, task)) = w.draw.get(&mapping_id) {
+                    crate::observe::off(format!(
+                        "lab_ws_reads mid={mapping_id} app_task={task} app_last_draw={t_draw} t={now}"
+                    ));
+                }
+            }
+        });
+    }
+}
+
 fn note_sampled_ref_backing(
     state: &crate::model::DeviceState,
     task_id: u32,
@@ -3602,6 +3891,7 @@ fn note_sampled_ref_backing(
     mapping_id: u32,
     route: &str,
 ) {
+    stale_watch::ws_sample(task_id, mapping_id);
     // A lab census line (one per change of backing): off with the route census,
     // as in the working launcher's ROUTES=off mode (b101: ~0.9 % of Weather's
     // drain, and ~200 lines a second in its log).
@@ -12405,6 +12695,20 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                             ));
                         };
                         let (rw, rh, mid, src) = loaded;
+                        if stale_watch::on() {
+                            if let Some(c) = req.colors.first() {
+                                let what = match &src {
+                                    SampledSourceRequest::Target(id, _) => format!("target {id:?}"),
+                                    SampledSourceRequest::TargetRegion(..) => "target_region".into(),
+                                    SampledSourceRequest::Bytes(..) => "bytes".into(),
+                                    SampledSourceRequest::GuestRuns(..) => "guest_runs".into(),
+                                    SampledSourceRequest::Staged(..) => "staged".into(),
+                                };
+                                stale_watch::note(req.task_id, c.mapping_id, c.texture_ref, Vec::new(), || {
+                                    format!("  samples ref={texture_ref} {rw}x{rh} mid={mid} {what}")
+                                });
+                            }
+                        }
                         if let SampledSourceRequest::GuestRuns(runs, ..) = &src {
                             lab_lut_watch(req, texture_ref, rw, rh, runs);
                         }
@@ -13574,6 +13878,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                             }
                             Some(MapperRefTextureLoadSeed::Guest(seed)) => {
                                 lab_seed_trace(acc.shared(), "mapping", "guest", c0.mapping_id, w, h, declared);
+                                lab_guest_seed_content(acc.shared(), &*host, req.task_id, c0.mapping_id, w, h);
                                 target_guest_seed = Some(seed)
                             }
                             None => {}
@@ -21140,7 +21445,42 @@ pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
 /// action, how much of the tile it covers, the geometry it fetches and which
 /// textures it samples. Says whether a Chromium tile's first pass on a fresh
 /// IOSurface expects prior content (Load + partial coverage) and where from.
+/// TEMP (lab, STALE_WATCH): [`lab_tile_draw`] plus the render identity the draw lands in.
+pub(crate) fn lab_tile_draw_with(state: &crate::model::DeviceState, req: &DrawEncodeRequest) {
+    if let Some(c) = req.colors.first() {
+        if stale_watch::on() {
+            let rid = pass_inv::render_identity(state, req);
+            stale_watch::note(req.task_id, c.mapping_id, c.texture_ref, Vec::new(), || {
+                format!("  renders_into {rid:?}")
+            });
+        }
+        if c.mapping_id != 0 && req.task_id == 1 && stale_watch::on() {
+            stale_watch::ws_identity(c.mapping_id, mapper_ref_texture_render_identity(state, req));
+        }
+        if c.mapping_id != 0 && req.task_id != 1 {
+            stale_watch::identity(
+                req.task_id,
+                c.mapping_id,
+                mapper_ref_texture_render_identity(state, req),
+            );
+        }
+    }
+    lab_tile_draw(req);
+}
+
 pub(crate) fn lab_tile_draw(req: &DrawEncodeRequest) {
+    if let Some(c) = req.colors.first() {
+        stale_watch::draw(req.task_id, c.mapping_id);
+        if stale_watch::on() {
+            let tex = req
+                .fragment_textures
+                .iter()
+                .filter(|t| t.texture_ref != 0)
+                .map(|t| t.texture_ref)
+                .collect();
+            stale_watch::note(req.task_id, c.mapping_id, c.texture_ref, tex, || lab_tile_draw_line(req));
+        }
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_TILE_TRACE").as_deref() == Ok("1")) {
         return;
@@ -21171,6 +21511,13 @@ pub(crate) fn lab_tile_draw(req: &DrawEncodeRequest) {
         *n += 1;
         g.0 += 1;
     }
+    crate::observe::off(format!("lab_tile_draw {}", lab_tile_draw_line(req)));
+}
+
+fn lab_tile_draw_line(req: &DrawEncodeRequest) -> String {
+    let Some(c) = req.colors.first() else {
+        return String::new();
+    };
     let sc = req
         .scissors
         .first()
@@ -21194,13 +21541,16 @@ pub(crate) fn lab_tile_draw(req: &DrawEncodeRequest) {
         .filter(|t| t.texture_ref != 0)
         .map(|t| format!("{}:{}", t.index, t.texture_ref))
         .collect();
-    crate::observe::off(format!(
-        "lab_tile_draw task={} mid={} {}x{} ref={} load={} store={} cont={} pipe={} prim={} inst={} {geo} sc=[{sc}] vp=[{vp}] tex=[{}] t={}",
+    format!(
+        "task={} mid={} {}x{} ref={} gva={:#x} s={} msrc={} load={} store={} cont={} pipe={} prim={} inst={} {geo} sc=[{sc}] vp=[{vp}] tex=[{}] t={}",
         req.task_id,
         c.mapping_id,
         c.width,
         c.height,
         c.texture_ref,
+        c.target_gva,
+        c.sample_count,
+        c.multisample_source_ref,
         c.load_action,
         c.store_action,
         u8::from(req.continues_render_pass),
@@ -21209,7 +21559,7 @@ pub(crate) fn lab_tile_draw(req: &DrawEncodeRequest) {
         req.instance_count,
         tex.join(","),
         crate::observe::elapsed_us() / 1000
-    ));
+    )
 }
 
 fn lab_draw_sig(req: &DrawEncodeRequest) {

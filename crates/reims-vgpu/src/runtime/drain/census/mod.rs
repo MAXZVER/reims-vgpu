@@ -3863,6 +3863,9 @@ pub(crate) fn store_route_count(route: &str) -> u64 {
 
 /// Drain and format the window's route counts, or `None` if none were taken.
 fn take_store_routes() -> Option<String> {
+    // TEMP (lab, STALE_WATCH): the census second is the watcher's clock at rest too.
+    #[cfg(feature = "backend-vulkan")]
+    crate::runtime::draw::vulkan::stale_watch::tick();
     let routes = STORE_ROUTES.lock().ok()?;
     let mut out = String::from("store_routes");
     let mut any = false;
