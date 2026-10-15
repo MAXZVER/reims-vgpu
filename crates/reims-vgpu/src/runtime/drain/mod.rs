@@ -3542,7 +3542,11 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
     // answer a withdrawal or a retirement threw away. Once per slot.
     if let Some(id) = census.first_unanswered_pipeline {
         if crate::observe::first_sight("draw_usage_no_stage", u64::from(id.slot.0)) {
-            crate::observe::fail(format!(
+            // Off, not a failure: an ordering-precision census in the safe
+            // direction. Without a reflection the draw's slots order against
+            // every other access to the same resource, which is slower and
+            // never wrong, and no guest work is lost or degraded.
+            crate::observe::off(format!(
                 "draw_usage_no_stage slot={} gen={} model_pipeline={} (a draw bound this \
                  pipeline and the ordering plane had no reflection for it, so every slot \
                  the draw binds ordered against every other access to the same resource)",
