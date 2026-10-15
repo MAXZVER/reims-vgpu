@@ -39,10 +39,17 @@ pub(crate) fn lab_pay_alias_landed<M: HostMemory + HostOps>(
     height: u32,
 ) {
     use crate::runtime::drain::note_store_route;
-    if crate::backend::vulkan::engine::resident_version_nowait(identity) != Some(v0) {
+    // The store settled the target's pending draws first, so the version moves inside it (b456: every payment
+    // `pay_alias_moved` against the version read before it). Read after: the drain, which is handling this
+    // packet, submitted nothing to the target since, so this is the version whose content landed.
+    let Some(v1) = crate::backend::vulkan::engine::resident_version_nowait(identity) else {
         note_store_route("pay_alias_moved");
         return;
+    };
+    if v1 != v0 {
+        note_store_route("pay_alias_settled");
     }
+    let v0 = v1;
     let Some((gpas, span)) = crate::runtime::mapping_write::lab_t2t_alias_window(state, mapping_id, width, height) else {
         note_store_route("pay_alias_shape");
         return;
