@@ -305,6 +305,11 @@ pub struct DeviceFeatures {
     /// and not from a reading of the spec's table.
     pub color_attachment: [bool; TexelLayout::ALL.len()],
     pub storage16: bool,
+    /// `shaderDrawParameters` (Vulkan 1.1 core): the `BaseInstance`/`BaseVertex` builtins the translator
+    /// lowers Metal's `[[base_instance]]`/`[[base_vertex]]` to. Chromium's GPU raster (ANGLE-Metal) reads
+    /// `base_instance` in the vertex stage; without it those draws were refused and their tiles came out empty.
+    /// Promoted into `VkPhysicalDeviceVulkan11Features`, which this chain does not carry, so it is its own struct.
+    pub shader_draw_parameters: bool,
     /// `storageInputOutput16`: 16-bit values as stage inputs and outputs, which
     /// the translator emits for Metal's `half` varyings
     /// (`VUID-RuntimeSpirv-storageInputOutput16-11162` in the p054 boot).
@@ -689,6 +694,14 @@ impl DeviceFeatures {
             .storage_input_output16(self.storage_io16)
     }
 
+    /// `shaderDrawParameters`, chained only where the device reported it.
+    pub fn enabled_shader_draw_parameters(
+        &self,
+    ) -> vk::PhysicalDeviceShaderDrawParametersFeatures<'static> {
+        vk::PhysicalDeviceShaderDrawParametersFeatures::default()
+            .shader_draw_parameters(self.shader_draw_parameters)
+    }
+
     /// `variablePointersStorageBuffer`, chained only where the device reported it.
     pub fn enabled_variable_pointers(&self) -> vk::PhysicalDeviceVariablePointersFeatures<'static> {
         vk::PhysicalDeviceVariablePointersFeatures::default()
@@ -753,6 +766,7 @@ impl DeviceFeatures {
             color_attachment,
             storage16,
             storage_io16,
+            shader_draw_parameters,
             variable_pointers_storage_buffer,
             storage8,
             float16,
@@ -815,7 +829,7 @@ impl DeviceFeatures {
              storage_image_write_without_format={storage_image_write_without_format} \
              storage_image_read_without_format={storage_image_read_without_format} \
              bgra8_storage={bgra8_storage} no_linear_filter={} no_blendable_attachment={} \
-             storage16={storage16} storage_io16={storage_io16} variable_pointers_sb={variable_pointers_storage_buffer} storage8={storage8} float16={float16} int8={int8} \
+             storage16={storage16} storage_io16={storage_io16} shader_draw_parameters={shader_draw_parameters} variable_pointers_sb={variable_pointers_storage_buffer} storage8={storage8} float16={float16} int8={int8} \
              shader_output_viewport_index={shader_output_viewport_index} \
              timeline_semaphore={timeline_semaphore} \
              descriptor_binding_partially_bound={descriptor_binding_partially_bound} \
@@ -906,7 +920,9 @@ pub unsafe fn query(
     let mut supported_demote =
         vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT::default();
     let mut supported_variable_pointers = vk::PhysicalDeviceVariablePointersFeatures::default();
+    let mut supported_draw_parameters = vk::PhysicalDeviceShaderDrawParametersFeatures::default();
     let mut features2 = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut supported_draw_parameters)
         .push_next(&mut supported_16)
         .push_next(&mut supported_8)
         .push_next(&mut supported_f16i8)
@@ -1140,6 +1156,7 @@ pub unsafe fn query(
         color_attachment,
         storage16: supported_16.storage_buffer16_bit_access == vk::TRUE,
         storage_io16: supported_16.storage_input_output16 == vk::TRUE,
+        shader_draw_parameters: supported_draw_parameters.shader_draw_parameters == vk::TRUE,
         variable_pointers_storage_buffer: supported_variable_pointers
             .variable_pointers_storage_buffer
             == vk::TRUE,
@@ -1196,6 +1213,7 @@ mod tests {
             sampled_linear_filter: [true; TexelLayout::ALL.len()],
             color_attachment: [true; TexelLayout::ALL.len()],
             storage16: true,
+            shader_draw_parameters: true,
             storage8: true,
             float16: true,
             int8: true,
