@@ -432,6 +432,11 @@ fn finish(
             .map(|m| m.surface_content_epoch)
         {
             crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch);
+            // Step 3: guest CPU-visible publication only after the copy landed.
+            // Host-window presentation never calls this path.
+            if crate::backend::vulkan::engine::stamp_guest_published_epoch(identity, epoch) {
+                crate::runtime::drain::note_store_route("guest_published_after_copyback");
+            }
         }
         crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
     } else {

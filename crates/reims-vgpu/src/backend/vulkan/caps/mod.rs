@@ -51,7 +51,7 @@ pub mod linear_sampled;
 pub mod linear_target;
 pub mod push_descriptor;
 
-pub(crate) use host_pointer::{HostPointerCaps, HostPointerImport};
+pub(crate) use host_pointer::{direct_host_images_allowed, HostPointerCaps, HostPointerImport};
 // Moved to `reims-vgpu-vulkan`, which is the layer the architecture names as
 // the only one that turns host capabilities into placement policy. Re-exported
 // here so `caps::` stays the one name this crate asks capability questions

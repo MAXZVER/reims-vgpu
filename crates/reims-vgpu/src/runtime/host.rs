@@ -642,6 +642,38 @@ pub trait HostOps {
     fn guest_written_pages(&self, _token: u64, _since_gen: u64) -> Option<Vec<u64>> {
         None
     }
+
+    /// Monotonic epoch of host-side dirty synchronization points.
+    ///
+    /// Increments whenever dirty bitmaps are harvested (doorbell, background,
+    /// or explicit harvest), or 0 when the host does not track dirty state.
+    /// This allows caching currency verdicts across queries within the same
+    /// drain epoch or background sync interval.
+    ///
+    /// **Profiling only since ABI v23.** It is not a cache key: a background
+    /// harvest advances it without any new guest handoff (a false miss), and a
+    /// doorbell need not advance it at all (a stale hit). Key caches by
+    /// [`HostOps::dirty_observation_epoch`] instead.
+    fn dirty_sync_epoch(&self) -> u64 {
+        0
+    }
+
+    /// Monotonic guest doorbell (observation) epoch (ABI v23).
+    ///
+    /// Advances, with release semantics on the QEMU side, at every doorbell
+    /// that makes guest stores ordered before it visible to the device. A
+    /// [`HostOps::guest_write_gen`] / [`HostOps::guest_written_pages`] answer
+    /// read between two equal values of this epoch is complete for every
+    /// doorbell up to it, which is what licenses reusing that answer until the
+    /// epoch moves — see
+    /// [`crate::runtime::surface_currency::observe_dirty_stably`].
+    ///
+    /// 0 means the host has no observation epoch (no dirty witness, a shim
+    /// without the callback, or no doorbell noted yet). 0 is never a cache key:
+    /// every consumer re-asks the witness each time.
+    fn dirty_observation_epoch(&self) -> u64 {
+        0
+    }
 }
 
 /// Arm64e guest page size, from the contract shift rather than a literal.
@@ -701,7 +733,7 @@ struct RealRange {
 /// aliasing): a GPU/CPU write through a view is immediately visible via
 /// `read_gpa` and vice versa. Bytes outside mapped ranges live in a sparse
 /// map (synthetic KVA fixtures); unmapped reads stay permissive zeros.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FakeHost {
     ranges: Vec<RealRange>,
     /// Sparse byte store for addresses outside real ranges.
@@ -785,6 +817,19 @@ pub struct FakeHost {
     pub ring_when_unsettled: Option<(std::sync::Arc<std::sync::atomic::AtomicU32>, u32)>,
     /// How many times [`HostOps::harvests_settled`] was asked.
     pub harvests_settled_calls: std::cell::Cell<u64>,
+    /// Monotonic count of dirty harvest sync points in this test host.
+    pub dirty_sync_epoch: std::cell::Cell<u64>,
+    /// Guest doorbell (observation) epoch answered by
+    /// [`HostOps::dirty_observation_epoch`]. Starts at 1 (a doorbell has been
+    /// noted) so caching is reachable; a `Cell` so a query closure holding
+    /// `&FakeHost` can move it mid-observation.
+    pub dirty_observation_epoch: std::cell::Cell<u64>,
+    /// Calls that asked the coarse dirty-generation question. The cache tests
+    /// assert on this rather than equating two returned verdicts: a second
+    /// equal answer can still have paid a WHPX query.
+    pub guest_write_gen_calls: std::cell::Cell<u64>,
+    /// Calls that enumerated the dirty page list after a coarse write verdict.
+    pub guest_written_pages_calls: std::cell::Cell<u64>,
 }
 
 #[cfg(test)]
@@ -919,6 +964,41 @@ impl Drop for FakeHost {
 }
 
 #[cfg(test)]
+impl Default for FakeHost {
+    fn default() -> Self {
+        Self {
+            ranges: Vec::new(),
+            pages: BTreeMap::new(),
+            views: Vec::new(),
+            bounce: Vec::new(),
+            xregs: BTreeMap::new(),
+            actions: Vec::new(),
+            mono_ns: 0,
+            bh_scheduled: false,
+            strict_linux_map: false,
+            stable_map_pages: false,
+            map_pages_calls: 0,
+            unmap_pages_calls: 0,
+            non_ram: std::cell::RefCell::new(Vec::new()),
+            rewires: std::cell::RefCell::new(Vec::new()),
+            unmap_on_read: std::cell::RefCell::new(Vec::new()),
+            rewires_fired: std::cell::Cell::new(0),
+            guest_write_sets: BTreeMap::new(),
+            guest_write_token_seq: 0,
+            guest_writes_unobservable: false,
+            guest_write_startup_window: false,
+            harvests_settled_answers: std::cell::RefCell::new(std::collections::VecDeque::new()),
+            ring_when_unsettled: None,
+            harvests_settled_calls: std::cell::Cell::new(0),
+            dirty_sync_epoch: std::cell::Cell::new(1),
+            dirty_observation_epoch: std::cell::Cell::new(1),
+            guest_write_gen_calls: std::cell::Cell::new(0),
+            guest_written_pages_calls: std::cell::Cell::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
 impl FakeHost {
     pub fn new() -> Self {
         Self::default()
@@ -965,7 +1045,14 @@ impl FakeHost {
     /// A set that does not hold it is untouched, which is the property the
     /// elision depends on: one surface's guest write must not invalidate
     /// another's resident.
+    ///
+    /// The product host only observes a guest store at a doorbell, so this
+    /// advances the doorbell (observation) epoch as well as the sync epoch: the
+    /// fixture cannot report an observed write that no doorbell made visible.
     pub fn guest_wrote_page(&mut self, gpa: u64) {
+        self.advance_dirty_observation_epoch();
+        self.dirty_sync_epoch
+            .set(self.dirty_sync_epoch.get().wrapping_add(1));
         for set in self.guest_write_sets.values_mut() {
             if set.page_size == 0 {
                 continue;
@@ -976,6 +1063,33 @@ impl FakeHost {
                 set.page_gen[i] = set.gen_;
             }
         }
+    }
+
+    /// Advance the dirty sync epoch to simulate a harvest occurring without any
+    /// specific page being marked written.
+    pub fn advance_dirty_sync_epoch(&self) -> u64 {
+        let next = self.dirty_sync_epoch.get().wrapping_add(1);
+        self.dirty_sync_epoch.set(next);
+        next
+    }
+
+    /// Advance the guest doorbell (observation) epoch with no page written: a
+    /// doorbell that handed the device work but no store to a tracked page.
+    /// Takes `&self` so a test can move it from inside a query closure, which
+    /// is the race [`crate::runtime::surface_currency::observe_dirty_stably`]
+    /// brackets against.
+    pub fn advance_dirty_observation_epoch(&self) -> u64 {
+        let next = self.dirty_observation_epoch.get().wrapping_add(1);
+        self.dirty_observation_epoch.set(next);
+        next
+    }
+
+    /// A guest store to the page holding `gpa` made visible by a doorbell: the
+    /// production order of events, stated as one step. Identical to
+    /// [`Self::guest_wrote_page`], which already advances the observation
+    /// epoch; named for tests whose subject is the doorbell.
+    pub fn note_doorbell_and_dirty_page(&mut self, gpa: u64) {
+        self.guest_wrote_page(gpa);
     }
 
     /// Live [`HostOps::track_guest_writes`] registrations, so a test can prove
@@ -1430,6 +1544,14 @@ impl HostOps for FakeHost {
         settled
     }
 
+    fn dirty_sync_epoch(&self) -> u64 {
+        self.dirty_sync_epoch.get()
+    }
+
+    fn dirty_observation_epoch(&self) -> u64 {
+        self.dirty_observation_epoch.get()
+    }
+
     fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {
         if self.guest_writes_unobservable
             || gpas.is_empty()
@@ -1466,6 +1588,8 @@ impl HostOps for FakeHost {
     }
 
     fn guest_write_gen(&self, token: u64) -> Option<u64> {
+        self.guest_write_gen_calls
+            .set(self.guest_write_gen_calls.get().saturating_add(1));
         // 0 is "unknown token, or still arming", never a generation — the same
         // contract `qemu::host_ops` enforces over the shim's answer. Returning
         // `Some(0)` here would let a caller latch 0 as a baseline and then match
@@ -1477,6 +1601,8 @@ impl HostOps for FakeHost {
     }
 
     fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
+        self.guest_written_pages_calls
+            .set(self.guest_written_pages_calls.get().saturating_add(1));
         if since_gen == 0 {
             return None;
         }

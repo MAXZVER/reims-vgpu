@@ -100,8 +100,7 @@ use crate::runtime::host::HostAction;
 /// produced 3074 of those draws: the other 508 were superseded in the slot
 /// before the loop looked, which is latest-wins working rather than a frame
 /// lost.
-const WINDOW_REDRAW_BACKSTOP: std::time::Duration =
-    std::time::Duration::from_millis(8);
+const WINDOW_REDRAW_BACKSTOP: std::time::Duration = std::time::Duration::from_millis(8);
 /// How many rebuilds of the presenter may go unproven before the window stops
 /// trying — asked of the running rail, which is what gets lost.
 ///
@@ -1121,13 +1120,7 @@ impl ApplicationHandler<FramePublished> for App {
                     self.force_redraw();
                 }
             }
-            let now = std::time::Instant::now();
-            let pending = std::mem::take(&mut self.frame_pending);
-            if redraw_due(pending, now, self.next_backstop) {
-                window.request_redraw();
-                self.loop_census.redraws_asked += 1;
-                self.next_backstop = now + WINDOW_REDRAW_BACKSTOP;
-            }
+            self.request_pending_redraw(&window);
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                 self.next_backstop,
             ));
@@ -1137,12 +1130,18 @@ impl ApplicationHandler<FramePublished> for App {
     /// A [`FramePublished`] from the device: the frame slot holds something the
     /// loop has not looked at.
     ///
-    /// Records the reason and returns. Requesting the redraw here instead would
-    /// put a second caller on the platform's redraw path, and the two would
-    /// disagree about the backstop — `about_to_wait` runs after this and after
-    /// every other event, so it is the one place that can hold that decision.
+    /// Windows' interactive move/resize runs a nested native message loop;
+    /// `about_to_wait` need not run until the drag ends. A publish must request
+    /// its paint here as well, through the same coalescing decision.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: FramePublished) {
         self.frame_pending = true;
+        #[cfg(target_os = "windows")]
+        if let Some(window) = self.window.clone() {
+            self.request_pending_redraw(&window);
+            _event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                self.next_backstop,
+            ));
+        }
     }
 }
 
@@ -1157,6 +1156,16 @@ fn redraw_due(frame_pending: bool, now: std::time::Instant, backstop: std::time:
 }
 
 impl App {
+    fn request_pending_redraw(&mut self, window: &Window) {
+        let now = std::time::Instant::now();
+        let pending = std::mem::take(&mut self.frame_pending);
+        if redraw_due(pending, now, self.next_backstop) {
+            window.request_redraw();
+            self.loop_census.redraws_asked += 1;
+            self.next_backstop = now + WINDOW_REDRAW_BACKSTOP;
+        }
+    }
+
     /// A window that has not opened yet.
     ///
     /// Both entry points build one — [`run`] on the calling thread and

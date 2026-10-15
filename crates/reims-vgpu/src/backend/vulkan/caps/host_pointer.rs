@@ -323,6 +323,32 @@ pub fn guest_surface_writes_allowed() -> bool {
     surface_writes_narrowing_mode() == SurfaceWritesNarrowing::None
 }
 
+/// Whether direct host-pointer VkImage binding (linear tiling in host system RAM)
+/// is allowed. By default on Discrete GPUs or on Windows WHPX, this is false,
+/// forcing all VkImages to be optimal DEVICE_LOCAL VRAM with host imports used
+/// strictly as VkBuffer DMA staging conduits. Can be explicitly enabled via
+/// `REIMS_VGPU_DIRECT_HOST_IMAGES=on`.
+pub fn direct_host_images_allowed() -> bool {
+    #[cfg(test)]
+    {
+        let (sw, _) = crate::config::read(crate::config::DIRECT_HOST_IMAGES);
+        return !matches!(sw, crate::config::Switch::Off);
+    }
+    #[cfg(not(test))]
+    {
+        static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ALLOWED.get_or_init(|| {
+            let (sw, _) = crate::config::read(crate::config::DIRECT_HOST_IMAGES);
+            let allowed = matches!(sw, crate::config::Switch::On);
+            crate::observe::off(format!(
+                "vk_direct_host_images_allowed allowed={allowed} switch={sw:?}"
+            ));
+            allowed
+        })
+    }
+}
+
+
 /// What [`crate::config::GUEST_IMPORT`] says about running this rail at all.
 ///
 /// `None` to go on and ask the device. `Some` short-circuits [`query`], which is

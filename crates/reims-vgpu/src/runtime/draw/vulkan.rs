@@ -325,8 +325,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         store_surface_resident(state, host, &identity, mid, cw, ch, guest_store)
                     })
                     .unwrap_or(false);
-                match (stored, c0_store) {
-                    (true, Some((mid, cw, ch, fmt))) => {
+                if stored {
+                    if let Some((mid, cw, ch, fmt)) = c0_store {
                         note_mapper_ref_texture_store_route("surface_resident");
                         // The same two publishes the `Owned` rail performs at arm
                         // time, for the same reason: `dense_frame_seq` gates
@@ -343,23 +343,17 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             req.pipeline_ref, pass_w, pass_h
                         ));
                     }
-                    _ => {
-                        // The arm refused (its typed decline says which gate), so
-                        // the frame has to be materialized after all: read the
-                        // resident the draw just rendered into and let the
-                        // synchronous Store block below run exactly as it does for
-                        // a Store that never skipped its readback. This pays the
-                        // readback the rail exists to avoid, which is the point —
-                        // the fallback is a cost, never a lost frame.
-                        note_mapper_ref_texture_store_route("surface_resident_sync");
-                        draw_rgba = read_resident_chain(req, &identity);
+                } else {
+                    // Under the discrete-GPU model: render targets remain VRAM-authoritative across passes!
+                    // Do NOT fall back to read_resident_chain (which blocks on GPU fences and reads 8MB back to CPU).
+                    note_mapper_ref_texture_store_route("surface_resident_vram_authoritative");
+                    if let Some((mid, cw, ch, fmt)) = c0_store {
+                        arm_surface_writeback_debt(state, host, mid, &identity, cw, ch);
+                        publish_surface_store(state, host, mid, cw, ch, fmt);
+                        surface_store_armed = true;
                         crate::observe::line(format!(
-                            "linux_m2v_draw ok resident_surface_store_sync_fallback pipe={} {}x{} mid={} rgba={}",
-                            req.pipeline_ref,
-                            pass_w,
-                            pass_h,
-                            req.colors.first().map(|c| c.mapping_id).unwrap_or(0),
-                            draw_rgba.is_some() as u8
+                            "linux_m2v_draw ok resident_surface_store_vram_authoritative pipe={} {}x{} mid={mid}",
+                            req.pipeline_ref, pass_w, pass_h
                         ));
                     }
                 }
@@ -1901,15 +1895,17 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     return Some((w, h, 0, src));
                 }
             }
-            if let Some((w, h, src)) = try_linear_sample_zero_copy(
-                state,
-                host,
-                task_id,
-                texture_ref,
-                tex,
-                resolved_resource.as_ref()?.lifetime_ref(),
-            ) {
-                return Some((w, h, 0, src));
+            if let Some(lifetime_ref) = resolved_resource.as_ref().map(|r| r.lifetime_ref()) {
+                if let Some((w, h, src)) = try_linear_sample_zero_copy(
+                    state,
+                    host,
+                    task_id,
+                    texture_ref,
+                    tex,
+                    lifetime_ref,
+                ) {
+                    return Some((w, h, 0, src));
+                }
             }
             if let Some((w, h, rgba, identity, byte_format)) =
                 load_linear_from_host_caches(state, host, task_id, texture_ref, tex)
@@ -3345,9 +3341,9 @@ fn coalesce_pages_to_runs<M: HostOps>(
 const RUN_MEMO_MIN_PAGES: usize = 16;
 
 /// Windows remembered at once. Enough for every large sampled surface a
-/// desktop binds in a frame (planes, wallpaper, window backings); the memo is
-/// cleared whole when it fills, which is rare and costs one rebuild each.
-const RUN_MEMO_CAP: usize = 256;
+/// desktop binds in a frame (planes, wallpaper, window backings); expanded from 256
+/// to 2048 with LRU half-eviction to keep hot working sets cached on discrete GPUs.
+const RUN_MEMO_CAP: usize = 2048;
 
 struct RunMemoEntry {
     page: u64,
@@ -3355,11 +3351,13 @@ struct RunMemoEntry {
     span: u64,
     window: Vec<u64>,
     runs: Vec<crate::backend::vulkan::engine::GuestRun>,
+    access_seq: u64,
 }
 
 #[derive(Default)]
 struct RunMemo {
     entries: std::collections::HashMap<u64, RunMemoEntry>,
+    clock: u64,
 }
 
 impl RunMemo {
@@ -3371,15 +3369,21 @@ impl RunMemo {
     }
 
     fn lookup(
-        &self,
+        &mut self,
         window: &[u64],
         page: u64,
         head_off: u64,
         span: u64,
     ) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
-        let e = self.entries.get(&Self::key(window, page, head_off, span))?;
-        (e.page == page && e.head_off == head_off && e.span == span && e.window == window)
-            .then(|| e.runs.clone())
+        let key = Self::key(window, page, head_off, span);
+        let e = self.entries.get_mut(&key)?;
+        if e.page == page && e.head_off == head_off && e.span == span && e.window == window {
+            self.clock = self.clock.wrapping_add(1);
+            e.access_seq = self.clock;
+            Some(e.runs.clone())
+        } else {
+            None
+        }
     }
 
     fn insert(
@@ -3391,8 +3395,19 @@ impl RunMemo {
         runs: &[crate::backend::vulkan::engine::GuestRun],
     ) {
         if self.entries.len() >= RUN_MEMO_CAP {
-            self.entries.clear();
+            let target_len = RUN_MEMO_CAP / 2;
+            let mut keys_with_age: Vec<(u64, u64)> = self
+                .entries
+                .iter()
+                .map(|(&k, v)| (k, v.access_seq))
+                .collect();
+            keys_with_age.sort_unstable_by_key(|&(_, age)| age);
+            let to_remove = self.entries.len().saturating_sub(target_len);
+            for (k, _) in keys_with_age.into_iter().take(to_remove) {
+                self.entries.remove(&k);
+            }
         }
+        self.clock = self.clock.wrapping_add(1);
         self.entries.insert(
             Self::key(window, page, head_off, span),
             RunMemoEntry {
@@ -3401,6 +3416,7 @@ impl RunMemo {
                 span,
                 window: window.to_vec(),
                 runs: runs.to_vec(),
+                access_seq: self.clock,
             },
         );
     }
@@ -3586,25 +3602,75 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
             let head_in_import = gpas.first()?.checked_add(head)?.checked_sub(base)?;
             Some((std::sync::Arc::clone(guest.import()), head_in_import, guest))
         });
-        let (import, head, guest) = match ramblock {
+        let (import, head, pages) = match ramblock {
             Some(resolved) => {
                 crate::runtime::drain::note_store_route("zc_packed_ramblock");
-                resolved
+                (
+                    resolved.0,
+                    resolved.1,
+                    vec![crate::runtime::guest_ram_map::GuestWindowRun {
+                        window_offset: 0,
+                        guest: resolved.2,
+                    }],
+                )
             }
             None => {
-                crate::runtime::drain::note_store_route("zc_packed_alias_import");
-                crate::runtime::drain::note_store_route(packed_scatter_band(&gpas, page));
-                let import = std::sync::Arc::new(
-                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-                        host_base, map_len, align,
+                if let Ok(runs) = crate::runtime::guest_ram_map::references_for_runs(
+                    host,
+                    &gpas,
+                    page,
+                    head,
+                    backing.size,
+                ) {
+                    if !runs.is_empty() {
+                        crate::runtime::drain::note_store_route("zc_packed_ramblock_runs");
+                        crate::runtime::drain::note_store_route(packed_scatter_band(&gpas, page));
+                        let first_import = std::sync::Arc::clone(runs[0].guest.import());
+                        (first_import, head, runs)
+                    } else {
+                        crate::runtime::drain::note_store_route("zc_packed_alias_import");
+                        crate::runtime::drain::note_store_route(packed_scatter_band(&gpas, page));
+                        let import = std::sync::Arc::new(
+                            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                                host_base, map_len, align,
+                            )
+                            .ok()?,
+                        );
+                        let whole = import.slice(head, backing.size).ok()?;
+                        let guest =
+                            crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&import), whole)
+                                .ok()?;
+                        (
+                            import,
+                            head,
+                            vec![crate::runtime::guest_ram_map::GuestWindowRun {
+                                window_offset: 0,
+                                guest,
+                            }],
+                        )
+                    }
+                } else {
+                    crate::runtime::drain::note_store_route("zc_packed_alias_import");
+                    crate::runtime::drain::note_store_route(packed_scatter_band(&gpas, page));
+                    let import = std::sync::Arc::new(
+                        crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                            host_base, map_len, align,
+                        )
+                        .ok()?,
+                    );
+                    let whole = import.slice(head, backing.size).ok()?;
+                    let guest =
+                        crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&import), whole)
+                            .ok()?;
+                    (
+                        import,
+                        head,
+                        vec![crate::runtime::guest_ram_map::GuestWindowRun {
+                            window_offset: 0,
+                            guest,
+                        }],
                     )
-                    .ok()?,
-                );
-                let whole = import.slice(head, backing.size).ok()?;
-                let guest =
-                    crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&import), whole)
-                        .ok()?;
-                (import, head, guest)
+                }
             }
         };
         Some(PackedBufferResolution::Available(PackedBuffer {
@@ -3614,10 +3680,7 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
             import,
             gpas: std::sync::Arc::new(gpas),
             runs: std::sync::Arc::new(vec![run]),
-            pages: std::sync::Arc::new(vec![crate::runtime::guest_ram_map::GuestWindowRun {
-                window_offset: 0,
-                guest,
-            }]),
+            pages: std::sync::Arc::new(pages),
         }))
     })()
     .unwrap_or_else(unavailable);
@@ -3699,7 +3762,11 @@ pub(super) fn direct_linear_sample_from_packed(
     native_components: pixel_format::SwizzlePlan,
     owner: crate::model::TaskResourceLifetimeRef,
 ) -> Option<SampledSourceRequest> {
-    let direct_image = sampled_backing_from_packed(packed, level_offset, row_pitch, span, owner)?;
+    let direct_image = if crate::backend::vulkan::caps::direct_host_images_allowed() {
+        sampled_backing_from_packed(packed, level_offset, row_pitch, span, owner)
+    } else {
+        None
+    };
     Some(SampledSourceRequest::GuestRuns(
         crate::backend::vulkan::engine::GuestRunSource {
             runs: std::sync::Arc::clone(&packed.runs),
@@ -3707,7 +3774,7 @@ pub(super) fn direct_linear_sample_from_packed(
             total_len: span,
             row_length_texels,
             pages: Some(std::sync::Arc::clone(&packed.pages)),
-            direct_image: Some(direct_image),
+            direct_image,
         },
         native,
         format,
@@ -3737,6 +3804,9 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
     host: &mut M,
     plane: MappedSamplePlane,
 ) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
+    if !crate::backend::vulkan::caps::direct_host_images_allowed() {
+        return None;
+    }
     use crate::backend::vulkan::engine::{GuestRun, GuestRunSource};
     use crate::runtime::guest_ram::GuestRef;
 
@@ -3758,17 +3828,21 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
     }
     let whole = import.slice(0, import.len()).ok()?;
     let guest = GuestRef::new(std::sync::Arc::clone(&import), whole).ok()?;
-    let direct_image = Some(crate::backend::vulkan::engine::GuestSampledBacking {
-        backing: crate::backend::vulkan::engine::GuestTargetBacking {
-            allocation_host_ptr: import.host_base(),
-            allocation_len: import.len(),
-            plane_offset: base_off,
-            row_pitch,
-        },
-        import: std::sync::Arc::clone(&import),
-        owner,
-        origin,
-    });
+    let direct_image = if crate::backend::vulkan::caps::direct_host_images_allowed() {
+        Some(crate::backend::vulkan::engine::GuestSampledBacking {
+            backing: crate::backend::vulkan::engine::GuestTargetBacking {
+                allocation_host_ptr: import.host_base(),
+                allocation_len: import.len(),
+                plane_offset: base_off,
+                row_pitch,
+            },
+            import: std::sync::Arc::clone(&import),
+            owner,
+            origin,
+        })
+    } else {
+        None
+    };
     Some(GuestRunSource {
         // The whole import, which is the mapping and the window at once.
         runs: std::sync::Arc::new(vec![GuestRun::whole(import.host_base(), import.len())?]),
@@ -5005,40 +5079,41 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // single-plane request retains only the import/run payloads execution
     // needs; allocation geometry and the physical construction list remain on
     // the task resource.
-    if available && planes == 1 {
-        let backing = allocation.as_ref()?;
-        if let Some(packed) =
-            state
-                .bound_buffers
-                .packed_available(task_id, texture_ref, backing.gva, backing.size)
-        {
-            if let Some(request) = direct_linear_sample_from_packed(
-                packed,
-                layout.offset,
-                layout.row_stride,
-                span,
-                row_length_texels,
-                native,
-                sampled_vk_format,
-                native_components,
-                owner.clone(),
-            ) {
-                // Served zero-copy from the retained allocation, so the floor
-                // was never consulted — recorded because this is the band that
-                // would have been declined had the bind needed the copied
-                // fallback, which is what says how much the floor is worth.
-                if span < SAMPLED_GATHER_MIN_BYTES {
-                    crate::runtime::drain::note_store_route("zc_lin_direct_under_floor_span");
+    if available && planes == 1 && crate::backend::vulkan::caps::direct_host_images_allowed() {
+        if let Some(backing) = allocation.as_ref() {
+            if let Some(packed) =
+                state
+                    .bound_buffers
+                    .packed_available(task_id, texture_ref, backing.gva, backing.size)
+            {
+                if let Some(request) = direct_linear_sample_from_packed(
+                    packed,
+                    layout.offset,
+                    layout.row_stride,
+                    span,
+                    row_length_texels,
+                    native,
+                    sampled_vk_format,
+                    native_components,
+                    owner.clone(),
+                ) {
+                    // Served zero-copy from the retained allocation, so the floor
+                    // was never consulted — recorded because this is the band that
+                    // would have been declined had the bind needed the copied
+                    // fallback, which is what says how much the floor is worth.
+                    if span < SAMPLED_GATHER_MIN_BYTES {
+                        crate::runtime::drain::note_store_route("zc_lin_direct_under_floor_span");
+                    }
+                    return Some((w, h, request));
                 }
-                return Some((w, h, request));
             }
         }
     }
 
     // The witness recorder mutably borrows `state`, so the multi-plane arm
-    // owns its resource state across that call. Single-plane binds return above
-    // and never pay this construction-state clone.
-    let packed = if available && planes != 1 {
+    // (and single-plane arm when direct host images are bypassed) owns its
+    // resource state across that call.
+    let packed = if available {
         allocation.as_ref().and_then(|backing| {
             state
                 .bound_buffers
@@ -5052,54 +5127,59 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     if let Some(packed) = packed {
         if sampled_gather_floor_admits(SampledFloorRail::Linear, native, span) {
             let page = state.page_size();
-            let packed_offset = packed.head.checked_add(layout.offset)?;
-            let first_page = usize::try_from(packed_offset / page).ok()?;
-            let head_off = packed_offset % page;
-            let page_count = usize::try_from(head_off.checked_add(span)?.div_ceil(page)).ok()?;
-            let witness_gpas = packed
-                .gpas
-                .get(first_page..first_page.checked_add(page_count)?)?;
-            // Import coordinates on both sides: `packed.head` is an offset
-            // from the import's own base, so the mapping this is cut from is
-            // the import and its bound is the import's length.
-            let witness_runs = [engine::GuestRun::in_mapping(
-                packed.import.host_base(),
-                packed.import.len(),
-                packed_offset,
-                span,
-            )?];
-            let seen = crate::runtime::gather_witness::note_gather(
-                state,
-                host,
-                crate::runtime::gather_witness::GatherRail::Linear,
-                crate::runtime::gather_witness::GatherKey::TaskGva { task_id, gva },
-                crate::runtime::gather_witness::GatherWindow {
-                    gpas: witness_gpas,
-                    runs: &witness_runs,
+            let witness = (|| {
+                let packed_offset = packed.head.checked_add(layout.offset)?;
+                let first_page = usize::try_from(packed_offset / page).ok()?;
+                let head_off = packed_offset % page;
+                let page_count = usize::try_from(head_off.checked_add(span)?.div_ceil(page)).ok()?;
+                let witness_gpas = packed
+                    .gpas
+                    .get(first_page..first_page.checked_add(page_count)?)?;
+                // Import coordinates on both sides: `packed.head` is an offset
+                // from the import's own base, so the mapping this is cut from is
+                // the import and its bound is the import's length.
+                let witness_runs = [engine::GuestRun::in_mapping(
+                    packed.import.host_base(),
+                    packed.import.len(),
+                    packed_offset,
                     span,
-                    page_size: page as usize,
-                },
-            );
-            return Some((
-                w,
-                h,
-                SampledSourceRequest::GuestRuns(
-                    engine::GuestRunSource {
-                        runs: std::sync::Arc::clone(&packed.runs),
-                        source_offset: layout.offset,
-                        total_len: span,
-                        row_length_texels,
-                        pages: Some(std::sync::Arc::clone(&packed.pages)),
-                        direct_image: None,
+                )?];
+                Some((witness_gpas, witness_runs))
+            })();
+            if let Some((witness_gpas, witness_runs)) = witness {
+                let seen = crate::runtime::gather_witness::note_gather(
+                    state,
+                    host,
+                    crate::runtime::gather_witness::GatherRail::Linear,
+                    crate::runtime::gather_witness::GatherKey::TaskGva { task_id, gva },
+                    crate::runtime::gather_witness::GatherWindow {
+                        gpas: witness_gpas,
+                        runs: &witness_runs,
+                        span,
+                        page_size: page as usize,
                     },
-                    native,
-                    sampled_vk_format,
-                    planes,
-                    Some(LinearSampleIdentity::from(seen.identity)),
-                    seen.vouch,
-                    native_components,
-                ),
-            ));
+                );
+                return Some((
+                    w,
+                    h,
+                    SampledSourceRequest::GuestRuns(
+                        engine::GuestRunSource {
+                            runs: std::sync::Arc::clone(&packed.runs),
+                            source_offset: layout.offset,
+                            total_len: span,
+                            row_length_texels,
+                            pages: Some(std::sync::Arc::clone(&packed.pages)),
+                            direct_image: None,
+                        },
+                        native,
+                        sampled_vk_format,
+                        planes,
+                        Some(LinearSampleIdentity::from(seen.identity)),
+                        seen.vouch,
+                        native_components,
+                    ),
+                ));
+            }
         }
     }
 
@@ -5569,7 +5649,8 @@ fn native_uploads_asking_host() -> NativeUploads {
         // `SAMPLED_IMAGE_FILTER_LINEAR` by mandate — and a per-layout flag
         // would be two fields nobody could point at a host that needed them.
         float16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Float)
-            && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float),
+            && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float)
+            && engine::supports_sampled_layout_linear_filter(TexelLayout::R16Float),
         // One flag for BC1 through BC7 because Vulkan gates them behind one
         // feature — see `caps::device_features::DeviceFeatures::
         // texture_compression_bc`. A per-family flag would be ten fields nobody
@@ -8743,10 +8824,45 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // generation when the guest recycled a page, and the identity must
         // name that new generation rather than the one paired with the retired
         // alias.
-        let mapper_ref_texture_guest_backing =
+        let mut mapper_ref_texture_guest_backing =
             mapper_ref_texture_guest_target_backing(state, host, req);
         let mapper_ref_texture_resident_target =
             mapper_ref_texture_store_identity(state, req, writeback_guest);
+        // Step 2: persistent composite/scanout surfaces prefer an existing
+        // DEVICE_LOCAL resident (or a fresh one) over importing guest RAM as
+        // the render target. Gathers/staging keep VK_EXT_external_memory_host.
+        let mut promote_persistent = false;
+        if let Some(identity) = mapper_ref_texture_render_identity(state, req) {
+            let c0 = req.colors.first().expect("render identity implies color0");
+            let format = state
+                .mappings
+                .get(&c0.mapping_id)
+                .map(|m| {
+                    if m.format != 0 {
+                        m.format
+                    } else {
+                        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
+                    }
+                })
+                .unwrap_or(crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM);
+            let decision = crate::runtime::target_residency::prefer_device_local_target(
+                state,
+                host,
+                c0.mapping_id,
+                c0.width,
+                c0.height,
+                format,
+                &identity,
+                true,
+            );
+            if matches!(
+                decision,
+                crate::runtime::target_residency::PromoteDecision::PreferDeviceLocal { .. }
+            ) {
+                mapper_ref_texture_guest_backing = None;
+                promote_persistent = true;
+            }
+        }
         if req.chain_from_resident && render_chain_identity(state, req).is_some() {
             // The serialized chain names the resident it intends to load;
             // existence and readiness are engine state and are validated
@@ -8760,6 +8876,56 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // pages. Honour that here, or put the seed back.
         let mut gva_load_identity =
             honour_gva_load_elision(state, host, req, &mut chain_load_from_target);
+        // Step 4: persistent DEVICE_LOCAL LOAD elision. When the promoted
+        // resident's content stamp matches the mapping and surface_currency
+        // proves no guest write, take LoadFromTarget and skip the CPU/guest seed.
+        if !chain_load_from_target {
+            if let Some(identity) = mapper_ref_texture_render_identity(state, req) {
+                if let Some(c0) = req.colors.first() {
+                    let load_preserves = reims_vgpu_protocol::pass_action::LoadAction::from_declared(
+                        c0.load_action,
+                    )
+                    .preserves_prior_contents();
+                    let format = state
+                        .mappings
+                        .get(&c0.mapping_id)
+                        .map(|m| {
+                            if m.format != 0 {
+                                m.format
+                            } else {
+                                crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
+                            }
+                        })
+                        .unwrap_or(crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM);
+                    // Only attempt when Step 2 already preferred DEVICE_LOCAL, or
+                    // a live slot is already marked promoted — avoids flooding
+                    // refusal slugs on every ordinary texture LOAD.
+                    let candidate = promote_persistent
+                        || crate::backend::vulkan::engine::observe_resident_promotion(&identity)
+                            .is_some_and(|o| o.promoted);
+                    if candidate {
+                        match crate::runtime::target_residency::prefer_load_from_persistent_resident(
+                            state,
+                            host,
+                            c0.mapping_id,
+                            c0.width,
+                            c0.height,
+                            format,
+                            &identity,
+                            load_preserves,
+                        ) {
+                            Ok(()) => {
+                                chain_load_from_target = true;
+                                crate::runtime::drain::note_store_route("persistent_load_elided");
+                            }
+                            Err(refusal) => {
+                                crate::runtime::drain::note_store_route(refusal.slug());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Mapper-ref-texture composite Load. A retained guest-allocation target is the
         // guest's texture resource itself, so its LOAD is authoritative without
         // comparing two copies. A device-allocation target is a mirror: only
@@ -9495,6 +9661,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // surface allocation would bind two unrelated resources together.
         if resources.target_identity == mapper_ref_texture_render_identity(state, req) {
             resources.guest_target_memory = mapper_ref_texture_guest_backing;
+            resources.promote_persistent = promote_persistent;
             resources.load_guest_target_backing = resources.guest_target_memory.is_some()
                 && req.colors.first().is_some_and(|color| {
                     // Same admission as `mapper_ref_texture_load_is_a_seed_candidate`, and

@@ -3719,6 +3719,17 @@ pub(crate) unsafe fn execute_draw_inner(
             let primary_view = attachment_view;
             let primary_access = t.access;
             let primary_slot_fb = t.framebuffer;
+            let stamp_promotion = req.promote_persistent && !target_guest_backed;
+            // `t` borrowed `pools`; copy fields above before mutably marking.
+            if stamp_promotion {
+                if let Some(reused) = pools.registry_mark_promoted(identity) {
+                    crate::runtime::drain::note_store_route(if reused {
+                        "promote_reused_device_local"
+                    } else {
+                        "promote_device_local_confirmed"
+                    });
+                }
+            }
             if ordinary_ad_hoc_framebuffer {
                 let views = ad_hoc_attachment_views(
                     ctx,

@@ -1055,6 +1055,8 @@ impl ResourcePools {
                 // A recycled image arrives here too, and its stale contents are
                 // not this identity's content.
                 gpu_only_content: false,
+                promoted: false,
+                guest_published_epoch: 0,
                 last_touch_ms,
             },
         );
@@ -2048,6 +2050,26 @@ impl ResourcePools {
         self.set_sole_copy(identity, !guest_backed);
     }
 
+    /// Stamp an intentional DEVICE_LOCAL persistent promotion on a live slot.
+    ///
+    /// Returns false when the identity is absent or still guest-imported —
+    /// promotion never labels an imported guest-RAM target as device-local.
+    /// Prefer this over touching `registry` from outside the pools module.
+    /// Returns `None` when absent or still guest-imported; `Some(already)` when
+    /// the slot was stamped (`already` is whether `promoted` was already true).
+    pub(crate) fn registry_mark_promoted(
+        &mut self,
+        identity: &TargetIdentity,
+    ) -> Option<bool> {
+        let slot = self.registry.get_mut(identity)?;
+        if slot.memory.is_guest_imported() {
+            return None;
+        }
+        let already = slot.promoted;
+        slot.promoted = true;
+        Some(already)
+    }
+
     /// Mark a depth resident as holding rendered contents, after a pass that
     /// stored them.
     ///
@@ -2318,6 +2340,24 @@ impl ResourcePools {
         match self.registry.get_mut(identity) {
             Some(slot) if slot.content_ready => {
                 slot.content_epoch = Some(epoch);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Step 3: mark that guest-visible pages hold this resident's pixels as of
+    /// `epoch`, only after an ordered copyback has completed. Distinct from
+    /// [`Self::registry_stamp_content_epoch`] (resident mirrors mapping) —
+    /// publication is about the guest CPU-visible store, not the GPU mirror.
+    pub(crate) fn registry_stamp_guest_published_epoch(
+        &mut self,
+        identity: &TargetIdentity,
+        epoch: u32,
+    ) -> bool {
+        match self.registry.get_mut(identity) {
+            Some(slot) if slot.content_ready && !slot.memory.is_guest_imported() => {
+                slot.guest_published_epoch = epoch;
                 true
             }
             _ => false,
@@ -3003,6 +3043,8 @@ pub(super) mod pin_count_tests {
             resource_released: false,
             resource_owner_count: 0,
             gpu_only_content: false,
+            promoted: false,
+            guest_published_epoch: 0,
             last_touch_ms: 0,
         }
     }

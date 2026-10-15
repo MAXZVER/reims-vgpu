@@ -1888,6 +1888,13 @@ pub(crate) struct ResolvedResident {
     /// blit leaves the image in, so it is part of the resolution and not a
     /// property re-derived at present time.
     pub guest_imported: bool,
+    /// Step 3 GPU-frame handoff: resident content stamp at publish (mapping's
+    /// `surface_content_epoch` the image last matched), or `None` when unset.
+    pub content_epoch: Option<u32>,
+    /// Step 3: last epoch published into guest-visible RAM (0 = never).
+    pub guest_published_epoch: u32,
+    /// Step 3: intentional DEVICE_LOCAL promotion bit from the live slot.
+    pub promoted: bool,
 }
 
 /// Resolve a slot into what the window's blit needs from it.
@@ -1901,6 +1908,9 @@ pub(crate) fn slot_window_resolution(slot: &ResidentTargetSlot) -> ResolvedResid
         width: slot.width,
         height: slot.height,
         guest_imported: slot.memory.is_guest_imported(),
+        content_epoch: slot.content_epoch,
+        guest_published_epoch: slot.guest_published_epoch,
+        promoted: slot.promoted,
     }
 }
 
@@ -2321,6 +2331,15 @@ pub(crate) struct ResidentTargetSlot {
     /// Sampled and staging images are written on other paths, but they are not
     /// registry residents and hold no identity a later draw could resolve.
     pub gpu_only_content: bool,
+    /// Step 2: this `DEVICE_LOCAL` resident was chosen as a persistent
+    /// composite/scanout target rather than imported guest RAM. Derived
+    /// consumers read it via `observe_resident_promotion`; it is not a
+    /// second pixel store.
+    pub promoted: bool,
+    /// Step 3: `surface_content_epoch` last successfully copied to guest-visible
+    /// memory. Remains 0 until ordered copyback completion stamps it via
+    /// [`ResourcePools::registry_stamp_guest_published_epoch`].
+    pub guest_published_epoch: u32,
     /// Value of `ResourcePools::idle_clock_ms` at this target's last use,
     /// retained for reuse-distance diagnostics. It is not a lifetime deadline.
     pub last_touch_ms: u64,
@@ -4348,6 +4367,8 @@ mod resident_reuse_tests {
             resource_released: false,
             resource_owner_count: 0,
             gpu_only_content: false,
+            promoted: false,
+            guest_published_epoch: 0,
             last_touch_ms: 0,
         }
     }

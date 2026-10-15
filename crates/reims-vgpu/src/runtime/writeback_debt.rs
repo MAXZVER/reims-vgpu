@@ -361,6 +361,18 @@ impl PendingWritebacks {
         self.debts.remove(&mapping_id)
     }
 
+    /// Drop `mapping_id`'s debt without paying it (e.g. when backing pages are refreshed
+    /// and the old generation/pages are retired). Step 3: keeps
+    /// `released_write_after_release` at 0 by cancelling rather than paying into
+    /// retired pages.
+    pub fn drop_mapping(&mut self, mapping_id: u32) -> bool {
+        let dropped = self.debts.remove(&mapping_id).is_some();
+        if dropped {
+            crate::runtime::drain::note_store_route("wbdebt_cancelled_on_refresh_or_unmap");
+        }
+        dropped
+    }
+
     /// Every mapping owed a frame, oldest arm first.
     pub fn mappings_by_age(&self) -> Vec<u32> {
         let mut all: Vec<(u64, u32)> = self.debts.iter().map(|(id, d)| (d.seq, *id)).collect();
@@ -3002,5 +3014,27 @@ mod tests {
         note_guest_framebuffer_write(&mut state, 5, SampledBind, |_| {
             unreachable!("the latch is set; the evidence must not be asked for")
         });
+    }
+
+    /// Step 3: backing refresh / unmap cancel the mapping debt instead of
+    /// paying into retired pages (`released_write_after_release` stays 0).
+    #[test]
+    fn drop_mapping_cancels_debt_without_paying() {
+        use crate::runtime::drain::store_route_count;
+        let mut pending = PendingWritebacks::default();
+        assert!(
+            pending
+                .arm(11, ident(11, 32, 32, 1), 32, 32, 1)
+                .is_none()
+        );
+        assert!(pending.get(11).is_some());
+        let before = store_route_count("wbdebt_cancelled_on_refresh_or_unmap");
+        assert!(pending.drop_mapping(11));
+        assert!(pending.get(11).is_none());
+        assert!(
+            store_route_count("wbdebt_cancelled_on_refresh_or_unmap") > before,
+            "cancel must be greppable"
+        );
+        assert!(!pending.drop_mapping(11), "second drop is a no-op");
     }
 }

@@ -493,7 +493,9 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
             want: dst_format,
         });
     }
-    let shared_backing = if host.map_pages_stable() {
+    let shared_backing = if host.map_pages_stable()
+        && crate::backend::vulkan::caps::direct_host_images_allowed()
+    {
         mapper::ensure_contig_view(state, host, mapping_id).map(|(ptr, len)| {
             crate::backend::vulkan::engine::GuestTargetBacking {
                 allocation_host_ptr: ptr,

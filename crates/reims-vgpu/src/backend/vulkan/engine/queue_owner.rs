@@ -14,6 +14,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use super::stamp_completion::SubmissionNote;
 
 type Reply = mpsc::SyncSender<Result<QueueOutcome, vk::Result>>;
+#[cfg(feature = "host-window")]
 type PresentReply = mpsc::SyncSender<Result<bool, vk::Result>>;
 
 #[derive(Clone, Copy, Debug)]
@@ -37,10 +38,12 @@ struct OwnedSubmit {
 /// ordering point, then waited after that lock is released.  Keeping the
 /// receiver as a value makes the split explicit: accepting the transaction and
 /// completing the host driver calls are two different events.
+#[cfg(any(test, feature = "host-window"))]
 pub(crate) struct PendingPresent {
     receiver: mpsc::Receiver<Result<bool, vk::Result>>,
 }
 
+#[cfg(any(test, feature = "host-window"))]
 impl PendingPresent {
     pub(crate) fn wait(self) -> Result<bool, vk::Result> {
         self.receiver
@@ -54,6 +57,9 @@ enum Request {
         submit: OwnedSubmit,
         reply: Option<Reply>,
     },
+    /// Built only by `enqueue_present`, so gated with it (`host-window`),
+    /// matching `context::PresentTransaction` / `submit_present_transaction`.
+    #[cfg(feature = "host-window")]
     PresentTransaction {
         submit: OwnedSubmit,
         loader: ash::khr::swapchain::Device,
@@ -364,6 +370,7 @@ fn run(
                     let _ = reply.send(result.map(|_| QueueOutcome::Unit));
                 }
             }
+            #[cfg(feature = "host-window")]
             Request::PresentTransaction {
                 submit,
                 loader,
@@ -423,6 +430,7 @@ fn run(
     }
 }
 
+#[cfg(any(test, feature = "host-window"))]
 fn complete_present_transaction(
     failure: &FailureLatch,
     submit: impl FnOnce() -> Result<(), vk::Result>,

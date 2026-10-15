@@ -1855,6 +1855,10 @@ impl WindowPresenter {
         if presented {
             self.cadence_presents = self.cadence_presents.saturating_add(1);
             self.cadence_direct = self.cadence_direct.saturating_add(u64::from(direct));
+            // Step 3: CPU-frame is a logged fallback only — never the desired path.
+            if !direct {
+                crate::runtime::drain::note_store_route("present_cpu_fallback");
+            }
         } else {
             self.cadence_busy = self.cadence_busy.saturating_add(1);
         }

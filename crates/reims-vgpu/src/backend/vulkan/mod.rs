@@ -292,6 +292,9 @@ impl Backend for VulkanBackend {
         // exact identity and geometry — so it runs whether or not the window
         // ends up taking the resident.
         let publication = engine::prepare_window_resident_present(&identity, width, height)?;
+        let map_generation = identity.generation();
+        let format = identity.resident_format();
+        let content_epoch = publication.resolved.content_epoch;
         Ok(window::WindowResident::Vulkan(
             engine::WindowPresentSource {
                 width,
@@ -299,6 +302,10 @@ impl Backend for VulkanBackend {
                 identity,
                 epoch: publication.epoch,
                 resolved: publication.resolved,
+                map_generation,
+                content_epoch,
+                format,
+                completion: engine::WindowPresentCompletion::GuestBatchFlushedAtPublish,
             },
         ))
     }

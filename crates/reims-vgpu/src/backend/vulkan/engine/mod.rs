@@ -81,7 +81,7 @@ pub use types::{
     SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
     SeedOrder, StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
     TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource,
-    VertexStepFunction, ViewportResource, VisibilityResultMode, WindowPresentSource,
+    VertexStepFunction, ViewportResource, VisibilityResultMode, WindowPresentCompletion, WindowPresentSource,
     COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
@@ -2372,6 +2372,52 @@ pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
     resident_content_backing(identity) != ResidentContentBacking::NotReady
 }
 
+/// Live registry facts a promotion decision needs, derived from the slot.
+///
+/// Returns `None` when nothing is registered for `identity`. Placement bytes
+/// use the same lower-bound formula as the registry's attachment accounting.
+pub fn observe_resident_promotion(
+    identity: &TargetIdentity,
+) -> Option<crate::runtime::target_residency::LiveResidentObservation> {
+    use crate::runtime::target_residency::{AllocationPlacement, LiveResidentObservation};
+    let guard = lock_engine();
+    let slot = guard.pools.registry_get(identity)?;
+    let bytes = crate::backend::vulkan::translate::pixel::bytes_per_texel(slot.format.declared())
+        .map(|texel| {
+            u64::from(slot.width)
+                * u64::from(slot.height)
+                * u64::from(slot.sample_count)
+                * u64::from(texel)
+        })
+        .unwrap_or(0);
+    let backing = classify_resident_content(slot.content_ready, slot.memory.is_guest_imported());
+    let placement = if slot.memory.is_guest_imported() {
+        AllocationPlacement::ImportedGuestRam { bytes }
+    } else {
+        AllocationPlacement::DeviceLocal { bytes }
+    };
+    let allocation_id = {
+        use ash::vk::Handle;
+        slot.image.as_raw()
+    };
+    Some(LiveResidentObservation {
+        backing,
+        placement,
+        allocation_id,
+        promoted: slot.promoted,
+        guest_published_epoch: slot.guest_published_epoch,
+    })
+}
+
+/// Mark a live `DEVICE_LOCAL` resident as an intentional persistent promotion.
+///
+/// No-op (and returns false) when the identity is absent or still guest-imported:
+/// promotion never labels an imported guest-RAM target as device-local.
+pub fn mark_resident_promoted(identity: &TargetIdentity) -> bool {
+    let mut guard = lock_engine();
+    guard.pools.registry_mark_promoted(identity).is_some()
+}
+
 #[cfg(test)]
 mod resident_content_backing_tests {
     use super::*;
@@ -2494,6 +2540,16 @@ pub fn resident_content_state(identity: &TargetIdentity) -> ResidentContent {
 pub fn stamp_resident_content_epoch(identity: &TargetIdentity, epoch: u32) -> bool {
     let mut guard = lock_engine();
     guard.pools.registry_stamp_content_epoch(identity, epoch)
+}
+
+/// Step 3: after an ordered guest copyback completes, record that guest-visible
+/// pages hold this resident as of `epoch`. Returns false when absent, not
+/// content_ready, or still guest-imported (imported *is* the guest pages).
+pub fn stamp_guest_published_epoch(identity: &TargetIdentity, epoch: u32) -> bool {
+    let mut guard = lock_engine();
+    guard
+        .pools
+        .registry_stamp_guest_published_epoch(identity, epoch)
 }
 
 /// Record that this resident's pixels now exist somewhere that outlives the

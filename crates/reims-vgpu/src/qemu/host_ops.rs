@@ -143,8 +143,18 @@ pub struct ReimsVgpuHostOps {
         Option<unsafe extern "C" fn(ctx: *mut c_void, out: *mut PageAliasCensus) -> i32>,
     /// Non-zero when every dirty-log harvest a register write asked for has
     /// finished. Never blocks. `None` is a shim that harvests inline, which is
-    /// always settled. Must stay the last field: it is the header's.
+    /// always settled.
     pub harvests_settled: Option<unsafe extern "C" fn(ctx: *mut c_void) -> c_int>,
+    /// Monotonic epoch of host-side dirty synchronization points.
+    ///
+    /// Increments whenever dirty bitmaps are harvested (doorbell, background,
+    /// or explicit harvest). Profiling only since v23: never a cache key.
+    pub dirty_sync_epoch: Option<unsafe extern "C" fn(ctx: *mut c_void) -> u64>,
+    /// v23: monotonic guest doorbell (observation) epoch, the only key a cached
+    /// dirty verdict may be held under. See
+    /// [`crate::runtime::host::HostOps::dirty_observation_epoch`]. Must stay
+    /// the last field: it is the header's.
+    pub dirty_observation_epoch: Option<unsafe extern "C" fn(ctx: *mut c_void) -> u64>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -185,6 +195,8 @@ impl ReimsVgpuHostOps {
             guest_ram_regions: None,
             notify_actions: None,
             harvests_settled: None,
+            dirty_sync_epoch: None,
+            dirty_observation_epoch: None,
         }
     }
 }
@@ -784,6 +796,23 @@ impl HostOps for QemuHost<'_> {
         }
         out.truncate(n);
         Some(out)
+    }
+
+    fn dirty_sync_epoch(&self) -> u64 {
+        match self.ops.dirty_sync_epoch {
+            // SAFETY: QEMU owns ctx; safe from any thread.
+            Some(f) => unsafe { f(self.ops.ctx) },
+            None => 0,
+        }
+    }
+
+    fn dirty_observation_epoch(&self) -> u64 {
+        match self.ops.dirty_observation_epoch {
+            // SAFETY: QEMU owns ctx; lock-free acquire load, safe from any thread.
+            Some(f) => unsafe { f(self.ops.ctx) },
+            // No callback: no observation epoch, so nothing may be cached.
+            None => 0,
+        }
     }
 }
 

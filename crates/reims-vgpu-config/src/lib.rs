@@ -1308,6 +1308,14 @@ pub const COLOR_GENERAL: &str = "REIMS_VGPU_COLOR_GENERAL";
 /// outcome a tiling compositor already produces. `host_window::present`'s
 /// `WindowMode` owns both halves.
 pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
+
+/// **Default off on discrete GPUs.** `on` allows directly binding linear `VkImage`s
+/// over `VK_EXT_external_memory_host` imports in host system RAM (`direct_image` and `shared_backing`).
+///
+/// When unset or `off`, all `VkImage`s are forced to Dedicated `DEVICE_LOCAL` VRAM
+/// (`VK_IMAGE_TILING_OPTIMAL`), and host-pointer imports are used strictly as `VkBuffer` DMA
+/// staging conduits asynchronously transferred via `vkCmdCopyBufferToImage` / `vkCmdCopyImageToBuffer`.
+pub const DIRECT_HOST_IMAGES: &str = "REIMS_VGPU_DIRECT_HOST_IMAGES";
 }
 
 counts! {

@@ -377,6 +377,7 @@ pub enum SampledClass {
     Rg8Unorm,
     Rgba8Unorm,
     Bgra8Unorm,
+    R16Float,
     Rgba16Float,
     Rg16Float,
     /// The packed 32-bit word `MTLPixelFormatBGR10A2Unorm` stores a texel in.
@@ -1810,6 +1811,7 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
         MTL_FORMAT_RG8_UNORM => SampledClass::Rg8Unorm,
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => SampledClass::Rgba8Unorm,
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => SampledClass::Bgra8Unorm,
+        MTL_FORMAT_R16_FLOAT => SampledClass::R16Float,
         MTL_FORMAT_RGBA16_FLOAT => SampledClass::Rgba16Float,
         MTL_FORMAT_RG16_FLOAT => SampledClass::Rg16Float,
         MTL_FORMAT_RGB10A2_UNORM => SampledClass::Rgb10a2Unorm,
@@ -4064,6 +4066,7 @@ mod tests {
                 SampledClass::Bgra8Unorm => TexelLayout::Bgra8,
                 SampledClass::A8Unorm | SampledClass::R8Unorm => TexelLayout::R8,
                 SampledClass::Rg8Unorm => TexelLayout::Rg8,
+                SampledClass::R16Float => TexelLayout::R16Float,
                 SampledClass::Rgba16Float => TexelLayout::Rgba16Float,
                 SampledClass::Rg16Float => TexelLayout::Rg16Float,
                 SampledClass::Rgb10a2Unorm => TexelLayout::Rgb10a2Unorm,
@@ -4917,6 +4920,7 @@ mod tests {
                 Some(match order {
                     TexelLayout::Rgba8 => SampledClass::Rgba8Unorm,
                     TexelLayout::Bgra8 => SampledClass::Bgra8Unorm,
+                    TexelLayout::R16Float => SampledClass::R16Float,
                     TexelLayout::Rgba16Float => SampledClass::Rgba16Float,
                     TexelLayout::Rg16Float => SampledClass::Rg16Float,
                     TexelLayout::Rgb10a2Unorm => SampledClass::Rgb10a2Unorm,

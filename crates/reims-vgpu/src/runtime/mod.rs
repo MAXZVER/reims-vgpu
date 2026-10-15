@@ -51,11 +51,11 @@ pub mod gpa_map;
 /// The last few pieces of work handed to the GPU, so a host GPU hang can name
 /// what it was running instead of only that a fence stopped signalling.
 pub mod gpu_hang_trail;
-/// The bound on every GPU reference to guest RAM — one import per RAMBlock,
+/// The bound on every GPU reference to guest RAM â€” one import per RAMBlock,
 /// and the only type that can name a byte inside one.
 ///
 /// Re-exported from `reims_vgpu_memory` under the path every caller already
-/// writes (`crate::runtime::guest_ram::…`) so moving the module out did not
+/// writes (`crate::runtime::guest_ram::â€¦`) so moving the module out did not
 /// move a call site. The crate boundary is what makes the bound structural:
 /// nothing there can see a resource table, a Vulkan handle or a QEMU
 /// structure, so there is no second way to answer "how big is this" and no
@@ -64,13 +64,13 @@ pub use reims_vgpu_memory as guest_ram;
 /// This process's imports of guest RAM, and the one place a guest physical
 /// address becomes a bindable reference.
 pub mod guest_ram_map;
-/// Scattered guest windows → image-copy rectangles. Pure arithmetic, ungated so
+/// Scattered guest windows â†’ image-copy rectangles. Pure arithmetic, ungated so
 /// both backends and every test arm reach it.
-/// Task GVA → guest RAM reads.
+/// Task GVA â†’ guest RAM reads.
 pub mod gva_mem;
 /// Which GVA render targets a Store has stamped, and what the two write
 /// witnesses said at the time. Neutral: it keys on the guest span a rail's
-/// resident stands for — see `Backend::gva_witness_key` — and not on the rail's
+/// resident stands for â€” see `Backend::gva_witness_key` â€” and not on the rail's
 /// own name for that resident.
 pub mod gva_store_witness;
 /// Task-GVA HostOps views (MapMemory2 / UnmapMemory lifecycle).
@@ -78,7 +78,7 @@ pub mod gva_view;
 /// CmdHeapTextureSizeAndAlign wire decode + host requirement query.
 pub mod heap_query;
 pub mod host;
-/// Which guest pages this device has written, and when — the half of the
+/// Which guest pages this device has written, and when â€” the half of the
 /// guest-write witness the hypervisor's dirty bitmap cannot supply.
 pub mod host_writes;
 /// Serializer-object ICB (0x36) materialization, host command fills, execute writeback.
@@ -94,7 +94,7 @@ pub mod draw;
 pub mod ingress;
 pub mod input;
 pub(crate) mod lifetime_trace;
-/// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
+/// Process-global metal2vulkan SPIR-V cache (AIR content hash â†’ SPIR-V).
 pub mod m2v_cache;
 /// IOSurface mapper capture + page-table resolve.
 pub mod map_audit;
@@ -104,7 +104,7 @@ pub mod mapping_write;
 /// generateMipmaps for multi-mip normal-texture linear textures.
 pub mod mipmap;
 pub mod mmio;
-/// MTLB container → wrapped-AIR carve for metal2vulkan.
+/// MTLB container â†’ wrapped-AIR carve for metal2vulkan.
 pub mod mtlb;
 pub mod node_guard;
 /// Object-list lookup and mapper-ref-texture registration.
@@ -114,7 +114,7 @@ pub mod objects;
 pub mod parked;
 pub mod plan;
 /// Whether a range's page-table entries are in the state the guest's own next
-/// edit of them requires — the direction that is ordered is the map.
+/// edit of them requires â€” the direction that is ordered is the map.
 pub mod range_coverage;
 pub mod released_pages;
 /// Transfer a host-resident render frame into guest pages when synchronization
@@ -129,19 +129,20 @@ pub(crate) mod resolve_profile;
 pub mod resource_validity;
 /// The split of [`chain_phase`]'s largest *undivided* column, `sampled_us`.
 pub mod sampled_phase;
-/// Guest surface → host BGRA8 for the QEMU console.
+/// Guest surface â†’ host BGRA8 for the QEMU console.
 pub mod scanout;
 /// SPIR-V set-0 binding relocation for metal2vulkan + internal Vulkan engine (Linux).
 pub mod spirv_bind;
 mod spirv_layout;
 /// How wide a translated vertex shader's stage-in reads are, per `Location`.
 pub mod spirv_vertex_input;
-/// Host surface cache (Linux/Vulkan discrete-GPU present, kb §8.5).
+/// Host surface cache (Linux/Vulkan discrete-GPU present, kb آ§8.5).
 pub mod surface_cache;
 /// Whether a host-side copy of a mapper-ref-texture surface's pixels is still
 /// that surface's content, per the hypervisor's witness.
 pub mod surface_currency;
-/// The wire task word a command payload carries → a live task slot.
+pub mod target_residency;
+/// The wire task word a command payload carries â†’ a live task slot.
 pub mod task_slot;
 /// Texture / mapper-ref-texture geometry registration.
 pub mod texture;

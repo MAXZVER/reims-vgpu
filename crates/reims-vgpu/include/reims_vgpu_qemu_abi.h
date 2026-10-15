@@ -21,7 +21,11 @@
 extern "C" {
 #endif
 
-/* v21: ReimsVgpuHostOps.harvests_settled — whether every dirty-log harvest a
+/* v23: ReimsVgpuHostOps.dirty_observation_epoch — the guest doorbell epoch, the
+ *      only key a cached dirty/currency verdict may be held under.
+ *      dirty_sync_epoch stays, for profiling only.
+ * v22: ReimsVgpuHostOps.dirty_sync_epoch — monotonic dirty sync / harvest epoch.
+ * v21: ReimsVgpuHostOps.harvests_settled — whether every dirty-log harvest a
  *      register write has asked for has finished. A shim that harvests off the
  *      vCPU lets the writing vCPU go at once; the drain asks this before it
  *      serves work a doorbell handed over, and leaves the work for a later
@@ -99,7 +103,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 21u
+#define REIMS_VGPU_QEMU_ABI_VERSION 23u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -398,6 +402,22 @@ typedef struct ReimsVgpuHostOps {
      * is always settled.
      */
     int (*harvests_settled)(void *ctx);
+    /*
+     * Monotonic dirty sync / harvest epoch. Advances when a dirty sync or
+     * harvest completes; doorbells do not advance it. Profiling only — never a
+     * cache key. Returns 0 when unsupported. Safe from any thread.
+     */
+    uint64_t (*dirty_sync_epoch)(void *ctx);
+    /*
+     * v23: monotonic guest doorbell (observation) epoch, read with acquire
+     * semantics. Advances at every doorbell that makes guest stores visible to
+     * the device; a guest_write_gen / guest_written_pages answer bracketed by
+     * two equal values is complete for every doorbell up to that value. The
+     * only key a cached dirty verdict may be held under. Returns 0 when
+     * unsupported or before the first doorbell (never a cache key). Safe from
+     * any thread. Must stay the last field.
+     */
+    uint64_t (*dirty_observation_epoch)(void *ctx);
 } ReimsVgpuHostOps;
 
 /*

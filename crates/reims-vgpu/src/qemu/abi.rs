@@ -97,7 +97,11 @@ use std::slice;
 /// v21 adds `harvests_settled` on [`ReimsVgpuHostOps`], so a shim can harvest the
 /// dirty log off the vCPU and the drain can still refuse to serve work whose
 /// harvest has not finished.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 21;
+/// v22 adds `dirty_sync_epoch` on [`ReimsVgpuHostOps`] for fast-path surface currency.
+/// v23 adds `dirty_observation_epoch` on [`ReimsVgpuHostOps`]: the guest doorbell
+/// epoch, which replaces `dirty_sync_epoch` as the only key a cached dirty
+/// verdict may be held under. `dirty_sync_epoch` remains for profiling only.
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 23;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -1026,15 +1030,16 @@ mod tests {
         assert_eq!(std::mem::offset_of!(GuestRamRegion, len), 16);
     }
 
-    /// `harvests_settled` is the last member of `ReimsVgpuHostOps` on both sides.
+    /// `dirty_observation_epoch` is the last member of `ReimsVgpuHostOps` on
+    /// both sides, with `dirty_sync_epoch` immediately before it.
     ///
     /// Nothing else compares the two declarations field by field, and a
     /// callback slot that sits one pointer off on one side is called with the
-    /// wrong function. The new field is where a v21 table can disagree with a
-    /// v20 one, so that is what this pins: last in the header's struct, and
-    /// last in the Rust one.
+    /// wrong function. The newest fields are where a v23 table can disagree
+    /// with a v22 (or v21) one, so that is what this pins: the last two in the
+    /// header's struct, and the last two in the Rust one.
     #[test]
-    fn the_abi_header_agrees_that_harvests_settled_closes_the_host_ops_table() {
+    fn the_abi_header_agrees_that_dirty_observation_epoch_closes_the_host_ops_table() {
         const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
         let body = HEADER
             .split_once("typedef struct ReimsVgpuHostOps {")
@@ -1043,16 +1048,23 @@ mod tests {
             .split_once("} ReimsVgpuHostOps;")
             .expect("the declaration must be closed")
             .0;
-        let last = body
+        let mut members = body
             .lines()
             .map(str::trim)
-            .rfind(|l| !l.is_empty() && !l.starts_with("/*") && !l.starts_with('*'))
-            .expect("the table has members");
-        assert_eq!(last, "int (*harvests_settled)(void *ctx);");
+            .filter(|l| !l.is_empty() && !l.starts_with("/*") && !l.starts_with('*'));
+        let last = members.next_back().expect("the table has members");
+        let before_last = members.next_back().expect("the table has two members");
+        assert_eq!(last, "uint64_t (*dirty_observation_epoch)(void *ctx);");
+        assert_eq!(before_last, "uint64_t (*dirty_sync_epoch)(void *ctx);");
         assert_eq!(
-            std::mem::offset_of!(ReimsVgpuHostOps, harvests_settled),
+            std::mem::offset_of!(ReimsVgpuHostOps, dirty_observation_epoch),
             std::mem::size_of::<ReimsVgpuHostOps>() - std::mem::size_of::<usize>(),
             "and it is the last pointer of the Rust table"
+        );
+        assert_eq!(
+            std::mem::offset_of!(ReimsVgpuHostOps, dirty_sync_epoch),
+            std::mem::size_of::<ReimsVgpuHostOps>() - 2 * std::mem::size_of::<usize>(),
+            "with dirty_sync_epoch the pointer before it"
         );
     }
 

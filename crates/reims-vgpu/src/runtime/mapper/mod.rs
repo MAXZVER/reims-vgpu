@@ -1577,6 +1577,11 @@ pub fn ensure_guest_write_token<H: HostOps>(
         e.guest_write_token_gen = 0;
         e.guest_write_gen_at_store = 0;
         state.retired_guest_write_tokens.push(stale);
+        state
+            .currency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_mapping(mapping_id);
     }
     let m = state.mappings.get(&mapping_id)?;
     if !m.mapped || m.page_entries.is_empty() {
@@ -1753,6 +1758,11 @@ pub fn commit_guest_write_stamp(
             && m.guest_write_token_gen == m.map_generation;
         m.guest_write_gen_at_store = if current { seen.gen_ } else { 0 };
     }
+    state
+        .currency_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forget_mapping(mapping_id);
 }
 
 /// What the hypervisor's dirty bitmap can say about a backing record's pages

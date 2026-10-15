@@ -3865,6 +3865,17 @@ fn apply_backing<M: HostMemory>(
         let replaced = !prior.is_empty() && changed;
         if changed {
             crate::model::DeviceState::bump_map_generation(m);
+            state
+                .currency_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .forget_mapping(surface_id);
+            state.host_surfaces.remove(&surface_id);
+            state.pending_writebacks.drop_mapping(surface_id);
+            let retired_token = crate::model::DeviceState::take_guest_write_token(m);
+            if retired_token != 0 {
+                state.retired_guest_write_tokens.push(retired_token);
+            }
         }
         if replaced {
             // Recycled-mid backing-refresh census — not a drop. Off the curated
@@ -3932,16 +3943,9 @@ fn apply_backing<M: HostMemory>(
             map_generation: m.map_generation,
         });
         // Contiguous view must be rebuilt.
-        let mut retired_import = None;
-        if m.contig_ptr != 0 {
-            state.retired_views.push((m.contig_ptr, m.contig_len));
-            m.contig_ptr = 0;
-            m.contig_len = 0;
-            m.contig_footprint = None;
-            retired_import = m.contig_import.take().map(|import| {
-                import.retire();
-                import.id()
-            });
+        let (retired, retired_import) = crate::model::DeviceState::take_mapping_view(m);
+        if let Some(v) = retired {
+            state.retired_views.push(v);
         }
         if let Some(import) = retired_import {
             state.retired_guest_imports.push(import);

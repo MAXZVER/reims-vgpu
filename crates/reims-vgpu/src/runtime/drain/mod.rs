@@ -31,6 +31,32 @@ use reims_vgpu_core::query::{self, QueryKind, RequestWords};
 pub(crate) mod census;
 pub use census::*;
 
+/// Step 4: wall-time budget for one drain tranche (non-nested). Yield only at
+/// safe packet / render-chain checkpoints once this elapses.
+pub const DRAIN_SLICE_BUDGET_US: u64 = 8_000;
+
+/// Whether the running tranche has exhausted its 8 ms slice.
+#[inline]
+pub(crate) fn drain_slice_should_yield() -> bool {
+    census::tranche_slice_armed()
+        && census::tranche_elapsed_us() >= DRAIN_SLICE_BUDGET_US
+}
+
+/// A single packet that alone exceeded the slice budget — finish it intact,
+/// do not split mid-packet, and make the overrun greppable.
+#[inline]
+pub(crate) fn note_uninterruptible_packet_if_needed(packet_started: std::time::Instant) {
+    if packet_started.elapsed().as_micros() as u64 >= DRAIN_SLICE_BUDGET_US {
+        note_store_route("uninterruptible_packet");
+    }
+}
+
+/// Leave remaining work armed and exit so QEMU's main/window loop can run.
+#[inline]
+pub(crate) fn note_drain_yield_8ms() {
+    note_store_route("drain_yield_8ms");
+}
+
 // The Vulkan rail's completion-stamp publication, named rather than
 // re-exported flat — `write_stamp` and the root drain reach it only through
 // `Backend`, so neither one mentions a rail.
@@ -2348,6 +2374,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
         }
     }
     state.parked.park(ingress, work);
+    state.last_pump_async_gen = u64::MAX;
 }
 
 /// How much of this packet's ordering is bought by knowing, and how much by not
@@ -2597,6 +2624,11 @@ fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host
 /// Nothing here runs anything. It moves pipelines to `Ready`, and readying a
 /// pipeline is what the model turns into released work.
 fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    let current_async_gen = crate::runtime::m2v_cache::async_completed_gen();
+    if state.last_pump_async_gen == current_async_gen {
+        return;
+    }
+    state.last_pump_async_gen = current_async_gen;
     for ingress in state.parked.waiting_in_order() {
         let Some((submission, resolved)) = state.parked.planning(ingress) else {
             continue;
@@ -4186,6 +4218,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                     .fifo_read
                     .store(packet.next_head, std::sync::atomic::Ordering::Release);
 
+                let packet_started = std::time::Instant::now();
                 admit_and_park(
                     state,
                     host,
@@ -4194,6 +4227,13 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                     packet,
                 );
                 settle_model_work(state, host);
+                note_uninterruptible_packet_if_needed(packet_started);
+                // Step 4: 8 ms slice at a root packet checkpoint.
+                if drain_slice_should_yield() {
+                    state.pending.main_drain = true;
+                    note_drain_yield_8ms();
+                    break;
+                }
             }
         }
     }
@@ -5668,7 +5708,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
             let page_shift = state.page_shift;
             let entries = m.condemned_entries.as_ref().unwrap_or(&m.page_entries);
             for &entry in entries {
-                if let Some(gpa) = crate::protocol::iosurface_pages::entry_gpa_shift(entry, page_shift) {
+                if let Some(gpa) =
+                    crate::protocol::iosurface_pages::entry_gpa_shift(entry, page_shift)
+                {
                     state.host_writes.release_page(gpa);
                 }
             }
@@ -7013,13 +7055,25 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     });
                 }
 
+                let packet_started = std::time::Instant::now();
                 admit_and_park(state, host, fifo, stamp_index, packet);
                 settle_model_work(state, host);
+                note_uninterruptible_packet_if_needed(packet_started);
 
                 if state.pending.host_action_yield {
                     if head != tail {
                         state.pending.child_mask |= bit;
                     }
+                    break;
+                }
+                // Step 4: 8 ms slice — yield only after a completed packet
+                // (settle published any ready frames). Leave remaining ring
+                // work in pending.child_mask.
+                if drain_slice_should_yield() {
+                    if head != tail {
+                        state.pending.child_mask |= bit;
+                    }
+                    note_drain_yield_8ms();
                     break;
                 }
             }
@@ -8093,6 +8147,11 @@ pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
 }
 
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    // Step 4: each drain_pending entry owns one 8 ms slice. Refreshing here
+    // keeps unit tests that call drain_pending without device_drain from
+    // inheriting an aged TRANCHE_START_US, and aligns the budget with this
+    // entry when the device worker already noted a tranche open a few µs ago.
+    census::note_tranche_started(crate::observe::elapsed_us().max(1));
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
     // wakeups must leave guest work queued until scanout consumes the action.
@@ -8173,6 +8232,12 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
                 }
                 if state.pending.host_action_yield {
                     state.pending.child_mask |= remaining;
+                    return;
+                }
+                // Step 4: yield between channels once the tranche slice is spent.
+                if drain_slice_should_yield() {
+                    state.pending.child_mask |= remaining;
+                    note_drain_yield_8ms();
                     return;
                 }
             }

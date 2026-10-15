@@ -919,6 +919,13 @@ fn repair_layout(
     Ok(spirv)
 }
 
+static ASYNC_COMPLETED_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Monotonically increasing generation incremented whenever an asynchronous translation completes.
+pub fn async_completed_gen() -> u64 {
+    ASYNC_COMPLETED_GEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Start translating a render stage without holding protocol state or the
 /// sole FIFO scheduler. Returns true when the content is already resolved
 /// (success or deterministic failure), false while the background worker owns
@@ -1078,11 +1085,19 @@ fn async_worker() {
                             vb.uses_vertex_index as u8
                         ));
                     }
+                    // Pre-warm all 4 shader variants on the background worker thread so the draw thread
+                    // never pays synchronous SPIR-V variant relocation under the engine lock.
+                    shader.variant(false, false);
+                    shader.variant(true, false);
+                    shader.variant(false, true);
+                    shader.variant(true, true);
                     c.put(task.id(), &task.air, Entry::Ready(Arc::new(shader)));
+                    ASYNC_COMPLETED_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
                     (format!("ok spv={len}"), None)
                 }
                 Err(e) => {
                     c.put(task.id(), &task.air, Entry::Failed(e.clone()));
+                    ASYNC_COMPLETED_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
                     ("fail".to_string(), Some(e))
                 }
             };

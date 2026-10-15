@@ -2714,6 +2714,15 @@ pub fn note_tranche_started(now_us: u64) {
     TRANCHE_START_US.store(now_us, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether [`note_tranche_started`] has armed a slice for this worker entry.
+///
+/// Before the first arm (and in unit tests that call `drain_pending` without a
+/// device tranche), [`tranche_elapsed_us`] looks like "forever" because the
+/// start stamp is 0 — Step 4 must not yield in that state.
+pub fn tranche_slice_armed() -> bool {
+    TRANCHE_START_US.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
 /// How long the tranche now running has been running.
 ///
 /// The question this exists for: a guest clears an object-list slot by writing

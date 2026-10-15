@@ -819,6 +819,7 @@ struct TaskResourceLifetime {
 }
 
 impl TaskResourceLifetime {
+    #[allow(deprecated)] // MSYS rustc 1.99 renamed fetch_update -> try_update; keep 1.98-compatible
     fn new() -> Self {
         let id = NEXT_TASK_RESOURCE_LIFETIME
             .fetch_update(
@@ -3589,6 +3590,11 @@ pub struct DeviceState {
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
+    /// Currency verdicts keyed by their precise mapping and Store identity,
+    /// retained only while the host dirty-sync epoch remains unchanged.
+    pub currency_cache: Mutex<crate::runtime::surface_currency::SurfaceCurrencyCache>,
+    /// Last `m2v_cache::async_completed_gen()` observed by `pump_translations`.
+    pub last_pump_async_gen: u64,
 }
 
 /// Domain tag for ch-event segment events (matches event_sync::Domain::Event).
@@ -3731,12 +3737,16 @@ impl DeviceState {
             mapper_ref_texture_memo_scratch: Vec::new(),
             gva_host_views: Vec::new(),
             view_stale_reads: 0,
+            currency_cache: Mutex::new(
+                crate::runtime::surface_currency::SurfaceCurrencyCache::default(),
+            ),
+            last_pump_async_gen: u64::MAX,
         }
     }
 
     /// Detach `e`'s contiguous view for later unmap (page table changed).
     /// Returns the retired (ptr, len) to push into `retired_views`.
-    fn take_mapping_view(
+    pub(crate) fn take_mapping_view(
         e: &mut MappingEntry,
     ) -> (
         Option<(usize, usize)>,
@@ -3761,10 +3771,50 @@ impl DeviceState {
     /// both. Also clears the Store stamp — a generation recorded against a
     /// released token cannot vouch for anything, and leaving it would let a
     /// re-tracked set's first readable generation coincide with it.
-    fn take_guest_write_token(e: &mut MappingEntry) -> u64 {
+    pub(crate) fn take_guest_write_token(e: &mut MappingEntry) -> u64 {
         e.guest_write_gen_at_store = 0;
         e.guest_write_token_gen = 0;
         std::mem::replace(&mut e.guest_write_token, 0)
+    }
+
+    /// Replace `mapping_id`'s `page_entries` on a backing page refresh,
+    /// retiring any contiguous view, guest-write token, and cached currency
+    /// from the prior page list, and recording removed pages as released.
+    pub fn refresh_mapping_backing_pages(
+        &mut self,
+        mapping_id: u32,
+        new_entries: Vec<u32>,
+        backing_walk: Option<BackingWalk>,
+    ) -> u32 {
+        self.currency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_mapping(mapping_id);
+        self.host_surfaces.remove(&mapping_id);
+        let page_shift = self.page_shift;
+        let Some(e) = self.mappings.get_mut(&mapping_id) else {
+            return 0;
+        };
+        let old_entries = std::mem::replace(&mut e.page_entries, new_entries);
+        let (retired, retired_import) = Self::take_mapping_view(e);
+        let retired_token = Self::take_guest_write_token(e);
+        Self::bump_map_generation(e);
+        let new_gen = e.map_generation;
+        e.backing_walk = backing_walk;
+        if let Some(v) = retired {
+            self.retired_views.push(v);
+        }
+        if let Some(import) = retired_import {
+            self.retired_guest_imports.push(import);
+        }
+        if retired_token != 0 {
+            self.retired_guest_write_tokens.push(retired_token);
+        }
+        // Supersede any pending writeback debt armed against the old map_generation
+        // before releasing the old pages, preventing released_write_after_release.
+        self.pending_writebacks.drop_mapping(mapping_id);
+        let _ = (old_entries, page_shift);
+        new_gen
     }
 
     /// Detach every HostOps mapping owned by the current guest lifetime.
@@ -4055,6 +4105,10 @@ impl DeviceState {
         // Held bind resolutions name guest addresses under a device that is
         // going away; nothing about them survives a reset.
         self.bound_buffers.clear();
+        self.currency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // A translation hold that is still standing here never resolved. The
         // hold itself is control flow — the FIFO is parked until an AIR module
         // finishes loading and the packet is retried, not consumed — so it is
@@ -5558,6 +5612,10 @@ impl DeviceState {
         if self.host_surfaces.remove(&mapping_id).is_some() {
             crate::runtime::drain::note_store_route("invalidate_dropped_host_cache");
         }
+        self.currency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_mapping(mapping_id);
         let Some(e) = self.mappings.get_mut(&mapping_id) else {
             return false;
         };
@@ -5593,6 +5651,10 @@ impl DeviceState {
         self.released_mappings.insert(mapping_id);
         self.forget_compositor_mapping(mapping_id);
         self.host_surfaces.remove(&mapping_id);
+        self.currency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_mapping(mapping_id);
         let Some(e) = self.mappings.get_mut(&mapping_id) else {
             return false;
         };
@@ -5676,6 +5738,10 @@ impl DeviceState {
         // Fresh MAP: prior host-cache for this surface_id is stale, and so is
         // any present evidence — the slot may hold a NEW surface.
         self.host_surfaces.remove(&mapping_id);
+        self.currency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_mapping(mapping_id);
         // Present evidence is stamped with the incarnation and deliberately NOT
         // dropped here. A fresh MAP does not yet know whether this is a new
         // surface — that is what the fingerprint compare decides, bumping the
@@ -5693,6 +5759,10 @@ impl DeviceState {
             return false;
         }
         self.forget_compositor_mapping(mapping_id);
+        self.currency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_mapping(mapping_id);
         if let Some(e) = self.mappings.get_mut(&mapping_id) {
             e.ever_released = true;
             e.mapped = false;
@@ -5772,6 +5842,10 @@ impl DeviceState {
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);
         }
+        self.currency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_mapping(mapping_id);
         // New MappingInternal ⇒ new surface, and the `bump_map_generation`
         // above is what retires the stale present evidence: it is stamped with
         // the incarnation that recorded it, so the recycled slot cannot inherit
@@ -5847,6 +5921,10 @@ impl DeviceState {
         // its resident, and keeps an epoch that was stamped against the old
         // interpretation of the same bytes.
         if e.width != width || e.height != height || e.format != format {
+            self.currency_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .forget_mapping(mapping_id);
             e.content_generation = 0;
             e.surface_content_epoch = 0;
         }
@@ -5979,6 +6057,10 @@ impl DeviceState {
     /// this crate's guest-page writers keeps that epoch closed for free — the
     /// completeness property the mapper-ref-texture `LoadFromTarget` gate rests on.
     pub fn mark_mapping_written(&mut self, mapping_id: u32) -> u32 {
+        self.currency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_mapping(mapping_id);
         let seq = self.next_validity_seq();
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
             return 0;
@@ -6036,6 +6118,10 @@ impl DeviceState {
     /// arm published 81 against 131 — real frames discarded as unchanged. It now
     /// carries `PresentState::frame_content_epoch` beside the generation.
     pub fn note_surface_content_published(&mut self, mapping_id: u32) -> u32 {
+        self.currency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_mapping(mapping_id);
         let seq = self.next_validity_seq();
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
             return 0;

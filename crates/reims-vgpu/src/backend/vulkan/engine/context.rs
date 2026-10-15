@@ -800,6 +800,9 @@ pub(crate) struct DeviceContext {
     /// Byte length of the last persisted cache blob — the growth debounce
     /// for [`Self::persist_pipeline_cache`].
     pub pipeline_cache_saved_len: AtomicUsize,
+    /// Timestamp of the last persisted cache blob — 10s cooldown to throttle
+    /// synchronous multi-megabyte disk writes during pipeline compile storms.
+    pub pipeline_cache_last_saved: Mutex<Option<std::time::Instant>>,
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
     #[cfg(feature = "host-window")]
     pub swapchain: bool,
@@ -1481,6 +1484,7 @@ impl DeviceContext {
             queue_owner,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
+            pipeline_cache_last_saved: Mutex::new(None),
             #[cfg(feature = "host-window")]
             swapchain,
         })
@@ -1494,9 +1498,26 @@ impl DeviceContext {
     /// creation rather than at context destroy is deliberate: the testing boot
     /// SIGKILLs QEMU, so destroy never runs there.
     pub(crate) fn persist_pipeline_cache(&self) {
+        self.persist_pipeline_cache_internal(false);
+    }
+
+    pub(crate) fn persist_pipeline_cache_internal(&self, force: bool) {
         let Some(path) = self.pipeline_cache_path.clone() else {
             return;
         };
+        const PIPELINE_CACHE_SAVE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+        let now = std::time::Instant::now();
+        if !force {
+            let last_saved = self
+                .pipeline_cache_last_saved
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(prev) = *last_saved {
+                if now.duration_since(prev) < PIPELINE_CACHE_SAVE_COOLDOWN {
+                    return;
+                }
+            }
+        }
         let data = match unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache) } {
             Ok(d) => d,
             Err(e) => {
@@ -1526,6 +1547,9 @@ impl DeviceContext {
             )
             .fail_once(0);
             persist::submit(persist::Job::Discard { path });
+            if let Ok(mut guard) = self.pipeline_cache_last_saved.lock() {
+                *guard = Some(now);
+            }
             return;
         }
         // Growth debounce: byte length is the proxy for "a new pipeline
@@ -1538,10 +1562,14 @@ impl DeviceContext {
         {
             return;
         }
+        if let Ok(mut guard) = self.pipeline_cache_last_saved.lock() {
+            *guard = Some(now);
+        }
         persist::submit(persist::Job::Write { path, data });
     }
 
     pub(crate) unsafe fn destroy(&mut self) {
+        self.persist_pipeline_cache_internal(true);
         // The queue owner may still hold ended command buffers and a clone of
         // the device. Drain it before stopping completion publication or
         // destroying anything a queued submission names.

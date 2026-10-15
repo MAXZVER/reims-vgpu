@@ -637,6 +637,12 @@ fn prefetch_arm_flushes_open_batch() {
 #[test]
 fn the_window_publish_flushes_the_open_batch_before_it_vouches() {
     let _guard = engine_test_lock().lock().unwrap();
+    // Warm-repeat fixtures (and any early-return path that opened a batch
+    // without a consumer) can leave BATCH_OPEN set across tests in this
+    // binary. Flush first so this case measures an open of its own rather
+    // than a join of leftover state — the assertion below is about publish
+    // flushing *the* open batch, not about suite order.
+    engine::flush_batched_draws(engine_device());
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_501,

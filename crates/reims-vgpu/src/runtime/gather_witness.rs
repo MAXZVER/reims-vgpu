@@ -390,6 +390,17 @@ struct Entry {
     token: u64,
     /// Generation read at the previous bind; 0 means "was not readable".
     gen: u64,
+    /// Host dirty-observation (doorbell) epoch that `last_guest_write_gen` was
+    /// stably observed in ([`crate::runtime::surface_currency::observe_dirty_stably`]),
+    /// or 0 for none. A later epoch means a guest doorbell may have made a store
+    /// visible, so the generation must be queried again. A background harvest
+    /// inside the same doorbell epoch does not (ABI v23: the sync epoch is
+    /// profiling only).
+    last_dirty_observation_epoch: u64,
+    /// Last value obtained from the host dirty witness. This is deliberately
+    /// separate from `gen`: `gen` is the previous bind's baseline, while this
+    /// value answers whether that baseline remains current this bind.
+    last_guest_write_gen: u64,
     /// Content fold from the last audit of this window.
     fold: u128,
     /// Whether `fold` still describes the window's bytes.
@@ -600,6 +611,8 @@ impl GatherWitness {
                 span: 0x1000,
                 token,
                 gen: 0,
+                last_dirty_observation_epoch: 0,
+                last_guest_write_gen: 0,
                 fold: 0,
                 fold_valid: false,
                 fold_seeded: false,
@@ -1404,14 +1417,24 @@ fn observe<M: crate::runtime::host::HostOps>(
             }
         }
         let token = host.track_guest_writes(gpas, page_size).unwrap_or(0);
-        let gen = if token == 0 {
-            0
+        // The generation and the doorbell epoch it is complete for, taken as
+        // one stable observation so the next bind can reuse it instead of
+        // immediately issuing the same WHPX query. An epoch that never settles
+        // leaves both 0: "cannot tell", and nothing to reuse.
+        let (gen, dirty_observation_epoch) = if token == 0 {
+            (0, 0)
         } else {
-            {
-                let _query = crate::runtime::resolve_profile::Span::open(
-                    crate::runtime::resolve_profile::Part::DirtyGeneration,
-                );
-                host.guest_write_gen(token).unwrap_or(0)
+            let _query = crate::runtime::resolve_profile::Span::open(
+                crate::runtime::resolve_profile::Part::DirtyGeneration,
+            );
+            match crate::runtime::surface_currency::observe_dirty_stably(
+                &*host,
+                "gather_witness_retry",
+                "gather_witness_conservative_fallback",
+                |h| h.guest_write_gen(token).unwrap_or(0),
+            ) {
+                Some((epoch, gen)) => (gen, epoch),
+                None => (0, 0),
             }
         };
         witness.entries.insert(
@@ -1421,6 +1444,8 @@ fn observe<M: crate::runtime::host::HostOps>(
                 span,
                 token,
                 gen,
+                last_dirty_observation_epoch: dirty_observation_epoch,
+                last_guest_write_gen: gen,
                 // A re-point gathers unconditionally, so folding here would buy
                 // nothing the first audit does not: the stride seeds one before
                 // there is any vouch for it to check.
@@ -1459,14 +1484,45 @@ fn observe<M: crate::runtime::host::HostOps>(
         .entries
         .get_mut(&key)
         .expect("the stale branch above returns for every absent key");
+    let observation_epoch = host.dirty_observation_epoch();
     let gen = if entry.token == 0 {
         0
+    } else if observation_epoch != 0 && entry.last_dirty_observation_epoch == observation_epoch {
+        // The doorbell epoch is the host's coherence boundary. Reusing inside
+        // it avoids the repeated per-surface WHPX query: the cached generation
+        // was stably observed in this epoch, so it is complete for every guest
+        // store a doorbell has made visible, and a background harvest inside
+        // the epoch cannot contradict it.
+        crate::runtime::drain::note_store_route("gw_dirty_epoch_hit");
+        entry.last_guest_write_gen
     } else {
+        crate::runtime::drain::note_store_route("gw_dirty_epoch_miss");
         {
             let _query = crate::runtime::resolve_profile::Span::open(
                 crate::runtime::resolve_profile::Part::DirtyGeneration,
             );
-            host.guest_write_gen(entry.token).unwrap_or(0)
+            let token = entry.token;
+            match crate::runtime::surface_currency::observe_dirty_stably(
+                &*host,
+                "gather_witness_retry",
+                "gather_witness_conservative_fallback",
+                |h| h.guest_write_gen(token).unwrap_or(0),
+            ) {
+                Some((epoch, gen)) => {
+                    entry.last_dirty_observation_epoch = epoch;
+                    entry.last_guest_write_gen = gen;
+                    gen
+                }
+                // Doorbells kept landing through the retry: no generation this
+                // bind can stand on. 0 is "cannot tell", which makes the verdict
+                // `Unarmed` and the vouch `Fresh` below — conservative, and
+                // nothing is memoized.
+                None => {
+                    entry.last_dirty_observation_epoch = 0;
+                    entry.last_guest_write_gen = 0;
+                    0
+                }
+            }
         }
     };
     // A generation of 0 on either side is "cannot tell": the token is unarmed,
@@ -1837,6 +1893,207 @@ mod tests {
             (guest_wrote.generation, guest_wrote.vouch),
             (13, GatherVouch::Fresh)
         );
+    }
+
+    #[test]
+    fn cached_dirty_generation_is_rechecked_only_after_a_dirty_observation_epoch_change() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut witness = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+
+        let first = observe(
+            &mut witness,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            QUIET,
+            next_gen(),
+        );
+        assert_eq!(first.verdict, GatherVerdict::Rearmed);
+        let initial_queries = host.guest_write_gen_calls.get();
+
+        // No harvest occurred, so a repeated bind reuses the current guest
+        // generation and still vouches for the prior gather.
+        let quiet = observe(
+            &mut witness,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            QUIET,
+            next_gen(),
+        );
+        assert_eq!(quiet.verdict, GatherVerdict::Vouched);
+        assert_eq!(host.guest_write_gen_calls.get(), initial_queries);
+
+        // A background harvest inside the same doorbell epoch is profiling, not
+        // a new observation: the memo holds and no query is paid.
+        host.advance_dirty_sync_epoch();
+        assert_eq!(
+            observe(
+                &mut witness,
+                &mut host,
+                KEY,
+                one_page(&GPAS, &runs),
+                QUIET,
+                next_gen(),
+            )
+            .verdict,
+            GatherVerdict::Vouched
+        );
+        assert_eq!(host.guest_write_gen_calls.get(), initial_queries);
+
+        // A doorbell boundary invalidates the memo even where no page changed:
+        // that boundary is the only proof a guest store was not made visible
+        // between the two binds.
+        host.advance_dirty_observation_epoch();
+        assert_eq!(
+            observe(
+                &mut witness,
+                &mut host,
+                KEY,
+                one_page(&GPAS, &runs),
+                QUIET,
+                next_gen(),
+            )
+            .verdict,
+            GatherVerdict::Vouched
+        );
+        assert_eq!(host.guest_write_gen_calls.get(), initial_queries + 1);
+    }
+
+    /// A doorbell that carries a store to the window's page retires the memo
+    /// before any harvest, and the bind is refused rather than vouched.
+    #[test]
+    fn a_doorbell_with_a_guest_store_refuses_the_vouch_before_any_harvest() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut witness = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+
+        let _ = observe(
+            &mut witness,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            QUIET,
+            next_gen(),
+        );
+        let quiet = observe(
+            &mut witness,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            QUIET,
+            next_gen(),
+        );
+        assert_eq!(quiet.verdict, GatherVerdict::Vouched);
+        let sync = host.dirty_sync_epoch.get();
+
+        host.note_doorbell_and_dirty_page(GPAS[0]);
+        host.dirty_sync_epoch.set(sync);
+        let wrote = observe(
+            &mut witness,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            QUIET,
+            next_gen(),
+        );
+        assert!(matches!(
+            wrote.verdict,
+            GatherVerdict::Refused {
+                guest_wrote: true,
+                ..
+            }
+        ));
+        assert_eq!(wrote.vouch, GatherVouch::Fresh);
+    }
+
+    /// A host whose doorbell epoch moves on every generation read.
+    struct DoorbellStorm<'a> {
+        inner: &'a crate::runtime::host::FakeHost,
+    }
+
+    impl crate::runtime::host::HostOps for DoorbellStorm<'_> {
+        fn mono_ns(&self) -> u64 {
+            0
+        }
+        fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
+        fn schedule_bh(&mut self) {}
+        fn track_guest_writes(&mut self, _gpas: &[u64], _page_size: usize) -> Option<u64> {
+            unreachable!("the storm only re-asks an armed window")
+        }
+        fn guest_write_gen(&self, token: u64) -> Option<u64> {
+            self.inner.advance_dirty_observation_epoch();
+            self.inner.guest_write_gen(token)
+        }
+        fn dirty_observation_epoch(&self) -> u64 {
+            self.inner.dirty_observation_epoch()
+        }
+    }
+
+    /// Epoch movement during the generation query retries once, and a second
+    /// movement leaves the bind unvouched (`Fresh`) with nothing memoized.
+    #[test]
+    fn gather_witness_epoch_movement_retries_once_then_refuses_to_vouch() {
+        use crate::runtime::drain::store_route_count;
+
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut witness = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+
+        let _ = observe(
+            &mut witness,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            QUIET,
+            next_gen(),
+        );
+        let quiet = observe(
+            &mut witness,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            QUIET,
+            next_gen(),
+        );
+        assert_eq!(quiet.vouch, GatherVouch::Vouched);
+
+        // A new doorbell, then a storm through the re-query: two queries (one
+        // retry), then the conservative arm.
+        host.advance_dirty_observation_epoch();
+        let retry_before = store_route_count("gather_witness_retry");
+        let fallback_before = store_route_count("gather_witness_conservative_fallback");
+        let queries = host.guest_write_gen_calls.get();
+        let mut storm = DoorbellStorm { inner: &host };
+        let stormy = observe(
+            &mut witness,
+            &mut storm,
+            KEY,
+            one_page(&GPAS, &runs),
+            QUIET,
+            next_gen(),
+        );
+        assert_eq!(host.guest_write_gen_calls.get(), queries + 2);
+        assert_eq!(stormy.vouch, GatherVouch::Fresh);
+        assert_eq!(stormy.verdict, GatherVerdict::Unarmed);
+        assert!(store_route_count("gather_witness_retry") > retry_before);
+        assert!(store_route_count("gather_witness_conservative_fallback") > fallback_before);
+
+        // Nothing was memoized: a settled host is asked again on the next bind.
+        let queries = host.guest_write_gen_calls.get();
+        let _ = observe(
+            &mut witness,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            QUIET,
+            next_gen(),
+        );
+        assert_eq!(host.guest_write_gen_calls.get(), queries + 1);
     }
 
     /// The guest's stated channel answers the same question as the inferred half

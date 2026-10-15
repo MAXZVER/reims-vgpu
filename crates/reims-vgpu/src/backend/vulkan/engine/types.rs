@@ -346,6 +346,7 @@ pub struct PipelineObjectIdentity {
 pub(crate) struct PipelineObjectLife;
 
 impl PipelineObjectIdentity {
+    #[allow(deprecated)] // MSYS rustc 1.99 renamed fetch_update -> try_update; keep 1.98-compatible
     pub(crate) fn new() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -578,6 +579,11 @@ pub struct DrawRequest {
     /// texels. This is true only when the guest's load source is that same
     /// surface allocation, never for an explicit texture-derived seed.
     pub load_guest_target_backing: bool,
+    /// Step 2: withhold guest-target import so `registry_ensure` reuses or
+    /// allocates a `DEVICE_LOCAL` persistent composite/scanout resident.
+    /// Set by the mapper-ref-texture prep path after
+    /// [`crate::runtime::target_residency::prefer_device_local_target`].
+    pub promote_persistent: bool,
     /// Load the live GPU image for [`DrawRequest::target_identity`] instead of
     /// seeding the attachment from the CPU. Requires that resident to exist.
     ///
@@ -1950,6 +1956,25 @@ pub struct WindowPresentSource {
     // the only question one may answer.
     #[cfg_attr(not(feature = "host-window"), allow(dead_code))]
     pub(crate) resolved: super::pools::ResolvedResident,
+    /// Step 3 GPU-frame handoff: mapping generation baked into `identity`.
+    /// Duplicated so present telemetry can name it without matching the enum.
+    pub map_generation: u64,
+    /// Step 3: resident content stamp at publish (`None` if never stamped).
+    pub content_epoch: Option<u32>,
+    /// Step 3: VkFormat of the resident (also on `identity`).
+    pub format: ash::vk::Format,
+    /// Step 3: guest batch was flushed at publish (`prepare_window_resident_present`);
+    /// the presenter's per-drawable `in_flight` fence is the blit completion wait.
+    /// Normal host-window presentation must not force a guest copyback.
+    pub completion: WindowPresentCompletion,
+}
+
+/// Step 3: how the window knows the GPU-frame is safe to sample.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowPresentCompletion {
+    /// `prepare_window_resident_present` flushed the open guest batch; the
+    /// presenter's swapchain blit fence serializes the sample into the drawable.
+    GuestBatchFlushedAtPublish,
 }
 
 impl Default for TargetIdentity {
