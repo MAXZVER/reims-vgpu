@@ -2732,6 +2732,17 @@ impl ObjectCaches {
         }
 
         let main_c = super::context::main_entry();
+        // The translator's `get_num_samples()` specialization constant is the pipeline's rasterization sample
+        // count. Named for every fragment stage: a map entry no constant in the module uses changes nothing.
+        let raster_samples: u32 = key.pass.0.sample_count.max(1);
+        let raster_spec_data = raster_samples.to_ne_bytes();
+        let raster_spec_entries = [vk::SpecializationMapEntry::default()
+            .constant_id(metal2vulkan::reflect::RASTER_SAMPLE_COUNT_SPEC_ID)
+            .offset(0)
+            .size(std::mem::size_of::<u32>())];
+        let raster_spec = vk::SpecializationInfo::default()
+            .map_entries(&raster_spec_entries)
+            .data(&raster_spec_data);
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -2740,7 +2751,8 @@ impl ObjectCaches {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(frag_module)
-                .name(&main_c),
+                .name(&main_c)
+                .specialization_info(&raster_spec),
         ];
         // Both lists were rebuilt here from the attributes with the step function
         // matched a second and a third time. They are built once, in the loop
