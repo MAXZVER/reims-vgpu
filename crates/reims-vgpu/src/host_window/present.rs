@@ -267,8 +267,17 @@ pub struct FramePublished;
 /// carry an `mpsc::Sender` — so it cannot be shared behind a `OnceLock`. The
 /// lock is uncontended and taken once per published frame, at the ~26 Hz this
 /// workload peaks at, against the publisher's own two existing locks.
+/// TEMP (lab, WAKE_THREAD): see [`WindowWaker::wake_via_poster`]. Latched.
+fn lab_wake_thread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_WAKE_THREAD").map_or(true, |v| v != "off"))
+}
+
 pub struct WindowWaker {
-    proxy: Mutex<Option<winit::event_loop::EventLoopProxy<FramePublished>>>,
+    proxy: Arc<Mutex<Option<winit::event_loop::EventLoopProxy<FramePublished>>>>,
+    /// TEMP (lab, WAKE_THREAD): a wake is owed, and the thread that posts it.
+    owed: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    poster: std::sync::OnceLock<()>,
 }
 
 /// A [`WindowWaker`] shared between the device's publisher and the window
@@ -280,7 +289,9 @@ impl WindowWaker {
     /// built its event loop and called [`Self::arm`].
     pub fn new() -> WindowWakeHandle {
         Arc::new(Self {
-            proxy: Mutex::new(None),
+            proxy: Arc::new(Mutex::new(None)),
+            owed: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+            poster: std::sync::OnceLock::new(),
         })
     }
 
@@ -300,11 +311,53 @@ impl WindowWaker {
     /// does not land costs latency bounded by that constant rather than a frame
     /// — which is the property that lets this be a wake and not a protocol.
     pub fn wake(&self) {
-        if let Ok(slot) = self.proxy.lock() {
+        if lab_wake_thread() {
+            self.wake_via_poster();
+            return;
+        }
+        Self::post(&self.proxy);
+    }
+
+    fn post(proxy: &Mutex<Option<winit::event_loop::EventLoopProxy<FramePublished>>>) {
+        if let Ok(slot) = proxy.lock() {
             if let Some(proxy) = slot.as_ref() {
                 let _ = proxy.send_event(FramePublished);
             }
         }
+    }
+
+    /// TEMP (lab, WAKE_THREAD, on; `REIMS_VGPU_LAB_WAKE_THREAD=off` posts inline again): the wake is posted by a
+    /// thread of its own. b456 (Windows, canvas 5K): `send_event` is a `PostMessageW`, and 342 of 5503 drain samples
+    /// (6 %) sat in `NtUserPostMessage` - ~1.5 ms a published frame, on the drain. Here the drain only marks a wake
+    /// owed (a mutex and a futex wake); wakes owed while a post is under way fold into one.
+    fn wake_via_poster(&self) {
+        self.poster.get_or_init(|| {
+            let (proxy, owed) = (self.proxy.clone(), self.owed.clone());
+            let _ = std::thread::Builder::new()
+                .name("reims-window-wake".into())
+                .spawn(move || loop {
+                    {
+                        let (lock, cv) = &*owed;
+                        let Ok(mut due) = lock.lock() else { return };
+                        while !*due {
+                            due = match cv.wait(due) {
+                                Ok(g) => g,
+                                Err(_) => return,
+                            };
+                        }
+                        *due = false;
+                    }
+                    Self::post(&proxy);
+                });
+        });
+        let (lock, cv) = &*self.owed;
+        if let Ok(mut due) = lock.lock() {
+            if *due {
+                return;
+            }
+            *due = true;
+        }
+        cv.notify_one();
     }
 }
 
