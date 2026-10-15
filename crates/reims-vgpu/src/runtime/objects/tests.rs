@@ -3630,7 +3630,7 @@ fn a_repoint_of_a_cleared_slot_retires_the_stale_name_and_an_unlisted_ref_keeps_
     let (task, cleared, beyond) = (1u32, 3u32, 4000u32);
 
     for slot in [cleared, beyond] {
-        state
+        let _declaration = state
             .declare_object(task, slot, Storage::NoBytes)
             .expect("the task is defined, so the slot can be named");
         assert!(state.object_name(task, slot).is_some());
