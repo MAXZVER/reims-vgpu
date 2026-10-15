@@ -175,6 +175,8 @@ pub enum RenderKind {
     DrawIndexedInstancedWide,
     DrawIndexedInstancedBase,
     DrawIndexedInstancedBaseWide,
+    DrawIndexedInstancedBaseCorrect,
+    DrawIndexedInstancedBaseCorrectWide,
     DrawIndirect,
     DrawIndexedIndirect,
     WriteDescriptor,
@@ -224,6 +226,8 @@ impl RenderKind {
         RenderKind::DrawIndexedInstancedWide,
         RenderKind::DrawIndexedInstancedBase,
         RenderKind::DrawIndexedInstancedBaseWide,
+        RenderKind::DrawIndexedInstancedBaseCorrect,
+        RenderKind::DrawIndexedInstancedBaseCorrectWide,
         RenderKind::DrawIndirect,
         RenderKind::DrawIndexedIndirect,
         RenderKind::WriteDescriptor,
@@ -274,6 +278,10 @@ impl RenderKind {
             Self::DrawIndexedInstancedWide => wire::OPCODE_DRAW_INDEXED_INSTANCED_WIDE,
             Self::DrawIndexedInstancedBase => wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE,
             Self::DrawIndexedInstancedBaseWide => wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE,
+            Self::DrawIndexedInstancedBaseCorrect => wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT,
+            Self::DrawIndexedInstancedBaseCorrectWide => {
+                wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT_WIDE
+            }
             Self::DrawIndirect => wire::OPCODE_DRAW_INDIRECT,
             Self::DrawIndexedIndirect => wire::OPCODE_DRAW_INDEXED_INDIRECT,
             Self::WriteDescriptor => render_pass::OPCODE_RENDER_PASS,
@@ -331,9 +339,10 @@ impl RenderKind {
             Self::DrawIndexedInstanced | Self::DrawIndexedInstancedWide => {
                 DrawShape::IndexedInstanced
             }
-            Self::DrawIndexedInstancedBase | Self::DrawIndexedInstancedBaseWide => {
-                DrawShape::IndexedInstancedBase
-            }
+            Self::DrawIndexedInstancedBase
+            | Self::DrawIndexedInstancedBaseWide
+            | Self::DrawIndexedInstancedBaseCorrect
+            | Self::DrawIndexedInstancedBaseCorrectWide => DrawShape::IndexedInstancedBase,
             Self::DrawIndirect => DrawShape::PrimitivesIndirect,
             Self::DrawIndexedIndirect => DrawShape::IndexedIndirect,
             _ => return None,
@@ -351,6 +360,7 @@ impl RenderKind {
                 | Self::DrawIndexedWide
                 | Self::DrawIndexedInstancedWide
                 | Self::DrawIndexedInstancedBaseWide
+                | Self::DrawIndexedInstancedBaseCorrectWide
         )
     }
 
@@ -405,8 +415,10 @@ mod tests {
         }
     }
 
-    /// Six shapes have two encodings each and two have one, which is fourteen
-    /// draw opcodes over eight shapes. Every shape is reachable.
+    /// Six shapes have two encodings each and two have one; the indexed draw
+    /// with a base vertex has a second compact/wide pair, the serializer's
+    /// correct-base-vertex rung (`0x1d`/`0x1c`). Sixteen draw opcodes over
+    /// eight shapes, and every shape is reachable.
     #[test]
     fn the_draw_shapes_are_covered_and_the_pairing_is_six_plus_two() {
         let mut paired = 0;
@@ -421,6 +433,11 @@ mod tests {
                     paired += 1;
                     assert_eq!(kinds.iter().filter(|k| k.is_wide_encoding()).count(), 1);
                 }
+                4 => {
+                    assert_eq!(*shape, DrawShape::IndexedInstancedBase);
+                    paired += 1;
+                    assert_eq!(kinds.iter().filter(|k| k.is_wide_encoding()).count(), 2);
+                }
                 1 => assert!(shape.is_indirect(), "{shape:?} has one encoding"),
                 n => panic!("{shape:?} has {n} encodings"),
             }
@@ -431,7 +448,7 @@ mod tests {
                 .iter()
                 .filter(|k| k.draw_shape().is_some())
                 .count(),
-            14
+            16
         );
     }
 

@@ -663,6 +663,22 @@ pub const LEDGER: &[Op] = &[
     },
     Op {
         rail: Rail::Render,
+        opcode: Some(0x001c),
+        selector: "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:",
+        closure: Closure::Implemented {
+            evidence: "0x0a's payload under the serializer's correct-base-vertex rung (deserializer version >= 8); base vertex is the zero-extended sixteen bits it writes",
+        },
+    },
+    Op {
+        rail: Rail::Render,
+        opcode: Some(0x001d),
+        selector: "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:",
+        closure: Closure::Implemented {
+            evidence: "0x0b's payload under the serializer's correct-base-vertex rung (deserializer version >= 8); base vertex is a range-checked i16",
+        },
+    },
+    Op {
+        rail: Rail::Render,
         opcode: Some(0x000c),
         selector: "drawIndexedPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:controlPointIndexBufferOffset:instanceCount:baseInstance:; drawPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:instanceCount:baseInstance:",
         closure: Closure::Unresolved {

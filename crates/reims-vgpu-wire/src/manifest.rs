@@ -368,7 +368,9 @@ pub const MANIFEST: &[Entry] = &[
         class: "PGSerializerRenderCommandEncoder",
         selector: "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:\
                    instanceCount:baseVertex:baseInstance:",
-        opcodes: &[0x0b, 0x0a],
+        // 0x1d/0x1c under the serializer's correct-base-vertex rung, which
+        // the oracle cannot force (read-only capability); recovered statically.
+        opcodes: &[0x0b, 0x0a, 0x1d, 0x1c],
         coverage: Coverage::Covered {
             module: "ops::render",
         },

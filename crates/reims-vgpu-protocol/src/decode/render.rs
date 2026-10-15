@@ -748,6 +748,46 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
                 base_vertex: r.base_vertex.get(),
             })
         }
+        // The correct-base-vertex rung: `0x0b`'s and `0x0a`'s payloads, with
+        // `base_vertex` a true `i16` in the compact form and the zero-extended
+        // sixteen bits in the wide one. See
+        // `reims_vgpu_wire::ops::render::OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT`.
+        RenderKind::DrawIndexedInstancedBaseCorrect => {
+            let r = wire::draw_indexed_instanced_base_correct(op)
+                .map_err(|_| fail(core::mem::size_of::<wire::DrawIndexedInstancedBase>()))?;
+            DrawRecord::Indexed(Indexed {
+                primitive: u32::from(r.primitive_type.get()),
+                index: IndexRef {
+                    buffer_ref: r.index_buffer_ref.get(),
+                    offset: u64::from(r.index_buffer_offset.get()),
+                    index_type: index_type(r.index_type.get())?,
+                },
+                index_count: u64::from(r.index_count.get()),
+                instances: Instancing {
+                    count: Some(u64::from(r.instance_count.get())),
+                    base: u64::from(r.base_instance.get()),
+                },
+                base_vertex: i64::from(r.base_vertex.get()),
+            })
+        }
+        RenderKind::DrawIndexedInstancedBaseCorrectWide => {
+            let r = wire::draw_indexed_instanced_base_correct_wide(op)
+                .map_err(|_| fail(core::mem::size_of::<wire::DrawIndexedInstancedBaseWide>()))?;
+            DrawRecord::Indexed(Indexed {
+                primitive: u32::from(r.primitive_type.get()),
+                index: IndexRef {
+                    buffer_ref: r.index_buffer_ref.get(),
+                    offset: r.index_buffer_offset.get(),
+                    index_type: index_type(r.index_type.get())?,
+                },
+                index_count: r.index_count.get(),
+                instances: Instancing {
+                    count: Some(r.instance_count.get()),
+                    base: r.base_instance.get(),
+                },
+                base_vertex: r.correct_base_vertex(),
+            })
+        }
         RenderKind::DrawIndirect => {
             let r = wire::draw_indirect(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawIndirect>()))?;
@@ -927,6 +967,64 @@ mod tests {
             panic!("not an indexed draw");
         };
         assert_eq!(base_vertex, -70_000);
+    }
+
+    /// The correct-base-vertex pair lifts to the same indexed draw as `0x0b` /
+    /// `0x0a`. The compact form's base vertex is a true `i16` (the serializer
+    /// range-checks it signed), and the wide form's slot holds the guest's value
+    /// zero-extended from sixteen bits, so it is read unsigned rather than
+    /// through the sign-extending field `0x0a` uses.
+    #[test]
+    fn the_correct_base_vertex_pair_lifts_like_its_classic_siblings() {
+        // primitive 3, index type 0, ref 5151, offset 0x40, count 6,
+        // instances 2, base vertex -2, base instance 4.
+        let mut compact = 3u16.to_le_bytes().to_vec();
+        compact.extend_from_slice(&0u16.to_le_bytes());
+        compact.extend_from_slice(&5151u32.to_le_bytes());
+        compact.extend_from_slice(&0x40u16.to_le_bytes());
+        compact.extend_from_slice(&6u16.to_le_bytes());
+        compact.extend_from_slice(&2u16.to_le_bytes());
+        compact.extend_from_slice(&(-2i16).to_le_bytes());
+        compact.extend_from_slice(&4u16.to_le_bytes());
+        compact.extend_from_slice(&[0xaa, 0xaa]);
+        let expected = |base_vertex: i64, offset: u64, index_count: u64| {
+            Ok(RenderRecord::Draw(DrawRecord::Indexed(Indexed {
+                primitive: 3,
+                index: IndexRef {
+                    buffer_ref: 5151,
+                    offset,
+                    index_type: IndexType::Uint16,
+                },
+                index_count,
+                instances: Instancing {
+                    count: Some(2),
+                    base: 4,
+                },
+                base_vertex,
+            })))
+        };
+        assert_eq!(
+            lift(&record(wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT, &compact)),
+            expected(-2, 0x40, 6)
+        );
+
+        // Widened by the count; base vertex 40000 does not fit an i16 and the
+        // serializer wrote its sixteen bits zero-extended.
+        let mut wide = 3u16.to_le_bytes().to_vec();
+        wide.extend_from_slice(&0u16.to_le_bytes());
+        wide.extend_from_slice(&5151u32.to_le_bytes());
+        wide.extend_from_slice(&0x40u64.to_le_bytes());
+        wide.extend_from_slice(&0x1_0000u64.to_le_bytes());
+        wide.extend_from_slice(&2u64.to_le_bytes());
+        wide.extend_from_slice(&40_000u64.to_le_bytes());
+        wide.extend_from_slice(&4u64.to_le_bytes());
+        assert_eq!(
+            lift(&record(
+                wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT_WIDE,
+                &wide
+            )),
+            expected(40_000, 0x40, 0x1_0000)
+        );
     }
 
     /// An index type outside `MTLIndexType` is refused by name. The two widths

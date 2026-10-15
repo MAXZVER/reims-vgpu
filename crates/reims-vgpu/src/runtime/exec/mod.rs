@@ -3549,6 +3549,8 @@ const fn is_render_stream_state(kind: ProtoRenderKind) -> bool {
         | K::DrawIndexedInstancedWide
         | K::DrawIndexedInstancedBase
         | K::DrawIndexedInstancedBaseWide
+        | K::DrawIndexedInstancedBaseCorrect
+        | K::DrawIndexedInstancedBaseCorrectWide
         | K::DrawIndirect
         | K::DrawIndexedIndirect
         | K::WriteDescriptor
@@ -3749,6 +3751,8 @@ const fn is_render_bind(kind: ProtoRenderKind) -> bool {
         | K::DrawIndexedInstancedWide
         | K::DrawIndexedInstancedBase
         | K::DrawIndexedInstancedBaseWide
+        | K::DrawIndexedInstancedBaseCorrect
+        | K::DrawIndexedInstancedBaseCorrectWide
         | K::DrawIndirect
         | K::DrawIndexedIndirect
         | K::WriteDescriptor
@@ -4124,6 +4128,8 @@ const fn is_render_pass_state(kind: ProtoRenderKind) -> bool {
         | K::DrawIndexedInstancedWide
         | K::DrawIndexedInstancedBase
         | K::DrawIndexedInstancedBaseWide
+        | K::DrawIndexedInstancedBaseCorrect
+        | K::DrawIndexedInstancedBaseCorrectWide
         | K::DrawIndirect
         | K::DrawIndexedIndirect
         | K::SetVertexBuffers

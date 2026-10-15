@@ -449,8 +449,88 @@ unsafe impl Wire for DrawIndexedInstancedBaseWide {}
 pub fn draw_indexed_instanced_base_wide<'a>(
     op: &Op<'a>,
 ) -> Result<&'a DrawIndexedInstancedBaseWide, WireError> {
-    debug_assert_eq!(op.opcode(), OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE);
+    debug_assert!(matches!(
+        op.opcode(),
+        OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE | OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT_WIDE
+    ));
     view::<DrawIndexedInstancedBaseWide>(op.payload)
+}
+
+// --- 0x1d / 0x1c the same draw under the serializer's correct-base-vertex rung --
+
+/// `drawIndexedPrimitives:…:baseVertex:baseInstance:` once the serializer's
+/// `supportsCorrectBaseVertex` is on, compact form.
+///
+/// # Where it comes from
+///
+/// `-[PGSerializer initWithDevice:objectRefAllocator:deserializerVersion:]` sets
+/// `supportsCorrectBaseVertex` for `deserializerVersion >= 8`, and the guest's
+/// Metal plugin passes device-info key 10 straight into that argument. This
+/// device serves 8 there (`DEVICE_INFO_SERIALIZER_VERSION`), so on every boot
+/// the render encoder copies the flag into `_supportsCorrectBaseVertex` and
+/// this draw leaves `0x0b`/`0x0a` for `0x1d`/`0x1c`. No other selector reads
+/// the flag. The oracle could not see the pair: the property is read-only, so
+/// no case could force it (see this crate's `AGENTS.md`).
+///
+/// Recovered by static inspection of the Tahoe serializer's implementation of
+/// the selector: both encodings are written by the **same code** as
+/// `0x0b`/`0x0a`, so the payloads are
+/// [`DrawIndexedInstancedBase`] and [`DrawIndexedInstancedBaseWide`] byte for
+/// byte. Only the choice between the opcodes and what `base_vertex` holds
+/// differ:
+///
+/// * `0x1d` is taken when `baseVertex + 0x8000`, `indexCount`,
+///   `indexBufferOffset`, `instanceCount` and `baseInstance` all fit sixteen
+///   bits, so its `base_vertex` is a **true `i16`** — the range test is signed,
+///   unlike `0x0b`'s, which truncates (`-70000` arrives as `0xee90`).
+/// * `0x1c` is everything else, and it stores `(uint16_t)baseVertex`
+///   zero-extended into the 64-bit slot where `0x0a` stores the sign-extended
+///   value. The record carries the guest's
+///   value modulo 2^16 and no sign; the faithful reading is the slot as written,
+///   which is exact for `0 <= baseVertex < 65536`. The loss outside that is the
+///   serializer's, upstream of the wire, like `0x0b`'s.
+///
+/// Missing from this device until 2026-10-15, so every packet carrying one was
+/// refused at admission (`decode_opcode_unknown`, render opcode 29) and its
+/// whole command buffer dropped: ANGLE issues this selector for Chromium's
+/// tile rasterisation, and Electron windows (the Claude desktop app) showed
+/// empty tiles while the window server, which never calls it, drew normally.
+pub const OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT: u32 = 0x1d;
+pub const DRAW_INDEXED_INSTANCED_BASE_CORRECT_TOTAL_LEN: u32 = DRAW_INDEXED_INSTANCED_BASE_TOTAL_LEN;
+
+/// Wide form of [`OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT`]; see there for
+/// what its `base_vertex` holds.
+pub const OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT_WIDE: u32 = 0x1c;
+pub const DRAW_INDEXED_INSTANCED_BASE_CORRECT_WIDE_TOTAL_LEN: u32 =
+    DRAW_INDEXED_INSTANCED_BASE_WIDE_TOTAL_LEN;
+
+/// The compact correct-base-vertex record, viewed with `0x0b`'s layout.
+pub fn draw_indexed_instanced_base_correct<'a>(
+    op: &Op<'a>,
+) -> Result<&'a DrawIndexedInstancedBase, WireError> {
+    debug_assert_eq!(op.opcode(), OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT);
+    view::<DrawIndexedInstancedBase>(op.payload)
+}
+
+/// The wide correct-base-vertex record, viewed with `0x0a`'s layout. Its
+/// `base_vertex` reads the zero-extended sixteen bits the serializer wrote, so
+/// use [`DrawIndexedInstancedBaseWide::correct_base_vertex`] rather than the
+/// signed field.
+pub fn draw_indexed_instanced_base_correct_wide<'a>(
+    op: &Op<'a>,
+) -> Result<&'a DrawIndexedInstancedBaseWide, WireError> {
+    debug_assert_eq!(op.opcode(), OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT_WIDE);
+    view::<DrawIndexedInstancedBaseWide>(op.payload)
+}
+
+impl DrawIndexedInstancedBaseWide {
+    /// `base_vertex` as the `0x1c` encoding writes it: the guest's value
+    /// truncated to sixteen bits and zero-extended, so the slot is read
+    /// unsigned. `0x0a` sign-extends instead and is read through the field.
+    #[inline]
+    pub fn correct_base_vertex(&self) -> i64 {
+        (self.base_vertex.get() as u64 & 0xffff) as i64
+    }
 }
 
 // --- 0x75 setScissorRect: --------------------------------------------------
