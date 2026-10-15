@@ -711,6 +711,10 @@ impl HostMemory for QemuHost<'_> {
 }
 
 impl HostOps for QemuHost<'_> {
+    fn lab_flush_held_irq(&mut self) {
+        self.flush_deferred_irqs();
+    }
+
     fn mono_ns(&self) -> u64 {
         match self.ops.mono_ns {
             // SAFETY: QEMU owns ctx.

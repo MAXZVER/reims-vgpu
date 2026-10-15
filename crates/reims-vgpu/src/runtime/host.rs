@@ -485,6 +485,10 @@ pub trait HostOps {
     fn enqueue(&mut self, action: HostAction);
     fn schedule_bh(&mut self);
 
+    /// TEMP (lab, `REIMS_VGPU_LAB_IRQ_RUN_END`): raise a gfx pulse the IRQ batch
+    /// is holding, if any. Default: nothing is held.
+    fn lab_flush_held_irq(&mut self) {}
+
     /// Read guest kernel virtual address (cpu_memory_rw_debug). Default: fail.
     fn read_kva(&self, _kva: u64, _buf: &mut [u8]) -> Result<(), MemError> {
         Err(MemError::Unmapped)

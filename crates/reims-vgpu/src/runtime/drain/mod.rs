@@ -11196,6 +11196,12 @@ fn drain_pending_inner_g<H: HostMemory + HostOps>(g: &mut crate::runtime::par::G
                 drain_child_fifo_g(g, host, ch);
                 state = g.st();
                 lab_chan::note_drained(ch, lab_wait, lab_t.elapsed().as_micros() as u64);
+                if lab_chan::irq_run_end() {
+                    // TEMP (lab, IRQ_RUN_END): the stamps this run published reach the guest now, not after the
+                    // other channels, the settle and the tranche's tail - a guest thread waits on the last
+                    // buffer it submitted, which is the run's last packet.
+                    host.lab_flush_held_irq();
+                }
                 if state.translation_deferred_mask != 0 {
                     state.pending.child_mask |= remaining | state.translation_deferred_mask;
                     note_translation_order_hold(state, remaining);
@@ -11775,7 +11781,15 @@ mod lab_chan {
         deferred
     }
 
-    /// TEMP (lab, REFILL_RESERVE, opt-in `REIMS_VGPU_LAB_REFILL_RESERVE=on`): see the refill loop.
+    /// TEMP (lab, IRQ_RUN_END, opt-in `REIMS_VGPU_LAB_IRQ_RUN_END=on`): see the refill loop. b475 canvas 5K: ~12k
+    /// stamps a second reach the guest in ~2k interrupts; Safari's GPU process waits on ~57 of them a frame.
+    pub(super) fn irq_run_end() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_IRQ_RUN_END").is_ok_and(|v| v == "on"))
+    }
+
+    /// TEMP (lab, REFILL_RESERVE, opt-in `REIMS_VGPU_LAB_REFILL_RESERVE=on`): see the refill loop. b475 (A B A2,
+    /// canvas 5K): 27.5 / 19.0 / 34.6 fps, ch1 ring 1137 / 1444 / 1098 us - worse; stays off.
     pub(super) fn reserve() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_REFILL_RESERVE").is_ok_and(|v| v == "on"))
