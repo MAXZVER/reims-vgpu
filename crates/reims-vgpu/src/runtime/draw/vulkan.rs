@@ -2876,12 +2876,20 @@ fn memo_copy(src: &SampledSourceRequest, all: bool, repeat: bool) -> Option<Samp
 /// pass's Store. So a repeat in the encoder takes the first resolve's bytes -
 /// the same `Arc` and identity, which also lets the engine's content cache hit
 /// without re-hashing. Cleared at every draw list's start.
+///
+/// **Off by default since 2026-10-15** (`REIMS_VGPU_LAB_RESOLVE_MEMO=on` or the
+/// live switch turns it on). Read by DRAW_PAR's pool jobs it handed a pass
+/// resolutions an earlier pass had made stale: Electron tiles kept other
+/// passes' content after a resize (b505-b520; even entries only the drain made,
+/// b520). Scoped as in [`lab_resolve_memo_record`] and kept from the jobs it is
+/// sound (b518, b519) but costs the drain (boot cssscroll 157-160 Hz, duty
+/// 0.55), and off it is both sound and fastest (b516 207 Hz, b521 178).
 pub(crate) fn lab_resolve_memo_on() -> bool {
     if let Some(on) = crate::runtime::lab_live::on("RESOLVE_MEMO") {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_MEMO").as_deref() != Ok("off"))
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_MEMO").as_deref() == Ok("on"))
 }
 
 fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledSourceRequest)> {
