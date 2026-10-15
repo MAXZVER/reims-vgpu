@@ -131,6 +131,12 @@ pub enum UnimplementedCommand {
     /// that happens to share the integer. Declining is the correct behaviour
     /// until this device tracks serializer refs, not a gap to be closed by
     /// wiring the existing teardown call to it.
+    ///
+    /// Reported on the failure channel only for the kinds whose host state a
+    /// destroy would have to end (buffer, texture, heap, rasterization rate
+    /// map, indirect command buffer). A function and a compute pipeline state
+    /// are cached by content, so there is nothing keyed by their ref to retire
+    /// and their line goes to the off channel.
     DeleteObject,
     /// `CmdDisplaySleepState` (`0x09`). The guest's panel is entering or leaving
     /// sleep and this device's display model does not move with it.
@@ -6707,6 +6713,21 @@ impl DeviceState {
         self.fails.lock().push(ev);
         #[cfg(not(test))]
         let _ = ev;
+    }
+
+    /// [`Self::record_fail_once`]'s counterpart for a declined command whose
+    /// decline loses or degrades nothing: the same line, once per
+    /// `(reason, discriminant)`, on the off channel.
+    ///
+    /// The line is a census of what the guest sent, not a failure, so it is not
+    /// appended to [`Self::fails`] (the tests' view of failures). It latches on
+    /// the same `(reason, discriminant)` space as the fail form, so a caller
+    /// splitting one reason between the two must give them different
+    /// discriminants or the first to arrive silences the other.
+    pub fn record_off_once(&self, ev: FailEvent, discriminant: u64) {
+        if crate::observe::first_sight(crate::observe::Decline::slug(&ev), discriminant) {
+            crate::observe::Emit::decline("fail_event", &ev).off();
+        }
     }
 }
 

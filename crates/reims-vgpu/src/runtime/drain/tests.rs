@@ -7138,6 +7138,74 @@ fn a_destroy_this_device_cannot_retire_says_what_its_ref_names_in_the_object_lis
     }
 }
 
+/// A destroy of a kind whose host state it would have to end stays a failure,
+/// and a content-cached kind arriving first must not latch it away.
+///
+/// The decline's two forms share one `(reason, discriminant)` latch, keyed by
+/// kind: with the packet opcode alone as the discriminant, a function destroy
+/// (off channel) would silence a later texture destroy (failure channel).
+#[test]
+fn a_content_cached_destroy_does_not_hide_a_texture_destroy_from_the_failure_channel() {
+    use reims_vgpu_wire::ops::destroy::{
+        DELETE_TOTAL_LEN, OPCODE_DELETE_COMPUTE_PIPELINE_STATE, OPCODE_DELETE_FUNCTION,
+        OPCODE_DELETE_TEXTURE,
+    };
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let destroy_packet = |record_opcode: u32| {
+        let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], 1);
+        st32(&mut payload[4..], record_opcode);
+        st32(&mut payload[8..], DELETE_TOTAL_LEN);
+        st32(&mut payload[12..], 0x20);
+        Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        }
+    };
+    let counted = || crate::runtime::drain::store_route_count("cmd_delete_object_unimplemented");
+    let before = counted();
+    let cap = crate::observe::FailCapture::start();
+
+    for opcode in [
+        OPCODE_DELETE_FUNCTION,
+        OPCODE_DELETE_COMPUTE_PIPELINE_STATE,
+        OPCODE_DELETE_TEXTURE,
+    ] {
+        process_child_packet(&mut state, &mut host, 2, &destroy_packet(opcode));
+    }
+
+    assert_eq!(counted(), before + 3, "every kind is counted");
+    let lines = cap.lines();
+    let off = lines
+        .iter()
+        .filter(|l| l.starts_with("OFF fail_event reason=cmd_delete_object_unimplemented "))
+        .count();
+    let fail = lines
+        .iter()
+        .filter(|l| l.starts_with("fail_event reason=cmd_delete_object_unimplemented "))
+        .count();
+    assert_eq!(off, 2, "the function and the compute pipeline: {lines:?}");
+    assert_eq!(
+        fail, 1,
+        "the texture, which a destroy would have to end: {lines:?}"
+    );
+    assert_eq!(
+        state
+            .fails
+            .lock()
+            .iter()
+            .filter(|e| matches!(e, FailEvent::UnimplementedChildCommand { .. }))
+            .count(),
+        1,
+        "only the texture is recorded as a failure"
+    );
+}
+
 /// The host's retired slots are reported as retired, not as undecodable.
 ///
 /// Fifteen opcodes share one deprecated handler on the reference host: it

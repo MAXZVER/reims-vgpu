@@ -493,12 +493,68 @@ fn apply_delete_object<H: HostMemory + HostOps>(
         op.opcode(),
         RefSpacePopulation::Untracked,
     );
-    note_unimplemented(
-        state,
-        channel_id,
-        UnimplementedCommand::DeleteObject,
-        packet,
-    );
+    note_delete_object_declined(state, channel_id, packet, op.opcode());
+}
+
+/// Report a `CmdDeleteObject` this device declines because it keeps nothing
+/// keyed by the kind's ref.
+///
+/// The counter is `cmd_delete_object_unimplemented` for every kind, as it always
+/// was. What differs by kind is whether the decline is a failure:
+///
+/// - A **function** and a **compute pipeline state** are cached by *content*:
+///   the translate cache is keyed by the AIR, is never evicted, and the compute
+///   rail reads its pipeline out of the guest's own list on every dispatch. There
+///   is no state keyed by the ref for the destroy to retire, so declining loses
+///   and degrades nothing and the line is an off-channel census. (A driven boot
+///   sends dozens of them: 21 and 17 in the one that prompted this.)
+/// - Every other untracked kind (buffer, texture, heap, rasterization rate map,
+///   indirect command buffer) names an object whose host state a destroy would
+///   have to end. Declining it is unsupported guest work and stays on the
+///   failure channel.
+///
+/// The latch is per kind. The two forms share one `(reason, discriminant)`
+/// space, and keyed by the packet opcode alone, as it used to be, the first kind
+/// to arrive would latch every later one out of the failure log — a function
+/// destroy would hide a texture destroy.
+fn note_delete_object_declined(
+    state: &mut DeviceState,
+    channel_id: u32,
+    packet: &Packet,
+    record_opcode: u32,
+) {
+    let command = UnimplementedCommand::DeleteObject;
+    // The counter first, before the latch: the emitter dedupes and the counter
+    // does not.
+    note_store_route(command.slug());
+    let ev = FailEvent::UnimplementedChildCommand {
+        channel: channel_id,
+        command,
+        opcode: packet.opcode,
+        total_size: packet.total_size,
+        stamp_count: packet.stamp_count(),
+        payload: packet.payload.clone(),
+    };
+    let discriminant = (u64::from(packet.opcode) << 32) | u64::from(record_opcode);
+    if is_content_cached_kind(record_opcode) {
+        state.record_off_once(ev, discriminant);
+    } else {
+        state.record_fail_once(ev, discriminant);
+    }
+}
+
+/// The destroy kinds whose objects this device caches by content and so holds
+/// no state for under their ref.
+///
+/// Beside [`is_retained_kind`], which names the kinds it does hold `(task,
+/// ref)`-keyed state for. A kind in neither list is an object this device may
+/// hold host state for and does not yet retire.
+const fn is_content_cached_kind(opcode: u32) -> bool {
+    use reims_vgpu_wire::ops::destroy as d;
+    matches!(
+        opcode,
+        d::OPCODE_DELETE_FUNCTION | d::OPCODE_DELETE_COMPUTE_PIPELINE_STATE
+    )
 }
 
 /// The destroy kinds this device holds `(task, ref)`-keyed state for.
