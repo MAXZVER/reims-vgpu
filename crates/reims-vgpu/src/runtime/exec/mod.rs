@@ -1693,12 +1693,14 @@ fn consume_resource_table<M: HostMemory + HostOps>(
 ///
 /// Byte +6 of a validity record (`clear_guest_valid`) is, on either reading of
 /// it, the guest about to look at the resource's pages — see
-/// `resource_validity::apply`, which raises `validity_guest_read_frame_owed`
-/// when a frame is still owed there and used to stop at the alarm. macOS 26
-/// raises it dozens of times a login, and a guest that reads a surface this
-/// device has rendered but not yet written back composites the previous frame:
-/// windows that update only when something else forces a writeback. So the
-/// debt is paid here, before the guest can look. Free when nothing is owed.
+/// `resource_validity::note_guest_read_still_owed`, which raises
+/// `validity_guest_read_frame_owed` when a frame is still owed *after* this
+/// payment. `apply` used to raise it before the payment, where it fired on
+/// every ordinary read. macOS 26 raises byte +6 dozens of times a login, and a
+/// guest that reads a surface this device has rendered but not yet written back
+/// composites the previous frame: windows that update only when something else
+/// forces a writeback. So the debt is paid here, before the guest can look.
+/// Free when nothing is owed.
 pub(crate) fn pay_owed_before_guest_read<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1725,6 +1727,9 @@ pub(crate) fn pay_owed_before_guest_read<M: HostMemory + HostOps>(
     }
     crate::runtime::drain::note_store_route("validity_guest_read_paid");
     crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, object_id);
+    // The guest looks next. A frame still owed now is the one the payment above
+    // failed to deliver, which is the only reading of "owed" that is a loss.
+    crate::runtime::resource_validity::note_guest_read_still_owed(state, task_id, object_id);
 }
 
 /// The one part of an `EXEC_INDIRECT2` resource-table record this device cannot

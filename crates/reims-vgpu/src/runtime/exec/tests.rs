@@ -8246,8 +8246,9 @@ fn owe_a_frame(state: &mut DeviceState, task_id: u32, object_id: u32) {
 ///
 /// The observable is that the ledger was asked: the debt is taken. Whether the
 /// payment lands is `pay`'s business and needs an engine; what regressed was
-/// the alarm (`validity_guest_read_frame_owed`) firing while nothing paid, and
-/// the guest compositing the frame before the one this device rendered.
+/// the alarm (`validity_guest_read_frame_owed`) firing while nothing paid - it
+/// is taken after the payment, so a paid frame must not raise it - and the
+/// guest compositing the frame before the one this device rendered.
 #[test]
 fn a_guest_read_pays_the_frame_its_object_owes_and_nothing_else_does() {
     use crate::runtime::drain::store_route_count;
@@ -8293,6 +8294,8 @@ fn a_guest_read_pays_the_frame_its_object_owes_and_nothing_else_does() {
     assert!(state.pending_writebacks.get(bystander).is_some());
 
     let before = paid();
+    let alarms = || store_route_count("validity_guest_read_frame_owed");
+    let alarms_before = alarms();
     pay_owed_before_guest_read(
         &mut state,
         &mut host,
@@ -8303,6 +8306,11 @@ fn a_guest_read_pays_the_frame_its_object_owes_and_nothing_else_does() {
     assert!(
         state.pending_writebacks.get(object_id).is_none(),
         "the guest was about to read pages this device still owes a frame"
+    );
+    assert_eq!(
+        alarms(),
+        alarms_before,
+        "a frame that was paid is not a frame still owed when the guest looks"
     );
     assert!(
         state.pending_writebacks.get(bystander).is_some(),
