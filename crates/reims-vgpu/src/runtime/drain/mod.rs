@@ -11222,7 +11222,16 @@ fn drain_pending_inner_g<H: HostMemory + HostOps>(g: &mut crate::runtime::par::G
         // while its own drain was in flight has had that work seen, and
         // re-running it here would spin on one busy channel while the others
         // wait.
-        mask = std::mem::take(&mut state.pending.child_mask) & !served;
+        mask = std::mem::take(&mut state.pending.child_mask);
+        if !lab_chan::reserve() {
+            mask &= !served;
+        } else if mask & served != 0 {
+            // TEMP (lab, REFILL_RESERVE): a channel rung again during this pass runs again in it (within the
+            // refill bound) instead of after the tranche's tail. b467-b474 (canvas 5K): Safari's GPU process waits
+            // in waitUntilScheduled while its ch1 command buffers sit ~0.85 ms in the ring (exec ~25 us) - a ring
+            // that came in after ch1's turn waited for the next wakeup, behind the tranche's tail work.
+            note_store_route("child_doorbell_reserve");
+        }
         if mask == 0 {
             break;
         }
@@ -11764,6 +11773,12 @@ mod lab_chan {
             super::note_store_route("lab_defer_exec");
         }
         deferred
+    }
+
+    /// TEMP (lab, REFILL_RESERVE, opt-in `REIMS_VGPU_LAB_REFILL_RESERVE=on`): see the refill loop.
+    pub(super) fn reserve() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_REFILL_RESERVE").is_ok_and(|v| v == "on"))
     }
 
     pub(super) fn compositor_first() -> Option<u32> {
