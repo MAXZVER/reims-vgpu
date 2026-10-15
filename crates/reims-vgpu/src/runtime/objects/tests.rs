@@ -2495,6 +2495,48 @@ fn a_repoint_retires_a_backing_mapping_owned_by_the_packet_task() {
     );
 }
 
+/// A re-point of a resource the device held no mapping for is a census, not a
+/// failure: it either found no host state to follow or dropped the stale
+/// ref-keyed copy it found, so nothing is lost. The line is said once per
+/// `(task, object)`, on the off channel, with the counters unchanged.
+#[test]
+fn a_repoint_with_no_mapping_to_follow_is_a_census_on_the_off_channel() {
+    use crate::runtime::drain::store_route_count;
+    let cap = crate::observe::FailCapture::start();
+    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let host = FakeHost::new();
+    let unknown = store_route_count("replace_physical_unknown_object");
+    let invalidated = store_route_count("replace_physical_unmapped_texture_invalidated");
+
+    super::note_replace_physical_unmapped_after_invalidation(&state, &host, 3, 9, true, false);
+    super::note_replace_physical_unmapped_after_invalidation(&state, &host, 3, 9, true, false);
+
+    assert_eq!(
+        store_route_count("replace_physical_unknown_object"),
+        unknown + 2,
+        "every re-point is counted"
+    );
+    assert_eq!(
+        store_route_count("replace_physical_unmapped_texture_invalidated"),
+        invalidated + 2
+    );
+    let lines = cap.lines();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("OFF replace_physical_unknown_object task=3 object=9 "))
+            .count(),
+        1,
+        "once per (task, object), on the off channel: {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("replace_physical_unknown_object ")),
+        "and not on the failure channel: {lines:?}"
+    );
+}
+
 /// Storage named by an address rather than by a mapping gets an incarnation,
 /// and it advances on exactly the events that make the pages behind that
 /// *window* different pages.
