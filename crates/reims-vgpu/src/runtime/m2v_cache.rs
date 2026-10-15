@@ -23,7 +23,7 @@ use metal2vulkan::reflect::ShaderReflection;
 
 use crate::observe::Decline;
 
-type FragmentRelocationCache = HashMap<(bool, bool), Arc<ShaderVariant>>;
+type FragmentRelocationCache = HashMap<(bool, bool, bool), Option<Arc<ShaderVariant>>>;
 type M2vResult<T> = Result<T, M2vCacheDecline>;
 
 /// A specific failure while caching, translating, or post-processing AIR.
@@ -412,9 +412,22 @@ impl CachedShader {
     /// because it is the one a vertex shader always takes and its walk is worth
     /// caching for exactly the same reason.
     pub fn variant(&self, separate_sampled: bool, buf_collide: bool) -> Arc<ShaderVariant> {
-        if !separate_sampled && !buf_collide {
-            return self
-                .base
+        self.variant_ms(separate_sampled, buf_collide, false)
+            .expect("a variant without the multisample demotion always exists")
+    }
+
+    /// [`Self::variant`], and with `ms_demote` every multisampled image made single-sample
+    /// ([`crate::runtime::spirv_bind::demote_multisampled_images`]) for a draw whose multisampled binds hold
+    /// single-sample content. `None` only for a demotion the module cannot take; cached like the others.
+    pub fn variant_ms(
+        &self,
+        separate_sampled: bool,
+        buf_collide: bool,
+        ms_demote: bool,
+    ) -> Option<Arc<ShaderVariant>> {
+        if !separate_sampled && !buf_collide && !ms_demote {
+            return Some(
+                self.base
                 .get_or_init(|| {
                     ShaderVariant::of(
                         self.words.clone(),
@@ -425,13 +438,17 @@ impl CachedShader {
                         .into(),
                     )
                 })
-                .clone();
+                .clone());
         }
         let mut cache = self.frag_reloc.lock().unwrap_or_else(|e| e.into_inner());
         cache
-            .entry((separate_sampled, buf_collide))
+            .entry((separate_sampled, buf_collide, ms_demote))
             .or_insert_with(|| {
                 let mut w: Vec<u32> = (*self.words).clone();
+                if ms_demote {
+                    w = crate::runtime::spirv_bind::demote_multisampled_images(&w)?;
+                    crate::observe::verbose(|| "linux_m2v frag_ms_demoted".to_string());
+                }
                 if separate_sampled {
                     let n = crate::runtime::spirv_bind::offset_fragment_sampled_resource_bindings(
                         &mut w,
@@ -442,14 +459,14 @@ impl CachedShader {
                     let n = crate::runtime::spirv_bind::offset_fragment_buffer_bindings(&mut w);
                     crate::observe::verbose(|| format!("linux_m2v frag_buf_reloc n={n}"));
                 }
-                ShaderVariant::of(
+                Some(ShaderVariant::of(
                     Arc::new(w),
                     crate::runtime::spirv_bind::reflected_sampler_descriptors(
                         &self.reflection,
                         separate_sampled,
                     )
                     .into(),
-                )
+                ))
             })
             .clone()
     }

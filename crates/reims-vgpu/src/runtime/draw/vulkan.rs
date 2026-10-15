@@ -11817,6 +11817,9 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         // is something the guest asked for. See
         // [`crate::runtime::gpu_hang_trail::SamplerNote`].
         let mut sampler_origin: std::collections::BTreeMap<u32, u8> = Default::default();
+        // A fragment multisampled bind whose source holds one image per pixel: the draw takes the fragment
+        // module with its multisampled images made single-sample (see `demote_multisampled_images`).
+        let mut frag_ms_demote = false;
         {
             let mut push_tex = |index: u32,
                                 texture_ref: u32,
@@ -12420,12 +12423,22 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 };
                 let SampledImageShape {
                     kind: image_shape,
-                    multisampled,
+                    mut multisampled,
                     mut layers,
                 } = shape;
                 let volume = image_shape.is_volume();
                 let one_dim = image_shape.is_one_dim();
                 let cube = image_shape.is_cube();
+                if multisampled && !source_is_target && frag_stage {
+                    // Chromium's GPU raster resolves its MSAA tiles by a shader that reads `texture2d_ms`; this
+                    // device holds those textures as one image per pixel (the pass that filled them ran
+                    // single-sample, or the content is the clear colour in guest RAM). Every sample is that
+                    // pixel, so the single-sample read is the resolve's exact answer - and refusing here used
+                    // to drop the whole pass with it, leaving Electron windows with empty tiles.
+                    frag_ms_demote = true;
+                    multisampled = false;
+                    crate::runtime::drain::note_store_route("frag_ms_demoted_bind");
+                }
                 if multisampled && !source_is_target {
                     return Err(DrawError::DrawPreparation(
                         DrawPreparationDecline::TextureDimensionUnsupported {
@@ -14418,6 +14431,28 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         // construction excludes every storage buffer.
         // Memoized on the `Arc`, because this is a per-draw walk of the whole
         // module and the words behind an `Arc` cannot change.
+        // The fragment module with its multisampled images single-sample, when a bind above asked for it.
+        let f_words = if frag_ms_demote {
+            match f_shader.variant_ms(separate_sampled, buf_collide, true) {
+                Some(variant) => {
+                    f_variant = variant;
+                    f_variant.words.clone()
+                }
+                None => {
+                    return Err(DrawError::DrawPreparation(
+                        DrawPreparationDecline::TextureDimensionUnsupported {
+                            stage: "fragment",
+                            index: 0,
+                            texture_ref: 0,
+                            binding: 0,
+                            kind: "D2Multisample(demotion refused)".to_string(),
+                        },
+                    ));
+                }
+            }
+        } else {
+            f_words
+        };
         let frag_declared_bindings =
             crate::runtime::spirv_bind::declared_binding_numbers_memoized(&f_words);
         let frag_layout_bindings: Vec<u32> = resources

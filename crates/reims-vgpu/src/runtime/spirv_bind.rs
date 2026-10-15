@@ -1098,6 +1098,250 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     Some((result, loops))
 }
 
+/// The module with every multisampled image type made single-sample, for a draw whose multisampled
+/// bindings hold single-sample content.
+///
+/// Metal's `texture2d_ms<T>::read(coord, sample)` is how Chromium's GPU raster (ANGLE-Metal) resolves its
+/// MSAA tiles by shader. This device often holds such a texture as one image per pixel - the pass that
+/// filled it ran single-sample, or the content is the clear colour it wrote to guest RAM - and an image
+/// with one sample cannot be bound where the module declares `MS=1`. Every sample of such content is the
+/// same value, so a read of any sample is a read of the pixel, and a resolve that averages them returns
+/// it unchanged. The rewrite makes that literal:
+///
+/// - `OpTypeImage … MS=1` becomes `MS=0`;
+/// - `OpImageFetch`/`OpImageRead` of such an image drop the `Sample` operand and read level 0 (`Lod 0`);
+/// - `OpImageQuerySize` becomes `OpImageQuerySizeLod … 0`, which a single-sample sampled image requires;
+/// - `OpImageQuerySamples` becomes the constant 1.
+///
+/// `None` when there is nothing to rewrite, the stream does not walk, or a single-sample twin of a
+/// multisampled type already exists (two identical type declarations are invalid, and re-pointing every
+/// use of one id is a different rewrite than this one).
+pub fn demote_multisampled_images(words: &[u32]) -> Option<Vec<u32>> {
+    const OP_TYPE_INT: u32 = 21;
+    const OP_CONSTANT: u32 = 43;
+    const OP_FUNCTION: u32 = 54;
+    const OP_IMAGE_FETCH: u32 = 95;
+    const IMAGE_OPERAND_LOD: u32 = 0x2;
+    const IMAGE_OPERAND_SAMPLE: u32 = 0x40;
+    if words.len() < HEADER_WORDS {
+        return None;
+    }
+    let mut ins: Vec<Vec<u32>> = Vec::new();
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let n = (words[i] >> 16) as usize;
+        if n == 0 || i + n > words.len() {
+            return None;
+        }
+        ins.push(words[i..i + n].to_vec());
+        i += n;
+    }
+    let op = |x: &[u32]| x[0] & 0xffff;
+    let ms_types: std::collections::HashSet<u32> = ins
+        .iter()
+        .filter(|x| op(x) == u32::from(OP_TYPE_IMAGE) && x.len() >= 9 && x[6] == 1)
+        .map(|x| x[1])
+        .collect();
+    if ms_types.is_empty() {
+        return None;
+    }
+    // A single-sample twin would become a duplicate declaration.
+    for x in ins.iter().filter(|x| op(x) == u32::from(OP_TYPE_IMAGE) && x.len() >= 9 && x[6] == 1) {
+        let twin = ins.iter().any(|y| {
+            op(y) == u32::from(OP_TYPE_IMAGE)
+                && y.len() == x.len()
+                && y[6] == 0
+                && y[2..6] == x[2..6]
+                && y[7..] == x[7..]
+        });
+        if twin {
+            return None;
+        }
+    }
+    // Values of a multisampled image type: every instruction whose result type is one (OpLoad, OpCopyObject,
+    // OpFunctionParameter, OpPhi, OpSelect). Result type is word 1 and result id word 2 for all of them.
+    let first_fn = ins.iter().position(|x| op(x) == OP_FUNCTION)?;
+    let ms_values: std::collections::HashSet<u32> = ins[first_fn..]
+        .iter()
+        .filter(|x| x.len() >= 3 && ms_types.contains(&x[1]))
+        .map(|x| x[2])
+        .collect();
+    let mut bound = words[3];
+    let mut next = || {
+        bound += 1;
+        bound - 1
+    };
+    let mut added: Vec<Vec<u32>> = Vec::new();
+    let globals: Vec<Vec<u32>> = ins[..first_fn].to_vec();
+    let int_ty = globals
+        .iter()
+        .find(|x| op(x) == OP_TYPE_INT && x.len() == 4 && x[2] == 32)
+        .map(|x| x[1]);
+    let int_ty = match int_ty {
+        Some(t) => t,
+        None => {
+            let t = next();
+            added.push(vec![(4 << 16) | OP_TYPE_INT, t, 32, 1]);
+            t
+        }
+    };
+    let constant = |ty: u32, value: u32, added: &mut Vec<Vec<u32>>, next: &mut dyn FnMut() -> u32| {
+        globals
+            .iter()
+            .chain(added.iter())
+            .find(|x| op(x) == OP_CONSTANT && x.len() == 4 && x[1] == ty && x[3] == value)
+            .map(|x| x[2])
+            .unwrap_or_else(|| {
+                let id = next();
+                added.push(vec![(4 << 16) | OP_CONSTANT, ty, id, value]);
+                id
+            })
+    };
+    let zero = constant(int_ty, 0, &mut added, &mut next);
+    let mut rewritten = 0usize;
+    for x in ins.iter_mut() {
+        if op(x) == u32::from(OP_TYPE_IMAGE) && x.len() >= 9 && x[6] == 1 {
+            x[6] = 0;
+            continue;
+        }
+    }
+    let mut body: Vec<Vec<u32>> = Vec::with_capacity(ins.len() - first_fn);
+    for x in ins.drain(first_fn..) {
+        let o = op(&x);
+        if (o == OP_IMAGE_FETCH || o == u32::from(OP_IMAGE_READ)) && x.len() >= 5 && ms_values.contains(&x[3]) {
+            let mut y = x[..5].to_vec();
+            if x.len() > 5 {
+                let mask = x[5];
+                // Image operands follow the mask in bit order; Grad and the offset sets take more words,
+                // but none of those is legal on a multisampled image, so every set bit below Sample is one
+                // id and Sample's id is the one after them.
+                let mut ids: Vec<(u32, u32)> = Vec::new();
+                let mut at = 6;
+                for bit in 0..32 {
+                    let b = 1u32 << bit;
+                    if mask & b == 0 {
+                        continue;
+                    }
+                    if at >= x.len() {
+                        return None;
+                    }
+                    ids.push((b, x[at]));
+                    at += 1;
+                }
+                ids.retain(|(b, _)| *b != IMAGE_OPERAND_SAMPLE);
+                if o == OP_IMAGE_FETCH && !ids.iter().any(|(b, _)| *b == IMAGE_OPERAND_LOD) {
+                    ids.push((IMAGE_OPERAND_LOD, zero));
+                }
+                ids.sort_by_key(|(b, _)| *b);
+                if !ids.is_empty() {
+                    y.push(ids.iter().fold(0, |m, (b, _)| m | b));
+                    y.extend(ids.iter().map(|(_, id)| *id));
+                }
+            } else if o == OP_IMAGE_FETCH {
+                y.push(IMAGE_OPERAND_LOD);
+                y.push(zero);
+            }
+            y[0] = ((y.len() as u32) << 16) | o;
+            body.push(y);
+            rewritten += 1;
+        } else if o == u32::from(OP_IMAGE_QUERY_SIZE) && x.len() == 4 && ms_values.contains(&x[3]) {
+            body.push(vec![(5 << 16) | u32::from(OP_IMAGE_QUERY_SIZE_LOD), x[1], x[2], x[3], zero]);
+            rewritten += 1;
+        } else if o == u32::from(OP_IMAGE_QUERY_SAMPLES) && x.len() == 4 && ms_values.contains(&x[3]) {
+            let one = constant(x[1], 1, &mut added, &mut next);
+            body.push(vec![(4 << 16) | u32::from(OP_COPY_OBJECT), x[1], x[2], one]);
+            rewritten += 1;
+        } else {
+            body.push(x);
+        }
+    }
+    let _ = rewritten;
+    let mut out: Vec<u32> = words[..HEADER_WORDS].to_vec();
+    out[3] = bound;
+    for x in ins.iter().chain(added.iter()).chain(body.iter()) {
+        out.extend_from_slice(x);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod demote_multisampled_tests {
+    /// `texture2d_ms<float> t; t.get_num_samples(); t.get_width(); t.read(uint2(0), 3)`, assembled from
+    /// SPIR-V text and valid for Vulkan 1.2 as it stands.
+    const MS_FETCH: &[u32] = &[
+        0x07230203, 0x00010500, 0x00070000, 0x00000015, 0x00000000, 0x00020011,
+        0x00000001, 0x00020011, 0x00000032, 0x0003000e, 0x00000000, 0x00000001,
+        0x0007000f, 0x00000004, 0x00000001, 0x6e69616d, 0x00000000, 0x00000002,
+        0x00000003, 0x00030010, 0x00000001, 0x00000007, 0x00040047, 0x00000002,
+        0x0000001e, 0x00000000, 0x00040047, 0x00000003, 0x00000022, 0x00000000,
+        0x00040047, 0x00000003, 0x00000021, 0x00000020, 0x00020013, 0x00000004,
+        0x00030021, 0x00000005, 0x00000004, 0x00030016, 0x00000006, 0x00000020,
+        0x00040015, 0x00000007, 0x00000020, 0x00000000, 0x00040017, 0x00000008,
+        0x00000006, 0x00000004, 0x00040017, 0x00000009, 0x00000007, 0x00000002,
+        0x00090019, 0x0000000a, 0x00000006, 0x00000001, 0x00000000, 0x00000000,
+        0x00000001, 0x00000001, 0x00000000, 0x00040020, 0x0000000b, 0x00000000,
+        0x0000000a, 0x0004003b, 0x0000000b, 0x00000003, 0x00000000, 0x00040020,
+        0x0000000c, 0x00000003, 0x00000008, 0x0004003b, 0x0000000c, 0x00000002,
+        0x00000003, 0x0004002b, 0x00000007, 0x0000000d, 0x00000000, 0x0004002b,
+        0x00000007, 0x0000000e, 0x00000003, 0x0005002c, 0x00000009, 0x0000000f,
+        0x0000000d, 0x0000000d, 0x00050036, 0x00000004, 0x00000001, 0x00000000,
+        0x00000005, 0x000200f8, 0x00000010, 0x0004003d, 0x0000000a, 0x00000011,
+        0x00000003, 0x0004006b, 0x00000007, 0x00000012, 0x00000011, 0x00040068,
+        0x00000009, 0x00000013, 0x00000011, 0x0007005f, 0x00000008, 0x00000014,
+        0x00000011, 0x0000000f, 0x00000040, 0x0000000e, 0x0003003e, 0x00000002,
+        0x00000014, 0x000100fd, 0x00010038,
+    ];
+
+    fn walk(words: &[u32]) -> Vec<(u32, Vec<u32>)> {
+        let mut out = Vec::new();
+        let mut i = 5;
+        while i < words.len() {
+            let n = (words[i] >> 16) as usize;
+            out.push((words[i] & 0xffff, words[i..i + n].to_vec()));
+            i += n;
+        }
+        out
+    }
+
+    #[test]
+    fn a_multisampled_read_becomes_a_level_zero_read_of_a_single_sample_image() {
+        let out = super::demote_multisampled_images(MS_FETCH).expect("one multisampled image to demote");
+        let ins = walk(&out);
+        assert!(ins.iter().filter(|(o, _)| *o == 25).all(|(_, x)| x[6] == 0), "an MS=1 image type is left");
+        assert!(!ins.iter().any(|(o, _)| *o == 107), "OpImageQuerySamples is left");
+        assert!(!ins.iter().any(|(o, _)| *o == 104), "OpImageQuerySize is left");
+        assert!(ins.iter().any(|(o, x)| *o == 103 && x.len() == 5), "no OpImageQuerySizeLod");
+        let fetch = ins.iter().find(|(o, _)| *o == 95).expect("the fetch").1.clone();
+        assert_eq!(fetch.len(), 7, "fetch keeps image, coordinate and one operand");
+        assert_eq!(fetch[5], 0x2, "the Sample operand became Lod");
+        // spirv-val, when this host has it: the rewritten module must be what Vulkan accepts.
+        let path = std::env::temp_dir().join("reims-demote-ms-test.spv");
+        let bytes: Vec<u8> = out.iter().flat_map(|w| w.to_le_bytes()).collect();
+        std::fs::write(&path, bytes).unwrap();
+        if let Ok(st) = std::process::Command::new(r"C:\msys64\ucrt64\bin\spirv-val.exe")
+            .args(["--target-env", "vulkan1.2"])
+            .arg(&path)
+            .status()
+        {
+            assert!(st.success(), "spirv-val rejected the demoted module");
+        }
+    }
+
+    #[test]
+    fn a_module_without_multisampled_images_is_left_alone() {
+        let mut single = MS_FETCH.to_vec();
+        let mut i = 5;
+        while i < single.len() {
+            let n = (single[i] >> 16) as usize;
+            if single[i] & 0xffff == 25 {
+                single[i + 6] = 0;
+            }
+            i += n;
+        }
+        assert!(super::demote_multisampled_images(&single).is_none());
+    }
+}
+
 #[cfg(test)]
 mod lab_loop_budget_tests {
     /// The real module behind the three device losses, rewritten and checked by
