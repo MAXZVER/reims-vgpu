@@ -207,46 +207,65 @@ pub fn apply(
         // Its name here is not settled. Under this crate's reading the guest is
         // declaring its own copy stale; under the emitting driver's it is the
         // page-off / synchronize-requested flag, the guest explicitly asking for
-        // host->guest visibility. The alarm below is deliberately built to be
-        // correct under *both*, because the two readings agree about what
-        // happens next: the guest is about to look at these guest pages. A frame
-        // this device still owes them is unserved guest work either way.
+        // host->guest visibility. The two readings agree about what happens
+        // next: the guest is about to look at these guest pages, and a frame this
+        // device still owes them is unserved guest work either way.
         //
-        // Expected to stay at zero, and a firing is the bug — the shape
-        // `AGENTS.md` calls a healthy-zero alarm. It matters because the blit
-        // rail stopped manufacturing host visibility for every
-        // `copyFromTexture:toTexture:`, on the grounds that the command does not
-        // carry it; this is the counterpart check that the guest's *explicit*
-        // request is not being dropped on the floor at the same time.
-        let owed_gva =
-            state
-                .pending_writebacks
-                .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
-                    task_id,
-                    texture_ref: object_id,
-                });
-        let owed_surface = targets
-            .iter()
-            .any(|id| state.pending_writebacks.get(id).is_some());
-        if owed_gva || owed_surface {
-            crate::observe::Emit::decline(
-                "validity_guest_read",
-                &GuestReadDecline::FrameStillOwed {
-                    gva: owed_gva,
-                    surface: owed_surface,
-                },
-            )
-            .field("task", task_id)
-            .field("object", object_id)
-            .fail_once(u64::from(object_id));
-            // Both, not either: the decline dedupes per object so a standing
-            // problem reads as one line, and the counter is what says whether
-            // that line stood for one occurrence or a million.
-            crate::runtime::drain::note_store_route("validity_guest_read_frame_owed");
-        }
+        // That check is not made here. This function only states the quad; the
+        // payment that serves the read is `exec::pay_owed_before_guest_read`,
+        // which both callers run immediately afterwards, so a debt seen at this
+        // point is about to be paid and is not yet a loss (56 alarms against
+        // 1002 payments on a driven macos-26 boot). The alarm is
+        // [`note_guest_read_still_owed`], taken after the payment.
         crate::runtime::drain::note_store_route("validity_clr_guest");
     }
     out
+}
+
+/// Raise the guest-read alarm if a frame is **still** owed to a resource the
+/// guest is reading, after the payment that was meant to deliver it.
+///
+/// Byte +6 of a validity record (`clear_guest_valid`) is the guest about to
+/// look at the resource's pages, and `exec::pay_owed_before_guest_read` is what
+/// delivers a frame this device owes them. A debt that survives that payment is
+/// unserved guest work: the guest reads the previous frame. That is the
+/// healthy-zero alarm `AGENTS.md` describes, and it matters because the blit
+/// rail stopped manufacturing host visibility for every
+/// `copyFromTexture:toTexture:`, on the grounds that the command does not carry
+/// it; this is the counterpart check that the guest's *explicit* request is not
+/// being dropped on the floor at the same time.
+///
+/// Asked before the payment it fires on every ordinary read, because the debt
+/// is exactly what the payment is about to take: `apply` used to ask there.
+pub(crate) fn note_guest_read_still_owed(state: &DeviceState, task_id: u32, object_id: u32) {
+    let owed_gva =
+        state
+            .pending_writebacks
+            .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
+                task_id,
+                texture_ref: object_id,
+            });
+    let owed_surface = state
+        .mappings_named_by(task_id, object_id)
+        .iter()
+        .any(|id| state.pending_writebacks.get(id).is_some());
+    if !(owed_gva || owed_surface) {
+        return;
+    }
+    crate::observe::Emit::decline(
+        "validity_guest_read",
+        &GuestReadDecline::FrameStillOwed {
+            gva: owed_gva,
+            surface: owed_surface,
+        },
+    )
+    .field("task", task_id)
+    .field("object", object_id)
+    .fail_once(u64::from(object_id));
+    // Both, not either: the decline dedupes per object so a standing problem
+    // reads as one line, and the counter is what says whether that line stood
+    // for one occurrence or a million.
+    crate::runtime::drain::note_store_route("validity_guest_read_frame_owed");
 }
 
 /// The guest signalled on byte +6 for a resource this device has not finished
@@ -455,17 +474,21 @@ mod tests {
         );
     }
 
-    /// Byte +6 arriving while a frame is still owed is the one thing that could
-    /// have been broken by the blit rail no longer settling every
-    /// `copyFromTexture:toTexture:`: the guest is about to read guest pages this
-    /// device has not delivered into.
+    /// A frame still owed to a resource the guest is reading, *after* the
+    /// payment meant to deliver it, is the one thing that could have been broken
+    /// by the blit rail no longer settling every `copyFromTexture:toTexture:`:
+    /// the guest is about to read guest pages this device has not delivered
+    /// into.
     ///
     /// Asserted in both directions, because an alarm that cannot stay quiet is
     /// worth as little as one that cannot fire — this one is expected to read
     /// zero on every boot, so a version of it that fired on the ordinary case
-    /// would be indistinguishable from the bug it is watching for.
+    /// would be indistinguishable from the bug it is watching for. The ordinary
+    /// case includes `apply` itself: it states the quad *before* the payment, so
+    /// a debt it sees is about to be paid and is not an alarm (56 of them
+    /// against 1002 payments on a driven macos-26 boot).
     #[test]
-    fn byte_six_against_an_owed_frame_is_an_alarm_and_is_otherwise_quiet() {
+    fn a_frame_owed_after_the_payment_is_an_alarm_and_is_otherwise_quiet() {
         let task_id = 4;
         let texture_ref = 12;
         let key = crate::runtime::writeback_debt::GvaResourceKey {
@@ -501,6 +524,7 @@ mod tests {
             quad(0, 0, 1, 0),
             ValiditySite::ExecTable,
         );
+        note_guest_read_still_owed(&quiet, task_id, texture_ref);
         assert_eq!(
             crate::runtime::drain::store_route_count("validity_guest_read_frame_owed"),
             before_quiet,
@@ -520,6 +544,12 @@ mod tests {
             quad(0, 0, 1, 0),
             ValiditySite::ExecTable,
         );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("validity_guest_read_frame_owed"),
+            before_owed,
+            "stating the quad is not the moment to ask: the payment has not run yet"
+        );
+        note_guest_read_still_owed(&owed, task_id, texture_ref);
         assert_eq!(
             crate::runtime::drain::store_route_count("validity_guest_read_frame_owed"),
             before_owed + 1,

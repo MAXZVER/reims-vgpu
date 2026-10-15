@@ -30,6 +30,20 @@
 //! resolve again. The held descriptor and shaders are host-owned copies, so no
 //! guest page remains borrowed for the pipeline lifetime.
 //!
+//! # Why a hit does not compare AIR content
+//!
+//! A hit could in principle be checked against a digest of the AIR the guest
+//! currently names, to catch a shader rewritten behind a live reference with
+//! no delete. The digest is not available at that site: a hit reads no guest
+//! memory (that is what the memo saves), and the AIR is reachable only through
+//! the pipeline entry, both function entries and the MTLB container behind
+//! each — the multi-microsecond guest walk this module replaced. The
+//! translate cache computes the digest only on a miss, which is also the only
+//! time a retained state is built. A check would therefore cost the memo.
+//! `m2v_cache`'s content-change census sees the other half of the picture
+//! (a task naming different AIR under a ref it used before) and reports it on
+//! the off channel; a rewrite behind a *retained* state is not observable here.
+//!
 //! `REIMS_VGPU_PIPELINE_MEMO=off` remains an ablation that narrows the device
 //! back to reconstructing every draw. The `pipe_memo_*` and
 //! `preflight_memo_*` route names remain for longitudinal log compatibility;
@@ -214,6 +228,9 @@ impl RailDeviceState for VulkanDeviceState {
             "pipeline_state_task_deleted",
             self.render_pipelines.delete_task(task_id) as u64,
         );
+        // The translate cache's content-change census is keyed by task too, and
+        // the guest reuses task ids.
+        crate::runtime::m2v_cache::forget_task_identities(task_id);
     }
 
     /// The device's end ends every reference this rail holds under it, whatever
@@ -230,6 +247,7 @@ impl RailDeviceState for VulkanDeviceState {
             "pipeline_state_device_ended",
             self.render_pipelines.clear() as u64,
         );
+        crate::runtime::m2v_cache::forget_all_identities();
         // The caches hold native objects, so their ending is a destruction and
         // not a drop. It goes through whatever context the engine still has,
         // which is the engine's half of this division: the device owns *when*,

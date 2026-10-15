@@ -5140,10 +5140,11 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
 /// `invalidate_object_host_copies` is the discharge, and it is the same one
 /// `delete_object` has always performed for the same two maps — the difference
 /// being that a delete also unnames the object while a re-point only moves its
-/// bytes. Kept fail-visible after the repair so the reliance stays measurable;
-/// a rising count is now this device correctly following the guest, and its
-/// disappearance would mean the packet stopped arriving, not that the bug was
-/// fixed twice.
+/// bytes. Reported on the off channel after the repair: nothing is lost (either
+/// the device held no state for the ref, or the copy it held was dropped), so
+/// the line is a census. A rising count is this device correctly following the
+/// guest, and its disappearance would mean the packet stopped arriving, not
+/// that the bug was fixed twice.
 ///
 /// The guest's own object list supplies the type, which is the only authority on
 /// what the id names: `lookup_list_entry` reads it at use time and this device
@@ -5178,7 +5179,10 @@ fn note_replace_physical_unmapped_after_invalidation<M: HostMemory>(
         let kind = object_type
             .map(|t| t.to_string())
             .unwrap_or_else(|| "absent".to_string());
-        crate::observe::fail(format!(
+        // Off, not a failure: the re-point either found no host state to follow
+        // or dropped the stale ref-keyed copy it found, so no guest work is
+        // lost or degraded.
+        crate::observe::off(format!(
             "replace_physical_unknown_object task={task_id} object={object_id} \
              obj_type={kind} tex_dropped={} lin_dropped={} \
              (no mapping belongs to this task-local resource; ref-keyed host copies dropped)",

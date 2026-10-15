@@ -290,11 +290,15 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
 /// in a space this device holds nothing keyed by, and there is nothing to find
 /// in either direction.
 ///
-/// They stay fail-visible even so. "There is nothing to retire" is a claim about
+/// They stay counted even so, and the `delete_object_*ref_type_*` lines are
+/// reported on the off channel. "There is nothing to retire" is a claim about
 /// this device's caches and not about the guest's object, and a counter that
 /// went quiet would stop saying which contract gap is still open — and the gap
 /// that is still open is now exactly the five kinds a driven guest has never
 /// sent: buffer, texture, heap, rasterization rate map, indirect command buffer.
+/// Not on the failure channel: the census is settled (the destroy ref lives in
+/// the serializer's per-kind space, so a type that differs is a random
+/// collision between two spaces) and no destroy is lost or degraded by it.
 fn apply_delete_object<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -489,12 +493,68 @@ fn apply_delete_object<H: HostMemory + HostOps>(
         op.opcode(),
         RefSpacePopulation::Untracked,
     );
-    note_unimplemented(
-        state,
-        channel_id,
-        UnimplementedCommand::DeleteObject,
-        packet,
-    );
+    note_delete_object_declined(state, channel_id, packet, op.opcode());
+}
+
+/// Report a `CmdDeleteObject` this device declines because it keeps nothing
+/// keyed by the kind's ref.
+///
+/// The counter is `cmd_delete_object_unimplemented` for every kind, as it always
+/// was. What differs by kind is whether the decline is a failure:
+///
+/// - A **function** and a **compute pipeline state** are cached by *content*:
+///   the translate cache is keyed by the AIR, is never evicted, and the compute
+///   rail reads its pipeline out of the guest's own list on every dispatch. There
+///   is no state keyed by the ref for the destroy to retire, so declining loses
+///   and degrades nothing and the line is an off-channel census. (A driven boot
+///   sends dozens of them: 21 and 17 in the one that prompted this.)
+/// - Every other untracked kind (buffer, texture, heap, rasterization rate map,
+///   indirect command buffer) names an object whose host state a destroy would
+///   have to end. Declining it is unsupported guest work and stays on the
+///   failure channel.
+///
+/// The latch is per kind. The two forms share one `(reason, discriminant)`
+/// space, and keyed by the packet opcode alone, as it used to be, the first kind
+/// to arrive would latch every later one out of the failure log — a function
+/// destroy would hide a texture destroy.
+fn note_delete_object_declined(
+    state: &mut DeviceState,
+    channel_id: u32,
+    packet: &Packet,
+    record_opcode: u32,
+) {
+    let command = UnimplementedCommand::DeleteObject;
+    // The counter first, before the latch: the emitter dedupes and the counter
+    // does not.
+    note_store_route(command.slug());
+    let ev = FailEvent::UnimplementedChildCommand {
+        channel: channel_id,
+        command,
+        opcode: packet.opcode,
+        total_size: packet.total_size,
+        stamp_count: packet.stamp_count(),
+        payload: packet.payload.clone(),
+    };
+    let discriminant = (u64::from(packet.opcode) << 32) | u64::from(record_opcode);
+    if is_content_cached_kind(record_opcode) {
+        state.record_off_once(ev, discriminant);
+    } else {
+        state.record_fail_once(ev, discriminant);
+    }
+}
+
+/// The destroy kinds whose objects this device caches by content and so holds
+/// no state for under their ref.
+///
+/// Beside [`is_retained_kind`], which names the kinds it does hold `(task,
+/// ref)`-keyed state for. A kind in neither list is an object this device may
+/// hold host state for and does not yet retire.
+const fn is_content_cached_kind(opcode: u32) -> bool {
+    use reims_vgpu_wire::ops::destroy as d;
+    matches!(
+        opcode,
+        d::OPCODE_DELETE_FUNCTION | d::OPCODE_DELETE_COMPUTE_PIPELINE_STATE
+    )
 }
 
 /// The destroy kinds this device holds `(task, ref)`-keyed state for.
@@ -690,7 +750,11 @@ fn note_delete_object_ref_space<M: HostMemory>(
     let route = retained.route(answer);
     note_store_route(route);
     if crate::observe::first_sight(route, (u64::from(opcode) << 32) | u64::from(object_ref)) {
-        crate::observe::fail(format!(
+        // Off, not a failure, for all six spellings: the destroy ref lives in the
+        // serializer's per-kind space, not the object list's, so a type that
+        // differs is an integer collision between two spaces and one that agrees
+        // is a coincidence. Settled census; nothing is lost either way.
+        crate::observe::off(format!(
             "{route} kind={} task={task_id} ref={object_ref} found_type={} expected_type={} \
              (whether this destroy record's ref is a number in the guest's object-list space \
              is what decides whether a retirement could ever be keyed on it)",
@@ -3534,7 +3598,11 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
     // answer a withdrawal or a retirement threw away. Once per slot.
     if let Some(id) = census.first_unanswered_pipeline {
         if crate::observe::first_sight("draw_usage_no_stage", u64::from(id.slot.0)) {
-            crate::observe::fail(format!(
+            // Off, not a failure: an ordering-precision census in the safe
+            // direction. Without a reflection the draw's slots order against
+            // every other access to the same resource, which is slower and
+            // never wrong, and no guest work is lost or degraded.
+            crate::observe::off(format!(
                 "draw_usage_no_stage slot={} gen={} model_pipeline={} (a draw bound this \
                  pipeline and the ordering plane had no reflection for it, so every slot \
                  the draw binds ordered against every other access to the same resource)",
@@ -4397,12 +4465,18 @@ fn run_parked_packet_g<H: HostMemory + HostOps>(
 ///
 /// The other half of [`ready_lease`], and the half the table had no step for
 /// until `77f5bd88`. `Ready` used to mean "was translated once", which is not
-/// the question a transaction about to bind it is asking: the guest rewrites
-/// the shader behind a live pipeline ref **in place**, so no delete arrives, no
-/// generation is minted, the [`reims_vgpu_core::identity::ResourceId`] is
-/// unchanged — and the rail's translate cache, being keyed by the shader's
-/// content, stops holding one. Four refs a driven macos-15 desktop, named by
-/// `m2v_pipe_content_changed`.
+/// the question a transaction about to bind it is asking: were the guest to
+/// rewrite the shader behind a live pipeline ref **in place**, no delete would
+/// arrive, no generation would be minted, the
+/// [`reims_vgpu_core::identity::ResourceId`] would be unchanged — and the
+/// rail's translate cache, being keyed by the shader's content, would stop
+/// holding one.
+///
+/// That case is a hazard this step closes, not a population anyone has
+/// measured. The census this doc once cited for it, `m2v_pipe_content_changed`,
+/// keyed its record by pipeline reference without the task, and references are
+/// per task: what it counted was two tasks naming one number, not one pipeline
+/// changing. It is keyed by task now and reports on the off channel.
 ///
 /// Silent when the lease was already waiting, which is the common case by three
 /// orders of magnitude: this runs for every pending ref of every pre-scan, and

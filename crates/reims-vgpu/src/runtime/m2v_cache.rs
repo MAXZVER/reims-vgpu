@@ -502,18 +502,30 @@ struct Cache {
     misses: u64,
     async_queue: VecDeque<TranslationTask>,
     async_worker_running: bool,
-    /// The last identity each `(pipeline_ref, stage_tag)` was translated under.
+    /// The last AIR each `(task, pipeline_ref, stage_tag)` was translated
+    /// under.
     ///
-    /// **Not a cache — a detector.** This cache is keyed by AIR content and the
-    /// pre-scan's memo [`crate::backend::vulkan::pipeline_resolve::translations_ready`]
-    /// is keyed by `(task, pipeline_ref)`, so the two answer "is this pipeline
-    /// translated" from different questions. They agree until the guest points
-    /// one ref at different AIR: the content key misses and a fresh translation
-    /// starts, while the name memo still says ready, so the ordering plane
-    /// releases a packet against a shader that is microseconds old. This
-    /// records where the two part company, and nothing reads it to decide
-    /// anything.
-    last_identity: HashMap<(u32, u8), u64>,
+    /// **Not a cache — a census.** Pipeline references are per task: two tasks
+    /// routinely name the same integer for unrelated pipelines, so a key
+    /// without the task reads one task's pipeline as the other's "change" (57
+    /// of the 63 refs a driven macos-15 boot reported were named in two or
+    /// more tasks at the same moment). The task is part of the key for that
+    /// reason, and [`forget_task_identities`] ends a task's entries with the
+    /// task, because the guest reuses task ids.
+    ///
+    /// What is left after that is one task naming different AIR under a ref it
+    /// used before: a delete followed by a reuse of the number, which is
+    /// legitimate guest behaviour. The render pre-scan asks only after
+    /// `pipeline_resolve::translations_ready` answered "not retained", so the
+    /// retained pipeline registry holds nothing for that ref when this fires
+    /// and no stale shader is served; the compute pre-scan has no retained
+    /// state to consult at all. The line is a census on the off channel, not a
+    /// failure, and nothing reads this map to decide anything.
+    ///
+    /// The value is the digest of the AIR alone: a kernel's cache digest also
+    /// carries its dispatch geometry, and one kernel dispatched at two
+    /// threadgroup sizes is two translations of one AIR, not a change.
+    last_identity: HashMap<(u32, u32, u8), u64>,
 }
 
 #[derive(Clone)]
@@ -612,6 +624,18 @@ impl<'a> ShaderId<'a> {
             air,
         }
     }
+
+    /// The digest of the AIR this identity was built from, without the dispatch
+    /// geometry a kernel's cache digest also carries.
+    ///
+    /// A render stage's cache digest already is that. A kernel pays one more
+    /// hash of its AIR for it, on a cache miss only.
+    fn air_digest(&self) -> u64 {
+        match self.local_size {
+            None => self.digest,
+            Some(_) => air_key(Stage::Kernel, self.air),
+        }
+    }
 }
 
 impl Cache {
@@ -643,6 +667,28 @@ impl Cache {
                 entry,
             }),
         }
+    }
+
+    /// Record the AIR `(task_id, pipeline_ref, id.stage)` is now translated
+    /// under, and return `(previous, now)` when that differs from the last one
+    /// recorded. See [`Cache::last_identity`] for what the answer means.
+    fn note_identity(
+        &mut self,
+        task_id: u32,
+        pipeline_ref: u32,
+        id: ShaderId<'_>,
+    ) -> Option<(u64, u64)> {
+        let now = id.air_digest();
+        let previous = self
+            .last_identity
+            .insert((task_id, pipeline_ref, id.stage), now)?;
+        (previous != now).then_some((previous, now))
+    }
+
+    /// End [`Self::last_identity`]'s records for one task.
+    fn forget_task_identities(&mut self, task_id: u32) {
+        self.last_identity
+            .retain(|&(task, _, _), _| task != task_id);
     }
 
     /// Drop the entry filed under `id`, and the bucket with it if it was the
@@ -1539,14 +1585,29 @@ fn repair_layout(
 /// sole FIFO scheduler. Returns true when the content is already resolved
 /// (success or deterministic failure), false while the background worker owns
 /// it. Callers keep the guest packet at the channel head and retry on poll.
-pub fn ensure_cached_async(air: &[u8], stage: Stage, pipeline_ref: u32) -> bool {
-    ensure_cached_async_keyed(ShaderId::render(stage, air), stage, None, pipeline_ref)
+///
+/// `task_id` and `pipeline_ref` name the guest pipeline that is asking. They
+/// feed only the content-change census ([`Cache::last_identity`]): pipeline
+/// references are per task, so the reference alone is not an identity.
+pub fn ensure_cached_async(air: &[u8], stage: Stage, task_id: u32, pipeline_ref: u32) -> bool {
+    ensure_cached_async_keyed(
+        ShaderId::render(stage, air),
+        stage,
+        None,
+        task_id,
+        pipeline_ref,
+    )
 }
 
 /// Kernel counterpart to [`ensure_cached_async`]. LocalSize is part of both
 /// the translation options and cache key, so two dispatch geometries can never
 /// alias one another.
-pub fn ensure_cached_kernel_async(air: &[u8], local_size: [u32; 3], pipeline_ref: u32) -> bool {
+pub fn ensure_cached_kernel_async(
+    air: &[u8],
+    local_size: [u32; 3],
+    task_id: u32,
+    pipeline_ref: u32,
+) -> bool {
     if local_size.contains(&0) {
         return true;
     }
@@ -1554,18 +1615,38 @@ pub fn ensure_cached_kernel_async(air: &[u8], local_size: [u32; 3], pipeline_ref
         ShaderId::kernel(air, local_size),
         Stage::Kernel,
         Some(local_size),
+        task_id,
         pipeline_ref,
     )
+}
+
+/// End the content-change census's memory of one task's pipeline references.
+///
+/// Called when the guest deletes or redefines the task: the guest reuses task
+/// ids, and a new incarnation naming different AIR under an old number is not
+/// a change of anything.
+pub(crate) fn forget_task_identities(task_id: u32) {
+    global()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forget_task_identities(task_id);
+}
+
+/// End the census's memory of every task, with the device that owned them.
+pub(crate) fn forget_all_identities() {
+    let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
+    c.last_identity.clear();
 }
 
 fn ensure_cached_async_keyed(
     id: ShaderId<'_>,
     stage: Stage,
     kernel_local_size: Option<[u32; 3]>,
+    task_id: u32,
     pipeline_ref: u32,
 ) -> bool {
     let mut start_worker = false;
-    let mut changed: Option<u64> = None;
+    let changed: Option<(u64, u64)>;
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
         match c.find(id) {
@@ -1580,15 +1661,10 @@ fn ensure_cached_async_keyed(
             Some(Entry::Loading) => return false,
             None => {}
         }
-        // A miss for a ref this process has already translated something else
-        // under. See `Cache::last_identity`: this is the exact moment the
-        // name-keyed memo becomes a promise about bytes that are no longer
-        // there, and the only moment both identities are in one hand.
-        if let Some(previous) = c.last_identity.insert((pipeline_ref, id.stage), id.digest) {
-            if previous != id.digest {
-                changed = Some(previous);
-            }
-        }
+        // A miss for a ref this task has already translated something else
+        // under. See `Cache::last_identity`: a census of the guest reusing a
+        // reference number for different AIR, not a stale-shader alarm.
+        changed = c.note_identity(task_id, pipeline_ref, id);
         let air: Arc<[u8]> = Arc::from(id.air);
         c.put(id, &air, Entry::Loading);
         c.misses = c.misses.saturating_add(1);
@@ -1613,21 +1689,24 @@ fn ensure_cached_async_keyed(
         "linux_m2v_async queued pipe={pipeline_ref} stage={stage:?}{dims} air={}",
         id.air.len()
     ));
-    // Always-on, and once per `(ref, stage)` rather than once per event: the
-    // population this names is the one whose size decides whether the pre-scan's
-    // name-keyed memo can be kept at all, and a boot that shows none of it is
-    // saying something different from a boot that shows it on eight refs.
-    if let Some(previous) = changed {
+    // Once per `(task, ref, stage)` rather than once per event. OFF, not a
+    // failure: the render pre-scan asks only after the retained pipeline
+    // registry answered "not retained" for this `(task, ref)` (the compute one
+    // has no registry), so the guest naming different AIR under a number it
+    // used before (a delete, then a reuse) has nothing stale to be served and
+    // loses no work. The magnitude still shows as
+    // `seen:m2v_pipe_content_changed` in `refusal_census`.
+    if let Some((previous, now)) = changed {
         if crate::observe::first_sight(
             "m2v_pipe_content_changed",
-            u64::from(pipeline_ref) << 8 | u64::from(id.stage),
+            (u64::from(task_id) << 40) | (u64::from(pipeline_ref) << 8) | u64::from(id.stage),
         ) {
-            crate::observe::fail(format!(
-                "linux_m2v reason=m2v_pipe_content_changed pipe={pipeline_ref} \
-                 stage={stage:?}{dims} air={} was={previous:#x} now={:#x} (the guest pointed this \
-                 ref at different AIR; the name-keyed pre-scan memo still calls it translated)",
-                id.air.len(),
-                id.digest
+            crate::observe::off(format!(
+                "linux_m2v reason=m2v_pipe_content_changed task={task_id} pipe={pipeline_ref} \
+                 stage={stage:?}{dims} air={} was={previous:#x} now={now:#x} (the guest named \
+                 different AIR under a reference this task used before; nothing was retained \
+                 for it when it was asked)",
+                id.air.len()
             ));
         }
     }
@@ -1941,48 +2020,101 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The detector fires when one ref is translated under two identities, and
-    /// stays silent when the same one is asked for twice.
+    /// The content-change census names one task reusing a reference number for
+    /// different AIR, and nothing else.
     ///
     /// It is checked at the map rather than through the log line, because the
-    /// line is latched per `(ref, stage)` for a whole process and a unit suite
-    /// is one process — a test that asserted on the line would pass or fail on
-    /// whether some earlier test happened to use the same ref.
+    /// line is latched per key for a whole process and a unit suite is one
+    /// process: a test that asserted on the line would pass or fail on whether
+    /// some earlier test happened to use the same key. A private [`Cache`]
+    /// keeps the state this test's own.
     ///
-    /// The population this names is the one that decides whether
-    /// `pipeline_resolve::translations_ready`'s `(task, ref)` memo can be kept:
-    /// on a driven macos-15 desktop it is the only shape under which a draw
-    /// refuses against a translation that started microseconds earlier while
-    /// the ordering plane holds the pipeline ready.
+    /// The population it used to name was a defect of the key. Pipeline
+    /// references are per task, so with the task left out, two tasks' unrelated
+    /// pipelines under one number read as one pipeline changing (57 of the 63
+    /// refs a driven macos-15 boot reported), and a kernel dispatched at two
+    /// threadgroup sizes read as its AIR changing.
     #[test]
-    fn one_ref_translated_under_two_identities_is_the_detectors_whole_population() {
-        let _guard = test_lock();
-        // A ref no other test in this process uses, so the map's own state is
-        // this test's.
-        const REF: u32 = 0xD1FF_0001;
+    fn only_one_task_reusing_a_ref_for_different_air_is_a_content_change() {
+        let mut c = Cache::default();
+        const REF: u32 = 30;
         let a = ShaderId::render(Stage::Fragment, b"air-one");
         let b = ShaderId::render(Stage::Fragment, b"air-two-longer");
         assert_ne!(a.digest, b.digest, "the fixture needs two identities");
 
-        let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
-        c.last_identity.remove(&(REF, a.stage));
-
         assert_eq!(
-            c.last_identity.insert((REF, a.stage), a.digest),
+            c.note_identity(1, REF, a),
             None,
             "the first translation of a ref has nothing to differ from"
         );
         assert_eq!(
-            c.last_identity.insert((REF, a.stage), a.digest),
-            Some(a.digest),
+            c.note_identity(1, REF, a),
+            None,
             "the same AIR asked for twice is not a change"
         );
         assert_eq!(
-            c.last_identity.insert((REF, b.stage), b.digest),
-            Some(a.digest),
-            "different AIR under one ref is the change the detector names"
+            c.note_identity(3, REF, b),
+            None,
+            "another task's pipeline under the same number is not this task's change"
         );
-        c.last_identity.remove(&(REF, a.stage));
+        assert_eq!(
+            c.note_identity(1, REF, a),
+            None,
+            "and it did not disturb the first task's record"
+        );
+        assert_eq!(
+            c.note_identity(1, REF, b),
+            Some((a.digest, b.digest)),
+            "different AIR under one task's ref is the change the census names"
+        );
+        assert_eq!(
+            c.note_identity(1, REF, ShaderId::render(Stage::Vertex, b"air-one")),
+            None,
+            "the stage is part of the key: a vertex stage is not the fragment stage changing"
+        );
+    }
+
+    /// One kernel dispatched at two threadgroup sizes is two translations of
+    /// one AIR, which is not a change; different AIR under the ref is.
+    #[test]
+    fn a_kernel_dispatched_at_two_geometries_is_not_a_content_change() {
+        let mut c = Cache::default();
+        let air = b"kernel-air";
+        let small = ShaderId::kernel(air, [8, 8, 1]);
+        let large = ShaderId::kernel(air, [16, 16, 1]);
+        assert_ne!(small.digest, large.digest, "the cache keeps the two apart");
+        assert_eq!(small.air_digest(), large.air_digest());
+
+        assert_eq!(c.note_identity(2, 9, small), None);
+        assert_eq!(c.note_identity(2, 9, large), None);
+        let other = ShaderId::kernel(b"other-kernel-air", [16, 16, 1]);
+        assert_eq!(
+            c.note_identity(2, 9, other),
+            Some((large.air_digest(), other.air_digest()))
+        );
+    }
+
+    /// The guest reuses task ids, so a task's records end with the task.
+    #[test]
+    fn forgetting_a_task_ends_only_that_tasks_records() {
+        let mut c = Cache::default();
+        let a = ShaderId::render(Stage::Fragment, b"air-one");
+        let b = ShaderId::render(Stage::Fragment, b"air-two-longer");
+        assert_eq!(c.note_identity(1, 5, a), None);
+        assert_eq!(c.note_identity(3, 5, a), None);
+
+        c.forget_task_identities(1);
+
+        assert_eq!(
+            c.note_identity(1, 5, b),
+            None,
+            "a new incarnation of task 1 naming other AIR under ref 5 is not a change"
+        );
+        assert_eq!(
+            c.note_identity(3, 5, b),
+            Some((a.digest, b.digest)),
+            "task 3 was not forgotten"
+        );
     }
 
     /// A variant's reflected sampler interface must agree with the executable
@@ -2368,7 +2500,7 @@ mod tests {
         // The admission still resolves, so the guest packet advances rather
         // than re-polling a translation that keeps failing.
         assert!(
-            ensure_cached_async(air, Stage::Vertex, 7),
+            ensure_cached_async(air, Stage::Vertex, 3, 7),
             "a stored failure must resolve the ask, or the packet never advances"
         );
 
@@ -2606,7 +2738,7 @@ mod tests {
             let mut c = global().lock().unwrap();
             c.put(id, &Arc::from(&air[..]), Entry::Loading);
         }
-        assert!(!ensure_cached_async(air, Stage::Fragment, 7));
+        assert!(!ensure_cached_async(air, Stage::Fragment, 3, 7));
         assert!(global().lock().unwrap().async_queue.is_empty());
 
         global().lock().unwrap().put(
@@ -2616,7 +2748,7 @@ mod tests {
                 detail: "synthetic failure".into(),
             }),
         );
-        assert!(ensure_cached_async(air, Stage::Fragment, 7));
+        assert!(ensure_cached_async(air, Stage::Fragment, 3, 7));
         assert_eq!(
             // `.err()` rather than `unwrap_err()`: the success arm is an
             // `Arc<CachedShader>`, which carries no `Debug`.
@@ -2661,7 +2793,7 @@ mod tests {
             );
         }
         assert!(
-            ensure_cached_async(&hot, Stage::Fragment, 1),
+            ensure_cached_async(&hot, Stage::Fragment, 3, 1),
             "the first-compiled shader is still resolved after 1024 later ones"
         );
         assert_eq!(
@@ -2685,9 +2817,9 @@ mod tests {
                 Entry::Loading,
             );
         }
-        assert!(!ensure_cached_kernel_async(air, [16, 16, 1], 20));
+        assert!(!ensure_cached_kernel_async(air, [16, 16, 1], 3, 20));
         assert!(global().lock().unwrap().async_queue.is_empty());
-        assert!(ensure_cached_kernel_async(air, [0, 16, 1], 20));
+        assert!(ensure_cached_kernel_async(air, [0, 16, 1], 3, 20));
         reset_for_test();
     }
 
