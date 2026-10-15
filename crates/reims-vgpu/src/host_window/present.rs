@@ -270,7 +270,7 @@ pub struct FramePublished;
 /// TEMP (lab, WAKE_THREAD): see [`WindowWaker::wake_via_poster`]. Latched.
 fn lab_wake_thread() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_WAKE_THREAD").map_or(true, |v| v != "off"))
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_WAKE_THREAD").is_ok_and(|v| v == "on"))
 }
 
 pub struct WindowWaker {
@@ -326,7 +326,7 @@ impl WindowWaker {
         }
     }
 
-    /// TEMP (lab, WAKE_THREAD, on; `REIMS_VGPU_LAB_WAKE_THREAD=off` posts inline again): the wake is posted by a
+    /// TEMP (lab, WAKE_THREAD, opt-in `REIMS_VGPU_LAB_WAKE_THREAD=on`; b466 inconclusive): the wake is posted by a
     /// thread of its own. b456 (Windows, canvas 5K): `send_event` is a `PostMessageW`, and 342 of 5503 drain samples
     /// (6 %) sat in `NtUserPostMessage` - ~1.5 ms a published frame, on the drain. Here the drain only marks a wake
     /// owed (a mutex and a futex wake); wakes owed while a post is under way fold into one.
