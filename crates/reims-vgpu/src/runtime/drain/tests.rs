@@ -7068,6 +7068,7 @@ fn a_destroy_this_device_cannot_retire_says_what_its_ref_names_in_the_object_lis
     let absent = store_route_count("delete_object_ref_no_list_entry");
     let agrees = store_route_count("delete_object_ref_type_agrees");
     let differs = store_route_count("delete_object_ref_type_differs");
+    let cap = crate::observe::FailCapture::start();
 
     // Slot 4 holds nothing.
     process_child_packet(&mut state, &mut host, 4, &destroy_packet(4));
@@ -7104,6 +7105,37 @@ fn a_destroy_this_device_cannot_retire_says_what_its_ref_names_in_the_object_lis
         (agrees + 1, differs + 1),
         "and the type agreeing is the evidence a retirement could be keyed here"
     );
+
+    // None of that is a failure: the destroy ref lives in the serializer's
+    // per-kind space, so these lines are a settled census and are said on the
+    // off channel.
+    let lines = cap.lines();
+    let on_fail = |slug: &str| {
+        lines
+            .iter()
+            .filter(|l| l.split_whitespace().next() == Some(slug))
+            .count()
+    };
+    let on_off = |slug: &str| {
+        lines
+            .iter()
+            .filter(|l| {
+                let mut words = l.split_whitespace();
+                words.next() == Some("OFF") && words.next() == Some(slug)
+            })
+            .count()
+    };
+    for slug in [
+        "delete_object_ref_type_differs",
+        "delete_object_ref_type_agrees",
+    ] {
+        assert_eq!(
+            on_fail(slug),
+            0,
+            "{slug} is a settled census, not a failure"
+        );
+        assert_eq!(on_off(slug), 1, "{slug} is still said, on the off channel");
+    }
 }
 
 /// The host's retired slots are reported as retired, not as undecodable.

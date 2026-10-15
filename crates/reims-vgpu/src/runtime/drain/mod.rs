@@ -290,11 +290,15 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
 /// in a space this device holds nothing keyed by, and there is nothing to find
 /// in either direction.
 ///
-/// They stay fail-visible even so. "There is nothing to retire" is a claim about
+/// They stay counted even so, and the `delete_object_*ref_type_*` lines are
+/// reported on the off channel. "There is nothing to retire" is a claim about
 /// this device's caches and not about the guest's object, and a counter that
 /// went quiet would stop saying which contract gap is still open — and the gap
 /// that is still open is now exactly the five kinds a driven guest has never
 /// sent: buffer, texture, heap, rasterization rate map, indirect command buffer.
+/// Not on the failure channel: the census is settled (the destroy ref lives in
+/// the serializer's per-kind space, so a type that differs is a random
+/// collision between two spaces) and no destroy is lost or degraded by it.
 fn apply_delete_object<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -690,7 +694,11 @@ fn note_delete_object_ref_space<M: HostMemory>(
     let route = retained.route(answer);
     note_store_route(route);
     if crate::observe::first_sight(route, (u64::from(opcode) << 32) | u64::from(object_ref)) {
-        crate::observe::fail(format!(
+        // Off, not a failure, for all six spellings: the destroy ref lives in the
+        // serializer's per-kind space, not the object list's, so a type that
+        // differs is an integer collision between two spaces and one that agrees
+        // is a coincidence. Settled census; nothing is lost either way.
+        crate::observe::off(format!(
             "{route} kind={} task={task_id} ref={object_ref} found_type={} expected_type={} \
              (whether this destroy record's ref is a number in the guest's object-list space \
              is what decides whether a retirement could ever be keyed on it)",
