@@ -2879,6 +2879,21 @@ pub fn mrt_draw_request_with<M: HostMemory + HostOps, S: crate::runtime::exec::w
             format: mfmt,
             sample_count: target_sample_count,
         } = target;
+        // TEMP (lab, Electron tiles): every distinct render target a pass resolves to - whether a tile a task
+        // renders into is the IOSurface mapping another task composites (mid) or a task-local texture (mid 0).
+        if crate::observe::first_sight(
+            "lab_rt_seen",
+            (u64::from(task_id) << 48)
+                ^ (u64::from(target_ref) << 24)
+                ^ (u64::from(mapping_id) << 8)
+                ^ (u64::from(mw) << 32)
+                ^ u64::from(mh),
+        ) {
+            crate::observe::off(format!(
+                "lab_rt_seen task={task_id} ref={target_ref} mid={mapping_id} gva={gva:#x} {mw}x{mh} fmt={mfmt:#x}                  samples={target_sample_count} load={:#x} store={:#x}",
+                att.load_action, att.store_action
+            ));
+        }
         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
         note_attachment_sample_count_override(
             pipeline_ref,
