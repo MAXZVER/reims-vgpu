@@ -419,6 +419,15 @@ pub enum SampledClass {
     ///
     /// See [`TexelLayout::Rgba32Float`] for why it is native-or-nothing.
     Rgba32Float,
+    /// One `binary16` channel - `MTLPixelFormatR16Float`, which macOS 26 renders
+    /// blur/backdrop intermediates into as linear GVA targets.
+    ///
+    /// Declared so [`store_texel_order`] can admit the format: its LOAD seed had
+    /// no rail at all (no byte-copy admission, no eight-bit row converter), so
+    /// every LOAD pass on one started undefined - `load_seed_lost fmt=0x19`, nine
+    /// times in one boot (b486). Native on the sampled side too, like
+    /// [`Self::Rg16Float`]: the eight-bit round trip would clamp signed values.
+    R16Float,
 }
 
 /// The byte layout of one guest texel on the sampled rails, independent of any
@@ -1825,6 +1834,7 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
         MTL_FORMAT_BGR10A2_UNORM => SampledClass::Bgr10a2Unorm,
         MTL_FORMAT_RG16_UINT => SampledClass::Rg16Uint,
         MTL_FORMAT_RGBA32_FLOAT => SampledClass::Rgba32Float,
+        MTL_FORMAT_R16_FLOAT => SampledClass::R16Float,
         _ => return None,
     })
 }
@@ -2155,6 +2165,11 @@ pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
         // Four float32 channels, on the same terms: no eight-bit narrowing
         // exists, so the byte copy of the resident is its only rail.
         MTL_FORMAT_RGBA32_FLOAT => TexelLayout::Rgba32Float,
+        // One half-float channel. Missing here was a loss, not a slow path: the
+        // CPU row converter has no arm for it either, so a LOAD on such a target
+        // had no seed at all (`load_seed_lost fmt=0x19`). The resident is created
+        // at `R16_SFLOAT`, so the copy is byte for byte.
+        MTL_FORMAT_R16_FLOAT => TexelLayout::R16Float,
         _ => return None,
     })
 }
@@ -3816,7 +3831,10 @@ mod tests {
             sampled_class(MTL_FORMAT_A8_UNORM),
             Some(SampledClass::A8Unorm)
         );
-        assert_eq!(sampled_class(MTL_FORMAT_R16_FLOAT), None);
+        assert_eq!(
+            sampled_class(MTL_FORMAT_R16_FLOAT),
+            Some(SampledClass::R16Float)
+        );
         assert_eq!(
             storage_selector(MTL_FORMAT_R8_UNORM),
             Some(StorageImageSelector::R8Unorm)
@@ -4086,14 +4104,10 @@ mod tests {
                 SampledClass::Bgr10a2Unorm => TexelLayout::Bgr10a2Unorm,
                 SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
                 SampledClass::Rgba32Float => TexelLayout::Rgba32Float,
+                SampledClass::R16Float => TexelLayout::R16Float,
             });
-            // Renderable, single-channel, and named by neither table above —
-            // admitted for macOS 26's blur intermediate.
-            let single_channel_float =
-                (format == MTL_FORMAT_R16_FLOAT).then_some(TexelLayout::R16Float);
             let layout = store_texel_order(format)
                 .or(from_class)
-                .or(single_channel_float)
                 .unwrap_or_else(|| panic!("{format:#x} is renderable with no layout"));
             if !from_formats.contains(&layout) {
                 from_formats.push(layout);
@@ -4939,6 +4953,7 @@ mod tests {
                     TexelLayout::Bgr10a2Unorm => SampledClass::Bgr10a2Unorm,
                     TexelLayout::Rg16Uint => SampledClass::Rg16Uint,
                     TexelLayout::Rgba32Float => SampledClass::Rgba32Float,
+                    TexelLayout::R16Float => SampledClass::R16Float,
                     // Named rather than defaulted. This arm used to be
                     // `_ => SampledClass::Bgra8Unorm`, which was true only while
                     // the admitted set was {Rgba8, Bgra8, Rgba16Float}: the next
@@ -4957,10 +4972,18 @@ mod tests {
         }
         // A renderable format that is still not a byte-copy destination, so a
         // further widening of the set above has to change this line to pass.
-        assert!(render_target_bpp(MTL_FORMAT_R16_FLOAT).is_some());
+        // R16_FLOAT held this line until its LOAD seed was measured lost
+        // (`load_seed_lost fmt=0x19`, b486); R8_UNORM is the one left, served
+        // by the eight-bit rails it is exact on.
+        assert!(render_target_bpp(MTL_FORMAT_R8_UNORM).is_some());
         assert!(
-            store_texel_order(MTL_FORMAT_R16_FLOAT).is_none(),
-            "R16_FLOAT renders but is not admitted to a copy"
+            store_texel_order(MTL_FORMAT_R8_UNORM).is_none(),
+            "R8_UNORM renders but is not admitted to a copy"
+        );
+        assert_eq!(
+            store_texel_order(MTL_FORMAT_R16_FLOAT),
+            Some(TexelLayout::R16Float),
+            "a single-channel half-float target has no eight-bit seed rail, so the copy is its only one"
         );
         assert_eq!(
             store_texel_order(MTL_FORMAT_RG16_FLOAT),

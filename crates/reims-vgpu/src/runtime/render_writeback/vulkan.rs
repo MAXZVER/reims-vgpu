@@ -2090,10 +2090,10 @@ pub enum GvaWritebackDecline {
     /// [`crate::backend::vulkan::translate::pixel::verbatim_texel`]'s question
     /// and not this doc's to restate.
     ///
-    /// `R16_FLOAT` is what lands here now, twice on a driven macos-26 boot: it
-    /// is renderable but deliberately not a byte-copy destination, for the
-    /// reason `store_texel_order`'s own doc gives for `RG16_FLOAT`, and no
-    /// compute selector names it either.
+    /// `R16_FLOAT` used to land here (twice a driven macos-26 boot) when it was
+    /// renderable but not a byte-copy destination; it is one now (b486 measured
+    /// its LOAD seed lost for want of either rail), so nothing renderable that
+    /// the copy can serve is expected here.
     FormatNeedsConversion { format: u16 },
     /// The resident's format is not the format the destination stores, so a
     /// byte copy would land the wrong texel. Distinct from the engine's own

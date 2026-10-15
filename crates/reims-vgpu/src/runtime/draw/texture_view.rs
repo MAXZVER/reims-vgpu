@@ -940,6 +940,7 @@ pub(crate) fn linear_native_upload_format(
         SampledClass::Bgra8Unorm if native.bgra8 => TexelLayout::Bgra8,
         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
+        SampledClass::R16Float if native.float16 => TexelLayout::R16Float,
         SampledClass::Rgba32Float if native.float32 => TexelLayout::Rgba32Float,
         // Ungated, like `Rgba8Unorm` and unlike every layout above it. Vulkan
         // mandates `SAMPLED_IMAGE` for `R16G16_UINT`, and the one capability
