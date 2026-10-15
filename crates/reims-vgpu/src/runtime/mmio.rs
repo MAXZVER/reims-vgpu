@@ -204,36 +204,15 @@ pub fn gfx_write<H: HostMemory + HostOps>(
         GFX_REG_EFI_FB_MODE => state.gfx.efi_fb_mode = val,
         GFX_REG_EFI_DISPLAY_IRQ => {
             // Dual-use: cursor sample doorbell + display IRQ bit.
-            if val < 32 {
-                state
-                    .gfx
-                    .interrupt_status_disp
-                    .fetch_or(1u32 << val, std::sync::atomic::Ordering::AcqRel);
-                // Sample cursor position from display shared page (GPA).
-                if state.display.shared_gpa != 0 {
-                    let mut pos = [0u8; 4];
-                    if host
-                        .read_gpa(
-                            state.display.shared_gpa + DISPLAY_SHARED_CURSOR_POS,
-                            &mut pos,
-                        )
-                        .is_ok()
-                    {
-                        let packed = u32::from_le_bytes(pos);
-                        if packed != 0xffff_ffff {
-                            state.cursor.x = (packed & 0xffff) as u16;
-                            state.cursor.y = ((packed >> 16) & 0xffff) as u16;
-                        }
-                    }
-                    host.enqueue(HostAction::cursor(
-                        state.cursor.x,
-                        state.cursor.y,
-                        state.cursor.show,
-                    ));
-                }
-                host.enqueue(HostAction::irq_gfx());
-                host.schedule_bh();
-            }
+            // One body, shared with the lock-free arm in
+            // `crate::device::device_gfx_write`: see [`cursor_doorbell`].
+            cursor_doorbell(
+                host,
+                &state.gfx.interrupt_status_disp,
+                &state.cursor.pos,
+                state.display.shared_gpa,
+                val,
+            );
         }
         GFX_REG_EFI_FB_STRIDE => {
             state.gfx.efi_fb_stride = val;
@@ -241,6 +220,51 @@ pub fn gfx_write<H: HostMemory + HostOps>(
         }
         _ => state.gfx.sparse_set(offset, val),
     }
+}
+
+/// The cursor doorbell (0x1220): the whole effect of one guest write.
+///
+/// Both arms call this: the locked handler above (queued writes, applied at
+/// `lock_for_drain`, and direct writes that found the device lock free) and
+/// the lock-free arm in `crate::device::device_gfx_write`, which passes the
+/// registry slot's clones of the same `Arc`s. So there is one spelling of what
+/// the register does, and the arm that serves a write cannot change what it
+/// means.
+///
+/// It touches no surface, mapping, FIFO or ring state. It ORs the display
+/// interrupt bit, reads the 4-byte cursor position from the display shared
+/// page, updates the [`CursorMirror`], and queues `CursorUpdate` then
+/// `IrqGfx` (that order: the guest's ISR runs after the position it is told
+/// about is published). A `val` of 32 or more names no bit and does nothing,
+/// as before.
+pub(crate) fn cursor_doorbell<H: HostMemory + HostOps>(
+    host: &mut H,
+    interrupt_status_disp: &std::sync::atomic::AtomicU32,
+    cursor: &CursorMirror,
+    shared_gpa: u64,
+    val: u32,
+) {
+    if val >= 32 {
+        return;
+    }
+    interrupt_status_disp.fetch_or(1u32 << val, std::sync::atomic::Ordering::AcqRel);
+    // Sample cursor position from display shared page (GPA).
+    if shared_gpa != 0 {
+        let mut pos = [0u8; 4];
+        if host
+            .read_gpa(shared_gpa + DISPLAY_SHARED_CURSOR_POS, &mut pos)
+            .is_ok()
+        {
+            let packed = u32::from_le_bytes(pos);
+            if packed != 0xffff_ffff {
+                cursor.set_xy((packed & 0xffff) as u16, ((packed >> 16) & 0xffff) as u16);
+            }
+        }
+        let (x, y, show) = cursor.load();
+        host.enqueue(HostAction::cursor(x, y, show));
+    }
+    host.enqueue(HostAction::irq_gfx());
+    host.schedule_bh();
 }
 
 /// Iosfc MMIO read.

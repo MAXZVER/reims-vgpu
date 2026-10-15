@@ -599,3 +599,179 @@ fn present_action_owns_worker_boundary_until_scanout_copy() {
     assert_eq!(slot.gfx_ingress.lock().len(), 0);
     assert!(device_destroy(id));
 }
+
+// ---- The cursor doorbell's lock-free arm (0x1220) ----
+
+static FAKE_CURSOR_WORD: AtomicU32 = AtomicU32::new(0);
+
+/// `read_gpa` that answers every read with the little-endian bytes of
+/// `FAKE_CURSOR_WORD`, so a test controls what the cursor page holds.
+unsafe extern "C" fn fake_cursor_read_gpa(
+    _ctx: *mut std::ffi::c_void,
+    _gpa: u64,
+    buf: *mut u8,
+    len: usize,
+) -> i32 {
+    let word = FAKE_CURSOR_WORD.load(Ordering::Acquire).to_le_bytes();
+    for (i, b) in word.iter().enumerate().take(len) {
+        // SAFETY: the caller hands a buffer valid for `len` bytes.
+        unsafe { *buf.add(i) = *b };
+    }
+    0
+}
+
+unsafe extern "C" fn fake_wake(_ctx: *mut std::ffi::c_void) {}
+
+fn cursor_test_ops() -> ReimsVgpuHostOps {
+    let mut ops = ReimsVgpuHostOps::null();
+    ops.read_gpa = Some(fake_cursor_read_gpa);
+    ops.schedule_bh = Some(fake_wake);
+    ops.notify_actions = Some(fake_wake);
+    ops
+}
+
+const CURSOR_TEST_GPA: u64 = 0x4000_0000;
+
+fn prompt_snapshot(slot: &BoundDevice) -> Vec<(crate::runtime::host::HostActionKind, u64, u64, u64)> {
+    slot.prompt_actions
+        .lock()
+        .iter()
+        .map(|a| (a.kind, a.a0, a.a1, a.a2))
+        .collect()
+}
+
+/// A cursor doorbell written while the render worker owns the device lock is
+/// served at once: the interrupt bit is set, the mirror moves, and
+/// `CursorUpdate` then `IrqGfx` reach the prompt rail. Nothing queues and
+/// `inner` is never asked for, because the test holds it throughout.
+///
+/// The present path reads the cursor through `state.cursor`, and it must see
+/// the same coordinates: the mirror is one word, not a copy.
+#[test]
+fn a_cursor_doorbell_is_served_lock_free_and_the_present_path_sees_it() {
+    use crate::runtime::drain::census::store_route_count;
+    use crate::runtime::host::HostActionKind;
+    let id = device_create(Some(cursor_test_ops()), PAGE_SHIFT_ARM64E).expect("create");
+    let slot = device_slot(id).expect("device");
+    slot.vbl_shared_gpa.store(CURSOR_TEST_GPA, Ordering::Release);
+    FAKE_CURSOR_WORD.store((0x123 << 16) | 0x456, Ordering::Release);
+    let served_before = store_route_count("lock_free_cursor_doorbell");
+
+    let inner = slot.inner.lock();
+    assert!(device_gfx_write(
+        id,
+        crate::model::GFX_REG_EFI_DISPLAY_IRQ,
+        2,
+        crate::model::MMIO_U32,
+    ));
+    assert_eq!(slot.gfx_ingress.lock().len(), 0, "the cursor doorbell must not queue");
+    assert_ne!(slot.intr_disp.load(Ordering::Acquire) & (1 << 2), 0, "IRQ bit raised");
+    assert_eq!(slot.cursor_pos.load(), (0x456, 0x123, true), "mirror moved, show kept");
+    assert_eq!(
+        prompt_snapshot(&slot),
+        vec![
+            (HostActionKind::CursorUpdate, 0x456, 0x123, 1),
+            (HostActionKind::IrqGfxPulse, 0, 0, 0),
+        ],
+        "CursorUpdate before the IRQ that announces it"
+    );
+    assert!(store_route_count("lock_free_cursor_doorbell") > served_before);
+    drop(inner);
+
+    let inner = slot.inner.lock();
+    let cursor = &inner.device.state.cursor;
+    assert_eq!((cursor.x(), cursor.y(), cursor.show()), (0x456, 0x123, true));
+    assert!(Arc::ptr_eq(&cursor.pos, &slot.cursor_pos), "one mirror, not two");
+    drop(inner);
+    assert!(device_destroy(id));
+}
+
+/// The lock-free arm and the queued arm are one behaviour.
+///
+/// The same three writes go through each: a device whose slot cannot serve
+/// them (no shared page published yet) queues them behind a held lock and
+/// applies them at `lock_for_drain`; the other serves them lock-free. The
+/// interrupt bits, the prompt actions in order, and the cursor must come out
+/// identical. Bits accumulate (r2c status), the IRQ pulse coalesces, and only
+/// the latest `CursorUpdate` survives on both arms. The queued arm must also
+/// say why under its own slug.
+#[test]
+fn the_queued_cursor_doorbell_fallback_matches_the_lock_free_arm() {
+    use crate::runtime::drain::census::store_route_count;
+    FAKE_CURSOR_WORD.store((40 << 16) | 30, Ordering::Release);
+    let writes = [0u64, 5, 31];
+
+    // Lock-free arm.
+    let fast = device_create(Some(cursor_test_ops()), PAGE_SHIFT_ARM64E).expect("create");
+    let fast_slot = device_slot(fast).expect("device");
+    fast_slot.vbl_shared_gpa.store(CURSOR_TEST_GPA, Ordering::Release);
+    let held = fast_slot.inner.lock();
+    for w in writes {
+        assert!(device_gfx_write(fast, crate::model::GFX_REG_EFI_DISPLAY_IRQ, w, 4));
+    }
+    drop(held);
+    assert_eq!(fast_slot.gfx_ingress.lock().len(), 0);
+
+    // Queued arm: the snapshot is unpublished, so every write falls back.
+    let slow = device_create(Some(cursor_test_ops()), PAGE_SHIFT_ARM64E).expect("create");
+    let slow_slot = device_slot(slow).expect("device");
+    slow_slot.inner.lock().device.state.display.shared_gpa = CURSOR_TEST_GPA;
+    let fallback_before = store_route_count("lock_free_cursor_doorbell_fallback_no_shared_gpa");
+    let held = slow_slot.inner.lock();
+    for w in writes {
+        assert!(device_gfx_write(slow, crate::model::GFX_REG_EFI_DISPLAY_IRQ, w, 4));
+    }
+    drop(held);
+    assert_eq!(slow_slot.gfx_ingress.lock().len(), writes.len(), "fallback queues");
+    assert_eq!(
+        store_route_count("lock_free_cursor_doorbell_fallback_no_shared_gpa") - fallback_before,
+        writes.len() as u64,
+        "each fallback is counted under its reason"
+    );
+    assert_eq!(slow_slot.intr_disp.load(Ordering::Acquire), 0, "not applied yet");
+    drop(lock_for_drain(&slow_slot));
+    assert_eq!(slow_slot.gfx_ingress.lock().len(), 0, "applied at lock_for_drain");
+
+    let bits = (1u32 << 0) | (1 << 5) | (1 << 31);
+    assert_eq!(fast_slot.intr_disp.load(Ordering::Acquire), bits);
+    assert_eq!(slow_slot.intr_disp.load(Ordering::Acquire), bits);
+    assert_eq!(prompt_snapshot(&fast_slot), prompt_snapshot(&slow_slot));
+    assert_eq!(fast_slot.cursor_pos.load(), slow_slot.cursor_pos.load());
+    assert_eq!(fast_slot.cursor_pos.load(), (30, 40, true));
+    assert!(device_destroy(fast));
+    assert!(device_destroy(slow));
+}
+
+/// A write naming no interrupt bit is not served lock-free; it takes the
+/// queued arm, which has always ignored it, and says why.
+#[test]
+fn an_out_of_range_cursor_doorbell_falls_back_and_raises_nothing() {
+    use crate::runtime::drain::census::store_route_count;
+    let id = device_create(Some(cursor_test_ops()), PAGE_SHIFT_ARM64E).expect("create");
+    let slot = device_slot(id).expect("device");
+    slot.vbl_shared_gpa.store(CURSOR_TEST_GPA, Ordering::Release);
+    let before = store_route_count("lock_free_cursor_doorbell_fallback_bit_range");
+    let held = slot.inner.lock();
+    assert!(device_gfx_write(id, crate::model::GFX_REG_EFI_DISPLAY_IRQ, 32, 4));
+    drop(held);
+    assert_eq!(store_route_count("lock_free_cursor_doorbell_fallback_bit_range") - before, 1);
+    drop(lock_for_drain(&slot));
+    assert_eq!(slot.intr_disp.load(Ordering::Acquire), 0);
+    assert!(prompt_snapshot(&slot).is_empty());
+    assert!(device_destroy(id));
+}
+
+/// A reset rebuilds the device state; the registry slot's cursor mirror must
+/// still be the state's, or the lock-free arm would write a word nobody reads.
+#[test]
+fn a_reset_keeps_the_cursor_mirror_wired_to_the_slot() {
+    let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
+    let slot = device_slot(id).expect("device");
+    slot.cursor_pos.store(9, 9, false);
+    assert!(device_reset(id));
+    let inner = slot.inner.lock();
+    assert!(Arc::ptr_eq(&inner.device.state.cursor.pos, &slot.cursor_pos));
+    assert_eq!(slot.cursor_pos.load(), (0, 0, true), "reset to a fresh state's cursor");
+    drop(inner);
+    assert!(device_destroy(id));
+}

@@ -15,7 +15,7 @@ pub(crate) use regs::*;
 // `mod`, so this is the only path those links can name — and rustc's
 // unused-import lint cannot see a doc link, so it will call this dead.
 pub use state::{
-    Acted, BackingWalk, ChannelRing, ComputeStorageResidencyKey, Declaration, DeviceId,
+    Acted, BackingWalk, ChannelRing, ComputeStorageResidencyKey, CursorMirror, Declaration, DeviceId,
     DeviceState, ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GuestWriteObservation, GvaBacking,
     GvaEvictionWitness, GvaHostView, HostLinearTexture, HostSurface, MapperCapture, MappingEntry,
     PacketFault, PresentBacking, PresentState, RailDeviceState, RailResourceState,
@@ -696,11 +696,11 @@ mod tests {
         let mut d = dev();
         d.state.present.width = 1440;
         d.state.present.height = 900;
-        d.state.cursor.show = true;
+        d.state.cursor.set_show(true);
         d.state.cursor.hot_x = 1;
         d.state.cursor.hot_y = 2;
         assert_eq!(d.state.present.width, 1440);
-        assert!(d.state.cursor.show);
+        assert!(d.state.cursor.show());
     }
 
     /// An opcode no ledger row names does not run, and the ring does not stop

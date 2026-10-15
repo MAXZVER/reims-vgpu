@@ -91,6 +91,11 @@ struct BoundDevice {
     /// Child channels the guest has rung, OR'd from the vCPU thread with no
     /// device lock; see [`crate::model::GfxRegs::child_doorbell_rung`].
     child_doorbell_rung: Arc<AtomicU32>,
+    /// Lock-free clone of the hardware cursor mirror (`state.cursor.pos`), the
+    /// one copy of x/y/show. The 0x1220 lock-free arm in [`device_gfx_write`]
+    /// writes it from the vCPU thread; the drain, and every `CursorUpdate` it
+    /// enqueues, read the same word. See [`crate::model::CursorMirror`].
+    cursor_pos: Arc<crate::model::CursorMirror>,
     /// Lock-free clone of the fault status (0x102c) — the ISR's third read.
     intr_fault: Arc<AtomicU32>,
     /// Lock-free clone of the main-FIFO consumer counter (0x100c): the guest
@@ -229,6 +234,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
     let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
+    let cursor_pos = Arc::clone(&dev.state.cursor.pos);
     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
     DEVICES.lock().insert(
@@ -245,6 +251,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             intr_disp,
             intr_gpu,
             child_doorbell_rung,
+            cursor_pos,
             intr_fault,
             fifo_read_live,
             present_action_pending: AtomicBool::new(false),
@@ -437,6 +444,31 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             }
             return true;
         }
+        // The cursor doorbell (0x1220), which measurement put second on this
+        // pathway once the child doorbell left it: macOS writes it on every
+        // hardware-cursor move (190-290 a second while the pointer moves) and
+        // each one queued behind the drain tranche, so the cursor sample and
+        // the display IRQ reached the guest 0.4-1.8 s late
+        // (`gfx_doorbell_delay off_0x1220`, `frame_late` ~95 %).
+        //
+        // It can be taken here for the same reason the child doorbell can: it
+        // carries no state the decode depends on. Its whole effect is
+        // `crate::runtime::mmio::cursor_doorbell` (an interrupt bit, a 4-byte
+        // read of the cursor page, the cursor mirror, two prompt actions), and
+        // every piece of state that touches is a lock-free clone on this slot.
+        // When the slot cannot serve it the write takes the queued arm below,
+        // unchanged, under its own `lock_free_cursor_doorbell_fallback_*` slug.
+        if offset == crate::model::GFX_REG_EFI_DISPLAY_IRQ {
+            match lock_free_cursor_doorbell(&slot, data as u32) {
+                Ok(()) => {
+                    crate::runtime::drain::note_store_route("lock_free_cursor_doorbell");
+                    return true;
+                }
+                Err(fallback) => crate::runtime::drain::note_store_route(fallback.slug()),
+            }
+        }
+    } else if offset == crate::model::GFX_REG_EFI_DISPLAY_IRQ {
+        crate::runtime::drain::note_store_route(CursorDoorbellFallback::Size.slug());
     }
     let mut write = QueuedGfxWrite {
         offset,
@@ -458,6 +490,76 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
     drop(ingress);
     schedule_device(&slot);
     true
+}
+
+/// Why a cursor doorbell (0x1220) took the queued arm instead of the lock-free
+/// one. Each reason is its own greppable `store_routes` slug.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorDoorbellFallback {
+    /// Not a 4-byte write; the locked handler splits or refuses it.
+    Size,
+    /// `val` names no interrupt bit. The locked handler ignores it; queueing
+    /// keeps that one spelling.
+    BitRange,
+    /// No QEMU host ops (unit tests, headless create).
+    NoHost,
+    /// No locked `device_poll` has published the display shared page yet, so
+    /// this arm has no page to sample. The locked handler reads
+    /// `state.display.shared_gpa` itself.
+    NoSharedGpa,
+}
+
+impl CursorDoorbellFallback {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Size => "lock_free_cursor_doorbell_fallback_size",
+            Self::BitRange => "lock_free_cursor_doorbell_fallback_bit_range",
+            Self::NoHost => "lock_free_cursor_doorbell_fallback_no_host",
+            Self::NoSharedGpa => "lock_free_cursor_doorbell_fallback_no_shared_gpa",
+        }
+    }
+}
+
+/// Serve a cursor doorbell without the device lock.
+///
+/// The same body the locked handler runs
+/// ([`crate::runtime::mmio::cursor_doorbell`]), handed the slot's lock-free
+/// clones: the display interrupt-status `Arc` (`intr_disp`), the cursor mirror
+/// (`cursor_pos`) and the shared-page address the last locked `device_poll`
+/// published (`vbl_shared_gpa`, the snapshot `vbl_contended_pulse` already
+/// relies on). Actions go to `prompt_actions` through a scratch-backed
+/// `QemuHost`, whose `enqueue` routes `CursorUpdate` and `IrqGfx` to the prompt
+/// rail and calls the thread-safe `notify_actions`, as
+/// `announce_stamp_interrupt` does.
+///
+/// Never takes `inner` or the engine lock, and never waits: the guest read is
+/// QEMU's `read_gpa` on the vCPU thread that already holds the BQL for this
+/// MMIO exit, and the prompt queue lock is held for a push.
+fn lock_free_cursor_doorbell(slot: &BoundDevice, val: u32) -> Result<(), CursorDoorbellFallback> {
+    if val >= 32 {
+        return Err(CursorDoorbellFallback::BitRange);
+    }
+    let Some(ops) = slot.ops else {
+        return Err(CursorDoorbellFallback::NoHost);
+    };
+    let shared_gpa = slot.vbl_shared_gpa.load(Ordering::Acquire);
+    if shared_gpa == 0 {
+        return Err(CursorDoorbellFallback::NoSharedGpa);
+    }
+    let mut scratch = VecDeque::new();
+    let mut host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
+    crate::runtime::mmio::cursor_doorbell(
+        &mut host,
+        &slot.intr_disp,
+        &slot.cursor_pos,
+        shared_gpa,
+        val,
+    );
+    drop(host);
+    // Neither action this body queues is a device-lock action; anything that
+    // landed in the scratch queue would be one, and would be lost here.
+    debug_assert!(scratch.is_empty(), "cursor doorbell queued a lock-owning action");
+    Ok(())
 }
 
 /// Take the device lock from the vCPU thread, measuring the wait.
