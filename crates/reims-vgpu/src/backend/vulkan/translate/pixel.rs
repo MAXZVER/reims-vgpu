@@ -742,9 +742,9 @@ mod tests {
                 // Four-channel `float32`. A macos-15 guest binds 1x1 and 4x1
                 // linear textures of it to a **vertex** sampler and every draw
                 // that did was refused, because this crate had no layout for the
-                // format at all. It is sampled-and-dispatched only: it never
-                // appears in the colour list below, and it has no CPU narrowing
-                // arm by design — see `TexelLayout::Rgba32Float`.
+                // format at all. It has no CPU narrowing arm by design — see
+                // `TexelLayout::Rgba32Float` — which is why the colour list
+                // below serves it through the native rail only.
                 p::MTL_FORMAT_RGBA32_FLOAT,
             ])
         );
@@ -812,6 +812,9 @@ mod tests {
                 // it, so a half-float secondary MRT slot was declined while a
                 // half-float primary was not.
                 p::MTL_FORMAT_RGBA16_FLOAT,
+                // Four-channel float32, on `RG16_UINT`'s native rail: Chromium
+                // renders one pass into a linear target of it per launch.
+                p::MTL_FORMAT_RGBA32_FLOAT,
             ])
         );
     }

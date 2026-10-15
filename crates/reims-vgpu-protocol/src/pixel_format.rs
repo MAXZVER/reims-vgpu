@@ -811,6 +811,7 @@ impl TexelLayout {
                 | Self::Rgb10a2Unorm
                 | Self::Bgr10a2Unorm
                 | Self::Rg16Uint
+                | Self::Rgba32Float
         )
     }
 
@@ -2060,7 +2061,14 @@ pub fn render_target_numeric_type(format: u16) -> Option<ColorNumericType> {
         | MTL_FORMAT_R16_FLOAT
         | MTL_FORMAT_R8_UNORM
         | MTL_FORMAT_RGB10A2_UNORM
-        | MTL_FORMAT_BGR10A2_UNORM => ColorNumericType::Float,
+        | MTL_FORMAT_BGR10A2_UNORM
+        // Chromium (ANGLE) renders one pass into a linear four-channel float32
+        // target at every launch, refused as `rt_resolve reason=rt_linear_format
+        // fmt=0x7d` until this arm. Its texel has no eight-bit form worth the
+        // name, so it is served by the native rail `RG16_UINT` built: the
+        // resident is created at `R32G32B32A32_SFLOAT` and its bytes land in the
+        // guest's verbatim (see `store_texel_order`).
+        | MTL_FORMAT_RGBA32_FLOAT => ColorNumericType::Float,
         MTL_FORMAT_RG16_UINT => ColorNumericType::Uint,
         _ => return None,
     })
@@ -2144,6 +2152,9 @@ pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
         // copying arm alike — which is why the copying arm learned to carry a
         // native frame rather than always an eight-bit one.
         MTL_FORMAT_RG16_UINT => TexelLayout::Rg16Uint,
+        // Four float32 channels, on the same terms: no eight-bit narrowing
+        // exists, so the byte copy of the resident is its only rail.
+        MTL_FORMAT_RGBA32_FLOAT => TexelLayout::Rgba32Float,
         _ => return None,
     })
 }
@@ -3890,7 +3901,7 @@ mod tests {
         }
         // A guard on the walk itself: an admission set that silently emptied
         // would satisfy every assertion above.
-        assert_eq!(admitted, 11, "the admitted colour render target formats");
+        assert_eq!(admitted, 12, "the admitted colour render target formats");
     }
 
     /// An integer texel has no semantic eight-bit solid colour.
@@ -3940,7 +3951,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("render target {format:#x} cannot publish its clear"));
             assert_eq!(image.pixels().len(), image.row_bytes() as usize * 2);
         }
-        assert_eq!(admitted, 11, "the admitted colour render target formats");
+        assert_eq!(admitted, 12, "the admitted colour render target formats");
 
         let integer = solid_clear_image(MTL_FORMAT_RG16_UINT, 2, 2, &clear)
             .expect("RG16Uint is an admitted render target");
@@ -4038,10 +4049,10 @@ mod tests {
         assert!(!TexelLayout::Bc7Rgba.needs_sampled_filter_query());
 
         // The vocabularies genuinely differ, which is the whole point: a
-        // four-channel float is sampled and filtered but never rendered into,
+        // single-channel float is sampled and filtered but never rendered into,
         // and a normalized colour order is both.
-        assert!(TexelLayout::Rgba32Float.needs_sampled_filter_query());
-        assert!(!TexelLayout::Rgba32Float.is_render_target_layout());
+        assert!(TexelLayout::R32Float.needs_sampled_filter_query());
+        assert!(!TexelLayout::R32Float.is_render_target_layout());
         assert!(TexelLayout::Bgra8.needs_sampled_filter_query());
         assert!(TexelLayout::Bgra8.is_render_target_layout());
         const { assert!(TexelLayout::RENDER_TARGET_COUNT < TexelLayout::FILTER_COUNT) };
@@ -4927,6 +4938,7 @@ mod tests {
                     TexelLayout::Rgb10a2Unorm => SampledClass::Rgb10a2Unorm,
                     TexelLayout::Bgr10a2Unorm => SampledClass::Bgr10a2Unorm,
                     TexelLayout::Rg16Uint => SampledClass::Rg16Uint,
+                    TexelLayout::Rgba32Float => SampledClass::Rgba32Float,
                     // Named rather than defaulted. This arm used to be
                     // `_ => SampledClass::Bgra8Unorm`, which was true only while
                     // the admitted set was {Rgba8, Bgra8, Rgba16Float}: the next
