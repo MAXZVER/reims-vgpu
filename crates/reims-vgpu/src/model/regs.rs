@@ -2133,6 +2133,36 @@ mod tests {
         );
     }
 
+    /// The cursor doorbell's C spelling is this register.
+    ///
+    /// `reims-vgpu-pci.c` exempts exactly one gfx write from advancing the
+    /// dirty observation epoch, and it names that write by
+    /// `REIMS_VGPU_GFX_REG_EFI_DISPLAY_IRQ` in
+    /// `reims-vgpu-doorbell-policy.h`. If the two drifted, the exemption would
+    /// silently land on some other register, possibly a work doorbell, and
+    /// a cached Clean could then be served across a handoff. Read out of the
+    /// header rather than pinned to a literal, and the parse must find the
+    /// define before it believes anything.
+    #[test]
+    fn the_cursor_doorbell_offset_matches_the_c_define() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/qemu/hw/display/reims-vgpu-doorbell-policy.h");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
+        let value = src
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("#define REIMS_VGPU_GFX_REG_EFI_DISPLAY_IRQ "))
+            .unwrap_or_else(|| panic!("{} must define the cursor doorbell", path.display()))
+            .trim()
+            .trim_end_matches('u');
+        let parsed = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+            .unwrap_or_else(|e| panic!("unparseable define {value:?}: {e}"));
+        assert_eq!(
+            parsed, GFX_REG_EFI_DISPLAY_IRQ,
+            "the C cursor-doorbell define has drifted from GFX_REG_EFI_DISPLAY_IRQ"
+        );
+    }
+
     #[test]
     fn the_mapping_id_bound_refuses_only_the_no_mapping_sentinel() {
         assert!(
