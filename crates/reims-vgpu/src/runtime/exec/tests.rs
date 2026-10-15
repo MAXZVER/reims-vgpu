@@ -5712,7 +5712,8 @@ fn clear_fallback_draw_accounting_is_scoped_to_one_render_stream() {
     );
 }
 
-/// A multisample colour attachment has no single-sample linear publication.
+/// A multisample colour attachment has no single-sample linear publication, and
+/// its clear belongs in its resident.
 ///
 /// # The contract
 ///
@@ -5741,8 +5742,23 @@ fn clear_fallback_draw_accounting_is_scoped_to_one_render_stream() {
 /// on this rail that refusal is `read_target_multisample_image`, which is
 /// itself correct. What followed it was a solid beige or near-black 300x300
 /// clear written over the guest's four-sample pages, twice a boot.
+///
+/// # Where the clear goes instead
+///
+/// The pages are not the clear's destination — the guest never reads them — so
+/// refusing to publish there was right and refusing the clear was not: the
+/// target's resident is the only copy of the attachment, and a clear-only pass
+/// that stopped at the pages left every later LOAD to load a resident that
+/// never held it (ten `clear_dropped ... clear_multisample_source_not_linear`
+/// lines a boot). So on a host that can hold the resident the clear lands there,
+/// publishes nothing to the pages, owes the guest no frame, and is not reported
+/// as dropped. Which of the two a machine does depends on whether it has a
+/// Vulkan device, so the pages' being left alone and the clear's being
+/// accounted for — landed, or dropped under a typed reason — are the assertions
+/// that hold on every machine, and the resident's being there is asserted where
+/// it can be.
 #[test]
-fn a_multisample_linear_target_keeps_its_guest_bytes_instead_of_a_one_sample_clear() {
+fn a_multisample_linear_target_keeps_its_guest_bytes_and_takes_its_clear_in_its_resident() {
     use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
@@ -5757,7 +5773,7 @@ fn a_multisample_linear_target_keeps_its_guest_bytes_instead_of_a_one_sample_cle
     // Both arms of one comparison: the same texture, the same clear, differing
     // only in the sample count its descriptor declares. Single-sample must keep
     // publishing — this narrows the clear rail, it does not close it.
-    let published = |sample_count: u16| -> (bool, Vec<u8>) {
+    let published = |sample_count: u16| -> (bool, Vec<u8>, DeviceState, FakeHost) {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         define_task_pages_arm64e(&mut host, &mut state, 4, 16);
@@ -5819,10 +5835,10 @@ fn a_multisample_linear_target_keeps_its_guest_bytes_instead_of_a_one_sample_cle
             PAGE_SHIFT_ARM64E,
         )
         .expect("read the target's guest pages");
-        (out.clears_applied == 1, pages)
+        (out.clears_applied == 1, pages, state, host)
     };
 
-    let (one_published, one_pages) = published(1);
+    let (one_published, one_pages, _, _) = published(1);
     assert!(
         one_published,
         "a single-sample linear Store still publishes its clear"
@@ -5833,25 +5849,83 @@ fn a_multisample_linear_target_keeps_its_guest_bytes_instead_of_a_one_sample_cle
          multisample arm below proves nothing"
     );
 
-    let (four_published, four_pages) = published(4);
-    assert!(
-        !four_published,
-        "a four-sample attachment has no single-sample linear publication"
-    );
+    let capture = crate::observe::sink::FailCapture::start();
+    #[cfg_attr(not(feature = "backend-vulkan"), allow(unused_mut, unused_variables))]
+    let (four_landed, four_pages, mut four_state, mut four_host) = published(4);
     assert!(
         four_pages.iter().all(|&byte| byte == 0xcc),
         "the guest's four-sample span must be left exactly as it was found, not \
          overwritten with one sample's worth of clear colour"
     );
-
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    let dropped: Vec<String> = capture
+        .lines()
+        .into_iter()
+        .filter(|line| line.starts_with("clear_dropped") && line.contains("tex_ref=200"))
+        .collect();
+    if !four_landed {
+        // No resident to hold it on this machine (no Vulkan device): the clear is
+        // dropped, and dropped by name — silently is the one outcome the ground
+        // rules forbid.
+        assert!(
+            dropped.iter().any(|line| {
+                line.contains("reason=clear_multisample_") && line.contains("samples=4")
+            }),
+            "a clear this device could not land must say why: {dropped:?}"
+        );
+        return;
+    }
     assert!(
-        log.lines().any(|line| {
-            line.contains("reason=clear_multisample_source_not_linear")
-                && line.contains("samples=4")
+        dropped.is_empty(),
+        "a clear that reached the resident was not dropped: {dropped:?}"
+    );
+
+    // The resident exists, holds the clear, and has four samples: the engine
+    // refuses to read a multisample image back, and says so only after it has
+    // found the identity and its content ready.
+    #[cfg(feature = "backend-vulkan")]
+    check_four_sample_resident(&mut four_state, &mut four_host);
+}
+
+/// The Vulkan rail's half of the multisample clear's evidence: what the engine
+/// holds for the texture the test cleared.
+#[cfg(feature = "backend-vulkan")]
+fn check_four_sample_resident(four_state: &mut DeviceState, four_host: &mut FakeHost) {
+    let identity = crate::runtime::draw::vulkan::gva_span_identity(
+        four_state,
+        four_host,
+        1,
+        crate::runtime::draw::GvaSpan {
+            texture_ref: 200,
+            gva: 8u64 << PAGE_SHIFT_ARM64E,
+            row_stride: 4 * 2 * 4,
+            width: 2,
+            height: 2,
+            format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        },
+    )
+    .expect("the texture is named and its pages are walkable");
+    match crate::backend::vulkan::engine::read_target(&identity) {
+        Err(crate::backend::vulkan::engine::DrawError::TargetRead(
+            crate::backend::vulkan::engine::reason::TargetReadDecline::MultisampleImage {
+                sample_count: 4,
+            },
+        )) => {}
+        other => panic!(
+            "the clear must have registered a ready four-sample resident, got {:?}",
+            other.map(|readback| readback.pixels.len())
+        ),
+    }
+    assert_eq!(
+        four_state.pending_writebacks.len(),
+        0,
+        "nothing is owed to guest pages that no rail can write"
+    );
+    assert!(
+        crate::backend::vulkan::gva_window(&identity).is_some_and(|window| {
+            crate::runtime::writeback_debt::gva_resident_authoritative(four_state, window)
         }),
-        "the refused publication must be fail-visible: a clear this device drops \
-         silently is the one outcome the ground rules forbid"
+        "and the resident stays the target's authority, so the next pass's LOAD \
+         and a sampled bind find it"
     );
 }
 

@@ -6628,8 +6628,15 @@ pub enum ClearResidentDecline {
     /// No resident under this identity: nothing on the GPU to clear, and the
     /// guest pages are the only copy.
     NotResident,
-    /// A multisample resident; the clear rail publishes one sample.
+    /// A multisample resident; the single-sample clear rail publishes one
+    /// sample. A multisample target is cleared by [`clear_multisample_resident`].
     Multisample,
+    /// The resident under this identity has a different sample count from the
+    /// one the clear asked for.
+    SampleCountDiffers,
+    /// This host cannot render at the requested sample count, so it cannot
+    /// hold the multisample image the clear is for.
+    SampleCountUnsupported,
     /// An imported resident is the guest allocation itself.
     GuestBacked,
     /// A layout a barrier may not name as its source or destination here.
@@ -6645,6 +6652,8 @@ impl ClearResidentDecline {
         match self {
             Self::NotResident => "lab_gpu_clear_not_resident",
             Self::Multisample => "lab_gpu_clear_multisample",
+            Self::SampleCountDiffers => "clear_resident_sample_count_differs",
+            Self::SampleCountUnsupported => "clear_resident_sample_count_unsupported",
             Self::GuestBacked => "lab_gpu_clear_guest_backed",
             Self::LayoutUnusable => "lab_gpu_clear_layout_unusable",
             Self::FormatDiffers => "lab_gpu_clear_format_differs",
@@ -6694,11 +6703,39 @@ pub fn clear_resident(
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
+    clear_registered_resident(ctx, pools, counters, identity, 1, attachment_format, clear)
+}
+
+/// Clear the registered resident under `identity`, which holds `samples`
+/// samples a texel, and publish it as holding the clear.
+///
+/// The half of [`clear_resident`] and [`clear_multisample_resident`] that does
+/// not depend on how many samples there are, written once because the
+/// barriers, the layout bookkeeping and the readiness publication around the
+/// one `vkCmdClearColorImage` are the same for both, and a copy of them is the
+/// next divergence. `samples` is what the caller expects the resident to hold:
+/// a clear that reaches an image of another sample count is declined, not
+/// resized, because the caller's reading of what it is clearing is wrong.
+///
+/// The engine lock is the caller's, and so is the context.
+fn clear_registered_resident(
+    ctx: &context::DeviceContext,
+    pools: &mut ResourcePools,
+    counters: &counters::EngineCounters,
+    identity: &TargetIdentity,
+    samples: u32,
+    attachment_format: ash::vk::Format,
+    clear: types::ColorClearValue,
+) -> Result<Result<(), ClearResidentDecline>, DrawError> {
     let Some(slot) = pools.registry_get(identity) else {
         return Ok(Err(ClearResidentDecline::NotResident));
     };
-    if slot.sample_count != 1 {
-        return Ok(Err(ClearResidentDecline::Multisample));
+    if slot.sample_count != samples {
+        return Ok(Err(if samples == 1 {
+            ClearResidentDecline::Multisample
+        } else {
+            ClearResidentDecline::SampleCountDiffers
+        }));
     }
     if slot.memory.guest_backing().is_some() || slot.memory.is_guest_imported() {
         return Ok(Err(ClearResidentDecline::GuestBacked));
@@ -6810,6 +6847,123 @@ pub fn clear_resident(
     // sole copy until a payment lands it in the guest pages.
     pools.registry_mark_ready_with_access(identity, new_access, pay_band::RowBand::Full);
     Ok(Ok(()))
+}
+
+/// Land a clear-only pass over a **multisample** target in the target's
+/// resident, creating the resident when this is the first thing to touch it.
+///
+/// # Why this exists beside [`clear_resident`]
+///
+/// A multisample target's resident is the only copy of its attachment there is:
+/// the guest strides those pages for its samples and never reads them, and no
+/// rail of this device writes them (see `runtime::draw::vulkan::gva_span_identity`).
+/// So the single-sample clear rail's answer to a multisample clear — decline,
+/// and let the CPU fill the guest pages — has no second half here, and a
+/// clear-only pass with no draw after it dropped the clear on the floor. The
+/// next pass that LOADs the target then loaded a resident that never held it.
+///
+/// # Why it creates
+///
+/// A clear-only pass is frequently the *first* use of the target (the guest
+/// clears a fresh multisample tile and draws into it on a later pass), so there
+/// is no resident to clear and refusing for want of one is the same loss. The
+/// resident is ensured exactly as the first draw into the target would ensure
+/// it — the identity's own allocation format, the geometry and generation the
+/// identity names, and a colour-only render pass at the requested sample count
+/// from the same cache — so that draw finds a reusable image and rebuilds at
+/// most its framebuffer.
+///
+/// Nothing is published to guest pages: there are none to publish to. The caller
+/// records that the resident is the target's only copy.
+///
+/// # Declines
+///
+/// [`ClearResidentDecline::SampleCountUnsupported`] when the host cannot render
+/// at `sample_count`; [`ClearResidentDecline::FormatDiffers`] when the
+/// identity's resident format is not the attachment's (the clear value's
+/// encoding would then differ from what the guest's attachment stores); and
+/// whatever [`clear_resident`] declines for a resident that already exists.
+pub fn clear_multisample_resident(
+    state: &crate::model::DeviceState,
+    identity: &TargetIdentity,
+    sample_count: u32,
+    attachment_format: ash::vk::Format,
+    clear: types::ColorClearValue,
+) -> Result<Result<(), ClearResidentDecline>, DrawError> {
+    let Some(device_caches) = device_caches(state) else {
+        return Err(DrawError::Facade(
+            facade_decline::EngineFacadeDecline::DeviceCachesUnreachable,
+        ));
+    };
+    device_caches.with(|caches| {
+        clear_multisample_resident_with(caches, identity, sample_count, attachment_format, clear)
+    })
+}
+
+fn clear_multisample_resident_with(
+    caches: &mut ObjectCaches,
+    identity: &TargetIdentity,
+    sample_count: u32,
+    attachment_format: ash::vk::Format,
+    clear: types::ColorClearValue,
+) -> Result<Result<(), ClearResidentDecline>, DrawError> {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    unsafe { pools.ensure_init(ctx, counters)? };
+    // The same bound the draw path puts on a multisample pass, asked before
+    // anything is allocated.
+    if sample_count < 2
+        || !sample_count.is_power_of_two()
+        || sample_count > ctx.features.max_sample_count
+    {
+        return Ok(Err(ClearResidentDecline::SampleCountUnsupported));
+    }
+    // A draw's attachment format is the identity's resident format unless the
+    // guest named one, and the resident is allocated in it; creating one here in
+    // another format would be a resident that draw then recreates empty.
+    if identity.resident_format() != attachment_format {
+        return Ok(Err(ClearResidentDecline::FormatDiffers));
+    }
+    let (width, height, generation) = (identity.width(), identity.height(), identity.generation());
+    let format = crate::backend::vulkan::translate::pixel::ResidentFormat::of(attachment_format);
+    let reusable = pools
+        .registry_get(identity)
+        .is_some_and(|slot| slot.reusable_for(width, height, sample_count, generation, format));
+    if !reusable {
+        let mut pass_key = caches::PassKey::single(caches::Color0Load::Clear, attachment_format);
+        pass_key.sample_count = sample_count;
+        let render_pass = unsafe { caches.get_or_create_pass(ctx, pass_key, counters, pools)? };
+        unsafe {
+            pools.registry_ensure(
+                ctx,
+                identity.clone(),
+                width,
+                height,
+                sample_count,
+                render_pass,
+                pass_key.framebuffer_compatibility(),
+                generation,
+                attachment_format,
+                None,
+                counters,
+            )?;
+        }
+    }
+    clear_registered_resident(
+        ctx,
+        pools,
+        counters,
+        identity,
+        sample_count,
+        attachment_format,
+        clear,
+    )
 }
 
 /// Copy the same window spans from one resident into another, on the queue.

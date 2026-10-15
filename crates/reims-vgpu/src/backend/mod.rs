@@ -1128,9 +1128,12 @@ pub(crate) trait Backend: Copy {
     ///
     /// The hold is released either way, for [`Backend::pay_surface_writeback`]'s
     /// reason: an image nothing will ask for again must not hold memory to the
-    /// next device reset. The rail reports *why* a payment was lost on the
-    /// failure channel, so there is nothing for the neutral ledger to add and
-    /// nothing for it to return.
+    /// next device reset. The exception is a resident that is the attachment's
+    /// only copy by contract (a multisample image, which no rail reads back): a
+    /// payment that finds one has lost nothing to release it for, and the
+    /// ledger arms no payable debt for such a target in the first place. The
+    /// rail reports *why* a payment was lost on the failure channel, so there is
+    /// nothing for the neutral ledger to add and nothing for it to return.
     #[allow(
         clippy::too_many_arguments,
         reason = "the store's own parameters, plus the bytes its owner may not overwrite"

@@ -674,7 +674,17 @@ impl Backend for VulkanBackend {
                 .field("task", task_id)
                 .field("texture", texture_ref)
                 .fail();
-            engine::note_resident_content_copied_out(identity);
+            // The hold ends with the loss, since a frame nothing will ask for
+            // again must not keep its image alive to the next device reset — but
+            // not for a multisample resident. That one is not a copy that failed
+            // to land: it is the only copy of its attachment, and marking it
+            // copied out makes it reclaimable. The ledger arms no payable debt
+            // for such a target (`writeback_debt::arm_gva` records it as a sole
+            // copy), so this is the guard against any path that still reaches a
+            // payment with one.
+            if !reason.resident_is_multisample() {
+                engine::note_resident_content_copied_out(identity);
+            }
         }
     }
 
