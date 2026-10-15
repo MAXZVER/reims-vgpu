@@ -357,6 +357,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut gva_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         record_plane_draw(req);
+        lab_tile_draw(req);
         lab_draw_sig(req);
         req.chain_resident_established = false;
         let engine = try_metal2vulkan_draw(state, host, req, writeback_guest);
@@ -20909,6 +20910,78 @@ pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
 /// distinct signatures for many draws means the frame repeats itself, and the
 /// per-draw resolution could be kept across frames. One `lab_draw_sig` line a
 /// second; nothing is kept but three sets of hashes.
+/// TEMP (lab, Electron tiles; `REIMS_VGPU_LAB_TILE_TRACE=1`): every draw into a
+/// tile-sized mapper surface (mapping id set, 128..=1400 wide, 64..=1024 tall),
+/// the first 80 per mapping and 6000 in all - which task draws, with what load
+/// action, how much of the tile it covers, the geometry it fetches and which
+/// textures it samples. Says whether a Chromium tile's first pass on a fresh
+/// IOSurface expects prior content (Load + partial coverage) and where from.
+pub(crate) fn lab_tile_draw(req: &DrawEncodeRequest) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_TILE_TRACE").as_deref() == Ok("1")) {
+        return;
+    }
+    let Some(c) = req.colors.first() else {
+        return;
+    };
+    if c.mapping_id == 0 || !(128..=1400).contains(&c.width) || !(64..=1024).contains(&c.height) {
+        return;
+    }
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<(u32, std::collections::HashMap<u32, u32>)>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new((0, std::collections::HashMap::new())));
+    {
+        let mut g = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        if g.0 >= 6000 {
+            return;
+        }
+        let n = g.1.entry(c.mapping_id).or_insert(0);
+        if *n >= 80 {
+            return;
+        }
+        *n += 1;
+        g.0 += 1;
+    }
+    let sc = req
+        .scissors
+        .first()
+        .map(|s| format!("{},{} {}x{}", s.x, s.y, s.width, s.height))
+        .unwrap_or_else(|| "-".into());
+    let vp = req
+        .viewports
+        .first()
+        .map(|v| format!("{:.0},{:.0} {:.0}x{:.0}", v[0], v[1], v[2], v[3]))
+        .unwrap_or_else(|| "-".into());
+    let geo = match &req.indexed {
+        Some(ix) => format!(
+            "idx n={} off={} bv={} ib={} t={}",
+            ix.index_count, ix.index_buffer_offset, ix.base_vertex, ix.index_buffer_ref, ix.index_type
+        ),
+        None => format!("vtx n={} first={}", req.vertex_count, req.first_vertex),
+    };
+    let tex: Vec<String> = req
+        .fragment_textures
+        .iter()
+        .filter(|t| t.texture_ref != 0)
+        .map(|t| format!("{}:{}", t.index, t.texture_ref))
+        .collect();
+    crate::observe::off(format!(
+        "lab_tile_draw task={} mid={} {}x{} ref={} load={} store={} cont={} pipe={} prim={} inst={} {geo} sc=[{sc}] vp=[{vp}] tex=[{}] t={}",
+        req.task_id,
+        c.mapping_id,
+        c.width,
+        c.height,
+        c.texture_ref,
+        c.load_action,
+        c.store_action,
+        u8::from(req.continues_render_pass),
+        req.pipeline_ref,
+        req.primitive_type,
+        req.instance_count,
+        tex.join(","),
+        crate::observe::elapsed_us() / 1000
+    ));
+}
+
 fn lab_draw_sig(req: &DrawEncodeRequest) {
     use std::hash::{Hash, Hasher};
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

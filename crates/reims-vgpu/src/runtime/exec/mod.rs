@@ -6377,6 +6377,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                                         resident_chain_before_this_record;
                                     resident_chain_before_this_record = resident_chain;
                                     crate::runtime::draw::vulkan::record_plane_draw(req);
+                                    crate::runtime::draw::vulkan::lab_tile_draw(req);
                                     crate::runtime::drain::note_store_route("draw_par_committed");
                                     fin.enter(crate::runtime::drain::FinishPhase::Result);
                                     crate::runtime::drain::note_drain_phase(
