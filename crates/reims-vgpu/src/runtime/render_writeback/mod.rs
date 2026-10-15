@@ -718,6 +718,21 @@ settle_sites! {
     MappingBytesWrite => "settle_mapping_bytes_write",
     /// `mapper::read_mapping_bytes`.
     MappingBytesRead => "settle_mapping_bytes_read",
+    /// `drain::apply_map_family` on `UnmapMemory`: the guest handing a GVA
+    /// span's pages back to its allocator. Not a reader: the pages are about
+    /// to belong to someone else, and a writeback still queued into them lands
+    /// in whatever the kernel puts there next. Upstream (steelbrain/reims-vgpu
+    /// abcd8f7d) traced a macOS 15 kernel panic during a Safari window drag to
+    /// exactly that: `RGBA16Float` texels inside a kqueue object, while every
+    /// write-after-release guard stayed at zero, because those guards fire at
+    /// plan time and the GPU landing hundreds of microseconds later calls none
+    /// of them. The guest unwires the span before it submits this packet, so
+    /// this settle is already late for a copy that has landed; it is the last
+    /// point that can hold one that has not.
+    GuestRelease => "settle_guest_release",
+    /// `drain::apply_map_family` on `DeleteIOSurfaceBacking2`: the same
+    /// hand-back for a mapping's pages, keyed by mapping instead of by span.
+    BackingRelease => "settle_backing_release",
 }
 
 /// Block until every guest-page write this device has submitted has executed.
@@ -803,6 +818,86 @@ pub fn settle_guest_writes_unless_disjoint(
     settle_guest_writes(site);
 }
 
+/// Hold the guest's hand-back of pages until every GPU writeback this device
+/// queued that may land in them has landed, or say why it could not.
+///
+/// The release-side twin of [`settle_guest_writes_unless_disjoint`], for the two
+/// packets that give pages back (`UnmapMemory`, `DeleteIOSurfaceBacking2`).
+/// `reach` is the engine ledger's answer for the released pages, asked by the
+/// caller only while a writeback is outstanding. Every outcome has its own
+/// census route so a boot can say what the release cost and whether it held:
+///
+/// * `<site>_disjoint`: nothing outstanding lands in these pages; no wait.
+/// * `<site>_overlap` / `<site>_unnamed`: a wait was owed (or could not be
+///   ruled out), then exactly one of
+///   * `release_settled_writeback`: every outstanding write landed first;
+///   * `release_settle_raced_clear`: another settle had already taken the debt;
+///   * `release_settle_timeout`: a fence wait hit its bound
+///     (`FENCE_TIMEOUT_NS`). The write may still land; reported once on the
+///     fail channel, because this is the one outcome where the guarantee did
+///     not hold;
+///   * `release_settle_failed`: the wait failed (device lost or an error).
+///
+/// Bounded: the only wait is the rail's own fence wait, which is bounded per
+/// slot. Lock order is the existing one: the caller holds the device state, the
+/// rail takes the engine lock inside, exactly as every other settle site does.
+pub fn settle_release(
+    site: SettleSite,
+    reach: crate::backend::GuestWriteReach,
+    finding: impl FnOnce() -> String,
+) -> Option<crate::backend::GuestWriteSettle> {
+    settle_release_with(site, reach, finding, || {
+        crate::backend::selected().quiesce_guest_writes_bounded()
+    })
+}
+
+/// [`settle_release`] with the wait injected, so the outcome routing (the
+/// timeout arm in particular) is testable without a GPU.
+pub(crate) fn settle_release_with(
+    site: SettleSite,
+    reach: crate::backend::GuestWriteReach,
+    finding: impl FnOnce() -> String,
+    quiesce: impl FnOnce() -> crate::backend::GuestWriteSettle,
+) -> Option<crate::backend::GuestWriteSettle> {
+    use crate::backend::GuestWriteReach as Reach;
+    use crate::backend::GuestWriteSettle as Settle;
+    crate::runtime::drain::note_store_route(match reach {
+        Reach::Disjoint => site.route_disjoint(),
+        Reach::Overlap => site.route_overlap(),
+        Reach::Unnamed => site.route_unnamed(),
+    });
+    if reach == Reach::Overlap
+        && crate::observe::first_sight("guest_release_reaches_outstanding_write", site as u64)
+    {
+        crate::observe::fail(finding());
+    }
+    if reach == Reach::Disjoint {
+        return None;
+    }
+    let started = std::time::Instant::now();
+    let outcome = quiesce();
+    let waited_us = started.elapsed().as_micros() as u64;
+    crate::runtime::drain::note_store_route(site.route());
+    crate::runtime::drain::note_store_route_us(site.route_us(), waited_us);
+    match outcome {
+        Settle::Settled => crate::runtime::drain::note_store_route("release_settled_writeback"),
+        Settle::Clear => crate::runtime::drain::note_store_route("release_settle_raced_clear"),
+        Settle::TimedOut => {
+            crate::runtime::drain::note_store_route("release_settle_timeout");
+            if crate::observe::first_sight("release_settle_timeout", site as u64) {
+                crate::observe::fail(format!(
+                    "release_settle_timeout site={} waited_us={waited_us} (a writeback this \
+                     device queued into pages the guest is releasing did not land within the \
+                     fence bound; it may still land after the release)",
+                    site.route()
+                ));
+            }
+        }
+        Settle::Failed => crate::runtime::drain::note_store_route("release_settle_failed"),
+    }
+    Some(outcome)
+}
+
 /// Release the engine residents of linear cache entries whose task or object
 /// the guest deleted this drain.
 ///
@@ -822,6 +917,77 @@ pub fn retire_linear_residents(state: &mut DeviceState) {
     // device's. A rail that pins nothing takes the whole list and does nothing
     // with it, which is the same answer it always gave.
     crate::backend::selected().retire_linear_residents(&retired);
+}
+
+#[cfg(test)]
+mod release_settle_tests {
+    use super::{settle_release_with, SettleSite};
+    use crate::backend::{GuestWriteReach as Reach, GuestWriteSettle as Settle};
+    use crate::runtime::drain::store_route_count;
+
+    /// A release whose pages are provably clear of every outstanding write does
+    /// not wait at all; the wait closure must not run.
+    #[test]
+    fn a_disjoint_release_does_not_wait() {
+        let before = store_route_count("settle_guest_release_disjoint");
+        let out = settle_release_with(
+            SettleSite::GuestRelease,
+            Reach::Disjoint,
+            || unreachable!("no finding on a disjoint release"),
+            || unreachable!("a disjoint release must not wait"),
+        );
+        assert_eq!(out, None);
+        assert_eq!(store_route_count("settle_guest_release_disjoint") - before, 1);
+    }
+
+    /// The in-flight copy completes before the release is acknowledged: the
+    /// wait runs inside the call, and the settled outcome is counted.
+    #[test]
+    fn an_overlapping_release_waits_and_records_the_settle() {
+        let settled = store_route_count("release_settled_writeback");
+        let overlap = store_route_count("settle_backing_release_overlap");
+        let mut waited = false;
+        let out = settle_release_with(
+            SettleSite::BackingRelease,
+            Reach::Overlap,
+            || "test finding".to_string(),
+            || {
+                waited = true;
+                Settle::Settled
+            },
+        );
+        assert!(waited, "the release must wait for the in-flight copy");
+        assert_eq!(out, Some(Settle::Settled));
+        assert_eq!(store_route_count("release_settled_writeback") - settled, 1);
+        assert_eq!(store_route_count("settle_backing_release_overlap") - overlap, 1);
+    }
+
+    /// A wait that hits the fence bound does not hang the drain: it returns,
+    /// and says so under its own slug.
+    #[test]
+    fn a_release_whose_wait_times_out_records_its_own_slug() {
+        let timeouts = store_route_count("release_settle_timeout");
+        let settled = store_route_count("release_settled_writeback");
+        let out = settle_release_with(
+            SettleSite::GuestRelease,
+            Reach::Unnamed,
+            String::new,
+            || Settle::TimedOut,
+        );
+        assert_eq!(out, Some(Settle::TimedOut));
+        assert_eq!(store_route_count("release_settle_timeout") - timeouts, 1);
+        assert_eq!(store_route_count("release_settled_writeback"), settled);
+        let failed = store_route_count("release_settle_failed");
+        let raced = store_route_count("release_settle_raced_clear");
+        settle_release_with(SettleSite::GuestRelease, Reach::Unnamed, String::new, || {
+            Settle::Failed
+        });
+        settle_release_with(SettleSite::GuestRelease, Reach::Unnamed, String::new, || {
+            Settle::Clear
+        });
+        assert_eq!(store_route_count("release_settle_failed") - failed, 1);
+        assert_eq!(store_route_count("release_settle_raced_clear") - raced, 1);
+    }
 }
 
 #[cfg(test)]

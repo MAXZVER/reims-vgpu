@@ -389,6 +389,19 @@ pub(crate) trait Backend: Copy {
     /// Block until they have.
     fn quiesce_guest_writes(&self) {}
 
+    /// [`Self::quiesce_guest_writes`], answering how the wait ended.
+    ///
+    /// For a caller that must say what it did when the wait could not finish:
+    /// the release settle (`render_writeback::settle_release`) hands pages back
+    /// to the guest after it, and a writeback that outlived its fence bound may
+    /// still land in them. The wait is bounded by the rail's own fence timeout;
+    /// this adds no wait of its own. The default is the rail that writes
+    /// nothing asynchronously: when it returns, everything has landed.
+    fn quiesce_guest_writes_bounded(&self) -> GuestWriteSettle {
+        self.quiesce_guest_writes();
+        GuestWriteSettle::Settled
+    }
+
     /// Whether anything outstanding lands in `pages`.
     ///
     /// A rail with no outstanding writes cannot reach anything, so the default
@@ -1191,6 +1204,26 @@ pub enum GuestWriteReach {
     Unnamed,
 }
 
+/// How a bounded settle of a rail's outstanding guest-page writes ended — the
+/// vocabulary of [`Backend::quiesce_guest_writes_bounded`].
+///
+/// Neutral for the reason [`GuestWriteReach`] is: the caller that needs it is
+/// the device handing pages back to the guest, and "did the write land before
+/// I let go" is the same question on any rail that writes guest memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestWriteSettle {
+    /// Nothing was outstanding by the time the rail looked (another settle
+    /// took the debt first).
+    Clear,
+    /// Every outstanding writeback landed.
+    Settled,
+    /// A fence wait reached its bound. The write has not been seen to land and
+    /// may still; the caller cannot hold the guest any longer.
+    TimedOut,
+    /// The wait failed for another reason (device lost, a Vulkan error).
+    Failed,
+}
+
 /// The backend a device executes through, resolved once per process.
 ///
 /// A fieldless `Copy` enum rather than a boxed `dyn Backend`: [`Backend`]'s
@@ -1511,6 +1544,15 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.quiesce_guest_writes(),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.quiesce_guest_writes(),
+        }
+    }
+
+    fn quiesce_guest_writes_bounded(&self) -> GuestWriteSettle {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.quiesce_guest_writes_bounded(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.quiesce_guest_writes_bounded(),
         }
     }
 

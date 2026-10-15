@@ -1728,9 +1728,21 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
 /// `runtime::render_writeback::settle_guest_writes` before touching guest
 /// mapping bytes.
 pub fn quiesce_guest_writes() {
+    let _ = quiesce_guest_writes_outcome();
+}
+
+/// [`quiesce_guest_writes`], answering how the wait ended.
+///
+/// The same wait, bounded the same way: every slot wait is
+/// `wait_for_fences(.., FENCE_TIMEOUT_NS)`, so a writeback the GPU never
+/// finishes surfaces as [`DrawError::FenceTimeout`] rather than a hang. What
+/// this adds is that the caller learns which of those happened, which the
+/// release settle needs and the stamp/reader settles do not.
+pub fn quiesce_guest_writes_outcome() -> crate::backend::GuestWriteSettle {
+    use crate::backend::GuestWriteSettle as Settle;
     use std::sync::atomic::Ordering;
     if !GUEST_WRITE_DEBT.load(Ordering::Acquire) {
-        return;
+        return Settle::Clear;
     }
     let started = std::time::Instant::now();
     let mut guard = lock_engine();
@@ -1744,9 +1756,15 @@ pub fn quiesce_guest_writes() {
         // No device, so nothing can be in flight and nothing can settle it.
         GUEST_WRITE_DEBT.store(false, Ordering::Release);
         clear_guest_write_pages();
-        return;
+        return Settle::Settled;
     };
-    if let Err(e) = unsafe { pools.quiesce_guest_writes(ctx, counters) } {
+    let result = unsafe { pools.quiesce_guest_writes(ctx, counters) };
+    let outcome = match &result {
+        Ok(()) => Settle::Settled,
+        Err(DrawError::FenceTimeout) => Settle::TimedOut,
+        Err(_) => Settle::Failed,
+    };
+    if let Err(e) = result {
         // The wait failed, so this device cannot say the frame reached the
         // guest's pages. Nothing here can hold the caller back — a stamp that
         // never moves hangs the guest — so report it, and latch a lost device
@@ -1774,6 +1792,18 @@ pub fn quiesce_guest_writes() {
         crate::runtime::drain::ReadbackPhase::Fence,
         started.elapsed().as_micros() as u64,
     );
+    outcome
+}
+
+/// Arm the write debt and its page ledger without a device or a ledger entry,
+/// for a test of a caller that must settle before handing pages back. With no
+/// device context the settle has nothing to wait on and clears the flag, which
+/// is exactly the observable a caller's test needs: the flag going down proves
+/// the caller asked. (Adapted from upstream steelbrain/reims-vgpu abcd8f7d.)
+#[cfg(test)]
+pub(crate) fn arm_guest_write_debt_for_tests(pages: &[u64]) {
+    arm_guest_write_pages(pages);
+    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Whether any guest-page writeback is submitted and not yet settled.

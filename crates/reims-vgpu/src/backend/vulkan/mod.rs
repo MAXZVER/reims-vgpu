@@ -349,6 +349,10 @@ impl Backend for VulkanBackend {
         engine::quiesce_guest_writes();
     }
 
+    fn quiesce_guest_writes_bounded(&self) -> crate::backend::GuestWriteSettle {
+        engine::quiesce_guest_writes_outcome()
+    }
+
     fn guest_writes_reaching(&self, pages: &[u64]) -> GuestWriteReach {
         engine::guest_writes_reaching(pages)
     }

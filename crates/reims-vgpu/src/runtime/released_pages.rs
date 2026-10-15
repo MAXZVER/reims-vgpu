@@ -83,23 +83,106 @@
 /// Runs on the drain tranche. Unlike the sweep this replaced, the work here is
 /// draining a queue that is empty on every tranche of every healthy boot; the
 /// detection itself happened at the write.
+///
+/// `released_at` and `wrote_at` are **write-census epochs** (one per write this
+/// device recorded), not milliseconds: `wrote_at=200389` is the 200 389th
+/// recorded write, not a write 200 s into the boot. The report itself is not
+/// late: findings are queued at the write and drained here on the next tranche,
+/// so a line's `t=` is within one tranche of the write that raised it.
+///
+/// Each finding is also classified by who still names the page now
+/// ([`ReleasedPageOwner`]), under its own `released_write_after_release_owner_*`
+/// route, so a boot can tell the retained-GVA-backing class, the
+/// reused-by-another-route residue the module doc describes, and a genuinely
+/// unowned page apart. The base route keeps counting every finding.
 pub fn sweep(state: &mut crate::model::DeviceState) {
-    let writes = &mut state.host_writes;
-    for hit in writes.take_released_writes() {
+    let hits = state.host_writes.take_released_writes();
+    let mut classified = 0usize;
+    for hit in hits {
         crate::runtime::drain::note_store_route("released_write_after_release");
+        let owner = if classified < CLASSIFY_PER_SWEEP {
+            classified += 1;
+            ReleasedPageOwner::of(state, hit.gpa)
+        } else {
+            ReleasedPageOwner::Unclassified
+        };
+        crate::runtime::drain::note_store_route(owner.slug());
         if !crate::observe::first_sight("released_write_after_release", hit.gpa) {
             continue;
         }
         crate::observe::fail(format!(
             "released_pages reason=released_write_after_release gpa={:#x} \
-             released_at={} wrote_at={} armed={} (this device wrote to a guest page after the \
-             guest released it; the guest is entitled to have given that page to something \
+             released_at={} wrote_at={} armed={} owner={} (this device wrote to a guest page after \
+             the guest released it; the guest is entitled to have given that page to something \
              else, including its own page table)",
             hit.gpa,
             hit.released_at,
             hit.wrote_at,
-            writes.armed_pages(),
+            state.host_writes.armed_pages(),
+            owner.slug(),
         ));
+    }
+}
+
+/// How many findings per tranche [`sweep`] classifies. Each classification is a
+/// scan of the retained GVA backings and the mapping page lists, so a burst
+/// (one tranche held 64) is bounded; the rest count as `owner_unclassified`.
+const CLASSIFY_PER_SWEEP: usize = 8;
+
+/// Who, when the finding is drained, still names a page this device wrote
+/// after the guest released it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReleasedPageOwner {
+    /// A live GVA plane's retained transfer backing holds it: the write came
+    /// through pages a plane kept across the guest's unmap.
+    GvaRetainedBacking,
+    /// A live IOSurface mapping's page list holds it: the page was handed to a
+    /// surface through a route that does not disarm the guard, the residue the
+    /// module doc states.
+    LiveMapping,
+    /// Only a condemned (backing-deleted) mapping's list still holds it.
+    CondemnedMapping,
+    /// Nothing this device tracks names it any more: the finding stands as is.
+    Unowned,
+    /// Over the per-tranche classification budget.
+    Unclassified,
+}
+
+impl ReleasedPageOwner {
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::GvaRetainedBacking => "released_write_after_release_owner_gva_retained",
+            Self::LiveMapping => "released_write_after_release_owner_live_mapping",
+            Self::CondemnedMapping => "released_write_after_release_owner_condemned_mapping",
+            Self::Unowned => "released_write_after_release_owner_none",
+            Self::Unclassified => "released_write_after_release_owner_unclassified",
+        }
+    }
+
+    pub(crate) fn of(state: &crate::model::DeviceState, gpa: u64) -> Self {
+        if state.pending_writebacks.retains_gva_page(gpa) {
+            return Self::GvaRetainedBacking;
+        }
+        let shift = state.page_shift;
+        let holds = |entries: &[u32]| {
+            entries
+                .iter()
+                .any(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, shift) == Some(gpa))
+        };
+        let mut condemned = false;
+        for m in state.mappings.values() {
+            if holds(&m.page_entries) {
+                return Self::LiveMapping;
+            }
+            if m.condemned_entries.as_deref().is_some_and(|e| holds(e)) {
+                condemned = true;
+            }
+        }
+        if condemned {
+            Self::CondemnedMapping
+        } else {
+            Self::Unowned
+        }
     }
 }
 
@@ -171,6 +254,33 @@ fn claim_census_interval(last_ms: &std::sync::atomic::AtomicU64, now_ms: u64) ->
     last_ms
         .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::ReleasedPageOwner;
+    use crate::model::{DeviceId, DeviceState};
+
+    /// A finding names who still holds the page: a live surface mapping (the
+    /// guard's stated residue), or nobody (the finding stands).
+    #[test]
+    fn a_finding_is_classified_by_who_still_names_the_page() {
+        let mut state = DeviceState::new(DeviceId::default(), 12);
+        let page = 0x0045_6000u64;
+        assert_eq!(ReleasedPageOwner::of(&state, page), ReleasedPageOwner::Unowned);
+        assert!(state.map_surface(4));
+        state.mappings.get_mut(&4).unwrap().page_entries =
+            vec![((page >> 12) as u32) << crate::protocol::iosurface_pages::PAGE_ENTRY_PFN_SHIFT
+                | crate::protocol::iosurface_pages::PAGE_ENTRY_VALID];
+        assert_eq!(ReleasedPageOwner::of(&state, page), ReleasedPageOwner::LiveMapping);
+        assert!(state.condemn_surface_backing(4));
+        assert_eq!(ReleasedPageOwner::of(&state, page), ReleasedPageOwner::CondemnedMapping);
+        assert_ne!(
+            ReleasedPageOwner::LiveMapping.slug(),
+            ReleasedPageOwner::Unowned.slug(),
+            "each owner has its own route"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -731,6 +731,21 @@ impl PendingWritebacks {
             .collect()
     }
 
+    /// Whether any live GVA plane still retains `gpa` in its transfer backing.
+    ///
+    /// Diagnostic only: [`crate::runtime::released_pages::sweep`] asks it to
+    /// say who still names a page this device wrote after the guest released
+    /// it. A plane keeps the pages of its first resolution across ordinary task
+    /// unmaps (see [`gva_resource_generation`]), so a yes here says the write
+    /// came through that retained backing. A linear scan, bounded by the caller
+    /// to a few findings per tranche.
+    pub fn retains_gva_page(&self, gpa: u64) -> bool {
+        self.gva_resources
+            .values()
+            .filter_map(|resource| resource.pages.as_ref())
+            .any(|pages| pages.contains(&gpa))
+    }
+
     /// The plane owed a frame at these guest coordinates, if any.
     ///
     /// A scan and not a lookup because the ledger is keyed by
@@ -3014,6 +3029,43 @@ mod tests {
         note_guest_framebuffer_write(&mut state, 5, SampledBind, |_| {
             unreachable!("the latch is set; the evidence must not be asked for")
         });
+    }
+
+    /// Step C: a frame still owed to a surface when the guest unmaps it is
+    /// cancelled at the unmap, under its own slug, so no payment path can land
+    /// it in the released pages. The release guard is armed over those pages
+    /// first, so a write into them after the unmap would be a finding; there is
+    /// none, and `released_write_after_release` does not move.
+    #[test]
+    fn an_unmap_cancels_the_pending_debt_and_nothing_is_written_after_release() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        assert!(state.map_surface(9));
+        let page = 0x0012_3000u64;
+        state.mappings.get_mut(&9).expect("mapped").page_entries =
+            vec![((page >> 12) as u32) << crate::protocol::iosurface_pages::PAGE_ENTRY_PFN_SHIFT
+                | crate::protocol::iosurface_pages::PAGE_ENTRY_VALID];
+        assert_eq!(state.mapping_reach_pages(9), Some(vec![page]), "the test names its page");
+        assert!(state
+            .pending_writebacks
+            .arm(9, ident(9, 32, 32, 1), 32, 32, 1)
+            .is_none());
+        state.host_writes.release_page(page);
+        let cancelled = store_route_count("release_cancelled_writeback_debt");
+        let found = store_route_count("released_write_after_release");
+
+        assert!(state.unmap_surface(9));
+
+        assert!(state.pending_writebacks.get(9).is_none(), "the debt is cancelled, not parked");
+        assert!(state.pending_writebacks.is_empty());
+        assert_eq!(store_route_count("release_cancelled_writeback_debt") - cancelled, 1);
+        crate::runtime::released_pages::sweep(&mut state);
+        assert_eq!(
+            store_route_count("released_write_after_release"),
+            found,
+            "nothing may be written into the released page"
+        );
+        assert_eq!(state.host_writes.armed_pages(), 1, "the page stays armed and quiet");
     }
 
     /// Step 3: backing refresh / unmap cancel the mapping debt instead of

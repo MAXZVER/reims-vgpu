@@ -7826,3 +7826,101 @@ fn drain_yield_8ms_route_is_recorded() {
     super::note_drain_yield_8ms();
     assert!(store_route_count("drain_yield_8ms") > before);
 }
+
+/// The guest hands a span's pages back on the strength of a completion it read
+/// before a writeback this device queued into them has landed, and the kernel
+/// can reuse the page before the copy arrives. The unmap is the last point that
+/// can hold that write, so it settles whenever a writeback is outstanding and
+/// the span cannot be proven disjoint: here the task has no page table, so the
+/// walk names nothing and the answer is `Unnamed`, the fail-safe direction.
+/// (Adapted from upstream steelbrain/reims-vgpu abcd8f7d.)
+///
+/// Vulkan rail by name: the write debt is the Vulkan engine's, and with no
+/// device context its settle has nothing to wait on and clears the flag, which
+/// is the observable that proves the release asked.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn unmap_memory_settles_an_outstanding_writeback_before_the_pages_go_back() {
+    use crate::backend::vulkan::engine;
+    use crate::model::CHILD_OP_UNMAP_MEMORY;
+    use crate::protocol::endian::{st32, st64};
+    use crate::runtime::drain::store_route_count;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    engine::arm_guest_write_debt_for_tests(&[0x1234_5000]);
+    assert!(engine::guest_writes_outstanding());
+    let settled = store_route_count("release_settled_writeback");
+    let unnamed = store_route_count("settle_guest_release_unnamed");
+    let found = store_route_count("released_write_after_release");
+
+    let mut unmap_pl = vec![0u8; 20];
+    st32(&mut unmap_pl[0..4], 1);
+    st64(&mut unmap_pl[4..12], 0x2c22000);
+    st64(&mut unmap_pl[12..20], 0x10000);
+    let unmap = Packet {
+        opcode: CHILD_OP_UNMAP_MEMORY,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + 20,
+        completion_stamp: 0,
+        payload: unmap_pl,
+        next_head: 0,
+    };
+    process_child_packet(&mut state, &mut host, 2, &unmap);
+
+    assert!(
+        !engine::guest_writes_outstanding(),
+        "the release must settle a writeback it cannot prove disjoint"
+    );
+    assert_eq!(store_route_count("settle_guest_release_unnamed") - unnamed, 1);
+    assert_eq!(store_route_count("release_settled_writeback") - settled, 1);
+    crate::runtime::released_pages::sweep(&mut state);
+    assert_eq!(store_route_count("released_write_after_release"), found);
+}
+
+/// `DeleteIOSurfaceBacking2` settles an in-flight copy into the mapping's own
+/// pages before the release is recorded: when the packet returns, the debt is
+/// gone, the overlap was named (the ledger holds exactly this page) and the
+/// page is armed only afterwards, with no finding against it.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn delete_iosurface_backing_settles_an_in_flight_copy_into_its_pages() {
+    use crate::backend::vulkan::engine;
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    assert!(state.map_surface(3));
+    let entry = (0x101u32 << crate::protocol::iosurface_pages::PAGE_ENTRY_PFN_SHIFT)
+        | crate::protocol::iosurface_pages::PAGE_ENTRY_VALID;
+    state.mappings.get_mut(&3).unwrap().page_entries = vec![entry];
+    let page = state.mapping_reach_pages(3).expect("one named page")[0];
+    engine::arm_guest_write_debt_for_tests(&[page]);
+    let overlap = store_route_count("settle_backing_release_overlap");
+    let settled = store_route_count("release_settled_writeback");
+    let found = store_route_count("released_write_after_release");
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&3u32.to_le_bytes()); // objectID
+    payload.extend_from_slice(&1u32.to_le_bytes()); // taskID
+    process_child_packet(
+        &mut state,
+        &mut host,
+        2,
+        &Packet {
+            opcode: CHILD_OP_DELETE_IOSURFACE_BACKING2,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    assert!(!engine::guest_writes_outstanding(), "settled before the release");
+    assert_eq!(store_route_count("settle_backing_release_overlap") - overlap, 1);
+    assert_eq!(store_route_count("release_settled_writeback") - settled, 1);
+    assert!(state.host_writes.armed_pages() >= 1, "the page is released after the settle");
+    crate::runtime::released_pages::sweep(&mut state);
+    assert_eq!(store_route_count("released_write_after_release"), found);
+}

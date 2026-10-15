@@ -5324,6 +5324,104 @@ fn observe_page_table_nodes<H: HostMemory + HostOps>(
     }
 }
 
+/// Hold the guest's hand-back of a GVA span's pages until every writeback this
+/// device has queued into them has landed.
+///
+/// The guest frees a span's pages before it submits the `UnmapMemory` that
+/// names it, on the strength of the completion it already read for the work
+/// that used them. A GPU-direct writeback is recorded into the command stream
+/// and not waited on, so between that completion and the copy landing there is
+/// a window in which the kernel can reuse the page, and the copy then lands in
+/// whatever it put there. Upstream (steelbrain/reims-vgpu abcd8f7d) traced a
+/// macOS 15 panic during a Safari window drag to exactly this, with every
+/// write-after-release guard (including `released_write_after_release`) at
+/// zero, because those guards run when a write is planned and nothing runs
+/// when it lands.
+///
+/// Cheap when the debt flag is clear (one atomic load, the common case); a
+/// bounded fence wait otherwise. The page walk runs only when something is
+/// outstanding, and often finds nothing (the guest unwired the span first),
+/// which reads as `Unnamed` and settles: the fail-safe direction. See
+/// [`crate::runtime::render_writeback::settle_release`] for the outcome slugs.
+fn settle_released_span<H: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &H,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+) {
+    let backend = crate::backend::selected();
+    if !backend.guest_writes_outstanding() {
+        return;
+    }
+    let pages: Vec<u64> = crate::runtime::gva_mem::task_gva_page_gpa_set(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        length,
+        state.page_shift,
+    )
+    .into_iter()
+    .collect();
+    let reach = if pages.is_empty() {
+        crate::backend::GuestWriteReach::Unnamed
+    } else {
+        backend.guest_writes_reaching(&pages)
+    };
+    let _ = crate::runtime::render_writeback::settle_release(
+        crate::runtime::render_writeback::SettleSite::GuestRelease,
+        reach,
+        || {
+            format!(
+                "guest_release_reaches_outstanding_write family=unmap_memory task={task_id} \
+                 gva={gva:#x} len={length:#x} pages={} (a writeback this device queued has not \
+                 landed and the guest has already released these pages; settled here, which is \
+                 the last point that can hold it)",
+                pages.len()
+            )
+        },
+    );
+}
+
+/// [`settle_released_span`] for `DeleteIOSurfaceBacking2`, whose pages are the
+/// mapping's own list rather than a span to walk.
+///
+/// The list is the one the release guard arms from: the condemned list when a
+/// first delete already condemned the backing, the live list otherwise. Any
+/// entry that cannot be named makes the whole answer `Unnamed`, which settles.
+fn settle_released_mapping(state: &DeviceState, mapping_id: u32) {
+    let backend = crate::backend::selected();
+    if !backend.guest_writes_outstanding() {
+        return;
+    }
+    let pages: Option<Vec<u64>> = state.mappings.get(&mapping_id).and_then(|m| {
+        let entries = m.condemned_entries.as_ref().unwrap_or(&m.page_entries);
+        if entries.is_empty() {
+            return None;
+        }
+        entries
+            .iter()
+            .map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, state.page_shift))
+            .collect()
+    });
+    let reach = match pages {
+        Some(p) => backend.guest_writes_reaching(&p),
+        None => crate::backend::GuestWriteReach::Unnamed,
+    };
+    let _ = crate::runtime::render_writeback::settle_release(
+        crate::runtime::render_writeback::SettleSite::BackingRelease,
+        reach,
+        || {
+            format!(
+                "guest_release_reaches_outstanding_write family=delete_iosurface_backing2 \
+                 mid={mapping_id} (a writeback this device queued has not landed and the guest \
+                 has already released this mapping's pages; settled here)"
+            )
+        },
+    );
+}
+
 /// Record the guest-physical pages of `[gva, gva+length)` as released, on an
 /// unmap, or as handed back, on a map.
 ///
@@ -5639,6 +5737,12 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // views so the next ensure_gva_view re-walks. Does not invent
         // PTEs and does not destroy host_gva_surfaces content.
         if gva != 0 && length != 0 {
+            // Before anything else here forgets the span: a writeback this
+            // device queued into these pages must land before the guest's
+            // allocator hands them to someone else (Step C; upstream abcd8f7d).
+            if matches!(family, MapFamily::UnmapMemory) {
+                settle_released_span(state, host, task_id, gva, length);
+            }
             // Held bind resolutions over this range name pages the guest
             // has just remapped. Retired by range, which is exactly what
             // this notify carries.
@@ -5701,6 +5805,10 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // resolve proves which incarnation this delete was for
         // (fingerprint compare in mapper::resolve). A second delete
         // with no resolve between is genuinely dead: tear down fully.
+        // Same obligation as the unmap arm, keyed by the mapping whose pages
+        // are going back: a queued writeback into them must land first. Taken
+        // while the page list still names them (the teardowns below clear it).
+        settle_released_mapping(state, object_id);
         state.released_mappings.insert(object_id);
         if let Some(m) = state.mappings.get_mut(&object_id) {
             m.ever_released = true;

@@ -5882,6 +5882,17 @@ impl DeviceState {
                 self.retired_guest_write_tokens.push(retired_token);
             }
             self.host_surfaces.remove(&mapping_id);
+            // The surface is gone and its generation bumped, so any frame still
+            // owed to this mapping names pages the guest has released. Cancel it
+            // here rather than leave it for `pay` to discover as
+            // `wbdebt_generation_moved`: no payment may be attempted into a
+            // released backing, whichever path reaches the ledger first. (The
+            // condemn path keeps its debt on purpose; see
+            // `condemn_surface_backing` and the black-band class. It also took
+            // the page list, so that debt has nowhere to land either.)
+            if self.pending_writebacks.drop_mapping(mapping_id) {
+                crate::runtime::drain::note_store_route("release_cancelled_writeback_debt");
+            }
             true
         } else {
             false
