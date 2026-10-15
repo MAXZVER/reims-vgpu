@@ -1004,7 +1004,10 @@ mod tests {
             })))
         };
         assert_eq!(
-            lift(&record(wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT, &compact)),
+            lift(&record(
+                wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT,
+                &compact
+            )),
             expected(-2, 0x40, 6)
         );
 

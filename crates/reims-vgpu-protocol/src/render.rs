@@ -278,7 +278,9 @@ impl RenderKind {
             Self::DrawIndexedInstancedWide => wire::OPCODE_DRAW_INDEXED_INSTANCED_WIDE,
             Self::DrawIndexedInstancedBase => wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE,
             Self::DrawIndexedInstancedBaseWide => wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE,
-            Self::DrawIndexedInstancedBaseCorrect => wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT,
+            Self::DrawIndexedInstancedBaseCorrect => {
+                wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT
+            }
             Self::DrawIndexedInstancedBaseCorrectWide => {
                 wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT_WIDE
             }

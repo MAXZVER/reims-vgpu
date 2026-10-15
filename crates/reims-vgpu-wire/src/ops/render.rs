@@ -496,7 +496,8 @@ pub fn draw_indexed_instanced_base_wide<'a>(
 /// tile rasterisation, and Electron windows (the Claude desktop app) showed
 /// empty tiles while the window server, which never calls it, drew normally.
 pub const OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT: u32 = 0x1d;
-pub const DRAW_INDEXED_INSTANCED_BASE_CORRECT_TOTAL_LEN: u32 = DRAW_INDEXED_INSTANCED_BASE_TOTAL_LEN;
+pub const DRAW_INDEXED_INSTANCED_BASE_CORRECT_TOTAL_LEN: u32 =
+    DRAW_INDEXED_INSTANCED_BASE_TOTAL_LEN;
 
 /// Wide form of [`OPCODE_DRAW_INDEXED_INSTANCED_BASE_CORRECT`]; see there for
 /// what its `base_vertex` holds.
