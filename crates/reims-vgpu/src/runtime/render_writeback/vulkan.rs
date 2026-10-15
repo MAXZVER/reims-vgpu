@@ -2193,6 +2193,30 @@ impl crate::observe::Decline for GvaWritebackDecline {
 
 crate::observe::decline::decline_display!(GvaWritebackDecline);
 
+impl GvaWritebackDecline {
+    /// Whether the frame stayed in the resident because the resident is a
+    /// multisample image, which no rail reads back.
+    ///
+    /// That is not a copy that failed to land. A multisample resident is the
+    /// only copy of its attachment by contract — the guest strides those pages
+    /// for its samples and never reads them — so releasing it as "copied out"
+    /// marks the only copy reclaimable, which is the one thing
+    /// [`crate::backend::vulkan::engine::note_resident_content_copied_out`] says
+    /// never to do for a copy that did not land.
+    pub(crate) fn resident_is_multisample(&self) -> bool {
+        use crate::backend::vulkan::engine::reason::TargetReadDecline;
+        use crate::backend::vulkan::engine::DrawError;
+        matches!(
+            self,
+            Self::Engine {
+                inner: DrawError::TargetRead(TargetReadDecline::MultisampleImage { .. })
+            } | Self::CopiedReadRefused {
+                inner: DrawError::TargetRead(TargetReadDecline::MultisampleImage { .. })
+            }
+        )
+    }
+}
+
 /// Land a GVA render Store's frame in the guest's pages, GPU-direct where the
 /// host allows it and by reading the resident back where it does not.
 ///
@@ -2730,6 +2754,43 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
         crate::runtime::gva_store_witness::note_store_eager(state, host, key, gpas);
     }
     Ok(extent)
+}
+
+#[cfg(test)]
+mod gva_multisample_decline_tests {
+    use super::*;
+    use crate::backend::vulkan::engine::reason::TargetReadDecline;
+    use crate::backend::vulkan::engine::DrawError;
+
+    /// The failure path must be able to tell "the copy did not land" from "the
+    /// resident cannot be copied out by construction": it releases a resident
+    /// for the first and must keep it for the second, since a multisample
+    /// resident is the only copy of its attachment.
+    #[test]
+    fn only_a_multisample_resident_is_kept_by_a_lost_payment() {
+        let multisample = DrawError::TargetRead(TargetReadDecline::MultisampleImage {
+            sample_count: 4,
+        });
+        assert!(GvaWritebackDecline::CopiedReadRefused {
+            inner: multisample.clone()
+        }
+        .resident_is_multisample());
+        assert!(GvaWritebackDecline::Engine { inner: multisample }.resident_is_multisample());
+
+        let gone = DrawError::TargetRead(TargetReadDecline::NoReadyContent);
+        assert!(
+            !GvaWritebackDecline::CopiedReadRefused { inner: gone }.resident_is_multisample(),
+            "a resident with nothing ready is not a multisample one"
+        );
+        assert!(
+            !GvaWritebackDecline::CopiedWriteRefused {
+                err: crate::runtime::host::MemError::Unmapped
+            }
+            .resident_is_multisample(),
+            "a page write that failed is a copy that did not land"
+        );
+        assert!(!GvaWritebackDecline::Unlicensed.resident_is_multisample());
+    }
 }
 
 #[cfg(test)]

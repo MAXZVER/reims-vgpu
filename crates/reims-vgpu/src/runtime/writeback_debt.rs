@@ -42,6 +42,12 @@
 //! invalidation, task retirement, and generation movement release the same
 //! ownership without inventing a guest write.
 //!
+//! A multisample target is the one Store that owes nothing: the guest never
+//! reads those pages and no rail can write them, so its resident is the only
+//! copy of the attachment for as long as the resource lives. It is recorded as a
+//! sole copy (`PendingWritebacks::gva_sole_copies`) beside the ledger rather
+//! than in it, and is released by the same lifetime events but never paid.
+//!
 //! [`MAX_DEBTS`] bounds only anonymous mapper-ref-texture surface debts. GVA resource
 //! lifetime is explicit — resource discard/delete and task teardown — so an
 //! unrelated capacity limit must not invent an early synchronization point.
@@ -564,6 +570,24 @@ pub enum WritebackKey {
 pub struct PendingWritebacks {
     debts: std::collections::BTreeMap<u32, WritebackDebt>,
     gva_debts: std::collections::BTreeMap<GvaPlaneKey, GvaWritebackDebt>,
+    /// GVA planes whose resident is the only copy of the attachment **by
+    /// contract** rather than by deferral: a multisample target.
+    ///
+    /// The guest strides a multisample allocation for its samples and never
+    /// reads it, and no rail of this device can read the samples back into it,
+    /// so nothing is owed to those pages and nothing can be paid into them. A
+    /// debt for such a plane was armed, found nothing to pay with at the first
+    /// synchronize (`gvadebt_pay_lost ... read_target_multisample_image`), and
+    /// then marked the resident reclaimable — the only copy of the attachment.
+    ///
+    /// So the plane is recorded here and **not** in [`Self::gva_debts`]. The
+    /// two answer different questions: that map is "which frames does the guest
+    /// still owe a copy of", and every payment, every reader's emptiness check
+    /// ([`Self::is_empty`]) and every overlap test walks it. This one only says
+    /// the resident is authoritative ([`gva_resident_authoritative`]) and whose
+    /// it is, so that the resource's end ([`Self::retire_gva_resource`]) and a
+    /// replacing Store release it the way a debt's resident is released.
+    gva_sole_copies: std::collections::BTreeMap<GvaPlaneKey, GvaWritebackDebt>,
     gva_resources: std::collections::BTreeMap<GvaPlaneKey, GvaResourceState>,
     next_seq: u64,
     next_gva_generation: u64,
@@ -760,6 +784,35 @@ impl PendingWritebacks {
         previous
     }
 
+    /// Record that one plane's resident is the only copy of its attachment by
+    /// contract, and so owes the guest nothing. See `PendingWritebacks::gva_sole_copies`.
+    ///
+    /// A second Store into the same plane replaces the record. The returned
+    /// previous record names an older resident identity that the caller must
+    /// release when the declaration changed, exactly as for [`Self::arm_gva`].
+    #[must_use = "a replaced record may own an older resident identity"]
+    pub fn arm_gva_sole_copy(
+        &mut self,
+        key: GvaResourceKey,
+        debt: GvaWritebackDebt,
+    ) -> Option<GvaWritebackDebt> {
+        let previous = self.gva_sole_copies.insert(key.plane(debt.gva), debt);
+        crate::runtime::drain::note_store_route(if previous.is_some() {
+            "gvasole_superseded"
+        } else {
+            "gvasole_armed"
+        });
+        previous
+    }
+
+    /// Whether a plane at these guest coordinates holds its attachment's only
+    /// copy by contract. A scan, for [`Self::gva_for_window`]'s reason.
+    fn gva_sole_copy_at(&self, window: GvaWindow) -> bool {
+        self.gva_sole_copies
+            .values()
+            .any(|record| record.window() == window)
+    }
+
     /// Establish or retrieve the lifetime identity of one live plane of a GVA
     /// resource.
     ///
@@ -897,12 +950,20 @@ impl PendingWritebacks {
             .range(key.planes())
             .map(|(plane, _)| *plane)
             .chain(self.gva_debts.range(key.planes()).map(|(plane, _)| *plane))
+            .chain(
+                self.gva_sole_copies
+                    .range(key.planes())
+                    .map(|(plane, _)| *plane),
+            )
             .collect();
         let mut existed = false;
         let mut debts = Vec::new();
         for plane in planes {
             existed |= self.gva_resources.remove(&plane).is_some();
             debts.extend(self.gva_debts.remove(&plane));
+            // Released like a debt's resident: the resource is over, and the
+            // only copy of its attachment has no reader left.
+            debts.extend(self.gva_sole_copies.remove(&plane));
         }
         (existed, debts)
     }
@@ -2181,6 +2242,21 @@ fn reback_gva_resource<M: HostMemory>(
     state.pending_writebacks.reback_gva_resource(plane, pages)
 }
 
+/// Drop every older host-side spelling of a resource a Store has just replaced.
+///
+/// Stale as soon as the render finishes. In particular, a compute storage
+/// resident and the linear byte cache can otherwise sit above the guest-page
+/// reader and serve the frame that preceded this Store indefinitely.
+#[cfg(feature = "backend-vulkan")]
+fn forget_stale_host_copies(
+    state: &mut DeviceState,
+    task_id: u32,
+    c0: &crate::runtime::draw::ColorRtRequest,
+) {
+    state.invalidate_object_host_copies(task_id, c0.texture_ref);
+    crate::runtime::surface_cache::evict_gva(state, c0.target_gva);
+}
+
 /// Record a GVA render result as host-authoritative without touching guest
 /// pages. Returns `false` when the attachment has no resource identity and must
 /// use the eager transfer path.
@@ -2201,6 +2277,47 @@ pub(crate) fn arm_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
 ) -> bool {
     if c0.texture_ref == 0 || window.generation == 0 {
         return false;
+    }
+    // A multisample target owes the guest nothing, so there is nothing to defer.
+    //
+    // The guest strides those pages for its samples and never reads them, and
+    // no rail of this device writes them: the resident is the only copy of the
+    // attachment there is, and it is authoritative for as long as the resource
+    // lives. Arming a debt for it promised a copy that no rail can make — the
+    // first synchronize paid it, found `read_target_multisample_image`, reported
+    // the frame lost and marked the only copy reclaimable. So it is recorded as
+    // a sole copy instead (`PendingWritebacks::gva_sole_copies`), which keeps
+    // the resident authoritative and releases it with the resource, and which
+    // no payment, emptiness check or overlap test walks.
+    //
+    // `true`, and before the checks below: none of them is about this Store.
+    // A debt's gates — a pending read request, the lazy switch, a witness that
+    // can date a guest write — all exist because the eager rail they fall back
+    // to can land the frame in guest pages, and for this target it cannot.
+    // Returning `false` here would only send the caller to a copy that fails.
+    if c0.stores_multisample_image() {
+        forget_stale_host_copies(state, task_id, c0);
+        let key = GvaResourceKey {
+            task_id,
+            texture_ref: c0.texture_ref,
+        };
+        let record = GvaWritebackDebt {
+            gva: c0.target_gva,
+            row_stride: c0.row_stride,
+            width: c0.width,
+            height: c0.height,
+            format: c0.format,
+            generation: window.generation,
+            // Nothing to compare a later stamp against: the guest cannot have
+            // written pages it never uses, so this record has no currency to lose.
+            guest_write: Default::default(),
+            seq: 0,
+        };
+        let previous = state.pending_writebacks.arm_gva_sole_copy(key, record);
+        if let Some(previous) = previous.filter(|previous| !same_gva_identity(*previous, record)) {
+            release_gva(rail, previous);
+        }
+        return true;
     }
     // TEMP (lab, READ_REQUESTED): the guest already asked to read this resource
     // and nothing was owed then - this Store's frame is what it will read, so it
@@ -2226,12 +2343,7 @@ pub(crate) fn arm_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("gvadebt_arm_window_diverges");
         return false;
     }
-    // Every older host-side spelling of this resource is stale as soon as the
-    // render finishes. In particular, a compute storage resident and the
-    // linear byte cache can otherwise sit above the guest-page reader and serve
-    // the frame that preceded this Store indefinitely.
-    state.invalidate_object_host_copies(task_id, c0.texture_ref);
-    crate::runtime::surface_cache::evict_gva(state, c0.target_gva);
+    forget_stale_host_copies(state, task_id, c0);
     let key = GvaResourceKey {
         task_id,
         texture_ref: c0.texture_ref,
@@ -2347,7 +2459,10 @@ fn gva_writeback_is_recoverable<B: crate::backend::Backend, M: HostMemory + Host
 /// stands for, which is the same key the arm recorded — see [`GvaWindow`].
 pub fn gva_resident_authoritative(state: &DeviceState, window: GvaWindow) -> bool {
     let Some((plane, debt)) = state.pending_writebacks.gva_for_window(window) else {
-        return false;
+        // No frame is owed, which says nothing about a plane whose resident
+        // is the only copy by contract: the guest cannot have written it
+        // newer, so there is no stamp to compare.
+        return state.pending_writebacks.gva_sole_copy_at(window);
     };
     state
         .buffer_write_gen
@@ -3906,6 +4021,165 @@ mod tests {
         let (armed, state) = arm(&mut ready);
         assert!(armed, "a witnessed plane still defers");
         assert_eq!(state.pending_writebacks.len(), 1);
+    }
+
+    /// A Store into a multisample target owes the guest nothing: the resident is
+    /// the attachment's only copy, it stays the authority across a synchronize,
+    /// and the failure channel hears nothing about a payment that was never
+    /// owed.
+    ///
+    /// The defect: the Store armed a debt, the guest's first synchronize paid it,
+    /// the payment found a multisample image no rail can read back
+    /// (`gvadebt_pay_lost ... read_target_multisample_image`), and the failure
+    /// path marked the only copy reclaimable. Run on a host that *cannot* defer
+    /// a single-sample Store at all, so that the Store being accepted is the
+    /// target's own doing and not a witness happening to be armed.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_multisample_store_is_the_only_copy_and_owes_the_guest_nothing() {
+        let rail = crate::backend::vulkan::VulkanBackend;
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let mut host = crate::runtime::FakeHost::new();
+        host.guest_writes_unobservable = true;
+        let debt = gva_debt(9);
+        let key = GvaResourceKey {
+            task_id: 3,
+            texture_ref: 12,
+        };
+        let span = u64::from(debt.row_stride) * u64::from(debt.height);
+        let pages: Vec<u64> = (0..span.div_ceil(state.page_size()))
+            .map(|i| 0x40_000 + i * state.page_size())
+            .collect();
+        let _ = state
+            .pending_writebacks
+            .ensure_gva_resource(key, debt.gva, span, Some(pages));
+        let multisample = crate::runtime::draw::ColorRtRequest {
+            texture_ref: key.texture_ref,
+            target_gva: debt.gva,
+            row_stride: debt.row_stride,
+            width: debt.width,
+            height: debt.height,
+            format: debt.format,
+            sample_count: 4,
+            ..Default::default()
+        };
+
+        let capture = crate::observe::sink::FailCapture::start();
+        assert!(
+            arm_gva(
+                rail,
+                &mut state,
+                &mut host,
+                key.task_id,
+                &multisample,
+                debt.window()
+            ),
+            "the Store is accepted: the eager rail it would otherwise fall back to \
+             cannot land a multisample frame either"
+        );
+        assert_eq!(state.pending_writebacks.len(), 0, "no frame is owed");
+        assert!(
+            state.pending_writebacks.is_empty(),
+            "so every reader's emptiness check stays the free one"
+        );
+        assert!(
+            gva_resident_authoritative(&state, debt.window()),
+            "and the resident is the authority"
+        );
+
+        pay_for_texture(&mut state, &mut host, key.task_id, key.texture_ref);
+        pay_all(&mut state, &mut host);
+        assert!(
+            capture
+                .lines()
+                .iter()
+                .all(|line| !line.starts_with("gvadebt_pay_lost")),
+            "nothing was owed, so nothing was lost: {:?}",
+            capture.lines()
+        );
+        assert!(
+            gva_resident_authoritative(&state, debt.window()),
+            "a synchronize consumed nothing, so the resident is still the authority"
+        );
+
+        // A replacing Store at the same coordinates is the same record; the
+        // resource's end is what releases it.
+        assert!(arm_gva(
+            rail,
+            &mut state,
+            &mut host,
+            key.task_id,
+            &multisample,
+            debt.window()
+        ));
+        assert!(gva_resident_authoritative(&state, debt.window()));
+        assert!(
+            retire_gva_resource(&mut state, key.task_id, key.texture_ref),
+            "the resource ending retires a record that was never a debt"
+        );
+        assert!(
+            !gva_resident_authoritative(&state, debt.window()),
+            "and a resident whose resource is gone is nobody's authority"
+        );
+    }
+
+    /// A resolve destination is a single-sample image whatever the pass
+    /// rasterized at, so its Store is an ordinary one: deferred where the host
+    /// can recover a deferral, refused where it cannot, and a debt when armed.
+    ///
+    /// The destination's request carries the pass's sample count (it is what
+    /// the pipeline was compiled for), so reading that count alone sends every
+    /// resolved frame down the rail that publishes nothing — and the guest never
+    /// sees a frame it asked to have resolved.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_resolve_destination_is_stored_like_any_single_sample_target() {
+        let rail = crate::backend::vulkan::VulkanBackend;
+        let debt = gva_debt(9);
+        let key = GvaResourceKey {
+            task_id: 3,
+            texture_ref: 12,
+        };
+        let span = u64::from(debt.row_stride) * u64::from(debt.height);
+        let resolve = crate::runtime::draw::ColorRtRequest {
+            texture_ref: key.texture_ref,
+            target_gva: debt.gva,
+            row_stride: debt.row_stride,
+            width: debt.width,
+            height: debt.height,
+            format: debt.format,
+            sample_count: 4,
+            multisample_source_ref: 7,
+            ..Default::default()
+        };
+        assert!(
+            !resolve.stores_multisample_image(),
+            "its image has one sample"
+        );
+        for (blind, deferred) in [(true, false), (false, true)] {
+            let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+            let mut host = crate::runtime::FakeHost::new();
+            host.guest_writes_unobservable = blind;
+            let pages: Vec<u64> = (0..span.div_ceil(state.page_size()))
+                .map(|i| 0x40_000 + i * state.page_size())
+                .collect();
+            let _ = state
+                .pending_writebacks
+                .ensure_gva_resource(key, debt.gva, span, Some(pages));
+            assert_eq!(
+                arm_gva(
+                    rail,
+                    &mut state,
+                    &mut host,
+                    key.task_id,
+                    &resolve,
+                    debt.window()
+                ),
+                deferred,
+                "blind host: {blind}"
+            );
+            assert_eq!(state.pending_writebacks.len(), usize::from(deferred));
+        }
     }
 
     /// A guest CPU write into part of a plane names that part, so the payment

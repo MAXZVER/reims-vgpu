@@ -3651,6 +3651,63 @@ fn a_repoint_the_model_is_not_told_about_names_which_fact_stopped_it() {
     );
 }
 
+/// A re-point of a reference whose slot the guest has cleared retires the
+/// model's name for it, and a reference this device merely could not read keeps
+/// its name.
+///
+/// Both look the same from the re-point's caller — `NoListEntry` — and they are
+/// opposite facts: an emptied slot is an object the guest has deleted, and the
+/// name outliving it would resolve the slot's next tenant to the dead object's
+/// resource; a ref past the declared list says nothing about the object, and
+/// retiring its name would cost a live object its resource.
+#[test]
+fn a_repoint_of_a_cleared_slot_retires_the_stale_name_and_an_unlisted_ref_keeps_it() {
+    use super::RepointStorageRefusal;
+    use reims_vgpu_core::lifecycle::Storage;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    // Slot 3 is inside the eight-entry list and zero; 4000 is past its end.
+    let (task, cleared, beyond) = (1u32, 3u32, 4000u32);
+
+    for slot in [cleared, beyond] {
+        let _declaration = state
+            .declare_object(task, slot, Storage::NoBytes)
+            .expect("the task is defined, so the slot can be named");
+        assert!(state.object_name(task, slot).is_some());
+        assert_eq!(
+            super::repointed_storage(&state, &host, task, slot)
+                .expect_err("the guest's list holds nothing at this reference"),
+            RepointStorageRefusal::NoListEntry,
+            "the caller sees one answer for both"
+        );
+    }
+
+    assert!(
+        super::retire_name_of_cleared_slot(&state, &host, task, cleared),
+        "a slot that reads as cleared is a deleted object"
+    );
+    assert_eq!(
+        state.object_name(task, cleared),
+        None,
+        "the stale name stops resolving"
+    );
+    assert!(
+        !super::retire_name_of_cleared_slot(&state, &host, task, cleared),
+        "and there is nothing left to retire a second time"
+    );
+
+    assert!(
+        !super::retire_name_of_cleared_slot(&state, &host, task, beyond),
+        "a reference past the declared list does not say the object is gone"
+    );
+    assert!(
+        state.object_name(task, beyond).is_some(),
+        "so its name is left to the guest's own delete"
+    );
+}
+
 /// The object-list walk's per-object translation: what the semantic model is
 /// told each constructed object's storage is.
 ///

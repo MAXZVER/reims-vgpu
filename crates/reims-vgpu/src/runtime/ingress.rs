@@ -246,15 +246,23 @@ pub enum Refused {
     /// and offset — because a bridge-level re-wording would lose the site and
     /// the owner that judged it.
     Exec(reims_vgpu_core::walk::WalkRefusal),
-    /// A re-pointed reference names no storage this device can describe.
+    /// A re-pointed reference names storage this device could not describe or
+    /// could not read.
     ///
     /// The device's own answer, carried whole. `ReplacePhysical` is the one
     /// command whose operation needs a term that is nowhere on its wire — the
     /// guest re-points a resource at frames it has already wired, at the same
     /// GPU-VA — so the storage arrives from the caller and this is what it says
-    /// when it has none. A driven macos-15 boot puts every route of it at zero:
-    /// all 242 of that boot's re-points named describable storage once a
-    /// surface-backing object stopped being read as owning no bytes.
+    /// when it has storage it cannot name. A driven macos-15 boot puts every
+    /// route of it at zero: all 242 of that boot's re-points named describable
+    /// storage once a surface-backing object stopped being read as owning no
+    /// bytes.
+    ///
+    /// **Only the arms that cost.** A reference with no storage at all — no
+    /// name, an emptied slot, a heap placement, an object that owns no bytes —
+    /// has nothing for the model to be stale about and is admitted as
+    /// `reims_vgpu_core::lifecycle::LifecycleOp::ReplacePhysicalNoStorage`; see
+    /// `RepointStorageRefusal::moves_no_storage`.
     Repoint(crate::runtime::objects::RepointStorageRefusal),
 }
 
@@ -415,9 +423,11 @@ pub struct DeviceInputs<'a> {
     pub exec: ExecStreams<'a>,
     /// What a re-pointed reference names now, or why the device cannot say.
     ///
-    /// `Err` refuses the packet under the device's own reason rather than
-    /// building an operation carrying the *old* backing, which would re-point
-    /// nothing while reporting success.
+    /// `Err` is never an operation carrying the *old* backing, which would
+    /// re-point nothing while reporting success. A reference with no storage to
+    /// move (`RepointStorageRefusal::moves_no_storage`) becomes an operation
+    /// that says so; any other `Err` refuses the packet under the device's own
+    /// reason.
     pub repointed: Result<ReplacementStorage, crate::runtime::objects::RepointStorageRefusal>,
 }
 
@@ -1025,6 +1035,22 @@ fn resource_lifetime(
                 backing,
                 extent,
             },
+            // A reference with no storage to move. The device's re-point already
+            // ran at arrival and found nothing to apply, so the packet is
+            // ordinary guest work whose ordering position and completion word
+            // are owed; refusing it wrote the word out of band and dropped the
+            // position. The operation changes nothing in the model and orders
+            // against nothing, which is the true statement.
+            Err(refusal) if refusal.moves_no_storage() => {
+                crate::runtime::drain::note_store_route("ingress_repoint_no_storage");
+                lifecycle::LifecycleOp::ReplacePhysicalNoStorage {
+                    task,
+                    object_ref: resource.slot.0,
+                }
+            }
+            // Storage the device could not describe, or could not read: the
+            // pages may have moved under authority the model still holds, and
+            // an unknown is not a no-op.
             Err(refusal) => return Err(Blocked::Refused(Refused::Repoint(refusal))),
         },
         Err(other) => return Err(Blocked::Refused(Refused::Lifecycle(other))),
@@ -1645,42 +1671,152 @@ mod tests {
     /// refusing affordable rather than a wall.
     #[test]
     fn a_repoint_the_device_cannot_describe_is_refused_under_the_devices_reason() {
-        use crate::runtime::objects::RepointStorageRefusal;
+        use crate::runtime::objects::{RepointStorageRefusal, StorageRefusal};
 
-        let mut accesses = NoAccesses;
-        let undescribable = RepointStorageRefusal::NoBytes {
-            object_type: 6,
-            mapping_names_a_surface: false,
-        };
-        let refusal = packet(
-            fifo_for(Channel::Child),
-            SessionGeneration::FIRST,
-            StampSlot(0),
-            &drained_with_list(Channel::Child, 0x3c),
-            resolvers(&EveryMapping),
-            DeviceInputs {
-                exec: ExecStreams {
-                    task: reims_vgpu_core::identity::TaskId(0),
-                    usages: &reims_vgpu_core::pipeline::NoUsage,
-                    streams: &[],
-                    accesses: &mut accesses,
+        // The two arms that cost: real storage this device has no vocabulary
+        // for, and a descriptor it could not read at all.
+        for undescribable in [
+            RepointStorageRefusal::Refused(StorageRefusal::ExtentUnrecovered { object_type: 11 }),
+            RepointStorageRefusal::DescriptorUnread,
+        ] {
+            let mut accesses = NoAccesses;
+            let refusal = packet(
+                fifo_for(Channel::Child),
+                SessionGeneration::FIRST,
+                StampSlot(0),
+                &drained_with_list(Channel::Child, 0x3c),
+                resolvers(&EveryMapping),
+                DeviceInputs {
+                    exec: ExecStreams {
+                        task: reims_vgpu_core::identity::TaskId(0),
+                        usages: &reims_vgpu_core::pipeline::NoUsage,
+                        streams: &[],
+                        accesses: &mut accesses,
+                    },
+                    repointed: Err(undescribable),
                 },
-                repointed: Err(undescribable),
+            )
+            .expect_err("the device has storage here and cannot say where it went");
+            assert_eq!(
+                refusal.gap(),
+                None,
+                "the input is not missing from this bridge; the device looked and \
+                 could not name what it found"
+            );
+            assert_eq!(refusal, Blocked::Refused(Refused::Repoint(undescribable)));
+            assert_eq!(
+                refusal.slug(),
+                undescribable.route(),
+                "reported under the route the device already counts it on"
+            );
+        }
+    }
+
+    /// A re-point of a reference with no storage to move is admitted: it takes
+    /// its ordering position and publishes its completion word, and it changes
+    /// nothing in the model.
+    ///
+    /// These were refused under the device's own reason, so a well-formed
+    /// packet whose work had already run at arrival (the guest's announcement
+    /// that it re-pointed an object it has since deleted, or an object that owns
+    /// no bytes) wrote its completion word out of band and lost its place in the
+    /// channel's order. One such packet a boot reached the failure channel as
+    /// `packet_unadmitted ... Refused(Repoint(NoListEntry))`.
+    ///
+    /// The partition is `RepointStorageRefusal::moves_no_storage`'s and is swept
+    /// over every variant, so a variant added later has to be placed on one side
+    /// of it before this compiles.
+    #[test]
+    fn a_repoint_with_no_storage_to_move_is_admitted_with_its_completion() {
+        use crate::runtime::objects::{RepointStorageRefusal, StorageRefusal};
+        use reims_vgpu_core::lifecycle::LifecycleOp;
+
+        let no_storage = [
+            RepointStorageRefusal::Unnamed,
+            RepointStorageRefusal::NoListEntry,
+            RepointStorageRefusal::Placed,
+            RepointStorageRefusal::NoBytes {
+                object_type: 6,
+                mapping_names_a_surface: false,
             },
-        )
-        .expect_err("the device has no storage for this reference");
-        assert_eq!(
-            refusal.gap(),
-            None,
-            "the input is not missing from this bridge; the device looked and \
-             there was nothing to name"
-        );
-        assert_eq!(refusal, Blocked::Refused(Refused::Repoint(undescribable)));
-        assert_eq!(
-            refusal.slug(),
-            undescribable.route(),
-            "reported under the route the device already counts it on"
-        );
+            RepointStorageRefusal::NoBytes {
+                object_type: 6,
+                mapping_names_a_surface: true,
+            },
+        ];
+        let costs = [
+            RepointStorageRefusal::DescriptorUnread,
+            RepointStorageRefusal::Refused(StorageRefusal::ExtentUnrecovered { object_type: 11 }),
+        ];
+        // Exhaustive, so a new variant is a compile error here and not a
+        // refusal nobody decided on.
+        for refusal in no_storage.iter().chain(&costs) {
+            match refusal {
+                RepointStorageRefusal::Unnamed
+                | RepointStorageRefusal::NoListEntry
+                | RepointStorageRefusal::DescriptorUnread
+                | RepointStorageRefusal::Placed
+                | RepointStorageRefusal::NoBytes { .. }
+                | RepointStorageRefusal::Refused(_) => {}
+            }
+        }
+        assert!(no_storage.iter().all(|r| r.moves_no_storage()));
+        assert!(costs.iter().all(|r| !r.moves_no_storage()));
+
+        let mut drained = drained(0x3c);
+        use reims_vgpu_protocol::fifo::{TASK_OBJECT_OBJECT_ID, TASK_OBJECT_TASK_ID};
+        drained.payload[TASK_OBJECT_TASK_ID..TASK_OBJECT_TASK_ID + 4]
+            .copy_from_slice(&6u32.to_le_bytes());
+        drained.payload[TASK_OBJECT_OBJECT_ID..TASK_OBJECT_OBJECT_ID + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
+        drained.completion_stamp = 0x77;
+
+        for refusal in no_storage {
+            let mut accesses = NoAccesses;
+            let built = packet(
+                fifo_for(Channel::Child),
+                SessionGeneration::FIRST,
+                StampSlot(3),
+                &drained,
+                resolvers(&EveryMapping),
+                DeviceInputs {
+                    exec: ExecStreams {
+                        task: reims_vgpu_core::identity::TaskId(0),
+                        usages: &reims_vgpu_core::pipeline::NoUsage,
+                        streams: &[],
+                        accesses: &mut accesses,
+                    },
+                    repointed: Err(refusal),
+                },
+            )
+            .unwrap_or_else(|blocked| panic!("{refusal:?} has nothing to move: {blocked:?}"));
+            let Payload::ResourceLifecycle(payload) = &built.payload else {
+                panic!("a re-point must not build another class's payload");
+            };
+            assert_eq!(
+                payload.op(),
+                &LifecycleOp::ReplacePhysicalNoStorage {
+                    task: TaskId(6),
+                    object_ref: 1,
+                },
+                "{refusal:?}: the reference is the packet's own words, resolved in \
+                 the packet's own task"
+            );
+            assert!(
+                payload.accesses().is_empty(),
+                "{refusal:?}: the model holds nothing keyed by this reference, so \
+                 the packet orders against nothing but its channel"
+            );
+            assert_eq!(
+                built.completion,
+                Some(CompletionStamp {
+                    slot: StampSlot(3),
+                    value: StampValue(0x77),
+                }),
+                "{refusal:?}: the packet's completion word is published in order, \
+                 not written out of band"
+            );
+        }
     }
 
     /// An exec packet's command stream refuses as the *walk's* refusal, with

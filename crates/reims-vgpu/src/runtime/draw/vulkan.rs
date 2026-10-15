@@ -7530,6 +7530,10 @@ pub(crate) fn lab_gpu_clear_enabled() -> bool {
 /// (no resident to clear, a format whose clear encoding differs, a debt the
 /// witness cannot arm); the resident may already hold the clear by then, which
 /// is the same content the CPU fill writes.
+///
+/// A multisample target is not this rail's: it has no CPU fill to fall back to
+/// and no guest pages to owe a frame, and `apply_clear` sends it to
+/// [`clear_multisample_gva`] before it gets here.
 pub(crate) fn lab_gpu_clear_gva<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -7605,6 +7609,130 @@ pub(crate) fn lab_gpu_clear_gva<M: HostMemory + HostOps>(
     state.pending_writebacks.lab_note_solid(own, clear_color);
     note("lab_gpu_clear_armed");
     true
+}
+
+/// Why [`clear_multisample_gva`] could not land a clear-only pass in a
+/// multisample target's resident.
+#[derive(Debug)]
+pub(crate) enum MultisampleClearDecline {
+    /// The attachment names no resource, no guest address, or is not a
+    /// multisample store at all: there is no resident to name.
+    Unnamed,
+    /// The attachment's pixel format has no host translation, so its clear
+    /// colour has no representation in a resident.
+    FormatUntranslated,
+    /// The span names no allocation identity — a degenerate span, or a resource
+    /// with no complete transfer backing to key the resident on.
+    NoIdentity,
+    /// The engine declined to clear (or to hold) the resident.
+    Engine(crate::backend::vulkan::engine::ClearResidentDecline),
+    /// The engine failed while clearing it.
+    EngineError(crate::backend::vulkan::engine::DrawError),
+    /// The clear landed and the ledger would not record that the resident is
+    /// the target's only copy.
+    Unrecorded,
+}
+
+impl MultisampleClearDecline {
+    /// The reason this reaches the failure channel under.
+    pub(crate) fn slug(&self) -> &'static str {
+        match self {
+            Self::Unnamed => "clear_multisample_unnamed",
+            Self::FormatUntranslated => "clear_multisample_format_untranslated",
+            Self::NoIdentity => "clear_multisample_no_identity",
+            Self::Engine(_) => "clear_multisample_resident_declined",
+            Self::EngineError(_) => "clear_multisample_engine_error",
+            Self::Unrecorded => "clear_multisample_unrecorded",
+        }
+    }
+
+    /// What the engine said, for the line's detail.
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            Self::Engine(decline) => format!("via={}", decline.slug()),
+            Self::EngineError(error) => format!("err={error:?}"),
+            _ => String::new(),
+        }
+    }
+}
+
+/// A clear-only pass over a **multisample** GVA target, on the GPU.
+///
+/// The clear goes into the target's resident
+/// ([`crate::backend::vulkan::engine::clear_multisample_resident`]), which is
+/// created cleared when this is the first thing to touch the target, and the
+/// ledger records that the resident is the target's only copy
+/// ([`crate::runtime::writeback_debt::arm_gva`]). Nothing is published to guest
+/// pages, and that is the contract and not a shortfall: the guest strides those
+/// pages for its samples and never reads them, so a one-sample image written
+/// there would be the wrong content (the refusal this replaces said so), and a
+/// clear that reached only the pages was a clear the next pass's LOAD never saw.
+///
+/// Unlike [`lab_gpu_clear_gva`] this has no CPU fill behind it to decline to,
+/// so it does not depend on `REIMS_VGPU_LAB_GPU_CLEAR`: the switch narrows how a
+/// single-sample clear reaches guest pages, and this reaches none.
+pub(crate) fn clear_multisample_gva<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c0: &ColorRtRequest,
+    clear_color: [f64; 4],
+) -> Result<(), MultisampleClearDecline> {
+    use crate::backend::vulkan::translate::pixel;
+    let note = crate::runtime::drain::note_store_route;
+    if c0.texture_ref == 0 || c0.target_gva == 0 || !c0.stores_multisample_image() {
+        note("clear_multisample_unnamed");
+        return Err(MultisampleClearDecline::Unnamed);
+    }
+    let Ok((attachment, _)) = pixel::color_attachment(c0.format) else {
+        note("clear_multisample_format_untranslated");
+        return Err(MultisampleClearDecline::FormatUntranslated);
+    };
+    let span = GvaSpan {
+        texture_ref: c0.texture_ref,
+        gva: c0.target_gva,
+        row_stride: c0.row_stride,
+        width: c0.width,
+        height: c0.height,
+        format: c0.format,
+    };
+    let Some(identity) = gva_span_identity(state, host, task_id, span) else {
+        note("clear_multisample_no_identity");
+        return Err(MultisampleClearDecline::NoIdentity);
+    };
+    match crate::backend::vulkan::engine::clear_multisample_resident(
+        state,
+        &identity,
+        c0.sample_count,
+        attachment.vk,
+        attachment.clear_value(clear_color),
+    ) {
+        Ok(Ok(())) => {}
+        Ok(Err(decline)) => {
+            note(decline.slug());
+            return Err(MultisampleClearDecline::Engine(decline));
+        }
+        Err(error) => {
+            note("clear_multisample_engine_error");
+            return Err(MultisampleClearDecline::EngineError(error));
+        }
+    }
+    let recorded = crate::backend::vulkan::gva_window(&identity).is_some_and(|window| {
+        crate::runtime::writeback_debt::arm_gva(
+            crate::backend::vulkan::VulkanBackend,
+            state,
+            host,
+            task_id,
+            c0,
+            window,
+        )
+    });
+    if !recorded {
+        note("clear_multisample_unrecorded");
+        return Err(MultisampleClearDecline::Unrecorded);
+    }
+    note("clear_multisample_resident");
+    Ok(())
 }
 
 /// Name the engine resident a render Store into this GVA span would have

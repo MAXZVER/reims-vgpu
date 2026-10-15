@@ -336,6 +336,36 @@ pub enum LifecycleOp {
         backing: BackingId,
         extent: ByteRange,
     },
+    /// The guest re-pointed a reference that names no pages the model holds
+    /// content authority over, so there is nothing to move.
+    ///
+    /// # Why this is an operation and not a refusal
+    ///
+    /// The re-point's packet is a bare `{task, object}` and its new pages come
+    /// from the device, which can report none for a reference that owns no bytes
+    /// (a sampler, a function, a view), names a heap window (a placement has no
+    /// physical of its own, so the re-point is the heap's event), or sits in a
+    /// slot the guest's own list no longer holds. For each of those the guest's
+    /// announcement is true and the model has no authority over pages it could
+    /// be stale about, so the packet is ordinary guest work: it takes its
+    /// ordering position and publishes its completion word, and it changes
+    /// nothing. Refusing it instead wrote the completion word out of band and
+    /// dropped the ordering position of a command that was well formed.
+    ///
+    /// # What it deliberately does not carry
+    ///
+    /// No resource and no storage. The reference travels as the guest's own
+    /// number, as a delete's does, because the point of this variant is that the
+    /// model holds nothing keyed by it: [`Self::resources`] is empty and
+    /// [`Self::declared_access`] is `None`, so the transaction orders against
+    /// nothing but its own channel. A re-point whose storage the device simply
+    /// *could not describe* is the opposite case — real pages the model was not
+    /// told moved — and is not this operation; the caller refuses it.
+    ReplacePhysicalNoStorage {
+        task: TaskId,
+        /// The guest's own number.
+        object_ref: u32,
+    },
     Invalidate {
         task: TaskId,
         resources: Vec<ResourceId>,
@@ -438,7 +468,9 @@ impl LifecycleOp {
             Self::DeleteResource { .. } => LifecycleKind::DeleteResource,
             Self::MapMemory { .. } => LifecycleKind::MapMemory,
             Self::UnmapMemory { .. } => LifecycleKind::UnmapMemory,
-            Self::ReplacePhysical { .. } => LifecycleKind::ReplacePhysical,
+            Self::ReplacePhysical { .. } | Self::ReplacePhysicalNoStorage { .. } => {
+                LifecycleKind::ReplacePhysical
+            }
             Self::Invalidate { .. } => LifecycleKind::Invalidate,
             Self::Synchronize { .. } => LifecycleKind::Synchronize,
             Self::SynchronizeAndDiscard { .. } => LifecycleKind::SynchronizeAndDiscard,
@@ -478,13 +510,15 @@ impl LifecycleOp {
             }
             // A task's own lifetime, an address interval, a slot declaration
             // and a backing retirement each name something that is not a
-            // resource id.
+            // resource id, and a re-point with no storage names a reference
+            // the model holds nothing keyed by.
             Self::DefineTask { .. }
             | Self::DeleteTask { .. }
             | Self::BindObjectList { .. }
             | Self::CreateResource { .. }
             | Self::MapMemory { .. }
             | Self::UnmapMemory { .. }
+            | Self::ReplacePhysicalNoStorage { .. }
             | Self::DeleteBacking { .. } => &[],
         }
     }
@@ -557,6 +591,7 @@ impl LifecycleOp {
             | Self::CreateResource { .. }
             | Self::MapMemory { .. }
             | Self::UnmapMemory { .. }
+            | Self::ReplacePhysicalNoStorage { .. }
             | Self::DeleteBacking { .. } => None,
         }
     }
@@ -572,6 +607,7 @@ impl LifecycleOp {
             | Self::MapMemory { task, .. }
             | Self::UnmapMemory { task, .. }
             | Self::ReplacePhysical { task, .. }
+            | Self::ReplacePhysicalNoStorage { task, .. }
             | Self::Invalidate { task, .. }
             | Self::Synchronize { task, .. }
             | Self::SynchronizeAndDiscard { task, .. }
@@ -2174,6 +2210,10 @@ impl Lifecycle {
                 backing,
                 extent,
             } => self.replace_physical(*task, *resource, *backing, *extent),
+            // Nothing to move, so nothing for the model to change. Like the
+            // unnamed delete above, it does not look the task up: the guest's
+            // announcement is about pages this model holds no authority over.
+            LifecycleOp::ReplacePhysicalNoStorage { .. } => Ok(Effects::default()),
             LifecycleOp::Invalidate { task, resources } => self.invalidate(*task, resources),
             LifecycleOp::Synchronize { task, resources } => {
                 self.synchronize(*task, resources, false)
@@ -2954,6 +2994,55 @@ mod tests {
                 op.kind()
             );
         }
+    }
+
+    /// A re-point with no storage to move is a `ReplacePhysical` command that
+    /// the model orders against nothing and changes nothing for.
+    ///
+    /// It is not in [`one_of_every_kind`] because that sweep is one operation
+    /// per *kind* and this shares its kind with the re-point that does move
+    /// pages; the properties the sweep asserts are asserted here for it by name.
+    /// The apply is checked on a task that does not exist as well as on one that
+    /// does, because "the model holds nothing keyed by this reference" has to be
+    /// true of both, and an arm that looked the task up would turn a well-formed
+    /// guest announcement into a refusal.
+    #[test]
+    fn a_repoint_with_no_storage_orders_against_nothing_and_changes_nothing() {
+        use crate::resolve::{ResourceStorage as _, TaskNamespaces as _};
+
+        let op = LifecycleOp::ReplacePhysicalNoStorage {
+            task: TASK,
+            object_ref: 0,
+        };
+        assert_eq!(op.kind(), LifecycleKind::ReplacePhysical);
+        assert_eq!(op.task(), TASK);
+        assert!(
+            op.resources().is_empty(),
+            "the model holds nothing keyed by the reference, so there is no \
+             resource for the packet to be ordered against"
+        );
+        assert_eq!(
+            op.declared_access(),
+            None,
+            "a mode without a resource orders against memory the operation never named"
+        );
+
+        let (mut l, resident) = with_one_resource(0x100);
+        let storage_before = l.storage(TASK, resident);
+        assert_eq!(l.apply(&op), Ok(Effects::default()));
+        assert_eq!(
+            l.resource(TASK, resident.slot.0),
+            Some(resident),
+            "the name is the caller's to retire, not this operation's"
+        );
+        assert_eq!(l.storage(TASK, resident), storage_before);
+
+        assert_eq!(
+            Lifecycle::new().apply(&op),
+            Ok(Effects::default()),
+            "a task the model does not hold is not a reason to refuse an \
+             announcement about pages it holds no authority over"
+        );
     }
 
     /// No lifecycle command may declare a pure read of the resources it names.
@@ -6010,6 +6099,7 @@ mod tests {
             // operation that *did* move names and reached this arm silently
             // would make the shadow agree with the model by not looking.
             LifecycleOp::BindObjectList { .. }
+            | LifecycleOp::ReplacePhysicalNoStorage { .. }
             | LifecycleOp::MapMemory { .. }
             | LifecycleOp::UnmapMemory { .. }
             | LifecycleOp::Invalidate { .. }

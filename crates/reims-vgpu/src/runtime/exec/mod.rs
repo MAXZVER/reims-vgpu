@@ -7509,7 +7509,58 @@ fn apply_clear<M: HostMemory + HostOps>(
     // This narrows the clear rail; it does not close it. A resolve destination
     // is single-sample by construction and still publishes, through
     // `ClearPublish::Resolved` above.
+    //
+    // **Refusing the publication is not refusing the clear.** The guest never
+    // reads a multisample allocation, so its pages are not where the clear
+    // belongs; the target's resident is the only copy of the attachment there
+    // is, and a clear-only pass that stopped at the pages left the next pass's
+    // LOAD to load a resident that never held it. On a rail that keeps
+    // residents the clear lands there, and publishes nothing to guest pages. The
+    // refusal below stays for a target that has no such resident to hold the
+    // samples — a mapping-backed one, or a rail that keeps none — and for a
+    // clear the engine declined, which is named with the engine's own reason.
     if c0.sample_count > 1 {
+        #[cfg(feature = "backend-vulkan")]
+        if c0.target_gva != 0 && crate::backend::selected().rail() == crate::backend::Rail::Vulkan
+        {
+            return match crate::runtime::draw::vulkan::clear_multisample_gva(
+                state,
+                host,
+                task_id,
+                c0,
+                att.clear_color,
+            ) {
+                Ok(()) => {
+                    crate::runtime::surface_cache::forget_gva_copies(
+                        state,
+                        task_id,
+                        c0.target_gva,
+                        att.texture_ref,
+                    );
+                    true
+                }
+                Err(decline) => {
+                    note_clear_dropped(
+                        decline.slug(),
+                        att.texture_ref,
+                        &format!(
+                            "{} samples={} {}x{} bpr={} gva={:#x} mid={} store={} (the \
+                             clear-only pass could not reach the multisample target's \
+                             resident, which is the only copy of its attachment)",
+                            decline.detail(),
+                            c0.sample_count,
+                            c0.width,
+                            c0.height,
+                            c0.row_stride,
+                            c0.target_gva,
+                            c0.mapping_id,
+                            att.store_action
+                        ),
+                    );
+                    false
+                }
+            };
+        }
         note_clear_dropped(
             "clear_multisample_source_not_linear",
             att.texture_ref,

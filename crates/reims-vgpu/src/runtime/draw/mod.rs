@@ -555,6 +555,26 @@ pub struct ColorRtRequest {
     pub multisample_source_ref: u32,
 }
 
+impl ColorRtRequest {
+    /// Whether the image a Store into this target lands in holds more than one
+    /// sample.
+    ///
+    /// **Not `sample_count > 1`.** [`Self::sample_count`] is the count the pass
+    /// *rasterizes* at, and a resolve destination carries it too while being a
+    /// single-sample image by construction: its resident is created at one
+    /// sample and its guest pages are where the resolved frame goes. Reading
+    /// the bare count would send every resolved Store down the rail that
+    /// publishes nothing, and the guest would never see the frame it asked for.
+    /// A resolve is named by [`Self::multisample_source_ref`].
+    ///
+    /// The image of a `true` target is the only copy of its attachment there is:
+    /// the guest strides those pages for its samples and never reads them, and
+    /// no rail of this device writes them.
+    pub fn stores_multisample_image(&self) -> bool {
+        self.sample_count > 1 && self.multisample_source_ref == 0
+    }
+}
+
 /// One `setVisibilityResultMode:offset:`, as the encoder state it is.
 ///
 /// The offset travels with the mode rather than beside it because they are one
