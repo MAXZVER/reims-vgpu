@@ -20929,13 +20929,19 @@ pub(crate) fn lab_tile_draw(req: &DrawEncodeRequest) {
     }
     static SEEN: std::sync::LazyLock<std::sync::Mutex<(u32, std::collections::HashMap<u32, u32>)>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new((0, std::collections::HashMap::new())));
+    // `REIMS_VGPU_LAB_TILE_TRACE_MAX` / `_PER` widen the caps (6000 lines, 80 a mapping).
+    static CAPS: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    let (cap_all, cap_per) = *CAPS.get_or_init(|| {
+        let get = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        (get("REIMS_VGPU_LAB_TILE_TRACE_MAX", 6000), get("REIMS_VGPU_LAB_TILE_TRACE_PER", 80))
+    });
     {
         let mut g = SEEN.lock().unwrap_or_else(|p| p.into_inner());
-        if g.0 >= 6000 {
+        if g.0 >= cap_all {
             return;
         }
         let n = g.1.entry(c.mapping_id).or_insert(0);
-        if *n >= 80 {
+        if *n >= cap_per {
             return;
         }
         *n += 1;
