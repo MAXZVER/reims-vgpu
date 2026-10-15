@@ -358,6 +358,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         record_plane_draw(req);
         lab_tile_draw(req);
+        lab_resolve_memo_record(req);
         lab_draw_sig(req);
         req.chain_resident_established = false;
         let engine = try_metal2vulkan_draw(state, host, req, writeback_guest);
@@ -2745,6 +2746,12 @@ pub(crate) fn lab_encoder_begin() {
             m.clear();
         }
     }
+    {
+        let mut w = STREAM_WRITTEN.write();
+        if !w.is_empty() {
+            w.clear();
+        }
+    }
 }
 
 /// (task, texture ref, retained resource address, may bind resident).
@@ -2768,6 +2775,14 @@ static RESOLVE_MEMO: std::sync::LazyLock<
     parking_lot::RwLock<reims_vgpu_core::fasthash::FxHashMap<ResolveMemoKey, MemoSlot>>,
 > = std::sync::LazyLock::new(|| {
     parking_lot::RwLock::new(reims_vgpu_core::fasthash::FxHashMap::with_hasher(Default::default()))
+});
+
+/// Textures this stream writes, by (task, ref): never memoized in it (see
+/// [`lab_resolve_memo_written`]). Cleared with the memo.
+static STREAM_WRITTEN: std::sync::LazyLock<
+    parking_lot::RwLock<reims_vgpu_core::fasthash::FxHashSet<(u32, u32)>>,
+> = std::sync::LazyLock::new(|| {
+    parking_lot::RwLock::new(reims_vgpu_core::fasthash::FxHashSet::with_hasher(Default::default()))
 });
 
 /// TEMP (lab, DRAW_PAR): the memo's entry. (A claim-and-wait slot was tried in
@@ -2875,6 +2890,11 @@ fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledS
     if crate::runtime::par::ahead::logging() {
         return None;
     }
+    // A pool job prepares a record ahead of the drain, possibly of a later pass
+    // than the entries were taken in; the memo is one pass's.
+    if crate::runtime::par::planning() || STREAM_WRITTEN.read().contains(&(key.0, key.1)) {
+        return None;
+    }
     let m = RESOLVE_MEMO.read();
     m.get(key).and_then(|MemoSlot::Ready(entry)| {
         let (w, h, mid, src) = &entry.0;
@@ -2903,11 +2923,23 @@ pub(super) fn lab_resolve_memo_prime<M: HostMemory + HostOps>(
     }
     let mut seen: Vec<ResolveMemoKey> = Vec::new();
     let mut resolved = 0u32;
+    // Textures any record of these writes are not memoized in this stream: a
+    // bind of one may run after that write (see `lab_resolve_memo_written`).
     for (req, _) in reqs {
+        lab_resolve_memo_written(req);
+    }
+    // The first pass's records only: the memo ends where the next pass opens.
+    for (i, (req, _)) in reqs.iter().enumerate() {
+        if i > 0 && !req.continues_render_pass {
+            break;
+        }
         let attachments: Vec<u32> = req.colors.iter().map(|c| c.texture_ref).collect();
         for (frag_stage, binds) in [(false, &req.vertex_textures), (true, &req.fragment_textures)] {
             for bind in binds.iter() {
-                if bind.texture_ref == 0 || (frag_stage && attachments.contains(&bind.texture_ref)) {
+                if bind.texture_ref == 0
+                    || (frag_stage && attachments.contains(&bind.texture_ref))
+                    || STREAM_WRITTEN.read().contains(&(req.task_id, bind.texture_ref))
+                {
                     continue;
                 }
                 let resource = bind.resource.clone().or_else(|| {
@@ -2946,6 +2978,67 @@ pub(super) fn lab_resolve_memo_prime<M: HostMemory + HostOps>(
     resolved
 }
 
+/// Every texture a draw's pass writes: its colour attachments (and the
+/// multisample sources they resolve from), depth and stencil, and their resolve
+/// targets.
+fn pass_written_refs(req: &DrawEncodeRequest) -> impl Iterator<Item = u32> + '_ {
+    req.colors
+        .iter()
+        .flat_map(|c| [c.texture_ref, c.multisample_source_ref])
+        .chain(
+            req.depth_attach
+                .iter()
+                .flat_map(|d| [d.texture_ref, d.resolve_texture_ref]),
+        )
+        .chain(
+            req.stencil_attach
+                .iter()
+                .flat_map(|s| [s.texture_ref, s.resolve_texture_ref]),
+        )
+        .filter(|&r| r != 0)
+}
+
+/// A memoized resolution holds until its texture is written. The memo's
+/// premise is the encoder's - a guest cannot legally write what it has encoded
+/// a read of - but it is kept for a whole stream, and a stream is many passes:
+/// Chromium's tiles render through one 4x MSAA scratch target per raster, each
+/// pass first loading a tile into it and then drawing it back. A resolution
+/// taken before a later pass wrote the scratch (or the tile) named content
+/// that pass replaced, so tiles came back holding another tile's or an older
+/// frame's pixels - permanently, since nothing redraws them (b505-b516).
+/// Called when a pass writes `req`'s attachments, before any later record
+/// samples them.
+/// A record that opens a render pass ends the previous pass's memo: whatever
+/// ran between the two (the pass itself, a blit, a compute dispatch, a clear)
+/// may have written what the memo resolved. The memo's premise holds within one
+/// encoder only.
+pub(crate) fn lab_resolve_memo_record(req: &DrawEncodeRequest) {
+    if !req.continues_render_pass {
+        let mut m = RESOLVE_MEMO.write();
+        if !m.is_empty() {
+            m.clear();
+        }
+    }
+    lab_resolve_memo_written(req);
+}
+
+pub(crate) fn lab_resolve_memo_written(req: &DrawEncodeRequest) {
+    let written: Vec<u32> = pass_written_refs(req).collect();
+    if written.is_empty() {
+        return;
+    }
+    {
+        let mut w = STREAM_WRITTEN.write();
+        for &r in &written {
+            w.insert((req.task_id, r));
+        }
+    }
+    let mut m = RESOLVE_MEMO.write();
+    if !m.is_empty() {
+        m.retain(|key, _| key.0 != req.task_id || !written.contains(&key.1));
+    }
+}
+
 fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSourceRequest)) {
     if crate::runtime::par::ahead::logging() {
         return;
@@ -2958,6 +3051,9 @@ fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSou
             SampledSourceRequest::GuestRuns(..) | SampledSourceRequest::Staged(..)
         )
     {
+        return;
+    }
+    if STREAM_WRITTEN.read().contains(&(key.0, key.1)) {
         return;
     }
     match memo_copy(&loaded.3, lab_resolve_memo_all(), false) {
