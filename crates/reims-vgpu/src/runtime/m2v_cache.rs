@@ -1841,7 +1841,7 @@ pub fn translate_cached_reflected(
         let hits = c.hits;
         let misses = c.misses;
         drop(c);
-        crate::observe::fail(format!(
+        crate::observe::off(format!(
             "linux_m2v_translate ok pipe={pipeline_ref} stage={stage:?} v_spv_or_f={} hits={hits} misses={misses}",
             shader.spirv.len()
         ));
@@ -1902,7 +1902,7 @@ pub fn translate_cached_kernel_reflected(
         let hits = c.hits;
         let misses = c.misses;
         drop(c);
-        crate::observe::fail(format!(
+        crate::observe::off(format!(
             "linux_m2v_translate ok pipe={pipeline_ref} stage=Kernel tg=[{},{},{}] spv={} hits={hits} misses={misses}",
             local_size[0], local_size[1], local_size[2], shader.spirv.len()
         ));

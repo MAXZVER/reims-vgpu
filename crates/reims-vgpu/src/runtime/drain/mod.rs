@@ -3625,7 +3625,7 @@ fn lab_note_pipeline_claim(lease: reims_vgpu_core::identity::ResourceId, task: O
         "lab_pipeline_id_shared",
         (u64::from(task) << 40) | (u64::from(first) << 32) | u64::from(lease.slot.0),
     ) {
-        crate::observe::fail(format!(
+        crate::observe::off(format!(
             "lab_pipeline_id_shared slot={} gen={} first_task={first} this_task={task}              (one pipeline-table entry for two tasks' pipelines)",
             lease.slot.0, lease.generation.0
         ));

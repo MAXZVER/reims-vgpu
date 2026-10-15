@@ -765,7 +765,7 @@ fn lab_probe_small_frame<M: HostMemory + HostOps>(
     }
     let key = (u64::from(mapping_id) << 1) | u64::from(nonzero > 0);
     if crate::observe::first_sight("lab_small_frame", key) {
-        crate::observe::fail(format!(
+        crate::observe::off(format!(
             "lab_small_frame mid={mapping_id} {width}x{height} fmt={:#x} pages={} unreadable={unreadable} nonzero_bytes={nonzero}/{total} nonempty_texels={alpha_hi}",
             m.format,
             m.page_entries.len()

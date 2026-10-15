@@ -3889,7 +3889,7 @@ fn handle_render_binds<M: HostMemory + HostOps, S: WalkState>(
                     ^ ((refs.len() as u64) << 32)
                     ^ mask;
                 if crate::observe::first_sight("lab_frag_tex_bind", key) {
-                    crate::observe::fail(format!(
+                    crate::observe::off(format!(
                         "lab_frag_tex_bind task={task_id} first={} count={} nonzero_mask={mask:#x} refs={refs:?}",
                         r.first,
                         refs.len()

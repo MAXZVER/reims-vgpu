@@ -2256,7 +2256,7 @@ fn note_extent_against_allocation(
         "declared_extent_is_a_sub_window",
         (u64::from(task_id) << 32) | u64::from(obj_ref),
     ) {
-        crate::observe::fail(format!(
+        crate::observe::off(format!(
             "declared_extent_is_a_sub_window task={task_id} ref={obj_ref} \
              object_type={} extent_offset={offset} extent_length={length} \
              allocation={allocation} (the model will check every record's window against \
@@ -3248,7 +3248,7 @@ pub fn resolve_resource<M: HostMemory>(
                     "lab_named_nobytes_constructed_dedicated",
                     (u64::from(task_id) << 32) | u64::from(obj_ref),
                 ) {
-                    crate::observe::fail(format!(
+                    crate::observe::off(format!(
                         "lab_named_nobytes_constructed_dedicated task={task_id} ref={obj_ref}                          type={} gen={} (the model holds this name with no bytes; the slot's                          object owns storage)",
                         entry.object_type, existing.generation.0
                     ));
@@ -3539,7 +3539,7 @@ fn lab_note_named_without_bytes(
         "lab_named_without_bytes",
         (u64::from(task_id) << 32) | u64::from(obj_ref),
     ) {
-        crate::observe::fail(format!(
+        crate::observe::off(format!(
             "lab_named_without_bytes task={task_id} ref={obj_ref} type={} desc_len={} storage_answer={}",
             entry.object_type,
             entry.descriptor_length,
@@ -3922,7 +3922,7 @@ fn note_memo_wrong_type<M: HostMemory>(
         "memo_wrong_type",
         (u64::from(task_id) << 32) | u64::from(obj_ref),
     ) {
-        crate::observe::fail(format!(
+        crate::observe::off(format!(
             "memo_wrong_type task={task_id} ref={obj_ref} want={want:?} memo_ot={} \
              live_ot={:?} memo_desc_gva={:#x} live_desc_gva={:?} (a retained resolution \
              refused a caller's type without re-reading the guest's list; live_ot is what \

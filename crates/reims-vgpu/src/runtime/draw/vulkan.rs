@@ -12689,7 +12689,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 "lab_unbound_tex_draw",
                 (u64::from(req.task_id) << 32) | u64::from(req.pipeline_ref),
             ) {
-                crate::observe::fail(format!(
+                crate::observe::off(format!(
                     "lab_unbound_tex_draw task={} pipe={} idx={index} entry={} provided={:?}",
                     req.task_id,
                     req.pipeline_ref,
