@@ -2186,8 +2186,11 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
     assert!(fragment_attachment_alias_sample(&req, texture_ref + 1, None).is_none());
 
     req.colors[0].mapping_id = 9;
-    assert!(fragment_attachment_alias_sample(&req, texture_ref, None).is_none());
+    assert!(fragment_attachment_alias_sample(&req, texture_ref, None).is_some());
     req.colors[0].mapping_id = 0;
+    req.colors[0].target_gva = 0;
+    assert!(fragment_attachment_alias_sample(&req, texture_ref, None).is_none());
+    req.colors[0].target_gva = target_gva;
     req.colors[0].load_action = MTL_LOAD_ACTION_DONT_CARE;
     assert!(fragment_attachment_alias_sample(&req, texture_ref, None).is_none());
     req.colors[0].load_action = MTL_LOAD_ACTION_CLEAR;

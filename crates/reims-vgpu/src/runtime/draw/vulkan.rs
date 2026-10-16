@@ -3448,15 +3448,17 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
     sampled_base_gva: Option<u64>,
 ) -> Option<(u32, u32, AttachmentAliasSample<'a>)> {
     let color = req.colors.iter().find(|color| {
-        color.texture_ref == texture_ref && color.mapping_id == 0 && color.target_gva != 0
+        color.texture_ref == texture_ref && (color.target_gva != 0 || color.mapping_id != 0)
     })?;
-    if sampled_base_gva.is_some_and(|base| base != color.target_gva) {
+    if color.target_gva != 0 && sampled_base_gva.is_some_and(|base| base != color.target_gva) {
         crate::runtime::drain::note_store_route("attachment_alias_other_level");
         return None;
     }
+    let bpp = pixel_format::store_texel_order(color.format)
+        .map_or(RGBA8_BPP, |layout| layout.bytes_per_texel());
     let need = (color.width as usize)
         .checked_mul(color.height as usize)?
-        .checked_mul(RGBA8_BPP as usize)?;
+        .checked_mul(bpp as usize)?;
     match color.load_action {
         MTL_LOAD_ACTION_CLEAR => Some((
             color.width,
@@ -3478,7 +3480,7 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
             // A secondary has no CPU seed and no chain flag of its own: its Load
             // is always the registry resident (`build_secondary_targets`), so
             // that resident is what the pass's earlier draws left there.
-            if req.chain_from_resident || color.slot != 0 {
+            if req.chain_from_resident || req.gva_load_from_resident || color.slot != 0 {
                 return Some((
                     color.width,
                     color.height,
@@ -9678,7 +9680,7 @@ fn native_scratch_to_upload(
 /// arm is lossy, which is exactly the set the half-float flag can change the
 /// answer for — so keying on it is the same rule stated once, not a fast path
 /// that could disagree with the slow one.
-fn native_uploads_for(sample_format: u16) -> NativeUploads {
+pub(super) fn native_uploads_for(sample_format: u16) -> NativeUploads {
     // One question, derived from the loader itself rather than approximated by
     // a second list. `native_bind_is_host_gated` compares the loader's answer
     // with every gate shut against its answer with every gate open, so the set
@@ -12775,7 +12777,11 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                                 SampledSourceRequest::Bytes(
                                     std::sync::Arc::new(seed.to_vec()),
                                     None,
-                                    SampledByteFormat::from_source(TexelLayout::Rgba8, stored),
+                                    SampledByteFormat::from_source(
+                                        pixel_format::store_texel_order(stored)
+                                            .unwrap_or(TexelLayout::Rgba8),
+                                        stored,
+                                    ),
                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
                                 ),
                             ),
