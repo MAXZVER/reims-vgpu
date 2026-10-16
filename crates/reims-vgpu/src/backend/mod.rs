@@ -405,6 +405,13 @@ pub(crate) trait Backend: Copy {
     /// that executes its work as it is recorded has nothing to wait for.
     fn wait_recorded_gpu_work(&self) {}
 
+    /// `(submission that will hold everything recorded so far, recorder jobs
+    /// posted so far)` for `crate::runtime::inflight_reads`, after retiring
+    /// completed work; `None` keeps a writer's wait.
+    fn recorded_read_horizon(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Whether anything outstanding lands in `pages`.
     ///
     /// A rail with no outstanding writes cannot reach anything, so the default
@@ -1590,6 +1597,15 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.wait_recorded_gpu_work(),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.wait_recorded_gpu_work(),
+        }
+    }
+
+    fn recorded_read_horizon(&self) -> Option<(u64, u64)> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.recorded_read_horizon(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.recorded_read_horizon(),
         }
     }
 

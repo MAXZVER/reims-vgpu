@@ -4235,7 +4235,9 @@ pub fn execute_blit<M: HostMemory + HostOps>(
     // writes guest RAM now. A draw recorded earlier that reads the destination
     // at execute time must run first - see `crate::runtime::inflight_reads`.
     if let (_, Some(dest)) = record.refs() {
-        if crate::runtime::inflight_reads::take_if_pending(task_id, dest) {
+        if crate::runtime::inflight_reads::take_if_pending(task_id, dest, || {
+            crate::backend::selected().recorded_read_horizon()
+        }) {
             crate::runtime::drain::note_store_route("blit_read_order_wait");
             crate::backend::selected().wait_recorded_gpu_work();
         }

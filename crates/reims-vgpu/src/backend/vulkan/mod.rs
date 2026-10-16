@@ -355,6 +355,10 @@ impl Backend for VulkanBackend {
         engine::wait_recorded_gpu_work();
     }
 
+    fn recorded_read_horizon(&self) -> Option<(u64, u64)> {
+        engine::recorded_read_horizon()
+    }
+
     fn guest_writes_reaching(&self, pages: &[u64]) -> GuestWriteReach {
         engine::guest_writes_reaching(pages)
     }

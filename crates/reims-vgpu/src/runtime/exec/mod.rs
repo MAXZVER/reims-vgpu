@@ -3215,7 +3215,9 @@ fn handle_blit_transfer_record<M: HostMemory + HostOps>(
     if let BlitRecord::GenerateMipmaps(m) = record {
         // The same order `execute_blit` keeps: the chain writes the texture's
         // lower levels on the CPU, after any draw recorded before it reads them.
-        if crate::runtime::inflight_reads::take_if_pending(task_id, m.texture_ref) {
+        if crate::runtime::inflight_reads::take_if_pending(task_id, m.texture_ref, || {
+            crate::backend::selected().recorded_read_horizon()
+        }) {
             crate::runtime::drain::note_store_route("blit_read_order_wait");
             crate::backend::selected().wait_recorded_gpu_work();
         }

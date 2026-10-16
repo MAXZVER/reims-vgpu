@@ -1513,6 +1513,10 @@ pub(crate) struct PendingGpuCleanup {
     staged: Vec<StagedRead>,
     /// TEMP (lab, T2T_PARK): readback leases this submission copies out of.
     keep: Vec<std::sync::Arc<crate::backend::vulkan::engine::LeaseHold>>,
+    /// This submission's number and the recorder jobs finished at its seal,
+    /// published when it retires (`crate::runtime::inflight_reads`).
+    read_seal: u64,
+    read_jobs: u64,
 }
 
 /// TEMP (lab, PASS_STAGE): one worker-arena window a sealed submission reads.

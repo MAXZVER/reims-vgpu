@@ -8993,6 +8993,44 @@ pub fn wait_recorded_gpu_work() {
     }
 }
 
+/// For `crate::runtime::inflight_reads`, on the drain: `(submission that will
+/// hold everything recorded so far, recorder jobs posted so far)`, after
+/// retiring the submissions that have completed. `None` when the engine cannot
+/// say (no device, or the poll failed).
+pub fn recorded_read_horizon() -> Option<(u64, u64)> {
+    // Only the drain posts, so this is every job prepared before the question.
+    let posted = recorder::DRAW.posted_seq();
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let Ok(ctx) = owner.ensure(counters) else {
+        return None;
+    };
+    // SAFETY: the context owns every slot the pool polls.
+    let open = unsafe {
+        pools
+            .ensure_init(ctx, counters)
+            .and_then(|()| pools.retire_for_read_horizon(ctx, counters))
+    };
+    match open {
+        Ok(open) => Some((
+            crate::runtime::inflight_reads::seals() + u64::from(open),
+            posted,
+        )),
+        Err(e) => {
+            if matches!(e, DrawError::DeviceLost(_)) {
+                device_lost::note_device_lost_seen();
+            }
+            crate::observe::Emit::decline("vk_recorded_read_horizon", &e).fail_once(0);
+            None
+        }
+    }
+}
+
 /// TEMP (lab, `REIMS_VGPU_LAB_DRAW_WAIT`): settle any deferred draw, submit the
 /// open batch and wait for the device to go idle - the synchronisation a target
 /// readback implies, without the readback.

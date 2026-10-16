@@ -610,6 +610,19 @@ impl ResourcePools {
     /// parked. This periodic edge is required even after guest work stops: a
     /// signalled fence is only a host-visible fact until slot retirement clears
     /// that slot from the graveyard masks.
+    /// For `crate::runtime::inflight_reads`: retire every completed slot without
+    /// waiting, and say whether a batch is open (its draws seal next).
+    pub(crate) unsafe fn retire_for_read_horizon(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+    ) -> Result<bool, DrawError> {
+        unsafe {
+            self.retire_signaled_slots(ctx, counters, DeviceLostOp::PoolsFenceStatusMaintenance)?
+        };
+        Ok(self.open_batch.is_some())
+    }
+
     pub(crate) unsafe fn advance_graveyard_maintenance(
         &mut self,
         ctx: &DeviceContext,
@@ -1512,6 +1525,8 @@ impl ResourcePools {
         // queries are readable exactly now and never before.
         unsafe { self.readback_span_read(ctx, index) };
         let pending = self.slots[index].pending.take().expect("checked above");
+        // Its fence covers every submission before it on the queue.
+        crate::runtime::inflight_reads::note_retired(pending.read_seal, pending.read_jobs);
         self.in_flight = self.in_flight.saturating_sub(1);
         // Its fence has signalled, so this submission is no longer a candidate
         // for a wedge. Paired with the `note_submit` in `finish_entry_async`.
@@ -1716,6 +1731,8 @@ impl ResourcePools {
                 unpin_compute_residents: std::mem::take(&mut self.entry.compute_write_pins_live),
                 staged: std::mem::take(&mut self.entry.staged_reads),
                 keep: std::mem::take(&mut self.entry.keep),
+                read_seal: 0,
+                read_jobs: 0,
             },
             admissions,
         }
@@ -1777,13 +1794,23 @@ impl ResourcePools {
     /// `device` must be the device every parked handle belongs to.
     pub(crate) unsafe fn finish_entry_async(&mut self, device: &ash::Device, sealed: SealedEntry) {
         let SealedEntry {
-            cleanup,
+            mut cleanup,
             admissions,
         } = sealed;
         debug_assert!(
             self.slots[self.cur].pending.is_none(),
             "current slot already owes cleanup"
         );
+        // Every recorder job finished by now recorded into this submission or
+        // an earlier one: no other entry is open while a batch is (`begin_entry`
+        // flushes it first), and the engine is held. More than one replay lane
+        // may still be filling another slot, so it vouches for no jobs then.
+        cleanup.read_seal = crate::runtime::inflight_reads::note_sealed();
+        cleanup.read_jobs = if super::super::cmd_sink::lane_count() == 1 {
+            super::super::recorder_finished_seq()
+        } else {
+            0
+        };
         self.slots[self.cur].pending = Some(cleanup);
         self.slots[self.cur].serial = self.slots[self.cur].serial.wrapping_add(1);
         self.in_flight += 1;
@@ -6503,6 +6530,8 @@ mod recycle_tests {
                 staging: Vec::new(),
                 staged: Vec::new(),
                 keep: Vec::new(),
+                read_seal: 0,
+                read_jobs: 0,
                 gather: Vec::new(),
                 readback: Vec::new(),
                 sampled: Vec::new(),
