@@ -71,7 +71,6 @@
 use crate::access::BackingId;
 use crate::identity::{ObjectListRef, ResourceId, SlotGeneration};
 use crate::fasthash::FxHashMap;
-use std::collections::HashMap;
 
 /// Why a namespace operation did not happen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

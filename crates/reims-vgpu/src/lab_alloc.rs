@@ -38,6 +38,8 @@
 //! `readback_split` during full-screen transitions). `REIMS_VGPU_LAB_LCACHE=off`
 //! sends them to the system heap again.
 
+#![allow(dead_code, unused_variables, unused_imports)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
