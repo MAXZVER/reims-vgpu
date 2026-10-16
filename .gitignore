@@ -13,6 +13,7 @@ dist/
 .idea/
 # (Negations must re-include the parent dir before re-including files within it.)
 *.o
+*.bak
 OVMF_VARS*.fd
 *.part
 *.png

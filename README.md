@@ -19,6 +19,22 @@ Nearly everything here is also offered upstream as pull requests; the fork-only 
 listed under [What changed](#what-changed). This fork is not a replacement for upstream: it is a
 place to try all of the pending Windows-host work in one build while those PRs are reviewed.
 
+Detailed architecture and root-cause analysis for hypervisor performance and stability fixes is documented in [docs/whpx-fixes.md](docs/whpx-fixes.md).
+
+---
+
+## WHPX Performance & Stability Architecture (Refs Issues #3, #4, #5, #6)
+
+Comprehensive documentation for Windows 11 + WHPX performance, lifecycle, and presentation fixes is available in **[docs/whpx-fixes.md](docs/whpx-fixes.md)**:
+
+- **[Issue #3](https://github.com/MAXZVER/reims-vgpu/issues/3)**: Cursor doorbell `0x1220` epoch bump bypass in QEMU and lock-free atomic `CursorMirror` in Rust, eliminating mouse-drag stutter (1–3 Hz → 50–60 Hz).
+- **[Issue #4](https://github.com/MAXZVER/reims-vgpu/issues/4)**: WHPX dirty query range caching and buffer pooling, reducing hypercalls from 65,000/s down to batch epochs.
+- **[Issue #5](https://github.com/MAXZVER/reims-vgpu/issues/5)**: Memory lifecycle writeback settling at unmap/backing release, resolving `released_write_after_release` display freezes and panics.
+- **[Issue #6](https://github.com/MAXZVER/reims-vgpu/issues/6)**: Refresh rate analysis, host window `stale_hold` protection, and presentation cadence throttling.
+- **Steps A/B/C**: Target residency promotion to `DEVICE_LOCAL`, ordered scanout handoff, and topology parity fixes.
+- **v8–v14**: Pipeline cache persistence, drain stall watchdog, incarnation guarding, MSAA load cache, sRGB resolve pair, and unbound buffer zero-page safety.
+- **v15–v16**: Wallpaper repair (synthesized null texture/sampler) and pipeline raster sample count specialization.
+
 ---
 
 ## Latest Results: macOS 26 Tahoe on Windows 11 + WHPX (2026-10-14)
