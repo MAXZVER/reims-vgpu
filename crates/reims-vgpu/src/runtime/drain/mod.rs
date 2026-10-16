@@ -1505,6 +1505,13 @@ pub struct Packet {
     pub completion_stamp: u32,
     pub payload: Vec<u8>,
     pub next_head: u32,
+    /// TEMP (lab, IRQ_URGENT): nothing was published behind this packet when
+    /// the ring was read - it arrived alone. A flush command buffer is the
+    /// shape this names: the guest closed its doorbell group and a guest
+    /// thread blocks on this one word (n350: 935 waits of ~512 us per 6 s on
+    /// the canvas, the word's pulse sitting in the IRQ batch). Marked in
+    /// [`arrival`]; read by [`lab_irq_urgent`].
+    pub lone: bool,
 }
 
 impl Packet {
@@ -2013,6 +2020,7 @@ fn decode_packet_inner(
         completion_stamp,
         payload,
         next_head: head.wrapping_add(total_size),
+        lone: false,
     })
 }
 
@@ -4423,6 +4431,9 @@ fn run_parked_packet_g<H: HostMemory + HostOps>(
             // The fast answer is only for this packet's own word: a release that
             // also carries an older position of the channel keeps the queue.
             let ctrl = lab_ctrl_stamp::classify(u16::from(work.packet().opcode), released.len());
+            // TEMP (lab, IRQ_URGENT): a lone EXEC's own completion word wants
+            // its pulse now, not at the batch hold; see `lab_irq_urgent`.
+            let urgent = lab_irq_urgent::classify(work.packet(), released.len());
             for release in released {
                 // **Counted here because the model cannot count it, and a
                 // publisher nobody counts reads exactly like one that never
@@ -4444,6 +4455,7 @@ fn run_parked_packet_g<H: HostMemory + HostOps>(
                     Some(stamp) => {
                         note_store_route("stamp_published_by_channel");
                         let _ctrl = lab_ctrl_stamp::scope(ctrl);
+                        let _urgent = lab_irq_urgent::scope(urgent);
                         publish_word(g.sh(), host, domain, stamp.slot.0, stamp.value.0);
                     }
                     // A position whose channel released it owing no word. It is
@@ -4717,7 +4729,14 @@ pub fn arrival<M: HostMemory>(ring: &Ring<'_>, mem: &M, head: u32, tail: u32) ->
         return Arrival::Fault(snap_fault);
     };
     match decode_packet(&snap, head, available, capacity) {
-        Ok(packet) => Arrival::Packet(packet),
+        Ok(mut packet) => {
+            // TEMP (lab, IRQ_URGENT): this read saw nothing behind the packet
+            // it took, which is exactly what `Packet::lone` names. The knob
+            // itself is read at the word's publication (`lab_irq_urgent`), so
+            // the fact stays free here.
+            packet.lone = packet.next_head == tail;
+            Arrival::Packet(packet)
+        }
         Err(err) => err.fault().map_or(Arrival::Nothing, Arrival::Fault),
     }
 }
@@ -5248,6 +5267,115 @@ pub(crate) mod lab_ctrl_stamp {
         fn drop(&mut self) {
             KIND.with(|k| k.set(self.0));
         }
+    }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_IRQ_URGENT=1`, off by default): adaptive urgent
+/// pulse - lever 1 of the 2026-10-16 board. A completion word whose EXEC
+/// arrived alone in its ring ([`Packet::lone`]; the flush-command-buffer
+/// shape: doorbell group closed, nothing queued behind) is the one word a
+/// guest thread is blocked on, so its gfx pulse is raised the moment the word
+/// lands instead of sitting in the `REIMS_VGPU_LAB_IRQ_BATCH` hold until the
+/// tranche ends or the 500 us budget runs (n350: 935 waits of ~512 us per 6 s
+/// on the canvas = ~1.1 ms a frame). The bulk keeps folding exactly as before
+/// - only the drained ring's own word is urgent, the same trade
+/// `lab_ctrl_stamp` makes for control words, on the same enqueue arm.
+pub(crate) mod lab_irq_urgent {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The pure half of the decision, so a test needs no environment: a lone
+    /// EXEC whose completion released only its own word. A release that also
+    /// carries an older position's word keeps the batch (that word had its
+    /// chance to fold, and a burst is not the wait this lever is about).
+    pub(crate) fn qualifies(packet: &super::Packet, released: usize) -> bool {
+        packet.lone && packet.opcode == super::CHILD_OP_EXEC_INDIRECT2 && released == 1
+    }
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var("REIMS_VGPU_LAB_IRQ_URGENT")
+                .is_ok_and(|v| v == "1" || v == "on");
+            crate::observe::off(format!("lab_irq_urgent on={on}"));
+            on
+        })
+    }
+
+    /// Whether the packet being completed wants its word's pulse raised at
+    /// once. The knob is latched once; the per-word answer is a flag test.
+    pub(crate) fn classify(packet: &super::Packet, released: usize) -> bool {
+        let hit = on() && qualifies(packet, released);
+        if hit {
+            super::note_store_route("lab_irq_urgent_word");
+        }
+        hit
+    }
+
+    thread_local! {
+        static URGENT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether the word being published on this thread wants its interrupt
+    /// raised at once; the enqueue hold consults this.
+    pub(crate) fn urgent() -> bool {
+        URGENT.with(|u| u.get())
+    }
+
+    pub(crate) struct Scope(bool);
+
+    /// Mark the words published until the guard drops.
+    pub(crate) fn scope(on: bool) -> Scope {
+        Scope(URGENT.with(|u| u.replace(on)))
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            URGENT.with(|u| u.set(self.0));
+        }
+    }
+
+    /// Pulses the urgent arm raised, for the `lab_stamp_lat` census line.
+    static PULSES: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn note_pulse() {
+        PULSES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn take_pulses() -> u64 {
+        PULSES.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// TEMP (lab, IRQ_URGENT): the knob's decision half - no environment, no
+/// backend selected.
+#[cfg(test)]
+mod lab_irq_urgent_tests {
+    use super::*;
+
+    fn exec(lone: bool) -> Packet {
+        Packet {
+            opcode: CHILD_OP_EXEC_INDIRECT2,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN,
+            completion_stamp: 1,
+            payload: Vec::new(),
+            next_head: 0,
+            lone,
+        }
+    }
+
+    /// A lone EXEC releasing only its own word is the flush-callback shape
+    /// the knob exists for. Anything published behind it, any other opcode,
+    /// and a release carrying an older position's word all keep the hold.
+    #[test]
+    fn only_a_lone_execs_own_word_is_urgent() {
+        assert!(lab_irq_urgent::qualifies(&exec(true), 1));
+        assert!(!lab_irq_urgent::qualifies(&exec(false), 1));
+        assert!(!lab_irq_urgent::qualifies(&exec(true), 2));
+        let mut control = exec(true);
+        control.opcode = CHILD_OP_DELETE_RESOURCE;
+        assert!(!lab_irq_urgent::qualifies(&control, 1));
     }
 }
 
@@ -12299,6 +12427,13 @@ mod lab_chan {
             if d + p > 0 {
                 line.push_str(&format!("ch{i}:{d}/{p},"));
             }
+        }
+        // TEMP (lab, IRQ_URGENT): pulses the urgent arm raised this second.
+        // Absent when the knob is off, so the N arm of the A/B reads exactly
+        // like today's line.
+        let urgent = super::lab_irq_urgent::take_pulses();
+        if urgent > 0 {
+            line.push_str(&format!(" irq_urgent={urgent}"));
         }
         for ((slot, task), a) in std::mem::take(agg) {
             let n = a.n.max(1);

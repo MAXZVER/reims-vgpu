@@ -733,10 +733,23 @@ impl HostOps for QemuHost<'_> {
         let prompt = self.prompt;
         match action.kind {
             // TEMP (lab): a control word a guest thread is blocked on skips the
-            // hold (`lab_ctrl_stamp`); the pulse below also carries any held one.
-            HostActionKind::IrqGfxPulse if crate::runtime::drain::lab_ctrl_stamp::urgent() => {
+            // hold (`lab_ctrl_stamp`), and so does the completion word of a lone
+            // EXEC (`lab_irq_urgent` - the flush-command-buffer shape, lever 1
+            // of the 2026-10-16 board); the pulse below also carries any held one.
+            HostActionKind::IrqGfxPulse
+                if crate::runtime::drain::lab_ctrl_stamp::urgent()
+                    || crate::runtime::drain::lab_irq_urgent::urgent() =>
+            {
+                let urgent = crate::runtime::drain::lab_irq_urgent::urgent();
+                if urgent {
+                    crate::runtime::drain::lab_irq_urgent::note_pulse();
+                }
+                crate::runtime::drain::note_store_route(if urgent {
+                    "lab_irq_urgent_irq_now"
+                } else {
+                    "lab_ctrl_stamp_irq_now"
+                });
                 self.deferred_gfx = None;
-                crate::runtime::drain::note_store_route("lab_ctrl_stamp_irq_now");
                 self.raise_pulse(action);
                 return;
             }
