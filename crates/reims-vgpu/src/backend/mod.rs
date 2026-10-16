@@ -398,6 +398,13 @@ pub(crate) trait Backend: Copy {
     /// Block until they have.
     fn quiesce_guest_writes(&self) {}
 
+    /// Block until every piece of GPU work recorded so far has executed.
+    ///
+    /// For a host-side writer about to change guest bytes that recorded work
+    /// still reads at execute time (`crate::runtime::inflight_reads`). A rail
+    /// that executes its work as it is recorded has nothing to wait for.
+    fn wait_recorded_gpu_work(&self) {}
+
     /// Whether anything outstanding lands in `pages`.
     ///
     /// A rail with no outstanding writes cannot reach anything, so the default
@@ -1574,6 +1581,15 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.quiesce_guest_writes(),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.quiesce_guest_writes(),
+        }
+    }
+
+    fn wait_recorded_gpu_work(&self) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.wait_recorded_gpu_work(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.wait_recorded_gpu_work(),
         }
     }
 

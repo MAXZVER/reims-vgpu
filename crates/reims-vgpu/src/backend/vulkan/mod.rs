@@ -351,6 +351,10 @@ impl Backend for VulkanBackend {
         engine::quiesce_guest_writes();
     }
 
+    fn wait_recorded_gpu_work(&self) {
+        engine::wait_recorded_gpu_work();
+    }
+
     fn guest_writes_reaching(&self, pages: &[u64]) -> GuestWriteReach {
         engine::guest_writes_reaching(pages)
     }

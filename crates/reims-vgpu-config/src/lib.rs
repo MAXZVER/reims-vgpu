@@ -463,6 +463,14 @@ pub const AIR_CAPTURE: &str = "REIMS_VGPU_AIR_CAPTURE";
 /// one of them without rebuilding.
 pub const GPU_STAMP: &str = "REIMS_VGPU_GPU_STAMP";
 
+/// Setting this off lets a host-side blit write guest pages that a draw
+/// recorded before it will still read when the GPU executes it - the order
+/// Metal guarantees and `crate::runtime::inflight_reads` keeps. It exists only
+/// so the cost of that wait can be measured against the defect it prevents
+/// (glyphs and masks vanishing from earlier passes' tiles); off is not a mode
+/// to run in.
+pub const BLIT_READ_ORDER: &str = "REIMS_VGPU_BLIT_READ_ORDER";
+
 /// Setting this off stops the two guest-page write guards —
 /// `crate::runtime::node_guard` and `crate::runtime::released_pages` — from
 /// observing anything. They decide nothing, so this changes no guest-visible

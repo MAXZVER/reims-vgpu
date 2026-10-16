@@ -16,6 +16,7 @@ pub mod blit_exec;
 pub mod bound_buffers;
 /// Guest-declared write generations for task-local GVA resources.
 pub mod buffer_write_gen;
+pub mod inflight_reads;
 /// Always-on proxies and censuses, one per measured bug class.
 pub mod census;
 /// Where a draw chain's wall clock goes on the runtime side of the engine

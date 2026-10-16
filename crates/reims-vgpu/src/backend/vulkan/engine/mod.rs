@@ -8956,6 +8956,37 @@ pub fn read_target_keeping(
 
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
 #[track_caller]
+/// Every draw recorded so far - deferred to the recorder or batched in an open
+/// command buffer - has executed when this returns. See
+/// [`crate::backend::Backend::wait_recorded_gpu_work`].
+pub fn wait_recorded_gpu_work() {
+    if let Some(failure) = settle_deferred_draws() {
+        report_deferred_failure(&failure);
+    }
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let Ok(ctx) = owner.ensure(counters) else {
+        return;
+    };
+    // SAFETY: the context owns every slot the pool waits on.
+    let waited = unsafe {
+        pools
+            .ensure_init(ctx, counters)
+            .and_then(|()| pools.retire_all(ctx, counters))
+    };
+    if let Err(e) = waited {
+        if matches!(e, DrawError::DeviceLost(_)) {
+            device_lost::note_device_lost_seen();
+        }
+        crate::observe::Emit::decline("vk_wait_recorded_gpu_work", &e).fail_once(0);
+    }
+}
+
 pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
     let site = std::panic::Location::caller();
     let r = read_target_inner(identity);

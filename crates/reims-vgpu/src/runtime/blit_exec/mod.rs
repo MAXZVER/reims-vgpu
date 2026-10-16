@@ -4231,6 +4231,15 @@ pub fn execute_blit<M: HostMemory + HostOps>(
         WireBlitKind::TextureSlices => "blit_kind_t2t_sl_us",
         WireBlitKind::GenerateMipmaps => "blit_kind_mipmap_us",
     };
+    // Metal orders this blit after every command encoded before it; this device
+    // writes guest RAM now. A draw recorded earlier that reads the destination
+    // at execute time must run first - see `crate::runtime::inflight_reads`.
+    if let (_, Some(dest)) = record.refs() {
+        if crate::runtime::inflight_reads::take_if_pending(task_id, dest) {
+            crate::runtime::drain::note_store_route("blit_read_order_wait");
+            crate::backend::selected().wait_recorded_gpu_work();
+        }
+    }
     let status = match record {
         BlitRecord::FillBuffer(fill) => match fill.pattern {
             // Which fill this is decides which write path runs *and* which of

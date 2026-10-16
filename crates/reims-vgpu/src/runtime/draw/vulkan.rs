@@ -7235,6 +7235,18 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
 
 /// TEMP (lab): the bytes each vertex/fragment buffer bind hands the engine, by
 /// stage and by whether an extent bounded it (`lab_bb_*` count and `_b` bytes).
+/// A buffer bind whose bytes the GPU reads from guest RAM when the draw runs
+/// (not a CPU snapshot taken now): name it for `inflight_reads`.
+fn note_inflight_buffer_read(
+    task_id: u32,
+    buffer_ref: u32,
+    content: &crate::backend::vulkan::engine::BufferContent,
+) {
+    if matches!(content, crate::backend::vulkan::engine::BufferContent::GuestRuns(_)) {
+        crate::runtime::inflight_reads::note(task_id, buffer_ref);
+    }
+}
+
 fn lab_note_bind_bytes(
     stage: &str,
     capped: bool,
@@ -11880,6 +11892,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 content
             };
             lab_note_bind_bytes("vtx", cap.is_some(), &content);
+            note_inflight_buffer_read(req.task_id, b.buffer_ref, &content);
             vtx_storage.push((b.index, content));
         }
         drop(vertex_span);
@@ -11952,6 +11965,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 content
             };
             lab_note_bind_bytes("frag", cap.is_some(), &content);
+            note_inflight_buffer_read(req.task_id, b.buffer_ref, &content);
             // TEMP (lab): which fragment functions bind a buffer they read
             // without a bound, once per (function, index) — the whole binds
             // left after ABSENT_NEUTRAL (p048: ~55k a phase, 4 GB of windows).
@@ -12888,6 +12902,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         evidence,
                         components,
                     ) => {
+                        crate::runtime::inflight_reads::note(req.task_id, texture_ref);
                         sampled_vk_format = format;
                         sampled_components = components;
                         source_planes = planes;
@@ -12902,6 +12917,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                     // above, carrying the same facts to the engine beside the
                     // window that holds the bytes.
                     SampledSourceRequest::Staged(staged) => {
+                        crate::runtime::inflight_reads::note(req.task_id, texture_ref);
                         sampled_vk_format = staged.format;
                         sampled_components = staged.components;
                         source_planes = staged.planes;
@@ -14363,6 +14379,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             .map_err(|reason| {
                     DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad { reason })
                 })?;
+            note_inflight_buffer_read(req.task_id, idx.index_buffer_ref, &content);
             resources.indexed = Some(crate::backend::vulkan::engine::IndexedDrawResource {
                 index_type,
                 index_count: idx.index_count,
