@@ -13585,7 +13585,12 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             }
             // TEMP (lab): REIMS_VGPU_LAB_NEUTRAL=white makes the stand-in opaque
             // white, to learn whether the unbound texture decides the output.
-            let lab_texel = if std::env::var("REIMS_VGPU_LAB_NEUTRAL").as_deref() == Ok("white") {
+            // Latched: this path runs per draw on canvas, and an uncached
+            // getenv was 1.7 % of the drain there (b634 sampler).
+            static LAB_WHITE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let lab_texel = if *LAB_WHITE
+                .get_or_init(|| std::env::var("REIMS_VGPU_LAB_NEUTRAL").as_deref() == Ok("white"))
+            {
                 [1.0f64; 4]
             } else {
                 [0.0; 4]

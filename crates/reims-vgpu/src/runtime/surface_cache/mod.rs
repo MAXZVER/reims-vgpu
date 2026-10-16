@@ -1526,10 +1526,6 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     static PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
 
-    let (surfaces, gva, linear) = cache_levels(state);
-    let total = surfaces.bytes + gva.bytes + linear.bytes;
-    let peak = PEAK_BYTES.fetch_max(total, Ordering::Relaxed).max(total);
-
     let now = crate::observe::elapsed_ms() as u64;
     let last = LAST_MS.load(Ordering::Relaxed);
     if now.saturating_sub(last) < 1000 {
@@ -1542,6 +1538,12 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
     {
         return;
     }
+    // Walked once per line, not per tranche: the walk on every tranche was
+    // 2.6 % of the canvas drain (b634 sampler) for a measure-only peak. The
+    // peak is now the largest of the per-second readings.
+    let (surfaces, gva, linear) = cache_levels(state);
+    let total = surfaces.bytes + gva.bytes + linear.bytes;
+    let peak = PEAK_BYTES.fetch_max(total, Ordering::Relaxed).max(total);
     let (moved, unmapped, checked) = gva_backing_moved(state, host);
     // `gva_cap_*` are the only running totals on this line — the eviction
     // witness accumulates for the life of the device, where every other field

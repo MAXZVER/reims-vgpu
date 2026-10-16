@@ -77,7 +77,12 @@ fn stamp_word_order_on_fifo<H: HostMemory + HostOps>(
     index: u32,
     value: u32,
 ) -> StampOrder {
-    if crate::config::switch(crate::config::GPU_STAMP) == crate::config::Switch::Off {
+    // Latched like the other switches: this runs per stamp, and the getenv
+    // behind an unlatched read was ~0.8 % of the drain on canvas (b634).
+    static STAMP_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *STAMP_OFF.get_or_init(|| {
+        crate::config::switch(crate::config::GPU_STAMP) == crate::config::Switch::Off
+    }) {
         return StampOrder::Declined;
     }
     // A CPU-only packet normally has nothing queued behind it. It must still
