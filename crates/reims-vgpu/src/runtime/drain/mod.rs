@@ -1505,12 +1505,6 @@ pub struct Packet {
     pub completion_stamp: u32,
     pub payload: Vec<u8>,
     pub next_head: u32,
-    /// TEMP (lab, IRQ_LONE): nothing was published behind this packet when
-    /// the ring was read - it arrived alone. Safari's GPU process flushes each
-    /// canvas renderer as one command buffer and blocks on its completion
-    /// stamp (b641: 56 such round trips a frame on one thread), while the
-    /// bulk arrives six or seven to a doorbell; the lone one is the wait.
-    pub lone: bool,
 }
 
 impl Packet {
@@ -2019,7 +2013,6 @@ fn decode_packet_inner(
         completion_stamp,
         payload,
         next_head: head.wrapping_add(total_size),
-        lone: false,
     })
 }
 
@@ -4429,7 +4422,7 @@ fn run_parked_packet_g<H: HostMemory + HostOps>(
             // (resource delete, GPU page-table map/unmap); see `lab_ctrl_stamp`.
             // The fast answer is only for this packet's own word: a release that
             // also carries an older position of the channel keeps the queue.
-            let ctrl = lab_ctrl_stamp::classify_packet(work.packet(), released.len());
+            let ctrl = lab_ctrl_stamp::classify(u16::from(work.packet().opcode), released.len());
             for release in released {
                 // **Counted here because the model cannot count it, and a
                 // publisher nobody counts reads exactly like one that never
@@ -4724,10 +4717,7 @@ pub fn arrival<M: HostMemory>(ring: &Ring<'_>, mem: &M, head: u32, tail: u32) ->
         return Arrival::Fault(snap_fault);
     };
     match decode_packet(&snap, head, available, capacity) {
-        Ok(mut packet) => {
-            packet.lone = packet.next_head == tail;
-            Arrival::Packet(packet)
-        }
+        Ok(packet) => Arrival::Packet(packet),
         Err(err) => err.fault().map_or(Arrival::Nothing, Arrival::Fault),
     }
 }
@@ -5208,31 +5198,10 @@ pub(crate) mod lab_ctrl_stamp {
         None,
         Fast,
         Flush,
-        /// TEMP (lab, IRQ_LONE): an EXEC that arrived alone in its ring - a
-        /// guest thread is blocking on this one word (see `Packet::lone`), so
-        /// its interrupt skips the batch hold; the bulk keeps folding.
-        Lone,
     }
 
     thread_local! {
         static KIND: Cell<Kind> = const { Cell::new(Kind::None) };
-    }
-
-    /// TEMP (lab): `REIMS_VGPU_LAB_IRQ_LONE=on` raises the completion
-    /// interrupt of a lone EXEC at once. Off by default until the A/B (b648).
-    fn lone_on() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_IRQ_LONE").is_ok_and(|v| v == "on"))
-    }
-
-    /// [`classify`] with the packet itself: a lone EXEC outranks the control
-    /// kinds, which only ever name control opcodes.
-    pub(crate) fn classify_packet(packet: &super::Packet, released: usize) -> Kind {
-        if lone_on() && packet.lone && packet.opcode == super::CHILD_OP_EXEC_INDIRECT2 {
-            super::note_store_route("lab_irq_lone");
-            return Kind::Lone;
-        }
-        classify(u16::from(packet.opcode), released)
     }
 
     fn on() -> bool {

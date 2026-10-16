@@ -503,7 +503,6 @@ mod tests {
             completion_stamp: 0,
             payload: vec![0u8; payload],
             next_head: 0,
-            lone: false,
         }
     }
 
