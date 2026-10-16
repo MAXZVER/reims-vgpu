@@ -30,7 +30,6 @@
 use crate::access::AccessMode;
 use crate::identity::{ResourceId, SessionGeneration, TaskId};
 use reims_vgpu_protocol::render::ShaderStage;
-use std::collections::HashMap;
 
 /// Where a pipeline is in its life.
 ///

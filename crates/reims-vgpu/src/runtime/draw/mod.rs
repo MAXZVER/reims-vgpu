@@ -65,6 +65,8 @@ use reims_vgpu_protocol::pass_action::{
 // sibling of `metal`, and gated once here rather than per item.
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
+#[cfg(feature = "backend-vulkan")]
+pub mod synthesized_sampled;
 // Only for `exec`'s pass-extent census, which declares its own copy of these
 // bands because it runs on every backend. See
 // `the_two_coverage_censuses_use_the_same_bands`.
