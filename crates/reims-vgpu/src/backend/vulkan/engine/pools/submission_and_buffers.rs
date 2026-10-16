@@ -1703,6 +1703,7 @@ impl ResourcePools {
         // recycle at retire and a draw's do not.
         SealedEntry {
             cleanup: PendingGpuCleanup {
+                lab_verify: std::mem::take(&mut self.entry.lab_verify),
                 dsets,
                 scatter_dsets: std::mem::take(&mut self.entry.scatter_dsets),
                 staging: std::mem::take(&mut self.entry.staging_live),
@@ -2310,6 +2311,11 @@ impl ResourcePools {
 
     /// Record that the command buffer being built reads guest RAM when it
     /// executes, so the next completion stamp waits for it.
+    /// TEMP (lab, INFLIGHT_VERIFY): remember what a bind held when recorded.
+    pub(crate) fn lab_verify_note(&mut self, v: super::LabVerify) {
+        self.entry.lab_verify.push(v);
+    }
+
     pub(crate) fn note_guest_read_recorded(&mut self) {
         self.guest_reads_in_flight = true;
         super::super::GUEST_READ_DEBT.store(true, Ordering::Release);
@@ -3237,6 +3243,35 @@ impl ResourcePools {
     /// # Safety
     /// The CB that referenced these resources must have retired.
     unsafe fn drain_cleanup(&mut self, device: &ash::Device, mut pending: PendingGpuCleanup) {
+        // TEMP (lab, INFLIGHT_VERIFY): did anything change what this command
+        // buffer read while it was in flight?
+        if !pending.lab_verify.is_empty() {
+            static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let now = crate::observe::elapsed_us() / 1000;
+            for v in pending.lab_verify.drain(..) {
+                let (kind, changed, len, t) = match &v {
+                    super::LabVerify::Staging { ptr, len, hash, t } => {
+                        let bytes = unsafe { std::slice::from_raw_parts(*ptr as *const u8, *len) };
+                        ("staging", super::lab_verify_hash(bytes) != *hash, *len, *t)
+                    }
+                    super::LabVerify::Guest { content, hash, t } => {
+                        let bytes = content.cpu_bytes();
+                        ("guest", super::lab_verify_hash(&bytes) != *hash, bytes.len(), *t)
+                    }
+                };
+                crate::runtime::drain::note_store_route(match (kind, changed) {
+                    ("staging", false) => "lab_inflight_staging_ok",
+                    ("staging", true) => "lab_inflight_staging_changed",
+                    (_, false) => "lab_inflight_guest_ok",
+                    (_, true) => "lab_inflight_guest_changed",
+                });
+                if changed && SHOWN.fetch_add(1, Ordering::Relaxed) < 200 {
+                    crate::observe::off(format!(
+                        "lab_inflight_changed kind={kind} len={len} recorded_t={t} retired_t={now}"
+                    ));
+                }
+            }
+        }
         for identity in pending.unpin_residents.drain(..) {
             self.pin_resident_target(&identity, false);
         }
@@ -3781,6 +3816,7 @@ impl ResourcePools {
             read.ring.release(read.window);
         }
         self.entry.keep.clear();
+        self.entry.lab_verify.clear();
         for slot in self.entry.staging_live.drain(..) {
             let bucket = Self::bucket(slot.size);
             self.staging_free.entry(bucket).or_default().push(slot);
@@ -6461,6 +6497,7 @@ mod recycle_tests {
             cmd_buf: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             pending: Some(PendingGpuCleanup {
+                lab_verify: Vec::new(),
                 dsets: Vec::new(),
                 scatter_dsets: Vec::new(),
                 staging: Vec::new(),

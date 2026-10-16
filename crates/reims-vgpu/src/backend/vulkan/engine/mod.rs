@@ -2328,6 +2328,12 @@ fn recorder_lazy_readers() -> bool {
 /// Whether a completion stamp must be queued behind guest-memory access.
 pub fn guest_access_outstanding() -> bool {
     recorder::settle_if_drain(is_drain_thread(), recorder::JoinSite::Reader);
+    // TEMP (lab, `REIMS_VGPU_LAB_STAMP_ALL_GPU=1`): every completion word waits
+    // for all GPU work recorded before it, debt or not.
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ALL.get_or_init(|| std::env::var("REIMS_VGPU_LAB_STAMP_ALL_GPU").as_deref() == Ok("1")) {
+        return true;
+    }
     GUEST_READ_DEBT.load(std::sync::atomic::Ordering::Acquire) || guest_writes_outstanding()
 }
 
@@ -8984,6 +8990,42 @@ pub fn wait_recorded_gpu_work() {
             device_lost::note_device_lost_seen();
         }
         crate::observe::Emit::decline("vk_wait_recorded_gpu_work", &e).fail_once(0);
+    }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_DRAW_WAIT`): settle any deferred draw, submit the
+/// open batch and wait for the device to go idle - the synchronisation a target
+/// readback implies, without the readback.
+pub fn lab_wait_idle() {
+    // `=flush`: submit the open batch without waiting; `=settle`: only join the
+    // recorder; anything else: submit and wait every slot.
+    static MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let mode = MODE.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_WAIT").unwrap_or_default());
+    if let Some(failure) = settle_deferred_draws() {
+        report_deferred_failure(&failure);
+    }
+    if mode == "settle" {
+        return;
+    }
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let Ok(ctx) = owner.ensure(counters) else {
+        return;
+    };
+    unsafe {
+        if pools.ensure_init(ctx, counters).is_err() {
+            return;
+        }
+        if mode == "flush" {
+            let _ = pools.batch_flush(ctx, counters);
+        } else {
+            let _ = pools.retire_all(ctx, counters);
+        }
     }
 }
 

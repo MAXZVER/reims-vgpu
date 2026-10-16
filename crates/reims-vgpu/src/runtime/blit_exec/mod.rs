@@ -4240,6 +4240,40 @@ pub fn execute_blit<M: HostMemory + HostOps>(
             crate::backend::selected().wait_recorded_gpu_work();
         }
     }
+    // TEMP (lab, `REIMS_VGPU_LAB_BLIT_QUIESCE=1`): a blit writes guest RAM on the
+    // CPU now, but GPU work recorded before it (and not yet executed) may read
+    // the same pages at execute time - Metal orders the blit after that work.
+    // Wait for every recorded guest read before this write.
+    #[cfg(feature = "backend-vulkan")]
+    {
+        static Q: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static RW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *RW.get_or_init(|| std::env::var("REIMS_VGPU_LAB_BLIT_QUIESCE").as_deref() == Ok("rw"))
+            && !matches!(record, BlitRecord::GenerateMipmaps(_))
+        {
+            if let Some(failure) = crate::backend::vulkan::engine::settle_deferred_draws() {
+                crate::backend::vulkan::engine::report_deferred_failure(&failure);
+            }
+            crate::runtime::render_writeback::settle_guest_writes(
+                crate::runtime::render_writeback::SettleSite::BlitWrite,
+            );
+            crate::backend::vulkan::engine::quiesce_guest_reads();
+        }
+        static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ALL.get_or_init(|| std::env::var("REIMS_VGPU_LAB_BLIT_QUIESCE").as_deref() == Ok("all"))
+            && !matches!(record, BlitRecord::GenerateMipmaps(_))
+        {
+            // `=all`: every blit waits for all GPU work recorded before it.
+            crate::backend::vulkan::engine::lab_wait_idle();
+        } else if *Q.get_or_init(|| std::env::var("REIMS_VGPU_LAB_BLIT_QUIESCE").as_deref() == Ok("1"))
+            && !matches!(record, BlitRecord::GenerateMipmaps(_))
+        {
+            if let Some(failure) = crate::backend::vulkan::engine::settle_deferred_draws() {
+                crate::backend::vulkan::engine::report_deferred_failure(&failure);
+            }
+            crate::backend::vulkan::engine::quiesce_guest_reads();
+        }
+    }
     let status = match record {
         BlitRecord::FillBuffer(fill) => match fill.pattern {
             // Which fill this is decides which write path runs *and* which of
@@ -4269,6 +4303,9 @@ pub fn execute_blit<M: HostMemory + HostOps>(
         kind_route,
         kind_started.elapsed().as_micros() as u64,
     );
+    crate::runtime::draw::vulkan::stale_watch::blit_note(task_id, || {
+        format!("{record:?} -> {status:?}")
+    });
     status
 }
 

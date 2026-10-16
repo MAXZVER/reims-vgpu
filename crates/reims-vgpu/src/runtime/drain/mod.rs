@@ -8570,6 +8570,34 @@ fn process_child_packet<H: HostMemory + HostOps>(
     note_packet_domain_definition(state, channel_id, packet.opcode);
     note_packet_class(reims_vgpu_protocol::packets::Channel::Child, packet.opcode);
     note_lifetime_task_definition(state, reims_vgpu_protocol::packets::Channel::Child, packet);
+    // TEMP (lab, `REIMS_VGPU_LAB_CTRL_QUIESCE=1`): a resource / memory teardown
+    // or remap packet first waits for every GPU read recorded before it.
+    #[cfg(feature = "backend-vulkan")]
+    {
+        static Q: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *Q.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CTRL_QUIESCE").as_deref() == Ok("1"))
+            && matches!(
+                packet.opcode,
+                CHILD_OP_DELETE_RESOURCE
+                    | CHILD_OP_DELETE_TASK
+                    | CHILD_OP_DELETE_OBJECT
+                    | CHILD_OP_REPLACE_PHYSICAL
+                    | CHILD_OP_UNMAP_MEMORY
+                    | CHILD_OP_MAP_MEMORY2
+                    | CHILD_OP_INVALIDATE_RESOURCES
+                    | CHILD_OP_SYNCHRONIZE_RESOURCES
+                    | CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES
+                    | CHILD_OP_DELETE_IOSURFACE_BACKING2
+                    | CHILD_OP_DISCARD_RESOURCES
+            )
+        {
+            note_store_route("lab_ctrl_quiesce");
+            if let Some(failure) = crate::backend::vulkan::engine::settle_deferred_draws() {
+                crate::backend::vulkan::engine::report_deferred_failure(&failure);
+            }
+            crate::backend::vulkan::engine::quiesce_guest_reads();
+        }
+    }
     match packet.opcode {
         CHILD_OP_DEFINE_TASK2 => {
             apply_define_task2(state, host, &packet.payload, Some(channel_id));

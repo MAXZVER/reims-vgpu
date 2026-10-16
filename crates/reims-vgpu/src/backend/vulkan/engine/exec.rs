@@ -702,6 +702,14 @@ unsafe fn stage_buffer_content(
             let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, b.len() as u64);
             pools.write_staging(ctx, &slot, b)?;
             drop(_s);
+            if super::pools::lab_verify_on() && slot.mapped != 0 && !b.is_empty() {
+                pools.lab_verify_note(super::pools::LabVerify::Staging {
+                    ptr: slot.mapped,
+                    len: b.len(),
+                    hash: super::pools::lab_verify_hash(b),
+                    t: crate::observe::elapsed_us() / 1000,
+                });
+            }
             BoundBuffer::from(slot)
         }
         // TEMP (lab, PASS_STAGE): the bytes are already in a worker arena,
@@ -736,14 +744,34 @@ unsafe fn stage_buffer_content(
             // [`crate::runtime::guest_ram::GuestRef`], which no call site can
             // construct without the range check against the RAMBlock it names,
             // and freeing the import is what ends the access.
-            if let Some(bound) = unsafe { import_guest_buffer_window(ctx, pools, src, gather_role) }
-            {
+            if super::pools::lab_verify_on() {
+                let bytes = content.cpu_bytes();
+                pools.lab_verify_note(super::pools::LabVerify::Guest {
+                    content: content.clone(),
+                    hash: super::pools::lab_verify_hash(&bytes),
+                    t: crate::observe::elapsed_us() / 1000,
+                });
+            }
+            // TEMP (lab, `REIMS_VGPU_LAB_SNAPSHOT_GUEST_BUFFERS=1`): every guest-RAM
+            // buffer bind is copied by the CPU now (the third arm below), never
+            // read by the GPU at execute time.
+            static SNAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let snapshot_only = *SNAP.get_or_init(|| {
+                std::env::var("REIMS_VGPU_LAB_SNAPSHOT_GUEST_BUFFERS").as_deref() == Ok("1")
+            });
+            if let Some(bound) = if snapshot_only {
+                None
+            } else {
+                unsafe { import_guest_buffer_window(ctx, pools, src, gather_role) }
+            } {
                 pools.note_guest_read_recorded();
                 counters.note_buffer_guest_import(src.total_len, gather_role);
                 bound
-            } else if let Some((bound, pending)) =
+            } else if let Some((bound, pending)) = if snapshot_only {
+                None
+            } else {
                 unsafe { gather_guest_buffer_window(ctx, pools, counters, src)? }
-            {
+            } {
                 // The copies read guest RAM when the CB executes, exactly as a
                 // direct bind does, so this owes the same quiesce.
                 pools.note_guest_read_recorded();
@@ -2852,8 +2880,14 @@ unsafe fn sample_guest_runs(
     // the bytes to compare them is the cost being removed. A
     // declined direct image carries no identity, so this lookup
     // misses without touching the copied-content ledger.
-    if let Some(image) =
-        pools.find_gathered_sampled(SampledKey::of(resource), resource.identity, counters)
+    // TEMP (lab, `REIMS_VGPU_LAB_NO_GATHER_SKIP=1`): never serve a retained image;
+    // every guest-runs bind gathers.
+    static NO_SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let no_skip = *NO_SKIP
+        .get_or_init(|| std::env::var("REIMS_VGPU_LAB_NO_GATHER_SKIP").as_deref() == Ok("1"));
+    if let Some(image) = (!no_skip)
+        .then(|| pools.find_gathered_sampled(SampledKey::of(resource), resource.identity, counters))
+        .flatten()
     {
         // TEMP (lab, SKIP_GUARD): the moment the skip is spent. The vouch was
         // minted at the producer's resolve, an instant the guest's stores can
@@ -3784,6 +3818,36 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         Color0Load::Clear
     };
+    // TEMP (lab, `REIMS_VGPU_LAB_C0_LOG=1`): how a tile-sized mapped surface's
+    // colour attachment opens - resident load, a seed (and which), clear or
+    // undefined - for every draw that does not simply continue a pass.
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_C0_LOG").as_deref() == Ok("1")) {
+            if let Some(TargetIdentity::Surface { id, width, height, generation, .. }) =
+                req.target_identity.as_ref()
+            {
+                let tile = (*width == 320 || *width == 512 || (900..=1100).contains(width))
+                    && (*height == 256 || *height == 320);
+                if tile && (!req.continues_render_pass || explicit_seed) {
+                    crate::observe::off(format!(
+                        "lab_c0 mid={id} gen={generation} cont={} load={:?} ready={} from_target={}                          preserve={} seed_rgba={} seed_guest={} seed_target={} guest_backing={} declared={:?} t={}",
+                        u8::from(req.continues_render_pass),
+                        color0_load,
+                        u8::from(resident_ready),
+                        u8::from(req.load_from_target),
+                        u8::from(preserving_existing_target),
+                        u8::from(req.target_rgba8.is_some()),
+                        u8::from(req.target_guest_seed.is_some()),
+                        u8::from(req.seed_from_target.is_some()),
+                        u8::from(req.load_guest_target_backing && req.guest_target_memory.is_some()),
+                        req.color0_declared,
+                        crate::observe::elapsed_us() / 1000
+                    ));
+                }
+            }
+        }
+    }
     let mut pass_key = PassKey::single(color0_load, color0_format);
     pass_key.host_accessible_color0 = req.guest_target_memory.is_some();
     for (i, sec) in req.secondary_targets.iter().enumerate() {

@@ -878,6 +878,8 @@ settle_sites! {
     /// `drain::apply_map_family` on `DeleteIOSurfaceBacking2` — the same
     /// hand-back for a mapping's pages, keyed by mapping instead of by span.
     BackingRelease => "settle_backing_release",
+    /// TEMP (lab, BLIT_QUIESCE=rw): a CPU blit about to write guest pages.
+    BlitWrite => "settle_blit_write",
 }
 
 /// Block until every guest-page write this device has submitted has executed.

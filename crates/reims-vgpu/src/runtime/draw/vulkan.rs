@@ -370,6 +370,30 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         // happened. Deriving the outcome from the one value that knows makes
         // that class of drift unrepresentable.
         engine_outcome = EngineDrawOutcome::of(&engine);
+        if let Some(c) = req.colors.first().filter(|c| c.mapping_id != 0 && req.task_id != 1) {
+            // TEMP (lab, `REIMS_VGPU_LAB_DRAW_WAIT=1`): the device idle after every
+            // direct app draw into a tile-sized mapped surface.
+            static DRAW_WAIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            static PRE_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let pre_mode = *PRE_MODE
+                .get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_WAIT").as_deref() == Ok("pre"));
+            static LAST_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let last_only = *LAST_ONLY
+                .get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_WAIT").as_deref() == Ok("last"));
+            if *DRAW_WAIT.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_WAIT").is_ok_and(|v| !v.is_empty() && v != "off"))
+                && (c.width == 320 || c.width == 512 || (900..=1100).contains(&c.width))
+                && (c.height == 256 || c.height == 320)
+                && (!last_only || !req.render_pass_continues)
+                && !pre_mode
+            {
+                crate::backend::vulkan::engine::lab_wait_idle();
+            }
+            if stale_watch::on() {
+                if let Some(id) = mapper_ref_texture_render_identity(state, req) {
+                    stale_watch::draw_snap(c.mapping_id, req.pipeline_ref, req.base_instance, &id);
+                }
+            }
+        }
         match engine {
             Ok(M2vDrawSpan::Pixels { bytes, bgra }) => {
                 lab_dump_pixels(req, pass_w, pass_h, &bytes, bgra);
@@ -3671,6 +3695,12 @@ pub(crate) mod stale_watch {
         // Final-set reports since the last app draw, and when the last one ran.
         final_emits: u32,
         last_final: u64,
+        // TEMP (lab, PASS_SNAP): per app tile, its content as each of its last
+        // six passes found it (time, opening pipeline, RGBA8 w x h).
+        snaps: HashMap<u32, std::collections::VecDeque<(u64, u32, u32, u32, Vec<u8>)>>,
+        // TEMP (lab, DRAW_SNAP): per app tile, its content after each of its last
+        // 32 direct draws (time, pipe, base instance, RLE of u32 pixels).
+        dsnaps: HashMap<u32, std::collections::VecDeque<(u64, u32, u32, u32, u32, Vec<u32>)>>,
     }
     static W: Mutex<Option<W>> = Mutex::new(None);
     pub(crate) fn on() -> bool {
@@ -3695,6 +3725,8 @@ pub(crate) mod stale_watch {
             ws_own_dumps: 0,
             final_emits: 0,
             last_final: 0,
+            snaps: HashMap::new(),
+            dsnaps: HashMap::new(),
         });
         f(w, now);
         if now.saturating_sub(w.last_scan) >= 1000 {
@@ -3750,6 +3782,10 @@ pub(crate) mod stale_watch {
                     }
                 }
             }
+            if !due.is_empty() {
+                vtx_ring_flush(now);
+                blit_ring_flush();
+            }
             for (mid, t, id) in due {
                 w.dumped.insert(mid, t);
                 // A surface the window server sampled after its last draw is on
@@ -3778,6 +3814,38 @@ pub(crate) mod stale_watch {
                     w.dumps += 1;
                 }
                 dump(mid, t, &id, if on_screen { "ws-" } else { "" }, now);
+                if on_screen {
+                    if let Some(ring) = w.snaps.get(&mid) {
+                        let dir = std::path::Path::new("E:/tmp-c/tiledump");
+                        for (k, (st, pipe, sw, sh, bytes)) in ring.iter().enumerate() {
+                            let mut out = Vec::with_capacity(16 + bytes.len());
+                            for v in [*sw, *sh, 0, 0] {
+                                out.extend_from_slice(&v.to_le_bytes());
+                            }
+                            out.extend_from_slice(bytes);
+                            let _ = std::fs::write(
+                                dir.join(format!("pass-m{mid}-{k}-t{st}-p{pipe}-{sw}x{sh}.rgba")),
+                                out,
+                            );
+                        }
+                    }
+                    if let Some(ring) = w.dsnaps.get(&mid) {
+                        let dir = std::path::Path::new("E:/tmp-c/tiledump");
+                        for (k, (st, pipe, bi, sw, sh, rle)) in ring.iter().enumerate() {
+                            let mut out = Vec::with_capacity(16 + rle.len() * 4);
+                            for v in [*sw, *sh, 1, 0] {
+                                out.extend_from_slice(&v.to_le_bytes());
+                            }
+                            for v in rle {
+                                out.extend_from_slice(&v.to_le_bytes());
+                            }
+                            let _ = std::fs::write(
+                                dir.join(format!("draw-m{mid}-{k:02}-t{st}-p{pipe}-bi{bi}-{sw}x{sh}.rle")),
+                                out,
+                            );
+                        }
+                    }
+                }
             }
             for (mid, t_draw, task, seen) in lines {
                 w.reported.insert(mid, t_draw);
@@ -3838,6 +3906,216 @@ pub(crate) mod stale_watch {
                 w.final_emits = 0;
             });
         }
+    }
+    /// TEMP (lab, `REIMS_VGPU_LAB_VTX_DUMP=N`): the bytes of every buffer bind of
+    /// an app draw with N instances, as the encode reads them, into
+    /// E:/tmp-c/tiledump/vtx-*.bin (at most 6000 files).
+    pub(crate) fn vtx_dump(
+        req: &super::DrawEncodeRequest,
+        stage: &str,
+        index: u32,
+        buffer_ref: u32,
+        offset: u64,
+        content: &crate::backend::vulkan::engine::BufferContent,
+    ) {
+        // `N` (instance count) or `tile:WxH` (draws into a mapped W x H surface);
+        // `REIMS_VGPU_LAB_VTX_DUMP_AFTER=ms` skips draws before that time.
+        enum F {
+            Inst(u32),
+            Tile(u32, u32),
+            Ring,
+        }
+        static FILT: std::sync::OnceLock<Option<F>> = std::sync::OnceLock::new();
+        let Some(f) = FILT.get_or_init(|| {
+            let v = std::env::var("REIMS_VGPU_LAB_VTX_DUMP").ok()?;
+            if v == "ring" {
+                return Some(F::Ring);
+            }
+            if let Some(t) = v.strip_prefix("tile:") {
+                let (w, h) = t.split_once('x')?;
+                return Some(F::Tile(w.parse().ok()?, h.parse().ok()?));
+            }
+            v.parse().ok().map(F::Inst)
+        }) else {
+            return;
+        };
+        if req.task_id == 1 {
+            return;
+        }
+        let c0 = req.colors.first();
+        match *f {
+            F::Inst(n) if req.instance_count != n => return,
+            F::Tile(w, h)
+                if !c0.is_some_and(|c| c.mapping_id != 0 && c.width == w && c.height == h) =>
+            {
+                return
+            }
+            _ => {}
+        }
+        static AFTER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let after = *AFTER.get_or_init(|| {
+            std::env::var("REIMS_VGPU_LAB_VTX_DUMP_AFTER").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        });
+        if crate::observe::elapsed_us() / 1000 < after {
+            return;
+        }
+        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let k = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ring = matches!(f, F::Ring);
+        if k >= 20000 && !ring {
+            return;
+        }
+        let kind = match content {
+            crate::backend::vulkan::engine::BufferContent::GuestRuns(_) => "runs",
+            crate::backend::vulkan::engine::BufferContent::Bytes(_) => "bytes",
+            crate::backend::vulkan::engine::BufferContent::Staged(_) => "staged",
+        };
+        let now = crate::observe::elapsed_us() / 1000;
+        let bytes = content.cpu_bytes();
+        let gva = req.colors.first().map_or(0, |c| c.target_gva);
+        let mid = req.colors.first().map_or(0, |c| c.mapping_id);
+        let name = format!(
+            "vtx-k{k}-d{}-t{now}-p{}-{stage}{index}-r{buffer_ref}-o{offset}-bi{}-fv{}-vc{}-ic{}-{kind}-g{gva:x}-m{mid}.bin",
+            DRAW_SEQ.load(std::sync::atomic::Ordering::Relaxed),
+            req.pipeline_ref,
+            req.base_instance,
+            req.first_vertex,
+            req.vertex_count,
+            req.instance_count
+        );
+        if ring {
+            let mut g = VTX_RING.lock().unwrap_or_else(|p| p.into_inner());
+            let r = g.get_or_insert_with(|| (std::collections::VecDeque::new(), 0));
+            r.1 += bytes.len();
+            r.0.push_back((name, bytes.into_owned()));
+            while r.1 > 160 << 20 {
+                let Some((_, b)) = r.0.pop_front() else { break };
+                r.1 -= b.len();
+            }
+            return;
+        }
+        let dir = std::path::Path::new("E:/tmp-c/tiledump");
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(dir.join(name), &bytes[..]);
+    }
+    /// TEMP (lab, `REIMS_VGPU_LAB_BLIT_RING=1`): the last 6000 app blits (not
+    /// the window server's), emitted when the app goes quiet.
+    static BLIT_RING: Mutex<Option<std::collections::VecDeque<String>>> = Mutex::new(None);
+    pub(crate) fn blit_note(task_id: u32, line: impl FnOnce() -> String) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if task_id == 1 || !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_BLIT_RING").as_deref() == Ok("1")) {
+            return;
+        }
+        let now = crate::observe::elapsed_us() / 1000;
+        let l = format!("task={task_id} {} t={now}", line());
+        let mut g = BLIT_RING.lock().unwrap_or_else(|p| p.into_inner());
+        let r = g.get_or_insert_with(Default::default);
+        if r.len() >= 6000 {
+            r.pop_front();
+        }
+        r.push_back(l);
+    }
+    fn blit_ring_flush() {
+        let taken = BLIT_RING.lock().unwrap_or_else(|p| p.into_inner()).take();
+        for l in taken.into_iter().flatten() {
+            crate::observe::off(format!("lab_blit {l}"));
+        }
+    }
+    /// TEMP (lab, VTX_DUMP=ring): every app draw's binds, newest 160 MiB.
+    #[allow(clippy::type_complexity)]
+    static VTX_RING: Mutex<Option<(std::collections::VecDeque<(String, Vec<u8>)>, usize)>> = Mutex::new(None);
+    /// TEMP (lab, VTX_DUMP): app draws seen by [`super::lab_tile_draw_with`].
+    pub(crate) static DRAW_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Writes the ring to E:/tmp-c/tiledump/vtx/ and empties it.
+    fn vtx_ring_flush(now: u64) {
+        let taken = VTX_RING.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let Some((ring, total)) = taken else {
+            return;
+        };
+        let dir = std::path::Path::new("E:/tmp-c/tiledump/vtx");
+        let _ = std::fs::create_dir_all(dir);
+        let n = ring.len();
+        for (name, b) in ring {
+            let _ = std::fs::write(dir.join(name), b);
+        }
+        crate::observe::off(format!("lab_vtx_ring_flush binds={n} bytes={total} t={now}"));
+    }
+    /// TEMP (lab, VTX_DUMP): a dumped pipeline's vertex layout, once per (task, pipeline).
+    pub(crate) fn vtx_layout(task_id: u32, pipe: u32, line: impl FnOnce() -> String) {
+        if std::env::var_os("REIMS_VGPU_LAB_VTX_DUMP").is_none() || task_id == 1 {
+            return;
+        }
+        static SEEN: Mutex<Option<std::collections::HashSet<(u32, u32)>>> = Mutex::new(None);
+        let mut g = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        if g.get_or_insert_with(Default::default).insert((task_id, pipe)) {
+            crate::observe::off(format!("lab_vtx_layout task={task_id} pipe={pipe} {}", line()));
+        }
+    }
+    /// TEMP (lab, `REIMS_VGPU_LAB_DRAW_SNAP=1`): an app tile after each direct
+    /// draw into it, run-length coded, in a ring of 32 per tile.
+    pub(crate) fn draw_snap(
+        mapping_id: u32,
+        pipe: u32,
+        base_instance: u32,
+        id: &crate::backend::vulkan::engine::TargetIdentity,
+    ) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !on() || !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_SNAP").as_deref() == Ok("1")) {
+            return;
+        }
+        let (iw, ih) = (id.width(), id.height());
+        if !matches!((iw, ih), (900..=1100, 256) | (320, 256) | (512, 320) | (512, 256)) {
+            return;
+        }
+        let Ok(rb) = crate::backend::vulkan::engine::read_target(id) else {
+            return;
+        };
+        let Some(rgba) = rb.into_rgba8() else {
+            return;
+        };
+        let mut rle: Vec<u32> = Vec::new();
+        for px in rgba.chunks_exact(4) {
+            let v = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+            match rle.len() {
+                n if n >= 2 && rle[n - 1] == v => rle[n - 2] += 1,
+                _ => {
+                    rle.push(1);
+                    rle.push(v);
+                }
+            }
+        }
+        with(|w, now| {
+            let ring = w.dsnaps.entry(mapping_id).or_default();
+            if ring.len() >= 32 {
+                ring.pop_front();
+            }
+            ring.push_back((now, pipe, base_instance, iw, ih, rle));
+        });
+    }
+    /// TEMP (lab, `REIMS_VGPU_LAB_PASS_SNAP=1`): an app tile as the pass `pipe`
+    /// opens it, kept in a ring of six per tile.
+    pub(crate) fn pass_snap(mapping_id: u32, pipe: u32, id: &crate::backend::vulkan::engine::TargetIdentity) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !on() || !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PASS_SNAP").as_deref() == Ok("1")) {
+            return;
+        }
+        let (iw, ih) = (id.width(), id.height());
+        if !matches!((iw, ih), (900..=1100, 256) | (320, 256) | (512, 320) | (512, 256)) {
+            return;
+        }
+        let Ok(rb) = crate::backend::vulkan::engine::read_target(id) else {
+            return;
+        };
+        let Some(rgba) = rb.into_rgba8() else {
+            return;
+        };
+        with(|w, now| {
+            let ring = w.snaps.entry(mapping_id).or_default();
+            if ring.len() >= 6 {
+                ring.pop_front();
+            }
+            ring.push_back((now, pipe, iw, ih, rgba));
+        });
     }
     /// The last 48 draws into an app surface, emitted when it is dumped on screen.
     pub(crate) fn note(
@@ -11893,6 +12171,8 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             };
             lab_note_bind_bytes("vtx", cap.is_some(), &content);
             note_inflight_buffer_read(req.task_id, b.buffer_ref, &content);
+            stale_watch::vtx_dump(req, "v", b.index, b.buffer_ref, b.offset, &content);
+            stale_watch::vtx_layout(req.task_id, req.pipeline_ref, || format!("{:?}", pd.vertex_attributes));
             vtx_storage.push((b.index, content));
         }
         drop(vertex_span);
@@ -11966,6 +12246,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             };
             lab_note_bind_bytes("frag", cap.is_some(), &content);
             note_inflight_buffer_read(req.task_id, b.buffer_ref, &content);
+            stale_watch::vtx_dump(req, "f", b.index, b.buffer_ref, b.offset, &content);
             // TEMP (lab): which fragment functions bind a buffer they read
             // without a bound, once per (function, index) — the whole binds
             // left after ABSENT_NEUTRAL (p048: ~55k a phase, 4 GB of windows).
@@ -12727,8 +13008,39 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                                     SampledSourceRequest::Staged(..) => "staged".into(),
                                 };
                                 stale_watch::note(req.task_id, c.mapping_id, c.texture_ref, Vec::new(), || {
-                                    format!("  samples ref={texture_ref} {rw}x{rh} mid={mid} {what}")
+                                    format!("  samples ref={texture_ref} {rw}x{rh} mid={mid} {what} (draw ggen={})", req.gva_alloc_gen)
                                 });
+                                // Every MSAA-target draw (once per draw) and every read of
+                                // a GVA resident by a draw into a mapped surface, unringed.
+                                if req.task_id != 1 {
+                                    if c.sample_count > 1 {
+                                        crate::observe::off(format!(
+                                            "lab_msaa_w task={} gva={:#x} gen={} pipe={} t={}",
+                                            req.task_id,
+                                            c.target_gva,
+                                            req.gva_alloc_gen,
+                                            req.pipeline_ref,
+                                            crate::observe::elapsed_us()
+                                        ));
+                                    }
+                                    if let SampledSourceRequest::Target(
+                                        crate::backend::vulkan::engine::TargetIdentity::Gva { gva, generation, .. },
+                                        _,
+                                    ) = &src
+                                    {
+                                        if c.mapping_id != 0 {
+                                            crate::observe::off(format!(
+                                                "lab_msaa_r task={} gva={:#x} gen={} tile={} pipe={} t={}",
+                                                req.task_id,
+                                                gva,
+                                                generation,
+                                                c.mapping_id,
+                                                req.pipeline_ref,
+                                                crate::observe::elapsed_us()
+                                            ));
+                                        }
+                                    }
+                                }
                             }
                         }
                         if let SampledSourceRequest::GuestRuns(runs, ..) = &src {
@@ -15742,6 +16054,14 @@ fn depth_state_for(
                 clear_value: s.clear_stencil,
             })
     });
+    // TEMP (lab, `REIMS_VGPU_LAB_DEPTH_TEST_OFF=1`): no depth test, no depth
+    // writes (diagnostic only: Metal ordering by depth is lost).
+    static TEST_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let test = if *TEST_OFF.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DEPTH_TEST_OFF").as_deref() == Ok("1")) {
+        None
+    } else {
+        test
+    };
     crate::backend::vulkan::engine::DepthState {
         identity: depth_chain_identity(req, stencil.is_some()),
         test_enable: test.is_some(),
@@ -15776,11 +16096,24 @@ pub(super) fn depth_chain_identity(
         return None;
     }
     if let Some(depth) = req.depth_attach.as_ref().filter(|d| d.texture_ref != 0) {
+        // TEMP (lab, `REIMS_VGPU_LAB_DEPTH_PER_TARGET=1`): one depth resident per
+        // colour target, so passes into different tiles never share depth.
+        static PER_TARGET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let generation = if *PER_TARGET
+            .get_or_init(|| std::env::var("REIMS_VGPU_LAB_DEPTH_PER_TARGET").as_deref() == Ok("1"))
+        {
+            (1u64 << 63)
+                | (u64::from(c0.mapping_id) << 40)
+                | (u64::from(c0.texture_ref) << 20)
+                ^ (c0.target_gva >> 12)
+        } else {
+            0
+        };
         return Some(crate::backend::vulkan::engine::TargetIdentity::Texture {
             ref_: depth.texture_ref,
             width,
             height,
-            generation: 0,
+            generation,
             stencil: with_stencil,
         });
     }
@@ -21472,6 +21805,26 @@ pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
 /// IOSurface expects prior content (Load + partial coverage) and where from.
 /// TEMP (lab, STALE_WATCH): [`lab_tile_draw`] plus the render identity the draw lands in.
 pub(crate) fn lab_tile_draw_with(state: &crate::model::DeviceState, req: &DrawEncodeRequest) {
+    // TEMP (lab, `REIMS_VGPU_LAB_DRAW_WAIT=pre`): the device idle before a pass
+    // into a tile-sized mapped app surface opens.
+    {
+        static PRE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *PRE.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DRAW_WAIT").as_deref() == Ok("pre"))
+            && req.task_id != 1
+            && !req.continues_render_pass
+        {
+            if let Some(c) = req.colors.first() {
+                if c.mapping_id != 0
+                    && (c.width == 320 || c.width == 512 || (900..=1100).contains(&c.width))
+                    && (c.height == 256 || c.height == 320)
+                {
+                    crate::backend::vulkan::engine::lab_wait_idle();
+                }
+            }
+        }
+    }
+    lab_shared_pages(state);
+    stale_watch::DRAW_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(c) = req.colors.first() {
         if stale_watch::on() {
             let rid = pass_inv::render_identity(state, req);
@@ -21483,14 +21836,74 @@ pub(crate) fn lab_tile_draw_with(state: &crate::model::DeviceState, req: &DrawEn
             stale_watch::ws_identity(c.mapping_id, mapper_ref_texture_render_identity(state, req));
         }
         if c.mapping_id != 0 && req.task_id != 1 {
-            stale_watch::identity(
-                req.task_id,
-                c.mapping_id,
-                mapper_ref_texture_render_identity(state, req),
-            );
+            let id = mapper_ref_texture_render_identity(state, req);
+            if !req.continues_render_pass {
+                if let Some(id) = id.as_ref() {
+                    stale_watch::pass_snap(c.mapping_id, req.pipeline_ref, id);
+                }
+            }
+            stale_watch::identity(req.task_id, c.mapping_id, id);
         }
     }
     lab_tile_draw(req);
+}
+
+/// TEMP (lab, STALE_WATCH): mapper surfaces that share guest pages - one
+/// IOSurface mapped twice (say by the app that draws it and by the window
+/// server that composites it) is two mapping ids over the same pages, and a
+/// write through one must show through the other. Every 2 s, each pair of mapped
+/// ids with common pages, once per (pair, sizes).
+fn lab_shared_pages(state: &crate::model::DeviceState) {
+    if !stale_watch::on() {
+        return;
+    }
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::observe::elapsed_us() / 1000;
+    let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < 2000
+        || LAST
+            .compare_exchange(last, now, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let shift = state.page_shift;
+    let mut owner: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    let mut pairs: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    for (&mid, m) in &state.mappings {
+        if !m.mapped {
+            continue;
+        }
+        for &e in &m.page_entries {
+            let Some(gpa) = crate::protocol::iosurface_pages::entry_gpa_shift(e, shift) else {
+                continue;
+            };
+            match owner.insert(gpa, mid) {
+                Some(other) if other != mid => *pairs.entry((other.min(mid), other.max(mid))).or_insert(0) += 1,
+                _ => {}
+            }
+        }
+    }
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(u32, u32, u32, u32, u32, u32)>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+    for ((a, b), n) in pairs {
+        let (ma, mb) = (&state.mappings[&a], &state.mappings[&b]);
+        let key = (a, b, ma.width, ma.height, mb.width, mb.height);
+        if seen.insert(key) {
+            crate::observe::off(format!(
+                "lab_shared_pages mid={a} {}x{} gen={} pages={} mid={b} {}x{} gen={} pages={} shared={n} t={now}",
+                ma.width,
+                ma.height,
+                ma.map_generation,
+                ma.page_entries.len(),
+                mb.width,
+                mb.height,
+                mb.map_generation,
+                mb.page_entries.len()
+            ));
+        }
+    }
 }
 
 pub(crate) fn lab_tile_draw(req: &DrawEncodeRequest) {
@@ -21566,14 +21979,25 @@ fn lab_tile_draw_line(req: &DrawEncodeRequest) -> String {
         .filter(|t| t.texture_ref != 0)
         .map(|t| format!("{}:{}", t.index, t.texture_ref))
         .collect();
+    let ds = format!(
+        "dss={} d={} s={}",
+        req.depth_stencil_ref,
+        req.depth_attach
+            .as_ref()
+            .map_or("-".to_string(), |d| format!("{}/l{}/s{}/c{}", d.texture_ref, d.load_action, d.store_action, d.clear_depth)),
+        req.stencil_attach
+            .as_ref()
+            .map_or("-".to_string(), |d| format!("{}/l{}/s{}/c{}", d.texture_ref, d.load_action, d.store_action, d.clear_stencil)),
+    );
     format!(
-        "task={} mid={} {}x{} ref={} gva={:#x} s={} msrc={} load={} store={} cont={} pipe={} prim={} inst={} {geo} sc=[{sc}] vp=[{vp}] tex=[{}] t={}",
+        "task={} mid={} {}x{} ref={} gva={:#x} ggen={} s={} msrc={} load={} store={} cont={} pipe={} prim={} inst={} {geo} sc=[{sc}] vp=[{vp}] tex=[{}] {ds} t={}",
         req.task_id,
         c.mapping_id,
         c.width,
         c.height,
         c.texture_ref,
         c.target_gva,
+        req.gva_alloc_gen,
         c.sample_count,
         c.multisample_source_ref,
         c.load_action,

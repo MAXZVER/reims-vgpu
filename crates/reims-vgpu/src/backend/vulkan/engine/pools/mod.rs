@@ -542,6 +542,9 @@ pub(crate) struct ResourcePools {
 pub(crate) struct EntryState {
     /// In-use staging slots returned after submit/wait.
     staging_live: Vec<BufferSlot>,
+    /// TEMP (lab, INFLIGHT_VERIFY): what this command buffer's buffer binds held
+    /// when recorded, checked again when its fence retires.
+    lab_verify: Vec<LabVerify>,
     /// TEMP (lab, PASS_STAGE): worker-arena windows the command buffer now
     /// recording reads — one reference each, sealed with the entry and
     /// released at its retire, exactly the lifetime `staging_live` gives a
@@ -1462,7 +1465,33 @@ impl ResourcePools {
 /// snapshots are different: their contents expire with this command buffer, so
 /// they remain here until its fence retires and then return to their scratch
 /// pool.
+/// TEMP (lab, `REIMS_VGPU_LAB_INFLIGHT_VERIFY=1`): one recorded buffer bind and
+/// a hash of the bytes it held when recorded.
+pub(crate) enum LabVerify {
+    /// A host-visible staging span the GPU reads.
+    Staging { ptr: usize, len: usize, hash: u64, t: u64 },
+    /// Guest RAM the GPU reads at execute time (an import or a gather).
+    Guest { content: super::types::BufferContent, hash: u64, t: u64 },
+}
+
+pub(crate) fn lab_verify_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_INFLIGHT_VERIFY").as_deref() == Ok("1"))
+}
+
+pub(crate) fn lab_verify_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for chunk in bytes.chunks(8) {
+        let mut w = [0u8; 8];
+        w[..chunk.len()].copy_from_slice(chunk);
+        h = (h ^ u64::from_le_bytes(w)).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(29);
+    }
+    h ^ bytes.len() as u64
+}
+
 pub(crate) struct PendingGpuCleanup {
+    /// TEMP (lab, INFLIGHT_VERIFY): see [`LabVerify`].
+    lab_verify: Vec<LabVerify>,
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     /// The guest-scatter sets, kept apart from `dsets` because they recycle
     /// rather than free — see [`ResourcePools::scatter_dset_free`].
