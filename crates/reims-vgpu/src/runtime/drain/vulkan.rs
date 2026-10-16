@@ -60,6 +60,9 @@ fn note_stamp_guest_ref_refusal(refusal: &crate::runtime::guest_ram_map::MapRefu
         // The stamp is a CPU store through QEMU's own mapping, never a GPU
         // write, so no stamp site asks `write_refusal`; the arm is for totality.
         MapRefusal::WritesNarrowed => "stamp_guest_ref_writes_narrowed",
+        // Nor does any stamp site ask `read_refusal` — the word is stored, not
+        // gathered — so this arm exists for the same totality.
+        MapRefusal::ReadsNarrowed => "stamp_guest_ref_reads_narrowed",
     };
     note_store_route(route);
 }

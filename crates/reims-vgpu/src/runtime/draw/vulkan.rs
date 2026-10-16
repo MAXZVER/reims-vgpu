@@ -6539,6 +6539,21 @@ fn guest_page_window<M: HostOps>(
     span: u64,
 ) -> Option<std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>> {
     use crate::runtime::guest_ram_map::MapRefusal;
+    // TEMP (lab, GUEST_IMPORT_READS): the read rails' narrow gate, asked
+    // before the walk `references_for_runs` would pay for. Every caller of
+    // this wrapper is a site where the GPU would *read* guest RAM through the
+    // import — sampled sources, vertex/index binds, LOAD seeds — and `None` is
+    // the routing answer each of them already takes on a host that cannot
+    // import, so what a narrowed boot runs is the CPU gather over `runs`. The
+    // debt payments never come through here: they ask for their references on
+    // the write side, which keeps the import (b626 turned whole-import reads
+    // into a 3.5x canvas loss on PCIe x8; this is the arm that splits the two
+    // directions the other way from `zc_buf_writes_narrowed`).
+    if crate::runtime::guest_ram_map::read_refusal().is_some() {
+        crate::runtime::drain::note_store_route("zc_buf_reads_narrowed");
+        note_read_via_pages(span);
+        return None;
+    }
     match crate::runtime::guest_ram_map::references_for_runs(host, gpas, page, head_offset, span) {
         Ok(runs) => {
             // Banded on the way through as well as on the refusals below,
@@ -6547,6 +6562,7 @@ fn guest_page_window<M: HostOps>(
             // a rail whose regions grew without anyone noticing would read here
             // first.
             crate::runtime::drain::note_store_route(band_runs(runs.len()));
+            note_read_via_import(span);
             Some(std::sync::Arc::new(runs))
         }
         Err(refusal) => {
@@ -6570,10 +6586,35 @@ fn guest_page_window<M: HostOps>(
                 // A read site: `references_for_runs` never produces this, only
                 // the write licences' `write_refusal` does.
                 MapRefusal::WritesNarrowed => "zc_buf_writes_narrowed",
+                // The other totality arm: the narrow gate above takes
+                // reads-narrowed windows before this match, and no write site
+                // routes through this wrapper, so this names a state only the
+                // compiler asks to describe.
+                MapRefusal::ReadsNarrowed => "zc_buf_reads_narrowed",
             });
+            note_read_via_pages(span);
             None
         }
     }
+}
+
+/// TEMP (lab, GUEST_IMPORT_READS): which rail served each guest window the
+/// draw asked to read — the import (`read_via_import`, the GPU binds or copies
+/// the stretches itself) or the pages (`read_via_pages`, the CPU gather walks
+/// the host-mapped `runs`). Counted at the window, not the bind, so the pair
+/// partitions every `guest_page_window` caller the same way and an A/B reads
+/// the switch off them directly: the narrowed arm's `read_via_import` is zero
+/// and `read_via_pages` takes the bytes the base arm still imports.
+fn note_read_via_import(span: u64) {
+    crate::runtime::drain::note_store_route_n("read_via_import", 1);
+    crate::runtime::drain::note_store_route_n("read_via_import_bytes", span);
+}
+
+/// TEMP (lab, GUEST_IMPORT_READS): the [`note_read_via_import`] twin for a
+/// window the CPU will read out of guest pages, narrowed or naturally refused.
+fn note_read_via_pages(span: u64) {
+    crate::runtime::drain::note_store_route_n("read_via_pages", 1);
+    crate::runtime::drain::note_store_route_n("read_via_pages_bytes", span);
 }
 
 /// Band a window's stretch count for the census.
@@ -6822,6 +6863,20 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
     rail: PackedResourceRail,
 ) -> bool {
     use crate::runtime::bound_buffers::{PackedBuffer, PackedBufferResolution};
+
+    // TEMP (lab, GUEST_IMPORT_READS): a packed alias exists so the GPU can
+    // *read* the bound buffer straight out of the guest's pages, which is the
+    // rail this narrowing takes away; the caller's copy-backed fallback over
+    // `runs` is the CPU staging it falls to. Asked at the top and before the
+    // held-resolution lookup because with the reads narrowed from the first
+    // call nothing can ever have been built or held.
+    if crate::runtime::guest_ram_map::read_refusal().is_some() {
+        crate::runtime::drain::note_store_route(match rail {
+            PackedResourceRail::Buffer => "zc_packed_reads_narrowed",
+            PackedResourceRail::LinearSample => "zc_packed_lin_reads_narrowed",
+        });
+        return false;
+    }
 
     if let Some(held) = state.bound_buffers.packed(task_id, resource_ref) {
         let matches = match held {
@@ -7074,6 +7129,17 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
 ) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
     use crate::backend::vulkan::engine::{GuestRun, GuestRunSource};
     use crate::runtime::guest_ram::GuestRef;
+
+    // TEMP (lab, GUEST_IMPORT_READS): this rail samples the mapping straight
+    // out of its imported pages, which is a GPU read of guest RAM — the thing
+    // this narrowing moves back to the CPU. `None` hands the caller to the
+    // rung below, the gather over `runs`, exactly as on a host whose shim
+    // cannot hold a stable alias. The write twin of this import (the shared
+    // render target) does not come through here and keeps the import.
+    if crate::runtime::guest_ram_map::read_refusal().is_some() {
+        crate::runtime::drain::note_store_route("zc_mapping_reads_narrowed");
+        return None;
+    }
 
     let MappedSamplePlane {
         mapping_id,

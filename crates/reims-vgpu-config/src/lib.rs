@@ -243,6 +243,37 @@ pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 /// the CPU on every rail.
 pub const GUEST_IMPORT_WRITES: &str = "REIMS_VGPU_GUEST_IMPORT_WRITES";
 
+/// `off` keeps the guest-RAM import for the GPU's *writes* — debt payments
+/// (`copy_target_to_guest_pages`, whose `vkCmdCopyImageToBuffer` lands frames
+/// straight in the guest's imported pages), the Store licences, storage-buffer
+/// binds — and takes every rail by which the GPU would *read* guest RAM
+/// through it onto the copying rails instead: draw-time sampled gathers,
+/// vertex/index zero-copy binds, packed aliases over bound buffers, and the
+/// mapping-import sampled source. Each read site declines exactly as it does
+/// when the host cannot import, so a narrowed boot runs the write half of the
+/// import-on arm and the read half of the import-off arm.
+///
+/// # Why a narrowing exists
+///
+/// It is the mirror of [`GUEST_IMPORT_WRITES`], for the host where the two
+/// directions have opposite signs. On a discrete GPU on a narrow bus (an RTX
+/// 4060 at PCIe x8), draw-time gathers out of host memory are bus copies the
+/// frame waits for: with the import on and the writes narrowed, a canvas boot
+/// read 19.2 present_hz against 68.3 on the copying rails — **3.5x worse**
+/// (lab b626) — while on a wide-bus host (a 4090 at x16) the same reads are
+/// worth +5-6 % (hq058). But the GPU-side *payments* are what the v6e
+/// readback storm wants off the drain worker either way (~155 MB/s of
+/// `target_reads` moving to `target_gpu_copies` at ~10 ms/s of bus), and until
+/// this switch the only way to keep them was to keep the reads too.
+///
+/// So this is the Intel combination's switch: writes and payments keep the
+/// import, assemblies go back to the CPU rails an import-off host runs, at the
+/// import-off arm's measured frame rate rather than the narrowed-writes arm's.
+///
+/// Narrowing only, as every switch here: it cannot enable an import the host
+/// refuses, and with the import off it changes nothing.
+pub const GUEST_IMPORT_READS: &str = "REIMS_VGPU_GUEST_IMPORT_READS";
+
 /// `off` keeps every GPU-direct write into guest RAM except one: a render or
 /// compute Store landed straight into a mapper-ref-texture surface (an
 /// IOSurface mapping) through `licence_mapper_ref_texture_surface`. That write
@@ -2076,6 +2107,7 @@ mod tests {
             COMPUTE_GATHER,
             SAMPLED_IDENTITY,
             GATHER_AUDIT_ALL,
+            GUEST_IMPORT_READS,
         ] {
             assert!(ALL.contains(&name), "{name} is not in the registry");
             let short = name
@@ -2120,5 +2152,20 @@ mod tests {
             line.contains("guest_import=unrecognized(disabled)"),
             "{line}"
         );
+    }
+
+    /// The reads narrowing says its arm on the boot line, so an A/B pair is
+    /// recoverable from the logs alone. The reads arm is the one whose two
+    /// arms differ only in where the *assemblies* run, so a boot that cannot
+    /// say which it ran is a boot whose fps number attributes nothing.
+    #[test]
+    fn the_reads_narrowing_reaches_the_boot_line() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock serializes every mutation of this variable in this
+        // process; `report_line` below is the only reader.
+        unsafe { std::env::set_var(GUEST_IMPORT_READS, "off") };
+        let line = report_line();
+        unsafe { std::env::remove_var(GUEST_IMPORT_READS) };
+        assert!(line.contains("guest_import_reads=off"), "{line}");
     }
 }
