@@ -2147,6 +2147,8 @@ pub enum GvaWritebackDecline {
     /// The **copying** arm read the frame and could not write it into the guest
     /// pages its licence names. A loss, for the same reason as above.
     CopiedWriteRefused { err: crate::runtime::host::MemError },
+    /// Target pages were released by the guest before this writeback landed.
+    PagesNotOurs,
 }
 
 impl crate::observe::Decline for GvaWritebackDecline {
@@ -2162,12 +2164,13 @@ impl crate::observe::Decline for GvaWritebackDecline {
             Self::Engine { inner } => crate::observe::Decline::slug(inner),
             Self::CopiedReadRefused { .. } => "gvawb_copied_read_refused",
             Self::CopiedWriteRefused { .. } => "gvawb_copied_write_refused",
+            Self::PagesNotOurs => "gvawb_pages_not_ours",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::Unlicensed | Self::SpanIncomplete => Vec::new(),
+            Self::Unlicensed | Self::SpanIncomplete | Self::PagesNotOurs => Vec::new(),
             Self::FormatNeedsConversion { format } => vec![("fmt", format!("{format:#x}"))],
             Self::ResidentFormatMismatch { held, want } => vec![
                 ("resident", format!("{held:?}")),
@@ -2293,6 +2296,9 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         Ok(extent) => {
             crate::runtime::drain::note_store_route("gva_flush_gpu_direct");
             return Ok(extent);
+        }
+        Err(GvaWritebackDecline::PagesNotOurs) => {
+            return Err(GvaWritebackDecline::PagesNotOurs);
         }
         Err(decline) => decline,
     };
@@ -2422,6 +2428,20 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
     };
     let extent =
         u64::from(c0.height.saturating_sub(1)) * u64::from(c0.row_stride) + u64::from(tight);
+    if let Some(gpas) = pages.ordered_complete(c0.target_gva, state.page_size()) {
+        if let Some(armed_gpa) = state.host_writes.first_armed(&gpas) {
+            crate::runtime::drain::note_store_route("released_write_blocked");
+            crate::runtime::drain::note_store_route("released_write_blocked_site_gva_copied_write");
+            if crate::observe::first_sight("released_write_blocked_gva_copied", armed_gpa) {
+                crate::observe::fail(format!(
+                    "released_write_blocked site=gva_copied_write gva={:#x} gpa={armed_gpa:#x} \
+                     (target pages were released by the guest; copied GVA write declined to protect guest kernel)",
+                    c0.target_gva,
+                ));
+            }
+            return Err(GvaWritebackDecline::PagesNotOurs);
+        }
+    }
     crate::runtime::draw::write_gva_frame_within_skipping(
         state,
         host,
@@ -2654,6 +2674,18 @@ pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
     let Some(gpas) = pages.ordered_complete(c0.target_gva, page_size) else {
         return Err(GvaWritebackDecline::SpanIncomplete);
     };
+    if let Some(armed_gpa) = state.host_writes.first_armed(&gpas) {
+        crate::runtime::drain::note_store_route("released_write_blocked");
+        crate::runtime::drain::note_store_route("released_write_blocked_site_gva_plane_writeback");
+        if crate::observe::first_sight("released_write_blocked_gva_plane", armed_gpa) {
+            crate::observe::fail(format!(
+                "released_write_blocked site=gva_plane_writeback gva={:#x} gpa={armed_gpa:#x} \
+                 (target pages were released by the guest; GVA plane writeback declined to protect guest kernel)",
+                c0.target_gva,
+            ));
+        }
+        return Err(GvaWritebackDecline::PagesNotOurs);
+    }
     let in_page = c0.target_gva % page_size;
     if !in_page.is_multiple_of(bpt) {
         return Err(GvaWritebackDecline::OffsetNotTexelAligned { in_page });
