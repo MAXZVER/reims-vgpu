@@ -8541,6 +8541,202 @@ fn a_stream_resolves_a_reference_once_and_its_binds_share_the_retained_object() 
     }
 }
 
+/// TEMP (lab, WALK_XMEMO): the batch behind the stream memo. A doorbell's
+/// second command buffer answers its first bind of a reference from the first
+/// CB's resolution — counted, because the registry would hand back the same
+/// retained object either way and only the counters say who answered.
+#[test]
+fn a_batches_second_command_buffer_answers_from_the_firsts_resolution() {
+    use crate::runtime::drain::store_route_count;
+    let bind = set_vertex_buffer_7();
+    let op = wire_render::OPCODE_SET_VERTEX_BUFFER;
+    let hits = || store_route_count("walk_xmemo_hit");
+    let misses = || store_route_count("walk_xmemo_miss");
+    for xmemo in [true, false] {
+        walk_memo::with(true, || {
+            walk_memo::with_walk_xmemo(xmemo, || {
+                let (host, mut state) = device_with_one_buffer();
+                let mut out = ExecResult::default();
+                // The packet the batch's first CB runs under.
+                walk_memo::begin_packet(&state);
+                let mut first = StreamAccum {
+                    pipeline_ref: 61,
+                    ..Default::default()
+                };
+                let m0 = misses();
+                handle_render_record(&mut state, &host, 1, op, &bind, &mut out, &mut first);
+                let resolved = first.vertex_buffers[0].resource.clone().expect("retained");
+                assert_eq!(
+                    misses() - m0,
+                    u64::from(xmemo),
+                    "xmemo {xmemo}: the first bind of the batch is a miss exactly when the batch \
+                     map is in play"
+                );
+                // The batch's second CB: a fresh stream memo, the batch's
+                // answer behind it.
+                let mut second = StreamAccum {
+                    pipeline_ref: 61,
+                    ..Default::default()
+                };
+                let (h1, m1) = (hits(), misses());
+                handle_render_record(&mut state, &host, 1, op, &bind, &mut out, &mut second);
+                assert!(
+                    Arc::ptr_eq(
+                        &resolved,
+                        second.vertex_buffers[0].resource.as_ref().unwrap()
+                    ),
+                    "xmemo {xmemo}: the second CB binds the object the first resolved"
+                );
+                assert_eq!(
+                    hits() - h1,
+                    u64::from(xmemo),
+                    "xmemo {xmemo}: only the batch's map answers the second CB's first bind"
+                );
+                assert_eq!(misses() - m1, 0, "xmemo {xmemo}: no miss after the batch answered");
+            });
+        });
+    }
+}
+
+/// TEMP (lab, WALK_XMEMO): a names bump between two CBs of a batch retires the
+/// batch's answers — the guard is the same one `RES_XMEMO` stands on, and the
+/// events that bump it (a declare, a delete, a non-EXEC packet) are the events
+/// that can change what a reference names.
+#[test]
+fn a_names_bump_retires_the_batchs_answers() {
+    use crate::runtime::drain::store_route_count;
+    let bind = set_vertex_buffer_7();
+    let op = wire_render::OPCODE_SET_VERTEX_BUFFER;
+    walk_memo::with(true, || {
+        walk_memo::with_walk_xmemo(true, || {
+            let (host, mut state) = device_with_one_buffer();
+            let mut out = ExecResult::default();
+            walk_memo::begin_packet(&state);
+            let mut first = StreamAccum {
+                pipeline_ref: 61,
+                ..Default::default()
+            };
+            handle_render_record(&mut state, &host, 1, op, &bind, &mut out, &mut first);
+            let resolved = first.vertex_buffers[0].resource.clone().expect("retained");
+            state.bump_names_gen();
+            let mut second = StreamAccum {
+                pipeline_ref: 61,
+                ..Default::default()
+            };
+            let (h1, m1) = (
+                store_route_count("walk_xmemo_hit"),
+                store_route_count("walk_xmemo_miss"),
+            );
+            handle_render_record(&mut state, &host, 1, op, &bind, &mut out, &mut second);
+            assert_eq!(h1, store_route_count("walk_xmemo_hit"), "the bump retired the answer");
+            assert_eq!(
+                m1 + 1,
+                store_route_count("walk_xmemo_miss"),
+                "the second CB paid its resolution again"
+            );
+            assert!(
+                Arc::ptr_eq(
+                    &resolved,
+                    second.vertex_buffers[0].resource.as_ref().unwrap()
+                ),
+                "the registry still holds the object the first CB resolved"
+            );
+        });
+    });
+}
+
+/// TEMP (lab, WALK_XMEMO): a reset empties every namespace wholesale, and the
+/// reset bumps the global names counter for exactly that reason — task ids and
+/// object refs are reused across the boundary, so a pre-reset answer must not
+/// survive it. Without the bump the second CB would bind the pre-reset
+/// resource against a task the guest no longer has.
+#[test]
+fn a_reset_retires_the_batchs_answers() {
+    let bind = set_vertex_buffer_7();
+    let op = wire_render::OPCODE_SET_VERTEX_BUFFER;
+    walk_memo::with(true, || {
+        walk_memo::with_walk_xmemo(true, || {
+            let (host, mut state) = device_with_one_buffer();
+            let mut out = ExecResult::default();
+            walk_memo::begin_packet(&state);
+            let mut first = StreamAccum {
+                pipeline_ref: 61,
+                ..Default::default()
+            };
+            handle_render_record(&mut state, &host, 1, op, &bind, &mut out, &mut first);
+            assert!(first.vertex_buffers[0].resource.is_some());
+            let gen_before = state.names_gen();
+            state.reset();
+            assert_ne!(
+                state.names_gen(),
+                gen_before,
+                "the reset bumped the names counter the batch's answers stand on"
+            );
+            // The next packet latches the session it runs under.
+            walk_memo::begin_packet(&state);
+            let mut second = StreamAccum {
+                pipeline_ref: 61,
+                ..Default::default()
+            };
+            handle_render_record(&mut state, &host, 1, op, &bind, &mut out, &mut second);
+            assert!(
+                second.vertex_buffers[0].resource.is_none(),
+                "the second CB resolved against the emptied namespaces, not the retired answer"
+            );
+        });
+    });
+}
+
+/// TEMP (lab, WALK_XMEMO): the admission side's name and storage answers die
+/// with the same two guards the walk side's do.
+#[test]
+fn the_admission_memos_answers_die_with_their_guards() {
+    use reims_vgpu_core::access::{BackingId, ResourceKey};
+    let (host, mut state) = device_with_one_buffer();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum {
+        pipeline_ref: 61,
+        ..Default::default()
+    };
+    let op = wire_render::OPCODE_SET_VERTEX_BUFFER;
+    let bind = set_vertex_buffer_7();
+    // One bind declares the object, so a real name exists to memoize.
+    handle_render_record(&mut state, &host, 1, op, &bind, &mut out, &mut acc);
+    let name = state.object_name(1, 7).expect("the buffer is named once resolved");
+    walk_memo::with_walk_xmemo(true, || {
+        let session = state.session_generation();
+        walk_memo::xmemo_name_keep(&state, session, 1, 7, name);
+        assert_eq!(
+            walk_memo::xmemo_name(&state, session, 1, 7),
+            Some(name),
+            "the batch answers the name under its guards"
+        );
+        let key = ResourceKey {
+            backing: BackingId(5),
+            heap: None,
+        };
+        walk_memo::xmemo_storage_keep(&state, session, 1, 7, key);
+        assert_eq!(walk_memo::xmemo_storage(&state, session, 1, 7), Some(key));
+        // A names bump retires both.
+        state.bump_names_gen();
+        assert_eq!(walk_memo::xmemo_name(&state, session, 1, 7), None);
+        assert_eq!(walk_memo::xmemo_storage(&state, session, 1, 7), None);
+        // So does a session the answers were not kept under. The ask itself
+        // moves the guard: a generation that closed is the world moving, and
+        // the answers kept under the closed one die with the asking.
+        walk_memo::xmemo_name_keep(&state, session, 1, 7, name);
+        walk_memo::xmemo_storage_keep(&state, session, 1, 7, key);
+        let other = session.next();
+        assert_eq!(walk_memo::xmemo_name(&state, other, 1, 7), None);
+        assert_eq!(walk_memo::xmemo_storage(&state, other, 1, 7), None);
+        assert_eq!(
+            walk_memo::xmemo_name(&state, session, 1, 7),
+            None,
+            "the ask under the closed generation retired the answers it stood over"
+        );
+    });
+}
+
 /// Binding a slot what it already holds leaves the table the previous draw
 /// shares; binding it anything else forks.
 #[test]
