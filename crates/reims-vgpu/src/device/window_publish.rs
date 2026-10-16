@@ -57,6 +57,13 @@ pub(crate) struct WindowLink {
     /// the only thing that knows a frame exists, so it is the only thing that
     /// can end the polling.
     wake: crate::host_window::present::WindowWakeHandle,
+    /// Latest guest cursor glyph for the window (latest-wins, RGBA8), beside
+    /// `frames`. Written with `try_lock` only; see [`publish_window_cursor`].
+    cursor: crate::host_window::guest_cursor::CursorSlot,
+    /// `CursorState::glyph_serial` last handed to `cursor` (0 = none). A glyph
+    /// whose offer was skipped on contention stays behind this and is retried
+    /// on the next tranche.
+    cursor_published: u64,
     /// `(mapping_id, generation, content_epoch, present_epoch)` of the last
     /// frame published.
     ///
@@ -150,6 +157,9 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     // covers the gap, so a publish that beats the loop's creation costs latency
     // rather than a frame.
     let wake = WindowWaker::new();
+    // The guest cursor rides beside the frames: the drain offers each newly
+    // loaded glyph here at the tranche tail and the window applies it.
+    let cursor = crate::host_window::guest_cursor::new_slot();
     // Weak so a live window does not pin a destroyed device; post-destroy input
     // upgrades to None and is dropped (the guest is gone anyway).
     let weak = Arc::downgrade(&slot);
@@ -195,6 +205,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
             cfg,
             on_input,
             Arc::clone(&frames),
+            Arc::clone(&cursor),
             Arc::clone(&stop),
             Arc::clone(&exited),
             Arc::clone(&wake),
@@ -211,12 +222,15 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         cfg,
         on_input,
         Arc::clone(&frames),
+        Arc::clone(&cursor),
         Arc::clone(&stop),
         Arc::clone(&wake),
     ));
     *link = Some(WindowLink {
         frames,
         wake,
+        cursor,
+        cursor_published: 0,
         last: (u32::MAX, u32::MAX, u32::MAX, u64::MAX),
         seq: 0,
         bgra_short_geom: None,
@@ -284,6 +298,9 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
         note_window_publish(WindowPublish::NoWindow);
         return;
     };
+    // Before the frame gates below: a glyph is not a frame, and an unchanged
+    // desktop (SameKey) is exactly when a hover changes the pointer.
+    publish_window_cursor(link, state);
     let p = &state.present;
     if !p.frame_valid || p.frame_width == 0 || p.frame_height == 0 {
         note_window_publish(WindowPublish::NoFrame);
@@ -375,6 +392,64 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     crate::runtime::census::present_proxy::host_window_publish::note(published);
     if published {
         link.last = key;
+    }
+}
+
+/// Offer the guest's latest cursor glyph to the window, never blocking.
+///
+/// `load_cursor_glyph` (drain op 0x04) marks a glyph pending by bumping
+/// `CursorState::glyph_serial`; the drain itself holds only `DeviceState`, so
+/// the hand-over happens here, on the same worker at the same tranche's tail,
+/// where the link is reachable. The ARGB->RGBA conversion is done once, here.
+/// The slot is taken with `try_lock`: if the window thread is reading it, the
+/// glyph stays pending (route `host_window_cursor_publish_skipped`) and the
+/// next tranche offers it again. A published glyph wakes the window loop, as a
+/// frame does. A glyph that cannot be converted is named once per reason
+/// (`host_window_cursor_fail`) and not retried.
+#[cfg(feature = "host-window")]
+fn publish_window_cursor(link: &mut WindowLink, state: &crate::model::DeviceState) {
+    use crate::host_window::guest_cursor::{self, CursorOffer};
+    let c = &state.cursor;
+    let offer = guest_cursor::offer_cursor(
+        &link.cursor,
+        &mut link.cursor_published,
+        guest_cursor::mode(),
+        c.glyph_serial,
+        c.glyph_ready,
+        (
+            u32::from(c.width),
+            u32::from(c.height),
+            u32::from(c.hot_x),
+            u32::from(c.hot_y),
+        ),
+        &c.pixels,
+    );
+    match offer {
+        CursorOffer::Unchanged | CursorOffer::NotWanted => {}
+        CursorOffer::Published => {
+            crate::runtime::drain::note_store_route("host_window_cursor_published");
+            link.wake.wake();
+        }
+        CursorOffer::Skipped => {
+            crate::runtime::drain::note_store_route("host_window_cursor_publish_skipped");
+        }
+        CursorOffer::Refused(refusal) => {
+            crate::runtime::drain::note_store_route("host_window_cursor_publish_refused");
+            static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&refusal.slug()) {
+                seen.push(refusal.slug());
+                crate::observe::fail(format!(
+                    "host_window_cursor_fail reason={} side=publish {}x{} hot=({},{}) pixels={}",
+                    refusal.slug(),
+                    c.width,
+                    c.height,
+                    c.hot_x,
+                    c.hot_y,
+                    c.pixels.len()
+                ));
+            }
+        }
     }
 }
 

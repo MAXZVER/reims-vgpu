@@ -39,6 +39,7 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use super::capture::{Capture, CaptureEngaged, CaptureMode};
+use super::guest_cursor::{self, CursorSlot};
 use super::input_map;
 use super::keyboard::{Grab, KeyEffect, Keyboard};
 use crate::backend::window::WindowPresentOutcome;
@@ -589,12 +590,13 @@ pub fn spawn(
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
+    cursor: CursorSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
 ) -> std::thread::JoinHandle<Result<(), WindowError>> {
     std::thread::Builder::new()
         .name("reims-vgpu-window".to_string())
-        .spawn(move || run(config, on_input, frames, stop, wake))
+        .spawn(move || run(config, on_input, frames, cursor, stop, wake))
         .expect("spawn reims-vgpu-window thread")
 }
 
@@ -605,12 +607,13 @@ pub fn run(
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
+    cursor: CursorSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
 ) -> Result<(), WindowError> {
     let event_loop = build_event_loop()?;
     wake.arm(event_loop.create_proxy());
-    let mut app = App::new(config, on_input, frames, stop);
+    let mut app = App::new(config, on_input, frames, cursor, stop);
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::RunApp(e.to_string()))
@@ -642,6 +645,7 @@ pub fn start_main_thread(
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
+    cursor: CursorSlot,
     stop: StopFlag,
     exited: ExitedFlag,
     wake: WindowWakeHandle,
@@ -657,7 +661,7 @@ pub fn start_main_thread(
         }
         let event_loop = build_event_loop()?;
         wake.arm(event_loop.create_proxy());
-        let app = App::new(config, on_input, frames, stop);
+        let app = App::new(config, on_input, frames, cursor, stop);
         *slot = Some(MainThreadWindow {
             id,
             event_loop,
@@ -729,6 +733,12 @@ struct App {
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
+    /// Latest guest cursor glyph the drain offered; see
+    /// [`super::guest_cursor`] and [`App::refresh_cursor`].
+    cursor_slot: CursorSlot,
+    /// What the window's cursor currently shows, and the platform cursors
+    /// built so far (per content and scale).
+    guest_cursor: guest_cursor::CursorView<winit::window::CustomCursor>,
     /// Set by the device to request teardown; polled in `about_to_wait`.
     stop: StopFlag,
     /// True once a `WindowClosed` action has been emitted (UI close), so the
@@ -954,6 +964,9 @@ impl ApplicationHandler<FramePublished> for App {
                 // one, so without this the window would never draw.
                 window.request_redraw();
                 self.window = Some(window);
+                // The bundled arrow until the guest's first glyph, so the
+                // pointer over the guest desktop is never the host's own.
+                self.refresh_cursor(event_loop);
             }
             Err(error) => {
                 // One rule on every platform and every rail: a rail that
@@ -1009,6 +1022,12 @@ impl ApplicationHandler<FramePublished> for App {
                 // otherwise skip until the guest happened to produce a new
                 // frame, leaving the resized window blank.
                 self.force_redraw();
+                // The viewport ratio the guest glyph is scaled by moved.
+                self.refresh_cursor(event_loop);
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                // The bundled arrow is sized by the host display scale.
+                self.refresh_cursor(event_loop);
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -1093,6 +1112,9 @@ impl ApplicationHandler<FramePublished> for App {
         if self.stop.load(Ordering::Relaxed) {
             event_loop.exit();
         }
+        // A glyph published without a frame (hover over a still desktop), or a
+        // viewport change: one slot lock and a key compare per wake.
+        self.refresh_cursor(event_loop);
         // Pacing: ask for a redraw when the device says it published one, and
         // otherwise sleep to the backstop. Two earlier shapes are what this has
         // to stay clear of. Re-requesting a redraw from inside `RedrawRequested`
@@ -1133,15 +1155,33 @@ impl ApplicationHandler<FramePublished> for App {
     /// Windows' interactive move/resize runs a nested native message loop;
     /// `about_to_wait` need not run until the drag ends. A publish must request
     /// its paint here as well, through the same coalescing decision.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: FramePublished) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: FramePublished) {
         self.frame_pending = true;
+        // A cursor publish wakes the loop the same way a frame does; inside a
+        // Windows move/resize modal loop `about_to_wait` may not run, so the
+        // glyph is applied here too.
+        self.refresh_cursor(event_loop);
         #[cfg(target_os = "windows")]
         if let Some(window) = self.window.clone() {
             self.request_pending_redraw(&window);
-            _event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                 self.next_backstop,
             ));
         }
+    }
+}
+
+/// Name a cursor build failure on the fail channel once per distinct line
+/// prefix (reason + side), so a guest whose every glyph fails the same way
+/// does not write one line per pointer change.
+fn cursor_fail_once(line: String) {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let key: String = line.split(" seq=").next().unwrap_or(&line).to_string();
+    let key = key.split(" scale_q=").next().unwrap_or(&key).to_string();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&key) {
+        seen.push(key);
+        crate::observe::fail(line);
     }
 }
 
@@ -1172,11 +1212,19 @@ impl App {
     /// `start_main_thread` on macOS's main thread — and every field but the
     /// four they are given is fixed. Written out at each site, a field added
     /// to the struct could be initialised in one and missed in the other.
-    fn new(config: WindowConfig, on_input: InputSink, frames: FrameSlot, stop: StopFlag) -> Self {
+    fn new(
+        config: WindowConfig,
+        on_input: InputSink,
+        frames: FrameSlot,
+        cursor_slot: CursorSlot,
+        stop: StopFlag,
+    ) -> Self {
         Self {
             config,
             on_input,
             frames,
+            cursor_slot,
+            guest_cursor: guest_cursor::CursorView::new(),
             stop,
             closed_sent: false,
             window: None,
@@ -1302,6 +1350,126 @@ impl App {
             pointer_report(position, self.surface_dims(), self.guest_extent);
         self.cursor = (x, y);
         (self.on_input)(HostAction::input_pointer_move(x, y, width, height));
+    }
+
+    /// Show the guest's pointer glyph (or the bundled arrow) as this window's
+    /// cursor ([`super::guest_cursor`]).
+    ///
+    /// Rebuilds only when the [`guest_cursor::CursorKey`] moves: a new glyph
+    /// `seq`, a new viewport ratio (resize, guest mode change), or a new host
+    /// display scale for the arrow. Built cursors are cached per (content,
+    /// scale), so a guest that cycles arrow/I-beam/hand re-sends cost a lookup.
+    /// The platform applies the cursor inside the client area only, so the
+    /// desktop's own arrow returns outside the window.
+    ///
+    /// Fallbacks, each named: a guest glyph that cannot be built
+    /// (`host_window_cursor_fail side=guest`) shows the bundled arrow; an arrow
+    /// that cannot be built (`side=static`) restores the platform default.
+    /// Off (`REIMS_VGPU_WINDOW_GUEST_CURSOR=0`) sets nothing at all.
+    ///
+    /// On Windows winit's `create_custom_cursor` does not report a failed
+    /// `CreateIconIndirect` (it logs through `tracing` and `set_cursor` then
+    /// ignores it), so the failures this can name are the image ones.
+    fn refresh_cursor(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        if guest_cursor::mode() == guest_cursor::CursorMode::System {
+            if self.guest_cursor.first_report("system") {
+                crate::observe::off("host_window_cursor mode=system reason=disabled_by_env");
+            }
+            return;
+        }
+        let glyph = self.cursor_slot.lock().ok().and_then(|slot| slot.clone());
+        let viewport_q = guest_cursor::viewport_scale_q(self.surface_dims(), self.guest_extent);
+        let dpi_q = guest_cursor::scale_q(window.scale_factor());
+        let key = guest_cursor::desired_key(glyph.as_deref(), viewport_q, dpi_q);
+        if !self.guest_cursor.needs(key) {
+            return;
+        }
+        // Recorded before the build: a key that fails is named once and not
+        // rebuilt on every wake; a new glyph or scale tries again.
+        self.guest_cursor.applied = Some(key);
+        if let Some(glyph) = glyph.as_deref() {
+            let built = self.build_cursor(event_loop, glyph.content, key.scale_q, || {
+                guest_cursor::scale_image(
+                    glyph.width,
+                    glyph.height,
+                    glyph.hot_x,
+                    glyph.hot_y,
+                    &glyph.rgba,
+                    key.scale_q,
+                )
+                .ok_or_else(|| "glyph_scale".to_string())
+            });
+            match built {
+                Ok(cursor) => {
+                    self.apply_cursor(&window, cursor, "guest");
+                    return;
+                }
+                Err(reason) => cursor_fail_once(format!(
+                    "host_window_cursor_fail reason={reason} side=guest seq={} {}x{} scale_q={}",
+                    glyph.seq, glyph.width, glyph.height, key.scale_q
+                )),
+            }
+        }
+        let built = self.build_cursor(event_loop, guest_cursor::STATIC_CONTENT, dpi_q, || {
+            Ok(guest_cursor::static_arrow(dpi_q))
+        });
+        match built {
+            Ok(cursor) => self.apply_cursor(&window, cursor, "static"),
+            Err(reason) => {
+                cursor_fail_once(format!(
+                    "host_window_cursor_fail reason={reason} side=static scale_q={dpi_q}"
+                ));
+                window.set_cursor(winit::window::CursorIcon::Default);
+                crate::runtime::drain::note_store_route("host_window_cursor_set");
+                if self.guest_cursor.first_report("system") {
+                    crate::observe::off("host_window_cursor mode=system reason=static_failed");
+                }
+            }
+        }
+    }
+
+    /// A platform cursor for `(content, scale_q)`, from the cache or built from
+    /// `image`. Errors are a reason slug for `host_window_cursor_fail`.
+    fn build_cursor(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        content: u64,
+        scale_q: u32,
+        image: impl FnOnce() -> Result<guest_cursor::CursorImage, String>,
+    ) -> Result<winit::window::CustomCursor, String> {
+        if let Some(cursor) = self.guest_cursor.cached(content, scale_q) {
+            return Ok(cursor);
+        }
+        let image = image()?;
+        let source = winit::window::CustomCursor::from_rgba(
+            image.rgba,
+            image.width,
+            image.height,
+            image.hot_x,
+            image.hot_y,
+        )
+        .map_err(|error| format!("bad_image detail={}", detail_field(&error.to_string())))?;
+        let cursor = event_loop.create_custom_cursor(source);
+        self.guest_cursor.remember(content, scale_q, cursor.clone());
+        Ok(cursor)
+    }
+
+    /// Set the cursor, count it (`host_window_cursor_set`), and say once per run
+    /// which mode the window reached (`host_window_cursor mode=`).
+    fn apply_cursor(
+        &mut self,
+        window: &Window,
+        cursor: winit::window::CustomCursor,
+        label: &'static str,
+    ) {
+        window.set_cursor(cursor);
+        crate::runtime::drain::note_store_route("host_window_cursor_set");
+        if self.guest_cursor.first_report(label) {
+            crate::observe::off(format!("host_window_cursor mode={label}"));
+        }
     }
 
     /// Build the platform's shortcut capture for this window.

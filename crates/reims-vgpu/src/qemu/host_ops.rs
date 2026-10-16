@@ -152,9 +152,14 @@ pub struct ReimsVgpuHostOps {
     pub dirty_sync_epoch: Option<unsafe extern "C" fn(ctx: *mut c_void) -> u64>,
     /// v23: monotonic guest doorbell (observation) epoch, the only key a cached
     /// dirty verdict may be held under. See
-    /// [`crate::runtime::host::HostOps::dirty_observation_epoch`]. Must stay
-    /// the last field: it is the header's.
+    /// [`crate::runtime::host::HostOps::dirty_observation_epoch`]. Immediately
+    /// before `dirty_note_polled_work`, as in the header.
     pub dirty_observation_epoch: Option<unsafe extern "C" fn(ctx: *mut c_void) -> u64>,
+    /// v24: advance the observation epoch before consuming polled ring work,
+    /// when a sync has captured it. See
+    /// [`crate::runtime::host::HostOps::note_polled_work`]. Must stay the last
+    /// field: it is the header's.
+    pub dirty_note_polled_work: Option<unsafe extern "C" fn(ctx: *mut c_void) -> c_int>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -197,6 +202,7 @@ impl ReimsVgpuHostOps {
             harvests_settled: None,
             dirty_sync_epoch: None,
             dirty_observation_epoch: None,
+            dirty_note_polled_work: None,
         }
     }
 }
@@ -812,6 +818,16 @@ impl HostOps for QemuHost<'_> {
             Some(f) => unsafe { f(self.ops.ctx) },
             // No callback: no observation epoch, so nothing may be cached.
             None => 0,
+        }
+    }
+
+    fn note_polled_work(&self) -> crate::runtime::host::PolledWorkEpoch {
+        match self.ops.dirty_note_polled_work {
+            // SAFETY: QEMU owns ctx; the shim takes only its tracker's leaf
+            // lock and never waits on a sync, so this is drain-thread safe.
+            Some(f) => crate::runtime::host::PolledWorkEpoch::from_abi(unsafe { f(self.ops.ctx) }),
+            // An older or harvest-mode shim (reims-vgpu-mmio.c): nothing to bump.
+            None => crate::runtime::host::PolledWorkEpoch::Unsupported,
         }
     }
 }

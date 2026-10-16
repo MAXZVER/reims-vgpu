@@ -29,6 +29,7 @@
 //! presenters need it too and `backend` may not reach up into this module.
 
 pub mod capture;
+pub mod guest_cursor;
 pub mod input_map;
 pub mod keyboard;
 pub mod present;

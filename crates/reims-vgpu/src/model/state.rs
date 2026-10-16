@@ -2076,6 +2076,13 @@ pub struct MappingEntry {
     pub condemned_entries: Option<Vec<u32>>,
     /// Whether this mapping has ever had its backing condemned, unmapped, or deleted.
     pub ever_released: bool,
+    /// v13 fix A: like [`Self::ever_released`], but scoped to one incarnation.
+    /// Set at every site that sets `ever_released`. Cleared when the mapping
+    /// adopts a fresh, non-empty page list (`runtime::mapper` and
+    /// `runtime::objects`), which is when a recycled id stops naming the
+    /// released pages. Read only by the `released_only` surface-write narrowing,
+    /// and only while `REIMS_VGPU_INCARNATION_WRITES` is on.
+    pub released_since_resolve: bool,
     /// Guest KVA of MappingInternal (from capture or recover).
     pub mapping_internal: u64,
     pub page_table_kva: u64,
@@ -2767,6 +2774,14 @@ pub struct CursorState {
     pub pixels: Vec<u32>,
     /// True when `pixels` holds a complete glyph for the host console.
     pub glyph_ready: bool,
+    /// Bumped once per glyph `load_cursor_glyph` accepts (never 0 once a
+    /// glyph has loaded; 0 means "no glyph yet").
+    ///
+    /// The host window's cursor publisher compares this against the serial it
+    /// last handed the window, so a glyph that could not be published on the
+    /// tranche that loaded it (slot contended) stays pending and is retried on
+    /// the next tranche instead of being lost. Census: `cursor_glyph_loaded`.
+    pub glyph_serial: u64,
 }
 
 impl CursorState {
@@ -4445,13 +4460,17 @@ impl DeviceState {
             self.released_mappings.insert(mid);
             let pfns = if let Some(m) = self.mappings.get_mut(&mid) {
                 m.ever_released = true;
+                m.released_since_resolve = true;
                 m.page_entries.clone()
             } else {
                 Vec::new()
             };
             for pfn in pfns {
                 let gpa = (pfn as u64) << page_shift;
-                self.host_writes.release_page(gpa);
+                self.host_writes.release_page_by(
+                    gpa,
+                    crate::runtime::host_writes::ReleaseSource::TaskDelete,
+                );
             }
         }
         self.texture_to_mapping.retain(|&(t, _), _| t != task_id);
@@ -5751,6 +5770,7 @@ impl DeviceState {
             return false;
         };
         e.ever_released = true;
+        e.released_since_resolve = true;
         if e.page_entries.is_empty() {
             return false;
         }
@@ -5791,6 +5811,7 @@ impl DeviceState {
             || self.released_mappings.contains(&mapping_id)
         {
             e.ever_released = true;
+            e.released_since_resolve = true;
         }
         e.mapped = true;
         // Fresh MAP invalidates any previous page table / geom for this slot.
@@ -5857,6 +5878,7 @@ impl DeviceState {
             .forget_mapping(mapping_id);
         if let Some(e) = self.mappings.get_mut(&mapping_id) {
             e.ever_released = true;
+            e.released_since_resolve = true;
             e.mapped = false;
             // The surface is gone; a recycled id has presented nothing yet.
             e.scanout_presented = false;
@@ -6059,6 +6081,16 @@ impl DeviceState {
         self.host_writes.note_pages(pages);
     }
 
+    /// [`Self::note_host_wrote_pages`], naming the writer (v11 issue #5
+    /// diagnostics: a finding on a released page then says which path wrote).
+    pub fn note_host_wrote_pages_at(
+        &mut self,
+        site: crate::runtime::host_writes::WriteSite,
+        pages: Vec<u64>,
+    ) {
+        self.host_writes.note_pages_at(site, pages);
+    }
+
     /// Every guest page a mapping covers, or `None` when the set cannot be
     /// named exactly.
     ///
@@ -6099,6 +6131,15 @@ impl DeviceState {
 
     /// The same, for a writer that knows which mapping's pages it is landing in.
     pub fn note_host_wrote_mapping(&mut self, mapping_id: u32) {
+        self.note_host_wrote_mapping_at(crate::runtime::host_writes::WriteSite::Unattributed, mapping_id);
+    }
+
+    /// [`Self::note_host_wrote_mapping`], naming the writer (v11).
+    pub fn note_host_wrote_mapping_at(
+        &mut self,
+        site: crate::runtime::host_writes::WriteSite,
+        mapping_id: u32,
+    ) {
         let Some(entries) = self
             .mappings
             .get(&mapping_id)
@@ -6120,7 +6161,7 @@ impl DeviceState {
             return;
         }
         self.host_writes
-            .note_page_iter(entries.iter().map(|&entry| {
+            .note_page_iter_at(site, entries.iter().map(|&entry| {
                 crate::protocol::iosurface_pages::entry_gpa_shift(entry, shift)
                     .expect("page entries were validated above")
             }));

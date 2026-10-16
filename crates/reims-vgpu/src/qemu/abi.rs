@@ -101,7 +101,10 @@ use std::slice;
 /// v23 adds `dirty_observation_epoch` on [`ReimsVgpuHostOps`]: the guest doorbell
 /// epoch, which replaces `dirty_sync_epoch` as the only key a cached dirty
 /// verdict may be held under. `dirty_sync_epoch` remains for profiling only.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 23;
+/// v24 adds `dirty_note_polled_work` on [`ReimsVgpuHostOps`]: the drain asks the
+/// shim to advance that epoch before consuming ring work it found by polling a
+/// ring tail (Step 1, polled-work epoch).
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 24;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -1030,16 +1033,16 @@ mod tests {
         assert_eq!(std::mem::offset_of!(GuestRamRegion, len), 16);
     }
 
-    /// `dirty_observation_epoch` is the last member of `ReimsVgpuHostOps` on
-    /// both sides, with `dirty_sync_epoch` immediately before it.
+    /// `dirty_note_polled_work` (v24) is the last member of `ReimsVgpuHostOps`
+    /// on both sides, with `dirty_observation_epoch` immediately before it.
     ///
     /// Nothing else compares the two declarations field by field, and a
     /// callback slot that sits one pointer off on one side is called with the
-    /// wrong function. The newest fields are where a v23 table can disagree
-    /// with a v22 (or v21) one, so that is what this pins: the last two in the
+    /// wrong function. The newest fields are where a v24 table can disagree
+    /// with a v23 (or v22) one, so that is what this pins: the last two in the
     /// header's struct, and the last two in the Rust one.
     #[test]
-    fn the_abi_header_agrees_that_dirty_observation_epoch_closes_the_host_ops_table() {
+    fn the_abi_header_agrees_that_dirty_note_polled_work_closes_the_host_ops_table() {
         const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
         let body = HEADER
             .split_once("typedef struct ReimsVgpuHostOps {")
@@ -1054,17 +1057,22 @@ mod tests {
             .filter(|l| !l.is_empty() && !l.starts_with("/*") && !l.starts_with('*'));
         let last = members.next_back().expect("the table has members");
         let before_last = members.next_back().expect("the table has two members");
-        assert_eq!(last, "uint64_t (*dirty_observation_epoch)(void *ctx);");
-        assert_eq!(before_last, "uint64_t (*dirty_sync_epoch)(void *ctx);");
+        assert_eq!(last, "int (*dirty_note_polled_work)(void *ctx);");
+        assert_eq!(before_last, "uint64_t (*dirty_observation_epoch)(void *ctx);");
         assert_eq!(
-            std::mem::offset_of!(ReimsVgpuHostOps, dirty_observation_epoch),
+            std::mem::offset_of!(ReimsVgpuHostOps, dirty_note_polled_work),
             std::mem::size_of::<ReimsVgpuHostOps>() - std::mem::size_of::<usize>(),
             "and it is the last pointer of the Rust table"
         );
         assert_eq!(
-            std::mem::offset_of!(ReimsVgpuHostOps, dirty_sync_epoch),
+            std::mem::offset_of!(ReimsVgpuHostOps, dirty_observation_epoch),
             std::mem::size_of::<ReimsVgpuHostOps>() - 2 * std::mem::size_of::<usize>(),
-            "with dirty_sync_epoch the pointer before it"
+            "with dirty_observation_epoch the pointer before it"
+        );
+        assert_eq!(
+            std::mem::offset_of!(ReimsVgpuHostOps, dirty_sync_epoch),
+            std::mem::size_of::<ReimsVgpuHostOps>() - 3 * std::mem::size_of::<usize>(),
+            "and dirty_sync_epoch before that"
         );
     }
 

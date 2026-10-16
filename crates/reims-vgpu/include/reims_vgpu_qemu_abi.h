@@ -21,7 +21,10 @@
 extern "C" {
 #endif
 
-/* v23: ReimsVgpuHostOps.dirty_observation_epoch — the guest doorbell epoch, the
+/* v24: ReimsVgpuHostOps.dirty_note_polled_work: the drain consumed ring work
+ *      it found by polling a ring tail; the shim advances the observation
+ *      epoch when a sync has already captured it.
+ * v23: ReimsVgpuHostOps.dirty_observation_epoch — the guest doorbell epoch, the
  *      only key a cached dirty/currency verdict may be held under.
  *      dirty_sync_epoch stays, for profiling only.
  * v22: ReimsVgpuHostOps.dirty_sync_epoch — monotonic dirty sync / harvest epoch.
@@ -103,7 +106,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 23u
+#define REIMS_VGPU_QEMU_ABI_VERSION 24u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -415,9 +418,22 @@ typedef struct ReimsVgpuHostOps {
      * two equal values is complete for every doorbell up to that value. The
      * only key a cached dirty verdict may be held under. Returns 0 when
      * unsupported or before the first doorbell (never a cache key). Safe from
-     * any thread. Must stay the last field.
+     * any thread. Immediately before dirty_note_polled_work.
      */
     uint64_t (*dirty_observation_epoch)(void *ctx);
+    /*
+     * v24: the drain is about to consume guest ring work it found by polling a
+     * ring tail, not by a doorbell. The shim advances the observation epoch
+     * (release, as a doorbell does) when a dirty sync has already captured the
+     * current epoch, so an answer taken at it cannot be reused for that work;
+     * otherwise every set's next read syncs after this call and nothing moves.
+     * Returns 1 (bumped), 0 (fresh, no bump needed), -1 (unsupported: no
+     * tracker, epoch 0, or harvest mode) or -2 (disabled by the shim's lab
+     * switch). Never blocks on a sync or a hypervisor query; safe from the
+     * drain with the device lock held. NULL reads as -1. Must stay the last
+     * field.
+     */
+    int (*dirty_note_polled_work)(void *ctx);
 } ReimsVgpuHostOps;
 
 /*
