@@ -4542,6 +4542,7 @@ fn apply_backing<M: HostMemory>(
         }
         m.page_entries = entries;
         m.mapped = true;
+        m.released_since_resolve = false;
         m.page_table_kva = 0;
         m.device_desc = device_desc;
         if std::mem::take(&mut m.repoint_keep) {
@@ -4590,6 +4591,11 @@ fn apply_backing<M: HostMemory>(
             surf.height,
             latched_mapping_format(surf),
         );
+    }
+    if backing_is_multiplanar(surf) {
+        if let Some(m) = state.mappings.get_mut(&surface_id) {
+            m.is_video_stream = true;
+        }
     }
 
     // Backing built cleanly — re-arm the fail latch so a later genuine failure
