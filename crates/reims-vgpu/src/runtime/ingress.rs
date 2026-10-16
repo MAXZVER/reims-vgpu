@@ -1290,6 +1290,7 @@ mod tests {
             completion_stamp: 0,
             payload: vec![0u8; ROOMY],
             next_head: 0,
+            lone: false,
         }
     }
 
@@ -2546,6 +2547,7 @@ mod device_tests {
             completion_stamp: 9,
             payload,
             next_head: 0,
+            lone: false,
         }
     }
 
@@ -2767,6 +2769,7 @@ mod device_tests {
             completion_stamp: completion,
             payload: vec![0u8; 64],
             next_head: 0,
+            lone: false,
         }
     }
 

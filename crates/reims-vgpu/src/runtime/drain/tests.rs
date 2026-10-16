@@ -176,6 +176,7 @@ fn present_packet(opcode: u16, mapping: u32) -> Packet {
         completion_stamp: 0,
         payload,
         next_head: 0,
+        lone: false,
     }
 }
 
@@ -521,6 +522,7 @@ fn delete_task_root_clears_active_task() {
             completion_stamp: 0,
             payload: 3u32.to_le_bytes().to_vec(),
             next_head: 0,
+            lone: false,
         },
     );
     assert!(
@@ -569,6 +571,7 @@ fn replace_physical_drops_the_cached_page_list() {
         completion_stamp: 0,
         payload,
         next_head: 0,
+        lone: false,
     };
     process_child_packet(&mut state, &mut host, 2, &pkt);
 
@@ -711,6 +714,7 @@ fn a_short_replace_physical_is_reported_and_not_acted_on() {
         completion_stamp: 0,
         payload: vec![0u8; plen],
         next_head: 0,
+        lone: false,
     };
     // Seven bytes first, and alone in its own capture. It is the length a
     // decoder that read what it could and zero-filled the rest would accept —
@@ -770,6 +774,7 @@ fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id()
         completion_stamp: 0,
         payload,
         next_head: 0,
+        lone: false,
     };
     process_child_packet(&mut state, &mut host, 2, &pkt);
 
@@ -831,6 +836,7 @@ fn replace_physical_retires_only_the_named_resource() {
             completion_stamp: 0,
             payload,
             next_head: 0,
+            lone: false,
         },
     );
 
@@ -920,6 +926,7 @@ fn replace_physical_does_not_confuse_another_tasks_mapping_for_the_resource() {
         completion_stamp: 0,
         payload,
         next_head: 0,
+        lone: false,
     };
     process_child_packet(&mut state, &mut host, 2, &pkt);
 
@@ -954,6 +961,7 @@ fn a_short_replace_physical_is_reported_and_drops_nothing() {
         completion_stamp: 0,
         payload: vec![0u8; 4],
         next_head: 0,
+        lone: false,
     };
     process_child_packet(&mut state, &mut host, 2, &pkt);
     assert!(
@@ -987,6 +995,7 @@ fn delete_iosurface_backing_condemns_then_second_delete_tears_down() {
                 completion_stamp: 0,
                 payload,
                 next_head: 0,
+                lone: false,
             },
         );
     };
@@ -1271,6 +1280,7 @@ fn a_cursor_pitch_wider_than_a_word_is_refused_rather_than_truncated() {
             completion_stamp: 0,
             payload,
             next_head: 0,
+            lone: false,
         },
     );
 
@@ -1317,6 +1327,7 @@ fn define_fifo_forgets_the_previous_occupants_translation_state() {
             completion_stamp: 0,
             payload: 1u32.to_le_bytes().to_vec(),
             next_head: 0,
+            lone: false,
         },
     );
 
@@ -1362,6 +1373,7 @@ fn a_channel_lifetime_outside_the_channel_range_is_reported() {
                     completion_stamp: 0,
                     payload: channel.to_le_bytes().to_vec(),
                     next_head: 0,
+                    lone: false,
                 },
             );
             let lines = cap.lines();
@@ -1430,6 +1442,7 @@ fn a_definition_opens_the_domain_in_the_model_and_a_doorbell_does_not() {
                 completion_stamp: 0,
                 payload: channel.to_le_bytes().to_vec(),
                 next_head: 0,
+                lone: false,
             },
         );
     };
@@ -1470,6 +1483,7 @@ fn the_channel_transitions_the_model_would_refuse_are_counted_apart() {
                 completion_stamp: 0,
                 payload: channel.to_le_bytes().to_vec(),
                 next_head: 0,
+                lone: false,
             },
         );
     };
@@ -1546,6 +1560,7 @@ fn every_dispatched_packet_is_counted_under_the_class_the_model_reads_it_as() {
             completion_stamp: 0,
             payload: 1u32.to_le_bytes().to_vec(),
             next_head: 0,
+            lone: false,
         },
     );
     assert_eq!(
@@ -1570,6 +1585,7 @@ fn every_dispatched_packet_is_counted_under_the_class_the_model_reads_it_as() {
             completion_stamp: 0,
             payload: Vec::new(),
             next_head: 0,
+            lone: false,
         },
     );
     assert_eq!(
@@ -1595,6 +1611,7 @@ fn every_dispatched_packet_is_counted_under_the_class_the_model_reads_it_as() {
             completion_stamp: 0,
             payload: Vec::new(),
             next_head: 0,
+            lone: false,
         },
     );
     assert_eq!(
@@ -1637,6 +1654,7 @@ fn a_lifetime_command_on_an_undefined_task_is_told_apart_from_one_on_a_defined_t
         completion_stamp: 0,
         payload: notice,
         next_head: 0,
+        lone: false,
     };
 
     let defined = store_route_count("lifetime_command_in_a_defined_task");
@@ -1672,6 +1690,7 @@ fn a_lifetime_command_on_an_undefined_task_is_told_apart_from_one_on_a_defined_t
             completion_stamp: 0,
             payload: define,
             next_head: 0,
+            lone: false,
         },
     );
     assert!(state.tasks.is_active(TASK), "the definition opened it");
@@ -1740,6 +1759,7 @@ fn a_packet_on_a_doorbell_only_domain_is_told_apart_from_one_on_a_defined_domain
         completion_stamp: 0,
         payload: Vec::new(),
         next_head: 0,
+        lone: false,
     };
     let _ = process_child_packet(&mut state, &mut host, channel, &nop);
     assert_eq!(
@@ -1762,6 +1782,7 @@ fn a_packet_on_a_doorbell_only_domain_is_told_apart_from_one_on_a_defined_domain
             completion_stamp: 0,
             payload: channel.to_le_bytes().to_vec(),
             next_head: 0,
+            lone: false,
         },
     );
     assert_eq!(
@@ -1791,6 +1812,7 @@ fn a_packet_on_a_doorbell_only_domain_is_told_apart_from_one_on_a_defined_domain
             completion_stamp: 0,
             payload: channel.to_le_bytes().to_vec(),
             next_head: 0,
+            lone: false,
         },
     );
     assert_eq!(
@@ -1823,6 +1845,7 @@ fn free_fifo_clears_translation_scheduler_state() {
             completion_stamp: 0,
             payload: 1u32.to_le_bytes().to_vec(),
             next_head: 0,
+            lone: false,
         },
     );
 
@@ -2812,6 +2835,7 @@ fn display_lifecycle_events_are_always_logged() {
         completion_stamp: 0,
         payload,
         next_head: 0,
+        lone: false,
     };
 
     // First setup: reinit=0 (initial display registration).
@@ -2824,6 +2848,7 @@ fn display_lifecycle_events_are_always_logged() {
         completion_stamp: 0,
         payload: vec![],
         next_head: 0,
+        lone: false,
     };
     process_child_packet(&mut state, &mut host, 4, &ack);
     assert!(state.display.online_acked);
@@ -4505,6 +4530,7 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
         completion_stamp: 0,
         payload: unmap_pl,
         next_head: 0,
+        lone: false,
     };
     process_child_packet(&mut state, &mut host, 2, &unmap);
 
@@ -4550,6 +4576,7 @@ fn unmap_memory_settles_an_outstanding_writeback_before_the_pages_go_back() {
         completion_stamp: 0,
         payload: unmap_pl,
         next_head: 0,
+        lone: false,
     };
     process_child_packet(&mut state, &mut host, 2, &unmap);
 
@@ -4589,6 +4616,7 @@ fn invalidate_resources_bumps_mapping_content_generation() {
             completion_stamp: 0,
             payload: pl,
             next_head: 0,
+            lone: false,
         },
     );
     assert_eq!(state.mappings[&0x2a].content_generation, 8);
@@ -4642,6 +4670,7 @@ fn an_invalidate_record_clearing_guest_valid_pays_the_owed_frame() {
             completion_stamp: 0,
             payload: pl,
             next_head: 0,
+            lone: false,
         },
     );
     assert!(
@@ -4703,6 +4732,7 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
             completion_stamp: 0,
             payload: pl,
             next_head: 0,
+            lone: false,
         },
     );
     let mut probe = [0u8; 4];
@@ -4763,6 +4793,7 @@ fn synchronize_resources_does_not_write_guest_pages() {
             completion_stamp: 0,
             payload: pl,
             next_head: 0,
+            lone: false,
         },
     );
     let mut probe = [0u8; 4];
@@ -4804,6 +4835,7 @@ fn invalidate_without_clr_host_does_not_bump_generation() {
             completion_stamp: 0,
             payload: pl,
             next_head: 0,
+            lone: false,
         },
     );
     assert_eq!(state.mappings[&0x2a].content_generation, 7);
@@ -5100,6 +5132,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
         completion_stamp: 0,
         payload: vec![0u8; plen],
         next_head: 0,
+        lone: false,
     };
 
     let n = store_route_count("child_nop");
@@ -5152,6 +5185,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
         completion_stamp: 0,
         payload: vec![0u8; plen],
         next_head: 0,
+        lone: false,
     };
 
     // Every command at exactly its declared trailer is conformant and silent.
@@ -5214,6 +5248,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
         completion_stamp: 0,
         payload,
         next_head: 0,
+        lone: false,
     };
 
     // op8 at the length the arm64 guest actually sends: 12 known, 28 unnamed.
@@ -5351,6 +5386,7 @@ fn device_info_reply(max_key: u32, count: u32) -> Vec<(u32, u32)> {
             completion_stamp: 0,
             payload,
             next_head: 0,
+            lone: false,
         },
     );
 
@@ -5436,6 +5472,7 @@ fn a_short_compute_info_request_is_reported_and_not_answered() {
         // would find a reply address rather than zero and try to use it.
         payload: vec![0xffu8; plen],
         next_head: 0,
+        lone: false,
     };
     // One byte under, alone in its own capture: the largest length a decoder
     // that read what it could would still accept.
@@ -5603,6 +5640,7 @@ fn compute_info_reply(key_table_len: u32, count: u32) -> (Vec<(u32, u32)>, u8) {
                 completion_stamp: 0,
                 payload,
                 next_head: 0,
+                lone: false,
             },
         ),
         ChildPacketDisposition::Complete,
@@ -5787,6 +5825,7 @@ fn every_short_control_packet_names_itself() {
         completion_stamp: 0,
         payload: vec![0u8; len],
         next_head: 0,
+        lone: false,
     };
 
     let before_mask = state.open_child_mask();
@@ -5906,6 +5945,7 @@ fn root_opcode_one_sets_up_the_display_shared_state() {
             completion_stamp: 0,
             payload,
             next_head: 0,
+            lone: false,
         },
     );
 
@@ -5951,6 +5991,7 @@ fn a_pipe_index_that_looks_like_an_opcode_is_still_a_pipe_index() {
             completion_stamp: 0,
             payload,
             next_head: 0,
+            lone: false,
         },
     );
 
@@ -6418,6 +6459,7 @@ fn a_dispatched_command_this_device_declines_names_itself() {
             completion_stamp: 0,
             payload,
             next_head: 0,
+            lone: false,
         };
         assert_eq!(
             process_child_packet(&mut state, &mut host, 2, &pkt),
@@ -6472,6 +6514,7 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
         completion_stamp: 0,
         payload,
         next_head: 0,
+        lone: false,
     };
     // Every exit from the record path, and only those. The packet-shape
     // refusals are `delete_object_short` and `delete_object_record_short`, which
@@ -6646,6 +6689,7 @@ fn a_pipeline_destroy_whose_ref_names_another_kind_retires_no_pipeline() {
             completion_stamp: 0,
             payload,
             next_head: 0,
+            lone: false,
         },
     );
 
@@ -6710,6 +6754,7 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
             completion_stamp: 0,
             payload,
             next_head: 0,
+            lone: false,
         }
     };
 
@@ -6871,6 +6916,7 @@ fn a_delete_object_counts_the_kind_its_record_names() {
             completion_stamp: 0,
             payload,
             next_head: 0,
+            lone: false,
         }
     };
 
@@ -6944,6 +6990,7 @@ fn a_fence_delete_forgets_every_generation_its_ref_held() {
             completion_stamp: 0,
             payload,
             next_head: 0,
+            lone: false,
         }
     };
 
@@ -7056,6 +7103,7 @@ fn a_destroy_this_device_cannot_retire_says_what_its_ref_names_in_the_object_lis
             completion_stamp: 0,
             payload,
             next_head: 0,
+            lone: false,
         }
     };
     let put_entry = |host: &mut FakeHost, slot: u32, object_type: u8| {
@@ -7165,6 +7213,7 @@ fn a_content_cached_destroy_does_not_hide_a_texture_destroy_from_the_failure_cha
             completion_stamp: 0,
             payload,
             next_head: 0,
+            lone: false,
         }
     };
     let counted = || crate::runtime::drain::store_route_count("cmd_delete_object_unimplemented");
@@ -7242,6 +7291,7 @@ fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
             completion_stamp: 0,
             payload: Vec::new(),
             next_head: 0,
+            lone: false,
         };
         assert_eq!(
             process_child_packet(&mut state, &mut host, 2, &pkt),
@@ -7307,6 +7357,7 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
             completion_stamp: 0,
             payload: payload.clone(),
             next_head: 0,
+            lone: false,
         };
 
         let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
@@ -7424,6 +7475,7 @@ fn each_map_family_command_takes_its_own_branch() {
                     completion_stamp: 0,
                     payload: payload.clone(),
                     next_head: 0,
+                    lone: false,
                 },
             ),
             ChildPacketDisposition::Complete,
@@ -7492,6 +7544,7 @@ fn an_opcode_past_the_dispatch_ceiling_is_reported_apart_from_an_unassigned_slot
         completion_stamp: 0,
         payload: Vec::new(),
         next_head: 0,
+        lone: false,
     };
 
     // 0x0b is inside the ceiling and has no handler on the reference host.
@@ -7562,6 +7615,7 @@ fn a_declined_command_is_latched_in_the_log_and_counted_in_the_census() {
         completion_stamp: 0,
         payload,
         next_head: 0,
+        lone: false,
     };
 
     let route = UnimplementedCommand::Delay.slug();
@@ -7788,6 +7842,7 @@ fn the_map_interval_audit_counts_a_clean_pairing_and_not_only_a_finding() {
         completion_stamp: 0,
         payload,
         next_head: 0,
+        lone: false,
     };
 
     let clean = store_route_count("map_audit_consistent");
@@ -7951,6 +8006,30 @@ mod arrivals {
         assert_eq!(from_root.next_head, tail);
     }
 
+    /// TEMP (lab, IRQ_LONE): a packet is lone when the tail sits right behind
+    /// it, and not when another packet is already published after it.
+    #[test]
+    fn a_packet_is_lone_only_when_nothing_is_published_behind_it() {
+        let one = packet_bytes(ROOT_OP_DEFINE_FIFO, 7, &1u32.to_le_bytes());
+        let mut two = one.clone();
+        two.extend_from_slice(&packet_bytes(ROOT_OP_DEFINE_FIFO, 8, &2u32.to_le_bytes()));
+        let host = host_with(&two);
+        let first_end = one.len() as u32;
+
+        let Arrival::Packet(alone) = arrival(&child(), &host, 0, first_end) else {
+            panic!("a whole published packet arrives");
+        };
+        assert!(alone.lone, "the tail right behind the packet: lone");
+        let Arrival::Packet(followed) = arrival(&child(), &host, 0, two.len() as u32) else {
+            panic!("a whole published packet arrives");
+        };
+        assert!(!followed.lone, "a packet published behind it: not lone");
+        let Arrival::Packet(last) = arrival(&child(), &host, first_end, two.len() as u32) else {
+            panic!("a whole published packet arrives");
+        };
+        assert!(last.lone, "the last packet of a burst: lone");
+    }
+
     /// A head that has caught its tail is nothing, and is not a read.
     #[test]
     fn a_head_that_has_caught_the_tail_is_nothing() {
@@ -8077,6 +8156,7 @@ fn a_settle_pass_over_waiting_positions_does_not_allocate() {
             completion_stamp: 0,
             payload: vec![0u8; 8],
             next_head: 0,
+            lone: false,
         };
         state.parked.lock().park(
             IngressOrdinal(n as u64 + 1),
