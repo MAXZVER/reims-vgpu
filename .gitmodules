@@ -1,4 +1,4 @@
 [submodule "vendor/qemu"]
 	path = vendor/qemu
-	url = https://github.com/steelbrain/qemu-reims-vgpu.git
-	branch = host-reims-vgpu-vmapple
+	url = https://github.com/MAXZVER/qemu-reims-vgpu.git
+	branch = windows-2026-10-16
