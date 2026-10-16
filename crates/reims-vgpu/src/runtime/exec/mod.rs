@@ -3221,6 +3221,8 @@ fn handle_blit_transfer_record<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route("blit_read_order_wait");
             crate::backend::selected().wait_recorded_gpu_work();
         }
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::draw::vulkan::lab_resolve_memo_wrote(task_id, m.texture_ref);
         match mipmap::generate_mipmaps_linear(state, host, task_id, m.texture_ref) {
             MipmapStatus::Ok => {}
             st => {

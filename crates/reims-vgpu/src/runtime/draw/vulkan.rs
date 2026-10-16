@@ -2801,8 +2801,10 @@ static RESOLVE_MEMO: std::sync::LazyLock<
     parking_lot::RwLock::new(reims_vgpu_core::fasthash::FxHashMap::with_hasher(Default::default()))
 });
 
-/// Textures this stream writes, by (task, ref): never memoized in it (see
-/// [`lab_resolve_memo_written`]). Cleared with the memo.
+/// Textures this stream writes, by (task, ref): the prime and the pool jobs,
+/// which resolve ahead of the drain's writes, never memoize one (see
+/// [`lab_resolve_memo_written`]); the drain, in stream order, may. Cleared
+/// with the memo.
 static STREAM_WRITTEN: std::sync::LazyLock<
     parking_lot::RwLock<reims_vgpu_core::fasthash::FxHashSet<(u32, u32)>>,
 > = std::sync::LazyLock::new(|| {
@@ -2901,19 +2903,19 @@ fn memo_copy(src: &SampledSourceRequest, all: bool, repeat: bool) -> Option<Samp
 /// the same `Arc` and identity, which also lets the engine's content cache hit
 /// without re-hashing. Cleared at every draw list's start.
 ///
-/// **Off by default since 2026-10-15** (`REIMS_VGPU_LAB_RESOLVE_MEMO=on` or the
-/// live switch turns it on). Read by DRAW_PAR's pool jobs it handed a pass
-/// resolutions an earlier pass had made stale: Electron tiles kept other
-/// passes' content after a resize (b505-b520; even entries only the drain made,
-/// b520). Scoped as in [`lab_resolve_memo_record`] and kept from the jobs it is
-/// sound (b518, b519) but costs the drain (boot cssscroll 157-160 Hz, duty
-/// 0.55), and off it is both sound and fastest (b516 207 Hz, b521 178).
+/// Off on 2026-10-15 (b505-b521) when it was read as the Electron stale-tile
+/// root - it was not (the root was the CPU blit ordering, 29f4d28f) - and back
+/// on 2026-10-16: Maps draws ~50k binds a second, and without the memo across
+/// the stream's passes it fell from 44 to 22 fps (b614-b619). Pool jobs never
+/// read it (they prepare records ahead of the drain's writes); every writer in
+/// the stream invalidates it (see [`lab_resolve_memo_record`]).
+/// `REIMS_VGPU_LAB_RESOLVE_MEMO=off` or the live switch turns it off (A/B).
 pub(crate) fn lab_resolve_memo_on() -> bool {
     if let Some(on) = crate::runtime::lab_live::on("RESOLVE_MEMO") {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_MEMO").as_deref() == Ok("on"))
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RESOLVE_MEMO").as_deref() != Ok("off"))
 }
 
 fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledSourceRequest)> {
@@ -2922,9 +2924,16 @@ fn lab_resolve_memo_get(key: &ResolveMemoKey) -> Option<(u32, u32, u32, SampledS
     if crate::runtime::par::ahead::logging() {
         return None;
     }
-    // A pool job prepares a record ahead of the drain, possibly of a later pass
-    // than the entries were taken in; the memo is one pass's.
-    if crate::runtime::par::planning() || STREAM_WRITTEN.read().contains(&(key.0, key.1)) {
+    // A pool job prepares a record ahead of the drain's writes: it reads only
+    // a texture nothing in the stream so far writes (the prime marked its own
+    // chunk's writes before the fork, every earlier writer ran on the drain
+    // before it). The drain, which invalidates in stream order, reads any
+    // entry: a stream-written texture's was taken after the drain's last write
+    // of it. (6c28a911 kept the jobs out and the stream-written textures out
+    // for the drain too; each job then resolved what the prime had already
+    // resolved, and Maps' tiles - rendered and sampled in one stream - were
+    // never memoized: 44 -> 22 fps, b614-b622.)
+    if crate::runtime::par::planning() && STREAM_WRITTEN.read().contains(&(key.0, key.1)) {
         return None;
     }
     let m = RESOLVE_MEMO.read();
@@ -2960,11 +2969,7 @@ pub(super) fn lab_resolve_memo_prime<M: HostMemory + HostOps>(
     for (req, _) in reqs {
         lab_resolve_memo_written(req);
     }
-    // The first pass's records only: the memo ends where the next pass opens.
-    for (i, (req, _)) in reqs.iter().enumerate() {
-        if i > 0 && !req.continues_render_pass {
-            break;
-        }
+    for (req, _) in reqs.iter() {
         let attachments: Vec<u32> = req.colors.iter().map(|c| c.texture_ref).collect();
         for (frag_stage, binds) in [(false, &req.vertex_textures), (true, &req.fragment_textures)] {
             for bind in binds.iter() {
@@ -3040,18 +3045,30 @@ fn pass_written_refs(req: &DrawEncodeRequest) -> impl Iterator<Item = u32> + '_ 
 /// frame's pixels - permanently, since nothing redraws them (b505-b516).
 /// Called when a pass writes `req`'s attachments, before any later record
 /// samples them.
-/// A record that opens a render pass ends the previous pass's memo: whatever
-/// ran between the two (the pass itself, a blit, a compute dispatch, a clear)
-/// may have written what the memo resolved. The memo's premise holds within one
-/// encoder only.
+/// A record's pass writes its attachments: those leave the memo and stay out
+/// of it for the stream. The memo itself lives for the whole stream - every
+/// other writer of a texture a stream can hold (a blit's destination, a mipmap
+/// chain, a compute kernel's storage image) tells it through
+/// [`lab_resolve_memo_wrote`] as the drain executes it, in stream order, so a
+/// resolution outlives a pass boundary exactly when nothing has written its
+/// texture. (Clearing at every pass open instead, 6c28a911, cost Maps half its
+/// frames: 44 -> 22 fps, b614-b619.)
 pub(crate) fn lab_resolve_memo_record(req: &DrawEncodeRequest) {
-    if !req.continues_render_pass {
-        let mut m = RESOLVE_MEMO.write();
-        if !m.is_empty() {
-            m.clear();
-        }
-    }
     lab_resolve_memo_written(req);
+}
+
+/// A writer other than a render pass - a blit, a mipmap chain, a compute
+/// kernel's storage image - is about to write `(task_id, reference)` in this
+/// stream: its resolution leaves the memo and is not taken again in the stream.
+pub(crate) fn lab_resolve_memo_wrote(task_id: u32, reference: u32) {
+    if reference == 0 || !lab_resolve_memo_on() {
+        return;
+    }
+    STREAM_WRITTEN.write().insert((task_id, reference));
+    let mut m = RESOLVE_MEMO.write();
+    if !m.is_empty() {
+        m.retain(|key, _| key.0 != task_id || key.1 != reference);
+    }
 }
 
 pub(crate) fn lab_resolve_memo_written(req: &DrawEncodeRequest) {
@@ -3085,7 +3102,9 @@ fn lab_resolve_memo_put(key: ResolveMemoKey, loaded: &(u32, u32, u32, SampledSou
     {
         return;
     }
-    if STREAM_WRITTEN.read().contains(&(key.0, key.1)) {
+    // A job's resolution may predate a write by an earlier record of its chunk;
+    // the drain's own is in stream order (see `lab_resolve_memo_get`).
+    if crate::runtime::par::planning() && STREAM_WRITTEN.read().contains(&(key.0, key.1)) {
         return;
     }
     match memo_copy(&loaded.3, lab_resolve_memo_all(), false) {
