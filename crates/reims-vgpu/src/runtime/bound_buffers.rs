@@ -165,6 +165,10 @@ pub struct WholeRuns {
     pub gva: u64,
     pub size: u64,
     pub runs: Arc<Vec<GuestRun>>,
+    /// The guest pages the walk found, one per page `gva..gva + size` spans
+    /// (the first at `gva % page`). TEMP (lab, BUF_RESIDENT): what the buffer
+    /// witness tracks for a window of these runs.
+    pub gpas: Arc<Vec<u64>>,
 }
 
 impl WholeRuns {
@@ -604,6 +608,7 @@ mod tests {
             gva,
             size,
             runs: Arc::new(Vec::new()),
+            gpas: Arc::new(Vec::new()),
         }
     }
 

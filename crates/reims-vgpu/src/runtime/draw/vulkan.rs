@@ -7686,6 +7686,7 @@ fn ensure_whole_runs<M: HostMemory + HostOps>(
             gva,
             size,
             runs: std::sync::Arc::new(runs),
+            gpas: std::sync::Arc::new(gpas),
         },
     );
     true
@@ -7961,8 +7962,9 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
 /// witness's identity for a window sliced out of a packed resource, so a window
 /// nothing has written since its last staging copy binds that copy again.
 ///
-/// Only the packed rail: its whole-buffer page list is retained beside the runs
-/// (`PackedBuffer::gpas`), which is what the witness tracks. The window's key is
+/// Windows of a retained whole-buffer source only — the packed alias or the
+/// whole-allocation run list — whose page list is kept beside the runs
+/// (`PackedBuffer::gpas`, `WholeRuns::gpas`) for the witness to track. The window's key is
 /// its task, GVA and length — two shaders reading one buffer through different
 /// extent caps are two windows rather than one window re-armed on every bind.
 fn attach_buffer_resident<M: HostMemory + HostOps>(
@@ -7979,23 +7981,64 @@ fn attach_buffer_resident<M: HostMemory + HostOps>(
     let crate::backend::vulkan::engine::BufferContent::GuestRuns(src) = content else {
         return;
     };
-    let Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(packed)) =
-        state.bound_buffers.packed(task_id, buffer_ref)
-    else {
-        return;
-    };
-    if !std::sync::Arc::ptr_eq(&packed.runs, &src.runs) || src.total_len == 0 {
+    if src.total_len == 0 {
         return;
     }
     let page = state.page_size();
-    let Some(start) = packed.head.checked_add(src.source_offset) else { return };
+    // The resource's retained whole-buffer source this window was sliced from:
+    // the packed alias, or the whole-allocation run list (the rail the work
+    // configuration's binds take — b657 saw 27k whole-runs binds a second on
+    // Maps against no packed ones).
+    let (base_gva, head, all_gpas, all_runs) = match state.bound_buffers.packed(task_id, buffer_ref) {
+        Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(packed))
+            if std::sync::Arc::ptr_eq(&packed.runs, &src.runs) =>
+        {
+            (
+                packed.gva,
+                packed.head,
+                std::sync::Arc::clone(&packed.gpas),
+                std::sync::Arc::clone(&packed.runs),
+            )
+        }
+        _ => match state.bound_buffers.whole(task_id, buffer_ref) {
+            Some(whole) if std::sync::Arc::ptr_eq(&whole.runs, &src.runs) => (
+                whole.gva,
+                whole.gva % page,
+                std::sync::Arc::clone(&whole.gpas),
+                std::sync::Arc::clone(&whole.runs),
+            ),
+            _ => return,
+        },
+    };
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for v in [task_id as u64, base_gva.wrapping_add(src.source_offset), src.total_len] {
+        h = (h ^ v).wrapping_mul(0x0100_0000_01b3);
+    }
+    // Arm a window on its second sight, not its first: a ring buffer streamed at
+    // a new offset every draw names a new window every bind, and arming each one
+    // would be a tracking set per draw for windows that never come back.
+    {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(HashSet::new);
+        if seen.len() >= 1 << 16 {
+            seen.clear();
+        }
+        if seen.insert(h) {
+            crate::runtime::drain::note_store_route("brw_first_sight");
+            return;
+        }
+    }
+    let Some(start) = head.checked_add(src.source_offset) else { return };
     let Some(end) = start.checked_add(src.total_len) else { return };
     let (first, last) = ((start / page) as usize, end.div_ceil(page) as usize);
-    let Some(gpas) = packed.gpas.get(first..last) else { return };
+    let Some(gpas) = all_gpas.get(first..last) else { return };
     // The window's own host spans, for the witness's strided content audit.
-    let mut runs = Vec::with_capacity(packed.runs.len());
+    let mut runs = Vec::with_capacity(all_runs.len());
     let (mut skip, mut left) = (src.source_offset, src.total_len);
-    for run in packed.runs.iter() {
+    for run in all_runs.iter() {
         if left == 0 {
             break;
         }
@@ -8016,10 +8059,6 @@ fn attach_buffer_resident<M: HostMemory + HostOps>(
         return;
     }
     let gpas = gpas.to_vec();
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for v in [packed.gva.wrapping_add(src.source_offset), src.total_len] {
-        h = (h ^ v).wrapping_mul(0x0100_0000_01b3);
-    }
     let key = GatherKey::Mapping {
         mid: 0x8000_0000 | task_id,
         base_off: h,
