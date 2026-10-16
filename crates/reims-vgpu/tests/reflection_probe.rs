@@ -13,11 +13,16 @@ fn print_reflection() {
     };
     let air = std::fs::read(&path).expect("read PROBE_AIR");
     let stage = match std::env::var("PROBE_STAGE").as_deref() {
-        Ok("vertex") => metal2vulkan::passes::Stage::Vertex,
-        _ => metal2vulkan::passes::Stage::Fragment,
+        Ok("vertex") => reims_vgpu::runtime::m2v_cache::RenderStage::Vertex,
+        _ => reims_vgpu::runtime::m2v_cache::RenderStage::Fragment,
     };
-    let shader = reims_vgpu::runtime::m2v_cache::translate_cached_reflected(&air, stage, 9999)
-        .expect("translate");
+    let shader = reims_vgpu::runtime::m2v_cache::translate_cached_render_reflected(
+        &air,
+        stage,
+        reims_vgpu::runtime::m2v_cache::RenderSampleCount::ONE,
+        9999,
+    )
+    .expect("translate");
     println!(
         "stage={:?} entry bindings={}",
         stage,

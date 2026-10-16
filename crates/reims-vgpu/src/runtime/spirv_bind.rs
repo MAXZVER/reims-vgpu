@@ -2454,7 +2454,7 @@ pub fn reflected_sampler_binding(
 ) -> Option<u32> {
     if !matches!(
         resource.kind,
-        ResourceKind::Sampler | ResourceKind::StaticSampler
+        ResourceKind::Sampler | ResourceKind::StaticSampler | ResourceKind::SynthesizedReadSampler
     ) {
         return None;
     }
@@ -4611,6 +4611,25 @@ mod more_tests {
             reflected_sampler_binding(&sampler, true),
             Some(SAMPLER_BINDING_BASE + 5 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET)
         );
+    }
+
+    #[test]
+    fn synthesized_read_samplers_keep_their_descriptor_in_each_variant() {
+        let mut sampler = static_sampler_binding(M2V_SAMPLER_BINDING_BASE + 5);
+        sampler.kind = ResourceKind::SynthesizedReadSampler;
+        sampler.metal_index = 77;
+        sampler.static_sampler = None;
+        let mut reflection = empty_reflection(ShaderStage::Vertex);
+        reflection.bindings.push(sampler);
+        for (relocated, binding) in [
+            (false, SAMPLER_BINDING_BASE + 5),
+            (true, SAMPLER_BINDING_BASE + 5 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET),
+        ] {
+            let descriptors = reflected_sampler_descriptors(&reflection, relocated);
+            assert_eq!(descriptors.len(), 1);
+            assert_eq!(descriptors[0].binding, binding);
+            assert_eq!(descriptors[0].static_state, None);
+        }
     }
 
     fn shape(dimension: TextureDimension, arrayed: bool, writable: bool) -> TextureShape {

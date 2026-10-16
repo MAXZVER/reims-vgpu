@@ -53,7 +53,12 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
         // first would allocate twice per pipeline ref for bytes nothing keeps.
         let pair = draw::vulkan::load_render_mtlb_pair(state, host, task_id, pipeline_ref);
         note_preflight_part(PreflightPart::Air, air_started.elapsed().as_nanos() as u64);
-        let Ok((v_mtlb, f_mtlb)) = pair else {
+        let Ok(draw::vulkan::RenderMtlbPair {
+            vertex: v_mtlb,
+            fragment: f_mtlb,
+            raster_sample_count: raw_raster_sample_count,
+        }) = pair
+        else {
             // Normal execution emits the precise pipeline/MTLB failure. A
             // missing plan input is deterministic, not asynchronous work.
             //
@@ -67,6 +72,21 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route("preflight_mtlb_unloadable");
             continue;
         };
+        let raster_sample_count =
+            match crate::runtime::m2v_cache::RenderSampleCount::from_pipeline_descriptor(
+                raw_raster_sample_count,
+            ) {
+                Ok(count) => count,
+                Err(reason) => {
+                    crate::observe::Emit::decline("preflight_raster_sample_count", &reason)
+                        .field("pipe", pipeline_ref)
+                        .fail_once(u64::from(pipeline_ref));
+                    crate::runtime::drain::note_store_route(
+                        "preflight_raster_sample_count_unsupported",
+                    );
+                    continue;
+                }
+            };
         // A container whose AIR will not extract is the same "deterministic
         // missing plan input" as one that would not load: normal execution
         // reports it precisely, and there is no asynchronous work to await.
@@ -80,13 +100,15 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
         let cache_started = std::time::Instant::now();
         // `|` and not `||`: both stages must be *started*, so they translate in
         // parallel and the packet is retried once rather than once per stage.
-        let translated = crate::runtime::m2v_cache::ensure_cached_async(
+        let translated = crate::runtime::m2v_cache::ensure_cached_render_async(
             v_air,
-            metal2vulkan::passes::Stage::Vertex,
+            crate::runtime::m2v_cache::RenderStage::Vertex,
+            raster_sample_count,
             pipeline_ref,
-        ) & crate::runtime::m2v_cache::ensure_cached_async(
+        ) & crate::runtime::m2v_cache::ensure_cached_render_async(
             f_air,
-            metal2vulkan::passes::Stage::Fragment,
+            crate::runtime::m2v_cache::RenderStage::Fragment,
+            raster_sample_count,
             pipeline_ref,
         );
         note_preflight_part(
@@ -99,7 +121,15 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             }
             continue;
         }
-        publish_render_usage(state, host, task_id, pipeline_ref, v_air, f_air);
+        publish_render_usage(
+            state,
+            host,
+            task_id,
+            pipeline_ref,
+            raster_sample_count,
+            v_air,
+            f_air,
+        );
     }
 }
 
@@ -129,6 +159,7 @@ fn publish_render_usage<M: HostMemory + HostOps>(
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
+    raster_sample_count: crate::runtime::m2v_cache::RenderSampleCount,
     v_air: &[u8],
     f_air: &[u8],
 ) {
@@ -152,14 +183,16 @@ fn publish_render_usage<M: HostMemory + HostOps>(
         return;
     };
     let (Ok(vertex), Ok(fragment)) = (
-        crate::runtime::m2v_cache::translate_cached_reflected(
+        crate::runtime::m2v_cache::translate_cached_render_reflected(
             v_air,
-            metal2vulkan::passes::Stage::Vertex,
+            crate::runtime::m2v_cache::RenderStage::Vertex,
+            raster_sample_count,
             pipeline_ref,
         ),
-        crate::runtime::m2v_cache::translate_cached_reflected(
+        crate::runtime::m2v_cache::translate_cached_render_reflected(
             f_air,
-            metal2vulkan::passes::Stage::Fragment,
+            crate::runtime::m2v_cache::RenderStage::Fragment,
+            raster_sample_count,
             pipeline_ref,
         ),
     ) else {

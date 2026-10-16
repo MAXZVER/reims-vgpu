@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -25,6 +26,44 @@ use crate::observe::Decline;
 
 type FragmentRelocationCache = HashMap<(bool, bool), Arc<ShaderVariant>>;
 type M2vResult<T> = Result<T, M2vCacheDecline>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RenderSampleCount(NonZeroU32);
+
+impl RenderSampleCount {
+    pub const ONE: Self = Self(NonZeroU32::MIN);
+
+    pub fn from_pipeline_descriptor(raw: u32) -> M2vResult<Self> {
+        let count = raw.max(1);
+        if !matches!(count, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
+            return Err(M2vCacheDecline::RasterSampleCountUnsupported {
+                raster_sample_count: count,
+            });
+        }
+        Ok(Self(
+            NonZeroU32::new(count).expect("nonzero after Metal default"),
+        ))
+    }
+
+    fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RenderStage {
+    Vertex,
+    Fragment,
+}
+
+impl RenderStage {
+    fn stage(self) -> Stage {
+        match self {
+            Self::Vertex => Stage::Vertex,
+            Self::Fragment => Stage::Fragment,
+        }
+    }
+}
 
 /// A specific failure while caching, translating, or post-processing AIR.
 ///
@@ -71,6 +110,9 @@ pub enum M2vCacheDecline {
         requested: [u32; 3],
         reflected: Option<[u32; 3]>,
     },
+    RasterSampleCountUnsupported {
+        raster_sample_count: u32,
+    },
 }
 
 impl M2vCacheDecline {
@@ -113,7 +155,8 @@ impl M2vCacheDecline {
             | Self::LayoutRepair { .. }
             | Self::TranslationPending { .. }
             | Self::KernelLocalSizeZero { .. }
-            | Self::KernelLocalSizeMismatch { .. } => false,
+            | Self::KernelLocalSizeMismatch { .. }
+            | Self::RasterSampleCountUnsupported { .. } => false,
         }
     }
 }
@@ -186,6 +229,7 @@ impl Decline for M2vCacheDecline {
             Self::TranslationPending { .. } => "m2v_translation_pending_at_sync_boundary",
             Self::KernelLocalSizeZero { .. } => "m2v_kernel_local_size_zero",
             Self::KernelLocalSizeMismatch { .. } => "m2v_kernel_local_size_mismatch",
+            Self::RasterSampleCountUnsupported { .. } => "m2v_raster_sample_count_unsupported",
         }
     }
 
@@ -251,6 +295,9 @@ impl Decline for M2vCacheDecline {
                     ),
                 ),
             ],
+            Self::RasterSampleCountUnsupported {
+                raster_sample_count,
+            } => vec![("raster_sample_count", raster_sample_count.to_string())],
         }
     }
 }
@@ -519,6 +566,7 @@ struct Slot {
     /// AIR blob dispatched at two geometries is two shaders. `None` for a render
     /// stage, which has no such parameter.
     local_size: Option<[u32; 3]>,
+    raster_sample_count: Option<RenderSampleCount>,
     air: Arc<[u8]>,
     entry: Entry,
 }
@@ -526,7 +574,10 @@ struct Slot {
 impl Slot {
     /// The full identity compare. This alone decides a hit.
     fn is(&self, id: ShaderId<'_>) -> bool {
-        self.stage == id.stage && self.local_size == id.local_size && *self.air == *id.air
+        self.stage == id.stage
+            && self.local_size == id.local_size
+            && self.raster_sample_count == id.raster_sample_count
+            && *self.air == *id.air
     }
 }
 
@@ -574,15 +625,17 @@ struct ShaderId<'a> {
     digest: u64,
     stage: u8,
     local_size: Option<[u32; 3]>,
+    raster_sample_count: Option<RenderSampleCount>,
     air: &'a [u8],
 }
 
 impl<'a> ShaderId<'a> {
-    fn render(stage: Stage, air: &'a [u8]) -> Self {
+    fn render(stage: RenderStage, raster_sample_count: RenderSampleCount, air: &'a [u8]) -> Self {
         Self {
-            digest: air_key(stage, air),
-            stage: stage_tag(stage),
+            digest: air_key_render(stage, raster_sample_count, air),
+            stage: stage_tag(stage.stage()),
             local_size: None,
+            raster_sample_count: Some(raster_sample_count),
             air,
         }
     }
@@ -592,6 +645,7 @@ impl<'a> ShaderId<'a> {
             digest: air_key_kernel(air, local_size),
             stage: stage_tag(Stage::Kernel),
             local_size: Some(local_size),
+            raster_sample_count: None,
             air,
         }
     }
@@ -622,6 +676,7 @@ impl Cache {
             None => bucket.push(Slot {
                 stage: id.stage,
                 local_size: id.local_size,
+                raster_sample_count: id.raster_sample_count,
                 air: Arc::clone(air),
                 entry,
             }),
@@ -654,6 +709,7 @@ impl Cache {
 struct TranslationTask {
     stage: Stage,
     kernel_local_size: Option<[u32; 3]>,
+    raster_sample_count: Option<RenderSampleCount>,
     /// Shared with the [`Slot`] the admission filed, so the identity the worker
     /// completes under is the same bytes the admission was asked about and not a
     /// second copy that could differ.
@@ -663,9 +719,18 @@ struct TranslationTask {
 
 impl TranslationTask {
     fn id(&self) -> ShaderId<'_> {
-        match self.kernel_local_size {
-            Some(local_size) => ShaderId::kernel(&self.air, local_size),
-            None => ShaderId::render(self.stage, &self.air),
+        match (self.kernel_local_size, self.raster_sample_count) {
+            (Some(local_size), None) => ShaderId::kernel(&self.air, local_size),
+            (None, Some(raster_sample_count)) => ShaderId::render(
+                match self.stage {
+                    Stage::Vertex => RenderStage::Vertex,
+                    Stage::Fragment => RenderStage::Fragment,
+                    Stage::Kernel => unreachable!("kernel task without LocalSize"),
+                },
+                raster_sample_count,
+                &self.air,
+            ),
+            _ => unreachable!("translation task constructed outside typed admission"),
         }
     }
 }
@@ -704,9 +769,10 @@ fn stage_tag(stage: Stage) -> u8 {
 /// two blobs of different lengths are not merely unlikely to share a bucket —
 /// the length is in the digest too. That is now a statement about walk length
 /// rather than about correctness.
-fn air_key(stage: Stage, air: &[u8]) -> u64 {
+fn air_key_render(stage: RenderStage, raster_sample_count: RenderSampleCount, air: &[u8]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    stage_tag(stage).hash(&mut h);
+    stage_tag(stage.stage()).hash(&mut h);
+    raster_sample_count.hash(&mut h);
     air.hash(&mut h);
     h.finish()
 }
@@ -799,7 +865,12 @@ fn capture_air(air: &[u8], stage: Stage, spirv: &[u8]) {
     }
 }
 
-fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
+fn translate_render_air(
+    air: &[u8],
+    stage: RenderStage,
+    raster_sample_count: RenderSampleCount,
+) -> M2vResult<CachedShader> {
+    let stage = stage.stage();
     // metal2vulkan's tool boundary uses fixed scratch names inside `tmp_dir`.
     // Serialize sync and background calls so their AIR/LLVM/SPIR-V files never
     // alias one another.
@@ -815,11 +886,32 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     // Reflected translate: byte-identical SPIR-V PLUS the stage-interface facade.
     // `reflection.datalayout` carries the source `target datalayout` the sanitizer
     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
-    let (spirv, reflection) =
-        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
-            .map_err(|e| translate_decline(stage, e.to_string()))?;
+    let options = metal2vulkan::passes::TransformOptions {
+        raster_sample_count: Some(raster_sample_count.get()),
+        ..Default::default()
+    };
+    let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
+        path.to_str().unwrap_or(name),
+        stage,
+        &tmp,
+        options,
+    )
+    .map_err(|e| translate_decline(stage, e.to_string()))?;
     capture_air(air, stage, &spirv);
-    finish_translated(spirv, reflection, stage)
+    let shader = finish_translated(spirv, reflection, stage)?;
+    // Once per translation, never per draw: remember whether this fragment
+    // shader asks `air.is_null_texture*`, which the translator answers with a
+    // constant `false` for every real texture. A neutral stand-in substituted
+    // for such a shader is sampled; for any other it may be dead. Read only by
+    // `draw::unbound_trace`'s census and trace line.
+    if matches!(stage, Stage::Fragment) {
+        crate::runtime::draw::unbound_trace::note_translated_fragment(
+            &shader.reflection,
+            shader.spirv.len(),
+            air,
+        );
+    }
+    Ok(shader)
 }
 
 fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedShader> {
@@ -930,8 +1022,29 @@ pub fn async_completed_gen() -> u64 {
 /// sole FIFO scheduler. Returns true when the content is already resolved
 /// (success or deterministic failure), false while the background worker owns
 /// it. Callers keep the guest packet at the channel head and retry on poll.
-pub fn ensure_cached_async(air: &[u8], stage: Stage, pipeline_ref: u32) -> bool {
-    ensure_cached_async_keyed(ShaderId::render(stage, air), stage, None, pipeline_ref)
+pub fn ensure_cached_render_async(
+    air: &[u8],
+    stage: RenderStage,
+    raster_sample_count: RenderSampleCount,
+    pipeline_ref: u32,
+) -> bool {
+    ensure_cached_async_keyed(
+        ShaderId::render(stage, raster_sample_count, air),
+        stage.stage(),
+        None,
+        Some(raster_sample_count),
+        pipeline_ref,
+    )
+}
+
+#[cfg(test)]
+fn ensure_cached_async(air: &[u8], stage: Stage, pipeline_ref: u32) -> bool {
+    let render_stage = match stage {
+        Stage::Vertex => RenderStage::Vertex,
+        Stage::Fragment => RenderStage::Fragment,
+        Stage::Kernel => panic!("kernel has its own cache API"),
+    };
+    ensure_cached_render_async(air, render_stage, RenderSampleCount::ONE, pipeline_ref)
 }
 
 /// Kernel counterpart to [`ensure_cached_async`]. LocalSize is part of both
@@ -945,6 +1058,7 @@ pub fn ensure_cached_kernel_async(air: &[u8], local_size: [u32; 3], pipeline_ref
         ShaderId::kernel(air, local_size),
         Stage::Kernel,
         Some(local_size),
+        None,
         pipeline_ref,
     )
 }
@@ -953,6 +1067,7 @@ fn ensure_cached_async_keyed(
     id: ShaderId<'_>,
     stage: Stage,
     kernel_local_size: Option<[u32; 3]>,
+    raster_sample_count: Option<RenderSampleCount>,
     pipeline_ref: u32,
 ) -> bool {
     let mut start_worker = false;
@@ -986,6 +1101,7 @@ fn ensure_cached_async_keyed(
         c.async_queue.push_back(TranslationTask {
             stage,
             kernel_local_size,
+            raster_sample_count,
             air,
             pipeline_ref,
         });
@@ -1040,9 +1156,18 @@ fn async_worker() {
                 }
             }
         };
-        let result = match task.kernel_local_size {
-            Some(local_size) => translate_kernel_air(&task.air, local_size),
-            None => translate_air(&task.air, task.stage),
+        let result = match (task.kernel_local_size, task.raster_sample_count) {
+            (Some(local_size), None) => translate_kernel_air(&task.air, local_size),
+            (None, Some(raster_sample_count)) => translate_render_air(
+                &task.air,
+                match task.stage {
+                    Stage::Vertex => RenderStage::Vertex,
+                    Stage::Fragment => RenderStage::Fragment,
+                    Stage::Kernel => unreachable!("kernel task without LocalSize"),
+                },
+                raster_sample_count,
+            ),
+            _ => unreachable!("translation task constructed outside typed admission"),
         };
         let (hits, misses, detail, failure) = {
             let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1188,12 +1313,14 @@ fn note_loading_translated_inline(pipeline_ref: u32, stage: &'static str) {
 /// (texture shapes, vertex builtins, descriptor bindings) from the reflection
 /// instead of re-walking the emitted SPIR-V. The returned `Arc` is a clone of the
 /// cached entry — a warm hit performs no allocation beyond the refcount bump.
-pub fn translate_cached_reflected(
+pub fn translate_cached_render_reflected(
     air: &[u8],
-    stage: Stage,
+    stage: RenderStage,
+    raster_sample_count: RenderSampleCount,
     pipeline_ref: u32,
 ) -> M2vResult<Arc<CachedShader>> {
-    let id = ShaderId::render(stage, air);
+    let id = ShaderId::render(stage, raster_sample_count, air);
+    let m2v_stage = stage.stage();
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
         match c.find(id).cloned() {
@@ -1226,12 +1353,14 @@ pub fn translate_cached_reflected(
             // black this way whenever a pipeline ref was re-pointed at new AIR
             // just before a packet binding it was admitted. Translate here, as a
             // miss does; the worker's later `put` of the same bytes is a no-op.
-            Some(Entry::Loading) => note_loading_translated_inline(pipeline_ref, stage_name(stage)),
+            Some(Entry::Loading) => {
+                note_loading_translated_inline(pipeline_ref, stage_name(m2v_stage))
+            }
             None => {}
         }
     }
 
-    let shader = Arc::new(translate_air(air, stage)?);
+    let shader = Arc::new(translate_render_air(air, stage, raster_sample_count)?);
 
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1246,6 +1375,20 @@ pub fn translate_cached_reflected(
         ));
     }
     Ok(shader)
+}
+
+#[cfg(test)]
+fn translate_cached_reflected(
+    air: &[u8],
+    stage: Stage,
+    pipeline_ref: u32,
+) -> M2vResult<Arc<CachedShader>> {
+    let render_stage = match stage {
+        Stage::Vertex => RenderStage::Vertex,
+        Stage::Fragment => RenderStage::Fragment,
+        Stage::Kernel => panic!("kernel has its own cache API"),
+    };
+    translate_cached_render_reflected(air, render_stage, RenderSampleCount::ONE, pipeline_ref)
 }
 
 /// Translate a **compute** AIR kernel with explicit LocalSize (threadgroup dims),
@@ -1359,8 +1502,12 @@ mod tests {
         // A ref no other test in this process uses, so the map's own state is
         // this test's.
         const REF: u32 = 0xD1FF_0001;
-        let a = ShaderId::render(Stage::Fragment, b"air-one");
-        let b = ShaderId::render(Stage::Fragment, b"air-two-longer");
+        let a = ShaderId::render(RenderStage::Fragment, RenderSampleCount::ONE, b"air-one");
+        let b = ShaderId::render(
+            RenderStage::Fragment,
+            RenderSampleCount::ONE,
+            b"air-two-longer",
+        );
         assert_ne!(a.digest, b.digest, "the fixture needs two identities");
 
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1679,10 +1826,36 @@ mod tests {
     #[test]
     fn air_key_differs_by_stage_and_bytes() {
         let a = b"same-air-bytes";
-        assert_ne!(air_key(Stage::Vertex, a), air_key(Stage::Fragment, a));
-        assert_ne!(air_key(Stage::Vertex, a), air_key(Stage::Vertex, b"other"));
-        assert_eq!(air_key(Stage::Vertex, a), air_key(Stage::Vertex, a));
+        assert_ne!(
+            air_key_render(RenderStage::Vertex, RenderSampleCount::ONE, a),
+            air_key_render(RenderStage::Fragment, RenderSampleCount::ONE, a)
+        );
+        assert_ne!(
+            air_key_render(RenderStage::Vertex, RenderSampleCount::ONE, a),
+            air_key_render(RenderStage::Vertex, RenderSampleCount::ONE, b"other")
+        );
+        assert_eq!(
+            air_key_render(RenderStage::Vertex, RenderSampleCount::ONE, a),
+            air_key_render(RenderStage::Vertex, RenderSampleCount::ONE, a)
+        );
         assert_ne!(air_key_kernel(a, [16, 16, 1]), air_key_kernel(a, [8, 8, 1]));
+    }
+
+    #[test]
+    fn render_sample_count_is_checked_and_part_of_cache_identity() {
+        let one = RenderSampleCount::from_pipeline_descriptor(0).expect("Metal default");
+        let four = RenderSampleCount::from_pipeline_descriptor(4).expect("supported count");
+        assert_eq!(one, RenderSampleCount::ONE);
+        assert!(matches!(
+            RenderSampleCount::from_pipeline_descriptor(3),
+            Err(M2vCacheDecline::RasterSampleCountUnsupported {
+                raster_sample_count: 3
+            })
+        ));
+        let a = ShaderId::render(RenderStage::Fragment, one, b"sample-query-air");
+        let b = ShaderId::render(RenderStage::Fragment, four, b"sample-query-air");
+        assert_ne!(a.digest, b.digest);
+        assert_ne!(a.raster_sample_count, b.raster_sample_count);
     }
 
     /// Each `local_size` component alone changes the kernel key.
@@ -1740,6 +1913,9 @@ mod tests {
             M2vCacheDecline::KernelLocalSizeZero {
                 local_size: [0, 1, 1],
             },
+            M2vCacheDecline::RasterSampleCountUnsupported {
+                raster_sample_count: 3,
+            },
         ] {
             assert!(!permanent.is_transient(), "{permanent:?} is about the AIR");
         }
@@ -1755,7 +1931,7 @@ mod tests {
         let _guard = test_lock();
         reset_for_test();
         let air = b"air-whose-scratch-write-failed";
-        let id = ShaderId::render(Stage::Vertex, air);
+        let id = ShaderId::render(RenderStage::Vertex, RenderSampleCount::ONE, air);
         let stored = M2vCacheDecline::VertexScratchWrite {
             detail: "No space left on device".to_string(),
         };
@@ -1797,7 +1973,7 @@ mod tests {
         // Not real AIR, so the inline translation fails — and that failure is
         // the proof it ran: a refusal would have been `TranslationPending`.
         let air = b"air-queued-for-the-worker";
-        let id = ShaderId::render(Stage::Fragment, air);
+        let id = ShaderId::render(RenderStage::Fragment, RenderSampleCount::ONE, air);
         global()
             .lock()
             .unwrap()
@@ -1845,15 +2021,15 @@ mod tests {
 
         let first = b"the-air-that-got-there-first";
         let second = b"a-different-shader-entirely";
-        let id = ShaderId::render(Stage::Vertex, first);
+        let id = ShaderId::render(RenderStage::Vertex, RenderSampleCount::ONE, first);
         // The second identity, forced into the first one's bucket. Everything
         // but `digest` is the second shader's own.
         let collided = ShaderId {
             digest: id.digest,
-            ..ShaderId::render(Stage::Vertex, second)
+            ..ShaderId::render(RenderStage::Vertex, RenderSampleCount::ONE, second)
         };
         assert_ne!(
-            ShaderId::render(Stage::Vertex, second).digest,
+            ShaderId::render(RenderStage::Vertex, RenderSampleCount::ONE, second).digest,
             id.digest,
             "the two blobs do not collide naturally; the bucket below is forced"
         );
@@ -1906,7 +2082,7 @@ mod tests {
         let _guard = test_lock();
         reset_for_test();
         let air = b"air-that-cannot-be-translated";
-        let id = ShaderId::render(Stage::Vertex, air);
+        let id = ShaderId::render(RenderStage::Vertex, RenderSampleCount::ONE, air);
         let stored = M2vCacheDecline::VertexTranslate {
             detail: "unsupported instruction".to_string(),
         };
@@ -1965,7 +2141,7 @@ mod tests {
             let mut c = global().lock().unwrap();
             // fake SPIR-V magic-ish
             c.put(
-                ShaderId::render(Stage::Vertex, air),
+                ShaderId::render(RenderStage::Vertex, RenderSampleCount::ONE, air),
                 &Arc::from(&air[..]),
                 Entry::Ready(synth_shader(Stage::Vertex, vec![0x03, 0x02, 0x23, 0x07])),
             );
@@ -2000,7 +2176,7 @@ mod tests {
         let _guard = test_lock();
         reset_for_test();
         let air = b"synthetic-async-cache-state";
-        let id = ShaderId::render(Stage::Fragment, air);
+        let id = ShaderId::render(RenderStage::Fragment, RenderSampleCount::ONE, air);
         {
             let mut c = global().lock().unwrap();
             c.put(id, &Arc::from(&air[..]), Entry::Loading);
@@ -2043,7 +2219,7 @@ mod tests {
         {
             let mut c = global().lock().unwrap();
             c.put(
-                ShaderId::render(Stage::Fragment, &hot),
+                ShaderId::render(RenderStage::Fragment, RenderSampleCount::ONE, &hot),
                 &Arc::from(&hot[..]),
                 Entry::Ready(synth_shader(Stage::Fragment, vec![1, 2, 3, 4])),
             );
@@ -2054,7 +2230,7 @@ mod tests {
             let air = format!("cold-shader-{i}").into_bytes();
             let mut c = global().lock().unwrap();
             c.put(
-                ShaderId::render(Stage::Fragment, &air),
+                ShaderId::render(RenderStage::Fragment, RenderSampleCount::ONE, &air),
                 &Arc::from(&air[..]),
                 Entry::Ready(synth_shader(Stage::Fragment, vec![0, 0, 0, 0])),
             );
@@ -2129,6 +2305,9 @@ mod tests {
                 requested: [16, 16, 1],
                 reflected: Some([8, 8, 1]),
             },
+            M2vCacheDecline::RasterSampleCountUnsupported {
+                raster_sample_count: 3,
+            },
         ];
         let mut slugs = Vec::new();
         for decline in all {
@@ -2145,7 +2324,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 12, "the m2v cache decline census moved");
+        assert_eq!(before, 13, "the m2v cache decline census moved");
         assert_eq!(before, slugs.len(), "duplicate m2v cache decline");
     }
 }

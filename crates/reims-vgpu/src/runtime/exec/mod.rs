@@ -117,11 +117,23 @@ struct PendingDraw {
     /// [`StreamAccum::visibility`]. `None` is the Metal default,
     /// `MTLVisibilityResultModeDisabled`.
     visibility: Option<draw::VisibilityArming>,
+    /// How many draws the stream had recorded when this one snapshotted its
+    /// binds: the `draw_tag` the raw bind log groups records by, so the trace
+    /// can say which binds arrived since the previous draw. Observation only.
+    bind_tag: u32,
 }
 
 #[derive(Clone, Debug, Default)]
 struct StreamAccum {
     pipeline_ref: u32,
+    /// Every raw bind record of this stream as the guest sent it, bounded and
+    /// empty when `REIMS_VGPU_TRACE_UNBOUND_BINDS` is off. Read only by
+    /// `draw::unbound_trace` to name why a substituted slot was empty.
+    bind_log: draw::unbound_trace::StreamBindLog,
+    /// The previous stream's final fragment texture table in this submission,
+    /// and this stream's position in it. Observation only, see `bind_log`.
+    prior_frag_textures: BindTable<TextureBind>,
+    stream_seq: u32,
     /// Every colour attachment whose `load_action` is `Clear`, in stream order.
     ///
     /// Membership is the **load** action alone, because this is the pass's
@@ -287,6 +299,7 @@ impl StreamAccum {
             depth_attach: self.depth_attach,
             stencil_attach: self.stencil_attach,
             visibility: self.visibility,
+            bind_tag: self.draws.len() as u32,
             ..Default::default()
         })
     }
@@ -1012,8 +1025,18 @@ fn execute_submission<M: HostMemory + HostOps>(
     // compare the second buffer's records against the first buffer's answers.
     let mut resolved = resolved.map(ResolvedCursor::new);
 
+    // Observation only (`draw::unbound_trace`): the previous stream's final
+    // fragment textures, so a slot this encoder never bound can be told apart
+    // from one the guest bound on an earlier encoder and relied on.
+    let mut prior_frag_textures: BindTable<TextureBind> = BindTable::default();
+    let mut stream_seq = 0u32;
     for stream in streams {
-        let mut acc = StreamAccum::default();
+        let mut acc = StreamAccum {
+            prior_frag_textures: std::mem::take(&mut prior_frag_textures),
+            stream_seq,
+            ..StreamAccum::default()
+        };
+        stream_seq = stream_seq.saturating_add(1);
         let walk_started = std::time::Instant::now();
         walk_stream(
             state,
@@ -1029,6 +1052,7 @@ fn execute_submission<M: HostMemory + HostOps>(
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
         let finish_started = std::time::Instant::now();
         finish_stream(state, host, task_id, out, &acc);
+        prior_frag_textures = acc.fragment_textures.clone();
         let finish_ns = finish_started.elapsed().as_nanos() as u64;
         *measured_ns += finish_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
@@ -3270,7 +3294,15 @@ fn handle_render_binds<M: HostMemory + HostOps>(
     };
     match record {
         RenderRecord::BindBuffers(r) => {
+        acc.bind_log.record(
+            acc.draws.len() as u32,
+            draw::unbound_trace::BindKind::Buffer,
+            r.stage,
+            r.first,
+            r.entries.iter().map(|e| e.buffer_ref.get()),
+        );
             let cleared = apply_binds(
+
                 r.entries,
                 r.first,
                 BindTarget {
@@ -3299,7 +3331,15 @@ fn handle_render_binds<M: HostMemory + HostOps>(
             out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
         }
         RenderRecord::BindBuffersWithStride(r) => {
+        acc.bind_log.record(
+            acc.draws.len() as u32,
+            draw::unbound_trace::BindKind::Buffer,
+            ShaderStage::Vertex,
+            r.first,
+            r.entries.iter().map(|e| e.buffer_ref.get()),
+        );
             let cleared = apply_binds(
+
                 r.entries,
                 r.first,
                 BindTarget {
@@ -3328,7 +3368,15 @@ fn handle_render_binds<M: HostMemory + HostOps>(
             out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
         }
         RenderRecord::BindTextures(r) => {
+        acc.bind_log.record(
+            acc.draws.len() as u32,
+            draw::unbound_trace::BindKind::Texture,
+            r.stage,
+            r.first,
+            r.entries.iter().map(|e| e.object_ref.get()),
+        );
             let cleared = apply_binds(
+
                 r.entries,
                 r.first,
                 BindTarget {
@@ -3371,7 +3419,15 @@ fn handle_render_binds<M: HostMemory + HostOps>(
             out.texture_unbinds = out.texture_unbinds.saturating_add(cleared);
         }
         RenderRecord::BindSamplers(r) => {
+        acc.bind_log.record(
+            acc.draws.len() as u32,
+            draw::unbound_trace::BindKind::Sampler,
+            r.stage,
+            r.first,
+            r.entries.iter().map(|e| e.object_ref.get()),
+        );
             let cleared = apply_binds(
+
                 r.entries,
                 r.first,
                 BindTarget {
@@ -3400,7 +3456,15 @@ fn handle_render_binds<M: HostMemory + HostOps>(
             out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
         }
         RenderRecord::BindSamplersWithLod(r) => {
+        acc.bind_log.record(
+            acc.draws.len() as u32,
+            draw::unbound_trace::BindKind::Sampler,
+            r.stage,
+            r.first,
+            r.entries.iter().map(|e| e.sampler_ref.get()),
+        );
             let cleared = apply_binds(
+
                 r.entries,
                 r.first,
                 BindTarget {
@@ -4977,6 +5041,9 @@ fn finish_stream<M: HostMemory + HostOps>(
     // [`finish_phase`] for what the split is for.
     let mut fin = finish_phase::FinishTimer::open();
     note_stream_draw_drops(task_id, acc);
+    // Once per stream, never per draw: the raw bind log every draw below may
+    // name in a `frag_unbound_trace` line. `None` when the trace is off.
+    let bind_log_snapshot = acc.bind_log.snapshot();
     // Archive ApplePVGPUDrawJob: clear/load seed is private initial_rgba for the
     // async job; guest pages are written once at completion. Apply clear-to-guest
     // only for clear-only streams (no draws). When draws run, CLEAR is the Metal
@@ -5140,6 +5207,14 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                     }
                 };
+                // Observation only: what a substitution inside this execute
+                // reports about where its binds came from.
+                let _bind_ctx = draw::unbound_trace::enter_draw(|| draw::unbound_trace::DrawBindContext {
+                    log: bind_log_snapshot.clone(),
+                    origin: draw::unbound_trace::DrawOrigin::Icb,
+                    prior_frag_textures: acc.prior_frag_textures.clone(),
+                    stream_seq: acc.stream_seq,
+                });
                 match crate::backend::selected().encode_icb_execute_and_writeback(
                     state,
                     host,
@@ -5310,6 +5385,14 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
                 let draw_started = std::time::Instant::now();
                 fin.enter(crate::runtime::drain::FinishPhase::Encode);
+                // Observation only: parked for this draw's preparation so a
+                // neutral-texture substitution can say why the slot was empty.
+                let _bind_ctx = draw::unbound_trace::enter_draw(|| draw::unbound_trace::DrawBindContext {
+                    log: bind_log_snapshot.clone(),
+                    origin: draw::unbound_trace::DrawOrigin::Direct(pd.bind_tag),
+                    prior_frag_textures: acc.prior_frag_textures.clone(),
+                    stream_seq: acc.stream_seq,
+                });
                 let encode = crate::backend::selected().encode_draw_chain(
                     state,
                     host,

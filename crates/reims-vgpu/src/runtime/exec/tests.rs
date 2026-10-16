@@ -2523,6 +2523,7 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         stencil_ref: None,
         depth_attach: None,
         stencil_attach: None,
+        bind_tag: 0,
     });
     finish_stream(&mut state, &mut host, 1, &mut out, &acc);
     // Unresolvable RT → mrt_request fail before encode (not NoMetal); no clear.
@@ -2632,6 +2633,7 @@ fn nometal_draw_falls_back_to_backing_clear() {
         stencil_ref: None,
         depth_attach: None,
         stencil_attach: None,
+        bind_tag: 0,
     });
     let mut second = acc.draws[0].clone();
     second.pipeline_ref = 8;
@@ -6716,6 +6718,9 @@ fn each_render_state_record_writes_the_one_field_it_names_and_no_other() {
     fn fingerprint(acc: &StreamAccum) -> Vec<(&'static str, String)> {
         let StreamAccum {
             pipeline_ref,
+            bind_log,
+            prior_frag_textures,
+            stream_seq,
             clears,
             color_slots,
             color_targets,
@@ -6750,6 +6755,9 @@ fn each_render_state_record_writes_the_one_field_it_names_and_no_other() {
         } = acc;
         vec![
             ("pipeline_ref", format!("{pipeline_ref:?}")),
+            ("bind_log", format!("{bind_log:?}")),
+            ("prior_frag_textures", format!("{prior_frag_textures:?}")),
+            ("stream_seq", format!("{stream_seq:?}")),
             ("clears", format!("{clears:?}")),
             ("color_slots", format!("{color_slots:?}")),
             ("color_targets", format!("{color_targets:?}")),

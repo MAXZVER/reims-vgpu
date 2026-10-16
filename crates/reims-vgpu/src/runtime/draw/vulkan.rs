@@ -2553,7 +2553,8 @@ pub(super) fn try_gva_target_guest_seed<M: HostMemory + HostOps>(
     if !guest_run_alias_available(host) {
         return None;
     }
-    let layout = pixel_format::store_texel_order(c0.format)?;
+    // v13 fix D: `store_texel_order`, plus R16Float when the rescue is on.
+    let layout = gva_seed_texel_layout(c0.format, load_seed_rescue_enabled())?;
     let source_format = translate::pixel::vk_texel_layout(layout);
     if source_format != target_format {
         return None;
@@ -3637,9 +3638,11 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
                             .ok()?,
                         );
                         let whole = import.slice(head, backing.size).ok()?;
-                        let guest =
-                            crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&import), whole)
-                                .ok()?;
+                        let guest = crate::runtime::guest_ram::GuestRef::new(
+                            std::sync::Arc::clone(&import),
+                            whole,
+                        )
+                        .ok()?;
                         (
                             import,
                             head,
@@ -3659,9 +3662,11 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
                         .ok()?,
                     );
                     let whole = import.slice(head, backing.size).ok()?;
-                    let guest =
-                        crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&import), whole)
-                            .ok()?;
+                    let guest = crate::runtime::guest_ram::GuestRef::new(
+                        std::sync::Arc::clone(&import),
+                        whole,
+                    )
+                    .ok()?;
                     (
                         import,
                         head,
@@ -4560,6 +4565,98 @@ fn retained_resident_is_ready(
     }
 }
 
+/// v13 fix D: read `REIMS_VGPU_LOAD_SEED_RESCUE` once (default on).
+pub(super) fn load_seed_rescue_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match crate::config::read(crate::config::LOAD_SEED_RESCUE) {
+        (crate::config::Switch::Off, _) => {
+            crate::observe::fail(
+                "load_seed_rescue_disabled reason=disabled_by_env (v12: a LOAD with no seed begins undefined; R16Float targets take no native seed)",
+            );
+            false
+        }
+        (crate::config::Switch::Unrecognized, value) => {
+            crate::observe::fail(format!(
+                "load_seed_rescue reason=load_seed_rescue_env_unrecognized value={:?} (kept on)",
+                value.unwrap_or_default()
+            ));
+            true
+        }
+        _ => true,
+    })
+}
+
+/// v13 fix D: the texel layout a GVA colour LOAD may take straight out of its
+/// guest pages. [`pixel_format::store_texel_order`] is the v12 answer;
+/// with the rescue on, `R16Float` is added. It has no store order (no sampled
+/// class names its texel, which is that table's own membership rule), but its
+/// guest pages hold its own two-byte texels and the resident is created at
+/// `R16_SFLOAT`, so the byte copy is exact. Without it every R16Float icon
+/// coverage LOAD began undefined (`load_seed_lost door=none fmt=0x19`).
+pub(super) fn gva_seed_texel_layout(
+    format: u16,
+    rescue: bool,
+) -> Option<crate::protocol::pixel_format::TexelLayout> {
+    use crate::protocol::pixel_format::TexelLayout;
+    pixel_format::store_texel_order(format).or_else(|| {
+        (rescue && format == pixel_format::MTL_FORMAT_R16_FLOAT).then_some(TexelLayout::R16Float)
+    })
+}
+
+/// v13 fix D: what a colour LOAD that arrived with no seed does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LostSeedRescue {
+    /// A seed was found; nothing to rescue.
+    NotNeeded,
+    /// `REIMS_VGPU_LOAD_SEED_RESCUE=0`: v12 behaviour, the pass begins undefined.
+    Disabled,
+    /// A mapper-ref-texture target; its doors are the mapping's, not this one.
+    NotGva,
+    /// No resident identity can be named for this target.
+    NoIdentity,
+    /// The resident exists in name but holds no finished content.
+    ResidentNotReady,
+    /// Load from the engine resident that holds this target's last render.
+    Rescued,
+}
+
+impl LostSeedRescue {
+    pub(super) fn slug(self) -> &'static str {
+        match self {
+            Self::NotNeeded => "load_seed_rescue_not_needed",
+            Self::Disabled => "load_seed_rescue_off",
+            Self::NotGva => "load_seed_rescue_refused_not_gva",
+            Self::NoIdentity => "load_seed_rescue_refused_no_identity",
+            Self::ResidentNotReady => "load_seed_rescue_refused_resident_not_ready",
+            Self::Rescued => "load_seed_rescued_from_resident",
+        }
+    }
+}
+
+/// Pure decision for [`LostSeedRescue`]. `resident_ready` is `None` when no
+/// identity could be named, else whether that resident holds finished content.
+pub(super) fn lost_seed_rescue_decision(
+    enabled: bool,
+    seeded: bool,
+    mapping_id: u32,
+    resident_ready: Option<bool>,
+) -> LostSeedRescue {
+    if seeded {
+        return LostSeedRescue::NotNeeded;
+    }
+    if !enabled {
+        return LostSeedRescue::Disabled;
+    }
+    if mapping_id != 0 {
+        return LostSeedRescue::NotGva;
+    }
+    match resident_ready {
+        None => LostSeedRescue::NoIdentity,
+        Some(false) => LostSeedRescue::ResidentNotReady,
+        Some(true) => LostSeedRescue::Rescued,
+    }
+}
+
 /// Whether the resident named by a GVA texture is still usable.
 ///
 /// A named texture owns a retained allocation lease, so warm binds answer from
@@ -5081,11 +5178,12 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // the task resource.
     if available && planes == 1 && crate::backend::vulkan::caps::direct_host_images_allowed() {
         if let Some(backing) = allocation.as_ref() {
-            if let Some(packed) =
-                state
-                    .bound_buffers
-                    .packed_available(task_id, texture_ref, backing.gva, backing.size)
-            {
+            if let Some(packed) = state.bound_buffers.packed_available(
+                task_id,
+                texture_ref,
+                backing.gva,
+                backing.size,
+            ) {
                 if let Some(request) = direct_linear_sample_from_packed(
                     packed,
                     layout.offset,
@@ -5131,7 +5229,8 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 let packed_offset = packed.head.checked_add(layout.offset)?;
                 let first_page = usize::try_from(packed_offset / page).ok()?;
                 let head_off = packed_offset % page;
-                let page_count = usize::try_from(head_off.checked_add(span)?.div_ceil(page)).ok()?;
+                let page_count =
+                    usize::try_from(head_off.checked_add(span)?.div_ceil(page)).ok()?;
                 let witness_gpas = packed
                     .gpas
                     .get(first_page..first_page.checked_add(page_count)?)?;
@@ -7977,15 +8076,42 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             for (_, use_) in &uses {
                 crate::runtime::drain::note_store_route(use_.slug());
             }
-            if let Some((gap, _)) = uses.iter().find(|(gap, use_)| {
-                gap.class == crate::runtime::draw::vulkan::FragUnboundClass::Buffer
-                    && use_.is_violation()
-            }) {
-                return Err(DrawError::DrawPreparation(
-                    DrawPreparationDecline::UnboundStorageBuffer {
-                        index: gap.metal_index,
-                        binding: gap.metal_index + FRAG_BUFFER_BINDING_OFFSET,
-                    },
+            // v14: a statically used buffer the guest left unbound is served
+            // the zeroed neutral page when the shader only reads it; every
+            // other case keeps the refusal below (`unbound_buffer_serve`).
+            let mut zero_served: Vec<u32> = Vec::new();
+            for (gap, use_) in &uses {
+                if gap.class != crate::runtime::draw::vulkan::FragUnboundClass::Buffer
+                    || !use_.is_violation()
+                {
+                    continue;
+                }
+                let access = crate::runtime::spirv_bind::reflected_buffer_access(
+                    &f_shader.reflection,
+                    gap.metal_index,
+                );
+                match unbound_buffer_serve(access, unbound_buffer_zero_enabled()) {
+                    UnboundBufferServe::Zero => {
+                        crate::runtime::drain::note_store_route(UnboundBufferServe::Zero.slug());
+                        zero_served.push(gap.metal_index);
+                    }
+                    refused => {
+                        crate::runtime::drain::note_store_route(refused.slug());
+                        return Err(DrawError::DrawPreparation(
+                            DrawPreparationDecline::UnboundStorageBuffer {
+                                index: gap.metal_index,
+                                binding: gap.metal_index + FRAG_BUFFER_BINDING_OFFSET,
+                            },
+                        ));
+                    }
+                }
+            }
+            for index in zero_served {
+                frag_storage.push((
+                    index,
+                    crate::backend::vulkan::engine::BufferContent::Bytes(
+                        crate::runtime::spirv_bind::neutral_bind_bytes(),
+                    ),
                 ));
             }
             if !unbound.is_empty() {
@@ -8609,6 +8735,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         //
         // Cold path: the vector is empty on every draw that binds what it
         // samples, so this costs one `is_empty` on the hot path.
+        // Observation only, and bounded (`draw::unbound_trace`): one line per
+        // admitted draw naming the declared slots, the raw binds since the last
+        // draw, the encoder tables and why each slot below was empty. Covers
+        // icon-sized and material/backdrop-sized passes alike (`class=`).
+        crate::runtime::draw::unbound_trace::trace_draw(
+            req,
+            &f_shader.reflection,
+            f_shader.spirv.len(),
+            &frag_unbound_used_textures,
+            w,
+            h,
+        );
         for &index in &frag_unbound_used_textures {
             use crate::runtime::spirv_bind::{ReflectedSampledKind, SampledImageKind};
             let base_off = if separate_sampled {
@@ -8660,10 +8798,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // A repair that succeeded, not a success: the shader samples a
             // texture whose contents this device invented, so it stays on the
             // fail channel and the reliance stays measurable.
+            // The census by *why* the slot was empty (`frag_neutral_tex_reason_*`)
+            // counts every substitution, trace on or off; `fate=` is appended
+            // after the fields earlier builds wrote so existing parsers still
+            // match.
+            let fate = crate::runtime::draw::unbound_trace::note_substitution(
+                &req.fragment_textures,
+                index,
+                &f_shader.reflection,
+                f_shader.spirv.len(),
+            );
             crate::observe::fail(format!(
                 "shader_resource_declared_unbound \
                  reason=frag_neutral_texture_substituted \
-                 pipe={} idx={index} binding={img_bind} kind={kind:?} 1x1",
+                 pipe={} idx={index} binding={img_bind} kind={kind:?} 1x1 fate={fate}",
                 req.pipeline_ref
             ));
             images.push(crate::backend::vulkan::engine::SampledImageResource {
@@ -8680,8 +8828,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // texels, not one. `layers` is 1 for every other shape here, so
                 // the repeat is the identity for them.
                 source: crate::backend::vulkan::engine::SampledSource::Bytes(std::sync::Arc::new(
-                    crate::protocol::pixel_format::solid_rgba8(1, 1, &[0.0; 4])
-                        .repeat(shape.layers.max(1) as usize),
+                    // Transparent black unless `REIMS_VGPU_NEUTRAL_TEXTURE_PROBE`
+                    // asks for white or magenta to A/B whether the shader samples
+                    // the stand-in at all. Read once per process.
+                    crate::protocol::pixel_format::solid_rgba8(
+                        1,
+                        1,
+                        &crate::runtime::draw::unbound_trace::neutral_texel(),
+                    )
+                    .repeat(shape.layers.max(1) as usize),
                 )),
                 byte_origin: crate::backend::vulkan::engine::SampledByteOrigin::Synthetic,
                 format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -8766,6 +8921,33 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             for s in req.fragment_samplers.iter() {
                 if s.sampler_ref != 0 {
                     push_smp(s.index, s.sampler_ref, s.lod_clamp, true)?;
+                }
+            }
+        }
+        // These bindings have no Metal argument-table slot: reflection names
+        // descriptors the translator retained for explicit null texture handles.
+        // Use the same relocation as the corresponding executable variant.
+        for (reflection, relocated, stage) in [
+            (&*v_shader.reflection, false, "vertex"),
+            (&*f_shader.reflection, separate_sampled, "fragment"),
+        ] {
+            let before = images.len();
+            super::synthesized_sampled::append_null_textures(reflection, relocated, &mut images)
+                .map_err(|reason| {
+                    DrawError::DrawPreparation(DrawPreparationDecline::SynthesizedSampled {
+                        stage,
+                        reason,
+                    })
+                })?;
+            for image in &images[before..] {
+                let key = (u64::from(req.pipeline_ref) << 32)
+                    | (u64::from(image.binding) << 1)
+                    | u64::from(relocated);
+                if crate::observe::first_sight("synthesized_null_texture_served", key) {
+                    crate::observe::fail(format!(
+                        "synthesized_null_texture_served pipe={} task={} stage={stage} binding={} 1x1",
+                        req.pipeline_ref, req.task_id, image.binding
+                    ));
                 }
             }
         }
@@ -8882,10 +9064,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         if !chain_load_from_target {
             if let Some(identity) = mapper_ref_texture_render_identity(state, req) {
                 if let Some(c0) = req.colors.first() {
-                    let load_preserves = reims_vgpu_protocol::pass_action::LoadAction::from_declared(
-                        c0.load_action,
-                    )
-                    .preserves_prior_contents();
+                    let load_preserves =
+                        reims_vgpu_protocol::pass_action::LoadAction::from_declared(c0.load_action)
+                            .preserves_prior_contents();
                     let format = state
                         .mappings
                         .get(&c0.mapping_id)
@@ -9162,18 +9343,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // content out of its own pages at its own width before the
                     // eight-bit colour seed is considered; see
                     // `try_gva_target_guest_seed`.
+                    // v13 fix D: R16Float joins the native seed (its eight-bit
+                    // seed does not exist at all; see `gva_seed_texel_layout`).
                     let native_seed = (c0.mapping_id == 0
-                        && gva_store_needs_native_texels(c0.format))
-                    .then(|| {
-                        try_gva_target_guest_seed(
-                            state,
-                            host,
-                            req.task_id,
-                            c0,
-                            gva_resident_format(c0.format),
-                        )
-                    })
-                    .flatten();
+                        && (gva_store_needs_native_texels(c0.format)
+                            || (load_seed_rescue_enabled()
+                                && c0.format == pixel_format::MTL_FORMAT_R16_FLOAT)))
+                        .then(|| {
+                            try_gva_target_guest_seed(
+                                state,
+                                host,
+                                req.task_id,
+                                c0,
+                                gva_resident_format(c0.format),
+                            )
+                        })
+                        .flatten();
                     if let Some(seed) = native_seed {
                         seed_door = "gva_guest_seed";
                         crate::runtime::drain::note_store_route("gva_guest_seed_native");
@@ -9270,13 +9455,58 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // being dropped; a DontCare that arrives empty is what
                         // the guest declared, and folding the two together would
                         // retire the one counter that names the defect.
-                        note_load_seed_outcome(
-                            seed_door,
-                            target_rgba8.is_some() || target_guest_seed.is_some(),
-                            c0,
-                            w,
-                            h,
+                        //
+                        // v13 fix D (`REIMS_VGPU_LOAD_SEED_RESCUE`): before
+                        // calling a seedless LOAD lost, a GVA target whose
+                        // engine resident holds its last render loads from that
+                        // resident -- the same arm the persistent LOAD elision
+                        // takes, entered here only once every CPU door has
+                        // declined. Undefined is the only alternative, so this
+                        // cannot be worse than v12; it is what the Tahoe icon
+                        // filter passes (454 BGRA8 targets at 32..224 px, all
+                        // `load_seed_lost door=none`) needed.
+                        let seeded = target_rgba8.is_some() || target_guest_seed.is_some();
+                        let rescue_enabled = !seeded && load_seed_rescue_enabled();
+                        let rescue_identity = if rescue_enabled && c0.mapping_id == 0 {
+                            gva_chain_identity(req)
+                        } else {
+                            None
+                        };
+                        let rescue_ready = rescue_identity
+                            .as_ref()
+                            .map(|id| gva_resident_ready(state, req.task_id, c0.texture_ref, id));
+                        let rescue = lost_seed_rescue_decision(
+                            rescue_enabled || seeded,
+                            seeded,
+                            c0.mapping_id,
+                            rescue_ready,
                         );
+                        if rescue == LostSeedRescue::Rescued {
+                            crate::runtime::drain::note_store_route(rescue.slug());
+                            chain_load_from_target = true;
+                            gva_load_identity = rescue_identity;
+                        } else {
+                            note_load_seed_outcome(seed_door, seeded, c0, w, h);
+                            if !matches!(
+                                rescue,
+                                LostSeedRescue::NotNeeded | LostSeedRescue::Disabled
+                            ) {
+                                crate::runtime::drain::note_store_route(rescue.slug());
+                                if crate::observe::first_sight(
+                                    "load_seed_rescue_refused",
+                                    c0.target_gva ^ ((c0.texture_ref as u64) << 40),
+                                ) {
+                                    crate::observe::fail(format!(
+                                        "load_seed_rescue_refused reason={} gva={:#x} ref={} mid={} {w}x{h} fmt={:#x}",
+                                        rescue.slug(),
+                                        c0.target_gva,
+                                        c0.texture_ref,
+                                        c0.mapping_id,
+                                        c0.format
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -9357,6 +9587,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 .colors
                 .first()
                 .is_some_and(|color| color.multisample_source_ref != 0),
+            // v14 C1: the per-source persistent multisample image, when on.
+            multisample_source: req
+                .colors
+                .first()
+                .filter(|color| color.multisample_source_ref != 0 && msaa_load_enabled())
+                .map_or(0, |color| {
+                    (u64::from(req.task_id) << 32) | u64::from(color.multisample_source_ref)
+                }),
+            multisample_load: req.colors.first().is_some_and(|color| {
+                color.multisample_source_ref != 0 && color.load_action == MTL_LOAD_ACTION_LOAD
+            }),
             ..crate::backend::vulkan::engine::DrawRequest::default()
         };
         let resolving_colors = req
@@ -9393,11 +9634,24 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 ));
             }
             if color.load_action == MTL_LOAD_ACTION_LOAD {
-                return Err(DrawError::Unsupported(
-                    crate::backend::vulkan::engine::reason::DrawReason::MultisampleLoadActionUnsupported {
-                        load_action: color.load_action,
-                    },
-                ));
+                match msaa_load_admission(msaa_load_enabled()) {
+                    MsaaLoadAdmission::Persistent => {
+                        // The engine loads the source's persistent image
+                        // (`msaa_load_warm`) or starts it from transparent
+                        // black (`msaa_load_cold_cleared`).
+                        crate::runtime::drain::note_store_route(
+                            MsaaLoadAdmission::Persistent.slug(),
+                        );
+                    }
+                    MsaaLoadAdmission::Disabled => {
+                        crate::runtime::drain::note_store_route(MsaaLoadAdmission::Disabled.slug());
+                        return Err(DrawError::Unsupported(
+                            crate::backend::vulkan::engine::reason::DrawReason::MultisampleLoadActionUnsupported {
+                                load_action: color.load_action,
+                            },
+                        ));
+                    }
+                }
             }
         }
         resources.viewports = req
@@ -13665,6 +13919,29 @@ mod vulkan_split_tests {
         );
     }
 
+    /// The failure emitter must retain the descriptor identity the engine
+    /// refused, through both typed wrappers and the runtime request context.
+    #[test]
+    fn a_layout_hole_emits_its_binding_and_shader_stage() {
+        use crate::backend::vulkan::engine::reason::DrawReason;
+
+        let req = DrawEncodeRequest {
+            task_id: 24,
+            pipeline_ref: 252,
+            ..DrawEncodeRequest::default()
+        };
+        for (fragment, stage) in [(true, "fragment"), (false, "vertex")] {
+            let error = DrawError::Unsupported(DrawReason::UsedBindingAbsentFromLayout {
+                binding: 707,
+                fragment,
+            });
+            let line = linux_m2v_draw_failure(&error, &req).render();
+            assert!(line.contains(&format!(
+                "reason=draw_used_binding_absent_from_layout binding=707 stage={stage} pipe=252 task=24"
+            )), "{line}");
+        }
+    }
+
     /// A bind past its class's table refuses the whole draw, before the pipeline
     /// is even resolved.
     ///
@@ -14753,12 +15030,18 @@ fn raster_or_default<T, E>(
 /// The remaining ~50 ms/s comes off only by not calling this at all. See
 /// [`crate::runtime::drain::PreflightPart`] for the memo that would do it, and
 /// for the fact that makes it soundable: the m2v cache never evicts.
+pub(crate) struct RenderMtlbPair {
+    pub(crate) vertex: Vec<u8>,
+    pub(crate) fragment: Vec<u8>,
+    pub(crate) raster_sample_count: u32,
+}
+
 pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
-) -> Result<(Vec<u8>, Vec<u8>), DrawPreparationDecline> {
+) -> Result<RenderMtlbPair, DrawPreparationDecline> {
     let pd = load_render_pipeline(state, host, task_id, pipeline_ref).ok_or(
         DrawPreparationDecline::PipelineMissing {
             task_id,
@@ -14782,7 +15065,11 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
         task_id,
         function_ref: pd.fragment_func_ref,
     })?;
-    Ok((v_mtlb, f_mtlb))
+    Ok(RenderMtlbPair {
+        vertex: v_mtlb,
+        fragment: f_mtlb,
+        raster_sample_count: pd.raster_sample_count,
+    })
 }
 
 /// Report the **residual** in-contract `MTLLoadActionDontCare` — one this
@@ -15791,6 +16078,283 @@ mod memo_scratch_tests {
             tags.len(),
             3,
             "two causes share a tag and cannot be told apart"
+        );
+    }
+}
+
+/// v13 fix D: the LOAD seed rescue decision and the R16Float native seed.
+#[cfg(test)]
+mod load_seed_rescue_tests {
+    use super::{gva_seed_texel_layout, lost_seed_rescue_decision, LostSeedRescue};
+    use crate::protocol::pixel_format::{self, TexelLayout};
+
+    #[test]
+    fn a_seeded_load_needs_no_rescue() {
+        assert_eq!(
+            lost_seed_rescue_decision(true, true, 0, Some(true)),
+            LostSeedRescue::NotNeeded
+        );
+        assert_eq!(
+            lost_seed_rescue_decision(false, true, 7, None),
+            LostSeedRescue::NotNeeded
+        );
+    }
+
+    #[test]
+    fn the_kill_switch_restores_v12() {
+        assert_eq!(
+            lost_seed_rescue_decision(false, false, 0, Some(true)),
+            LostSeedRescue::Disabled
+        );
+    }
+
+    #[test]
+    fn a_seedless_gva_load_rescues_only_from_a_ready_resident() {
+        assert_eq!(
+            lost_seed_rescue_decision(true, false, 0, Some(true)),
+            LostSeedRescue::Rescued
+        );
+        assert_eq!(
+            lost_seed_rescue_decision(true, false, 0, Some(false)),
+            LostSeedRescue::ResidentNotReady
+        );
+        assert_eq!(
+            lost_seed_rescue_decision(true, false, 0, None),
+            LostSeedRescue::NoIdentity
+        );
+        assert_eq!(
+            lost_seed_rescue_decision(true, false, 9, Some(true)),
+            LostSeedRescue::NotGva
+        );
+    }
+
+    #[test]
+    fn every_outcome_has_its_own_slug() {
+        let all = [
+            LostSeedRescue::NotNeeded,
+            LostSeedRescue::Disabled,
+            LostSeedRescue::NotGva,
+            LostSeedRescue::NoIdentity,
+            LostSeedRescue::ResidentNotReady,
+            LostSeedRescue::Rescued,
+        ];
+        let mut slugs: Vec<&str> = all.iter().map(|o| o.slug()).collect();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), all.len());
+    }
+
+    #[test]
+    fn r16float_takes_a_native_seed_only_with_the_rescue_on() {
+        assert_eq!(
+            gva_seed_texel_layout(pixel_format::MTL_FORMAT_R16_FLOAT, true),
+            Some(TexelLayout::R16Float)
+        );
+        assert_eq!(
+            gva_seed_texel_layout(pixel_format::MTL_FORMAT_R16_FLOAT, false),
+            None
+        );
+        // The store-order formats are unchanged either way.
+        for fmt in 0u16..=0x300 {
+            if let Some(order) = pixel_format::store_texel_order(fmt) {
+                assert_eq!(gva_seed_texel_layout(fmt, true), Some(order));
+                assert_eq!(gva_seed_texel_layout(fmt, false), Some(order));
+            }
+        }
+    }
+}
+
+/// v14: what a statically used fragment buffer the guest left unbound gets.
+///
+/// Metal lets a pass leave a buffer argument nil when the shader's own control
+/// flow never reaches it; Vulkan still needs a descriptor. Reads see the zeroed
+/// neutral page (and `robustBufferAccess` keeps reads past it defined). A
+/// shader that may write the buffer, or whose access reflection cannot name,
+/// keeps the v13 refusal: zeros would be a guess there, and a write would land
+/// in a page other draws share.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnboundBufferServe {
+    /// Bind the shared zeroed neutral page.
+    Zero,
+    /// `REIMS_VGPU_UNBOUND_BUFFER_ZERO=0`.
+    RefusedDisabled,
+    /// Reflection says the shader may write it.
+    RefusedWritable,
+    /// Reflection declares it without a usable access answer.
+    RefusedUnknown,
+    /// Reflection declares no buffer here at all.
+    RefusedAbsent,
+}
+
+impl UnboundBufferServe {
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Zero => "unbound_buffer_zero_served",
+            Self::RefusedDisabled => "unbound_buffer_zero_refused_disabled",
+            Self::RefusedWritable => "unbound_buffer_zero_refused_writable",
+            Self::RefusedUnknown => "unbound_buffer_zero_refused_unknown",
+            Self::RefusedAbsent => "unbound_buffer_zero_refused_absent",
+        }
+    }
+}
+
+/// Pure rule behind [`UnboundBufferServe`].
+pub(crate) fn unbound_buffer_serve(
+    access: crate::runtime::spirv_bind::ReflectedBufferAccess,
+    enabled: bool,
+) -> UnboundBufferServe {
+    use crate::runtime::spirv_bind::ReflectedBufferAccess as A;
+    if !enabled {
+        return UnboundBufferServe::RefusedDisabled;
+    }
+    match access {
+        A::Unused | A::ReadOnly => UnboundBufferServe::Zero,
+        A::Writable => UnboundBufferServe::RefusedWritable,
+        A::Unknown => UnboundBufferServe::RefusedUnknown,
+        A::Absent => UnboundBufferServe::RefusedAbsent,
+    }
+}
+
+/// `REIMS_VGPU_UNBOUND_BUFFER_ZERO`, read once (default on).
+pub(crate) fn unbound_buffer_zero_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match crate::config::read(crate::config::UNBOUND_BUFFER_ZERO) {
+        (crate::config::Switch::Off, _) => {
+            crate::observe::fail(
+                "unbound_buffer_zero_disabled reason=disabled_by_env (v13: an unbound statically used fragment buffer drops the draw)",
+            );
+            false
+        }
+        (crate::config::Switch::Unrecognized, value) => {
+            crate::observe::fail(format!(
+                "unbound_buffer_zero reason=unbound_buffer_zero_env_unrecognized value={:?} (kept on)",
+                value.unwrap_or_default()
+            ));
+            true
+        }
+        _ => true,
+    })
+}
+
+#[cfg(test)]
+mod unbound_buffer_zero_tests {
+    use super::{unbound_buffer_serve, UnboundBufferServe};
+    use crate::runtime::spirv_bind::ReflectedBufferAccess as A;
+
+    #[test]
+    fn read_only_and_unused_gaps_get_the_zero_page() {
+        assert_eq!(
+            unbound_buffer_serve(A::ReadOnly, true),
+            UnboundBufferServe::Zero
+        );
+        assert_eq!(
+            unbound_buffer_serve(A::Unused, true),
+            UnboundBufferServe::Zero
+        );
+    }
+
+    #[test]
+    fn writable_unknown_and_absent_keep_the_refusal() {
+        assert_eq!(
+            unbound_buffer_serve(A::Writable, true),
+            UnboundBufferServe::RefusedWritable
+        );
+        assert_eq!(
+            unbound_buffer_serve(A::Unknown, true),
+            UnboundBufferServe::RefusedUnknown
+        );
+        assert_eq!(
+            unbound_buffer_serve(A::Absent, true),
+            UnboundBufferServe::RefusedAbsent
+        );
+    }
+
+    #[test]
+    fn the_kill_switch_restores_v13() {
+        for a in [A::ReadOnly, A::Unused, A::Writable, A::Unknown, A::Absent] {
+            assert_eq!(
+                unbound_buffer_serve(a, false),
+                UnboundBufferServe::RefusedDisabled
+            );
+        }
+    }
+
+    #[test]
+    fn every_outcome_has_its_own_slug() {
+        let all = [
+            UnboundBufferServe::Zero,
+            UnboundBufferServe::RefusedDisabled,
+            UnboundBufferServe::RefusedWritable,
+            UnboundBufferServe::RefusedUnknown,
+            UnboundBufferServe::RefusedAbsent,
+        ];
+        let mut slugs: Vec<&str> = all.iter().map(|o| o.slug()).collect();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), all.len());
+    }
+}
+
+/// v14 C1: whether a multisample-resolve pass may `MTLLoadActionLoad` its
+/// multisample source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MsaaLoadAdmission {
+    /// Served through the per-source persistent multisample image.
+    Persistent,
+    /// `REIMS_VGPU_MSAA_LOAD=0`: the v13 refusal.
+    Disabled,
+}
+
+impl MsaaLoadAdmission {
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Persistent => "msaa_load_admitted",
+            Self::Disabled => "msaa_load_refused_disabled",
+        }
+    }
+}
+
+/// Pure rule behind [`MsaaLoadAdmission`].
+pub(crate) fn msaa_load_admission(enabled: bool) -> MsaaLoadAdmission {
+    if enabled {
+        MsaaLoadAdmission::Persistent
+    } else {
+        MsaaLoadAdmission::Disabled
+    }
+}
+
+/// `REIMS_VGPU_MSAA_LOAD`, read once (default on).
+pub(crate) fn msaa_load_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match crate::config::read(crate::config::MSAA_LOAD) {
+        (crate::config::Switch::Off, _) => {
+            crate::observe::fail(
+                "msaa_load_disabled reason=disabled_by_env (v13: a multisample Load drops the draw; one discard-only slot)",
+            );
+            false
+        }
+        (crate::config::Switch::Unrecognized, value) => {
+            crate::observe::fail(format!(
+                "msaa_load reason=msaa_load_env_unrecognized value={:?} (kept on)",
+                value.unwrap_or_default()
+            ));
+            true
+        }
+        _ => true,
+    })
+}
+
+#[cfg(test)]
+mod msaa_load_admission_tests {
+    use super::{msaa_load_admission, MsaaLoadAdmission};
+
+    #[test]
+    fn on_admits_and_off_restores_v13() {
+        assert_eq!(msaa_load_admission(true), MsaaLoadAdmission::Persistent);
+        assert_eq!(msaa_load_admission(false), MsaaLoadAdmission::Disabled);
+        assert_ne!(
+            MsaaLoadAdmission::Persistent.slug(),
+            MsaaLoadAdmission::Disabled.slug()
         );
     }
 }

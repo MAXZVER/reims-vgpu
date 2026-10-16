@@ -553,6 +553,176 @@ pub const UNUSED_BINDS: &str = "REIMS_VGPU_UNUSED_BINDS";
 /// less concurrency than several, never more.
 pub const PRESENT_DEPTH: &str = "REIMS_VGPU_PRESENT_DEPTH";
 
+/// **Default on.** `off` (`0`) restores the host window's slate clear for a
+/// present whose published source went stale with no CPU copy to cover it.
+///
+/// On, such a present is held instead: nothing is acquired, the previous
+/// swapchain image stays on screen, and the next publish presents. A hold that
+/// outlives its bound (250 ms) falls back to the slate, so the window cannot be
+/// stuck. The slate was a one-frame near-black flash, 72 times in 17 minutes on
+/// the v6 bump boot of 2026-10-15; the switch keeps it reachable without a
+/// rebuild for A/B.
+pub const WINDOW_STALE_HOLD: &str = "REIMS_VGPU_WINDOW_STALE_HOLD";
+
+/// **Default on.** `off` (`0`) keeps the host window on the platform's own
+/// default arrow, which is what every build before v9 showed.
+///
+/// On, the window shows the guest's own pointer glyph (`CmdSetCursorGlyph`),
+/// scaled by the presenter's viewport ratio, and a bundled black-and-white
+/// arrow until the first glyph arrives or when a glyph cannot be built. The
+/// platform applies it inside the client area only. Logged once per run as
+/// `host_window_cursor mode=guest|static|system`.
+pub const WINDOW_GUEST_CURSOR: &str = "REIMS_VGPU_WINDOW_GUEST_CURSOR";
+
+/// **Default on.** `off` (`0`) restores the pre-v10 pipeline-cache persistence:
+/// the blob in the temp directory keyed by pipelineCacheUUID, a save attempted
+/// on every pipeline creation under the Engine lock (10 s cooldown), and the
+/// file *deleted* once the in-memory cache passes the warm bound (8 MiB until
+/// v12, 50 MiB since; see `PIPELINE_CACHE_MAX_MB`).
+///
+/// On, the blob lives at `%LOCALAPPDATA%\reims-vgpu\pipeline-cache\` keyed by
+/// vendor/device/driver/UUID, the header is validated field by field on load,
+/// saves run on the persistence thread at most every 10 s when pipelines were
+/// created, and over the bound the last good snapshot is kept rather than
+/// deleted. The v9 Tahoe boots crossed the bound at ~210 s every boot, so the
+/// legacy arm deleted the file every boot and every boot started cold.
+/// Logged as `pipeline_cache_persist_disabled` when off.
+pub const PIPELINE_CACHE_PERSIST: &str = "REIMS_VGPU_PIPELINE_CACHE_PERSIST";
+
+/// **Default on (v13).** The persisted pipeline cache has no compiled size
+/// bound: every periodic save lands, however large the in-memory cache grows,
+/// and the boot-time load accepts any header-valid blob.
+/// `REIMS_VGPU_PIPELINE_CACHE_MAX_MB` still sets an optional lower limit, and
+/// over that limit the last good file is kept and never deleted. A save that
+/// would leave less than 1 GiB free on the cache's drive is skipped
+/// (`pipeline_cache_save_skipped reason=low_disk_keep_last`) and the last good
+/// file kept.
+///
+/// `off` (`0`) restores the v12 behaviour exactly: the 50 MiB compiled bound,
+/// keep-last / discard-stale over it, no free-space check. Logged as
+/// `pipeline_cache_unbounded_disabled` when off. Only meaningful while
+/// `PIPELINE_CACHE_PERSIST` is on; the legacy arm keeps its own bound.
+pub const PIPELINE_CACHE_UNBOUNDED: &str = "REIMS_VGPU_PIPELINE_CACHE_UNBOUNDED";
+
+/// **Default on (v13 fix D, icons).** A colour LOAD on a GVA render target
+/// whose every seed door came up empty used to begin the pass undefined
+/// (`load_seed_lost door=none`): the v12 Tahoe/Simulator boot lost 454 BGRA8
+/// and 129 R16Float icon-sized targets (32..224 px) that way, so the icon
+/// filter passes composited onto nothing. On, two things change: an R16Float
+/// target takes its own texels out of its guest pages (as RG16Float and
+/// RGBA16Float already do), and a LOAD that still has no seed loads from the
+/// engine resident that holds this target's last render when that resident is
+/// ready (`load_seed_rescued_from_resident`). `off` (`0`) restores v12; logged
+/// once as `load_seed_rescue_disabled`.
+pub const LOAD_SEED_RESCUE: &str = "REIMS_VGPU_LOAD_SEED_RESCUE";
+
+/// **Default on (v13 E3).** The compute stall watchdog used to cover only the
+/// backend call (2 s). The 23:49:50 MobileSafari watchdog kill (0x8BADF00D) was a
+/// 5.76 s compute exec (`exec_phase walk_us=5984749`, `compute_us=5971881`
+/// over 32 computes) with no `compute_engine_stall` line, so the time went
+/// outside the backend call and nothing named where. On, every compute exec is
+/// watched as a whole at 250 ms and a miss writes `compute_exec_stall
+/// reason=compute_exec_unreturned phase=<load|stage|engine|writeback>`, once
+/// per stalled exec. Observation only; it changes no routing. `off` (`0`)
+/// restores v12.
+pub const COMPUTE_EXEC_WATCHDOG: &str = "REIMS_VGPU_COMPUTE_EXEC_WATCHDOG";
+
+/// **Default on (v13 E4).** After `vkAllocateMemory` refuses a host-pointer
+/// import with `ERROR_OUT_OF_DEVICE_MEMORY` / `ERROR_OUT_OF_HOST_MEMORY`, new
+/// imports are declined without probing (`host_ram_import_oom_backoff`) for a
+/// backoff that starts at 250 ms and doubles to 8 s, and ends early once
+/// imported bytes fall below the level at the failure. Each refused import
+/// first paid a 40..240 ms pointer probe on the drain (v12 boot: 13 such
+/// refusals inside the boot's 2.7 s drain holds). The copying rails serve
+/// declined imports, as before. `off` (`0`) restores v12.
+pub const IMPORT_OOM_BACKOFF: &str = "REIMS_VGPU_IMPORT_OOM_BACKOFF";
+
+/// **Default on (v13 fix A).** Under `guest_import_surface_writes=released_only`
+/// the "released" test used `ever_released` and `released_mappings`, which are
+/// sticky for a mapping id's whole life across incarnations. Mapping ids are
+/// recycled within ~20 ms, so the Simulator screen (mid 32/50, 1170x2532)
+/// was refused direct GPU writes for good (`GuestRefRefused{WritesNarrowed}`),
+/// and each compute dispatch paid ~59 MB of CPU copies on the drain. On, a mapping
+/// counts as released only until it adopts fresh page entries. The condemned,
+/// unmapped and `content_generation < 2` checks stay as they are. `off` (`0`)
+/// restores v12; logged once as `incarnation_writes_disabled`.
+pub const INCARNATION_WRITES: &str = "REIMS_VGPU_INCARNATION_WRITES";
+
+/// **Default on (v14).** A fragment shader that statically uses a
+/// `[[buffer(n)]]` the guest left unbound used to drop the whole draw
+/// (`draw_prepare_unbound_storage_buffer`; v13 Simulator: pipes 197/462 at
+/// index 5, pipe 43 at index 2). On, a gap whose reflected access is `Unused`
+/// or `ReadOnly` is served the shared zeroed neutral page instead
+/// (`unbound_buffer_zero_served`); with `robustBufferAccess` on, reads past it
+/// stay defined. Writable, unknown and undeclared gaps keep the refusal
+/// (`unbound_buffer_zero_refused_*`). `off` (`0`) restores v13; logged once as
+/// `unbound_buffer_zero_disabled`.
+pub const UNBOUND_BUFFER_ZERO: &str = "REIMS_VGPU_UNBOUND_BUFFER_ZERO";
+
+/// **Default on (v14 C2).** A multisample pass whose source and resolve
+/// textures differ only in sRGB-ness (`BGRA8Unorm_sRGB` 0x51 resolving into
+/// `BGRA8Unorm` 0x50, or the RGBA8 pair 0x47/0x46) used to drop the whole
+/// draw as `render_resolve_target_mismatch` (v13 Simulator: the 1170x2532
+/// passes on mid 44/45). The two share one byte layout and one resident
+/// allocation family, so on, the resolve target is encoded at the source's
+/// (sRGB) declaration over the same allocation and the raw bytes the guest reads
+/// are the ones Metal's resolve writes (`render_resolve_srgb_pair_admitted`).
+/// Geometry and other format mismatches keep the refusal. `off` (`0`) restores
+/// v13; logged once as `msaa_srgb_resolve_disabled`.
+pub const MSAA_SRGB_RESOLVE: &str = "REIMS_VGPU_MSAA_SRGB_RESOLVE";
+
+/// **Default on (v14).** A multisample-resolve pass lays its attachments out
+/// as `[multisample colour, resolve, depth]`, but the clear values were built
+/// as `[colour, secondaries.., depth]` with no entry for the resolve, so the
+/// depth clear landed on the resolve slot and the depth attachment read past
+/// the end of the array (every Simulator MSAA pass carries depth). On, a
+/// placeholder entry is pushed for the resolve attachment
+/// (`msaa_resolve_clear_slot_filled`). `off` (`0`) restores v13; logged once as
+/// `msaa_resolve_clear_slot_disabled`.
+pub const MSAA_RESOLVE_CLEAR_SLOT: &str = "REIMS_VGPU_MSAA_RESOLVE_CLEAR_SLOT";
+
+/// **Default on (v14 C1).** `MTLLoadActionLoad` on a multisample-resolve
+/// colour attachment used to drop the draw (`multisample_load_action_unsupported`;
+/// v13 Simulator: the space wallpaper's `rasterizeCylinderFragment` pass, pipe
+/// 304's 1170x2532 passes, and the 486..1026 px widget passes). On, every
+/// multisample-resolve pass renders into a multisample image that belongs to
+/// its guest source texture and outlives the pass (up to four, LRU), so a
+/// later Load reads what the earlier pass left (`msaa_load_warm`). A Load with
+/// no live contents starts from transparent black (`msaa_load_cold_cleared`,
+/// `msaa_load_layout_mismatch_cleared`) instead of being dropped. `off` (`0`)
+/// restores v13 (one discard-only slot, Load refused); logged once as
+/// `msaa_load_disabled`.
+pub const MSAA_LOAD: &str = "REIMS_VGPU_MSAA_LOAD";
+
+/// **Default on.** `off` (`0`) lets a write through a *retained* guest-page
+/// translation land even when that translation names a page the guest has
+/// released, which is what every build before v11 did (issue #5).
+///
+/// On, a GVA writeback debt whose retained page list names a released page
+/// (armed by the `released_pages` guard) re-walks the live page table; a
+/// complete walk is written, otherwise the debt stays owed and the write is
+/// refused as `released_write_blocked site=gva_debt_retained`. Off is counted
+/// as `released_write_guard_off_would_block` and logged once as
+/// `release_write_guard_disabled`. Diagnostics (write site, arming source,
+/// per-write owner classification) run either way.
+pub const RELEASE_WRITE_GUARD: &str = "REIMS_VGPU_RELEASE_WRITE_GUARD";
+
+/// **Default on, and diagnostic only.** `off` (`0`) stops the per-stream raw
+/// bind log and the bounded `frag_unbound_trace` line that a draw substituting
+/// a neutral fragment texture writes (`runtime::draw::unbound_trace`).
+///
+/// Nothing it gates changes what is bound or drawn. On, every render bind
+/// record is appended to a stream-local log of at most 512 slots, and a draw
+/// that hits `frag_neutral_texture_substituted` writes one line naming the
+/// shader's declared slots, the raw binds since the previous draw, the
+/// encoder's tables and why each declared slot ended up empty
+/// (`never_bound`, `cleared_by_nil`, `vertex_stage_only`,
+/// `never_bound_prior_encoder_had`, `dropped_bound_ref_lost`). Lines are
+/// limited to the first four per (pipeline, pass class), then one in 256, and
+/// 4000 per process. The `frag_neutral_tex_reason_*` census counts either way
+/// (as `untraced` when off). Logged once as `unbound_bind_trace_disabled`.
+pub const TRACE_UNBOUND_BINDS: &str = "REIMS_VGPU_TRACE_UNBOUND_BINDS";
+
 /// **Default on.** Setting this off restores one completion-stamp write per
 /// packet, which is what `drain_child_fifo` did before the stamps in a single
 /// drain of one channel were collapsed into a single write at its end.
@@ -1338,6 +1508,20 @@ counts! {
 /// `crate::runtime::gpu_hang_trail`'s ring covers every submission still in
 /// flight instead of the last half millisecond of a batch.
 pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
+
+/// **A count, not a switch.** The persisted pipeline-cache bound in whole MiB,
+/// narrowing the compiled 50 MiB (`PIPELINE_CACHE_MAX_WARM_BYTES`). Read once
+/// through [`count`], so a value above 50 or zero is refused
+/// (`pipeline_cache_max_mb_refused`) and the compiled bound kept. A blob past
+/// the bound is refused at load and handled by the over-cap keep-last /
+/// discard-stale arm at save; the bound in force is logged once as
+/// `pipeline_cache_cap`.
+///
+/// v13: with `PIPELINE_CACHE_UNBOUNDED` on (the default) there is no compiled
+/// bound to narrow, so this is an optional *lower limit* in whole MiB (1 up to
+/// 1048576). Over it the persistence arm keeps the last good file and never
+/// deletes it. With `PIPELINE_CACHE_UNBOUNDED=0` the v12 rule above applies.
+pub const PIPELINE_CACHE_MAX_MB: &str = "REIMS_VGPU_PIPELINE_CACHE_MAX_MB";
 }
 
 choices! {
@@ -1353,6 +1537,18 @@ choices! {
 /// Unset keeps the 1920x1080 panel. A value that does not parse as two sizes
 /// in 1..=8192 is refused on the failure channel and ignored.
 pub const DISPLAY_NATIVE: &str = "REIMS_VGPU_DISPLAY_NATIVE";
+
+/// **A choice, diagnostic only.** The texel of the 1x1 stand-in a draw binds
+/// for a fragment texture its shader statically uses and the guest left
+/// unbound (`frag_neutral_texture_substituted`). `zero` (the default, and what
+/// every earlier build bound), `white` or `magenta`.
+///
+/// Not a fix and not a default to change: it exists to A/B whether a missing
+/// glyph or a washed-out layer *depends* on the stand-in. If the content
+/// changes under `magenta`, the shader sampled it; if nothing changes, the
+/// substitution is not the cause. Logged once as `neutral_texture_probe`;
+/// anything else is refused as `neutral_texture_probe_refused` and zero kept.
+pub const NEUTRAL_TEXTURE_PROBE: &str = "REIMS_VGPU_NEUTRAL_TEXTURE_PROBE";
 
 /// **A choice, not a switch.** Which execution rail this process runs guest work
 /// on, when the binary carries more than one.

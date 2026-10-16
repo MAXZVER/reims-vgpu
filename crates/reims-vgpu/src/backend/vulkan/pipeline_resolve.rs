@@ -686,6 +686,14 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
             task_id,
             pipeline_ref,
         })?;
+    let raster_sample_count =
+        crate::runtime::m2v_cache::RenderSampleCount::from_pipeline_descriptor(
+            desc.raster_sample_count,
+        )
+        .map_err(|reason| DrawPreparationDecline::VertexTranslate {
+            pipeline_ref,
+            reason,
+        })?;
     // The descriptor decoded and the pipeline is declared; the guest's shader
     // form is about to become the host's.
     crate::runtime::draw::advance_pipeline(
@@ -752,9 +760,10 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         })
         .transpose()?;
     enter(Phase::PipelineXlate);
-    let vertex = crate::runtime::m2v_cache::translate_cached_reflected(
+    let vertex = crate::runtime::m2v_cache::translate_cached_render_reflected(
         v_air,
-        metal2vulkan::passes::Stage::Vertex,
+        crate::runtime::m2v_cache::RenderStage::Vertex,
+        raster_sample_count,
         pipeline_ref,
     )
     .map_err(|reason| DrawPreparationDecline::VertexTranslate {
@@ -762,9 +771,10 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         reason,
     })?;
     let fragment = match f_air {
-        Some(f_air) => crate::runtime::m2v_cache::translate_cached_reflected(
+        Some(f_air) => crate::runtime::m2v_cache::translate_cached_render_reflected(
             f_air,
-            metal2vulkan::passes::Stage::Fragment,
+            crate::runtime::m2v_cache::RenderStage::Fragment,
+            raster_sample_count,
             pipeline_ref,
         )
         .map_err(|reason| DrawPreparationDecline::FragmentTranslate {

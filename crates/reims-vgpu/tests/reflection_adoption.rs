@@ -205,14 +205,26 @@ fn m2v_cache_reflects_on_the_cold_call_and_hits_on_the_warm_one() {
     // Deltas rather than absolutes: the cache is process-global and
     // `reset_for_test` is `#[cfg(test)]`, so an integration test cannot clear it.
     let (hits_before, _, _) = m2v_cache::stats();
-    let cold = m2v_cache::translate_cached_reflected(&air, Stage::Fragment, 1).unwrap();
+    let cold = m2v_cache::translate_cached_render_reflected(
+        &air,
+        m2v_cache::RenderStage::Fragment,
+        m2v_cache::RenderSampleCount::ONE,
+        1,
+    )
+    .unwrap();
     assert_eq!(
         cold.reflection.stage,
         metal2vulkan::reflect::ShaderStage::Fragment
     );
     assert!(cold.reflection.datalayout.is_some());
 
-    let warm = m2v_cache::translate_cached_reflected(&air, Stage::Fragment, 1).unwrap();
+    let warm = m2v_cache::translate_cached_render_reflected(
+        &air,
+        m2v_cache::RenderStage::Fragment,
+        m2v_cache::RenderSampleCount::ONE,
+        1,
+    )
+    .unwrap();
     assert!(
         std::sync::Arc::ptr_eq(&cold, &warm),
         "a warm call must hand back the cached entry, not a re-translation"
