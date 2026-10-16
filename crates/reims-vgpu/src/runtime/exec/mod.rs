@@ -1490,7 +1490,7 @@ pub fn execute_planned_g<M: HostMemory + HostOps>(
 ) -> ExecResult {
     let started = crate::lab_clock::LabInstant::now();
     let mut measured_ns = 0u64;
-    walk_memo::begin_packet();
+    walk_memo::begin_packet(g.st());
     // Read, plan, execute. The plan step is separate because it is the only one
     // of the three that a caller may run at a moment of its own choosing: it is
     // pure CPU work over bytes the submission already holds, where the read
@@ -3936,8 +3936,11 @@ fn handle_render_binds<M: HostMemory + HostOps, S: WalkState>(
                     // already resolved: the two registry lookups this arm makes
                     // (one inside the mapper resolution, one for the bind's own
                     // identity) are the ones the memo answers. See [`walk_memo`].
+                    // TEMP (lab, WALK_XMEMO): the batch's map answers the same
+                    // two lookups for a later CB of the doorbell batch.
                     let memoized = if walk_memo::on() {
-                        acc.memo.resource(texture_ref, 2)
+                        acc.memo
+                            .resource_x(state.shared(), task_id, texture_ref, 2)
                     } else {
                         None
                     };
@@ -3963,7 +3966,12 @@ fn handle_render_binds<M: HostMemory + HostOps, S: WalkState>(
                             let resource = state.walk_resource(host, task_id, texture_ref);
                             if let Some(resource) = &resource {
                                 if walk_memo::on() {
-                                    acc.memo.remember(texture_ref, resource);
+                                    acc.memo.remember_x(
+                                        state.shared(),
+                                        task_id,
+                                        texture_ref,
+                                        resource,
+                                    );
                                 }
                             }
                             resource
@@ -5537,11 +5545,14 @@ fn bind_resource<M: HostMemory, S: WalkState>(
     if !walk_memo::on() {
         return state.walk_resource(host, task_id, obj_ref);
     }
-    if let Some(resource) = memo.resource(obj_ref, 1) {
+    // TEMP (lab, WALK_XMEMO): the batch's answer stands between the stream's
+    // map and the resolution ladder, so a later CB of one doorbell batch does
+    // not pay the first bind's resolution again. See [`walk_memo`].
+    if let Some(resource) = memo.resource_x(state.shared(), task_id, obj_ref, 1) {
         return Some(resource);
     }
     let resource = state.walk_resource(host, task_id, obj_ref)?;
-    memo.remember(obj_ref, &resource);
+    memo.remember_x(state.shared(), task_id, obj_ref, &resource);
     Some(resource)
 }
 
@@ -7846,7 +7857,7 @@ fn lab_cached_clear_image(
 }
 
 pub(crate) mod finish_phase;
-mod walk_memo;
+pub(crate) mod walk_memo;
 pub(crate) mod walk_ahead;
 use walk_ahead::WalkState;
 

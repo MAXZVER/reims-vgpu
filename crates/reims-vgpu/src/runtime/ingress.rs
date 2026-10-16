@@ -614,6 +614,80 @@ pub struct PacketReads<'a> {
     pub repointed: Result<ReplacementStorage, crate::runtime::objects::RepointStorageRefusal>,
 }
 
+/// TEMP (lab, `WALK_XMEMO`): the batch's object-namespace answer wrapped
+/// around [`crate::runtime::objects::TaskNames`], so the 2nd..7th CB of a
+/// doorbell batch does not pay the namespace lookup and (on a cold name) the
+/// guest list walk the 1st already paid. Only successes are kept — a name that
+/// has not been declared yet is declared by the inner holder on retry, exactly
+/// as without this. See `crate::runtime::exec::walk_memo` for the guards.
+struct XmemoNames<'a, M: crate::runtime::host::HostMemory> {
+    state: &'a crate::model::DeviceState,
+    session: SessionGeneration,
+    inner: &'a crate::runtime::objects::TaskNames<'a, M>,
+}
+
+impl<M: crate::runtime::host::HostMemory> TaskNamespaces for XmemoNames<'_, M> {
+    fn resource(
+        &self,
+        task: reims_vgpu_core::identity::TaskId,
+        object_ref: u32,
+    ) -> Option<reims_vgpu_core::identity::ResourceId> {
+        if let Some(name) =
+            crate::runtime::exec::walk_memo::xmemo_name(self.state, self.session, task.0, object_ref)
+        {
+            return Some(name);
+        }
+        let name = self.inner.resource(task, object_ref);
+        if let Some(name) = name {
+            crate::runtime::exec::walk_memo::xmemo_name_keep(
+                self.state,
+                self.session,
+                task.0,
+                object_ref,
+                name,
+            );
+        }
+        name
+    }
+}
+
+/// TEMP (lab, `WALK_XMEMO`): the batch's storage answer wrapped around
+/// [`crate::runtime::objects::TaskNames`]. The inner holder reads the guest's
+/// object list and descriptor through the page tables on every ask; the batch
+/// asks once. Only successes are kept (a refusal is retried, as the ladder's
+/// own contract says a still-publishing descriptor can succeed on retry).
+struct XmemoStorage<'a, M: crate::runtime::host::HostMemory> {
+    state: &'a crate::model::DeviceState,
+    session: SessionGeneration,
+    inner: &'a crate::runtime::objects::TaskNames<'a, M>,
+}
+
+impl<M: crate::runtime::host::HostMemory> ResourceStorage for XmemoStorage<'_, M> {
+    fn storage(
+        &self,
+        task: reims_vgpu_core::identity::TaskId,
+        resource: reims_vgpu_core::identity::ResourceId,
+    ) -> Option<reims_vgpu_core::access::ResourceKey> {
+        let slot = resource.slot.0;
+        if let Some(key) =
+            crate::runtime::exec::walk_memo::xmemo_storage(self.state, self.session, task.0, slot)
+        {
+            return Some(key);
+        }
+        let key = self.inner.storage(task, resource);
+        if let Some(key) = key {
+            crate::runtime::exec::walk_memo::xmemo_storage_keep(
+                self.state,
+                self.session,
+                task.0,
+                slot,
+                key,
+            );
+        }
+        key
+    }
+}
+
 /// [`packet`] with this device supplying every namespace it asks for.
 ///
 /// # Why the assembly is a function and not a call site
@@ -655,7 +729,21 @@ pub fn device_packet<M: crate::runtime::host::HostMemory>(
     reads: PacketReads<'_>,
 ) -> Result<Packet, Blocked> {
     let names = crate::runtime::objects::TaskNames::new(state, host);
-    device_packet_with(state, host, fifo, session, completion_slot, drained, reads, &names)
+    // TEMP (lab, WALK_XMEMO): the drain's serial admission keeps its
+    // namespace answers for the doorbell batch (see `exec::walk_memo`). The
+    // ahead forms below are not wrapped: PeekNames' witness is the list of
+    // names it read, and a memo answer would leave that list shorter than the
+    // truth it is checked against.
+    if crate::runtime::exec::walk_memo::walk_xmemo_on() {
+        let memoed = XmemoNames {
+            state,
+            session,
+            inner: &names,
+        };
+        device_packet_with(state, host, fifo, session, completion_slot, drained, reads, &memoed)
+    } else {
+        device_packet_with(state, host, fifo, session, completion_slot, drained, reads, &names)
+    }
 }
 
 /// TEMP (lab, INGRESS_AHEAD): [`device_packet`] for a pool helper, ahead of
@@ -752,10 +840,23 @@ fn device_packet_with<M: crate::runtime::host::HostMemory>(
     }
 
     let names = crate::runtime::objects::TaskNames::new(state, host);
+    // TEMP (lab, WALK_XMEMO): the storage answer is the one this pass pays a
+    // guest page-table walk per record for; the batch's map stands in front of
+    // it (see `exec::walk_memo`). `replies` stays the plain holder - a query
+    // is a handful of packets a boot, not a per-record path.
+    let memoed_storage = crate::runtime::exec::walk_memo::walk_xmemo_on().then(|| XmemoStorage {
+        state,
+        session,
+        inner: &names,
+    });
+    let storage: &dyn ResourceStorage = match &memoed_storage {
+        Some(memoed) => memoed,
+        None => &names,
+    };
     let resolvers = Resolvers {
         mappings: state,
         objects,
-        storage: &names,
+        storage,
         replies: &names,
     };
     // `TaskId(0)` for every class that is not exec: the field is the task an

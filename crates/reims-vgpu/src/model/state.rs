@@ -4231,6 +4231,13 @@ impl DeviceState {
     }
 
     pub fn reset(&mut self) {
+        // Every namespace this state held is emptied wholesale here, while the
+        // names counter is process-global — a memoized name-derived answer
+        // from before the reset (WALK_XMEMO, RES_XMEMO) would otherwise
+        // outlive the namespaces it was read from, and task ids and object
+        // refs are reused across the boundary. A reset is the largest names
+        // change there is, so it bumps the counter like every smaller one.
+        bump_names_gen();
         // Held bind resolutions name guest addresses under a device that is
         // going away; nothing about them survives a reset.
         self.bound_buffers.clear();

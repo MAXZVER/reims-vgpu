@@ -366,6 +366,11 @@ pub(crate) fn walk_stream_spec<M: HostMemory + HostOps>(
     task_id: u32,
     stream: &[u8],
 ) -> Option<SpecStream> {
+    // TEMP (lab, WALK_XMEMO): a helper's own thread answers from its own
+    // batch map, so it latches the session the drain's packet runs under.
+    if super::walk_memo::walk_xmemo_on() {
+        super::walk_memo::latch_session(st);
+    }
     let mut segments = SegmentStream::new(stream).ok()?;
     let mut spec = SpecWalk {
         st,
