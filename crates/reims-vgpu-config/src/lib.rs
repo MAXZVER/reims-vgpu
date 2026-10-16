@@ -1552,6 +1552,28 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// pointer, and never reaches a captured frame. `off` keeps the host's own arrow
 /// and never moves the host pointer — the behavior before this existed.
 pub const HOST_CURSOR: &str = "REIMS_VGPU_HOST_CURSOR";
+
+/// **Default on.** A multisample-resolve pass lays its attachments out
+/// as `[multisample colour, resolve, depth]`, but the clear values were built
+/// as `[colour, secondaries.., depth]` with no entry for the resolve, so the
+/// depth clear landed on the resolve slot and the depth attachment read past
+/// the end of the array (every Simulator MSAA pass carries depth). On, a
+/// placeholder entry is pushed for the resolve attachment
+/// (`msaa_resolve_clear_slot_filled`). `off` (`0`) restores legacy behavior;
+/// logged once as `msaa_resolve_clear_slot_disabled`.
+pub const MSAA_RESOLVE_CLEAR_SLOT: &str = "REIMS_VGPU_MSAA_RESOLVE_CLEAR_SLOT";
+
+/// **Default on.** `MTLLoadActionLoad` on a multisample-resolve
+/// colour attachment used to drop the draw (`multisample_load_action_unsupported`;
+/// Simulator: wallpaper cylinder pass, pipe 304 1170x2532 passes, widgets, and Dock blur).
+/// On, every multisample-resolve pass renders into a multisample image that belongs to
+/// its guest source texture and outlives the pass (up to four, LRU), so a
+/// later Load reads what the earlier pass left (`msaa_load_warm`). A Load with
+/// no live contents starts from transparent black (`msaa_load_cold_cleared`,
+/// `msaa_load_layout_mismatch_cleared`) instead of being dropped. `off` (`0`)
+/// restores legacy behavior (one discard-only slot, Load refused); logged once as
+/// `msaa_load_disabled`.
+pub const MSAA_LOAD: &str = "REIMS_VGPU_MSAA_LOAD";
 }
 
 counts! {

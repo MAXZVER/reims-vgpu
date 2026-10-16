@@ -195,6 +195,10 @@ impl ResourcePools {
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
         }
+        for s in self.multisample_sources.drain(..) {
+            device.destroy_image_view(s.view, None);
+            device.destroy_image(s.image, None);
+        }
         // The wholesale half of the window's licence, in the same statement as
         // the destruction it answers for.
         //

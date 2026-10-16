@@ -14167,9 +14167,11 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         target_guest_seed = Some(seed);
                     } else if color0_seed.is_some() {
                         seed_door = "color_seed";
+                        let expected_bpp = crate::protocol::pixel_format::store_texel_order(c0.format)
+                            .map_or(4, |layout| layout.bytes_per_texel() as usize);
                         if color0_seed
                             .as_ref()
-                            .is_some_and(|seed| seed.len() == (w as usize) * (h as usize) * 4)
+                            .is_some_and(|seed| seed.len() == (w as usize) * (h as usize) * expected_bpp)
                         {
                             // seed_color_load selected this by RT provenance.
                             // Black/transparent bytes are valid attachment data.
@@ -14555,6 +14557,16 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 .colors
                 .first()
                 .is_some_and(|color| color.multisample_source_ref != 0),
+            multisample_source: req
+                .colors
+                .first()
+                .filter(|color| color.multisample_source_ref != 0 && msaa_load_enabled())
+                .map_or(0, |color| {
+                    (u64::from(req.task_id) << 32) | u64::from(color.multisample_source_ref)
+                }),
+            multisample_load: req.colors.first().is_some_and(|color| {
+                color.multisample_source_ref != 0 && color.load_action == MTL_LOAD_ACTION_LOAD
+            }),
             ..crate::backend::vulkan::engine::DrawRequest::default()
         };
         let resolving_colors = req
@@ -14591,11 +14603,21 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 ));
             }
             if color.load_action == MTL_LOAD_ACTION_LOAD {
-                return Err(DrawError::Unsupported(
-                    crate::backend::vulkan::engine::reason::DrawReason::MultisampleLoadActionUnsupported {
-                        load_action: color.load_action,
-                    },
-                ));
+                match msaa_load_admission(msaa_load_enabled()) {
+                    MsaaLoadAdmission::Persistent => {
+                        crate::runtime::drain::note_store_route(
+                            MsaaLoadAdmission::Persistent.slug(),
+                        );
+                    }
+                    MsaaLoadAdmission::Disabled => {
+                        crate::runtime::drain::note_store_route(MsaaLoadAdmission::Disabled.slug());
+                        return Err(DrawError::Unsupported(
+                            crate::backend::vulkan::engine::reason::DrawReason::MultisampleLoadActionUnsupported {
+                                load_action: color.load_action,
+                            },
+                        ));
+                    }
+                }
             }
         }
         resources.viewports = req
@@ -22979,3 +23001,65 @@ fn lab_seed_trace(
     crate::observe::off(line);
 }
 
+/// Whether a multisample-resolve pass may `MTLLoadActionLoad` its multisample source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MsaaLoadAdmission {
+    /// Served through the per-source persistent multisample image.
+    Persistent,
+    /// `REIMS_VGPU_MSAA_LOAD=0`: the legacy refusal.
+    Disabled,
+}
+
+impl MsaaLoadAdmission {
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Persistent => "msaa_load_admitted",
+            Self::Disabled => "msaa_load_refused_disabled",
+        }
+    }
+}
+
+/// Pure rule behind [`MsaaLoadAdmission`].
+pub(crate) fn msaa_load_admission(enabled: bool) -> MsaaLoadAdmission {
+    if enabled {
+        MsaaLoadAdmission::Persistent
+    } else {
+        MsaaLoadAdmission::Disabled
+    }
+}
+
+/// `REIMS_VGPU_MSAA_LOAD`, read once (default on).
+pub(crate) fn msaa_load_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match crate::config::read(crate::config::MSAA_LOAD) {
+        (crate::config::Switch::Off, _) => {
+            crate::observe::fail(
+                "msaa_load_disabled reason=disabled_by_env (a multisample Load drops the draw; one discard-only slot)",
+            );
+            false
+        }
+        (crate::config::Switch::Unrecognized, value) => {
+            crate::observe::fail(format!(
+                "msaa_load reason=msaa_load_env_unrecognized value={:?} (kept on)",
+                value.unwrap_or_default()
+            ));
+            true
+        }
+        _ => true,
+    })
+}
+
+#[cfg(test)]
+mod msaa_load_admission_tests {
+    use super::{msaa_load_admission, MsaaLoadAdmission};
+
+    #[test]
+    fn on_admits_and_off_restores_v13() {
+        assert_eq!(msaa_load_admission(true), MsaaLoadAdmission::Persistent);
+        assert_eq!(msaa_load_admission(false), MsaaLoadAdmission::Disabled);
+        assert_ne!(
+            MsaaLoadAdmission::Persistent.slug(),
+            MsaaLoadAdmission::Disabled.slug()
+        );
+    }
+}
