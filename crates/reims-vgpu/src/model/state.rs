@@ -3311,6 +3311,14 @@ pub struct DeviceState {
     /// belong to the task's address space, so a reused id inheriting them would
     /// be watching memory that is now somebody else's.
     pub node_guard: std::collections::BTreeMap<u32, crate::runtime::node_guard::NodeWatch>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_CH2_RETURN_CNT`): per-task rings of recently
+    /// unmapped intervals, for the returning-IOSurface census.
+    ///
+    /// Observation only — see [`crate::runtime::lab_ch2ret`] for what it
+    /// watches. Keyed and dropped exactly as [`Self::map_audit`] is: a map
+    /// packet may name a task id this device has no entry for, and a reused id
+    /// must not inherit a ring that describes somebody else's address space.
+    pub ch2ret: std::collections::BTreeMap<u32, crate::runtime::lab_ch2ret::RetTrack>,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// This is membership for host-copy teardown. [`Self::task_resources`]
@@ -3844,6 +3852,7 @@ impl DeviceState {
             map_family_events: 0,
             map_audit: std::collections::BTreeMap::new(),
             node_guard: std::collections::BTreeMap::new(),
+            ch2ret: std::collections::BTreeMap::new(),
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
             lifecycle: Mutex::new(reims_vgpu_core::lifecycle::Lifecycle::new()),
@@ -4375,6 +4384,8 @@ impl DeviceState {
         // this id is losing, and after a redefine they describe whatever the
         // guest has since done with them.
         self.node_guard.remove(&task_id);
+        // TEMP (lab): the census ring goes with the address space it describes.
+        self.ch2ret.remove(&task_id);
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
@@ -4444,6 +4455,7 @@ impl DeviceState {
         // holding a page set that describes memory it has given back.
         self.map_audit.remove(&task_id);
         self.node_guard.remove(&task_id);
+        self.ch2ret.remove(&task_id);
         self.tasks.remove(task_id);
         crate::runtime::gva_mem::lab_tlb::new_epoch();
         true
