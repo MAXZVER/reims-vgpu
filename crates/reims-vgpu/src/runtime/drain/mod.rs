@@ -7156,6 +7156,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     if let Some(m) = state.mappings.get_mut(&mapping) {
         m.scanout_presented = true;
     }
+    state.guest_copies_framebuffers = true;
     // The presented frame is paid at its swap from the first present on, not
     // from whenever a guest CPU store into a presented surface is first caught
     // (a race that half the boots lose): see `config::PRESENT_PAYMENT`.
@@ -8235,6 +8236,13 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // Same obligation as the unmap arm, keyed by the mapping whose pages
         // are going back: a queued writeback into them must land first.
         settle_released_mapping(state, object_id);
+        if state.pending_writebacks.drop_mapping(object_id) {
+            crate::runtime::drain::note_store_route("release_cancelled_writeback_debt");
+        }
+        if let Some(m) = state.mappings.get_mut(&object_id) {
+            m.ever_released = true;
+            m.released_since_resolve = true;
+        }
         let mode = if state.mapping_backing_condemned(object_id) {
             let _ = state.unmap_surface(object_id);
             "dead"

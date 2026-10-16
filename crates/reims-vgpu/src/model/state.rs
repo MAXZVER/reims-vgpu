@@ -2132,6 +2132,11 @@ pub struct MappingEntry {
     /// (bump + drop condemned windows). Cleared by every explicit lifecycle
     /// event (fresh MAP, unmap, MappingInternal reattach, ReplacePhysical).
     pub condemned_entries: Option<Vec<u32>>,
+    /// Whether this mapping has ever had its backing condemned, unmapped, or deleted.
+    pub ever_released: bool,
+    /// Like [`Self::ever_released`], but scoped to one incarnation.
+    /// Cleared when the mapping adopts a fresh, non-empty page list.
+    pub released_since_resolve: bool,
     /// Guest KVA of MappingInternal (from capture or recover).
     pub mapping_internal: u64,
     pub page_table_kva: u64,
@@ -2249,6 +2254,9 @@ pub struct MappingEntry {
     /// are CPU-written too, and writing every one of them back eagerly cost what
     /// turning the lazy rail off everywhere does.
     pub scanout_presented: bool,
+    /// Whether this mapping has been identified as receiving video playback frames
+    /// (e.g. from shaders sampling video planes or biplanar formats).
+    pub is_video_stream: bool,
     /// Bumped by every landing of device bytes into this mapping's guest pages
     /// (`mapper::write_mapping_bytes_only`). The page-diff writeback keeps a copy
     /// of what it last landed and trusts it only while this has not moved since.
@@ -6183,6 +6191,8 @@ impl DeviceState {
             return false;
         }
         e.condemned_entries = Some(std::mem::take(&mut e.page_entries));
+        e.ever_released = true;
+        e.released_since_resolve = true;
         e.page_table_kva = 0;
         let (retired, retired_import) = Self::take_mapping_view(e);
         let retired_token = Self::take_guest_write_token(e);
@@ -6235,6 +6245,8 @@ impl DeviceState {
         e.device_desc.clear();
         e.content_generation = 0;
         e.surface_content_epoch = 0;
+        e.is_video_stream = false;
+        e.released_since_resolve = false;
         e.has_geom = false;
         e.width = 0;
         e.height = 0;
@@ -6275,10 +6287,13 @@ impl DeviceState {
             e.page_entries.clear();
             e.page_table_kva = 0;
             e.condemned_entries = None;
+            e.ever_released = true;
+            e.released_since_resolve = true;
             e.mapping_internal = 0;
             e.device_desc.clear();
             Self::end_repoint_keep(e);
             Self::bump_map_generation(e);
+            e.is_video_stream = false;
             e.has_geom = false;
             e.width = 0;
             e.height = 0;
