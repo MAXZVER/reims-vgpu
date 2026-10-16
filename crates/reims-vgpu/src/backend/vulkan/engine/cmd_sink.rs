@@ -484,7 +484,84 @@ pub(crate) fn take_window_text() -> String {
         STATS.gate_wait_ns.swap(0, Ordering::Relaxed) / 1000,
         STATS.deferred_ends.swap(0, Ordering::Relaxed),
         STATS.copy_bytes.swap(0, Ordering::Relaxed) >> 20,
-    )
+    ) + &copy_repeat::take_window_text()
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_COPY_REPEAT=on`): how much of the lane's guest
+/// RAM -> staging copying repeats bytes it already copied. Maps streams ~2.7
+/// GB/s through these copies (b651, ~68 MB a frame); the question is how much
+/// of it is the same source span with the same content as its previous copy
+/// (a resident GPU copy would skip it) against new or changed bytes. Each
+/// segment's source is hashed on the lane, keyed by (address, length); the
+/// census tail adds `copy_repeat_mb= copy_changed_mb= copy_new_mb=`.
+/// Measure only: the copies themselves are untouched.
+mod copy_repeat {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    static REPEAT: AtomicU64 = AtomicU64::new(0);
+    static CHANGED: AtomicU64 = AtomicU64::new(0);
+    static NEW: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_COPY_REPEAT").as_deref() == Ok("on"))
+    }
+
+    fn seen() -> &'static Mutex<HashMap<(usize, usize), u64>> {
+        static SEEN: OnceLock<Mutex<HashMap<(usize, usize), u64>>> = OnceLock::new();
+        SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// A multiply-xor digest over 8-byte words: ~10 GB/s, enough to tell a
+    /// repeat from a change for a census (a collision only miscounts).
+    ///
+    /// # Safety
+    /// `src` is readable for `n` bytes.
+    unsafe fn digest(src: *const u8, n: usize) -> u64 {
+        let mut h = 0x9e37_79b9_7f4a_7c15u64 ^ n as u64;
+        let words = n / 8;
+        for i in 0..words {
+            // SAFETY: i * 8 + 8 <= n.
+            let w = unsafe { (src.add(i * 8) as *const u64).read_unaligned() };
+            h = (h ^ w).wrapping_mul(0x0100_0000_01b3).rotate_left(29);
+        }
+        for i in words * 8..n {
+            // SAFETY: i < n.
+            h = (h ^ u64::from(unsafe { *src.add(i) })).wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    }
+
+    /// # Safety
+    /// `src` is readable for `n` bytes.
+    pub(super) unsafe fn note(src: *const u8, n: usize) {
+        // SAFETY: forwarded.
+        let h = unsafe { digest(src, n) };
+        let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= 1 << 20 {
+            seen.clear();
+        }
+        let counter = match seen.insert((src as usize, n), h) {
+            Some(old) if old == h => &REPEAT,
+            Some(_) => &CHANGED,
+            None => &NEW,
+        };
+        counter.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn take_window_text() -> String {
+        if !on() {
+            return String::new();
+        }
+        format!(
+            " copy_repeat_mb={} copy_changed_mb={} copy_new_mb={}",
+            REPEAT.swap(0, Ordering::Relaxed) >> 20,
+            CHANGED.swap(0, Ordering::Relaxed) >> 20,
+            NEW.swap(0, Ordering::Relaxed) >> 20,
+        )
+    }
 }
 
 thread_local! {
@@ -947,7 +1024,11 @@ unsafe fn replay(lo: &Loaders, l: &mut List) {
                 Cmd::HostCopy(r) => {
                     let bytes: usize = r.of(&l.segs).iter().map(|s| s.n).sum();
                     STATS.copy_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+                    let repeat = copy_repeat::on();
                     for seg in r.of(&l.segs) {
+                        if repeat {
+                            copy_repeat::note(seg.src, seg.n);
+                        }
                         std::ptr::copy_nonoverlapping(seg.src, seg.dst, seg.n)
                     }
                 }
