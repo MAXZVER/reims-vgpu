@@ -7863,6 +7863,17 @@ fn apply_map_family<H: HostMemory + HostOps>(
         length,
     }) = notice
     {
+        // TEMP (lab, `REIMS_VGPU_LAB_CH2_RETURN_CNT`): the returning-IOSurface
+        // census — measure only, standing in the pre-apply position the other
+        // map-side observers use, and touching nothing but its own rings.
+        crate::runtime::lab_ch2ret::note(
+            state,
+            &*host,
+            task_id,
+            gva,
+            length,
+            matches!(family, MapFamily::UnmapMemory),
+        );
         // Audit the interval against what this task already has live: a range
         // mapped twice or unmapped without a map is a disagreement the guest's
         // own teardown assertion will eventually find.
