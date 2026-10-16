@@ -143,6 +143,27 @@ pub(crate) struct MultisampleTargetSlot {
     pub key: MultisampleTargetKey,
 }
 
+/// v14 C1: a multisample colour image that belongs to one guest multisample
+/// source texture and outlives its pass, so `MTLLoadActionLoad` has contents
+/// to load. Framebuffers over it go through `ensure_ad_hoc_framebuffer`, which
+/// purges them when any of their views (this one included) is destroyed.
+pub(crate) struct MultisampleSourceSlot {
+    pub source: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: vk::Format,
+    pub samples: u32,
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+    /// The layout the last pass left the image in; `None` until one has.
+    pub layout: Option<vk::ImageLayout>,
+}
+
+/// How many [`MultisampleSourceSlot`]s live at once (LRU). A 1170x2532 4x
+/// BGRA8 slot is ~47 MiB of device memory.
+pub(crate) const MULTISAMPLE_SOURCE_CAP: usize = 4;
+
 /// A readback slot checked out of the pool, and the token its holder returns.
 pub(crate) struct LeasedReadback {
     pub token: u64,
@@ -313,6 +334,8 @@ pub(crate) struct ResourcePools {
     /// current single-sample resolve view; a shape change safely retires it
     /// behind the command-buffer ring rather than retaining guest content.
     multisample_target: Option<MultisampleTargetSlot>,
+    /// v14 C1: per-guest-source multisample images, least recently used first.
+    multisample_sources: Vec<MultisampleSourceSlot>,
     /// Framebuffers for passes whose attachment shape is not the target slot's
     /// colour-only one — MRT, depth, and colour-input draws.
     ///

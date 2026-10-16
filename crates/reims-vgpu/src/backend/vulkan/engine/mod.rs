@@ -29,6 +29,7 @@ mod host_ram;
 pub mod init_decline;
 mod linear_target_import;
 mod page_diff;
+pub(crate) mod pipeline_cache_persist;
 mod pools;
 mod queue_owner;
 /// This rail's half of a serialized resource's rail state: the resident-target
@@ -54,6 +55,8 @@ mod slab;
 pub mod stage_phase;
 pub mod types;
 pub mod vk_call;
+pub(crate) mod stale_hold;
+pub(crate) mod window_source_census;
 #[cfg(feature = "host-window")]
 mod window_present;
 

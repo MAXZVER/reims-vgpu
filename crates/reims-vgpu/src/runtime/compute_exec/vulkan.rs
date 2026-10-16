@@ -534,9 +534,18 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     if acc.pipeline_ref == 0 {
         return ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero");
     }
+    // v13 E3: watch the whole exec, so a stall outside the backend call names
+    // its phase (`compute_exec_stall`). Dropped on every return path.
+    let _exec_watch = super::stall_watchdog::compute_exec_watchdog_enabled().then(|| {
+        super::stall_watchdog::arm_compute_exec_watchdog(
+            acc.pipeline_ref,
+            std::time::Duration::from_millis(super::stall_watchdog::COMPUTE_EXEC_STALL_MS),
+        )
+    });
     let Some(pipeline) = load_compute_pipeline(state, host, task_id, acc.pipeline_ref) else {
         return ComputeStatus::MissingPipeline("compute_vk_pipeline_load");
     };
+    super::stall_watchdog::note_compute_exec_phase(super::stall_watchdog::ExecPhase::Stage);
     if let Some(stage_input) = pipeline.stage_input.as_ref() {
         if crate::observe::first_sight("compute_stage_input_contract", u64::from(acc.pipeline_ref))
         {
@@ -1352,7 +1361,9 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         );
         vk_engine::execute_compute_request(device, req)
     };
+    super::stall_watchdog::note_compute_exec_phase(super::stall_watchdog::ExecPhase::Engine);
     let out_result = run_engine(&req);
+    super::stall_watchdog::note_compute_exec_phase(super::stall_watchdog::ExecPhase::Writeback);
     let out = match out_result {
         Ok(o) => o,
         Err(e) => {

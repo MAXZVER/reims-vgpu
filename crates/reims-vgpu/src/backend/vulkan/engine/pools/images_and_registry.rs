@@ -680,6 +680,9 @@ impl ResourcePools {
             // Bump rather than evict: evicting the oldest would leave a live
             // source whose removal moves nothing, which is the exact hole the
             // set exists to close. Bumping costs one present from host memory.
+            crate::backend::vulkan::engine::window_source_census::note(
+                crate::backend::vulkan::engine::window_source_census::InvalidateSite::Overflow,
+            );
             self.invalidate_window_sources();
         }
         self.window_published.push(identity.clone());
@@ -947,6 +950,9 @@ impl ResourcePools {
         // frame from host memory — but it would make the counter mean less than
         // it says.
         if self.window_published.contains(identity) {
+            crate::backend::vulkan::engine::window_source_census::note(
+                crate::backend::vulkan::engine::window_source_census::InvalidateSite::Removed,
+            );
             self.invalidate_window_sources();
         }
         if old.pin_count > 0 {
@@ -2407,6 +2413,9 @@ impl ResourcePools {
         }
         slot.format = format;
         if self.window_published.contains(identity) {
+            crate::backend::vulkan::engine::window_source_census::note(
+                crate::backend::vulkan::engine::window_source_census::InvalidateSite::Format,
+            );
             self.invalidate_window_sources();
         }
     }
@@ -2454,6 +2463,9 @@ impl ResourcePools {
         }
         slot.access = access;
         if self.window_published.contains(identity) {
+            crate::backend::vulkan::engine::window_source_census::note(
+                crate::backend::vulkan::engine::window_source_census::InvalidateSite::Access,
+            );
             self.invalidate_window_sources();
         }
     }
@@ -3580,6 +3592,49 @@ pub(super) mod pin_count_tests {
             stamped,
             "a published resident leaving is exactly what the stamp is for"
         );
+    }
+
+    /// Each door into `invalidate_window_sources` counts on its own
+    /// `window_source_invalidate` census field. Logging only: the epoch moves
+    /// exactly as the siblings above pin.
+    #[test]
+    fn each_invalidation_door_counts_on_its_own_census_field() {
+        use crate::backend::vulkan::engine::window_source_census::snapshot;
+        fn delta(before: [u64; 4], after: [u64; 4]) -> [u64; 4] {
+            std::array::from_fn(|i| after[i] - before[i])
+        }
+        let mut pools = ResourcePools::new();
+        let published = surface(57);
+        admit_ready(&mut pools, &published);
+
+        pools.note_window_published(Some(&published));
+        let before = snapshot();
+        pools.registry_note_access(&published, ResidentAccess::transfer_read(false));
+        assert_eq!(delta(before, snapshot()), [0, 0, 1, 0], "access");
+
+        pools.note_window_published(Some(&published));
+        let held = pools
+            .registry_get(&published)
+            .expect("just admitted")
+            .format;
+        let other = rgba_format();
+        assert_ne!(other, held, "the two interpretations must actually differ");
+        let before = snapshot();
+        pools.set_registry_format(&published, other);
+        assert_eq!(delta(before, snapshot()), [0, 1, 0, 0], "format");
+
+        pools.note_window_published(Some(&published));
+        let before = snapshot();
+        assert!(pools
+            .unregister_resident(&published, ResidentReclaim::Recreated)
+            .is_some());
+        assert_eq!(delta(before, snapshot()), [1, 0, 0, 0], "removed");
+
+        let before = snapshot();
+        for id in 0..=super::WINDOW_PUBLISHED_MAX as u32 {
+            pools.note_window_published(Some(&surface(300 + id)));
+        }
+        assert_eq!(delta(before, snapshot()), [0, 0, 0, 1], "overflow");
     }
 
     /// The defect that made this a set rather than "the latest published

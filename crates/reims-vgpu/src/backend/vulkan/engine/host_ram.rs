@@ -131,6 +131,10 @@ pub enum HostRamDecline {
     /// The reference did not survive its own bound. Carries the check that
     /// refused, from [`crate::runtime::guest_ram`].
     Bound { inner: GuestRamError },
+    /// v13 E4: the driver refused an import for lack of memory recently, and no
+    /// import has been released since; this one was declined without probing.
+    /// Transient, so it is never remembered per import.
+    OomBackoff { remaining_ms: u64, failures: u32 },
 }
 
 impl Decline for HostRamDecline {
@@ -144,6 +148,7 @@ impl Decline for HostRamDecline {
             Self::TooSmall { .. } => "host_ram_import_too_small",
             Self::AllocateMemory { .. } => "host_ram_import_allocate_memory",
             Self::BindBuffer { .. } => "host_ram_import_bind_buffer",
+            Self::OomBackoff { .. } => "host_ram_import_oom_backoff",
             // The inner check is the diagnosis. Forwarding rather than adding a
             // slug keeps one name per check across the two modules.
             Self::Bound { inner } => inner.slug(),
@@ -195,8 +200,101 @@ impl Decline for HostRamDecline {
                 ("available", available.to_string()),
             ],
             Self::Bound { inner } => inner.fields(),
+            Self::OomBackoff {
+                remaining_ms,
+                failures,
+            } => vec![
+                ("remaining_ms", remaining_ms.to_string()),
+                ("failures", failures.to_string()),
+            ],
         }
     }
+}
+
+/// v13 E4 (`REIMS_VGPU_IMPORT_OOM_BACKOFF`): stop probing new host-pointer
+/// imports for a while after the driver ran out of memory for one.
+///
+/// Times are milliseconds on a process-local monotonic clock, passed in so
+/// the policy is testable without sleeping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImportOomBackoff {
+    until_ms: Option<u64>,
+    step_ms: u64,
+    failures: u32,
+    imported_at_fail: u64,
+}
+
+impl ImportOomBackoff {
+    pub(crate) const FIRST_MS: u64 = 250;
+    pub(crate) const MAX_MS: u64 = 8_000;
+
+    /// `Err((remaining_ms, failures))` while backing off. Ends early once the
+    /// imported total falls below what it was at the failure, since a released
+    /// import is the only thing that changes the driver's answer.
+    pub(crate) fn admit(&self, now_ms: u64, imported: u64) -> Result<(), (u64, u32)> {
+        match self.until_ms {
+            Some(until) if now_ms < until && imported >= self.imported_at_fail => {
+                Err((until - now_ms, self.failures))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The driver refused for lack of memory. Returns the new step.
+    pub(crate) fn note_oom(&mut self, now_ms: u64, imported: u64) -> u64 {
+        self.step_ms = if self.step_ms == 0 {
+            Self::FIRST_MS
+        } else {
+            self.step_ms.saturating_mul(2).min(Self::MAX_MS)
+        };
+        self.until_ms = Some(now_ms.saturating_add(self.step_ms));
+        self.failures = self.failures.saturating_add(1);
+        self.imported_at_fail = imported;
+        self.step_ms
+    }
+
+    /// An import landed: the next refusal starts from the first step again.
+    pub(crate) fn note_success(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Whether a refusal is the driver running out of memory.
+pub(crate) fn is_oom_decline(decline: &HostRamDecline) -> bool {
+    matches!(
+        decline,
+        HostRamDecline::AllocateMemory { result }
+            if *result == vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                || *result == vk::Result::ERROR_OUT_OF_HOST_MEMORY
+    )
+}
+
+fn import_oom_backoff_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match crate::config::read(crate::config::IMPORT_OOM_BACKOFF) {
+        (crate::config::Switch::Off, _) => {
+            crate::observe::fail(
+                "import_oom_backoff_disabled reason=disabled_by_env (v12: every new import probes after an OOM)",
+            );
+            false
+        }
+        (crate::config::Switch::Unrecognized, value) => {
+            crate::observe::fail(format!(
+                "import_oom_backoff reason=import_oom_backoff_env_unrecognized value={:?} (kept on)",
+                value.unwrap_or_default()
+            ));
+            true
+        }
+        _ => true,
+    })
+}
+
+fn backoff_now_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 crate::observe::decline_display!(HostRamDecline);
@@ -240,6 +338,8 @@ pub(crate) struct HostRamImports {
     /// Driver refusals are properties of this pointer/device pair. Holding the
     /// answer prevents every draw from repeating a failed allocation.
     declined: HashMap<u64, HostRamDecline>,
+    /// v13 E4: device-wide backoff after an out-of-memory refusal.
+    oom_backoff: ImportOomBackoff,
 }
 
 impl HostRamImports {
@@ -398,10 +498,37 @@ impl HostRamImports {
         if let Some(decline) = self.declined.get(&key) {
             return Err(*decline);
         }
+        let backoff = import_oom_backoff_enabled();
+        if backoff {
+            if let Err((remaining_ms, failures)) =
+                self.oom_backoff.admit(backoff_now_ms(), self.imported_bytes())
+            {
+                // Not remembered in `declined`: the answer is about now.
+                return Err(HostRamDecline::OomBackoff {
+                    remaining_ms,
+                    failures,
+                });
+            }
+        }
         let made = match unsafe { import_ramblock(ctx, import) } {
-            Ok(made) => made,
+            Ok(made) => {
+                if backoff {
+                    self.oom_backoff.note_success();
+                }
+                made
+            }
             Err(decline) => {
                 self.declined.insert(key, decline);
+                if backoff && is_oom_decline(&decline) {
+                    let imported = self.imported_bytes();
+                    let step = self.oom_backoff.note_oom(backoff_now_ms(), imported);
+                    crate::observe::fail(format!(
+                        "host_ram_import_oom_backoff_armed id={key} bytes={} step_ms={step} \
+                         imported_mib={} decline={decline}",
+                        import.len(),
+                        imported >> 20,
+                    ));
+                }
                 return Err(decline);
             }
         };
@@ -758,6 +885,10 @@ mod tests {
             HostRamDecline::BindBuffer {
                 result: vk::Result::ERROR_UNKNOWN,
             },
+            HostRamDecline::OomBackoff {
+                remaining_ms: 0,
+                failures: 0,
+            },
         ];
         let mut slugs: Vec<_> = all.iter().map(|d| d.slug()).collect();
         let count = slugs.len();
@@ -1029,5 +1160,63 @@ mod tests {
         let imports = HostRamImports::default();
         assert_eq!(imports.counts(), (0, 0));
         assert_eq!(imports.imported_bytes(), 0);
+    }
+}
+
+/// v13 E4: the out-of-memory backoff policy.
+#[cfg(test)]
+mod oom_backoff_tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_policy_admits() {
+        assert_eq!(ImportOomBackoff::default().admit(0, 0), Ok(()));
+    }
+
+    #[test]
+    fn an_oom_backs_off_and_doubles_to_the_ceiling() {
+        let mut b = ImportOomBackoff::default();
+        assert_eq!(b.note_oom(1_000, 10), ImportOomBackoff::FIRST_MS);
+        assert_eq!(b.admit(1_100, 10), Err((150, 1)));
+        assert_eq!(b.admit(1_250, 10), Ok(()));
+        let mut step = ImportOomBackoff::FIRST_MS;
+        for _ in 0..10 {
+            step = b.note_oom(2_000, 10);
+        }
+        assert_eq!(step, ImportOomBackoff::MAX_MS);
+    }
+
+    #[test]
+    fn a_released_import_ends_the_backoff_early() {
+        let mut b = ImportOomBackoff::default();
+        b.note_oom(0, 1 << 30);
+        assert!(b.admit(10, 1 << 30).is_err());
+        assert_eq!(b.admit(10, (1 << 30) - 1), Ok(()));
+    }
+
+    #[test]
+    fn a_landed_import_resets_the_step() {
+        let mut b = ImportOomBackoff::default();
+        b.note_oom(0, 0);
+        b.note_oom(0, 0);
+        b.note_success();
+        assert_eq!(b, ImportOomBackoff::default());
+        assert_eq!(b.note_oom(0, 0), ImportOomBackoff::FIRST_MS);
+    }
+
+    #[test]
+    fn only_memory_exhaustion_arms_the_backoff() {
+        for (result, oom) in [
+            (vk::Result::ERROR_OUT_OF_DEVICE_MEMORY, true),
+            (vk::Result::ERROR_OUT_OF_HOST_MEMORY, true),
+            (vk::Result::ERROR_INVALID_EXTERNAL_HANDLE, false),
+            (vk::Result::ERROR_UNKNOWN, false),
+        ] {
+            assert_eq!(is_oom_decline(&HostRamDecline::AllocateMemory { result }), oom);
+        }
+        assert!(!is_oom_decline(&HostRamDecline::OomBackoff {
+            remaining_ms: 1,
+            failures: 1
+        }));
     }
 }

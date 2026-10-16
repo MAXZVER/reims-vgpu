@@ -26,6 +26,7 @@
 //! silent unwatched dispatch would read as "no stall" when it means "no
 //! watchdog".
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,122 @@ impl crate::observe::Decline for StallWatchdogDecline {
 
 crate::observe::decline_display!(StallWatchdogDecline);
 
+/// What a slot watches (v13 E3). `Engine` is the original backend-call watch,
+/// with its SPIR-V dump; `Exec` is a whole compute exec, which names the phase
+/// it was in when the deadline passed and dumps nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchKind {
+    Engine,
+    Exec,
+}
+
+/// The phase of the compute exec in flight (v13 E3). The engine serializes
+/// compute through one process-global lock, so one global is exact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ExecPhase {
+    Idle = 0,
+    Load = 1,
+    Stage = 2,
+    Engine = 3,
+    Writeback = 4,
+}
+
+impl ExecPhase {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Load => "load",
+            Self::Stage => "stage",
+            Self::Engine => "engine",
+            Self::Writeback => "writeback",
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Load,
+            2 => Self::Stage,
+            3 => Self::Engine,
+            4 => Self::Writeback,
+            _ => Self::Idle,
+        }
+    }
+}
+
+static EXEC_PHASE: AtomicU8 = AtomicU8::new(0);
+
+/// Record which phase the compute exec in flight has reached.
+pub fn note_compute_exec_phase(phase: ExecPhase) {
+    EXEC_PHASE.store(phase as u8, Ordering::Relaxed);
+}
+
+/// The phase most recently recorded.
+pub fn compute_exec_phase() -> ExecPhase {
+    ExecPhase::from_u8(EXEC_PHASE.load(Ordering::Relaxed))
+}
+
+/// The whole-exec threshold: the drain's own `sync_exec_lock_hold` threshold.
+pub const COMPUTE_EXEC_STALL_MS: u64 = 250;
+
+/// `REIMS_VGPU_COMPUTE_EXEC_WATCHDOG`, read once (default on).
+pub fn compute_exec_watchdog_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match crate::config::read(crate::config::COMPUTE_EXEC_WATCHDOG) {
+        (crate::config::Switch::Off, _) => {
+            crate::observe::fail(
+                "compute_exec_watchdog_disabled reason=disabled_by_env (v12: only the backend call is watched)",
+            );
+            false
+        }
+        (crate::config::Switch::Unrecognized, value) => {
+            crate::observe::fail(format!(
+                "compute_exec_watchdog reason=compute_exec_watchdog_env_unrecognized value={:?} (kept on)",
+                value.unwrap_or_default()
+            ));
+            true
+        }
+        _ => true,
+    })
+}
+
+/// Watch a whole compute exec (v13 E3). See [`WatchKind::Exec`].
+pub fn arm_compute_exec_watchdog(pipeline_ref: u32, threshold: Duration) -> StallWatch {
+    note_compute_exec_phase(ExecPhase::Load);
+    let registry = registry();
+    let deadline = Instant::now() + threshold;
+    let mut table = registry
+        .table
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(index) = table.iter().position(|slot| slot.state == SlotState::Free) else {
+        drop(table);
+        crate::observe::Emit::decline(
+            "compute_stall_watchdog",
+            &StallWatchdogDecline::NoFreeSlot {
+                pipeline_ref,
+                slots: SLOTS,
+            },
+        )
+        .fail_once(u64::from(pipeline_ref));
+        return StallWatch { slot: None };
+    };
+    let slot = &mut table[index];
+    slot.state = SlotState::Armed;
+    slot.kind = WatchKind::Exec;
+    slot.deadline = Some(deadline);
+    slot.threshold_ms = threshold.as_millis();
+    slot.pipeline_ref = pipeline_ref;
+    slot.grid = [0; 3];
+    slot.buffers = 0;
+    slot.images = 0;
+    slot.image_geometry.clear();
+    slot.spirv.clear();
+    drop(table);
+    registry.armed.notify_one();
+    StallWatch { slot: Some(index) }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SlotState {
     /// Nothing is being watched here; the buffers keep their capacity.
@@ -79,6 +196,7 @@ enum SlotState {
 
 struct Slot {
     state: SlotState,
+    kind: WatchKind,
     deadline: Option<Instant>,
     /// The threshold this call was armed with, kept so the report names the
     /// promise that was broken rather than the wake-up jitter around it.
@@ -97,6 +215,7 @@ impl Slot {
     fn free() -> Self {
         Self {
             state: SlotState::Free,
+            kind: WatchKind::Engine,
             deadline: None,
             threshold_ms: 0,
             pipeline_ref: 0,
@@ -113,6 +232,7 @@ impl Slot {
 /// unlocked. Allocating here is fine: it happens only when a call really did
 /// not return inside its threshold.
 struct Report {
+    kind: WatchKind,
     pipeline_ref: u32,
     elapsed_ms: u128,
     grid: [u32; 3],
@@ -188,6 +308,7 @@ pub fn arm_compute_engine_stall_watchdog(
     };
     let slot = &mut table[index];
     slot.state = SlotState::Armed;
+    slot.kind = WatchKind::Engine;
     slot.deadline = Some(deadline);
     slot.threshold_ms = threshold.as_millis();
     slot.pipeline_ref = pipeline_ref;
@@ -232,6 +353,7 @@ fn watch_forever() {
             }
             slot.state = SlotState::Reported;
             due.push(Report {
+                kind: slot.kind,
                 pipeline_ref: slot.pipeline_ref,
                 elapsed_ms: slot.threshold_ms,
                 grid: slot.grid,
@@ -280,7 +402,20 @@ impl Report {
         // `elapsed_ms` is the threshold, not the overshoot: the reader wants
         // "this call had not returned after N ms", and the watchdog's wake-up
         // jitter is not part of that claim.
+        if self.kind == WatchKind::Exec {
+            // v13 E3: the whole exec, not the backend call. The phase is read
+            // now, at the deadline, which is the phase the exec is stuck in.
+            crate::runtime::drain::note_store_route("compute_exec_stall");
+            crate::observe::fail(format!(
+                "compute_exec_stall reason=compute_exec_unreturned pipe={} threshold_ms={} phase={}",
+                self.pipeline_ref,
+                self.elapsed_ms,
+                compute_exec_phase().name()
+            ));
+            return;
+        }
         let Report {
+            kind: _,
             pipeline_ref,
             elapsed_ms,
             grid,
@@ -318,3 +453,47 @@ impl Report {
 
 /// The threshold every production dispatch arms with.
 pub const COMPUTE_ENGINE_STALL_PROXY_MS: u64 = 2_000;
+
+/// v13 E3: the whole-exec watch.
+#[cfg(test)]
+mod exec_watch_tests {
+    use super::*;
+
+    #[test]
+    fn every_phase_round_trips_and_has_its_own_name() {
+        let all = [
+            ExecPhase::Idle,
+            ExecPhase::Load,
+            ExecPhase::Stage,
+            ExecPhase::Engine,
+            ExecPhase::Writeback,
+        ];
+        let mut names: Vec<&str> = all.iter().map(|p| p.name()).collect();
+        for p in all {
+            assert_eq!(ExecPhase::from_u8(p as u8), p);
+        }
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), all.len());
+        assert_eq!(ExecPhase::from_u8(200), ExecPhase::Idle);
+    }
+
+    #[test]
+    fn an_exec_watch_holds_a_slot_until_dropped() {
+        let free = || {
+            registry()
+                .table
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .filter(|s| s.state == SlotState::Free)
+                .count()
+        };
+        let before = free();
+        let watch = arm_compute_exec_watchdog(7, Duration::from_secs(3600));
+        assert_eq!(compute_exec_phase(), ExecPhase::Load);
+        assert_eq!(free(), before - 1);
+        drop(watch);
+        assert_eq!(free(), before);
+    }
+}

@@ -4711,8 +4711,35 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
     state.cursor.hot_y = hot_y as u16;
     state.cursor.pixels = pixels;
     state.cursor.glyph_ready = true;
+    note_cursor_glyph_loaded(state);
     sample_cursor_position(state, host);
     true
+}
+
+/// Bookkeeping for one glyph [`load_cursor_glyph`] accepted.
+///
+/// Bumps [`crate::model::CursorState::glyph_serial`], which is what marks the
+/// glyph pending for the host window's cursor publisher, and counts the load
+/// as `cursor_glyph_loaded` on the per-second `store_routes` line. The
+/// geometry (`w`/`h`/hotspot) goes on the offline channel only when it differs
+/// from the previous load: the guest re-sends a glyph per pointer *image*
+/// change, and the rate is the route count, so one line per distinct shape is
+/// the whole signal and a hover storm cannot flood the log.
+pub(crate) fn note_cursor_glyph_loaded(state: &mut DeviceState) {
+    use std::sync::Mutex;
+    let cursor = &mut state.cursor;
+    cursor.glyph_serial = cursor.glyph_serial.wrapping_add(1).max(1);
+    note_store_route("cursor_glyph_loaded");
+    static LAST: Mutex<Option<(u16, u16, u16, u16)>> = Mutex::new(None);
+    let geom = (cursor.width, cursor.height, cursor.hot_x, cursor.hot_y);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != Some(geom) {
+        *last = Some(geom);
+        crate::observe::off(format!(
+            "cursor_glyph_loaded w={} h={} hot_x={} hot_y={} serial={}",
+            geom.0, geom.1, geom.2, geom.3, cursor.glyph_serial
+        ));
+    }
 }
 
 /// Account one accepted present and request a worker→host action boundary.
@@ -5460,7 +5487,7 @@ fn note_released_or_remapped<H: HostMemory + HostOps>(
     match family {
         MapFamily::UnmapMemory => {
             for gpa in pages {
-                writes.release_page(gpa);
+                writes.release_page_by(gpa, crate::runtime::host_writes::ReleaseSource::UnmapMemory);
             }
         }
         _ => {
@@ -5812,6 +5839,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
         state.released_mappings.insert(object_id);
         if let Some(m) = state.mappings.get_mut(&object_id) {
             m.ever_released = true;
+            m.released_since_resolve = true;
         }
         if let Some(m) = state.mappings.get(&object_id) {
             let page_shift = state.page_shift;
@@ -5820,7 +5848,10 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 if let Some(gpa) =
                     crate::protocol::iosurface_pages::entry_gpa_shift(entry, page_shift)
                 {
-                    state.host_writes.release_page(gpa);
+                    state.host_writes.release_page_by(
+                        gpa,
+                        crate::runtime::host_writes::ReleaseSource::BackingRelease,
+                    );
                 }
             }
         }
@@ -7093,6 +7124,11 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     state.draining_channel = channel_id;
     state.draining_mask |= bit;
 
+    // Step 1 (polled-work epoch): the tail whose work the observation epoch
+    // already covers in this call. A re-read that returns it again found no
+    // new work, so it asks nothing of the host.
+    let mut polled_tail_covered: Option<u32> = None;
+
     loop {
         let regs_started = std::time::Instant::now();
         let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
@@ -7111,6 +7147,12 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 break;
             }
         };
+        // Step 1: before `arrival` decodes anything, so the epoch has moved
+        // before this work can ask a currency question.
+        if tail != head && polled_tail_covered != Some(tail) {
+            note_polled_ring_work(&*host);
+            polled_tail_covered = Some(tail);
+        }
         let ring = Ring::Child {
             page_gpas: &page_gpas,
             capacity: ring_length,
@@ -7198,6 +7240,56 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
 
     state.draining_mask &= !bit;
     state.draining_channel = prev_channel;
+}
+
+/// Step 1 (polled-work epoch): a child ring's tail moved and the drain is about
+/// to consume what it found, with no promise that a doorbell came *after* the
+/// guest published it.
+///
+/// A child ring's tail is guest memory [`drain_child_fifo`] polls, not a
+/// register: the per-packet re-read, the poll-tick Dekker rescue
+/// (`device_poll`) and [`drain_other_child_fifos`] all consume work no doorbell
+/// handed over. The root FIFO is not polled (`fifo_written` is the 0x1008
+/// register, whose write bumps the epoch in the shim before it reaches this
+/// side), so this is the one site. Before Step A the cursor doorbell bumped the
+/// epoch ~300 times a second, which hid this; with Step A on, a currency
+/// verdict for polled work could be the cached `Clean` of an epoch whose sync
+/// ran before the guest's stores (the stale-menu A/B).
+///
+/// **Why the bump is the shim's.** The epoch, and each set's `synced_epoch`
+/// that decides whether a generation read re-syncs, live in the QEMU tracker.
+/// A Rust-only key change would retire this side's cached verdicts but leave
+/// the tracker answering from its old sync. So this asks
+/// [`HostOps::note_polled_work`] (ABI v24), which bumps only when some sync has
+/// already captured the current epoch; when none has, every set's next read
+/// syncs after this call anyway and the answer is `Fresh`, with no bump.
+///
+/// **Why not "only when no doorbell came since the last bump".** A doorbell
+/// that landed *before* the guest's later stores (another channel's, or this
+/// channel's previous submission) would pass that test while the tracker's
+/// prefetch had already synced the sets at that epoch: the same stale `Clean`.
+/// Whether a doorbell followed the stores cannot be read off the epoch;
+/// whether a sync observed the epoch can, under the tracker's lock.
+///
+/// Never blocks the drain: the shim takes only its tracker's leaf `d->lock`
+/// (never `sync_lock`, never a hypervisor query), which the drain already takes
+/// for every generation read with the device lock held. Epoch 0 still caches
+/// nothing, and a cached verdict is still never served across an epoch change
+/// ([`crate::runtime::surface_currency`]); this only adds a change.
+pub(crate) fn note_polled_ring_work<H: HostOps + ?Sized>(
+    host: &H,
+) -> crate::runtime::host::PolledWorkEpoch {
+    use crate::runtime::host::PolledWorkEpoch;
+    let answer = host.note_polled_work();
+    note_store_route(match answer {
+        PolledWorkEpoch::Bumped => "dirty_epoch_bump_polled_work",
+        PolledWorkEpoch::Fresh => "dirty_epoch_polled_work_fresh",
+        PolledWorkEpoch::Disabled => "dirty_epoch_polled_work_disabled",
+        // Harvest mode, no tracker or an older shim: fail-visible, because the
+        // polled-work guarantee is then the per-write harvest's, not this.
+        PolledWorkEpoch::Unsupported => "dirty_epoch_polled_work_unsupported",
+    });
+    answer
 }
 
 /// Drain iosfc mapper producer→consumer handshake.

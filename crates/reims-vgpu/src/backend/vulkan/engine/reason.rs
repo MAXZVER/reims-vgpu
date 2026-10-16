@@ -396,6 +396,21 @@ impl crate::observe::Decline for DrawReason {
             Self::SwapchainSurface(refusal) => refusal.slug(),
         }
     }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            // Emit::decline consumes fields, not Display. Keep the binding and
+            // stage that identify this layout hole through DrawError's wrapper.
+            Self::UsedBindingAbsentFromLayout { binding, fragment } => vec![
+                ("binding", binding.to_string()),
+                (
+                    "stage",
+                    if *fragment { "fragment" } else { "vertex" }.to_string(),
+                ),
+            ],
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Display for DrawReason {

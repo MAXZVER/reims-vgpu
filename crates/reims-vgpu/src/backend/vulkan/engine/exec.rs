@@ -3196,6 +3196,34 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     pass_key.sample_count = raster_sample_count;
     pass_key.multisample_resolve = req.multisample_resolve;
+    // v14 C1: a pass through a persistent per-source multisample image loads
+    // it only when a previous pass left it in the layout this pass names;
+    // otherwise a pass that wants prior contents starts from transparent black
+    // rather than LOADing an image in a layout it is not in.
+    let mut multisample_cold_clear = false;
+    if req.multisample_resolve && req.multisample_source != 0 {
+        let wants_prior = req.multisample_load || pass_key.color0_load == Color0Load::Preserve;
+        let outcome = multisample_source_load(
+            wants_prior,
+            pools.multisample_source_layout(
+                req.multisample_source,
+                req.width,
+                req.height,
+                color0_format,
+                raster_sample_count,
+            ),
+            pass_key.color_final_layout(0),
+        );
+        crate::runtime::drain::note_store_route(outcome.slug());
+        match outcome {
+            MultisampleSourceLoad::Fresh => {}
+            MultisampleSourceLoad::Warm => pass_key.color0_load = Color0Load::Preserve,
+            MultisampleSourceLoad::ColdCleared | MultisampleSourceLoad::LayoutMismatchCleared => {
+                pass_key.color0_load = Color0Load::Clear;
+                multisample_cold_clear = true;
+            }
+        }
+    }
     // Into the command buffer's scratch and then interned, for the reason the
     // layout bindings below are: `PipelineKey` carries the attribute set, and a
     // key owning a `Vec<AttrKey>` is a heap allocation on every draw that has
@@ -3803,23 +3831,30 @@ pub(crate) unsafe fn execute_draw_inner(
             }
         };
     let _multisample_source_image = if req.multisample_resolve {
-        let (image, _view, framebuffer) = pools.acquire_multisample_target(
-            ctx,
-            super::pools::MultisampleTargetKey {
-                width: req.width,
-                height: req.height,
-                format: color0_format,
-                samples: raster_sample_count,
-                compatibility: pass_key.framebuffer_compatibility(),
-                resolve_view: target_view,
-                depth_view: depth_attachment.as_ref().map(|depth| depth.view),
-                transient_depth: depth_attachment
-                    .as_ref()
-                    .is_some_and(|depth| depth.owned.is_some()),
-            },
-            render_pass,
-            counters,
-        )?;
+        let multisample_key = super::pools::MultisampleTargetKey {
+            width: req.width,
+            height: req.height,
+            format: color0_format,
+            samples: raster_sample_count,
+            compatibility: pass_key.framebuffer_compatibility(),
+            resolve_view: target_view,
+            depth_view: depth_attachment.as_ref().map(|depth| depth.view),
+            transient_depth: depth_attachment
+                .as_ref()
+                .is_some_and(|depth| depth.owned.is_some()),
+        };
+        let (image, _view, framebuffer) = if req.multisample_source != 0 {
+            pools.acquire_multisample_source(
+                ctx,
+                req.multisample_source,
+                multisample_key,
+                render_pass,
+                pass_key.color_final_layout(0),
+                counters,
+            )?
+        } else {
+            pools.acquire_multisample_target(ctx, multisample_key, render_pass, counters)?
+        };
         target_fb = framebuffer;
         Some(image)
     } else {
@@ -5073,7 +5108,15 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
-    let clear = clear_values(req)?;
+    let mut clear = clear_values(req)?;
+    if multisample_cold_clear {
+        // v14 C1: Metal's Load of a multisample image with no live contents
+        // reads undefined values; transparent black is the value with no
+        // meaning, and not the guest's clear colour, which it did not ask for.
+        clear.values[0] = vk::ClearValue {
+            color: vk::ClearColorValue { float32: [0.0; 4] },
+        };
+    }
     phase.enter(super::draw_phase::Phase::RecordPass);
     let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
@@ -6140,6 +6183,14 @@ fn clear_values(req: &DrawRequest) -> Result<ClearValues, DrawError> {
             color: sec.attachment.clear().vk(),
         })?;
     }
+    // v14: the render pass places the resolve attachment after the colour
+    // slots and before depth (`caches::get_or_create_pass`). Its load op is
+    // DONT_CARE, so the value is never read; the entry exists so depth's lands
+    // at depth's index.
+    if resolve_clear_slot(req.multisample_resolve, msaa_resolve_clear_slot_enabled()) {
+        crate::runtime::drain::note_store_route("msaa_resolve_clear_slot_filled");
+        clear.push(vk::ClearValue::default())?;
+    }
     if let Some(d) = &req.depth {
         clear.push(vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
@@ -6149,6 +6200,74 @@ fn clear_values(req: &DrawRequest) -> Result<ClearValues, DrawError> {
         })?;
     }
     Ok(clear)
+}
+
+/// v14 C1: how a pass through a persistent per-source multisample image begins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MultisampleSourceLoad {
+    /// The pass wants no prior contents (Clear / DontCare); unchanged.
+    Fresh,
+    /// The image holds the previous pass's contents in this pass's layout.
+    Warm,
+    /// The pass wants prior contents and the image has none.
+    ColdCleared,
+    /// The image holds contents, but in a layout this pass does not name.
+    LayoutMismatchCleared,
+}
+
+impl MultisampleSourceLoad {
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Fresh => "msaa_source_fresh",
+            Self::Warm => "msaa_load_warm",
+            Self::ColdCleared => "msaa_load_cold_cleared",
+            Self::LayoutMismatchCleared => "msaa_load_layout_mismatch_cleared",
+        }
+    }
+}
+
+/// Pure rule behind [`MultisampleSourceLoad`]. `slot_layout` is the layout the
+/// persistent image was left in (`None`: absent, reshaped, or never rendered);
+/// `pass_initial` is the layout a LOAD pass would declare for attachment 0.
+pub(crate) fn multisample_source_load(
+    wants_prior: bool,
+    slot_layout: Option<vk::ImageLayout>,
+    pass_initial: vk::ImageLayout,
+) -> MultisampleSourceLoad {
+    if !wants_prior {
+        return MultisampleSourceLoad::Fresh;
+    }
+    match slot_layout {
+        Some(layout) if layout == pass_initial => MultisampleSourceLoad::Warm,
+        Some(_) => MultisampleSourceLoad::LayoutMismatchCleared,
+        None => MultisampleSourceLoad::ColdCleared,
+    }
+}
+
+/// v14: whether [`clear_values`] owes the resolve attachment an entry.
+pub(crate) fn resolve_clear_slot(multisample_resolve: bool, enabled: bool) -> bool {
+    multisample_resolve && enabled
+}
+
+/// `REIMS_VGPU_MSAA_RESOLVE_CLEAR_SLOT`, read once (default on).
+pub(crate) fn msaa_resolve_clear_slot_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match crate::config::read(crate::config::MSAA_RESOLVE_CLEAR_SLOT) {
+        (crate::config::Switch::Off, _) => {
+            crate::observe::fail(
+                "msaa_resolve_clear_slot_disabled reason=disabled_by_env (v13: a multisample pass's depth clear lands on the resolve slot)",
+            );
+            false
+        }
+        (crate::config::Switch::Unrecognized, value) => {
+            crate::observe::fail(format!(
+                "msaa_resolve_clear_slot reason=msaa_resolve_clear_slot_env_unrecognized value={:?} (kept on)",
+                value.unwrap_or_default()
+            ));
+            true
+        }
+        _ => true,
+    })
 }
 
 /// The clear values of one draw, held inline.
@@ -7959,6 +8078,31 @@ mod tests {
         );
     }
 
+    /// v14: a multisample-resolve pass with depth has three attachments
+    /// (colour, resolve, depth) and depth's clear value sits at index 2.
+    #[test]
+    fn a_multisample_resolve_pass_gives_depth_its_own_index() {
+        assert!(super::resolve_clear_slot(true, true));
+        assert!(!super::resolve_clear_slot(true, false), "the kill switch restores v13");
+        assert!(!super::resolve_clear_slot(false, true), "single-sample passes are unchanged");
+        let req = DrawRequest {
+            multisample_resolve: true,
+            depth: Some(super::super::types::DepthState {
+                identity: None,
+                test_enable: true,
+                write_enable: true,
+                compare: super::super::types::SamplerCompareFunction::Less,
+                clear_value: 0.5,
+                load: false,
+                stencil: None,
+            }),
+            ..DrawRequest::default()
+        };
+        let clear = clear_values(&req).expect("three attachments");
+        assert_eq!(clear.len(), 3, "colour, resolve, depth");
+        unsafe { assert_eq!(clear[2].depth_stencil.depth, 0.5) };
+    }
+
     /// A default request still clears to transparent black, which is what every
     /// draw that names no colour has always got.
     #[test]
@@ -8614,5 +8758,53 @@ mod depth_load_tests {
             }
         }
         assert_eq!(checked, COMPARES.len() * OPS.len() * 2);
+    }
+}
+
+#[cfg(test)]
+mod multisample_source_load_tests {
+    use super::{multisample_source_load, MultisampleSourceLoad};
+    use ash::vk::ImageLayout as L;
+
+    #[test]
+    fn a_pass_that_wants_nothing_is_unchanged() {
+        assert_eq!(
+            multisample_source_load(false, None, L::COLOR_ATTACHMENT_OPTIMAL),
+            MultisampleSourceLoad::Fresh
+        );
+        assert_eq!(
+            multisample_source_load(false, Some(L::GENERAL), L::COLOR_ATTACHMENT_OPTIMAL),
+            MultisampleSourceLoad::Fresh
+        );
+    }
+
+    #[test]
+    fn a_load_reads_only_an_image_left_in_its_layout() {
+        assert_eq!(
+            multisample_source_load(true, Some(L::GENERAL), L::GENERAL),
+            MultisampleSourceLoad::Warm
+        );
+        assert_eq!(
+            multisample_source_load(true, Some(L::COLOR_ATTACHMENT_OPTIMAL), L::GENERAL),
+            MultisampleSourceLoad::LayoutMismatchCleared
+        );
+        assert_eq!(
+            multisample_source_load(true, None, L::GENERAL),
+            MultisampleSourceLoad::ColdCleared
+        );
+    }
+
+    #[test]
+    fn every_outcome_has_its_own_slug() {
+        let all = [
+            MultisampleSourceLoad::Fresh,
+            MultisampleSourceLoad::Warm,
+            MultisampleSourceLoad::ColdCleared,
+            MultisampleSourceLoad::LayoutMismatchCleared,
+        ];
+        let mut slugs: Vec<&str> = all.iter().map(|o| o.slug()).collect();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), all.len());
     }
 }

@@ -1146,6 +1146,32 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     assert_eq!(state.translation_order_hold_mask, 0);
 }
 
+/// An accepted glyph is counted and marked pending for the window publisher.
+///
+/// `cursor_glyph_loaded` is the census the host-window cursor work reads to
+/// know glyphs arrive at all, and `glyph_serial` is what the publisher compares
+/// against: it must move on every accepted load (even an identical one), and
+/// never read 0 once a glyph has loaded, because 0 means "nothing to publish".
+#[test]
+fn an_accepted_cursor_glyph_is_counted_and_bumps_the_serial() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    assert_eq!(state.cursor.glyph_serial, 0, "no glyph yet");
+    let before = crate::runtime::drain::census::store_route_count("cursor_glyph_loaded");
+    state.cursor.width = 32;
+    state.cursor.height = 32;
+    state.cursor.hot_x = 4;
+    state.cursor.hot_y = 5;
+    super::note_cursor_glyph_loaded(&mut state);
+    assert_eq!(state.cursor.glyph_serial, 1);
+    super::note_cursor_glyph_loaded(&mut state);
+    assert_eq!(state.cursor.glyph_serial, 2, "an identical reload still moves it");
+    state.cursor.glyph_serial = u64::MAX;
+    super::note_cursor_glyph_loaded(&mut state);
+    assert_eq!(state.cursor.glyph_serial, 1, "wrap skips 0, which means no glyph");
+    let after = crate::runtime::drain::census::store_route_count("cursor_glyph_loaded");
+    assert!(after >= before + 3, "each load is counted: {before} -> {after}");
+}
+
 /// A cursor pitch that does not fit a word must be refused, not wrapped.
 ///
 /// `CmdSetCursorGlyph` carries `stride` in eight bytes and the drain wanted
@@ -7923,4 +7949,189 @@ fn delete_iosurface_backing_settles_an_in_flight_copy_into_its_pages() {
     assert!(state.host_writes.armed_pages() >= 1, "the page is released after the settle");
     crate::runtime::released_pages::sweep(&mut state);
     assert_eq!(store_route_count("released_write_after_release"), found);
+}
+
+
+// ---------------------------------------------------------------------------
+// Step 1 (polled-work epoch)
+// ---------------------------------------------------------------------------
+
+/// One child ring published by its tail alone (no doorbell, nothing in
+/// `pending`): `count` UnmapMemory packets for a task nobody defined, which
+/// complete as no-ops. Returns the channel's register block and the ring.
+fn polled_child_ring(
+    state: &mut DeviceState,
+    host: &mut FakeHost,
+    channel: u32,
+    count: usize,
+) -> (u64, u64, Vec<u8>) {
+    let page_size = state.page_size() as usize;
+    let root_gpa = state.pfn_gpa(0x10);
+    let list_gpa = state.pfn_gpa(0x20);
+    let ring_gpa = state.pfn_gpa(0x30);
+    let stamp_gpa = state.pfn_gpa(0x40);
+    for gpa in [root_gpa, list_gpa, ring_gpa, stamp_gpa] {
+        host.map_range(gpa, page_size, 0);
+    }
+    let mut payload = vec![0u8; 20];
+    payload[0..4].copy_from_slice(&0x77u32.to_le_bytes());
+    payload[4..12].copy_from_slice(&0x101000u64.to_le_bytes());
+    payload[12..20].copy_from_slice(&0x4000u64.to_le_bytes());
+    let packet = packet_bytes(CHILD_OP_UNMAP_MEMORY, 0x55, &payload);
+    let ring: Vec<u8> = packet.repeat(count);
+    host.write_gpa(ring_gpa, &ring).unwrap();
+    host.put_u32(list_gpa, 0x30);
+    let regs_gpa = root_gpa + child_reg_block_offset(channel).unwrap();
+    host.put_u32(regs_gpa + CHILD_REG_TAIL, ring.len() as u32);
+    host.put_u32(regs_gpa + CHILD_REG_HEAD, 0);
+    host.put_u32(regs_gpa + CHILD_REG_STAMP_INDEX, 1);
+    host.put_u32(regs_gpa + CHILD_REG_BASE_PFN, 0x20);
+    state.gfx.root_page = 0x10;
+    state.gfx.fifo_base_page = 0x40;
+    state.open_child_domains_for_test(1u32 << channel);
+    (regs_gpa, ring_gpa, packet)
+}
+
+/// Polled ring work moves the observation epoch before it is consumed, once
+/// per new tail and not once per packet: two packets behind one tail cost one
+/// ask, a tail the guest advanced again costs one more, and a re-drain of a
+/// ring with nothing new asks nothing.
+#[test]
+fn polled_child_ring_work_asks_for_one_epoch_bump_per_new_tail() {
+    use crate::runtime::host::PolledWorkEpoch;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    host.polled_work_answer.set(Some(PolledWorkEpoch::Bumped));
+    let channel = 3u32;
+    let (regs_gpa, ring_gpa, packet) = polled_child_ring(&mut state, &mut host, channel, 2);
+    let epoch0 = host.dirty_observation_epoch.get();
+    let routes0 = census::store_route_count("dirty_epoch_bump_polled_work");
+
+    drain_child_fifo(&mut state, &mut host, channel);
+    assert_eq!(
+        host.get_u32(regs_gpa + CHILD_REG_HEAD),
+        2 * packet.len() as u32,
+        "both polled packets were consumed"
+    );
+    assert_eq!(host.polled_work_calls.get(), 1, "one tail, one ask");
+    assert_eq!(host.dirty_observation_epoch.get(), epoch0 + 1);
+    assert!(census::store_route_count("dirty_epoch_bump_polled_work") > routes0);
+
+    // Nothing new behind the tail: no ask, no bump.
+    drain_child_fifo(&mut state, &mut host, channel);
+    assert_eq!(host.polled_work_calls.get(), 1);
+    assert_eq!(host.dirty_observation_epoch.get(), epoch0 + 1);
+
+    // The guest appends a packet and moves the tail, with no doorbell.
+    host.write_gpa(ring_gpa + 2 * packet.len() as u64, &packet).unwrap();
+    host.put_u32(regs_gpa + CHILD_REG_TAIL, 3 * packet.len() as u32);
+    drain_child_fifo(&mut state, &mut host, channel);
+    assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), 3 * packet.len() as u32);
+    assert_eq!(host.polled_work_calls.get(), 2);
+    assert_eq!(host.dirty_observation_epoch.get(), epoch0 + 2);
+}
+
+/// A host without the callback (or in harvest mode, or with the lab switch
+/// off) moves nothing, says so under its own slug, and the work still runs:
+/// the ask never holds the drain.
+#[test]
+fn polled_child_ring_work_without_a_bump_is_fail_visible_and_still_consumed() {
+    use crate::runtime::host::PolledWorkEpoch;
+    for (answer, slug) in [
+        (None, "dirty_epoch_polled_work_unsupported"),
+        (Some(PolledWorkEpoch::Fresh), "dirty_epoch_polled_work_fresh"),
+        (Some(PolledWorkEpoch::Disabled), "dirty_epoch_polled_work_disabled"),
+    ] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.polled_work_answer.set(answer);
+        let channel = 4u32;
+        let (regs_gpa, _ring_gpa, packet) = polled_child_ring(&mut state, &mut host, channel, 1);
+        let epoch0 = host.dirty_observation_epoch.get();
+        let routes0 = census::store_route_count(slug);
+        drain_child_fifo(&mut state, &mut host, channel);
+        assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), packet.len() as u32);
+        assert_eq!(host.polled_work_calls.get(), 1);
+        assert_eq!(host.dirty_observation_epoch.get(), epoch0, "{slug}: no bump");
+        assert!(census::store_route_count(slug) > routes0, "{slug} counted");
+    }
+}
+
+/// An empty ring (head == tail) is not work and asks nothing.
+#[test]
+fn an_empty_polled_child_ring_asks_for_no_epoch_bump() {
+    use crate::runtime::host::PolledWorkEpoch;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    host.polled_work_answer.set(Some(PolledWorkEpoch::Bumped));
+    let channel = 3u32;
+    let (regs_gpa, _ring_gpa, _packet) = polled_child_ring(&mut state, &mut host, channel, 1);
+    host.put_u32(regs_gpa + CHILD_REG_TAIL, 0);
+    let epoch0 = host.dirty_observation_epoch.get();
+    drain_child_fifo(&mut state, &mut host, channel);
+    assert_eq!(host.polled_work_calls.get(), 0);
+    assert_eq!(host.dirty_observation_epoch.get(), epoch0);
+}
+
+/// The hazard itself. A Clean verdict is cached at epoch E; the guest then
+/// writes the surface and publishes the work on a ring tail with no doorbell.
+/// Without a bump the cache keeps answering the pre-store Clean (Step A's stale
+/// menus); the polled-work bump retires it, so the same ask re-reads the
+/// witness and does not serve the stale copy.
+#[test]
+fn a_polled_ring_bump_retires_a_cached_clean_verdict() {
+    use crate::protocol::pixel_format;
+    use crate::runtime::host::PolledWorkEpoch;
+    use crate::runtime::mapper::GuestWriteVerdict;
+    use crate::runtime::surface_currency::{surface_currency, SurfaceCurrency};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let mid = 42;
+    assert!(state.map_surface(mid));
+    let pages: Vec<u64> = (0..4).map(|i| 0x1000_0000 + i * 4096).collect();
+    let token = host.track_guest_writes(&pages, 4096).unwrap();
+    let gen = host.guest_write_gen(token).unwrap();
+    {
+        let m = state.mappings.get_mut(&mid).unwrap();
+        m.has_geom = true;
+        m.width = 64;
+        m.height = 64;
+        m.format = pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        m.guest_write_token = token;
+        m.guest_write_token_gen = m.map_generation;
+        m.guest_write_gen_at_store = gen;
+    }
+    let clean = SurfaceCurrency::Unwritten(GuestWriteVerdict::Clean);
+    assert_eq!(surface_currency(&state, &host, mid, 64, 64), clean);
+
+    host.guest_wrote_page_without_doorbell(0x1000_0000);
+    assert_eq!(
+        surface_currency(&state, &host, mid, 64, 64),
+        clean,
+        "no epoch change: the cached pre-store verdict is still a hit"
+    );
+
+    host.polled_work_answer.set(Some(PolledWorkEpoch::Bumped));
+    assert_eq!(note_polled_ring_work(&host), PolledWorkEpoch::Bumped);
+    let after = surface_currency(&state, &host, mid, 64, 64);
+    assert_ne!(after, clean, "the bump must retire the cached Clean");
+    assert!(!after.serves(crate::runtime::surface_currency::CurrencyStandard::WatchedAndUnwritten));
+}
+
+/// The ABI answers map one way, and an unknown one claims nothing.
+#[test]
+fn polled_work_abi_answers_map_and_unknown_values_claim_no_bump() {
+    use crate::runtime::host::PolledWorkEpoch;
+    assert_eq!(PolledWorkEpoch::from_abi(1), PolledWorkEpoch::Bumped);
+    assert_eq!(PolledWorkEpoch::from_abi(0), PolledWorkEpoch::Fresh);
+    assert_eq!(PolledWorkEpoch::from_abi(-1), PolledWorkEpoch::Unsupported);
+    assert_eq!(PolledWorkEpoch::from_abi(-2), PolledWorkEpoch::Disabled);
+    assert_eq!(PolledWorkEpoch::from_abi(7), PolledWorkEpoch::Unsupported);
+    assert_eq!(PolledWorkEpoch::from_abi(-9), PolledWorkEpoch::Unsupported);
+    // NullHost and every host that predates v24: no callback.
+    assert_eq!(
+        crate::qemu::host_ops::NullHost.note_polled_work(),
+        PolledWorkEpoch::Unsupported
+    );
 }
