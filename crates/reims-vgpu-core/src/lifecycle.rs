@@ -63,7 +63,6 @@ use crate::resolve::MappingResolver;
 use crate::transaction::{classify, PayloadClass};
 use reims_vgpu_protocol::fifo;
 use reims_vgpu_protocol::packets::Channel;
-use std::collections::HashMap;
 
 /// Which lifecycle command a packet is.
 ///

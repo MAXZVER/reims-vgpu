@@ -15,6 +15,12 @@ use crate::runtime::mtlb::MtlbDecline;
 /// A specific pipeline/stage preparation failure before engine request validation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DrawPreparationDecline {
+    /// A translator-owned sampled image cannot be provisioned from its
+    /// reflected contract. No guest argument index can supply this resource.
+    SynthesizedSampled {
+        stage: &'static str,
+        reason: crate::runtime::draw::synthesized_sampled::SynthesizedImageDecline,
+    },
     PipelineMissing {
         task_id: u32,
         pipeline_ref: u32,
@@ -226,6 +232,7 @@ fn log_token(detail: &str) -> String {
 impl Decline for DrawPreparationDecline {
     fn slug(&self) -> &'static str {
         match self {
+            Self::SynthesizedSampled { reason, .. } => reason.slug(),
             Self::PipelineMissing { .. } => "draw_prepare_pipeline_missing",
             Self::VertexMtlbMissing { .. } => "draw_prepare_vertex_mtlb_missing",
             Self::FragmentMtlbMissing { .. } => "draw_prepare_fragment_mtlb_missing",
@@ -348,8 +355,20 @@ impl Decline for DrawPreparationDecline {
         }
     }
 
+    fn owner(&self) -> &'static str {
+        match self {
+            Self::SynthesizedSampled { reason, .. } => reason.owner(),
+            _ => std::any::type_name::<Self>(),
+        }
+    }
+
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
+            Self::SynthesizedSampled { stage, reason } => {
+                let mut fields = vec![("stage", stage.to_string())];
+                fields.extend(reason.fields());
+                fields
+            }
             Self::PipelineMissing {
                 task_id,
                 pipeline_ref,

@@ -13502,6 +13502,33 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 push_tex(t.index, t.texture_ref, t.resource.as_ref(), true)?;
             }
         }
+        // These bindings have no Metal argument-table slot: reflection names
+        // descriptors the translator retained for explicit null texture handles.
+        // Use the same relocation as the corresponding executable variant.
+        for (reflection, relocated, stage) in [
+            (&*v_shader.reflection, false, "vertex"),
+            (&*f_shader.reflection, separate_sampled, "fragment"),
+        ] {
+            let before = images.len();
+            super::synthesized_sampled::append_null_textures(reflection, relocated, &mut images)
+                .map_err(|reason| {
+                    DrawError::DrawPreparation(DrawPreparationDecline::SynthesizedSampled {
+                        stage,
+                        reason,
+                    })
+                })?;
+            for image in &images[before..] {
+                let key = (u64::from(req.pipeline_ref) << 32)
+                    | (u64::from(image.binding) << 1)
+                    | u64::from(relocated);
+                if crate::observe::first_sight("synthesized_null_texture_served", key) {
+                    crate::observe::fail(format!(
+                        "synthesized_null_texture_served pipe={} task={} stage={stage} binding={} 1x1",
+                        req.pipeline_ref, req.task_id, image.binding
+                    ));
+                }
+            }
+        }
         // Repair the gaps the guard found. A fragment texture the module
         // statically uses and this draw did not bind is absent from the
         // descriptor set layout *entirely* — `engine/exec.rs` builds the layout
