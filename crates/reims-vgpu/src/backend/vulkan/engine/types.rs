@@ -2396,6 +2396,11 @@ pub struct GuestRunSource {
     /// image directly. When the host declines that image layout, `runs` and
     /// `pages` remain the complete copy-backed fallback for the same texels.
     pub direct_image: Option<GuestSampledBacking>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_BUF_RESIDENT=on`): the buffer witness's
+    /// identity for this window. The engine keeps the staging copy it made
+    /// under `(key, generation)` and binds it again, with nothing copied, while
+    /// the witness keeps answering the same generation. `None` everywhere else.
+    pub resident: Option<crate::runtime::gather_witness::GatheredIdentity>,
 }
 
 /// One stretch of a [`GuestRunSource`]'s window, already clipped to it.

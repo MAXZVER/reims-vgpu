@@ -72,6 +72,9 @@ impl ResourcePools {
         // taking the presenter down — is this function's precondition and not an
         // incidental property of today's three callers.
         self.release_graveyard(device, SlotMask::MAX);
+        for s in self.buf_resident_take_all() {
+            release_buffer_slot(device, &mut self.slabs, s);
+        }
         for list in self.staging_free.values_mut() {
             for s in list.drain(..) {
                 release_buffer_slot(device, &mut self.slabs, s);

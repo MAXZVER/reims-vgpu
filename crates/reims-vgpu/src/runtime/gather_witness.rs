@@ -463,6 +463,12 @@ pub struct GatherWitness {
     /// what makes every construction site — the one in `DeviceState` and the
     /// ones in this module's tests — pick the switch up without naming it.
     audit: AuditDensity,
+    /// Most windows tracked at once; [`MAX_TRACKED_WINDOWS`] for the sampled
+    /// witness.
+    cap: usize,
+    /// TEMP (lab, BUF_RESIDENT): this table witnesses buffer windows, so its
+    /// census routes carry the `brw_` prefix instead of `gw_`.
+    buffers: bool,
 }
 
 impl Default for GatherWitness {
@@ -471,8 +477,51 @@ impl Default for GatherWitness {
             entries: HashMap::new(),
             binds: 0,
             audit: AuditDensity::from_env(),
+            cap: MAX_TRACKED_WINDOWS,
+            buffers: false,
         }
     }
+}
+
+impl GatherWitness {
+    /// TEMP (lab, BUF_RESIDENT): the buffer-window table. A draw-time buffer
+    /// working set is several times the sampled one (`buffer_gather_working_set`
+    /// counted ~1.9k distinct windows a second on a driven boot), so its cap is
+    /// `REIMS_VGPU_LAB_BUF_RESIDENT_WINDOWS` (default 2048).
+    pub fn for_buffers() -> Self {
+        let cap = std::env::var("REIMS_VGPU_LAB_BUF_RESIDENT_WINDOWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(2048);
+        Self {
+            cap,
+            buffers: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_BUF_RESIDENT=on`): draw-time buffer windows of
+/// packed resources are witnessed, and the engine keeps and rebinds the staging
+/// copy of a window the witness vouches for instead of copying it again.
+pub fn buf_resident_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(std::env::var("REIMS_VGPU_LAB_BUF_RESIDENT").as_deref(), Ok("on" | "1"))
+    })
+}
+
+/// TEMP (lab, BUF_RESIDENT): `route` under the buffer table's `brw_` prefix.
+/// Interned once per name, so the census keeps taking `&'static str`.
+fn buffer_route(route: &'static str) -> &'static str {
+    use std::sync::Mutex;
+    static NAMES: Mutex<Option<HashMap<&'static str, &'static str>>> = Mutex::new(None);
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    names.get_or_insert_with(HashMap::new).entry(route).or_insert_with(|| {
+        let tail = route.strip_prefix("gw_").unwrap_or(route);
+        Box::leak(format!("brw_{tail}").into_boxed_str())
+    })
 }
 
 impl GatherWitness {
@@ -1682,6 +1731,54 @@ pub fn note_gather<M: crate::runtime::host::HostMemory + crate::runtime::host::H
     }
 }
 
+/// TEMP (lab, BUF_RESIDENT): [`note_gather`] for one draw-time buffer window,
+/// against [`crate::model::DeviceState::buffer_witness`].
+///
+/// The same two halves decide it — the guest-write generation of the window's
+/// pages and the page-exact record of this device's own writes into them — so a
+/// vouch means what it means for a sampled window: nothing has written these
+/// bytes since the bind that minted `identity`. None of the sampled rail's
+/// parked-frame or stated-channel machinery applies to a buffer, so neither is
+/// consulted. Census: `brw_vouched` / `brw_refused` / `brw_rearm` /
+/// `brw_unarmed`, the vouched bytes as `brw_vouched_kb`.
+pub fn note_buffer_window<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
+    state: &mut crate::model::DeviceState,
+    host: &mut M,
+    key: GatherKey,
+    window: GatherWindow<'_>,
+) -> GatherOutcome {
+    use crate::runtime::drain::{note_store_route, note_store_route_n};
+    let span = window.span;
+    let counts = WitnessReadings {
+        pages_epoch: state.host_writes.epoch(),
+        pages_wrote: state
+            .buffer_witness
+            .previous_pages_epoch(&key)
+            .map(|since| state.host_writes.wrote_any_since(since, window.gpas)),
+        stated_gen: None,
+        pending: PendingWrites::over(window.gpas),
+    };
+    let fresh = state.next_sampled_content_generation();
+    let seen = observe(&mut state.buffer_witness, host, key, window, counts, fresh);
+    match seen.verdict {
+        GatherVerdict::Rearmed => note_store_route("brw_rearm"),
+        GatherVerdict::Unarmed => note_store_route("brw_unarmed"),
+        GatherVerdict::Vouched => {
+            note_store_route("brw_vouched");
+            note_store_route_n("brw_vouched_kb", span / 1024);
+        }
+        GatherVerdict::Refused { .. } => note_store_route("brw_refused"),
+    }
+    GatherOutcome {
+        identity: GatheredIdentity {
+            key: key.content_key(),
+            generation: seen.generation,
+        },
+        vouch: seen.vouch,
+        evidence: seen.evidence,
+    }
+}
+
 /// Whether this bind's identity names bytes some earlier gather already moved,
 /// or one minted for bytes nothing has ever gathered.
 ///
@@ -2437,8 +2534,10 @@ fn observe<M: crate::runtime::host::HostOps>(
     } = counts;
 
     witness.binds = witness.binds.wrapping_add(1);
-    while witness.entries.len() >= MAX_TRACKED_WINDOWS && !witness.entries.contains_key(&key) {
-        crate::runtime::drain::note_store_route("gw_window_overflow");
+    let buffers = witness.buffers;
+    let route = |r: &'static str| if buffers { buffer_route(r) } else { r };
+    while witness.entries.len() >= witness.cap && !witness.entries.contains_key(&key) {
+        crate::runtime::drain::note_store_route(route("gw_window_overflow"));
         // The counter carries the magnitude; the decline carries the identity.
         // Deduped per evicted window, because a window thrashing in and out of
         // the table reports the same loss on every pass and the count above
@@ -2449,7 +2548,7 @@ fn observe<M: crate::runtime::host::HostOps>(
                 &GatherWitnessFault::TrackedWindowEvicted {
                     key: victim,
                     span,
-                    tracked: MAX_TRACKED_WINDOWS,
+                    tracked: witness.cap,
                 },
             )
             .fail_once(victim.content_key());
@@ -2549,8 +2648,8 @@ fn observe<M: crate::runtime::host::HostOps>(
         &mut routes,
     );
     entry.last_seen = binds;
-    for route in routes {
-        crate::runtime::drain::note_store_route(route);
+    for r in routes {
+        crate::runtime::drain::note_store_route(route(r));
     }
     observation
 }

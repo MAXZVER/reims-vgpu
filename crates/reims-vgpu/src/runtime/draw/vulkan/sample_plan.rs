@@ -1175,6 +1175,7 @@ pub(crate) fn commit_ref_view_plan<M: HostMemory + HostOps>(
                     row_length_texels: plan.plane.row_length_texels,
                     pages,
                     direct_image: None,
+                    resident: None,
                 },
                 plan.plane.native,
                 plan.plane.sampled_vk_format,
@@ -1712,6 +1713,7 @@ pub(crate) fn commit_linear_plan<M: HostMemory + HostOps>(
         row_length_texels: plan.row_length_texels,
         pages: Some(packed_pages),
         direct_image: None,
+        resident: None,
     };
     if plan.gather.is_none() {
         // The direct arm: rebuilt from the same borrowed allocation, moving
@@ -1986,6 +1988,7 @@ impl MapperRefPlan {
                     row_length_texels: self.row_length_texels,
                     pages,
                     direct_image: None,
+                    resident: None,
                 },
                 self.native,
                 self.sampled_vk_format,
@@ -2722,6 +2725,7 @@ pub(crate) fn predict_ref_view_plan<M: HostMemory + HostOps>(
                     row_length_texels: plan.plane.row_length_texels,
                     pages,
                     direct_image: None,
+                    resident: None,
                 },
                 plan.plane.native,
                 plan.plane.sampled_vk_format,
@@ -2824,6 +2828,7 @@ pub(crate) fn predict_linear_plan<M: HostMemory + HostOps>(
         row_length_texels: plan.row_length_texels,
         pages: Some(packed_pages),
         direct_image: None,
+        resident: None,
     };
     if plan.gather.is_none() {
         // The direct arm: rebuilt from the same borrowed allocation, moving

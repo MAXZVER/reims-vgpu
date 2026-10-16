@@ -3480,6 +3480,10 @@ pub struct DeviceState {
     /// against the bytes themselves. See
     /// [`crate::runtime::gather_witness`] — it selects no behaviour.
     pub gather_witness: crate::runtime::gather_witness::GatherWitness,
+    /// TEMP (lab, `REIMS_VGPU_LAB_BUF_RESIDENT=on`): the same witness over
+    /// draw-time buffer windows of packed resources, a separate table so the
+    /// two working sets do not evict each other.
+    pub buffer_witness: crate::runtime::gather_witness::GatherWitness,
     /// The GVA render targets a Store has stamped, and what the two write
     /// witnesses said at the time. The GVA half of the mapper-ref-texture witness that
     /// licenses the attachment LOAD elision — see
@@ -3906,6 +3910,7 @@ impl DeviceState {
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
+            buffer_witness: crate::runtime::gather_witness::GatherWitness::for_buffers(),
             bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
             buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens::default(),
             sampled_content_gen: AtomicU64::new(0),
@@ -3981,6 +3986,7 @@ impl DeviceState {
         // loop above cannot see them and a reset that only walked mappings left
         // them armed on the host forever.
         tokens.extend(self.gather_witness.take_tokens());
+        tokens.extend(self.buffer_witness.take_tokens());
         tokens.extend(self.gva_store_witness.take_tokens());
         // Back onto the retired list rather than out through the return value:
         // the caller's contract is "invalidate backend aliases, then release

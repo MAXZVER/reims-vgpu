@@ -792,6 +792,13 @@ unsafe fn stage_buffer_content(
                 // this is what says so.
                 gather_owed = true;
                 bound
+            } else if let Some(slot) = src
+                .resident
+                .and_then(|id| pools.buf_resident_hit(id, src.total_len))
+            {
+                // TEMP (lab, BUF_RESIDENT): the witness kept the generation this
+                // slot was filled under, so its bytes are the window's bytes.
+                BoundBuffer::from(slot)
             } else {
                 // No import on this host, or an offset it will not bind at. The
                 // CPU gathers the runs into the mapped staging span, with no
@@ -814,6 +821,9 @@ unsafe fn stage_buffer_content(
                     counters
                         .buffer_snapshot_binds
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(id) = src.resident {
+                    pools.buf_resident_adopt(id, slot);
                 }
                 BoundBuffer::from(slot)
             }
@@ -7915,6 +7925,7 @@ mod tests {
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
             direct_image: None,
+            resident: None,
         }
     }
 
@@ -7996,6 +8007,7 @@ mod tests {
                 row_length_texels: 0,
                 pages: None,
                 direct_image: None,
+                resident: None,
             })
         };
         let a = CbBind::of(&content(0));
@@ -8083,6 +8095,7 @@ mod tests {
                 row_length_texels: 0,
                 pages: None,
                 direct_image: None,
+                resident: None,
             })
         };
         let vertex_only = content(0x1000);
@@ -8409,6 +8422,7 @@ mod tests {
                         // RAM, so there is no reference an import could bind.
                         pages: None,
                         direct_image: None,
+                        resident: None,
                     },
                     // No witness ran for a synthetic source, so nothing vouches:
                     // the gather is the only disposition this fixture can take.
@@ -8448,6 +8462,7 @@ mod tests {
                     row_length_texels,
                     pages: None,
                     direct_image: None,
+                    resident: None,
                 },
                 format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
             }),
@@ -9404,6 +9419,7 @@ mod tests {
             // A fixture over a dummy host address has no guest pages.
             pages: None,
             direct_image: None,
+            resident: None,
         })
     }
 
@@ -9617,6 +9633,7 @@ mod tests {
             // A fixture over a host `Vec` has no guest pages.
             pages: None,
             direct_image: None,
+            resident: None,
         });
         assert_eq!(content.len(), 20);
         let bytes = content.cpu_bytes();

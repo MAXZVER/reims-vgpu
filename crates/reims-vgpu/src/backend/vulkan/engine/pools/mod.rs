@@ -201,6 +201,10 @@ pub(crate) struct ResourcePools {
     entry: EntryState,
     /// Size-bucketed free host-visible buffers (TRANSFER_SRC | VERTEX | INDEX | STORAGE).
     staging_free: HashMap<u64, Vec<BufferSlot>>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_BUF_RESIDENT=on`): staging copies of buffer
+    /// windows kept past their command buffer, by the buffer witness's key.
+    /// See [`buf_resident`].
+    buf_resident: buf_resident::BufResident,
     /// Size-bucketed free DEVICE_LOCAL buffers the draw-time guest gather
     /// assembles scattered windows into, and the in-use ones the ring returns
     /// after submit/wait.
@@ -3886,6 +3890,7 @@ impl Drop for SlowStagingWrite {
 }
 
 pub mod buffer_gather_working_set;
+pub(crate) mod buf_resident;
 mod images_and_registry;
 pub(crate) mod par_stage;
 /// What the resident registry says about an identity's content, readable

@@ -3037,6 +3037,7 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
             row_length_texels: 0,
             pages: None,
             direct_image: None,
+            resident: None,
         },
         format: SURFACE_TEST_FORMAT,
     });

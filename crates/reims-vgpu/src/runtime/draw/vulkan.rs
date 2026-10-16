@@ -5577,6 +5577,7 @@ fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
             row_length_texels,
             pages: guest_page_window(host, &gpas, page, base_off % page, span),
             direct_image: None,
+            resident: None,
         },
         format: source_format,
     })
@@ -5646,6 +5647,7 @@ pub(super) fn try_gva_target_guest_seed<M: HostMemory + HostOps>(
             row_length_texels,
             pages: guest_page_window(host, &gpas, page, head_off, span),
             direct_image: None,
+            resident: None,
         },
         format: source_format,
     })
@@ -7096,6 +7098,7 @@ pub(super) fn direct_linear_sample_from_packed(
             row_length_texels,
             pages: Some(std::sync::Arc::clone(&packed.pages)),
             direct_image: Some(direct_image),
+            resident: None,
         },
         native,
         format,
@@ -7183,6 +7186,7 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
             },
         ])),
         direct_image,
+        resident: None,
     })
 }
 
@@ -7729,6 +7733,7 @@ fn bound_buffer_content(
         row_length_texels: 0,
         pages: bound.pages.clone(),
         direct_image: None,
+        resident: None,
     })
 }
 
@@ -7929,10 +7934,11 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
         buffer_plan::Ask::Serial
     };
     let was_shadow = matches!(asked, buffer_plan::Ask::Shadow);
-    if let buffer_plan::Ask::Serve(content) = asked {
+    if let buffer_plan::Ask::Serve(mut content) = asked {
+        attach_buffer_resident(state, host, task_id, buffer_ref, &mut content);
         return Some(content);
     }
-    let answer = load_buffer_content_serial(
+    let mut answer = load_buffer_content_serial(
         state,
         host,
         task_id,
@@ -7945,7 +7951,91 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     if was_shadow {
         buffer_plan::shadow_compare_buffer(buffer_ref, offset, true, answer.as_ref());
     }
+    if let Some(content) = answer.as_mut() {
+        attach_buffer_resident(state, host, task_id, buffer_ref, content);
+    }
     answer
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_BUF_RESIDENT=on`): hand the engine the buffer
+/// witness's identity for a window sliced out of a packed resource, so a window
+/// nothing has written since its last staging copy binds that copy again.
+///
+/// Only the packed rail: its whole-buffer page list is retained beside the runs
+/// (`PackedBuffer::gpas`), which is what the witness tracks. The window's key is
+/// its task, GVA and length — two shaders reading one buffer through different
+/// extent caps are two windows rather than one window re-armed on every bind.
+fn attach_buffer_resident<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    buffer_ref: u32,
+    content: &mut crate::backend::vulkan::engine::BufferContent,
+) {
+    use crate::runtime::gather_witness::{GatherKey, GatherWindow};
+    if !crate::runtime::gather_witness::buf_resident_on() {
+        return;
+    }
+    let crate::backend::vulkan::engine::BufferContent::GuestRuns(src) = content else {
+        return;
+    };
+    let Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(packed)) =
+        state.bound_buffers.packed(task_id, buffer_ref)
+    else {
+        return;
+    };
+    if !std::sync::Arc::ptr_eq(&packed.runs, &src.runs) || src.total_len == 0 {
+        return;
+    }
+    let page = state.page_size();
+    let Some(start) = packed.head.checked_add(src.source_offset) else { return };
+    let Some(end) = start.checked_add(src.total_len) else { return };
+    let (first, last) = ((start / page) as usize, end.div_ceil(page) as usize);
+    let Some(gpas) = packed.gpas.get(first..last) else { return };
+    // The window's own host spans, for the witness's strided content audit.
+    let mut runs = Vec::with_capacity(packed.runs.len());
+    let (mut skip, mut left) = (src.source_offset, src.total_len);
+    for run in packed.runs.iter() {
+        if left == 0 {
+            break;
+        }
+        if skip >= run.len() {
+            skip -= run.len();
+            continue;
+        }
+        let n = (run.len() - skip).min(left);
+        let Some(r) = crate::runtime::guest_ram::GuestRun::in_mapping(run.host_ptr(), run.len(), skip, n)
+        else {
+            return;
+        };
+        runs.push(r);
+        skip = 0;
+        left -= n;
+    }
+    if left != 0 {
+        return;
+    }
+    let gpas = gpas.to_vec();
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for v in [packed.gva.wrapping_add(src.source_offset), src.total_len] {
+        h = (h ^ v).wrapping_mul(0x0100_0000_01b3);
+    }
+    let key = GatherKey::Mapping {
+        mid: 0x8000_0000 | task_id,
+        base_off: h,
+    };
+    let outcome = crate::runtime::gather_witness::note_buffer_window(
+        state,
+        host,
+        key,
+        GatherWindow {
+            gpas: &gpas,
+            runs: &runs,
+            span: src.total_len,
+            page_size: page as usize,
+        },
+    );
+    src.resident = Some(outcome.identity);
 }
 
 /// [`load_buffer_content`]'s serial body: the held registry first, then the
@@ -9076,6 +9166,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                         row_length_texels,
                         pages: Some(std::sync::Arc::clone(&packed.pages)),
                         direct_image: None,
+                        resident: None,
                     },
                     native,
                     sampled_vk_format,
@@ -9134,6 +9225,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 row_length_texels,
                 pages: guest_page_window(host, &gpas, page as u64, gva % page as u64, span),
                 direct_image: None,
+                resident: None,
             },
             native,
             sampled_vk_format,
@@ -9266,6 +9358,7 @@ pub(super) fn try_buffer_texture_zero_copy<M: HostMemory + HostOps>(
                 row_length_texels,
                 pages: guest_page_window(host, &gpas, page as u64, gva % page as u64, span),
                 direct_image: None,
+                resident: None,
             },
             native,
             sampled_vk_format,
@@ -9414,6 +9507,7 @@ pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
             row_length_texels,
             pages: lab_pages,
             direct_image: None,
+            resident: None,
         },
         native,
         sampled_vk_format,
@@ -9627,6 +9721,7 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
             row_length_texels,
             pages: lab_pages,
             direct_image: None,
+            resident: None,
         },
         native,
         sampled_vk_format,

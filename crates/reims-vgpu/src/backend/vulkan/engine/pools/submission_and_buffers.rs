@@ -269,6 +269,7 @@ impl ResourcePools {
         Self {
             entry: super::EntryState::default(),
             staging_free: HashMap::new(),
+            buf_resident: Default::default(),
             gather_free: HashMap::new(),
             staging_hits: 0,
             staging_misses: 0,

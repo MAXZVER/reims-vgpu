@@ -1123,6 +1123,7 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
             row_length_texels: 0,
             pages: None,
             direct_image: None,
+            resident: None,
         }),
     });
     match engine::execute_draw_request(engine_device(), &opener) {
@@ -1276,6 +1277,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
                 row_length_texels: 0,
                 pages: None,
                 direct_image: None,
+                resident: None,
             },
             // A fixture over a host `Vec` went through no witness, so the gather is
             // the only disposition available to it.
@@ -1439,6 +1441,7 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
             direct_image: None,
+            resident: None,
         }),
     });
     engine::execute_draw_request(engine_device(), &req).expect("the gathered draw");
@@ -1669,6 +1672,7 @@ void main() {{
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
             direct_image: None,
+            resident: None,
         }),
     });
     engine::execute_draw_request(engine_device(), &req).expect("the gathered draw");
@@ -1850,6 +1854,7 @@ void main() {{
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
             direct_image: None,
+            resident: None,
         }),
     });
     engine::execute_draw_request(engine_device(), &req).expect("the fallback draw");
@@ -2012,6 +2017,7 @@ void main() {{
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
             direct_image: None,
+            resident: None,
         }),
     });
     engine::execute_draw_request(engine_device(), &req).expect("the in-place draw");
@@ -2120,6 +2126,7 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
         row_length_texels: 0,
         pages: Some(std::sync::Arc::new(pages)),
         direct_image: None,
+        resident: None,
     };
 
     let before = engine::counter_snapshot();

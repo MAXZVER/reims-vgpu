@@ -3018,6 +3018,7 @@ mod tests {
                     row_length_texels: 0,
                     pages: None,
                     direct_image: None,
+                    resident: None,
                 },
                 crate::protocol::pixel_format::TexelLayout::Bgra8,
                 ash::vk::Format::B8G8R8A8_UNORM,
