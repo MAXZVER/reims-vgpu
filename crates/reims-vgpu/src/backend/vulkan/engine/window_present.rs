@@ -646,6 +646,12 @@ pub(crate) struct WindowPresenter {
     /// a second query is a second answer that could disagree with the one
     /// attach already refused on.
     present_family_supported: bool,
+    /// The stale-source hold (`stale_hold.rs`): when the episode in progress
+    /// started, so a hold is bounded and then falls back to the slate.
+    stale_hold: super::stale_hold::StaleHold,
+    /// Presents held this cadence window instead of cleared to slate.
+    /// `stale_hold=` on the cadence line; slug `host_window_stale_hold`.
+    cadence_stale_hold: u64,
 }
 
 /// Everything one in-flight present owns for as long as its blit is running.
@@ -908,6 +914,8 @@ impl WindowPresenter {
             // Attach refused above unless this was true, so the presenter that
             // exists is one whose queue can address its surface.
             present_family_supported: present_capable,
+            stale_hold: super::stale_hold::StaleHold::default(),
+            cadence_stale_hold: 0,
         };
         // A window created while minimized has no swapchain yet, which is not a
         // failure to attach: `begin_present` retries every frame until the
@@ -1209,6 +1217,46 @@ impl WindowPresenter {
             }
         }
         // Bound after any swapchain recreation above, which resets every latch.
+        // Stale-hold (`stale_hold.rs`), decided BEFORE the acquire so a held
+        // present never owns an acquired image it does not present. A stale
+        // source with no CPU copy to cover it keeps the previous swapchain image
+        // on screen (slug `host_window_stale_hold`) instead of clearing to
+        // `SLATE_CLEAR`. Past `STALE_HOLD_MAX`, or with the switch off, it falls
+        // through to the slate arm below, which is unchanged. The epoch is
+        // re-read below for the blit itself, so a bump landing between here and
+        // there still takes the slate arm: the safety check is not moved, only
+        // preceded.
+        {
+            let stale_now =
+                source.is_some_and(|source| source.epoch != super::pools::window_source_epoch());
+            let cpu_ready = cpu.is_some_and(|frame| frame.complete());
+            match self.stale_hold.judge(
+                super::stale_hold::enabled(),
+                stale_now,
+                cpu_ready,
+                Instant::now(),
+            ) {
+                super::stale_hold::StaleVerdict::Proceed => {}
+                super::stale_hold::StaleVerdict::Hold => {
+                    self.cadence_stale_hold = self.cadence_stale_hold.saturating_add(1);
+                    self.note_cadence(false, false);
+                    return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
+                }
+                super::stale_hold::StaleVerdict::Expired { held_ms } => {
+                    crate::observe::fail(format!(
+                        "host_window_stale_hold_expired held_ms={held_ms} bound_ms={}",
+                        super::stale_hold::STALE_HOLD_MAX.as_millis()
+                    ));
+                }
+                super::stale_hold::StaleVerdict::Disabled => {
+                    if self.stale_hold.first_disabled_report() {
+                        crate::observe::off(
+                            "host_window_stale_hold_disabled reason=disabled_by_env",
+                        );
+                    }
+                }
+            }
+        }
         let frame_ix = self.frame_ix;
         let frame_cmd = self.frames[frame_ix].cmd;
         let frame_image_available = self.frames[frame_ix].image_available;
@@ -1875,6 +1923,7 @@ impl WindowPresenter {
                 fence: self.cadence_busy_fence,
                 acquire: self.cadence_busy_acquire,
                 no_area: self.cadence_busy_no_area,
+                stale_hold: self.cadence_stale_hold,
             },
             self.cadence_offered,
         ));
@@ -1886,6 +1935,7 @@ impl WindowPresenter {
         self.cadence_busy_fence = 0;
         self.cadence_busy_acquire = 0;
         self.cadence_busy_no_area = 0;
+        self.cadence_stale_hold = 0;
     }
 
     /// Give every entry's graveyard claim back after the caller has waited the
@@ -2044,6 +2094,9 @@ struct CadenceBusy {
     fence: u64,
     acquire: u64,
     no_area: u64,
+    /// Presents held by the stale-source hold rather than cleared to slate.
+    /// Part of `total`, like the three gates above.
+    stale_hold: u64,
 }
 
 fn window_cadence_line(
@@ -2058,9 +2111,9 @@ fn window_cadence_line(
     let offered_hz = offered as f64 * 1_000.0 / window_ms.max(1) as f64;
     format!(
         "host_window_cadence window_ms={window_ms} presents={presents} direct={direct} \
-         busy={} busy_fence={} busy_acquire={} busy_no_area={} offered={offered} \
+         busy={} busy_fence={} busy_acquire={} busy_no_area={} stale_hold={} offered={offered} \
          present_hz={hz:.1} offered_hz={offered_hz:.1} direct_frac={direct_fraction:.2}",
-        busy.total, busy.fence, busy.acquire, busy.no_area
+        busy.total, busy.fence, busy.acquire, busy.no_area, busy.stale_hold
     )
 }
 
@@ -2191,6 +2244,7 @@ mod tests {
                 fence: 100,
                 acquire: 30,
                 no_area: 1,
+                stale_hold: 0,
             },
             240,
         );
@@ -2202,6 +2256,7 @@ mod tests {
         // The third gate is its own number, so `busy` stays the sum of the
         // three rather than of the two that used to be named.
         assert!(line.contains("busy_no_area=1"), "{line}");
+        assert!(line.contains("stale_hold=0"), "{line}");
         assert!(line.contains("present_hz=120.0"), "{line}");
         assert!(line.contains("direct_frac=0.99"), "{line}");
     }
@@ -2222,6 +2277,7 @@ mod tests {
                 fence: 400,
                 acquire: 20,
                 no_area: 0,
+                stale_hold: 0,
             },
             109,
         );

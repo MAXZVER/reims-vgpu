@@ -136,6 +136,17 @@ pub(crate) fn emit_engine_delta() {
     crate::observe::off(line);
     emit_registry_pressure(&now);
     emit_draw_phase();
+    emit_window_source_invalidate();
+}
+
+/// Which of `invalidate_window_sources`' four doors moved the window's source
+/// epoch this second. Silent when none did. See
+/// [`crate::backend::vulkan::engine::window_source_census`].
+fn emit_window_source_invalidate() {
+    use crate::backend::vulkan::engine::window_source_census as census;
+    if let Some(line) = census::line(census::take_window()) {
+        crate::observe::off(line);
+    }
 }
 
 /// How far the resident registries reached, and what the populations that
