@@ -67,6 +67,7 @@ use reims_vgpu::backend::vulkan::engine::{
     window_present_attached, window_present_frame, window_present_resize,
 };
 use reims_vgpu::backend::window::{WindowCpuFrame, WindowPresentOutcome};
+use reims_vgpu::host_window::guest_cursor::GuestCursorFeed;
 use reims_vgpu::host_window::present::{spawn, FrameSlot, WindowConfig, WindowMode, WindowWaker};
 
 const W: u32 = 640;
@@ -171,7 +172,8 @@ fn main() {
         Arc::new(|_action| {}),
         frames,
         stop,
-        wake,
+        wake.clone(),
+        GuestCursorFeed::new(wake),
     );
 
     let _ = probe.join();
