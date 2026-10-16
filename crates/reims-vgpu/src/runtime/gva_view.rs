@@ -620,7 +620,7 @@ pub fn map_fresh_span_within<H: HostMemory + HostOps>(
     // caller of it writes. Recorded on the acquisition rather than in each caller
     // because that is where the resolved page list exists, and because a new
     // caller then inherits the record instead of having to remember it.
-    state.note_host_wrote_pages(gpas.clone());
+    state.note_host_wrote_pages_at(crate::runtime::host_writes::WriteSite::GvaFreshSpan, gpas.clone());
     Some(FreshSpan {
         // SAFETY: map_pages returned `map_len` mapped bytes at `ptr_base`.
         ptr: unsafe { (ptr_base as *mut u8).add(off) },
@@ -724,7 +724,7 @@ fn span_multi<H: HostMemory + HostOps>(
         // witness. Recorded here, after the walk that names them and before any
         // of them is written, so a refusal below costs a spurious invalidation
         // rather than a missing one.
-        state.note_host_wrote_pages(gpas.clone());
+        state.note_host_wrote_pages_at(crate::runtime::host_writes::WriteSite::GvaSpanWrite, gpas.clone());
         if !span_within_window(&gpas, allowed) {
             return Err(MemError::WriteOutsideWindow);
         }

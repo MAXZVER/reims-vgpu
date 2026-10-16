@@ -419,7 +419,7 @@ fn contig_for_write<H: HostMemory + HostOps>(
     // guest has not written" is stale the moment this rail runs. Recorded beside
     // the footprint mark rather than in each caller, so the two cannot drift and
     // a new caller inherits both.
-    state.note_host_wrote_mapping(mapping_id);
+    state.note_host_wrote_mapping_at(crate::runtime::host_writes::WriteSite::MappingContig, mapping_id);
     Some(view)
 }
 

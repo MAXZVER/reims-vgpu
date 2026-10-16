@@ -3928,6 +3928,10 @@ fn apply_backing<M: HostMemory>(
                 ));
             }
         }
+        // v13 fix A: a fresh page list starts a new incarnation.
+        if !entries.is_empty() {
+            m.released_since_resolve = false;
+        }
         m.page_entries = entries;
         m.mapped = true;
         m.page_table_kva = 0;

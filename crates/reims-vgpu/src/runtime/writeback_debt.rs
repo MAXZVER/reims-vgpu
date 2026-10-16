@@ -543,6 +543,16 @@ impl PendingWritebacks {
         true
     }
 
+    /// Forget a plane's retained page translation (v11 release-write guard),
+    /// keeping its declaration, generation and texture. The next payment
+    /// re-walks the live table through [`reback_gva_resource`], exactly as after
+    /// an explicit discard. Returns whether the plane had pages to forget.
+    fn forget_gva_resource_pages(&mut self, plane: GvaPlaneKey) -> bool {
+        self.gva_resources
+            .get_mut(&plane)
+            .is_some_and(|resource| resource.pages.take().is_some())
+    }
+
     fn gva_resource_backing(
         &self,
         plane: GvaPlaneKey,
@@ -1950,6 +1960,96 @@ fn pay<M: HostMemory + HostOps>(
     crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
 }
 
+/// The v11 release-write guard's answer for a retained GVA translation.
+#[derive(Debug, PartialEq, Eq)]
+enum RetainedTranslation {
+    /// Write through these pages (the retained ones, or a fresh walk).
+    Pass(std::sync::Arc<[u64]>),
+    /// Refused: `gpa` is released and the range does not walk completely now.
+    Blocked { gpa: u64 },
+}
+
+/// Check a GVA plane's retained translation against the release guard before a
+/// debt payment writes through it (v11, issue #5).
+///
+/// - Diagnostic, always on, sampled 1 in [`RETAINED_TRANSLATION_SAMPLE`]
+///   payments: re-walk the live table and count whether the retained pages are
+///   still what the address names (`gva_debt_retained_translation_same`), moved
+///   to other pages (`_moved`), or no longer walk completely (`_unmapped`). This
+///   answers, from the next run, how often a retained translation outlives the
+///   guest's mapping — the hypothesis behind the `gva_retained` findings — even
+///   for releases the guard never saw armed (an unmap the guest had already
+///   unwired before the packet was read resolves nothing and arms nothing).
+/// - Guard (`enabled`): if any retained page is armed, forget the retained
+///   translation and walk again. A complete fresh walk is the guest's current
+///   mapping of that address, so its pages are written and any of them still
+///   armed is disarmed (`released_page_disarmed_by_live_walk`: the guest mapped
+///   it there again without a map packet this device saw). Otherwise
+///   [`RetainedTranslation::Blocked`] (`released_write_blocked`,
+///   `released_write_blocked_site_gva_debt_retained`).
+/// - Off: the retained pages pass, as before v11; an armed page is still
+///   counted (`released_write_guard_off_would_block`).
+fn guard_retained_gva_translation<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    plane: GvaPlaneKey,
+    ordered: std::sync::Arc<[u64]>,
+    enabled: bool,
+) -> RetainedTranslation {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PAYMENTS: AtomicU64 = AtomicU64::new(0);
+    if PAYMENTS.fetch_add(1, Ordering::Relaxed) % RETAINED_TRANSLATION_SAMPLE == 0 {
+        let span = state
+            .pending_writebacks
+            .gva_resource_status(plane)
+            .map_or(0, |(_, span, _)| span);
+        let live = crate::runtime::gva_mem::task_gva_page_gpas(
+            host,
+            &state.tasks,
+            plane.resource.task_id,
+            plane.gva,
+            span,
+            state.page_shift,
+        );
+        crate::runtime::drain::note_store_route(if live.len() != ordered.len() {
+            "gva_debt_retained_translation_unmapped"
+        } else if live[..] == ordered[..] {
+            "gva_debt_retained_translation_same"
+        } else {
+            "gva_debt_retained_translation_moved"
+        });
+    }
+    let Some(gpa) = state.host_writes.first_armed(&ordered) else {
+        return RetainedTranslation::Pass(ordered);
+    };
+    if !enabled {
+        crate::runtime::drain::note_store_route("released_write_guard_off_would_block");
+        return RetainedTranslation::Pass(ordered);
+    }
+    state.pending_writebacks.forget_gva_resource_pages(plane);
+    if reback_gva_resource(state, host, plane) {
+        if let Some((_, _, fresh)) = state.pending_writebacks.gva_resource_backing(plane) {
+            for &page in fresh.iter() {
+                if state.host_writes.first_armed(&[page]).is_some() {
+                    state.host_writes.remap_page(page);
+                    crate::runtime::drain::note_store_route("released_page_disarmed_by_live_walk");
+                }
+            }
+            crate::runtime::drain::note_store_route("released_write_rewalked_gva_debt");
+            return RetainedTranslation::Pass(fresh);
+        }
+    }
+    crate::runtime::drain::note_store_route("released_write_blocked");
+    crate::runtime::drain::note_store_route("released_write_blocked_site_gva_debt_retained");
+    RetainedTranslation::Blocked { gpa }
+}
+
+/// One payment in this many re-walks its retained translation for the
+/// `gva_debt_retained_translation_*` diagnostic. A walk is O(pages) — the same
+/// cost the draw-time store walk pays every Store — so sampling keeps the
+/// diagnostic far below that.
+const RETAINED_TRANSLATION_SAMPLE: u64 = 16;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GvaPaySite {
     Named,
@@ -2113,6 +2213,35 @@ fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
         rail.abandon_resident(&target);
         return true;
     }
+    // v11 release-write guard (issue #5). `ordered` is the plane's *retained*
+    // translation — the pages of its first resolution, kept across ordinary
+    // task unmaps by design (see [`gva_resource_generation`]) — so it can name
+    // pages the guest has since released. A page the guard holds armed is one
+    // the guest released and has not mapped again; landing the frame there is
+    // the defect. The translation is re-walked instead; a complete fresh walk
+    // is the guest's current answer and is used, otherwise the debt is kept
+    // (not lost) and the write refused by name.
+    let ordered = match guard_retained_gva_translation(
+        state,
+        host,
+        plane,
+        ordered,
+        crate::runtime::released_pages::write_guard_enabled(),
+    ) {
+        RetainedTranslation::Pass(ordered) => ordered,
+        RetainedTranslation::Blocked { gpa } => {
+            state.pending_writebacks.restore_gva(plane, debt);
+            if crate::observe::first_sight("released_write_blocked_gva_debt", gpa) {
+                crate::observe::fail(format!(
+                    "released_write_blocked site=gva_debt_retained task={} texture={} gva={:#x} gpa={gpa:#x} \
+                     (a GVA debt's retained translation names a page the guest released and the \
+                     range no longer walks completely; the frame stays owed, nothing was written)",
+                    key.task_id, key.texture_ref, plane.gva
+                ));
+            }
+            return false;
+        }
+    };
     // The third answer. Writing the whole frame over a plane the guest CPU wrote
     // part of loses the guest's stores; dropping the frame loses everything the
     // GPU rendered, which is the whole layer minus the guest's rectangle. Only
@@ -2167,6 +2296,62 @@ mod tests {
     /// are what the ledger keys on; the rest is only carried.
     use super::test_resident_identity as ident;
     use super::*;
+
+    /// v11 release-write guard: a retained GVA translation that names a page
+    /// the guest released is not written through. With no live walk to fall
+    /// back on (the task maps nothing there now) the payment is refused, the
+    /// retained pages are forgotten so the next payment re-walks, and no write
+    /// is recorded on the released page. Off, the retained pages pass as before.
+    #[test]
+    fn a_retained_gva_translation_over_a_released_page_is_blocked_not_written() {
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let host = crate::runtime::host::FakeHost::default();
+        let key = GvaResourceKey {
+            task_id: 77,
+            texture_ref: 5,
+        };
+        let plane = key.plane(0x4000);
+        let pages = vec![0x0009_0000u64, 0x0009_1000];
+        let _ = state
+            .pending_writebacks
+            .ensure_gva_resource(key, 0x4000, 0x2000, Some(pages.clone()));
+        let (_, _, ordered) = state.pending_writebacks.gva_resource_backing(plane).unwrap();
+
+        // Nothing released: the retained translation passes untouched.
+        assert_eq!(
+            guard_retained_gva_translation(&mut state, &host, plane, ordered.clone(), true),
+            RetainedTranslation::Pass(ordered.clone())
+        );
+
+        state.host_writes.release_page_by(
+            pages[1],
+            crate::runtime::host_writes::ReleaseSource::UnmapMemory,
+        );
+        // Off: passes (pre-v11 behaviour) and says it would have blocked.
+        let would = crate::runtime::drain::store_route_count("released_write_guard_off_would_block");
+        assert_eq!(
+            guard_retained_gva_translation(&mut state, &host, plane, ordered.clone(), false),
+            RetainedTranslation::Pass(ordered.clone())
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("released_write_guard_off_would_block"),
+            would + 1
+        );
+
+        // On: refused, by name, and the translation is forgotten.
+        let blocked = crate::runtime::drain::store_route_count("released_write_blocked");
+        assert_eq!(
+            guard_retained_gva_translation(&mut state, &host, plane, ordered, true),
+            RetainedTranslation::Blocked { gpa: pages[1] }
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("released_write_blocked"),
+            blocked + 1
+        );
+        assert!(state.pending_writebacks.gva_resource_backing(plane).is_none());
+        assert_eq!(state.host_writes.armed_pages(), 1, "still armed: nothing was written");
+        assert!(state.host_writes.take_released_writes().is_empty());
+    }
 
     /// The coalescing the rail exists for, at the container: a second arm into
     /// one mapping replaces the first rather than queueing beside it, so N

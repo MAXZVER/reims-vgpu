@@ -674,6 +674,52 @@ pub trait HostOps {
     fn dirty_observation_epoch(&self) -> u64 {
         0
     }
+
+    /// Step 1 (polled-work epoch, ABI v24): the drain is about to consume guest
+    /// ring work it found by polling a ring tail, with no doorbell known to
+    /// follow the guest's stores.
+    ///
+    /// The host advances [`HostOps::dirty_observation_epoch`] when a dirty sync
+    /// has already captured the current epoch (an answer at it may predate
+    /// those stores), and otherwise answers [`PolledWorkEpoch::Fresh`]: every
+    /// set's next read then syncs after this call anyway. Never blocks on a
+    /// sync or a hypervisor query. See
+    /// [`crate::runtime::drain::note_polled_ring_work`].
+    ///
+    /// Default: [`PolledWorkEpoch::Unsupported`], a host with no epoch to move.
+    fn note_polled_work(&self) -> PolledWorkEpoch {
+        PolledWorkEpoch::Unsupported
+    }
+}
+
+/// What [`HostOps::note_polled_work`] did (ABI v24 values in brackets; the C
+/// spelling is `ReimsDirtyPolledWork` in reims-vgpu-doorbell-policy.h).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolledWorkEpoch {
+    /// The observation epoch moved (`1`). Slug `dirty_epoch_bump_polled_work`.
+    Bumped,
+    /// No sync had captured the current epoch, so nothing at it can predate
+    /// the polled stores; not moved (`0`). Slug `dirty_epoch_polled_work_fresh`.
+    Fresh,
+    /// No tracker, epoch 0, harvest mode, or no callback (`-1`, or any value
+    /// this side does not know). Slug `dirty_epoch_polled_work_unsupported`.
+    Unsupported,
+    /// `REIMS_VGPU_DIRTY_POLLED_EPOCH=off` on the shim (`-2`). Slug
+    /// `dirty_epoch_polled_work_disabled`.
+    Disabled,
+}
+
+impl PolledWorkEpoch {
+    /// The shim's `int` answer. Unknown values are `Unsupported`: the epoch
+    /// did not provably move, which is the answer that claims nothing.
+    pub fn from_abi(v: std::os::raw::c_int) -> Self {
+        match v {
+            1 => Self::Bumped,
+            0 => Self::Fresh,
+            -2 => Self::Disabled,
+            _ => Self::Unsupported,
+        }
+    }
 }
 
 /// Arm64e guest page size, from the contract shift rather than a literal.
@@ -824,6 +870,13 @@ pub struct FakeHost {
     /// noted) so caching is reachable; a `Cell` so a query closure holding
     /// `&FakeHost` can move it mid-observation.
     pub dirty_observation_epoch: std::cell::Cell<u64>,
+    /// What [`HostOps::note_polled_work`] answers. `None` (the default) is a
+    /// host without the callback: `Unsupported`, nothing moves, so tests that
+    /// predate Step 1 see the same epochs. `Some(Bumped)` also advances
+    /// [`Self::dirty_observation_epoch`], as the shim does.
+    pub polled_work_answer: std::cell::Cell<Option<PolledWorkEpoch>>,
+    /// Calls to [`HostOps::note_polled_work`].
+    pub polled_work_calls: std::cell::Cell<u64>,
     /// Calls that asked the coarse dirty-generation question. The cache tests
     /// assert on this rather than equating two returned verdicts: a second
     /// equal answer can still have paid a WHPX query.
@@ -992,6 +1045,8 @@ impl Default for FakeHost {
             harvests_settled_calls: std::cell::Cell::new(0),
             dirty_sync_epoch: std::cell::Cell::new(1),
             dirty_observation_epoch: std::cell::Cell::new(1),
+            polled_work_answer: std::cell::Cell::new(None),
+            polled_work_calls: std::cell::Cell::new(0),
             guest_write_gen_calls: std::cell::Cell::new(0),
             guest_written_pages_calls: std::cell::Cell::new(0),
         }
@@ -1063,6 +1118,19 @@ impl FakeHost {
                 set.page_gen[i] = set.gen_;
             }
         }
+    }
+
+    /// A guest store to the page holding `gpa` that **no doorbell** made
+    /// visible: work the guest then published on a ring tail the drain polls
+    /// (Step 1). Moves the page's generation but not the observation epoch,
+    /// so a verdict cached at this epoch is still a hit until something bumps
+    /// it, which is the hazard [`HostOps::note_polled_work`] closes. (The
+    /// product witness would not even see the store before a bump; the
+    /// fixture's generation moving at once is the stricter case for a cache.)
+    pub fn guest_wrote_page_without_doorbell(&mut self, gpa: u64) {
+        let epoch = self.dirty_observation_epoch.get();
+        self.guest_wrote_page(gpa);
+        self.dirty_observation_epoch.set(epoch);
     }
 
     /// Advance the dirty sync epoch to simulate a harvest occurring without any
@@ -1550,6 +1618,19 @@ impl HostOps for FakeHost {
 
     fn dirty_observation_epoch(&self) -> u64 {
         self.dirty_observation_epoch.get()
+    }
+
+    fn note_polled_work(&self) -> PolledWorkEpoch {
+        self.polled_work_calls
+            .set(self.polled_work_calls.get().wrapping_add(1));
+        match self.polled_work_answer.get() {
+            Some(PolledWorkEpoch::Bumped) => {
+                self.advance_dirty_observation_epoch();
+                PolledWorkEpoch::Bumped
+            }
+            Some(other) => other,
+            None => PolledWorkEpoch::Unsupported,
+        }
     }
 
     fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {

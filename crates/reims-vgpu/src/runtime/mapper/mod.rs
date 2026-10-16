@@ -677,6 +677,10 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                 ));
             }
         }
+        // v13 fix A: a fresh page list starts a new incarnation.
+        if !plan.entries.is_empty() {
+            m.released_since_resolve = false;
+        }
         m.page_entries = plan.entries;
         m.page_table_kva = plan.page_table_kva;
         m.mapping_internal = internal;
@@ -2664,7 +2668,7 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     if copy.is_write() {
         // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
         // witness. The read direction shares this walk and writes nothing.
-        state.note_host_wrote_mapping(mapping_id);
+        state.note_host_wrote_mapping_at(crate::runtime::host_writes::WriteSite::MapperCopyRuns, mapping_id);
     }
     let page_size = state.page_size();
     let len = copy.len();

@@ -471,22 +471,66 @@ pub fn surface_write_refusal_for_mapping(
             let Some(m) = state.mappings.get(&mapping_id) else {
                 return Some(report_once(MapRefusal::WritesNarrowed));
             };
-            if m.ever_released || state.released_mappings.contains(&mapping_id) {
+            let sticky = m.ever_released || state.released_mappings.contains(&mapping_id);
+            let incarnation = incarnation_writes_enabled();
+            if released_for_narrowing(incarnation, sticky, m.released_since_resolve) {
+                crate::runtime::drain::note_store_route("surface_write_narrowed_released");
                 return Some(report_once(MapRefusal::WritesNarrowed));
             }
             if m.condemned_entries.is_some() || !m.mapped {
+                crate::runtime::drain::note_store_route("surface_write_narrowed_condemned_or_unmapped");
                 return Some(report_once(MapRefusal::WritesNarrowed));
             }
             if m.scanout_presented {
+                if sticky {
+                    crate::runtime::drain::note_store_route("surface_write_incarnation_admitted");
+                }
                 return None;
             }
             // Require content_generation >= 2 to prove persistence before allowing direct GPU write
             if m.content_generation < 2 {
+                crate::runtime::drain::note_store_route("surface_write_narrowed_young");
                 return Some(report_once(MapRefusal::WritesNarrowed));
+            }
+            if sticky {
+                // v13 fix A: v12 would have refused this one.
+                crate::runtime::drain::note_store_route("surface_write_incarnation_admitted");
             }
             None
         }
     }
+}
+
+/// v13 fix A: whether `released_only` narrowing treats a mapping as released.
+/// `sticky` is v12's `ever_released || released_mappings.contains(id)`;
+/// `since_resolve` is [`crate::model::MappingEntry::released_since_resolve`].
+pub(crate) fn released_for_narrowing(incarnation: bool, sticky: bool, since_resolve: bool) -> bool {
+    if incarnation {
+        since_resolve
+    } else {
+        sticky
+    }
+}
+
+/// `REIMS_VGPU_INCARNATION_WRITES`, read once (default on).
+pub(crate) fn incarnation_writes_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match crate::config::read(crate::config::INCARNATION_WRITES) {
+        (crate::config::Switch::Off, _) => {
+            crate::observe::fail(
+                "incarnation_writes_disabled reason=disabled_by_env (v12: a released mapping id is narrowed for life)",
+            );
+            false
+        }
+        (crate::config::Switch::Unrecognized, value) => {
+            crate::observe::fail(format!(
+                "incarnation_writes reason=incarnation_writes_env_unrecognized value={:?} (kept on)",
+                value.unwrap_or_default()
+            ));
+            true
+        }
+        _ => true,
+    })
 }
 
 /// The whole admission rule for a packed-alias import, in one place.
@@ -1761,5 +1805,37 @@ mod tests {
                 "a host that cannot import has not lost guest work to fragmentation"
             );
         });
+    }
+}
+
+/// v13 fix A: incarnation-scoped release narrowing.
+#[cfg(test)]
+mod incarnation_writes_tests {
+    use super::released_for_narrowing;
+
+    #[test]
+    fn v12_narrows_a_released_id_for_life() {
+        assert!(released_for_narrowing(false, true, false));
+        assert!(!released_for_narrowing(false, false, false));
+    }
+
+    #[test]
+    fn v13_narrows_only_until_the_next_incarnation() {
+        assert!(released_for_narrowing(true, true, true));
+        assert!(!released_for_narrowing(true, true, false));
+        assert!(!released_for_narrowing(true, false, false));
+    }
+
+    #[test]
+    fn the_flag_is_set_with_ever_released_and_cleared_by_a_fresh_page_list() {
+        let mut state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let mut m = crate::model::MappingEntry::default();
+        assert!(!m.released_since_resolve);
+        m.ever_released = true;
+        m.released_since_resolve = true;
+        state.mappings.insert(77, m);
+        assert!(state.mappings[&77].released_since_resolve);
+        assert!(state.mappings[&77].ever_released, "the sticky flag is untouched");
     }
 }

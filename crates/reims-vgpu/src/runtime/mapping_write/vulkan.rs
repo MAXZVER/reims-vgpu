@@ -651,7 +651,7 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
     // than from zero, because unlike the contig view this rail knows its own
     // rows and has no pointer whose coverage it is restating.
     mapper::note_mapping_write_footprint(state, mapping_id, base_off, span_end - base_off);
-    state.note_host_wrote_mapping(mapping_id);
+    state.note_host_wrote_mapping_at(crate::runtime::host_writes::WriteSite::MappingGpuWriteback, mapping_id);
     note_readback_phase(
         ReadbackPhase::Resolve,
         resolve_started.elapsed().as_micros() as u64,
@@ -746,7 +746,25 @@ pub fn synchronize_guest_backed_resident(
     };
 
     mapper::note_physical_page_write_footprint(&footprint, base_off, span_end - base_off);
-    state.host_writes.note_footprint(&footprint);
+    // v11 (issue #5): this resident's attachment *is* guest memory, named by
+    // the footprint retained when it was admitted, so the GPU has already
+    // written these pages by the time this runs — nothing here can stop that
+    // write. What this can do is say so: a footprint page the guest has
+    // released is a write after release through a retained translation, and
+    // it is counted under its own route (and once on the fail channel) so the
+    // next run shows whether this rail is a source. Read-only; the census
+    // record below still runs and still reports the finding.
+    if let Some(gpa) = state.host_writes.first_armed(footprint.pages()) {
+        crate::runtime::drain::note_store_route("released_write_guest_backed_unblockable");
+        if crate::observe::first_sight("released_write_guest_backed_unblockable", u64::from(mapping_id)) {
+            crate::observe::fail(format!(
+                "released_write_blocked reason=unblockable site=guest_backed_sync mid={mapping_id} gpa={gpa:#x} \
+                 (a guest-backed resident's footprint names a page the guest released; the GPU \
+                 rendered into it before this sync, so it is reported, not blocked)"
+            ));
+        }
+    }
+    state.host_writes.note_footprint_at(crate::runtime::host_writes::WriteSite::GuestBackedSync, &footprint);
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
     crate::runtime::surface_cache::forget(state, mapping_id);

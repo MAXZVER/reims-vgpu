@@ -222,6 +222,113 @@ impl Default for EpochChunk {
     }
 }
 
+/// Which writer recorded a guest-page write (v11 diagnostics for issue #5).
+///
+/// Carried with every write into the census so a `released_write_after_release`
+/// finding can say *which code path* landed on the released page, per owner
+/// class. `Unattributed` is every caller that still uses the site-less entry
+/// points (tests, and any writer added later without naming itself — which then
+/// reads as `site=unattributed` rather than as a guess).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WriteSite {
+    #[default]
+    Unattributed,
+    /// `mapping_write::contig_for_write`: raw rows poked through a mapping's
+    /// contiguous host view (the largest CPU guest-write rail).
+    MappingContig,
+    /// `mapping_write::vulkan` surface licence: GPU copy of a resident into a
+    /// mapping's current page list.
+    MappingGpuWriteback,
+    /// `mapping_write::vulkan::synchronize_guest_backed_resident`: a resident
+    /// whose attachment *is* guest memory, named by its admission-time
+    /// footprint. The GPU wrote the pages when it rendered; this is the record.
+    GuestBackedSync,
+    /// `mapper::copy_mapping_runs` write direction.
+    MapperCopyRuns,
+    /// `render_writeback::vulkan::licence_gva_plane`: GPU copy into a GVA
+    /// plane's pages (fresh walk, or a GVA debt's retained translation).
+    GvaPlaneWriteback,
+    /// `gva_view::map_fresh_span_within`: writable alias over a fresh walk.
+    GvaFreshSpan,
+    /// `gva_view::span_multi` write direction (fresh walk, per-run maps).
+    GvaSpanWrite,
+}
+
+impl WriteSite {
+    /// Every site, in slug-table order.
+    pub const ALL: [WriteSite; 8] = [
+        WriteSite::Unattributed,
+        WriteSite::MappingContig,
+        WriteSite::MappingGpuWriteback,
+        WriteSite::GuestBackedSync,
+        WriteSite::MapperCopyRuns,
+        WriteSite::GvaPlaneWriteback,
+        WriteSite::GvaFreshSpan,
+        WriteSite::GvaSpanWrite,
+    ];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Unattributed => "unattributed",
+            Self::MappingContig => "mapping_contig",
+            Self::MappingGpuWriteback => "mapping_gpu_writeback",
+            Self::GuestBackedSync => "guest_backed_sync",
+            Self::MapperCopyRuns => "mapper_copy_runs",
+            Self::GvaPlaneWriteback => "gva_plane_writeback",
+            Self::GvaFreshSpan => "gva_fresh_span",
+            Self::GvaSpanWrite => "gva_span_write",
+        }
+    }
+}
+
+/// What armed a released page (v11 diagnostics for issue #5).
+///
+/// Stored in the top two bits of the release cell, so it costs no memory and
+/// travels with the finding. Epochs never reach 2^62.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReleaseSource {
+    #[default]
+    Unattributed = 0,
+    /// `UnmapMemory`: the guest unmapped a task GVA range (live-walk resolve).
+    UnmapMemory = 1,
+    /// Task teardown: pages of mappings latched to the deleted task.
+    TaskDelete = 2,
+    /// `DeleteIOSurfaceBacking2`: the backing's own lifetime ended.
+    BackingRelease = 3,
+}
+
+impl ReleaseSource {
+    const SHIFT: u32 = 62;
+    const EPOCH_MASK: u64 = (1u64 << Self::SHIFT) - 1;
+
+    fn encode(self, epoch: u64) -> u64 {
+        (epoch.max(1) & Self::EPOCH_MASK) | ((self as u64) << Self::SHIFT)
+    }
+
+    fn decode(cell: u64) -> (u64, Self) {
+        let source = match cell >> Self::SHIFT {
+            1 => Self::UnmapMemory,
+            2 => Self::TaskDelete,
+            3 => Self::BackingRelease,
+            _ => Self::Unattributed,
+        };
+        (cell & Self::EPOCH_MASK, source)
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Unattributed => "unattributed",
+            Self::UnmapMemory => "unmap_memory",
+            Self::TaskDelete => "task_delete",
+            Self::BackingRelease => "backing_release",
+        }
+    }
+}
+
 /// A write this device recorded against a page the guest had taken back.
 ///
 /// Both epochs travel with it: `released_at` is the write census epoch current
@@ -237,6 +344,10 @@ pub struct ReleasedWrite {
     pub released_at: u64,
     /// Write census epoch of the write that landed on it afterwards.
     pub wrote_at: u64,
+    /// Which writer recorded that write (v11).
+    pub site: WriteSite,
+    /// What armed the page (v11).
+    pub armed_by: ReleaseSource,
 }
 
 /// How many findings the report queue holds between drains.
@@ -256,6 +367,7 @@ struct HitSink<'a> {
     hits: &'a mut Vec<ReleasedWrite>,
     hits_dropped: &'a mut u64,
     page_shift: u32,
+    site: WriteSite,
 }
 
 impl HitSink<'_> {
@@ -272,7 +384,7 @@ impl HitSink<'_> {
             if *cell == 0 {
                 continue;
             }
-            let released_at = std::mem::replace(cell, 0);
+            let (released_at, armed_by) = ReleaseSource::decode(std::mem::replace(cell, 0));
             *self.armed = self.armed.saturating_sub(1);
             let page = chunk_key * EPOCHS_PER_CHUNK as u64 + (slot + offset) as u64;
             if self.hits.len() < RELEASED_REPORT_CAP {
@@ -280,6 +392,8 @@ impl HitSink<'_> {
                     gpa: page << self.page_shift,
                     released_at,
                     wrote_at: at,
+                    site: self.site,
+                    armed_by,
                 });
             } else {
                 *self.hits_dropped += 1;
@@ -289,7 +403,14 @@ impl HitSink<'_> {
 }
 
 impl PageEpochs {
-    fn note_page_range(&mut self, mut page: u64, mut count: usize, epoch: u64, page_shift: u32) {
+    fn note_page_range(
+        &mut self,
+        mut page: u64,
+        mut count: usize,
+        epoch: u64,
+        page_shift: u32,
+        site: WriteSite,
+    ) {
         let Self {
             chunks,
             armed,
@@ -302,6 +423,7 @@ impl PageEpochs {
             hits,
             hits_dropped,
             page_shift,
+            site,
         };
         while count != 0 {
             let chunk_key = page / EPOCHS_PER_CHUNK as u64;
@@ -333,7 +455,7 @@ impl PageEpochs {
     /// release epoch: the question is whether anything was written since the
     /// guest stopped wanting us there, and re-stamping it would forgive a write
     /// that had already happened.
-    fn arm(&mut self, page: u64, epoch: u64) {
+    fn arm(&mut self, page: u64, epoch: u64, source: ReleaseSource) {
         let chunk_key = page / EPOCHS_PER_CHUNK as u64;
         let slot = (page % EPOCHS_PER_CHUNK as u64) as usize;
         let chunk = self
@@ -348,8 +470,10 @@ impl PageEpochs {
         }
         // Epoch 0 is "never written", so an arm at epoch 0 would be
         // indistinguishable from an unarmed cell. Arm at 1 instead: no write
-        // has happened yet, so no write can be older than it.
-        released[slot] = epoch.max(1);
+        // has happened yet, so no write can be older than it. The arming
+        // source rides in the top two bits (v11); `encode` keeps the cell
+        // non-zero either way.
+        released[slot] = source.encode(epoch);
         self.armed += 1;
     }
 
@@ -368,7 +492,17 @@ impl PageEpochs {
         }
     }
 
-    fn note_pages<I>(&mut self, pages: I, epoch: u64, page_shift: u32)
+    /// Whether `page` is armed right now (read-only; nothing is disarmed).
+    fn is_armed(&self, page: u64) -> bool {
+        let chunk_key = page / EPOCHS_PER_CHUNK as u64;
+        let slot = (page % EPOCHS_PER_CHUNK as u64) as usize;
+        self.chunks
+            .get(&chunk_key)
+            .and_then(|chunk| chunk.released.as_deref())
+            .is_some_and(|released| released[slot] != 0)
+    }
+
+    fn note_pages<I>(&mut self, pages: I, epoch: u64, page_shift: u32, site: WriteSite)
     where
         I: IntoIterator<Item = u64>,
     {
@@ -384,6 +518,7 @@ impl PageEpochs {
             hits,
             hits_dropped,
             page_shift,
+            site,
         };
         let mut pages = pages.into_iter().peekable();
         while let Some(gpa) = pages.next() {
@@ -508,17 +643,26 @@ impl HostWrites {
     pub fn note_mapping(&mut self, pages: Option<&[u64]>) {
         self.epoch = self.epoch.wrapping_add(1);
         match pages {
-            Some(p) => self
-                .pages
-                .note_pages(p.iter().copied(), self.epoch, self.page_shift),
+            Some(p) => self.pages.note_pages(
+                p.iter().copied(),
+                self.epoch,
+                self.page_shift,
+                WriteSite::Unattributed,
+            ),
             None => self.pages.note_unknown(self.epoch),
         }
     }
 
     /// Record a write covering exactly `pages` (page-aligned guest addresses).
     pub fn note_pages(&mut self, pages: Vec<u64>) {
+        self.note_pages_at(WriteSite::Unattributed, pages);
+    }
+
+    /// [`Self::note_pages`], naming the writer (v11) so a finding on a released
+    /// page carries its site.
+    pub fn note_pages_at(&mut self, site: WriteSite, pages: Vec<u64>) {
         self.epoch = self.epoch.wrapping_add(1);
-        self.pages.note_pages(pages, self.epoch, self.page_shift);
+        self.pages.note_pages(pages, self.epoch, self.page_shift, site);
     }
 
     /// Record an already-resolved page iterator without materializing a second
@@ -528,14 +672,31 @@ impl HostWrites {
     where
         I: IntoIterator<Item = u64>,
     {
+        self.note_page_iter_at(WriteSite::Unattributed, pages);
+    }
+
+    /// [`Self::note_page_iter`], naming the writer (v11).
+    pub fn note_page_iter_at<I>(&mut self, site: WriteSite, pages: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
         self.epoch = self.epoch.wrapping_add(1);
-        self.pages.note_pages(pages, self.epoch, self.page_shift);
+        self.pages.note_pages(pages, self.epoch, self.page_shift, site);
     }
 
     /// Record the exact page runs retained with an admitted guest allocation.
     /// The run partition was derived once with the resource, so a repeated
     /// Store updates slices rather than rebuilding adjacency page by page.
     pub fn note_footprint(&mut self, footprint: &crate::runtime::guest_ram::GuestPageFootprint) {
+        self.note_footprint_at(WriteSite::Unattributed, footprint);
+    }
+
+    /// [`Self::note_footprint`], naming the writer (v11).
+    pub fn note_footprint_at(
+        &mut self,
+        site: WriteSite,
+        footprint: &crate::runtime::guest_ram::GuestPageFootprint,
+    ) {
         self.epoch = self.epoch.wrapping_add(1);
         if footprint.page_size() != (1u64 << self.page_shift) {
             self.pages.note_unknown(self.epoch);
@@ -548,6 +709,7 @@ impl HostWrites {
                 run.end - run.start,
                 self.epoch,
                 self.page_shift,
+                site,
             );
         }
     }
@@ -584,7 +746,26 @@ impl HostWrites {
     /// write census uses, so an arm and a write cannot disagree about which
     /// cell they mean.
     pub fn release_page(&mut self, gpa: u64) {
-        self.pages.arm(gpa >> self.page_shift, self.epoch);
+        self.release_page_by(gpa, ReleaseSource::Unattributed);
+    }
+
+    /// [`Self::release_page`], naming what released it (v11), so a finding can
+    /// say whether the page went back by a task unmap, a task teardown or the
+    /// backing's own release.
+    pub fn release_page_by(&mut self, gpa: u64, source: ReleaseSource) {
+        self.pages.arm(gpa >> self.page_shift, self.epoch, source);
+    }
+
+    /// The first of `pages` that is armed right now — released by the guest
+    /// and not mapped again — or `None`. Read-only: asking disarms nothing and
+    /// records no write. One chunk lookup per page, the same cost as recording
+    /// the write. This is what the v11 release-write guard asks before a write
+    /// through a *retained* translation.
+    pub fn first_armed(&self, pages: &[u64]) -> Option<u64> {
+        pages
+            .iter()
+            .copied()
+            .find(|&gpa| self.pages.is_armed(gpa >> self.page_shift))
     }
 
     /// The guest has mapped `gpa` again, so writing to it is legitimate.
@@ -620,6 +801,63 @@ mod tests {
     use super::*;
 
     const P: u64 = 4096;
+
+    /// v11: a finding carries the writer that landed on the page and what
+    /// armed it, and the source bits do not leak into `released_at`.
+    #[test]
+    fn a_finding_names_its_write_site_and_what_armed_the_page() {
+        let mut w = HostWrites::default();
+        w.note_pages(vec![P]);
+        w.note_pages(vec![2 * P]);
+        let at_release = w.epoch();
+        w.release_page_by(9 * P, ReleaseSource::BackingRelease);
+        w.release_page_by(10 * P, ReleaseSource::UnmapMemory);
+        w.release_page(11 * P);
+        assert_eq!(w.first_armed(&[3 * P, 10 * P, 9 * P]), Some(10 * P));
+        assert_eq!(w.first_armed(&[3 * P, 4 * P]), None);
+        assert_eq!(w.armed_pages(), 3, "asking disarms nothing");
+        w.note_pages_at(WriteSite::GvaPlaneWriteback, vec![9 * P]);
+        w.note_page_iter_at(WriteSite::MappingContig, [10 * P]);
+        w.note_pages(vec![11 * P]);
+        let hits = w.take_released_writes();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].gpa, 9 * P);
+        assert_eq!(hits[0].released_at, at_release);
+        assert_eq!(hits[0].site, WriteSite::GvaPlaneWriteback);
+        assert_eq!(hits[0].armed_by, ReleaseSource::BackingRelease);
+        assert_eq!(hits[1].site, WriteSite::MappingContig);
+        assert_eq!(hits[1].armed_by, ReleaseSource::UnmapMemory);
+        assert_eq!(hits[1].released_at, at_release);
+        assert_eq!(hits[2].site, WriteSite::Unattributed);
+        assert_eq!(hits[2].armed_by, ReleaseSource::Unattributed);
+        assert_eq!(w.first_armed(&[9 * P, 10 * P, 11 * P]), None, "reported pages disarm");
+        // Every site has a distinct slug and its own table index.
+        let mut slugs: Vec<_> = WriteSite::ALL.iter().map(|s| s.slug()).collect();
+        for (i, s) in WriteSite::ALL.iter().enumerate() {
+            assert_eq!(s.index(), i);
+        }
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), WriteSite::ALL.len());
+    }
+
+    /// v11: an arm at epoch 0 with a source is still armed (non-zero cell) and
+    /// still reports epoch 1, exactly as an unattributed arm does.
+    #[test]
+    fn an_attributed_arm_before_any_write_still_reads_as_armed_at_one() {
+        let mut w = HostWrites::default();
+        w.release_page_by(5 * P, ReleaseSource::TaskDelete);
+        assert_eq!(w.armed_pages(), 1);
+        let pages: std::sync::Arc<[u64]> = vec![5 * P].into();
+        let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(pages, P)
+            .expect("one page");
+        w.note_footprint_at(WriteSite::GuestBackedSync, &footprint);
+        let hits = w.take_released_writes();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].released_at, 1);
+        assert_eq!(hits[0].armed_by, ReleaseSource::TaskDelete);
+        assert_eq!(hits[0].site, WriteSite::GuestBackedSync);
+    }
 
     /// The record rules a window in and out by page, and a reader that already
     /// saw a write is not invalidated by it.

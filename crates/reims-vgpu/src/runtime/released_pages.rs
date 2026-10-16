@@ -95,39 +95,191 @@
 /// route, so a boot can tell the retained-GVA-backing class, the
 /// reused-by-another-route residue the module doc describes, and a genuinely
 /// unowned page apart. The base route keeps counting every finding.
+///
+/// # v11: the unclassified bulk, the write site and the arming source
+///
+/// The v7 four-hour run read 152 166 of 192 390 findings as
+/// `owner_unclassified`, because only the first eight findings of a sweep were
+/// classified and a single write that lands on a released surface reports one
+/// finding per page (a tranche held 64). Those pages share one write — one
+/// `wrote_at` — and so one destination. So the budget is now spent per
+/// **distinct write**: the first finding of each write is classified exactly
+/// (up to [`CLASSIFY_PER_SWEEP`] writes a sweep, the same bounded scan as
+/// before), and the other pages of that write inherit its class, counted under
+/// `released_write_after_release_owner_inferred` so the inference is visible.
+/// Only writes past the budget stay unclassified.
+///
+/// Each finding also names the **site** that wrote
+/// (`released_write_after_release_site_<site>`, see
+/// [`crate::runtime::host_writes::WriteSite`]), the owner x site cell
+/// (`rwar_owner_<owner>_site_<site>`), and what **armed** the page
+/// (`released_write_after_release_armed_by_<source>`). A live-mapping owner is
+/// split into `..._owner_live_mapping_active` (the mapping is not marked
+/// released: most likely the guard's stated residue, a page legitimately
+/// re-owned by a live surface) and `..._owner_live_mapping_released` (the
+/// mapping itself was released: a defect candidate).
 pub fn sweep(state: &mut crate::model::DeviceState) {
     let hits = state.host_writes.take_released_writes();
-    let mut classified = 0usize;
+    if hits.is_empty() {
+        return;
+    }
+    // (wrote_at, owner, live detail) per distinct write classified this sweep.
+    let mut by_write: Vec<(u64, ReleasedPageOwner, Option<&'static str>)> = Vec::new();
     for hit in hits {
         crate::runtime::drain::note_store_route("released_write_after_release");
-        let owner = if classified < CLASSIFY_PER_SWEEP {
-            classified += 1;
-            ReleasedPageOwner::of(state, hit.gpa)
-        } else {
-            ReleasedPageOwner::Unclassified
+        let (owner, detail, inferred) = match by_write.iter().find(|(w, ..)| *w == hit.wrote_at) {
+            Some(&(_, owner, detail)) => (owner, detail, true),
+            None if by_write.len() < CLASSIFY_PER_SWEEP => {
+                let (owner, detail) = ReleasedPageOwner::of_detailed(state, hit.gpa);
+                by_write.push((hit.wrote_at, owner, detail));
+                (owner, detail, false)
+            }
+            None => (ReleasedPageOwner::Unclassified, None, false),
         };
         crate::runtime::drain::note_store_route(owner.slug());
+        if let Some(detail) = detail {
+            crate::runtime::drain::note_store_route(detail);
+        }
+        if inferred {
+            crate::runtime::drain::note_store_route("released_write_after_release_owner_inferred");
+        }
+        crate::runtime::drain::note_store_route(SITE_ROUTES[hit.site.index()]);
+        crate::runtime::drain::note_store_route(OWNER_SITE_ROUTES[owner.index()][hit.site.index()]);
+        crate::runtime::drain::note_store_route(armed_by_route(hit.armed_by));
         if !crate::observe::first_sight("released_write_after_release", hit.gpa) {
             continue;
         }
         crate::observe::fail(format!(
             "released_pages reason=released_write_after_release gpa={:#x} \
-             released_at={} wrote_at={} armed={} owner={} (this device wrote to a guest page after \
+             released_at={} wrote_at={} armed={} owner={} site={} armed_by={} inferred={} \
+             (this device wrote to a guest page after \
              the guest released it; the guest is entitled to have given that page to something \
              else, including its own page table)",
             hit.gpa,
             hit.released_at,
             hit.wrote_at,
             state.host_writes.armed_pages(),
-            owner.slug(),
+            detail.unwrap_or(owner.slug()),
+            hit.site.slug(),
+            hit.armed_by.slug(),
+            inferred,
         ));
     }
 }
 
-/// How many findings per tranche [`sweep`] classifies. Each classification is a
-/// scan of the retained GVA backings and the mapping page lists, so a burst
-/// (one tranche held 64) is bounded; the rest count as `owner_unclassified`.
-const CLASSIFY_PER_SWEEP: usize = 8;
+/// How many **distinct writes** per tranche [`sweep`] classifies exactly (v11:
+/// was eight findings). Each classification is a scan of the retained GVA
+/// backings and the mapping page lists, so a burst is bounded; the other pages
+/// of a classified write inherit its class, and only writes past this budget
+/// count as `owner_unclassified`.
+const CLASSIFY_PER_SWEEP: usize = 16;
+
+/// `released_write_after_release_site_<site>`, indexed by
+/// [`crate::runtime::host_writes::WriteSite::index`].
+const SITE_ROUTES: [&str; 8] = [
+    "released_write_after_release_site_unattributed",
+    "released_write_after_release_site_mapping_contig",
+    "released_write_after_release_site_mapping_gpu_writeback",
+    "released_write_after_release_site_guest_backed_sync",
+    "released_write_after_release_site_mapper_copy_runs",
+    "released_write_after_release_site_gva_plane_writeback",
+    "released_write_after_release_site_gva_fresh_span",
+    "released_write_after_release_site_gva_span_write",
+];
+
+/// `rwar_owner_<owner>_site_<site>`, indexed by
+/// [`ReleasedPageOwner::index`] then
+/// [`crate::runtime::host_writes::WriteSite::index`].
+const OWNER_SITE_ROUTES: [[&str; 8]; 5] = [
+    [
+        "rwar_owner_gva_retained_site_unattributed",
+        "rwar_owner_gva_retained_site_mapping_contig",
+        "rwar_owner_gva_retained_site_mapping_gpu_writeback",
+        "rwar_owner_gva_retained_site_guest_backed_sync",
+        "rwar_owner_gva_retained_site_mapper_copy_runs",
+        "rwar_owner_gva_retained_site_gva_plane_writeback",
+        "rwar_owner_gva_retained_site_gva_fresh_span",
+        "rwar_owner_gva_retained_site_gva_span_write",
+    ],
+    [
+        "rwar_owner_live_mapping_site_unattributed",
+        "rwar_owner_live_mapping_site_mapping_contig",
+        "rwar_owner_live_mapping_site_mapping_gpu_writeback",
+        "rwar_owner_live_mapping_site_guest_backed_sync",
+        "rwar_owner_live_mapping_site_mapper_copy_runs",
+        "rwar_owner_live_mapping_site_gva_plane_writeback",
+        "rwar_owner_live_mapping_site_gva_fresh_span",
+        "rwar_owner_live_mapping_site_gva_span_write",
+    ],
+    [
+        "rwar_owner_condemned_mapping_site_unattributed",
+        "rwar_owner_condemned_mapping_site_mapping_contig",
+        "rwar_owner_condemned_mapping_site_mapping_gpu_writeback",
+        "rwar_owner_condemned_mapping_site_guest_backed_sync",
+        "rwar_owner_condemned_mapping_site_mapper_copy_runs",
+        "rwar_owner_condemned_mapping_site_gva_plane_writeback",
+        "rwar_owner_condemned_mapping_site_gva_fresh_span",
+        "rwar_owner_condemned_mapping_site_gva_span_write",
+    ],
+    [
+        "rwar_owner_none_site_unattributed",
+        "rwar_owner_none_site_mapping_contig",
+        "rwar_owner_none_site_mapping_gpu_writeback",
+        "rwar_owner_none_site_guest_backed_sync",
+        "rwar_owner_none_site_mapper_copy_runs",
+        "rwar_owner_none_site_gva_plane_writeback",
+        "rwar_owner_none_site_gva_fresh_span",
+        "rwar_owner_none_site_gva_span_write",
+    ],
+    [
+        "rwar_owner_unclassified_site_unattributed",
+        "rwar_owner_unclassified_site_mapping_contig",
+        "rwar_owner_unclassified_site_mapping_gpu_writeback",
+        "rwar_owner_unclassified_site_guest_backed_sync",
+        "rwar_owner_unclassified_site_mapper_copy_runs",
+        "rwar_owner_unclassified_site_gva_plane_writeback",
+        "rwar_owner_unclassified_site_gva_fresh_span",
+        "rwar_owner_unclassified_site_gva_span_write",
+    ],
+];
+
+fn armed_by_route(source: crate::runtime::host_writes::ReleaseSource) -> &'static str {
+    use crate::runtime::host_writes::ReleaseSource as S;
+    match source {
+        S::Unattributed => "released_write_after_release_armed_by_unattributed",
+        S::UnmapMemory => "released_write_after_release_armed_by_unmap_memory",
+        S::TaskDelete => "released_write_after_release_armed_by_task_delete",
+        S::BackingRelease => "released_write_after_release_armed_by_backing_release",
+    }
+}
+
+/// `REIMS_VGPU_RELEASE_WRITE_GUARD`, read once (v11). Unset/on: a write through
+/// a *retained* translation that names a page the guest has released is
+/// refused (`released_write_blocked`). Off restores the pre-v11 behaviour —
+/// the write lands and is only reported — and says so once.
+pub(crate) fn write_guard_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let (state, value) = crate::config::read(crate::config::RELEASE_WRITE_GUARD);
+        match state {
+            crate::config::Switch::Off => {
+                crate::observe::fail(
+                    "release_write_guard_disabled reason=disabled_by_env (writes through retained \
+                     translations into released pages land and are only reported, as before v11)",
+                );
+                false
+            }
+            crate::config::Switch::Unrecognized => {
+                crate::observe::fail(format!(
+                    "release_write_guard reason=release_write_guard_env_unrecognized value={}",
+                    value.unwrap_or_default()
+                ));
+                true
+            }
+            _ => true,
+        }
+    })
+}
 
 /// Who, when the finding is drained, still names a page this device wrote
 /// after the guest released it.
@@ -159,9 +311,26 @@ impl ReleasedPageOwner {
         }
     }
 
-    pub(crate) fn of(state: &crate::model::DeviceState, gpa: u64) -> Self {
+    /// Row of [`OWNER_SITE_ROUTES`].
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::GvaRetainedBacking => 0,
+            Self::LiveMapping => 1,
+            Self::CondemnedMapping => 2,
+            Self::Unowned => 3,
+            Self::Unclassified => 4,
+        }
+    }
+
+    /// The owner class, plus for a live mapping whether that mapping is itself
+    /// marked released (`released_mappings` / `ever_released`) — v11. Same
+    /// single bounded scan.
+    pub(crate) fn of_detailed(
+        state: &crate::model::DeviceState,
+        gpa: u64,
+    ) -> (Self, Option<&'static str>) {
         if state.pending_writebacks.retains_gva_page(gpa) {
-            return Self::GvaRetainedBacking;
+            return (Self::GvaRetainedBacking, None);
         }
         let shift = state.page_shift;
         let holds = |entries: &[u32]| {
@@ -170,19 +339,37 @@ impl ReleasedPageOwner {
                 .any(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, shift) == Some(gpa))
         };
         let mut condemned = false;
-        for m in state.mappings.values() {
+        for (&mid, m) in state.mappings.iter() {
             if holds(&m.page_entries) {
-                return Self::LiveMapping;
+                let released = m.ever_released || state.released_mappings.contains(&mid);
+                return (
+                    Self::LiveMapping,
+                    Some(if released {
+                        "released_write_after_release_owner_live_mapping_released"
+                    } else {
+                        "released_write_after_release_owner_live_mapping_active"
+                    }),
+                );
             }
             if m.condemned_entries.as_deref().is_some_and(|e| holds(e)) {
                 condemned = true;
             }
         }
         if condemned {
-            Self::CondemnedMapping
+            (Self::CondemnedMapping, None)
         } else {
-            Self::Unowned
+            (Self::Unowned, None)
         }
+    }
+
+    /// The owner class alone. Since v11 the sweep classifies through
+    /// [`Self::of_detailed`] (one scan that also splits live mappings into
+    /// active/released), so this coarse form is only the tests' view of that
+    /// same scan; it delegates rather than keeping a second copy that could
+    /// drift from what production reports.
+    #[cfg(test)]
+    pub(crate) fn of(state: &crate::model::DeviceState, gpa: u64) -> Self {
+        Self::of_detailed(state, gpa).0
     }
 }
 
@@ -280,6 +467,82 @@ mod owner_tests {
             ReleasedPageOwner::Unowned.slug(),
             "each owner has its own route"
         );
+    }
+
+    /// v11: one write that lands on forty released pages of a live surface is
+    /// classified once and the rest inherit it — none of them is unclassified —
+    /// and every finding is counted under its site, its owner x site cell, its
+    /// arming source, and the live mapping's active/released split.
+    #[test]
+    fn a_sweep_classifies_per_write_and_names_site_and_arming_source() {
+        use crate::runtime::drain::store_route_count as count;
+        use crate::runtime::host_writes::{ReleaseSource, WriteSite};
+        let mut state = DeviceState::new(DeviceId::default(), 12);
+        let base = 0x0100_0000u64;
+        let pages: Vec<u64> = (0..40).map(|i| base + i * 4096).collect();
+        assert!(state.map_surface(6));
+        state.mappings.get_mut(&6).unwrap().page_entries = pages
+            .iter()
+            .map(|&g| {
+                ((g >> 12) as u32) << crate::protocol::iosurface_pages::PAGE_ENTRY_PFN_SHIFT
+                    | crate::protocol::iosurface_pages::PAGE_ENTRY_VALID
+            })
+            .collect();
+        for &g in &pages {
+            state.host_writes.release_page_by(g, ReleaseSource::TaskDelete);
+        }
+        let before = (
+            count("released_write_after_release_owner_unclassified"),
+            count("released_write_after_release_owner_live_mapping"),
+            count("released_write_after_release_owner_inferred"),
+            count("released_write_after_release_site_mapping_contig"),
+            count("rwar_owner_live_mapping_site_mapping_contig"),
+            count("released_write_after_release_armed_by_task_delete"),
+            count("released_write_after_release_owner_live_mapping_active"),
+        );
+        state.note_host_wrote_mapping_at(WriteSite::MappingContig, 6);
+        super::sweep(&mut state);
+        let after = (
+            count("released_write_after_release_owner_unclassified"),
+            count("released_write_after_release_owner_live_mapping"),
+            count("released_write_after_release_owner_inferred"),
+            count("released_write_after_release_site_mapping_contig"),
+            count("rwar_owner_live_mapping_site_mapping_contig"),
+            count("released_write_after_release_armed_by_task_delete"),
+            count("released_write_after_release_owner_live_mapping_active"),
+        );
+        // 40 findings, but the report queue holds 64, so all 40 arrive.
+        assert_eq!(after.0, before.0, "nothing is unclassified");
+        assert_eq!(after.1, before.1 + 40);
+        assert_eq!(after.2, before.2 + 39, "one exact classification, 39 inferred");
+        assert_eq!(after.3, before.3 + 40);
+        assert_eq!(after.4, before.4 + 40);
+        assert_eq!(after.5, before.5 + 40);
+        assert_eq!(after.6, before.6 + 40, "mapping 6 is not marked released");
+        // Index tables line up with the enums.
+        for (i, owner) in [
+            ReleasedPageOwner::GvaRetainedBacking,
+            ReleasedPageOwner::LiveMapping,
+            ReleasedPageOwner::CondemnedMapping,
+            ReleasedPageOwner::Unowned,
+            ReleasedPageOwner::Unclassified,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(owner.index(), i);
+            let short = owner.slug().trim_start_matches("released_write_after_release_owner_");
+            for site in WriteSite::ALL {
+                assert_eq!(
+                    super::OWNER_SITE_ROUTES[i][site.index()],
+                    format!("rwar_owner_{short}_site_{}", site.slug())
+                );
+                assert_eq!(
+                    super::SITE_ROUTES[site.index()],
+                    format!("released_write_after_release_site_{}", site.slug())
+                );
+            }
+        }
     }
 }
 
