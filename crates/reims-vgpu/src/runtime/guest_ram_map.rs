@@ -186,6 +186,14 @@ pub enum MapRefusal {
     /// import-off host always takes. Only the write sites produce it — see
     /// [`write_refusal`].
     WritesNarrowed,
+    /// The GPU would *read* these guest pages through a bind or a gather, and
+    /// the operator narrowed the import to writes
+    /// ([`crate::config::GUEST_IMPORT_READS`]). Expected, like
+    /// [`Self::WritesNarrowed`]: the read takes the CPU staging rail an
+    /// import-off host always runs, while the write half — payments, licences
+    /// — keeps the import. Only the read sites produce it; see
+    /// [`read_refusal`].
+    ReadsNarrowed,
 }
 
 impl crate::observe::Decline for MapRefusal {
@@ -198,6 +206,7 @@ impl crate::observe::Decline for MapRefusal {
             Self::GpaNotInAnyImport { .. } => "guest_ram_map_gpa_not_in_any_import",
             Self::Scattered { .. } => "guest_ram_map_scattered",
             Self::WritesNarrowed => "guest_ram_map_writes_narrowed",
+            Self::ReadsNarrowed => "guest_ram_map_reads_narrowed",
             // The inner reason is the diagnosis; this wrapper only says where
             // it happened, so it forwards rather than adding a slug of its own.
             Self::OutsideImport(inner) => inner.slug(),
@@ -206,7 +215,7 @@ impl crate::observe::Decline for MapRefusal {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::NoBackendImport | Self::WritesNarrowed => Vec::new(),
+            Self::NoBackendImport | Self::WritesNarrowed | Self::ReadsNarrowed => Vec::new(),
             Self::HostRefused(inner) => {
                 let mut f = vec![("host_reason", inner.slug().to_string())];
                 f.extend(crate::observe::Decline::fields(inner));
@@ -454,6 +463,21 @@ pub fn standing_refusal_resolved() -> Option<Option<MapRefusal>> {
 pub fn write_refusal() -> Option<MapRefusal> {
     (!crate::backend::vulkan::caps::host_pointer::guest_writes_allowed())
         .then(|| report_once(MapRefusal::WritesNarrowed))
+}
+
+/// The refusal a site that would bind or gather guest pages for the GPU to
+/// *read* takes before asking for references, or `None` to go on.
+///
+/// Asked by the read rails only — the sampled sources, the vertex/index
+/// zero-copy binds, the packed aliases; the write licences and the debt
+/// payments never see it, which is the point of the switch: a host can keep
+/// `copy_target_to_guest_pages` on the GPU while its draw-time assemblies go
+/// back to the CPU staging rails. A read site that gets `Some` declines
+/// exactly as it does for [`MapRefusal::NoBackendImport`], so the rail behind
+/// it is the same one an import-off host runs.
+pub fn read_refusal() -> Option<MapRefusal> {
+    (!crate::backend::vulkan::caps::host_pointer::guest_reads_allowed())
+        .then(|| report_once(MapRefusal::ReadsNarrowed))
 }
 
 /// [`write_refusal`] for the one write class
@@ -879,6 +903,11 @@ fn report_once(refusal: MapRefusal) -> MapRefusal {
         }
         MapRefusal::WritesNarrowed => {
             if crate::observe::first_sight("guest_ram_map_writes_narrowed", 0) {
+                line.off();
+            }
+        }
+        MapRefusal::ReadsNarrowed => {
+            if crate::observe::first_sight("guest_ram_map_reads_narrowed", 0) {
                 line.off();
             }
         }
