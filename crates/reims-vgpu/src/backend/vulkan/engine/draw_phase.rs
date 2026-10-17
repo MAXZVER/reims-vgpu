@@ -490,6 +490,24 @@ pub(crate) enum Phase {
     /// This is the floor. Whatever else this device stops doing, it still issues
     /// one draw call per guest draw, exactly as Apple's driver does.
     RecordDraw = 32,
+    /// The render target's own hold, carved out of [`Phase::Acquire`]: the
+    /// resident `registry_ensure` or the pooled `acquire_target`, plus the ad-hoc
+    /// framebuffer an MRT/depth/fetch draw builds over it.
+    ///
+    /// # Why `acquire` is split a second time
+    ///
+    /// The first split settled `acquire_sampled` on Maps, but a heavy WebGL page
+    /// reads the other way: ZCode's n386 (5K raymarch, 420 draws a frame) charged
+    /// 13-39 us per draw to `acquire_us` itself with `acquire_sampled_us` near
+    /// zero, the largest bar of a 27.5 ms drain frame. `acquire` then still
+    /// covered the target hold, the multisample source and the guest-backed seed
+    /// load, three costs with three different repairs.
+    AcquireTarget = 33,
+    /// The multisample colour source of a resolving draw.
+    AcquireMultisample = 34,
+    /// Admitting the target's guest-page LOAD: a shared imported backing, or a
+    /// seed imported or gathered from guest RAM before the sampled loop.
+    AcquireSeed = 35,
 }
 
 impl Phase {
@@ -500,7 +518,7 @@ impl Phase {
     /// the ordinals that existed when they were added, rather than inserted next
     /// to the phase they divide, so that every existing ordinal kept its value
     /// and this stayed the only place the count is written.
-    const LAST: Phase = Phase::RecordDraw;
+    const LAST: Phase = Phase::AcquireSeed;
 }
 
 const PHASES: usize = Phase::LAST as usize + 1;
@@ -563,6 +581,11 @@ pub struct DrawPhaseWindow {
     pub stage_seed_us: u64,
     pub stage_pass_us: u64,
     pub acquire_us: u64,
+    /// The three below are carved out of `acquire_us`; the four together are what
+    /// it used to be alone.
+    pub acquire_target_us: u64,
+    pub acquire_multisample_us: u64,
+    pub acquire_seed_us: u64,
     pub acquire_sampled_us: u64,
     pub sampled_upload_us: u64,
     pub acquire_readback_us: u64,
@@ -608,6 +631,11 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         stage_seed_us: to_us(ACC[Phase::StageSeed as usize].swap(0, Ordering::Relaxed)),
         stage_pass_us: to_us(ACC[Phase::StagePass as usize].swap(0, Ordering::Relaxed)),
         acquire_us: to_us(ACC[Phase::Acquire as usize].swap(0, Ordering::Relaxed)),
+        acquire_target_us: to_us(ACC[Phase::AcquireTarget as usize].swap(0, Ordering::Relaxed)),
+        acquire_multisample_us: to_us(
+            ACC[Phase::AcquireMultisample as usize].swap(0, Ordering::Relaxed),
+        ),
+        acquire_seed_us: to_us(ACC[Phase::AcquireSeed as usize].swap(0, Ordering::Relaxed)),
         acquire_sampled_us: to_us(ACC[Phase::AcquireSampled as usize].swap(0, Ordering::Relaxed)),
         sampled_upload_us: to_us(ACC[Phase::SampledUpload as usize].swap(0, Ordering::Relaxed)),
         acquire_readback_us: to_us(ACC[Phase::AcquireReadback as usize].swap(0, Ordering::Relaxed)),
@@ -839,6 +867,10 @@ mod tests {
             Phase::RecordPass,
             Phase::RecordState,
             Phase::RecordDraw,
+            // The second acquire split, appended for the same reason.
+            Phase::AcquireTarget,
+            Phase::AcquireMultisample,
+            Phase::AcquireSeed,
         ];
         assert_eq!(all.len(), PHASES);
         for (want, phase) in all.iter().enumerate() {

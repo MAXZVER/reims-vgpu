@@ -248,7 +248,8 @@ fn emit_draw_phase() {
          pl_depth_us={} pl_shader_us={} pl_layoutpass_us={} pl_compile_us={} pl_sampler_us={} \
          stage_us={} sg_roles_us={} sg_vertex_us={} sg_index_us={} sg_storage_us={} \
          sg_seed_us={} stage_pass_us={} \
-         acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
+         acquire_us={} acq_target_us={} acq_msaa_us={} acq_seed_us={} \
+         acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
          descriptors_us={} \
          record_us={} rec_begin_us={} rec_barrier_us={} rec_pass_us={} rec_state_us={} \
          rec_draw_us={} submit_us={} post_target_us={} post_store_us={} post_sampled_us={} \
@@ -270,6 +271,9 @@ fn emit_draw_phase() {
         w.stage_seed_us,
         w.stage_pass_us,
         w.acquire_us,
+        w.acquire_target_us,
+        w.acquire_multisample_us,
+        w.acquire_seed_us,
         w.acquire_sampled_us,
         w.sampled_upload_us,
         w.acquire_readback_us,

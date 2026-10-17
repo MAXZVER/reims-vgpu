@@ -4518,6 +4518,7 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_note_sampled_use(identity);
         }
     }
+    phase.enter(super::draw_phase::Phase::AcquireTarget);
     let mut target_guest_backed = false;
     let mut target_loads_guest_backing = false;
     let mut target_guest_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint> = None;
@@ -4639,6 +4640,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 )
             }
         };
+    phase.enter(super::draw_phase::Phase::AcquireMultisample);
     let _multisample_source_image = if req.multisample_resolve {
         let multisample_key = super::pools::MultisampleTargetKey {
             width: req.width,
@@ -4681,6 +4683,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // its exact CPU fallback. Fragmented imports append a gather owed by this
     // command buffer; the copy into the attachment is deliberately recorded
     // only after the shared gather block below has filled it.
+    phase.enter(super::draw_phase::Phase::AcquireSeed);
     let mut target_guest_zero = false;
     let target_guest_texels =
         match guest_target_load(target_loads_guest_backing, req.target_guest_seed.as_ref()) {
