@@ -1567,6 +1567,9 @@ impl PreparedSampled {
     }
 
     fn descriptor_layout(&self) -> vk::ImageLayout {
+        if crate::runtime::spirv_bind::is_storage_texture_binding(self.binding()) {
+            return vk::ImageLayout::GENERAL;
+        }
         match self {
             // Derived, never spelled: this descriptor and the subpass attachment
             // reference name one image at one moment, so they are one answer.
@@ -2454,6 +2457,7 @@ unsafe fn upload_buffer_to_sampled_image(
     array_layers: u32,
     extent_depth: u32,
     row_length_texels: u32,
+    target_layout: vk::ImageLayout,
 ) {
     let range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -2499,11 +2503,16 @@ unsafe fn upload_buffer_to_sampled_image(
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         &copy,
     );
+    let dst_access = if target_layout == vk::ImageLayout::GENERAL {
+        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE
+    } else {
+        vk::AccessFlags::SHADER_READ
+    };
     let to_shader = [vk::ImageMemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .dst_access_mask(dst_access)
         .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .new_layout(target_layout)
         .image(image)
         .subresource_range(range)];
     crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
@@ -3679,9 +3688,14 @@ pub(crate) unsafe fn execute_draw_inner(
         });
     }
     for b in &req.sampled_images {
+        let ty = if crate::runtime::spirv_bind::is_storage_texture_binding(b.binding) {
+            vk::DescriptorType::STORAGE_IMAGE.as_raw() as u32
+        } else {
+            vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32
+        };
         layout_bindings.push(BindingSig {
             binding: b.binding,
-            ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
+            ty,
             stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
             count: b.descriptor_count,
         });
@@ -5753,6 +5767,7 @@ pub(crate) unsafe fn execute_draw_inner(
             if *volume { 1 } else { *layers },
             if *volume { *layers } else { 1 },
             0,
+            image.descriptor_layout(),
         );
     }
 
@@ -6022,6 +6037,7 @@ pub(crate) unsafe fn execute_draw_inner(
             if *volume { 1 } else { *layers },
             if *volume { *layers } else { 1 },
             *row_length_texels,
+            image.descriptor_layout(),
         );
     }
 
@@ -7336,13 +7352,20 @@ fn fill_descriptor_bindings(
     out.extend(
         sampled
             .iter()
-            .map(|image| super::pools::PushDescriptorBinding::Image {
-                binding: image.binding(),
-                array_element: image.array_element(),
-                ty: vk::DescriptorType::SAMPLED_IMAGE,
-                sampler: vk::Sampler::null(),
-                view: image.view(),
-                layout: image.descriptor_layout(),
+            .map(|image| {
+                let ty = if crate::runtime::spirv_bind::is_storage_texture_binding(image.binding()) {
+                    vk::DescriptorType::STORAGE_IMAGE
+                } else {
+                    vk::DescriptorType::SAMPLED_IMAGE
+                };
+                super::pools::PushDescriptorBinding::Image {
+                    binding: image.binding(),
+                    array_element: image.array_element(),
+                    ty,
+                    sampler: vk::Sampler::null(),
+                    view: image.view(),
+                    layout: image.descriptor_layout(),
+                }
             }),
     );
     out.extend(sampler_handles.iter().map(|(binding, sampler)| {

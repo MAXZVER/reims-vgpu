@@ -12127,10 +12127,10 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         ("fragment", &f_shader, &req.fragment_textures),
     ] {
         if let Some((index, descriptor)) =
-            crate::runtime::spirv_bind::first_non_sampled_texture_descriptor(&shader.reflection)
+            crate::runtime::spirv_bind::first_unsupported_texture_descriptor(&shader.reflection)
         {
             let access = match descriptor.access {
-                crate::runtime::spirv_bind::ReflectedTextureAccess::Storage => "storage",
+                crate::runtime::spirv_bind::ReflectedTextureAccess::Storage => continue,
                 crate::runtime::spirv_bind::ReflectedTextureAccess::Unknown => "unknown",
                 crate::runtime::spirv_bind::ReflectedTextureAccess::Sampled => continue,
             };
@@ -12887,8 +12887,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 if let Some(descriptor) = reflected_descriptor {
                     use crate::runtime::spirv_bind::ReflectedTextureAccess;
                     let unsupported = match descriptor.access {
-                        ReflectedTextureAccess::Sampled => None,
-                        ReflectedTextureAccess::Storage => Some("storage"),
+                        ReflectedTextureAccess::Sampled | ReflectedTextureAccess::Storage => None,
                         ReflectedTextureAccess::Unknown => Some("unknown"),
                     };
                     if let Some(access) = unsupported {
@@ -14826,8 +14825,13 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             .first()
             .filter(|color| color.multisample_source_ref != 0)
         {
-            use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
-            if color.store_action != MTL_STORE_ACTION_MULTISAMPLE_RESOLVE {
+            use reims_vgpu_protocol::pass_action::{
+                MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
+                MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+            };
+            if color.store_action != MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
+                && color.store_action != MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
+            {
                 return Err(DrawError::Unsupported(
                     crate::backend::vulkan::engine::reason::DrawReason::MultisampleStoreActionUnsupported {
                         store_action: color.store_action,
@@ -23295,3 +23299,21 @@ mod msaa_load_admission_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod storage_texture_admission_tests {
+    #[test]
+    fn storage_texture_binding_mapping() {
+        use crate::runtime::spirv_bind::{is_storage_texture_binding, STORAGE_TEXTURE_BINDING_BASE};
+
+        assert!(!is_storage_texture_binding(0));
+        assert!(!is_storage_texture_binding(31));
+
+        let b0 = STORAGE_TEXTURE_BINDING_BASE;
+        assert!(is_storage_texture_binding(b0));
+
+        let b5 = STORAGE_TEXTURE_BINDING_BASE + 5;
+        assert!(is_storage_texture_binding(b5));
+    }
+}
+

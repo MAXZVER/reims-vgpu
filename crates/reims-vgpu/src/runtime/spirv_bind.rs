@@ -128,6 +128,8 @@ pub use metal2vulkan::reflect::{
     COLOR_INPUT_BINDING_BASE as M2V_COLOR_INPUT_BINDING_BASE,
     DEFAULT_DESCRIPTOR_LAYOUT as M2V_DEFAULT_DESCRIPTOR_LAYOUT,
     SAMPLER_BINDING_BASE as M2V_SAMPLER_BINDING_BASE,
+    STORAGE_TEXTURE_BINDING_BASE as M2V_STORAGE_TEXTURE_BINDING_BASE,
+    STORAGE_TEXTURE_BINDING_RANGE as M2V_STORAGE_TEXTURE_BINDING_RANGE,
     TEXTURE_BINDING_BASE as M2V_TEXTURE_BINDING_BASE,
 };
 
@@ -150,6 +152,14 @@ pub const SAMPLER_BINDING_BASE: u32 = M2V_SAMPLER_BINDING_BASE;
 /// this number. m2v-synthesized constexpr samplers currently also land here;
 /// they are unbindable either way, so preserving the band never makes them worse.
 pub const COLOR_INPUT_BINDING_BASE: u32 = M2V_COLOR_INPUT_BINDING_BASE;
+/// Device Storage Texture band base (Metal texture index N → binding 480+N).
+pub const STORAGE_TEXTURE_BINDING_BASE: u32 = M2V_STORAGE_TEXTURE_BINDING_BASE;
+pub const STORAGE_TEXTURE_BINDING_END: u32 = M2V_STORAGE_TEXTURE_BINDING_RANGE.end;
+
+#[inline]
+pub fn is_storage_texture_binding(binding: u32) -> bool {
+    binding >= STORAGE_TEXTURE_BINDING_BASE && binding < STORAGE_TEXTURE_BINDING_END
+}
 
 /// How far [`widen_sampled_bands`] moves a sampler or ColorInput decoration.
 ///
@@ -3121,6 +3131,23 @@ pub fn first_non_sampled_texture_descriptor(
 ) -> Option<(u32, ReflectedTextureDescriptor)> {
     reflection.bindings.iter().find_map(|binding| {
         if !is_texture_kind(binding.kind) || binding.access == Some(ResourceAccess::Sampled) {
+            return None;
+        }
+        reflected_texture_descriptor(reflection, binding.metal_index)
+            .map(|descriptor| (binding.metal_index, descriptor))
+    })
+}
+
+/// First texture descriptor that cannot be exposed through any supported render binding
+/// (neither sampled nor storage).
+pub fn first_unsupported_texture_descriptor(
+    reflection: &ShaderReflection,
+) -> Option<(u32, ReflectedTextureDescriptor)> {
+    reflection.bindings.iter().find_map(|binding| {
+        if !is_texture_kind(binding.kind)
+            || binding.access == Some(ResourceAccess::Sampled)
+            || binding.access == Some(ResourceAccess::Storage)
+        {
             return None;
         }
         reflected_texture_descriptor(reflection, binding.metal_index)
