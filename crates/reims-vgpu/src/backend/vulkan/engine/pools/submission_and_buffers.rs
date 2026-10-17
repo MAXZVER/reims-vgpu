@@ -4695,6 +4695,25 @@ impl ResourcePools {
             vk::ImageCreateFlags::empty()
         };
         let vk_format = format;
+        // TEMP (lab, `REIMS_VGPU_LAB_SAMPLED_STORAGE`, default on): a texture a
+        // render shader declares in the translator's storage band (480+N) is
+        // bound as STORAGE_IMAGE (Nouradawy PR #12), and Vulkan allows that only
+        // on an image created with STORAGE usage. Asked for where the format can
+        // be a storage image with optimal tiling; elsewhere the image is created
+        // as before and such a bind stays outside the spec.
+        let usage = vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | if lab_sampled_storage()
+                && ctx
+                    .instance
+                    .get_physical_device_format_properties(ctx.pd, vk_format)
+                    .optimal_tiling_features
+                    .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
+            {
+                vk::ImageUsageFlags::STORAGE
+            } else {
+                vk::ImageUsageFlags::empty()
+            };
         let image = ctx
             .device
             .create_image(
@@ -4711,7 +4730,7 @@ impl ResourcePools {
                     .array_layers(array_layers)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                    .usage(usage)
                     .initial_layout(vk::ImageLayout::UNDEFINED),
                 None,
             )
@@ -7761,4 +7780,13 @@ mod scatter_descriptor_sets_do_not_alias {
         assert_eq!(pools.attachment_snapshot_free.per_key, expected);
         assert_eq!(pools.attachment_snapshot_free.total, expected);
     }
+}
+
+/// TEMP (lab): `REIMS_VGPU_LAB_SAMPLED_STORAGE=off` keeps sampled-cache images
+/// SAMPLED | TRANSFER_DST only (the A/B arm). Latched.
+fn lab_sampled_storage() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(std::env::var("REIMS_VGPU_LAB_SAMPLED_STORAGE").as_deref(), Ok("off" | "0"))
+    })
 }
