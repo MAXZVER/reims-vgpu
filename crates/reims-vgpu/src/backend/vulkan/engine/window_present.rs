@@ -328,6 +328,8 @@ impl StagingImage {
 enum BlitSource {
     Resident {
         image: vk::Image,
+        /// TEMP (lab, PRESENT_SHARP): the resident's own view.
+        view: vk::ImageView,
         access: super::pools::ResidentAccess,
         next_access: super::pools::ResidentAccess,
         width: u32,
@@ -567,6 +569,11 @@ pub(crate) struct WindowPresenter {
     /// again, and the identity is put back into the published set so a removal
     /// still moves it. `REIMS_VGPU_LAB_RESTAMP=off` restores the old behaviour.
     lab_restamp: Option<(TargetIdentity, u64, super::pools::ResolvedResident)>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_SHARP=on`): the Catmull-Rom scaled
+    /// present, built on first use; `sharp_failed` keeps a refused build from
+    /// being retried every frame.
+    sharp: Option<super::present_sharp::PresentSharp>,
+    sharp_failed: bool,
 }
 
 /// Everything one in-flight present owns for as long as its blit is running.
@@ -830,6 +837,8 @@ impl WindowPresenter {
             // exists is one whose queue can address its surface.
             present_family_supported: present_capable,
             lab_restamp: None,
+            sharp: None,
+            sharp_failed: false,
         };
         // A window created while minimized has no swapchain yet, which is not a
         // failure to attach: `begin_present` retries every frame until the
@@ -1005,6 +1014,10 @@ impl WindowPresenter {
         // workaround assumes. The queue idled above, so no submitted work
         // references the old swapchain.
         let from = self.extent;
+        // TEMP (lab, PRESENT_SHARP): views of the old images go first.
+        if let Some(sharp) = self.sharp.as_mut() {
+            sharp.release_all(&ctx.device);
+        }
         if self.swapchain != vk::SwapchainKHR::null() {
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
@@ -1284,6 +1297,7 @@ impl WindowPresenter {
             .as_ref()
             .map(|(_, now)| BlitSource::Resident {
                 image: now.image,
+                view: now.view,
                 access: now.access,
                 next_access: super::pools::ResidentAccess::transfer_read(now.guest_imported),
                 width: now.width,
@@ -1350,7 +1364,32 @@ impl WindowPresenter {
                     (base_width, base_height),
                     (self.extent.width, self.extent.height),
                 );
-                if !vp.covers((self.extent.width, self.extent.height)) {
+                // TEMP (lab, PRESENT_SHARP): a scaled resident frame is drawn
+                // through the Catmull-Rom pass, which clears its own slate.
+                let sharp_view = match &blit {
+                    BlitSource::Resident { view, .. }
+                        if super::present_sharp::on()
+                            && *view != vk::ImageView::null()
+                            && (vp.width, vp.height) != (base_width, base_height) =>
+                    {
+                        if self.sharp.is_none() && !self.sharp_failed {
+                            match super::present_sharp::PresentSharp::create(
+                                &ctx.device,
+                                translate::pixel::SCANOUT_FORMAT,
+                                self.frames.len(),
+                            ) {
+                                Ok(s) => self.sharp = Some(s),
+                                Err(e) => {
+                                    self.sharp_failed = true;
+                                    crate::observe::fail(format!("present_sharp_refused build={e:?}"));
+                                }
+                            }
+                        }
+                        self.sharp.as_ref().map(|_| *view)
+                    }
+                    _ => None,
+                };
+                if sharp_view.is_none() && !vp.covers((self.extent.width, self.extent.height)) {
                     // Letterbox bars: clear the whole image first so stale
                     // swapchain pixels never frame the guest content.
                     ctx.device.cmd_clear_color_image(
@@ -1387,15 +1426,65 @@ impl WindowPresenter {
                     );
                 }
                 let src_layout = blit.record_read_barrier(&ctx.device, frame_cmd);
-                blit_rect(
-                    &ctx.device,
-                    frame_cmd,
-                    blit.image(),
-                    dst,
-                    src_layout,
-                    (0, 0, base_width, base_height),
-                    (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
-                );
+                let drew_sharp = match (sharp_view, self.sharp.as_mut()) {
+                    (Some(view), Some(sharp)) => {
+                        let src = super::present_sharp::SharpSource {
+                            image: blit.image(),
+                            view,
+                            layout: src_layout,
+                            width: base_width,
+                            height: base_height,
+                        };
+                        sharp
+                            .record(
+                                &ctx.device,
+                                frame_cmd,
+                                frame_ix,
+                                &src,
+                                dst,
+                                translate::pixel::SCANOUT_FORMAT,
+                                self.extent,
+                                (vp.x, vp.y, vp.width, vp.height),
+                                SLATE_CLEAR,
+                            )
+                            .map_err(|e| crate::observe::fail(format!("present_sharp_refused record={e:?}")))
+                            .is_ok()
+                    }
+                    _ => false,
+                };
+                if !drew_sharp {
+                    if sharp_view.is_some() && !vp.covers((self.extent.width, self.extent.height)) {
+                        ctx.device.cmd_clear_color_image(
+                            frame_cmd,
+                            dst,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &vk::ClearColorValue {
+                                float32: SLATE_CLEAR,
+                            },
+                            &[color_range],
+                        );
+                        ctx.device.cmd_pipeline_barrier(
+                            frame_cmd,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &[vk::MemoryBarrier::default()
+                                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)],
+                            &[],
+                            &[],
+                        );
+                    }
+                    blit_rect(
+                        &ctx.device,
+                        frame_cmd,
+                        blit.image(),
+                        dst,
+                        src_layout,
+                        (0, 0, base_width, base_height),
+                        (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
+                    );
+                }
                 if selected.is_some() {
                     probe_armed = lab_probe_record(
                         ctx,
@@ -1889,6 +1978,9 @@ impl WindowPresenter {
         }
         if let Some(staging) = self.staging.take() {
             staging.destroy(&ctx.device);
+        }
+        if let Some(mut sharp) = self.sharp.take() {
+            sharp.destroy(&ctx.device);
         }
         // Drained rather than iterated, so a second `destroy` — `create` calls
         // it on a failed `recreate_swapchain`, and the caller may call it again

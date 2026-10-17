@@ -1997,6 +1997,9 @@ pub(crate) struct ResolvedResident {
     /// blit leaves the image in, so it is part of the resolution and not a
     /// property re-derived at present time.
     pub guest_imported: bool,
+    /// The slot's own view, for TEMP (lab) `REIMS_VGPU_LAB_PRESENT_SHARP`,
+    /// which samples the frame instead of blitting it.
+    pub view: vk::ImageView,
 }
 
 /// Resolve a slot into what the window's blit needs from it.
@@ -2010,6 +2013,7 @@ pub(crate) fn slot_window_resolution(slot: &ResidentTargetSlot) -> ResolvedResid
         width: slot.width,
         height: slot.height,
         guest_imported: slot.memory.is_guest_imported(),
+        view: slot.view,
     }
 }
 
