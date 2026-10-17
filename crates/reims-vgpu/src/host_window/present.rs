@@ -511,7 +511,18 @@ fn guest_resize_request(
     incoming: (u32, u32),
     window: (u32, u32),
 ) -> bool {
-    mode == WindowMode::Sized && observed != Some(incoming) && incoming != window
+    mode == WindowMode::Sized && observed != Some(incoming) && incoming != window && !lab_fixed_window()
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_FIXED_WINDOW=1`): the window keeps the size it
+/// opened at and the presenter scales every guest mode into it — the scaled
+/// present path (`REIMS_VGPU_LAB_PRESENT_SHARP`) without a full-screen window.
+fn lab_fixed_window() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("REIMS_VGPU_LAB_FIXED_WINDOW").as_deref(), Ok("1" | "on")))
 }
 
 /// How a `Resized` event answers an outstanding guest-driven request, or

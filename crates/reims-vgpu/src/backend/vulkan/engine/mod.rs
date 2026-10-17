@@ -47,6 +47,10 @@ pub(crate) mod recorder;
 /// leases the guest's own delete releases.
 pub mod resource_lease;
 mod scatter_shader;
+#[cfg(feature = "host-window")]
+mod present_sharp_shader;
+#[cfg(feature = "host-window")]
+mod present_sharp;
 pub(crate) mod stamp_completion;
 /// The requested draw-time buffer-gather working set. Re-exported for the same
 /// reason: `pools` is private, and the number this reports is what a content
@@ -3108,6 +3112,8 @@ unsafe fn snapshot_window_source(
         width: resolved.width,
         height: resolved.height,
         guest_imported: false,
+        // A snapshot image has no view; PRESENT_SHARP blits it as before.
+        view: ash::vk::ImageView::null(),
     })
 }
 
