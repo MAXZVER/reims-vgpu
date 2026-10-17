@@ -260,6 +260,28 @@ pub const fn is_block_compressed(format: u16) -> bool {
     bc_block_bytes(format).is_some()
 }
 
+/// Whether `format` names a video chroma plane format (8-bit '420v' NV12 chroma,
+/// 10-bit 'x420' P010 chroma, or video integer companion planes).
+///
+/// NOTE: `MTL_FORMAT_R8_UNORM` and `MTL_FORMAT_R16_UNORM` are deliberately excluded
+/// because single-channel R8 is universally used for text font glyph atlases and
+/// opacity masks across macOS WindowServer, Finder, and AppKit. Matching R8 here
+/// causes all text-rendering passes to be falsely flagged as video streams.
+pub const fn is_video_chroma_format(format: u16) -> bool {
+    matches!(
+        format,
+        MTL_FORMAT_RG8_UNORM
+            | MTL_FORMAT_RG16_UNORM
+            | MTL_FORMAT_RG8_UINT
+            | MTL_FORMAT_RG16_UINT
+    )
+}
+
+/// Whether `format` names a biplanar video plane format.
+pub const fn is_video_or_biplanar_format(format: u16) -> bool {
+    is_video_chroma_format(format)
+}
+
 /// The [`TexelLayout`] a block-compressed guest format's bytes are already in,
 /// or `None` for an uncompressed one.
 ///

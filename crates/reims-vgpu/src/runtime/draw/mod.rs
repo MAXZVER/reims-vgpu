@@ -65,6 +65,8 @@ use reims_vgpu_protocol::pass_action::{
 // sibling of `metal`, and gated once here rather than per item.
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
+#[cfg(feature = "backend-vulkan")]
+pub mod synthesized_sampled;
 // Only for `exec`'s pass-extent census, which declares its own copy of these
 // bands because it runs on every backend. See
 // `the_two_coverage_censuses_use_the_same_bands`.
@@ -3159,6 +3161,7 @@ pub fn mrt_draw_request_with<M: HostMemory + HostOps, S: crate::runtime::exec::w
                         gva,
                         mw,
                         mh,
+                        Some(mfmt),
                     ) {
                         // TEMP (lab, ZERO_SEED): colour0's guest bytes are all
                         // zero, so loading them is clearing to [0; 4] — the pass
@@ -4124,7 +4127,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> Option<Vec<u8>> {
-    match seed_color_load_or_zero(state, host, task_id, texture_ref, target_gva, width, height)? {
+    match seed_color_load_or_zero(state, host, task_id, texture_ref, target_gva, width, height, None)? {
         ColorSeed::Bytes(bytes) => Some(bytes),
         ColorSeed::Zero => Some(vec![0u8; (width as usize) * (height as usize) * 4]),
     }
@@ -4168,6 +4171,7 @@ fn seed_color_load_or_zero<M: HostMemory + HostOps>(
     target_gva: u64,
     width: u32,
     height: u32,
+    format: Option<u16>,
 ) -> Option<ColorSeed> {
     // Discrete GPU: exact target GVA is the strongest identity across object-ref
     // recycling. Fall back to the normal texture namespace, never the
@@ -4431,12 +4435,36 @@ fn seed_color_load_or_zero<M: HostMemory + HostOps>(
         );
         return Some(ColorSeed::Zero);
     }
+    #[cfg(feature = "backend-vulkan")]
+    let native = {
+        let fmt = format.filter(|&f| f != 0).or_else(|| {
+            if texture_ref != 0 {
+                let (tex_ref, _, fmt_override) = resolve_texture_view(state, host, task_id, texture_ref)
+                    .map(|view| (view.base_texture_ref, view.level, view.pixel_format))
+                    .unwrap_or((texture_ref, 0, None));
+                fmt_override.or_else(|| {
+                    objects::lookup_list_entry(state, host, task_id, tex_ref)
+                        .and_then(|e| objects::read_descriptor(state, host, task_id, &e))
+                        .and_then(|d| decode_texture_descriptor(&d).ok())
+                        .map(|t| t.pixel_format)
+                })
+            } else {
+                None
+            }
+        }).unwrap_or(0);
+        let mut n = vulkan::native_uploads_for(fmt);
+        n.bgra8 = false;
+        n
+    };
+    #[cfg(not(feature = "backend-vulkan"))]
+    let native = NativeUploads::NONE;
+
     let (rgba, _layout) = load_sampled_rgba_static(
         state,
         host,
         task_id,
         texture_ref,
-        NativeUploads::NONE,
+        native,
         crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
     )?;
     Some(ColorSeed::Bytes(rgba))

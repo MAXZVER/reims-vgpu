@@ -698,6 +698,15 @@ impl PendingWritebacks {
         taken
     }
 
+    /// Cancel any pending writeback debt for `mapping_id` (e.g. when mapping is unmapped/released).
+    pub fn drop_mapping(&mut self, mapping_id: u32) -> bool {
+        let dropped = self.debts.remove(&mapping_id).is_some();
+        if dropped {
+            crate::runtime::drain::note_store_route("wbdebt_cancelled_on_refresh_or_unmap");
+        }
+        dropped
+    }
+
     /// Every mapping owed a frame, oldest arm first.
     pub fn mappings_by_age(&self) -> Vec<u32> {
         let mut all: Vec<(u64, u32)> = self.debts.iter().map(|(id, d)| (d.seq, *id)).collect();
@@ -3159,12 +3168,31 @@ fn pay<M: HostMemory + HostOps>(
     let Some(entry) = state.mappings.get(&mapping_id) else {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
         lab_pay_exit(mapping_id, &debt, "no_mapping");
+        crate::backend::selected().abandon_resident(&debt.target);
         return;
     };
+    if entry.released_since_resolve {
+        crate::runtime::drain::note_store_route("wbdebt_cancelled_released");
+        lab_pay_exit(mapping_id, &debt, "released_since_resolve");
+        crate::backend::selected().abandon_resident(&debt.target);
+        return;
+    }
+    let gpas: Vec<u64> = entry
+        .page_entries
+        .iter()
+        .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, state.page_shift))
+        .collect();
+    if let Some(_armed) = state.host_writes.first_armed(&gpas) {
+        crate::runtime::drain::note_store_route("wbdebt_cancelled_released_page");
+        lab_pay_exit(mapping_id, &debt, "armed_page_released");
+        crate::backend::selected().abandon_resident(&debt.target);
+        return;
+    }
     let (map_generation, validity) = (entry.map_generation, entry.validity);
     if map_generation != debt.map_generation {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
         lab_pay_exit(mapping_id, &debt, "generation_moved");
+        crate::backend::selected().abandon_resident(&debt.target);
         return;
     }
     // The resident the draw registered, not the one a fresh derivation would

@@ -368,6 +368,16 @@ impl PageEpochs {
         }
     }
 
+    /// Whether `page` is armed right now (read-only; nothing is disarmed).
+    fn is_armed(&self, page: u64) -> bool {
+        let chunk_key = page / EPOCHS_PER_CHUNK as u64;
+        let slot = (page % EPOCHS_PER_CHUNK as u64) as usize;
+        self.chunks
+            .get(&chunk_key)
+            .and_then(|chunk| chunk.released.as_deref())
+            .is_some_and(|released| released[slot] != 0)
+    }
+
     fn note_pages<I>(&mut self, pages: I, epoch: u64, page_shift: u32)
     where
         I: IntoIterator<Item = u64>,
@@ -632,6 +642,18 @@ impl HostWrites {
     /// The guest has mapped `gpa` again, so writing to it is legitimate.
     pub fn remap_page(&mut self, gpa: u64) {
         self.pages.disarm(gpa >> self.page_shift);
+    }
+
+    /// The first of `pages` that is armed right now — released by the guest
+    /// and not mapped again — or `None`. Read-only: asking disarms nothing and
+    /// records no write. One chunk lookup per page, the same cost as recording
+    /// the write. This is what the release-write guard asks before a write
+    /// through a *retained* translation.
+    pub fn first_armed(&self, pages: &[u64]) -> Option<u64> {
+        pages
+            .iter()
+            .copied()
+            .find(|&gpa| self.pages.is_armed(gpa >> self.page_shift))
     }
 
     /// Take the findings recorded since the last drain.

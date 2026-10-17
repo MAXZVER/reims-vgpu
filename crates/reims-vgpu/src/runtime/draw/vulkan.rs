@@ -3448,15 +3448,17 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
     sampled_base_gva: Option<u64>,
 ) -> Option<(u32, u32, AttachmentAliasSample<'a>)> {
     let color = req.colors.iter().find(|color| {
-        color.texture_ref == texture_ref && color.mapping_id == 0 && color.target_gva != 0
+        color.texture_ref == texture_ref && (color.target_gva != 0 || color.mapping_id != 0)
     })?;
-    if sampled_base_gva.is_some_and(|base| base != color.target_gva) {
+    if color.target_gva != 0 && sampled_base_gva.is_some_and(|base| base != color.target_gva) {
         crate::runtime::drain::note_store_route("attachment_alias_other_level");
         return None;
     }
+    let bpp = pixel_format::store_texel_order(color.format)
+        .map_or(RGBA8_BPP, |layout| layout.bytes_per_texel());
     let need = (color.width as usize)
         .checked_mul(color.height as usize)?
-        .checked_mul(RGBA8_BPP as usize)?;
+        .checked_mul(bpp as usize)?;
     match color.load_action {
         MTL_LOAD_ACTION_CLEAR => Some((
             color.width,
@@ -3478,7 +3480,7 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
             // A secondary has no CPU seed and no chain flag of its own: its Load
             // is always the registry resident (`build_secondary_targets`), so
             // that resident is what the pass's earlier draws left there.
-            if req.chain_from_resident || color.slot != 0 {
+            if req.chain_from_resident || req.gva_load_from_resident || color.slot != 0 {
                 return Some((
                     color.width,
                     color.height,
@@ -9878,7 +9880,7 @@ fn native_scratch_to_upload(
 /// arm is lossy, which is exactly the set the half-float flag can change the
 /// answer for — so keying on it is the same rule stated once, not a fast path
 /// that could disagree with the slow one.
-fn native_uploads_for(sample_format: u16) -> NativeUploads {
+pub(super) fn native_uploads_for(sample_format: u16) -> NativeUploads {
     // One question, derived from the loader itself rather than approximated by
     // a second list. `native_bind_is_host_gated` compares the loader's answer
     // with every gate shut against its answer with every gate open, so the set
@@ -12125,10 +12127,10 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         ("fragment", &f_shader, &req.fragment_textures),
     ] {
         if let Some((index, descriptor)) =
-            crate::runtime::spirv_bind::first_non_sampled_texture_descriptor(&shader.reflection)
+            crate::runtime::spirv_bind::first_unsupported_texture_descriptor(&shader.reflection)
         {
             let access = match descriptor.access {
-                crate::runtime::spirv_bind::ReflectedTextureAccess::Storage => "storage",
+                crate::runtime::spirv_bind::ReflectedTextureAccess::Storage => continue,
                 crate::runtime::spirv_bind::ReflectedTextureAccess::Unknown => "unknown",
                 crate::runtime::spirv_bind::ReflectedTextureAccess::Sampled => continue,
             };
@@ -12885,8 +12887,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 if let Some(descriptor) = reflected_descriptor {
                     use crate::runtime::spirv_bind::ReflectedTextureAccess;
                     let unsupported = match descriptor.access {
-                        ReflectedTextureAccess::Sampled => None,
-                        ReflectedTextureAccess::Storage => Some("storage"),
+                        ReflectedTextureAccess::Sampled | ReflectedTextureAccess::Storage => None,
                         ReflectedTextureAccess::Unknown => Some("unknown"),
                     };
                     if let Some(access) = unsupported {
@@ -12975,7 +12976,11 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                                 SampledSourceRequest::Bytes(
                                     std::sync::Arc::new(seed.to_vec()),
                                     None,
-                                    SampledByteFormat::from_source(TexelLayout::Rgba8, stored),
+                                    SampledByteFormat::from_source(
+                                        pixel_format::store_texel_order(stored)
+                                            .unwrap_or(TexelLayout::Rgba8),
+                                        stored,
+                                    ),
                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
                                 ),
                             ),
@@ -13696,6 +13701,33 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 push_tex(t.index, t.texture_ref, t.resource.as_ref(), true)?;
             }
         }
+        // These bindings have no Metal argument-table slot: reflection names
+        // descriptors the translator retained for explicit null texture handles.
+        // Use the same relocation as the corresponding executable variant.
+        for (reflection, relocated, stage) in [
+            (&*v_shader.reflection, false, "vertex"),
+            (&*f_shader.reflection, separate_sampled, "fragment"),
+        ] {
+            let before = images.len();
+            super::synthesized_sampled::append_null_textures(reflection, relocated, &mut images)
+                .map_err(|reason| {
+                    DrawError::DrawPreparation(DrawPreparationDecline::SynthesizedSampled {
+                        stage,
+                        reason,
+                    })
+                })?;
+            for image in &images[before..] {
+                let key = (u64::from(req.pipeline_ref) << 32)
+                    | (u64::from(image.binding) << 1)
+                    | u64::from(relocated);
+                if crate::observe::first_sight("synthesized_null_texture_served", key) {
+                    crate::observe::fail(format!(
+                        "synthesized_null_texture_served pipe={} task={} stage={stage} binding={} 1x1",
+                        req.pipeline_ref, req.task_id, image.binding
+                    ));
+                }
+            }
+        }
         // Repair the gaps the guard found. A fragment texture the module
         // statically uses and this draw did not bind is absent from the
         // descriptor set layout *entirely* — `engine/exec.rs` builds the layout
@@ -14366,9 +14398,11 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         target_guest_seed = Some(seed);
                     } else if color0_seed.is_some() {
                         seed_door = "color_seed";
+                        let expected_bpp = crate::protocol::pixel_format::store_texel_order(c0.format)
+                            .map_or(4, |layout| layout.bytes_per_texel() as usize);
                         if color0_seed
                             .as_ref()
-                            .is_some_and(|seed| seed.len() == (w as usize) * (h as usize) * 4)
+                            .is_some_and(|seed| seed.len() == (w as usize) * (h as usize) * expected_bpp)
                         {
                             // seed_color_load selected this by RT provenance.
                             // Black/transparent bytes are valid attachment data.
@@ -14754,6 +14788,16 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 .colors
                 .first()
                 .is_some_and(|color| color.multisample_source_ref != 0),
+            multisample_source: req
+                .colors
+                .first()
+                .filter(|color| color.multisample_source_ref != 0 && msaa_load_enabled())
+                .map_or(0, |color| {
+                    (u64::from(req.task_id) << 32) | u64::from(color.multisample_source_ref)
+                }),
+            multisample_load: req.colors.first().is_some_and(|color| {
+                color.multisample_source_ref != 0 && color.load_action == MTL_LOAD_ACTION_LOAD
+            }),
             ..crate::backend::vulkan::engine::DrawRequest::default()
         };
         let resolving_colors = req
@@ -14781,8 +14825,13 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             .first()
             .filter(|color| color.multisample_source_ref != 0)
         {
-            use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
-            if color.store_action != MTL_STORE_ACTION_MULTISAMPLE_RESOLVE {
+            use reims_vgpu_protocol::pass_action::{
+                MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
+                MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+            };
+            if color.store_action != MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
+                && color.store_action != MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
+            {
                 return Err(DrawError::Unsupported(
                     crate::backend::vulkan::engine::reason::DrawReason::MultisampleStoreActionUnsupported {
                         store_action: color.store_action,
@@ -14790,11 +14839,21 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 ));
             }
             if color.load_action == MTL_LOAD_ACTION_LOAD {
-                return Err(DrawError::Unsupported(
-                    crate::backend::vulkan::engine::reason::DrawReason::MultisampleLoadActionUnsupported {
-                        load_action: color.load_action,
-                    },
-                ));
+                match msaa_load_admission(msaa_load_enabled()) {
+                    MsaaLoadAdmission::Persistent => {
+                        crate::runtime::drain::note_store_route(
+                            MsaaLoadAdmission::Persistent.slug(),
+                        );
+                    }
+                    MsaaLoadAdmission::Disabled => {
+                        crate::runtime::drain::note_store_route(MsaaLoadAdmission::Disabled.slug());
+                        return Err(DrawError::Unsupported(
+                            crate::backend::vulkan::engine::reason::DrawReason::MultisampleLoadActionUnsupported {
+                                load_action: color.load_action,
+                            },
+                        ));
+                    }
+                }
             }
         }
         resources.viewports = req
@@ -23176,5 +23235,85 @@ fn lab_seed_trace(
         None => format!("lab_seed_trace door={door} src={src} mid={mapping_id} {w}x{h} declared={declared:?} unmapped"),
     };
     crate::observe::off(line);
+}
+
+/// Whether a multisample-resolve pass may `MTLLoadActionLoad` its multisample source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MsaaLoadAdmission {
+    /// Served through the per-source persistent multisample image.
+    Persistent,
+    /// `REIMS_VGPU_MSAA_LOAD=0`: the legacy refusal.
+    Disabled,
+}
+
+impl MsaaLoadAdmission {
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Persistent => "msaa_load_admitted",
+            Self::Disabled => "msaa_load_refused_disabled",
+        }
+    }
+}
+
+/// Pure rule behind [`MsaaLoadAdmission`].
+pub(crate) fn msaa_load_admission(enabled: bool) -> MsaaLoadAdmission {
+    if enabled {
+        MsaaLoadAdmission::Persistent
+    } else {
+        MsaaLoadAdmission::Disabled
+    }
+}
+
+/// `REIMS_VGPU_MSAA_LOAD`, read once (default on).
+pub(crate) fn msaa_load_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match crate::config::read(crate::config::MSAA_LOAD) {
+        (crate::config::Switch::Off, _) => {
+            crate::observe::fail(
+                "msaa_load_disabled reason=disabled_by_env (a multisample Load drops the draw; one discard-only slot)",
+            );
+            false
+        }
+        (crate::config::Switch::Unrecognized, value) => {
+            crate::observe::fail(format!(
+                "msaa_load reason=msaa_load_env_unrecognized value={:?} (kept on)",
+                value.unwrap_or_default()
+            ));
+            true
+        }
+        _ => true,
+    })
+}
+
+#[cfg(test)]
+mod msaa_load_admission_tests {
+    use super::{msaa_load_admission, MsaaLoadAdmission};
+
+    #[test]
+    fn on_admits_and_off_restores_v13() {
+        assert_eq!(msaa_load_admission(true), MsaaLoadAdmission::Persistent);
+        assert_eq!(msaa_load_admission(false), MsaaLoadAdmission::Disabled);
+        assert_ne!(
+            MsaaLoadAdmission::Persistent.slug(),
+            MsaaLoadAdmission::Disabled.slug()
+        );
+    }
+}
+
+#[cfg(test)]
+mod storage_texture_admission_tests {
+    #[test]
+    fn storage_texture_binding_mapping() {
+        use crate::runtime::spirv_bind::{is_storage_texture_binding, STORAGE_TEXTURE_BINDING_BASE};
+
+        assert!(!is_storage_texture_binding(0));
+        assert!(!is_storage_texture_binding(31));
+
+        let b0 = STORAGE_TEXTURE_BINDING_BASE;
+        assert!(is_storage_texture_binding(b0));
+
+        let b5 = STORAGE_TEXTURE_BINDING_BASE + 5;
+        assert!(is_storage_texture_binding(b5));
+    }
 }
 

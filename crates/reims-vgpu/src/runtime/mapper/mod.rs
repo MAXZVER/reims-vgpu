@@ -685,6 +685,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         m.page_table_kva = plan.page_table_kva;
         m.mapping_internal = internal;
         m.mapped = true;
+        m.released_since_resolve = false;
         if std::mem::take(&mut m.repoint_keep) {
             // TEMP (lab, REPOINT_KEEP): the re-pointed list is in.
             crate::runtime::drain::note_store_route("repoint_keep_carried");
@@ -1881,6 +1882,12 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     let Some(m) = state.mappings.get(&mapping_id) else {
         return GuestWriteVerdict::NoMapping;
     };
+    if m.is_video_stream
+        || crate::protocol::pixel_format::is_video_or_biplanar_format(m.format)
+        || crate::protocol::pixel_format::is_video_chroma_format(m.format)
+    {
+        return GuestWriteVerdict::Wrote;
+    }
     // The dominant disjunct is the first, and the reason is the shim's arming
     // window rather than anything about this mapping. `reims_vgpu_dirty_track`
     // sets `arm_at = harvests + 1`, and `reims_vgpu_dirty_harvest` pins

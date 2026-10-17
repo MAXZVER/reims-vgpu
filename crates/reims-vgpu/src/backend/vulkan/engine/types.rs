@@ -484,6 +484,13 @@ pub struct DrawRequest {
     /// Rasterize into an N-sample attachment and resolve into the ordinary
     /// primary target at render-pass end.
     pub multisample_resolve: bool,
+    /// The guest multisample source this resolve pass renders through,
+    /// as `(task << 32) | texture_ref`. Non-zero selects the per-source
+    /// persistent multisample image (`acquire_multisample_source`); zero keeps
+    /// the legacy discard-only slot.
+    pub multisample_source: u64,
+    /// The guest asked `MTLLoadActionLoad` for the multisample source.
+    pub multisample_load: bool,
     /// Every viewport the guest bound, in its order. Empty takes the
     /// full-target default, and so does any slot past the end of this list when
     /// [`Self::scissors`] is longer — the two counts are independent in Metal

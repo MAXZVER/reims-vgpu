@@ -564,6 +564,17 @@ pub fn map_fresh_span_within<H: HostMemory + HostOps>(
         let (_tid, task) = resolve_task_for_walk(&state.tasks, task_id)?;
         collect_span_gpas(host, task, gva, length, page_shift).ok()?
     };
+    if let Some(armed_gpa) = state.host_writes.first_armed(&gpas) {
+        crate::runtime::drain::note_store_route("released_write_blocked");
+        crate::runtime::drain::note_store_route("released_write_blocked_site_gva_fresh_span");
+        if crate::observe::first_sight("released_write_blocked_gva_fresh", armed_gpa) {
+            crate::observe::fail(format!(
+                "released_write_blocked site=gva_fresh_span task={task_id} gva={gva:#x} gpa={armed_gpa:#x} \
+                 (target pages were released by the guest; fresh span map declined to protect guest kernel)"
+            ));
+        }
+        return None;
+    }
     if !span_within_window(&gpas, allowed) {
         return None;
     }
@@ -720,6 +731,17 @@ fn span_multi<H: HostMemory + HostOps>(
         collect_span_gpas(host, task, gva, length, page_shift)?
     };
     if copy.is_write() {
+        if let Some(armed_gpa) = state.host_writes.first_armed(&gpas) {
+            crate::runtime::drain::note_store_route("released_write_blocked");
+            crate::runtime::drain::note_store_route("released_write_blocked_site_gva_span_write");
+            if crate::observe::first_sight("released_write_blocked_gva_span", armed_gpa) {
+                crate::observe::fail(format!(
+                    "released_write_blocked site=gva_span_write task={task_id} gva={gva:#x} gpa={armed_gpa:#x} \
+                     (target pages were released by the guest; GVA span write declined to protect guest kernel)"
+                ));
+            }
+            return Err(MemError::WriteOutsideWindow);
+        }
         // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
         // witness. Recorded here, after the walk that names them and before any
         // of them is written, so a refusal below costs a spurious invalidation
