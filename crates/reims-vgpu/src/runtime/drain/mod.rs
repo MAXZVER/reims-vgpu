@@ -7098,6 +7098,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     } else {
         channel_id
     };
+    // TEMP (lab): op0x06 costs ~5 ms a present on Maps (n361/b658); these
+    // spans split it (lab_px_*_us in the chain_phase line, ROUTES=on).
+    let lab_px = crate::runtime::chain_phase::CostSpan::new("lab_px_drains_us");
     drain_other_child_fifos(state, host, skip);
     drain_other_child_fifos(state, host, skip);
     // Main-ring Dekker only (not full drain_stranded): guest may
@@ -7115,6 +7118,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // Body-layer child work may be doorbell'd from main packets.
         drain_other_child_fifos(state, host, skip);
     }
+    drop(lab_px);
 
     // Preflight translation keeps an EXEC packet at its channel head. If one
     // is still held after all rescue drains, accepting this display packet
@@ -7159,11 +7163,15 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     // A presented framebuffer is what WindowServer copies from with the CPU,
     // unannounced, to fill the next back buffer. Its frame has to be in its
     // pages before anything after this swap can reach the guest.
+    let lab_px = crate::runtime::chain_phase::CostSpan::new("lab_px_pay_us");
     crate::runtime::writeback_debt::pay_cpu_shared_mapping(state, host, mapping);
+    drop(lab_px);
     // x86: present surface_id → backing object-list slot (heap index =
     // IOSurface getSurfaceID). Arm: MappingInternal page-table resolve.
     // Always attempt backing when pages empty; then iosfc/mapper path.
+    let lab_px = crate::runtime::chain_phase::CostSpan::new("lab_px_surface_us");
     let _ = crate::runtime::objects::ensure_surface_for_present(state, host, mapping);
+    drop(lab_px);
     let force = state
         .mappings
         .get(&mapping)
@@ -7272,7 +7280,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // rotation step behind the one the guest asked for — residue when a
         // window closed in between, a stale region when one moved, thrash as
         // the choice oscillates.
+        let lab_px = crate::runtime::chain_phase::CostSpan::new("lab_px_capture_us");
         let encoded = crate::runtime::scanout::capture_present_frame(state, mapping, w, h, gen);
+        drop(lab_px);
         if !encoded {
             // Retry encode at first host paint. Do **not** clear
             // frame_valid: PGDisplay keeps the prior presentFrame
@@ -7352,7 +7362,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // `copy_to_bgra8`'s Unchanged/expected_generation checks on the QEMU
         // paint; with no paint action produced, the window resolves the frame
         // from `state.present` directly and the distinction has no consumer.
+        let lab_px = crate::runtime::chain_phase::CostSpan::new("lab_px_enqueue_us");
         enqueue_present_scanout(state, host, w, h);
+        drop(lab_px);
         // Entry-side waitForPendingFrames / apple-gfx pending_frames:
         // count accepted presents until host paint. Stamp still
         // fires with this packet (below) — PGDisplay completion
