@@ -9965,6 +9965,9 @@ mod depth_load_tests {
 /// the window counts: a non-zero pad byte answers `false`, the safe direction.
 fn guest_runs_are_zero(source: &super::GuestRunSource) -> bool {
     let (mut skip, mut left) = (source.source_offset, source.total_len);
+    // The window as (host address, length) spans; addresses as usize so the
+    // list can cross to the scan threads.
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(source.runs.len());
     for run in source.runs.iter() {
         if left == 0 {
             break;
@@ -9975,19 +9978,135 @@ fn guest_runs_are_zero(source: &super::GuestRunSource) -> bool {
             continue;
         }
         let n = (len - skip).min(left);
-        // SAFETY: a run's host pointer is a live RAMBlock alias for `run.len()`
-        // bytes for the VM lifetime (the contract `write_staging_from_runs`
-        // relies on); `skip + n <= run.len()`.
-        let bytes = unsafe {
-            std::slice::from_raw_parts((run.host_ptr() as *const u8).add(skip as usize), n as usize)
-        };
-        if bytes.chunks(4096).any(|c| c.iter().fold(0u8, |a, &b| a | b) != 0) {
-            return false;
-        }
+        // SAFETY (for the reads below): a run's host pointer is a live RAMBlock
+        // alias for `run.len()` bytes for the VM lifetime (the contract
+        // `write_staging_from_runs` relies on); `skip + n <= run.len()`.
+        spans.push((run.host_ptr() as usize + skip as usize, n as usize));
         skip = 0;
         left -= n;
     }
-    left == 0
+    if left != 0 {
+        return false;
+    }
+    zero_scan_spans(&spans, source.total_len as usize)
+}
+
+/// TEMP (lab, Opus 2026-10-18): the ZERO_SEED scan split across threads.
+///
+/// A heavy WebGL page (ZCode's raymarch scene, b704) seeds a fresh 5K target
+/// about 56 times a second from guest pages WebKit just zero-filled: 841 seeds,
+/// 32.7 GB scanned in 15 s, `acq_seed_us` 1.52 s of a 15.1 s drain - 1.8 ms a
+/// seed on one thread at ~21 GB/s, all of it on the draw's critical path. Above
+/// [`ZERO_SCAN_PAR_MIN`] the spans are cut into byte-balanced parts scanned by
+/// scoped threads, which stop at the first non-zero word any of them finds; the
+/// answer is the same as the serial scan's. `REIMS_VGPU_LAB_ZERO_SCAN_THREADS`
+/// (default 4, `1` = the serial scan) sets the width; live `ZERO_SCAN_PAR=off`
+/// forces the serial scan within a boot for A/B.
+fn zero_scan_spans(spans: &[(usize, usize)], total: usize) -> bool {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let threads = *THREADS.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_ZERO_SCAN_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4usize)
+            .clamp(1, 16)
+    });
+    let live_off = crate::runtime::lab_live::on("ZERO_SCAN_PAR") == Some(false);
+    if threads == 1 || live_off || total < ZERO_SCAN_PAR_MIN {
+        return spans.iter().all(|&(p, n)| zero_scan_bytes(p, n, None));
+    }
+    // Cut the spans into `threads` parts of about equal byte count; a span may
+    // be divided between two parts.
+    let per = total.div_ceil(threads);
+    let mut parts: Vec<Vec<(usize, usize)>> = vec![Vec::new()];
+    let mut fill = 0usize;
+    for &(mut p, mut n) in spans {
+        while n > 0 {
+            let take = n.min(per - fill);
+            parts.last_mut().expect("one part").push((p, take));
+            p += take;
+            n -= take;
+            fill += take;
+            if fill == per {
+                parts.push(Vec::new());
+                fill = 0;
+            }
+        }
+    }
+    let found = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let mut parts = parts.into_iter().filter(|p| !p.is_empty());
+        let first = parts.next();
+        for part in parts {
+            let found = &found;
+            s.spawn(move || {
+                if !part.iter().all(|&(p, n)| zero_scan_bytes(p, n, Some(found))) {
+                    found.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+        if let Some(part) = first {
+            if !part.iter().all(|&(p, n)| zero_scan_bytes(p, n, Some(&found))) {
+                found.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+    !found.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Below this the serial scan wins over spawning threads (a 5K target is ~39 MB).
+const ZERO_SCAN_PAR_MIN: usize = 8 << 20;
+
+/// Whether `n` bytes at host address `p` are all zero, OR-ing 64-byte blocks of
+/// words and stopping early when `stop` says another part already found data.
+fn zero_scan_bytes(p: usize, n: usize, stop: Option<&std::sync::atomic::AtomicBool>) -> bool {
+    // SAFETY: see `guest_runs_are_zero` - every span lies inside a live RAMBlock
+    // alias; reads only.
+    let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, n) };
+    for chunk in bytes.chunks(64 << 10) {
+        if stop.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+            return true; // the caller already has its answer
+        }
+        // SAFETY: u64 has no invalid bit patterns; `align_to` keeps the
+        // unaligned head and tail as bytes.
+        let (head, words, tail) = unsafe { chunk.align_to::<u64>() };
+        if head.iter().any(|&b| b != 0) || tail.iter().any(|&b| b != 0) {
+            return false;
+        }
+        if words.chunks(8).any(|w| w.iter().fold(0u64, |a, &x| a | x) != 0) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod zero_scan_tests {
+    use super::{zero_scan_spans, ZERO_SCAN_PAR_MIN};
+
+    fn spans_of(bufs: &[Vec<u8>]) -> (Vec<(usize, usize)>, usize) {
+        let spans: Vec<(usize, usize)> = bufs.iter().map(|b| (b.as_ptr() as usize, b.len())).collect();
+        let total = spans.iter().map(|s| s.1).sum();
+        (spans, total)
+    }
+
+    /// The threaded scan answers exactly as the serial one: zero windows of
+    /// several spans are zero, and one non-zero byte anywhere - first span,
+    /// a span cut between two parts, the last byte - makes the window non-zero.
+    #[test]
+    fn threaded_scan_matches_serial_answers() {
+        let sizes = [ZERO_SCAN_PAR_MIN / 3 + 7, ZERO_SCAN_PAR_MIN / 2 + 4093, ZERO_SCAN_PAR_MIN];
+        let mut bufs: Vec<Vec<u8>> = sizes.iter().map(|&n| vec![0u8; n]).collect();
+        let (spans, total) = spans_of(&bufs);
+        assert!(total >= ZERO_SCAN_PAR_MIN);
+        assert!(zero_scan_spans(&spans, total));
+        for (bi, at) in [(0usize, 0usize), (1, sizes[1] / 2), (2, sizes[2] - 1)] {
+            bufs[bi][at] = 1;
+            let (spans, total) = spans_of(&bufs);
+            assert!(!zero_scan_spans(&spans, total), "byte {at} of span {bi}");
+            bufs[bi][at] = 0;
+        }
+    }
 }
 
 /// TEMP (lab): ZERO_SEED for guest-page target seeds on the recorder - live
