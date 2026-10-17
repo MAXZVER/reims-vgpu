@@ -12075,19 +12075,25 @@ mod lab_chan {
     }
 
     pub(super) fn compositor_first() -> Option<u32> {
-        // TEMP (lab, live `COMPOSITOR_FIRST=on|off`, else env, default off): n379 read
-        // the presenting channel's latency as pre=6-10 ms waiting behind ch1's render
-        // tranches (channel census: ch1 busy 5.7-6.9 s of an 11-s window while ch5
-        // waits 3.9-4.7 s). The 2026-10-02 verdict ("does not help, WindowServer's
-        // buffers share ch1") predates per-task channels; the compositor now has its
-        // own channel with its own EXECs, so the reorder is live-switchable and worth
-        // one phased verdict.
+        // TEMP (lab, live `COMPOSITOR_FIRST=on|off`, else env
+        // `REIMS_VGPU_LAB_COMPOSITOR_FIRST=off` to disable; default ON since
+        // n380/n381/n382 2026-10-17): the presenting channel is served before the
+        // other channels of the pass. n379 read its latency as pre=6-10 ms waiting
+        // behind ch1's render tranches (channel census: ch1 busy 5.7-6.9 s of an
+        // 11-s window while ch5 waits 3.9-4.7 s). The 2026-10-02 verdict ("does not
+        // help, WindowServer's buffers share ch1") predates per-task channels; with
+        // the compositor on its own channel the reorder bought Maps +3.6..+10.5 fps
+        // in all four alternating pairs, canvas and fullscreen toggles neutral, ART 0.
         let on = if let Some(on) = crate::runtime::lab_live::on("COMPOSITOR_FIRST") {
             on
         } else {
+            // Default ON since n380/n381/n382 (2026-10-17): Maps +3.6..+10.5 fps in all
+            // four alternating pairs, canvas neutral (noise), Safari/Finder fullscreen
+            // toggles neutral, ART 0. `REIMS_VGPU_LAB_COMPOSITOR_FIRST=off` reverts a
+            // boot; the live key flips it per phase.
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ON.get_or_init(|| {
-                std::env::var("REIMS_VGPU_LAB_COMPOSITOR_FIRST").is_ok_and(|v| v == "on")
+                std::env::var("REIMS_VGPU_LAB_COMPOSITOR_FIRST").as_deref() != Ok("off")
             })
         };
         if !on {
