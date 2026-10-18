@@ -1605,6 +1605,20 @@ pub const MSAA_RESOLVE_CLEAR_SLOT: &str = "REIMS_VGPU_MSAA_RESOLVE_CLEAR_SLOT";
 /// restores legacy behavior (one discard-only slot, Load refused); logged once as
 /// `msaa_load_disabled`.
 pub const MSAA_LOAD: &str = "REIMS_VGPU_MSAA_LOAD";
+
+/// **Default off (lab).** `on` makes the two writeback-debt exits that drop a
+/// debt without paying it — the mapping is gone (`no_mapping`) or its
+/// generation moved (`generation_moved`), both counted as
+/// `wbdebt_generation_moved` — also call `abandon_resident` on the debt's
+/// target, as the `abandoned_guest_wrote` exit already does. Only
+/// `pay_deferred` is governed by this switch: `pay` releases the resident on
+/// these exits unconditionally. `abandon_resident` is what lets the reclaim
+/// paths take the resident; without it the resident is retained. Each such call
+/// notes `wbdebt_abandoned_on_dropped_exit`.
+///
+/// Unset or `off` is the shipping behaviour. Stays opt-in until a 30-minute
+/// Simulator A/B of retained VRAM says otherwise.
+pub const LAB_WBDEBT_ABANDON_ON_EXIT: &str = "REIMS_VGPU_LAB_WBDEBT_ABANDON_ON_EXIT";
 }
 
 counts! {
