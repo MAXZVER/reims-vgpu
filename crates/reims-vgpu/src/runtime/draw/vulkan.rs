@@ -12125,9 +12125,18 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         ("fragment", &f_shader, &req.fragment_textures),
     ] {
         if let Some((index, descriptor)) =
-            crate::runtime::spirv_bind::first_non_sampled_texture_descriptor(&shader.reflection)
+            if storage_textures_lab_enabled() {
+                crate::runtime::spirv_bind::first_unsupported_texture_descriptor(&shader.reflection)
+            } else {
+                crate::runtime::spirv_bind::first_non_sampled_texture_descriptor(&shader.reflection)
+            }
         {
             let access = match descriptor.access {
+                crate::runtime::spirv_bind::ReflectedTextureAccess::Storage
+                    if storage_textures_lab_enabled() =>
+                {
+                    continue
+                }
                 crate::runtime::spirv_bind::ReflectedTextureAccess::Storage => "storage",
                 crate::runtime::spirv_bind::ReflectedTextureAccess::Unknown => "unknown",
                 crate::runtime::spirv_bind::ReflectedTextureAccess::Sampled => continue,
@@ -12886,6 +12895,10 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                     use crate::runtime::spirv_bind::ReflectedTextureAccess;
                     let unsupported = match descriptor.access {
                         ReflectedTextureAccess::Sampled => None,
+                        ReflectedTextureAccess::Storage if storage_textures_lab_enabled() => {
+                            crate::runtime::drain::note_store_route("draw_storage_texture_lab_bound");
+                            None
+                        }
                         ReflectedTextureAccess::Storage => Some("storage"),
                         ReflectedTextureAccess::Unknown => Some("unknown"),
                     };
@@ -23178,3 +23191,52 @@ fn lab_seed_trace(
     crate::observe::off(line);
 }
 
+/// [`crate::config::LAB_STORAGE_TEXTURES`] state to arm: only an explicit `on`.
+pub(crate) fn storage_textures_from_switch(state: crate::config::Switch) -> bool {
+    matches!(state, crate::config::Switch::On)
+}
+
+/// `REIMS_VGPU_LAB_STORAGE_TEXTURES`, read once (default off).
+pub(crate) fn storage_textures_lab_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let (state, value) = crate::config::read(crate::config::LAB_STORAGE_TEXTURES);
+        let on = storage_textures_from_switch(state);
+        if state == crate::config::Switch::Unrecognized {
+            crate::observe::fail(format!(
+                "storage_textures reason=storage_textures_env_unrecognized value={:?} (kept off)",
+                value.unwrap_or_default()
+            ));
+        }
+        if on {
+            crate::observe::fail(
+                "storage_textures_lab_enabled reason=read_only (sampled-pool image without STORAGE usage; stores are not written back)",
+            );
+        }
+        crate::observe::off(format!("lab_storage_textures on={on} switch={state:?}"));
+        on
+    })
+}
+
+#[cfg(test)]
+mod storage_texture_admission_tests {
+    use crate::config::Switch;
+
+    #[test]
+    fn the_lab_switch_is_default_off() {
+        assert!(!super::storage_textures_from_switch(Switch::Unset));
+        assert!(!super::storage_textures_from_switch(Switch::Off));
+        assert!(!super::storage_textures_from_switch(Switch::Unrecognized));
+        assert!(super::storage_textures_from_switch(Switch::On));
+    }
+
+    #[test]
+    fn storage_texture_binding_mapping() {
+        use crate::runtime::spirv_bind::{is_storage_texture_binding, STORAGE_TEXTURE_BINDING_BASE};
+
+        assert!(!is_storage_texture_binding(0));
+        assert!(!is_storage_texture_binding(31));
+        assert!(is_storage_texture_binding(STORAGE_TEXTURE_BINDING_BASE));
+        assert!(is_storage_texture_binding(STORAGE_TEXTURE_BINDING_BASE + 5));
+    }
+}

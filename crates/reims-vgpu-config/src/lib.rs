@@ -1583,6 +1583,20 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// pointer, and never reaches a captured frame. `off` keeps the host's own arrow
 /// and never moves the host pointer — the behavior before this existed.
 pub const HOST_CURSOR: &str = "REIMS_VGPU_HOST_CURSOR";
+
+/// **Default off (lab).** `on` admits storage textures in the render path:
+/// a texture the vertex or fragment function reflects as storage access is
+/// bound as `VK_DESCRIPTOR_TYPE_STORAGE_IMAGE` (Metal index N -> binding
+/// `STORAGE_TEXTURE_BINDING_BASE + N`) in `GENERAL` layout, instead of
+/// refusing the draw as `draw_prepare_texture_access_unsupported`
+/// (`access=storage`). Known gaps while it is a lab arm: the image comes from
+/// the sampled pool (created without `STORAGE` usage), and nothing writes a
+/// shader's stores back to the guest, so only reads are meaningful. Each
+/// admitted binding notes `draw_storage_texture_lab_bound`.
+///
+/// Unset or `off` is the shipping refusal. Stays opt-in until a validation
+/// layer run and an alternated same-boot A/B say otherwise.
+pub const LAB_STORAGE_TEXTURES: &str = "REIMS_VGPU_LAB_STORAGE_TEXTURES";
 }
 
 counts! {
