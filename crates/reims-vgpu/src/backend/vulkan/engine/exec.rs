@@ -1895,7 +1895,28 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         };
-        if target.len() != expected {
+        // REIMS_VGPU_LAB_WIDE_ALIAS_SEED: a seed may also be the attachment's
+        // own texels when they are wider than four bytes (see
+        // `wide_seed_is_native`); every other length is still refused.
+        let native_ok = req
+            .color_attachment
+            .map(|a| a.format())
+            .or_else(|| req.target_identity.as_ref().map(|id| id.resident_format()))
+            .and_then(crate::backend::vulkan::translate::pixel::texel_layout_of)
+            .and_then(|layout| {
+                let bpp = layout.bytes_per_texel();
+                reims_vgpu_protocol::extent::tight_image_bytes(req.width, req.height, bpp as usize)
+                    .map(|native| (bpp, native))
+            })
+            .is_some_and(|(bpp, native)| {
+                crate::runtime::draw::vulkan::wide_seed_is_native(
+                    crate::runtime::draw::vulkan::wide_alias_seed_enabled(),
+                    bpp,
+                    target.len(),
+                    native,
+                )
+            });
+        if target.len() != expected && !native_ok {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::TargetSeedLength {
                     actual: target.len(),
@@ -4359,7 +4380,20 @@ pub(crate) unsafe fn execute_draw_inner(
         };
         let pixels = req.width.saturating_mul(req.height);
         let mut wide = vec![0u8; (pixels as usize) * (layout.bytes_per_texel() as usize)];
-        if !crate::protocol::pixel_format::expand_rgba8_to_texel(layout, src, pixels, &mut wide) {
+        if crate::runtime::draw::vulkan::wide_seed_is_native(
+            crate::runtime::draw::vulkan::wide_alias_seed_enabled(),
+            layout.bytes_per_texel(),
+            rgba8.len(),
+            wide.len(),
+        ) {
+            // REIMS_VGPU_LAB_WIDE_ALIAS_SEED: already the attachment's own
+            // texels (RGBA16Float read natively from guest pages). Copied as
+            // they arrived, before the R/B exchange above, which only means
+            // something for eight-bit seeds; expand_rgba8_to_texel would
+            // quantize the half-float values.
+            crate::runtime::drain::note_store_route("wide_seed_native_copied");
+            wide.copy_from_slice(rgba8);
+        } else if !crate::protocol::pixel_format::expand_rgba8_to_texel(layout, src, pixels, &mut wide) {
             return Err(DrawError::DrawExecution(
                 DrawExecutionDecline::SeedFormatUnwritable {
                     format: color0_format,

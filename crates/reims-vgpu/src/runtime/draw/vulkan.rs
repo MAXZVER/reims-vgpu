@@ -3448,15 +3448,21 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
     sampled_base_gva: Option<u64>,
 ) -> Option<(u32, u32, AttachmentAliasSample<'a>)> {
     let color = req.colors.iter().find(|color| {
-        color.texture_ref == texture_ref && color.mapping_id == 0 && color.target_gva != 0
+        color.texture_ref == texture_ref
+            && alias_color_admitted(color.target_gva, color.mapping_id, wide_alias_seed_enabled())
     })?;
-    if sampled_base_gva.is_some_and(|base| base != color.target_gva) {
+    if color.target_gva != 0 && sampled_base_gva.is_some_and(|base| base != color.target_gva) {
         crate::runtime::drain::note_store_route("attachment_alias_other_level");
         return None;
     }
+    let bpp = if wide_alias_seed_enabled() {
+        pixel_format::store_texel_order(color.format).map_or(RGBA8_BPP, |layout| layout.bytes_per_texel())
+    } else {
+        RGBA8_BPP
+    };
     let need = (color.width as usize)
         .checked_mul(color.height as usize)?
-        .checked_mul(RGBA8_BPP as usize)?;
+        .checked_mul(bpp as usize)?;
     match color.load_action {
         MTL_LOAD_ACTION_CLEAR => Some((
             color.width,
@@ -3478,7 +3484,10 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
             // A secondary has no CPU seed and no chain flag of its own: its Load
             // is always the registry resident (`build_secondary_targets`), so
             // that resident is what the pass's earlier draws left there.
-            if req.chain_from_resident || color.slot != 0 {
+            if req.chain_from_resident
+                || (wide_alias_seed_enabled() && req.gva_load_from_resident)
+                || color.slot != 0
+            {
                 return Some((
                     color.width,
                     color.height,
@@ -9878,7 +9887,7 @@ fn native_scratch_to_upload(
 /// arm is lossy, which is exactly the set the half-float flag can change the
 /// answer for — so keying on it is the same rule stated once, not a fast path
 /// that could disagree with the slow one.
-fn native_uploads_for(sample_format: u16) -> NativeUploads {
+pub(super) fn native_uploads_for(sample_format: u16) -> NativeUploads {
     // One question, derived from the loader itself rather than approximated by
     // a second list. `native_bind_is_host_gated` compares the loader's answer
     // with every gate shut against its answer with every gate open, so the set
@@ -12975,7 +12984,15 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                                 SampledSourceRequest::Bytes(
                                     std::sync::Arc::new(seed.to_vec()),
                                     None,
-                                    SampledByteFormat::from_source(TexelLayout::Rgba8, stored),
+                                    SampledByteFormat::from_source(
+                                        if wide_alias_seed_enabled() {
+                                            pixel_format::store_texel_order(stored)
+                                                .unwrap_or(TexelLayout::Rgba8)
+                                        } else {
+                                            TexelLayout::Rgba8
+                                        },
+                                        stored,
+                                    ),
                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
                                 ),
                             ),
@@ -14366,9 +14383,15 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         target_guest_seed = Some(seed);
                     } else if color0_seed.is_some() {
                         seed_door = "color_seed";
+                        let expected_bpp = if wide_alias_seed_enabled() {
+                            crate::protocol::pixel_format::store_texel_order(c0.format)
+                                .map_or(4, |layout| layout.bytes_per_texel() as usize)
+                        } else {
+                            4
+                        };
                         if color0_seed
                             .as_ref()
-                            .is_some_and(|seed| seed.len() == (w as usize) * (h as usize) * 4)
+                            .is_some_and(|seed| seed.len() == (w as usize) * (h as usize) * expected_bpp)
                         {
                             // seed_color_load selected this by RT provenance.
                             // Black/transparent bytes are valid attachment data.
@@ -23178,3 +23201,77 @@ fn lab_seed_trace(
     crate::observe::off(line);
 }
 
+/// [`crate::config::LAB_WIDE_ALIAS_SEED`] state to arm: only an explicit `on`.
+pub(crate) fn wide_alias_seed_from_switch(state: crate::config::Switch) -> bool {
+    matches!(state, crate::config::Switch::On)
+}
+
+/// `REIMS_VGPU_LAB_WIDE_ALIAS_SEED`, read once (default off).
+pub(crate) fn wide_alias_seed_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let (state, value) = crate::config::read(crate::config::LAB_WIDE_ALIAS_SEED);
+        let on = wide_alias_seed_from_switch(state);
+        if state == crate::config::Switch::Unrecognized {
+            crate::observe::fail(format!(
+                "wide_alias_seed reason=wide_alias_seed_env_unrecognized value={:?} (kept off)",
+                value.unwrap_or_default()
+            ));
+        }
+        crate::observe::off(format!("lab_wide_alias_seed on={on} switch={state:?}"));
+        on
+    })
+}
+
+/// Which colour attachment an alias sample may read. The shipping rule takes
+/// only an unmapped attachment with a target GVA; the lab arm also takes a
+/// mapped one.
+pub(crate) fn alias_color_admitted(target_gva: u64, mapping_id: u32, wide: bool) -> bool {
+    if wide {
+        target_gva != 0 || mapping_id != 0
+    } else {
+        mapping_id == 0 && target_gva != 0
+    }
+}
+
+/// Whether a wide colour seed of `seed_len` bytes is already the attachment's
+/// own texels. Only for texels wider than four bytes: at four bytes a native
+/// seed (RG16Float) and an RGBA8 one have the same length, and the length is
+/// the only thing this rule can see.
+pub(crate) fn wide_seed_is_native(wide: bool, bytes_per_texel: u32, seed_len: usize, native_len: usize) -> bool {
+    wide && bytes_per_texel > 4 && seed_len == native_len
+}
+
+#[cfg(test)]
+mod wide_alias_seed_tests {
+    use super::{alias_color_admitted, wide_alias_seed_from_switch, wide_seed_is_native};
+    use crate::config::Switch;
+
+    #[test]
+    fn the_lab_switch_is_default_off() {
+        assert!(!wide_alias_seed_from_switch(Switch::Unset));
+        assert!(!wide_alias_seed_from_switch(Switch::Off));
+        assert!(!wide_alias_seed_from_switch(Switch::Unrecognized));
+        assert!(wide_alias_seed_from_switch(Switch::On));
+    }
+
+    #[test]
+    fn off_keeps_the_shipping_alias_rule() {
+        assert!(alias_color_admitted(0x1000, 0, false));
+        assert!(!alias_color_admitted(0x1000, 9, false));
+        assert!(!alias_color_admitted(0, 9, false));
+        assert!(alias_color_admitted(0x1000, 9, true));
+        assert!(alias_color_admitted(0, 9, true));
+        assert!(!alias_color_admitted(0, 0, true));
+    }
+
+    #[test]
+    fn a_four_byte_seed_is_never_taken_as_native() {
+        // RG16Float: 4 bytes a texel, same length as RGBA8.
+        assert!(!wide_seed_is_native(true, 4, 64, 64));
+        // RGBA16Float: 8 bytes a texel.
+        assert!(wide_seed_is_native(true, 8, 128, 128));
+        assert!(!wide_seed_is_native(true, 8, 64, 128));
+        assert!(!wide_seed_is_native(false, 8, 128, 128));
+    }
+}

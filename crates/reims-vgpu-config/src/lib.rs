@@ -1583,6 +1583,22 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// pointer, and never reaches a captured frame. `off` keeps the host's own arrow
 /// and never moves the host pointer — the behavior before this existed.
 pub const HOST_CURSOR: &str = "REIMS_VGPU_HOST_CURSOR";
+
+/// **Default off (lab).** `on` lets a colour attachment wider than four bytes a
+/// texel (RGBA16Float, RG16Float, ...) keep its own texels through the
+/// attachment-alias sample and the colour Load seed instead of being narrowed
+/// to RGBA8 and widened back (which quantizes half-float values):
+/// the alias admits a mapped attachment (`mapping_id != 0`) and a pass loading
+/// from the resident, sizes its seed by the attachment's texel, the CPU seed is
+/// read with the native upload set, and an eight-byte native seed is copied
+/// verbatim (`wide_seed_native_copied`). Four-byte non-colour layouts such as
+/// RG16Float stay on the RGBA8 widening path because their length cannot tell a
+/// native seed from an RGBA8 one.
+///
+/// Unset or `off` is the shipping behaviour (RGBA8 alias and seed). Stays
+/// opt-in until an alternated same-boot A/B (glyph case, Finder/Safari desktop
+/// seeds) says otherwise.
+pub const LAB_WIDE_ALIAS_SEED: &str = "REIMS_VGPU_LAB_WIDE_ALIAS_SEED";
 }
 
 counts! {
