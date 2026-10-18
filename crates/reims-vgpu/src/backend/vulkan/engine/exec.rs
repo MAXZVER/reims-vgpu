@@ -3979,6 +3979,30 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     pass_key.sample_count = raster_sample_count;
     pass_key.multisample_resolve = req.multisample_resolve;
+    let mut multisample_cold_clear = false;
+    if req.multisample_resolve && req.multisample_source != 0 {
+        let wants_prior = req.multisample_load || pass_key.color0_load == Color0Load::Preserve;
+        let outcome = multisample_source_load(
+            wants_prior,
+            pools.multisample_source_layout(
+                req.multisample_source,
+                req.width,
+                req.height,
+                color0_format,
+                raster_sample_count,
+            ),
+            pass_key.color_final_layout(0),
+        );
+        crate::runtime::drain::note_store_route(outcome.slug());
+        match outcome {
+            MultisampleSourceLoad::Fresh => {}
+            MultisampleSourceLoad::Warm => pass_key.color0_load = Color0Load::Preserve,
+            MultisampleSourceLoad::ColdCleared | MultisampleSourceLoad::LayoutMismatchCleared => {
+                pass_key.color0_load = Color0Load::Clear;
+                multisample_cold_clear = true;
+            }
+        }
+    }
     // Into the command buffer's scratch and then interned, for the reason the
     // layout bindings below are: `PipelineKey` carries the attribute set, and a
     // key owning a `Vec<AttrKey>` is a heap allocation on every draw that has
@@ -4598,23 +4622,30 @@ pub(crate) unsafe fn execute_draw_inner(
             }
         };
     let _multisample_source_image = if req.multisample_resolve {
-        let (image, _view, framebuffer) = pools.acquire_multisample_target(
-            ctx,
-            super::pools::MultisampleTargetKey {
-                width: req.width,
-                height: req.height,
-                format: color0_format,
-                samples: raster_sample_count,
-                compatibility: pass_key.framebuffer_compatibility(),
-                resolve_view: target_view,
-                depth_view: depth_attachment.as_ref().map(|depth| depth.view),
-                transient_depth: depth_attachment
-                    .as_ref()
-                    .is_some_and(|depth| depth.owned.is_some()),
-            },
-            render_pass,
-            counters,
-        )?;
+        let multisample_key = super::pools::MultisampleTargetKey {
+            width: req.width,
+            height: req.height,
+            format: color0_format,
+            samples: raster_sample_count,
+            compatibility: pass_key.framebuffer_compatibility(),
+            resolve_view: target_view,
+            depth_view: depth_attachment.as_ref().map(|depth| depth.view),
+            transient_depth: depth_attachment
+                .as_ref()
+                .is_some_and(|depth| depth.owned.is_some()),
+        };
+        let (image, _view, framebuffer) = if req.multisample_source != 0 {
+            pools.acquire_multisample_source(
+                ctx,
+                req.multisample_source,
+                multisample_key,
+                render_pass,
+                pass_key.color_final_layout(0),
+                counters,
+            )?
+        } else {
+            pools.acquire_multisample_target(ctx, multisample_key, render_pass, counters)?
+        };
         target_fb = framebuffer;
         Some(image)
     } else {
@@ -6040,7 +6071,12 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
-    let clear = clear_values(req)?;
+    let mut clear = clear_values(req)?;
+    if multisample_cold_clear {
+        clear.values[0] = vk::ClearValue {
+            color: vk::ClearColorValue { float32: [0.0; 4] },
+        };
+    }
     phase.enter(super::draw_phase::Phase::RecordPass);
     let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
@@ -7162,6 +7198,48 @@ fn clear_values(req: &DrawRequest) -> Result<ClearValues, DrawError> {
         })?;
     }
     Ok(clear)
+}
+
+/// How a pass through a persistent per-source multisample image begins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MultisampleSourceLoad {
+    /// The pass wants no prior contents (Clear / DontCare); unchanged.
+    Fresh,
+    /// The image holds the previous pass's contents in this pass's layout.
+    Warm,
+    /// The pass wants prior contents and the image has none.
+    ColdCleared,
+    /// The image holds contents, but in a layout this pass does not name.
+    LayoutMismatchCleared,
+}
+
+impl MultisampleSourceLoad {
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Fresh => "msaa_source_fresh",
+            Self::Warm => "msaa_load_warm",
+            Self::ColdCleared => "msaa_load_cold_cleared",
+            Self::LayoutMismatchCleared => "msaa_load_layout_mismatch_cleared",
+        }
+    }
+}
+
+/// Pure rule behind [`MultisampleSourceLoad`]. `slot_layout` is the layout the
+/// persistent image was left in (`None`: absent, reshaped, or never rendered);
+/// `pass_initial` is the layout a LOAD pass would declare for attachment 0.
+pub(crate) fn multisample_source_load(
+    wants_prior: bool,
+    slot_layout: Option<vk::ImageLayout>,
+    pass_initial: vk::ImageLayout,
+) -> MultisampleSourceLoad {
+    if !wants_prior {
+        return MultisampleSourceLoad::Fresh;
+    }
+    match slot_layout {
+        Some(layout) if layout == pass_initial => MultisampleSourceLoad::Warm,
+        Some(_) => MultisampleSourceLoad::LayoutMismatchCleared,
+        None => MultisampleSourceLoad::ColdCleared,
+    }
 }
 
 /// The clear values of one draw, held inline.
@@ -9837,4 +9915,52 @@ fn zero_seed_mapping_mode() -> bool {
     *ON.get_or_init(|| {
         std::env::var("REIMS_VGPU_LAB_ZERO_SEED_MAPPING").as_deref() != Ok("off")
     })
+}
+
+#[cfg(test)]
+mod multisample_source_load_tests {
+    use super::{multisample_source_load, MultisampleSourceLoad};
+    use ash::vk::ImageLayout as L;
+
+    #[test]
+    fn a_pass_that_wants_nothing_is_unchanged() {
+        assert_eq!(
+            multisample_source_load(false, None, L::COLOR_ATTACHMENT_OPTIMAL),
+            MultisampleSourceLoad::Fresh
+        );
+        assert_eq!(
+            multisample_source_load(false, Some(L::GENERAL), L::COLOR_ATTACHMENT_OPTIMAL),
+            MultisampleSourceLoad::Fresh
+        );
+    }
+
+    #[test]
+    fn a_load_reads_only_an_image_left_in_its_layout() {
+        assert_eq!(
+            multisample_source_load(true, Some(L::GENERAL), L::GENERAL),
+            MultisampleSourceLoad::Warm
+        );
+        assert_eq!(
+            multisample_source_load(true, Some(L::COLOR_ATTACHMENT_OPTIMAL), L::GENERAL),
+            MultisampleSourceLoad::LayoutMismatchCleared
+        );
+        assert_eq!(
+            multisample_source_load(true, None, L::GENERAL),
+            MultisampleSourceLoad::ColdCleared
+        );
+    }
+
+    #[test]
+    fn every_outcome_has_its_own_slug() {
+        let all = [
+            MultisampleSourceLoad::Fresh,
+            MultisampleSourceLoad::Warm,
+            MultisampleSourceLoad::ColdCleared,
+            MultisampleSourceLoad::LayoutMismatchCleared,
+        ];
+        let mut slugs: Vec<&str> = all.iter().map(|o| o.slug()).collect();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), all.len());
+    }
 }

@@ -1583,6 +1583,24 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// pointer, and never reaches a captured frame. `off` keeps the host's own arrow
 /// and never moves the host pointer — the behavior before this existed.
 pub const HOST_CURSOR: &str = "REIMS_VGPU_HOST_CURSOR";
+
+/// **Default off (lab).** `on` lets a multisample-resolve pass honour
+/// `MTLLoadActionLoad` on its multisample colour source. Every
+/// multisample-resolve pass then renders into a multisample image that belongs
+/// to its guest source texture and outlives the pass (at most
+/// `MULTISAMPLE_SOURCE_CAP` = 4, LRU), so a later Load reads what the earlier
+/// pass left (`msaa_load_warm`); a Load with no live contents starts from
+/// transparent black (`msaa_load_cold_cleared`,
+/// `msaa_load_layout_mismatch_cleared`). The same arm admits
+/// `MTLStoreActionStoreAndMultisampleResolve`, which only means something when
+/// the multisample contents persist. Cost: device memory for up to four
+/// multisample images (a 1170x2532 4x BGRA8 image is ~47 MiB).
+///
+/// Unset or `off` is the shipping behaviour: one discard-only multisample slot,
+/// a Load is refused as `multisample_load_action_unsupported` and the draw is
+/// dropped. Stays opt-in until an alternated same-boot A/B (draw counts, VRAM)
+/// says otherwise.
+pub const LAB_MSAA_LOAD: &str = "REIMS_VGPU_LAB_MSAA_LOAD";
 }
 
 counts! {

@@ -279,6 +279,7 @@ impl ResourcePools {
             targets: HashMap::new(),
             target_order: Vec::new(),
             multisample_target: None,
+            multisample_sources: Vec::new(),
             ad_hoc_framebuffers: HashMap::new(),
             readback_free: HashMap::new(),
             readback_leased: Vec::new(),
@@ -4346,6 +4347,170 @@ impl ResourcePools {
             key,
         });
         Ok((image, view, framebuffer))
+    }
+
+    /// The layout `source`'s persistent multisample image was left in,
+    /// when one of exactly this shape exists and a pass has rendered it.
+    pub(crate) fn multisample_source_layout(
+        &self,
+        source: u64,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        samples: u32,
+    ) -> Option<vk::ImageLayout> {
+        self.multisample_sources
+            .iter()
+            .find(|s| {
+                s.source == source
+                    && s.width == width
+                    && s.height == height
+                    && s.format == format
+                    && s.samples == samples
+            })
+            .and_then(|s| s.layout)
+    }
+
+    /// Acquire `source`'s persistent multisample image and a
+    /// framebuffer `[multisample, resolve, depth?]` over it under `render_pass`.
+    ///
+    /// A shape change or LRU eviction retires the old image behind the ring
+    /// (`dispose`), and its cached framebuffers go with its view. The slot is
+    /// recorded as left in `final_layout`, which is what this pass's
+    /// attachment 0 exits in.
+    pub(crate) unsafe fn acquire_multisample_source(
+        &mut self,
+        ctx: &DeviceContext,
+        source: u64,
+        key: MultisampleTargetKey,
+        render_pass: vk::RenderPass,
+        final_layout: vk::ImageLayout,
+        counters: &EngineCounters,
+    ) -> Result<(vk::Image, vk::ImageView, vk::Framebuffer), DrawError> {
+        let found = self.multisample_sources.iter().position(|s| s.source == source);
+        let fits = found.is_some_and(|i| {
+            let s = &self.multisample_sources[i];
+            s.width == key.width
+                && s.height == key.height
+                && s.format == key.format
+                && s.samples == key.samples
+        });
+        let index = if let (Some(i), true) = (found, fits) {
+            i
+        } else {
+            if let Some(i) = found {
+                let old = self.multisample_sources.remove(i);
+                crate::runtime::drain::note_store_route("msaa_source_reshaped");
+                self.dispose(
+                    &ctx.device,
+                    DeferredHandle::Image {
+                        image: old.image,
+                        view: old.view,
+                        memory: old.memory,
+                    },
+                );
+            }
+            if self.multisample_sources.len() >= MULTISAMPLE_SOURCE_CAP {
+                let old = self.multisample_sources.remove(0);
+                crate::runtime::drain::note_store_route("msaa_source_evicted");
+                self.dispose(
+                    &ctx.device,
+                    DeferredHandle::Image {
+                        image: old.image,
+                        view: old.view,
+                        memory: old.memory,
+                    },
+                );
+            }
+            let (image, memory, view) = unsafe { self.create_multisample_image(ctx, &key, counters) }?;
+            crate::runtime::drain::note_store_route("msaa_source_created");
+            self.multisample_sources.push(MultisampleSourceSlot {
+                source,
+                width: key.width,
+                height: key.height,
+                format: key.format,
+                samples: key.samples,
+                image,
+                memory,
+                view,
+                layout: None,
+            });
+            self.multisample_sources.len() - 1
+        };
+        // Most recently used last.
+        let slot = self.multisample_sources.remove(index);
+        let (image, view) = (slot.image, slot.view);
+        self.multisample_sources.push(slot);
+        let mut views = vec![view, key.resolve_view];
+        views.extend(key.depth_view);
+        let framebuffer = unsafe {
+            self.ensure_ad_hoc_framebuffer(ctx, render_pass, &views, key.width, key.height, counters)
+        }?;
+        if let Some(last) = self.multisample_sources.last_mut() {
+            last.layout = Some(final_layout);
+        }
+        Ok((image, view, framebuffer))
+    }
+
+    /// Create one multisample colour image of `key`'s shape.
+    unsafe fn create_multisample_image(
+        &mut self,
+        ctx: &DeviceContext,
+        key: &MultisampleTargetKey,
+        counters: &EngineCounters,
+    ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), DrawError> {
+        let image = ctx
+            .device
+            .create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(key.format)
+                    .extent(vk::Extent3D {
+                        width: key.width,
+                        height: key.height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(super::super::caches::vk_sample_count(key.samples))
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetImage, e)))?;
+        counters.note_create(CreateSite::TargetImage);
+        let requirements = ctx.device.get_image_memory_requirements(image);
+        let memory = match self.bind_image_slab(
+            ctx,
+            image,
+            &requirements,
+            VkOp::PoolsBindTarget,
+            counters,
+        ) {
+            Ok(memory) => memory,
+            Err(error) => {
+                ctx.device.destroy_image(image, None);
+                return Err(error);
+            }
+        };
+        let view = ctx
+            .device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(key.format)
+                    .subresource_range(super::super::color_subresource_range()),
+                None,
+            )
+            .map_err(|e| {
+                ctx.device.destroy_image(image, None);
+                self.free_image_slab(&ctx.device, image);
+                DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetView, e))
+            })?;
+        counters.note_create(CreateSite::TargetImageView);
+        Ok((image, memory, view))
     }
 
     pub(crate) unsafe fn acquire_sampled(

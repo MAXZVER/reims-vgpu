@@ -14754,6 +14754,16 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 .colors
                 .first()
                 .is_some_and(|color| color.multisample_source_ref != 0),
+            multisample_source: req
+                .colors
+                .first()
+                .filter(|color| color.multisample_source_ref != 0 && msaa_load_enabled())
+                .map_or(0, |color| {
+                    (u64::from(req.task_id) << 32) | u64::from(color.multisample_source_ref)
+                }),
+            multisample_load: req.colors.first().is_some_and(|color| {
+                color.multisample_source_ref != 0 && color.load_action == MTL_LOAD_ACTION_LOAD
+            }),
             ..crate::backend::vulkan::engine::DrawRequest::default()
         };
         let resolving_colors = req
@@ -14781,8 +14791,16 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             .first()
             .filter(|color| color.multisample_source_ref != 0)
         {
-            use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
-            if color.store_action != MTL_STORE_ACTION_MULTISAMPLE_RESOLVE {
+            use reims_vgpu_protocol::pass_action::{
+                MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
+                MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+            };
+            let store_and_resolve_admitted = color.store_action
+                == MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
+                && msaa_load_enabled();
+            if color.store_action != MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
+                && !store_and_resolve_admitted
+            {
                 return Err(DrawError::Unsupported(
                     crate::backend::vulkan::engine::reason::DrawReason::MultisampleStoreActionUnsupported {
                         store_action: color.store_action,
@@ -14790,11 +14808,21 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 ));
             }
             if color.load_action == MTL_LOAD_ACTION_LOAD {
-                return Err(DrawError::Unsupported(
-                    crate::backend::vulkan::engine::reason::DrawReason::MultisampleLoadActionUnsupported {
-                        load_action: color.load_action,
-                    },
-                ));
+                match msaa_load_admission(msaa_load_enabled()) {
+                    MsaaLoadAdmission::Persistent => {
+                        crate::runtime::drain::note_store_route(
+                            MsaaLoadAdmission::Persistent.slug(),
+                        );
+                    }
+                    MsaaLoadAdmission::Disabled => {
+                        crate::runtime::drain::note_store_route(MsaaLoadAdmission::Disabled.slug());
+                        return Err(DrawError::Unsupported(
+                            crate::backend::vulkan::engine::reason::DrawReason::MultisampleLoadActionUnsupported {
+                                load_action: color.load_action,
+                            },
+                        ));
+                    }
+                }
             }
         }
         resources.viewports = req
@@ -23178,3 +23206,77 @@ fn lab_seed_trace(
     crate::observe::off(line);
 }
 
+/// Whether a multisample-resolve pass may `MTLLoadActionLoad` its multisample source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MsaaLoadAdmission {
+    /// Served through the per-source persistent multisample image.
+    Persistent,
+    /// `REIMS_VGPU_LAB_MSAA_LOAD` not on (the default): the shipping refusal.
+    Disabled,
+}
+
+impl MsaaLoadAdmission {
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Persistent => "msaa_load_admitted",
+            Self::Disabled => "msaa_load_refused_disabled",
+        }
+    }
+}
+
+/// Pure rule behind [`MsaaLoadAdmission`].
+pub(crate) fn msaa_load_admission(enabled: bool) -> MsaaLoadAdmission {
+    if enabled {
+        MsaaLoadAdmission::Persistent
+    } else {
+        MsaaLoadAdmission::Disabled
+    }
+}
+
+/// [`crate::config::LAB_MSAA_LOAD`] state to arm. Only an explicit `on`
+/// enables the lab arm; unset, `off` and an unrecognized value keep the
+/// shipping refusal.
+pub(crate) fn msaa_load_from_switch(state: crate::config::Switch) -> bool {
+    matches!(state, crate::config::Switch::On)
+}
+
+/// `REIMS_VGPU_LAB_MSAA_LOAD`, read once (default off).
+pub(crate) fn msaa_load_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let (state, value) = crate::config::read(crate::config::LAB_MSAA_LOAD);
+        let on = msaa_load_from_switch(state);
+        if state == crate::config::Switch::Unrecognized {
+            crate::observe::fail(format!(
+                "msaa_load reason=msaa_load_env_unrecognized value={:?} (kept off)",
+                value.unwrap_or_default()
+            ));
+        }
+        crate::observe::off(format!("lab_msaa_load on={on} switch={state:?}"));
+        on
+    })
+}
+
+#[cfg(test)]
+mod msaa_load_admission_tests {
+    use super::{msaa_load_admission, MsaaLoadAdmission};
+
+    #[test]
+    fn the_lab_switch_is_default_off() {
+        use crate::config::Switch;
+        assert!(!super::msaa_load_from_switch(Switch::Unset));
+        assert!(!super::msaa_load_from_switch(Switch::Off));
+        assert!(!super::msaa_load_from_switch(Switch::Unrecognized));
+        assert!(super::msaa_load_from_switch(Switch::On));
+    }
+
+    #[test]
+    fn on_admits_and_off_refuses() {
+        assert_eq!(msaa_load_admission(true), MsaaLoadAdmission::Persistent);
+        assert_eq!(msaa_load_admission(false), MsaaLoadAdmission::Disabled);
+        assert_ne!(
+            MsaaLoadAdmission::Persistent.slug(),
+            MsaaLoadAdmission::Disabled.slug()
+        );
+    }
+}
