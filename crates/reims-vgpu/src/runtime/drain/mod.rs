@@ -2118,6 +2118,7 @@ fn publish_word<H: HostMemory + HostOps>(
                 .gfx
                 .interrupt_status_gpu
                 .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+            crate::runtime::drain::note_store_route("irq_src_root_stamp");
             host.enqueue(HostAction::irq_gfx());
             lab_rewake::note(0);
         }
@@ -5176,6 +5177,7 @@ fn write_stamp_now<H: HostMemory + HostOps>(
             .gfx
             .interrupt_status_gpu
             .fetch_or(1u32 << (index & 0x1f), std::sync::atomic::Ordering::AcqRel);
+        crate::runtime::drain::note_store_route("irq_src_stamp");
         host.enqueue(HostAction::irq_gfx());
         lab_rewake::note(index);
     }
@@ -10200,6 +10202,7 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
         .gfx
         .interrupt_status_disp
         .fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
+    crate::runtime::drain::note_store_route("irq_src_present");
     host.enqueue(HostAction::irq_gfx());
 }
 
@@ -10905,6 +10908,7 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
         1u32 << (display_index & 0x1f),
         std::sync::atomic::Ordering::AcqRel,
     );
+    crate::runtime::drain::note_store_route("irq_src_vbl");
     host.enqueue(HostAction::irq_gfx());
 }
 

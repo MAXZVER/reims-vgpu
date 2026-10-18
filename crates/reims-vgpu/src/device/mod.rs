@@ -502,6 +502,7 @@ fn announce_stamp_interrupt(id: u64, index: u32) {
         return;
     };
     let mut scratch = VecDeque::new();
+    crate::runtime::drain::census::note_store_route("irq_src_device_stamp");
     QemuHost::new(&ops, &mut scratch, &slot.prompt_actions).enqueue(HostAction::irq_gfx());
     crate::runtime::drain::lab_rewake::note(index);
 }

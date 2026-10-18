@@ -261,6 +261,7 @@ pub fn gfx_write<H: HostMemory + HostOps>(
                         state.cursor.show,
                     );
                 }
+                crate::runtime::drain::note_store_route("irq_src_mmio");
                 host.enqueue(HostAction::irq_gfx());
                 host.schedule_bh();
             }
