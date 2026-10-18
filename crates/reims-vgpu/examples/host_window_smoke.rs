@@ -31,6 +31,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use reims_vgpu::host_window::guest_cursor::GuestCursorFeed;
 use reims_vgpu::host_window::present::{
     spawn, Frame, FrameSlot, WindowConfig, WindowMode, WindowWaker,
 };
@@ -73,7 +74,8 @@ fn main() {
         on_input,
         frames,
         stop,
-        wake,
+        wake.clone(),
+        GuestCursorFeed::new(wake),
     );
     match handle.join() {
         Ok(Ok(())) => println!("window closed"),
