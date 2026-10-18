@@ -8138,6 +8138,11 @@ fn lab_index_runs_max() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_INDEX_RUNS_MAX").map_or(true, |v| v != "off"))
 }
 
+/// TEMP (lab, MERGE_DRAWS): [`indexed_vertex_max`] under a name a local of the same name cannot shadow.
+fn indexed_vertex_max_fn(info: &IndexedDrawInfo, bytes: &[u8]) -> Option<u64> {
+    indexed_vertex_max(info, bytes)
+}
+
 /// TEMP (lab, MERGE_DRAWS): [`indexed_vertex_max`] of a record, over each of its draws' index ranges when it
 /// carries folded sub-draws (`draw::merge::vertex_max`).
 fn lab_merged_vertex_max(
@@ -12379,6 +12384,68 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             }
             _ => None,
         };
+        // TEMP (lab, MERGE_DRAWS): sub-draws with their own index buffer: their index bytes, and their reach folded
+        // into the record's vertex bound (the shared buffers serve them too).
+        let mut lab_sub_index: Vec<Option<std::sync::Arc<Vec<u8>>>> = Vec::new();
+        // Each own-index sub-draw's own vertex reach; its overridden buffers are read that far, not the record's.
+        let mut lab_sub_vmax: Vec<Option<u64>> = Vec::new();
+        let mut indexed_vertex_max = indexed_vertex_max;
+        if let (Some(m), true) = (req.merged.as_deref(), !lab_merge_deltas.is_empty()) {
+            if m.overrides.iter().any(|o| o.index.is_some()) {
+                lab_sub_index = vec![None; m.subs.len()];
+                lab_sub_vmax = vec![None; m.subs.len()];
+                for o in &m.overrides {
+                    let Some(info) = o.index.as_ref() else {
+                        continue;
+                    };
+                    let content = match acc.exclusive() {
+                        Some(state) => load_index_content_reason(state, host, req.task_id, info),
+                        None => match draw_par::load_index_content_worker(acc.shared(), host, prep_log!(), req.task_id, info) {
+                            Ok(content) => Ok(content),
+                            Err(bail) => worker_bail!(bail),
+                        },
+                    }
+                    .map_err(|reason| DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad { reason }))?;
+                    note_inflight_buffer_read(req.task_id, info.index_buffer_ref, &content);
+                    let bytes = match content {
+                        crate::backend::vulkan::engine::BufferContent::Bytes(b) => b,
+                        other => std::sync::Arc::new(other.cpu_bytes().into_owned()),
+                    };
+                    let sub_vmax = indexed_vertex_max_fn(info, &bytes);
+                    // The record's shared per-vertex buffers serve this sub-draw too unless it brings its own for
+                    // every one of them (stage-in buffers, and device buffers indexed by vertex_id).
+                    let own_v: Vec<u32> = o.vstage.iter().chain(o.vertex.iter()).map(|b| b.index).collect();
+                    let stage_shared = pd
+                        .vertex_attributes
+                        .iter()
+                        .any(|a| a.step_function_ordinal(1) == 1 && !own_v.contains(&a.buffer_index));
+                    let storage_shared = v_shader.reflection.bindings.iter().any(|b| {
+                        b.kind == metal2vulkan::reflect::ResourceKind::Buffer
+                            && !own_v.contains(&b.metal_index)
+                            && req.vertex_buffers.iter().any(|v| v.index == b.metal_index)
+                            && b.footprint.as_ref().is_none_or(|fp| {
+                                fp.has_unbounded_access
+                                    || fp.strided_accesses.iter().any(|a| {
+                                        a.terms.iter().any(|t| t.source == metal2vulkan::reflect::BufferIndexSource::VertexIndex)
+                                    })
+                            })
+                    });
+                    if stage_shared || storage_shared {
+                        crate::runtime::drain::note_store_route("merge_sub_bound_shared");
+                        indexed_vertex_max = match (indexed_vertex_max, sub_vmax) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            _ => None,
+                        };
+                    }
+                    if let Some(slot) = lab_sub_index.get_mut(o.sub as usize) {
+                        *slot = Some(bytes);
+                    }
+                    if let Some(slot) = lab_sub_vmax.get_mut(o.sub as usize) {
+                        *slot = sub_vmax;
+                    }
+                }
+            }
+        }
         // TEMP (lab, MERGE_DRAWS): a merged non-indexed record fetches its sub-draws' vertices too, and as far
         // past them as its largest stage-in move.
         let (lab_first, lab_count) = match (req.merged.as_deref(), req.indexed.is_none()) {
@@ -12738,6 +12805,138 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         // the "blank Safari body text" class. Bind a stage-in buffer as storage
         // too whenever the adopted vertex reflection structurally declares a
         // buffer at that binding (never name-keyed).
+        // TEMP (lab, MERGE_DRAWS): every sub-draw that binds other device buffers than its record gets its own bytes
+        // for those storage bindings, read with the record's bounds (a superset of each sub-draw's) and handed to the
+        // engine as bytes (each is staged into its own slot before the sub-draw).
+        let mut lab_sub_storage: Vec<Vec<(u32, std::sync::Arc<Vec<u8>>)>> = Vec::new();
+        if let Some(m) = req.merged.as_deref().filter(|m| !m.overrides.is_empty() && !lab_merge_deltas.is_empty()) {
+            lab_sub_storage = vec![Vec::new(); m.subs.len()];
+            for o in &m.overrides {
+                let Some(slot) = lab_sub_storage.get_mut(o.sub as usize) else {
+                    continue;
+                };
+                let bounds = lab_sub_vmax.get(o.sub as usize).copied().flatten().map_or(render_buffer_bounds, |v| {
+                    crate::runtime::spirv_bind::RenderBufferIndexBounds::new(0, 0, req.base_instance, req.instance_count, true)
+                        .with_indexed_vertex_max(Some(v))
+                });
+                for (frag, b) in o.vertex.iter().map(|b| (false, b)).chain(o.fragment.iter().map(|b| (true, b))) {
+                    let (reflection, binding) = if frag {
+                        (&f_shader.reflection, if buf_collide { b.index + FRAG_BUFFER_BINDING_OFFSET } else { b.index })
+                    } else {
+                        if !vertex_buffer_needs_storage_binding(&v_shader.reflection, b.index, stage_in_bufs.contains(&b.index)) {
+                            continue;
+                        }
+                        (&v_shader.reflection, b.index)
+                    };
+                    let access = crate::runtime::spirv_bind::reflected_buffer_access(reflection, b.index);
+                    if crate::runtime::spirv_bind::may_serve_neutral(access, false) {
+                        continue;
+                    }
+                    let cap = if frag {
+                        crate::runtime::spirv_bind::reflected_render_buffer_extent(reflection, b.index, bounds)
+                    } else {
+                        crate::runtime::spirv_bind::vertex_buffer_extent(reflection, b.index, false, bounds)
+                    };
+                    let loaded = match acc.exclusive() {
+                        Some(state) => load_buffer_content(
+                            state,
+                            host,
+                            req.task_id,
+                            b.buffer_ref,
+                            b.resource.as_deref(),
+                            b.offset,
+                            false,
+                            cap,
+                        ),
+                        None => match draw_par::load_buffer_content_worker(
+                            acc.shared(),
+                            host,
+                            prep_log!(),
+                            req.task_id,
+                            b.buffer_ref,
+                            b.resource.as_ref(),
+                            b.offset,
+                            false,
+                            cap,
+                        ) {
+                            Ok(content) => Some(content),
+                            Err(bail) => worker_bail!(bail),
+                        },
+                    };
+                    let Some(content) = loaded else {
+                        return Err(DrawError::DrawPreparation(if frag {
+                            DrawPreparationDecline::FragmentBufferMissing { index: b.index, buffer_ref: b.buffer_ref, offset: b.offset }
+                        } else {
+                            DrawPreparationDecline::VertexBufferMissing { index: b.index, buffer_ref: b.buffer_ref, offset: b.offset }
+                        }));
+                    };
+                    note_inflight_buffer_read(req.task_id, b.buffer_ref, &content);
+                    let bytes = match content {
+                        crate::backend::vulkan::engine::BufferContent::Bytes(b) => b,
+                        other => std::sync::Arc::new(other.cpu_bytes().into_owned()),
+                    };
+                    slot.push((binding, bytes));
+                }
+            }
+            crate::runtime::drain::note_store_route_n("merge_sub_overrides", m.overrides.len() as u64);
+        }
+        // TEMP (lab, MERGE_DRAWS): stage-in buffers a sub-draw reads instead of the record's - its own bytes, read with
+        // the record's bounds, for every location the buffer feeds.
+        let mut lab_sub_vstage: Vec<Vec<(std::sync::Arc<[u32]>, std::sync::Arc<Vec<u8>>)>> = Vec::new();
+        if let Some(m) = req.merged.as_deref().filter(|m| m.overrides.iter().any(|o| !o.vstage.is_empty()) && !lab_merge_deltas.is_empty()) {
+            lab_sub_vstage = vec![Vec::new(); m.subs.len()];
+            for o in &m.overrides {
+                let bounds = lab_sub_vmax.get(o.sub as usize).copied().flatten().map_or(render_buffer_bounds, |v| {
+                    crate::runtime::spirv_bind::RenderBufferIndexBounds::new(0, 0, req.base_instance, req.instance_count, true)
+                        .with_indexed_vertex_max(Some(v))
+                });
+                for b in &o.vstage {
+                    let locations: Vec<u32> =
+                        pd.vertex_attributes.iter().filter(|a| a.buffer_index == b.index).map(|a| a.location).collect();
+                    if locations.is_empty() {
+                        continue;
+                    }
+                    let cap = crate::runtime::spirv_bind::stage_in_buffer_extent(
+                        &pd.vertex_attributes,
+                        |a| super::bind_attribute_stride(&req.vertex_buffers, a.buffer_index, a.stride),
+                        b.index,
+                        bounds,
+                    );
+                    let loaded = match acc.exclusive() {
+                        Some(state) => load_buffer_content(state, host, req.task_id, b.buffer_ref, b.resource.as_deref(), b.offset, false, cap),
+                        None => match draw_par::load_buffer_content_worker(
+                            acc.shared(),
+                            host,
+                            prep_log!(),
+                            req.task_id,
+                            b.buffer_ref,
+                            b.resource.as_ref(),
+                            b.offset,
+                            false,
+                            cap,
+                        ) {
+                            Ok(content) => Some(content),
+                            Err(bail) => worker_bail!(bail),
+                        },
+                    };
+                    let Some(content) = loaded else {
+                        return Err(DrawError::DrawPreparation(DrawPreparationDecline::VertexBufferMissing {
+                            index: b.index,
+                            buffer_ref: b.buffer_ref,
+                            offset: b.offset,
+                        }));
+                    };
+                    note_inflight_buffer_read(req.task_id, b.buffer_ref, &content);
+                    let bytes = match content {
+                        crate::backend::vulkan::engine::BufferContent::Bytes(b) => b,
+                        other => std::sync::Arc::new(other.cpu_bytes().into_owned()),
+                    };
+                    if let Some(slot) = lab_sub_vstage.get_mut(o.sub as usize) {
+                        slot.push((locations.into(), bytes));
+                    }
+                }
+            }
+        }
         // At most every vertex and fragment buffer, in one allocation (b093).
         let mut storage: Vec<crate::backend::vulkan::engine::StorageBufferResource> =
             Vec::with_capacity(if lab_vec_cap() { vtx_storage.len() + frag_storage.len() } else { 0 });
@@ -14831,6 +15030,15 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             pipeline_object: resolved.pipeline_object.clone(),
             sub_draws: lab_merge_deltas.clone(), // TEMP (lab, MERGE_DRAWS)
             sub_rebind: lab_merge_rebind.clone(),
+            sub_storage: Vec::new(),
+            sub_index: Vec::new(),
+            sub_vstage: Vec::new(),
+            lab_head_scissor: req.merged.as_deref().filter(|_| !lab_merge_deltas.is_empty()).and_then(|m| m.head_scissor),
+            lab_head_stencil: req.merged.as_deref().filter(|_| !lab_merge_deltas.is_empty()).and_then(|m| m.head_stencil),
+            lab_head_first: match (req.merged.as_deref(), req.indexed.is_some()) {
+                (Some(m), true) => m.head_first,
+                _ => 0,
+            },
             // The four fixed-function encoder states, as the guest wrote
             // them. `None` is the state it never set, which takes Metal's own
             // default — and an out-of-contract *value* is a different thing
@@ -15116,6 +15324,9 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         resources.base_instance = req.base_instance;
         resources.vertex_attributes = attrs;
         resources.storage_buffers = storage;
+        resources.sub_storage = std::mem::take(&mut lab_sub_storage); // TEMP (lab, MERGE_DRAWS)
+        resources.sub_index = std::mem::take(&mut lab_sub_index);
+        resources.sub_vstage = std::mem::take(&mut lab_sub_vstage);
         resources.sampled_images = images;
         resources.color_input = frag_color_input;
         resources.continues_render_pass = req.continues_render_pass;

@@ -4717,14 +4717,127 @@ fn handle_render_draw<M: HostMemory + HostOps, S: WalkState>(
     }
 }
 
-/// TEMP (lab, MERGE_DRAWS): fold `d` into `head` as a sub-draw when the two differ only in where one vertex buffer
-/// starts, by whole elements of the stride the pipeline's learned shape names (`draw::merge`). The comparison is
-/// against the head's own state, so every sub-draw is the head with that one offset moved.
+thread_local! {
+    /// TEMP (lab, MERGE_DRAWS diagnosis): the reason the last fold on this thread was refused.
+    static LAB_MERGE_WHY: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+    static LAB_MERGE_SEEN: std::cell::RefCell<std::collections::HashMap<&'static str, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// TEMP (lab, MERGE_DRAWS diagnosis): [`lab_merge_fold_inner`], and for one refusal in 2048 of each reason (up to 40
+/// per reason) both draws, so the next fold can be designed from what the refused neighbours look like.
 fn lab_merge_fold(state: &DeviceState, task_id: u32, head: &mut PendingDraw, d: &PendingDraw) -> bool {
+    if lab_merge_fold_dyn(state, task_id, head, d) {
+        return true;
+    }
+    if !crate::runtime::drain::census::route_census_on() {
+        return false;
+    }
+    let why = LAB_MERGE_WHY.with(|w| w.get());
+    let n = LAB_MERGE_SEEN.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(why).or_insert(0);
+        *e += 1;
+        *e
+    });
+    if n % 2048 == 1 && n / 2048 < 40 {
+        let desc = |p: &PendingDraw| {
+            format!(
+                "pipe={} prim={} n={} first={} inst={:?} idx={:?} vbs=[{}] fbs=[{}] ft=[{}] vp={} sc={:?}",
+                p.pipeline_ref,
+                p.draw.primitive_type,
+                p.draw.vertex_count,
+                p.draw.first_vertex,
+                p.draw.instance_count,
+                p.indexed.as_ref().map(|i| (i.index_type, i.index_count, i.index_buffer_ref, i.index_buffer_offset, i.base_vertex)),
+                p.vertex_buffers.iter().map(|v| format!("{}:{}+{}", v.index, v.buffer_ref, v.offset)).collect::<Vec<_>>().join(" "),
+                p.fragment_buffers.iter().map(|v| format!("{}:{}+{}", v.index, v.buffer_ref, v.offset)).collect::<Vec<_>>().join(" "),
+                p.fragment_textures.iter().map(|t| format!("{}:{}", t.index, t.texture_ref)).collect::<Vec<_>>().join(" "),
+                p.viewports.len(),
+                p.scissors.first().map(|r| (r.x, r.y, r.width, r.height))
+            )
+        };
+        crate::observe::off(format!("merge_refusal_sample why={} head {{{}}} next {{{}}}", why, desc(head), desc(d)));
+    }
+    false
+}
+
+/// TEMP (lab, MERGE_DRAWS): [`lab_merge_fold_inner`] with scissors and stencil references allowed to differ - a
+/// single scissor and the stencil reference are dynamic state the engine sets before each sub-draw. The record's
+/// scissor becomes the union of its draws' (the rows they can write); its own is kept for its own draw.
+fn lab_merge_fold_dyn(state: &DeviceState, task_id: u32, head: &mut PendingDraw, d: &PendingDraw) -> bool {
+    let rect = |s: &crate::runtime::render_pass::ScissorRect| [s.x, s.y, s.width, s.height];
+    let head_sc = head.merged.as_ref().and_then(|m| m.head_scissor).or_else(|| head.scissors.first().map(rect));
+    let d_sc = d.scissors.first().map(rect);
+    let sc_diff = head_sc != d_sc;
+    if sc_diff && (head.scissors.len() != 1 || d.scissors.len() != 1) {
+        crate::runtime::drain::note_store_route("mf_state_scissors");
+        LAB_MERGE_WHY.with(|w| w.set("mf_state_scissors"));
+        return false;
+    }
+    let head_st = head.merged.as_ref().and_then(|m| m.head_stencil).unwrap_or(head.stencil_ref.unwrap_or((0, 0)));
+    let d_st = d.stencil_ref.unwrap_or((0, 0));
+    let st_diff = head_st != d_st;
+    // The comparison in the inner fold sees the head's own values.
+    let saved_sc = head.scissors.clone();
+    let saved_st = head.stencil_ref;
+    let sc_mode = sc_diff || head.merged.as_ref().is_some_and(|m| m.head_scissor.is_some());
+    let st_mode = st_diff || head.merged.as_ref().is_some_and(|m| m.head_stencil.is_some());
+    if sc_mode {
+        head.scissors = d.scissors.clone();
+    }
+    if st_mode {
+        head.stencil_ref = d.stencil_ref;
+    }
+    let ok = lab_merge_fold_inner(state, task_id, head, d);
+    head.stencil_ref = saved_st;
+    head.scissors = saved_sc;
+    if !ok {
+        return false;
+    }
+    let Some(m) = head.merged.as_mut() else {
+        return true;
+    };
+    if sc_diff || m.head_scissor.is_some() {
+        if m.head_scissor.is_none() {
+            m.head_scissor = head_sc;
+            for s in m.subs.iter_mut() {
+                s.scissor.get_or_insert(head_sc.unwrap_or([0, 0, u32::MAX, u32::MAX]));
+            }
+        }
+        if let Some(s) = m.subs.last_mut() {
+            s.scissor = d_sc;
+        }
+        if let (Some(u), Some([x, y, w, h])) = (head.scissors.first_mut(), d_sc) {
+            let (x1, y1) = ((u.x + u.width).max(x.saturating_add(w)), (u.y + u.height).max(y.saturating_add(h)));
+            u.x = u.x.min(x);
+            u.y = u.y.min(y);
+            u.width = x1 - u.x;
+            u.height = y1 - u.y;
+        }
+        crate::runtime::drain::note_store_route("mf_ok_scissor");
+    }
+    if st_diff || m.head_stencil.is_some() {
+        if m.head_stencil.is_none() {
+            m.head_stencil = Some(head_st);
+            for s in m.subs.iter_mut() {
+                s.stencil.get_or_insert(head_st);
+            }
+        }
+        if let Some(s) = m.subs.last_mut() {
+            s.stencil = Some(d_st);
+        }
+        crate::runtime::drain::note_store_route("mf_ok_stencil");
+    }
+    true
+}
+
+fn lab_merge_fold_inner(state: &DeviceState, task_id: u32, head: &mut PendingDraw, d: &PendingDraw) -> bool {
     use std::sync::Arc;
     // TEMP (lab, MERGE_DRAWS diagnosis): each refusal counted by reason (ROUTES only).
     let no = |why: &'static str| {
         crate::runtime::drain::note_store_route(why);
+        LAB_MERGE_WHY.with(|w| w.set(why));
         false
     };
     if head.pipeline_ref != d.pipeline_ref {
@@ -4769,182 +4882,130 @@ fn lab_merge_fold(state: &DeviceState, task_id: u32, head: &mut PendingDraw, d: 
     if head.draw.first_vertex != d.draw.first_vertex {
         return no("mf_args");
     }
-    if a.index_type != b.index_type || a.index_buffer_ref != b.index_buffer_ref {
+    if a.index_type != b.index_type {
         return no("mf_idx_buf");
     }
+    // Another index buffer: the sub-draw reads its own (bound before it), outside the record's window.
+    let own_index = a.index_buffer_ref != b.index_buffer_ref;
     let isz: u64 = match u16::try_from(a.index_type).ok().and_then(crate::protocol::render::IndexType::parse) {
         Some(crate::protocol::render::IndexType::Uint16) => 2,
         Some(crate::protocol::render::IndexType::Uint32) => 4,
         None => return no("mf_idx_type"),
     };
-    let (head_count, window) = match head.merged.as_ref() {
-        Some(m) => (m.head_count, u64::from(m.window)),
-        None => (a.index_count, u64::from(a.index_count)),
+    let (head_count, head_first, window) = match head.merged.as_ref() {
+        Some(m) => (m.head_count, u64::from(m.head_first), u64::from(m.window)),
+        None => (a.index_count, 0, u64::from(a.index_count)),
     };
-    if b.index_buffer_offset < a.index_buffer_offset || (b.index_buffer_offset - a.index_buffer_offset) % isz != 0 {
-        return no("mf_idx_off");
-    }
-    let first = (b.index_buffer_offset - a.index_buffer_offset) / isz;
-    let new_window = window.max(first + u64::from(b.index_count));
+    // The window starts at the record's index offset; a sub-draw whose indices lie before it moves the start back
+    // (`shift` indices) and every range already folded moves forward by as much.
+    let (first, shift) = if own_index {
+        (0, 0)
+    } else if b.index_buffer_offset >= a.index_buffer_offset {
+        let d_bytes = b.index_buffer_offset - a.index_buffer_offset;
+        if d_bytes % isz != 0 {
+            return no("mf_idx_off");
+        }
+        (d_bytes / isz, 0)
+    } else {
+        let d_bytes = a.index_buffer_offset - b.index_buffer_offset;
+        if d_bytes % isz != 0 {
+            return no("mf_idx_off");
+        }
+        (0, d_bytes / isz)
+    };
+    let new_window = if own_index { window } else { (window + shift).max(first + u64::from(b.index_count)) };
     if new_window * isz > draw::merge::MAX_WINDOW_BYTES {
         return no("mf_idx_window");
     }
-    let Some(bv_delta) = b.base_vertex.checked_sub(a.base_vertex).filter(|v| (0..=i64::from(i32::MAX / 2)).contains(v))
+    let Some(bv_delta) =
+        b.base_vertex.checked_sub(a.base_vertex).filter(|v| (-i64::from(i32::MAX / 2)..=i64::from(i32::MAX / 2)).contains(v))
     else {
         return no("mf_idx_bv");
     };
-    let same_res = |x: &Option<Arc<crate::model::TaskResource>>, y: &Option<Arc<crate::model::TaskResource>>| match (x, y)
-    {
-        (Some(x), Some(y)) => Arc::ptr_eq(x, y),
-        (None, None) => true,
-        _ => false,
+    let binds = match lab_merge_same_binds(state, task_id, head, d) {
+        Ok(b) => b,
+        Err(why) => return no(why),
     };
-    let tex_same = |a: &[draw::TextureBind], b: &[draw::TextureBind]| {
-        a.len() == b.len()
-            && a.iter().zip(b).all(|(x, y)| x.index == y.index && x.texture_ref == y.texture_ref && same_res(&x.resource, &y.resource))
-    };
-    let smp_same = |a: &[draw::SamplerBind], b: &[draw::SamplerBind]| {
-        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.index == y.index && x.sampler_ref == y.sampler_ref)
-    };
-    let buf_same = |x: &draw::BufferBind, y: &draw::BufferBind| {
-        x.index == y.index
-            && x.buffer_ref == y.buffer_ref
-            && x.offset == y.offset
-            && x.attribute_stride == y.attribute_stride
-            && same_res(&x.resource, &y.resource)
-    };
-    if !tex_same(&head.vertex_textures, &d.vertex_textures) || !tex_same(&head.fragment_textures, &d.fragment_textures)
-    {
-        return no("mf_tex");
+    let heavy = own_index || !binds.vertex.is_empty() || !binds.fragment.is_empty() || !binds.vstage.is_empty();
+    if heavy && head.merged.as_ref().is_some_and(|m| m.overrides.len() >= draw::merge::max_heavy_subs()) {
+        return no("mf_heavy_full");
     }
-    if !smp_same(&head.vertex_samplers, &d.vertex_samplers) || !smp_same(&head.fragment_samplers, &d.fragment_samplers)
-    {
-        return no("mf_smp");
-    }
-    if head.fragment_buffers.len() != d.fragment_buffers.len()
-        || !head.fragment_buffers.iter().zip(d.fragment_buffers.iter()).all(|(x, y)| buf_same(x, y))
-    {
-        return no("mf_fbuf");
-    }
-    if head.vertex_buffers.len() != d.vertex_buffers.len() {
-        return no("mf_vcount");
-    }
-    let mut moved: Option<(u32, u64)> = None;
-    for (x, y) in head.vertex_buffers.iter().zip(d.vertex_buffers.iter()) {
-        if buf_same(x, y) {
-            continue;
-        }
-        if x.index != y.index || x.buffer_ref != y.buffer_ref || x.attribute_stride != y.attribute_stride {
-            return no("mf_vref");
-        }
-        if !same_res(&x.resource, &y.resource) {
-            return no("mf_vres");
-        }
-        if y.offset <= x.offset {
-            return no("mf_vback");
-        }
-        if moved.is_some() {
-            return no("mf_vmulti");
-        }
-        moved = Some((x.index, y.offset - x.offset));
-    }
-    // A moved vertex buffer becomes a vertexOffset move, valid only under the pipeline's learned shape.
-    let mut moved_shape = None;
-    let mut rebind: Option<(u32, u64)> = None;
-    let mut elems: u64 = 0;
-    let rebind_ok = |index: u32| {
-        crate::backend::vulkan::pipeline_resolve::retained(state)
-            .and_then(|s| s.get(task_id, head.pipeline_ref))
-            .is_some_and(|obj| draw::merge::stage_in_only(&obj, index))
-    };
-    if let Some((index, delta)) = moved.filter(|(index, _)| rebind_ok(*index)) {
-        // Rebind path: the sub-draw binds the stage-in buffer `delta` bytes later, as the guest did.
-        if head.merged.as_ref().is_some_and(|m| m.shape.is_some() || m.rebind_index.is_some_and(|i| i != index)) {
-            return no("mf_rebind_mix");
-        }
-        crate::runtime::drain::note_store_route("mf_ok_rebind");
-        rebind = Some((index, delta));
-    } else if let Some((index, delta)) = moved {
-        let Some(obj) = crate::backend::vulkan::pipeline_resolve::retained(state)
-            .and_then(|s| s.get(task_id, head.pipeline_ref))
-        else {
-            return no("mf_noobj");
-        };
-        if head.merged.as_ref().is_some_and(|m| m.rebind_index.is_some()) {
-            return no("mf_rebind_mix");
-        }
-        let Some(shape) = draw::merge::shape(task_id, head.pipeline_ref, &obj) else {
-            return no("mf_noshape");
-        };
-        if shape.index != index {
-            return no("mf_index");
-        }
-        if delta % shape.stride != 0 {
-            // TEMP (lab, MERGE_DRAWS diagnosis): what the moves look like.
-            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
-                let offs: Vec<String> =
-                    d.vertex_buffers.iter().map(|v| format!("{}:{}+{}", v.index, v.buffer_ref, v.offset)).collect();
-                crate::observe::off(format!(
-                    "merge_stride_sample pipe={} index={} delta={} stride={} idx_off={}->{} idx_ref={} bv={}->{} vbs=[{}] fbs={}",
-                    head.pipeline_ref,
-                    index,
-                    delta,
-                    shape.stride,
-                    a.index_buffer_offset,
-                    b.index_buffer_offset,
-                    a.index_buffer_ref,
-                    a.base_vertex,
-                    b.base_vertex,
-                    offs.join(" "),
-                    d.fragment_buffers.len()
-                ));
-            }
-            return no("mf_stride");
-        }
-        elems = delta / shape.stride;
-        // Quads keep vertex_id % 4 (corner arithmetic in the shader) only on multiples of four.
-        if elems % 4 != 0 || elems > (i32::MAX / 2) as u64 {
-            return no("mf_quad");
-        }
-        if head.merged.as_ref().and_then(|m| m.shape).is_some_and(|s| s != shape) {
-            return no("mf_reshape");
-        }
-        moved_shape = Some(shape);
-    } else {
-        crate::runtime::drain::note_store_route("mf_ok_unmoved");
-    }
-    let vertex_delta = (elems as i64 + bv_delta) as i32;
+    let new_sub = head.merged.as_ref().map_or(0, |m| m.subs.len()) as u32;
     let m = head.merged.get_or_insert_with(|| draw::merge::MergedSubs {
         shape: None,
         rebind_index: None,
         subs: Vec::new(),
         head_count,
+        head_first: 0,
         window: head_count,
         span: (0, 0),
+        overrides: Vec::new(),
+        head_scissor: None,
+        head_stencil: None,
     });
-    if m.shape.is_none() {
-        m.shape = moved_shape;
+    let _ = head_first;
+    if shift > 0 {
+        m.head_first += shift as u32;
+        for s in m.subs.iter_mut() {
+            s.first += shift as u32;
+        }
     }
-    if let Some((index, _)) = rebind {
+    if let Some((index, _)) = binds.rebind {
         m.rebind_index = Some(index);
     }
     m.subs.push(draw::merge::SubDraw {
         first: first as u32,
         count: b.index_count,
-        vertex_delta,
-        vb_delta: rebind.map_or(0, |(_, d)| d),
+        vertex_delta: bv_delta as i32,
+        vb_delta: binds.rebind.map_or(0, |(_, d)| d),
+        own_index,
+        scissor: None,
+        stencil: None,
     });
+    if own_index {
+        crate::runtime::drain::note_store_route("mf_ok_own_index");
+    }
+    if !binds.vertex.is_empty() || !binds.fragment.is_empty() || !binds.vstage.is_empty() || own_index {
+        crate::runtime::drain::note_store_route("mf_ok_override");
+        m.overrides.push(draw::merge::SubBinds {
+            sub: new_sub,
+            vertex: binds.vertex,
+            fragment: binds.fragment,
+            vstage: binds.vstage,
+            index: own_index.then(|| b.clone()),
+        });
+    }
     m.window = new_window as u32;
     if let Some(ix) = head.indexed.as_mut() {
         ix.index_count = new_window as u32;
+        if shift > 0 {
+            ix.index_buffer_offset = b.index_buffer_offset;
+        }
     }
     true
 }
 
-/// Binds of `head` and `d` identical but for at most one vertex buffer that moved forward: `Ok(None)` when nothing
-/// moved, `Ok(Some((index, bytes)))` for the one move, `Err(reason)` otherwise.
-fn lab_merge_same_binds(head: &PendingDraw, d: &PendingDraw) -> Result<Option<(u32, u64)>, &'static str> {
+/// TEMP (lab, MERGE_DRAWS): how a sub-draw's binds differ from its record's.
+struct LabSubBinds {
+    /// The one stage-in buffer moved forward in the same buffer (rebind path): index, bytes.
+    rebind: Option<(u32, u64)>,
+    /// Vertex buffers read only as device buffers, bound to something else: the sub-draw's own binds.
+    vertex: Vec<draw::BufferBind>,
+    /// Fragment buffers bound to something else.
+    fragment: Vec<draw::BufferBind>,
+    /// Stage-in buffers bound to something else (not a forward move in the same buffer): the sub-draw's own bytes.
+    vstage: Vec<draw::BufferBind>,
+}
+
+/// Textures and samplers of `head` and `d` identical, and every buffer slot the same index; buffers that differ are
+/// the sub-draw's overrides (device buffers: the engine binds the sub-draw's own bytes) or its one stage-in move
+/// (rebind path). `Err(reason)` when the two cannot be one record.
+fn lab_merge_same_binds(
+    state: &DeviceState,
+    task_id: u32,
+    head: &PendingDraw,
+    d: &PendingDraw,
+) -> Result<LabSubBinds, &'static str> {
     use std::sync::Arc;
     let same_res = |x: &Option<Arc<crate::model::TaskResource>>, y: &Option<Arc<crate::model::TaskResource>>| match (x, y)
     {
@@ -4975,37 +5036,73 @@ fn lab_merge_same_binds(head: &PendingDraw, d: &PendingDraw) -> Result<Option<(u
         return Err("mf_smp");
     }
     if head.fragment_buffers.len() != d.fragment_buffers.len()
-        || !head.fragment_buffers.iter().zip(d.fragment_buffers.iter()).all(|(x, y)| buf_same(x, y))
+        || head.fragment_buffers.iter().zip(d.fragment_buffers.iter()).any(|(x, y)| x.index != y.index)
     {
-        return Err("mf_fbuf");
+        return Err("mf_fslots");
     }
-    if head.vertex_buffers.len() != d.vertex_buffers.len() {
+    if head.vertex_buffers.len() != d.vertex_buffers.len()
+        || head.vertex_buffers.iter().zip(d.vertex_buffers.iter()).any(|(x, y)| x.index != y.index)
+    {
         return Err("mf_vcount");
     }
-    let mut moved: Option<(u32, u64)> = None;
+    let mut out = LabSubBinds { rebind: None, vertex: Vec::new(), fragment: Vec::new(), vstage: Vec::new() };
+    for (x, y) in head.fragment_buffers.iter().zip(d.fragment_buffers.iter()) {
+        if !buf_same(x, y) {
+            if y.buffer_ref == 0 {
+                return Err("mf_fnull");
+            }
+            out.fragment.push(y.clone());
+        }
+    }
+    let mut obj = None;
     for (x, y) in head.vertex_buffers.iter().zip(d.vertex_buffers.iter()) {
         if buf_same(x, y) {
             continue;
         }
-        if x.index != y.index || x.buffer_ref != y.buffer_ref || x.attribute_stride != y.attribute_stride {
+        if x.attribute_stride != y.attribute_stride || y.buffer_ref == 0 {
             return Err("mf_vref");
         }
-        if !same_res(&x.resource, &y.resource) {
-            return Err("mf_vres");
+        if obj.is_none() {
+            obj = crate::backend::vulkan::pipeline_resolve::retained(state).and_then(|s| s.get(task_id, head.pipeline_ref));
         }
-        if y.offset <= x.offset {
-            return Err("mf_vback");
+        let Some(o) = obj.as_ref() else {
+            return Err("mf_noobj");
+        };
+        let feeds_stage_in = o.desc.vertex_attributes.iter().any(|a| a.buffer_index == y.index);
+        if !feeds_stage_in {
+            out.vertex.push(y.clone());
+            continue;
         }
-        if moved.is_some() {
-            return Err("mf_vmulti");
+        if !draw::merge::stage_in_only(o, y.index) {
+            return Err("mf_vmixed");
         }
-        moved = Some((x.index, y.offset - x.offset));
+        let rebind_index = head.merged.as_ref().and_then(|m| m.rebind_index);
+        let has_vstage = head.merged.as_ref().is_some_and(|m| m.overrides.iter().any(|s| !s.vstage.is_empty()));
+        let movable = x.buffer_ref == y.buffer_ref
+            && same_res(&x.resource, &y.resource)
+            && y.offset > x.offset
+            && out.rebind.is_none()
+            && out.vstage.is_empty()
+            && !has_vstage
+            && rebind_index.is_none_or(|i| i == y.index);
+        if movable {
+            out.rebind = Some((y.index, y.offset - x.offset));
+            continue;
+        }
+        // Whole other bytes for this stage-in buffer; never on a record that moves one by rebinding.
+        if rebind_index.is_some() || out.rebind.is_some() {
+            return Err("mf_rebind_mix");
+        }
+        out.vstage.push(y.clone());
     }
-    Ok(moved)
+    if out.rebind.is_some() {
+        crate::runtime::drain::note_store_route("mf_ok_rebind");
+    }
+    Ok(out)
 }
 
 /// TEMP (lab, MERGE_DRAWS): [`lab_merge_fold`] for two non-indexed draws. A sub-draw keeps its own firstVertex and
-/// vertexCount; a moved vertex buffer is folded only on the rebind path (stage-in, `draw::merge::stage_in_only`).
+/// vertexCount, its own device buffers and its stage-in move (rebind path).
 fn lab_merge_fold_vertices(
     state: &DeviceState,
     task_id: u32,
@@ -5013,35 +5110,33 @@ fn lab_merge_fold_vertices(
     d: &PendingDraw,
     no: &dyn Fn(&'static str) -> bool,
 ) -> bool {
-    let moved = match lab_merge_same_binds(head, d) {
-        Ok(m) => m,
+    let binds = match lab_merge_same_binds(state, task_id, head, d) {
+        Ok(b) => b,
         Err(why) => return no(why),
     };
-    if let Some((index, _)) = moved {
-        let ok = crate::backend::vulkan::pipeline_resolve::retained(state)
-            .and_then(|s| s.get(task_id, head.pipeline_ref))
-            .is_some_and(|obj| draw::merge::stage_in_only(&obj, index));
-        if !ok {
-            return no("mf_ni_moved");
-        }
-        if head.merged.as_ref().is_some_and(|m| m.rebind_index.is_some_and(|i| i != index)) {
-            return no("mf_rebind_mix");
-        }
-    }
     let first = d.draw.first_vertex;
     let Some(end) = first.checked_add(d.draw.vertex_count) else {
         return no("mf_ni_range");
     };
     let (h_first, h_count) = (head.draw.first_vertex, head.draw.vertex_count);
+    let heavy = !binds.vertex.is_empty() || !binds.fragment.is_empty() || !binds.vstage.is_empty();
+    if heavy && head.merged.as_ref().is_some_and(|m| m.overrides.len() >= draw::merge::max_heavy_subs()) {
+        return no("mf_heavy_full");
+    }
+    let new_sub = head.merged.as_ref().map_or(0, |m| m.subs.len()) as u32;
     let m = head.merged.get_or_insert_with(|| draw::merge::MergedSubs {
         shape: None,
         rebind_index: None,
         subs: Vec::new(),
         head_count: h_count,
+        head_first: 0,
         window: 0,
         span: (h_first, h_first.saturating_add(h_count)),
+        overrides: Vec::new(),
+        head_scissor: None,
+        head_stencil: None,
     });
-    if let Some((index, _)) = moved {
+    if let Some((index, _)) = binds.rebind {
         m.rebind_index = Some(index);
     }
     m.span = (m.span.0.min(first), m.span.1.max(end));
@@ -5049,8 +5144,21 @@ fn lab_merge_fold_vertices(
         first,
         count: d.draw.vertex_count,
         vertex_delta: 0,
-        vb_delta: moved.map_or(0, |(_, b)| b),
+        vb_delta: binds.rebind.map_or(0, |(_, b)| b),
+        own_index: false,
+        scissor: None,
+        stencil: None,
     });
+    if !binds.vertex.is_empty() || !binds.fragment.is_empty() || !binds.vstage.is_empty() {
+        crate::runtime::drain::note_store_route("mf_ok_override");
+        m.overrides.push(draw::merge::SubBinds {
+            sub: new_sub,
+            vertex: binds.vertex,
+            fragment: binds.fragment,
+            vstage: binds.vstage,
+            index: None,
+        });
+    }
     crate::runtime::drain::note_store_route("mf_ok_vertices");
     true
 }

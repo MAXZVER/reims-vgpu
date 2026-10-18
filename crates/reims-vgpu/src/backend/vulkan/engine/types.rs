@@ -521,6 +521,20 @@ pub struct DrawRequest {
     pub sub_draws: std::sync::Arc<[LabSubDraw]>,
     /// TEMP (lab, MERGE_DRAWS): the vertex input bindings a sub-draw's `vb_delta` moves.
     pub sub_rebind: std::sync::Arc<[u32]>,
+    /// TEMP (lab, MERGE_DRAWS): per sub-draw (by position), the storage bindings it binds to its own bytes.
+    pub sub_storage: Vec<Vec<(u32, std::sync::Arc<Vec<u8>>)>>,
+    /// TEMP (lab, MERGE_DRAWS): the record's own firstIndex into its index window.
+    pub lab_head_first: u32,
+    /// TEMP (lab, MERGE_DRAWS): the record's own scissor when its sub-draws carry theirs (`scissors` is then their
+    /// union, for the rows the draws can write).
+    pub lab_head_scissor: Option<[u32; 4]>,
+    /// TEMP (lab, MERGE_DRAWS): the record's own stencil reference when its sub-draws carry theirs.
+    pub lab_head_stencil: Option<(u32, u32)>,
+    /// TEMP (lab, MERGE_DRAWS): per sub-draw (by position), its own index bytes.
+    pub sub_index: Vec<Option<std::sync::Arc<Vec<u8>>>>,
+    /// TEMP (lab, MERGE_DRAWS): per sub-draw (by position), stage-in bytes it binds instead of the record's, each with
+    /// the vertex input bindings (one per location) that read them.
+    pub sub_vstage: Vec<Vec<(std::sync::Arc<[u32]>, std::sync::Arc<Vec<u8>>)>>,
     pub vertex_attributes: Vec<VertexAttributeResource>,
     pub storage_buffers: Vec<StorageBufferResource>,
     pub sampled_images: Vec<SampledImageResource>,
@@ -1059,6 +1073,12 @@ pub struct LabSubDraw {
     pub vertex_delta: i32,
     /// Bytes added to the bound offset of every binding in [`DrawRequest::sub_rebind`] for this sub-draw.
     pub vb_delta: u64,
+    /// The sub-draw reads its own index buffer ([`DrawRequest::sub_index`]); `first` is into that.
+    pub own_index: bool,
+    /// The sub-draw's own scissor `[x, y, w, h]` (set when the record carries per-sub-draw scissors).
+    pub scissor: Option<[u32; 4]>,
+    /// The sub-draw's own stencil reference (front, back) (set when the record carries per-sub-draw references).
+    pub stencil: Option<(u32, u32)>,
 }
 
 #[derive(Debug)]

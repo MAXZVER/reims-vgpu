@@ -2125,7 +2125,7 @@ impl ResourcePools {
         // back, passed through as one value because it only ever travels as one.
         slot: (vk::CommandBuffer, vk::Fence),
         target: BatchTarget,
-        dset: Option<(vk::DescriptorSet, vk::DescriptorPool)>,
+        dset: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
         sampled_retains: Vec<SampledRetain>,
         counters: &EngineCounters,
     ) {
@@ -2698,6 +2698,19 @@ impl ResourcePools {
                 };
             }
         }
+    }
+
+    /// TEMP (lab, MERGE_DRAWS): forget which push descriptors this command buffer holds, after a merged record's
+    /// sub-draws pushed their own.
+    pub(in crate::backend::vulkan::engine) fn lab_forget_push(&mut self) {
+        self.entry.cb_graphics.push_layout = None;
+    }
+
+    /// TEMP (lab, MERGE_DRAWS): forget the scissors and stencil reference this command buffer holds, after a merged
+    /// record's sub-draws set their own.
+    pub(in crate::backend::vulkan::engine) fn lab_forget_scissor_stencil(&mut self) {
+        self.entry.cb_graphics.scissors.clear();
+        self.entry.cb_graphics.stencil = None;
     }
 
     /// Begin a draw's vertex-bind list, discarding the previous draw's.

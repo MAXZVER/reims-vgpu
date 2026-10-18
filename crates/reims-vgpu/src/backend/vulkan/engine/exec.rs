@@ -5137,6 +5137,9 @@ pub(crate) unsafe fn execute_draw_inner(
     // Owning pool block travels alongside an allocated set so the flush-time
     // free routes back to the block it came from. A push layout owns neither.
     let mut dset_pool: Option<vk::DescriptorPool> = None;
+    // TEMP (lab, MERGE_DRAWS): sets allocated for sub-draws with their own storage bytes on a non-push layout;
+    // they retire with the record's own set.
+    let mut lab_extra_dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)> = Vec::new();
     let dset = if dsl != vk::DescriptorSetLayout::null() && !push_descriptors {
         let (dset, pool) = pools.alloc_descriptor_set(&ctx.device, dsl, counters)?;
         dset_pool = Some(pool);
@@ -6414,6 +6417,34 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     phase.enter(super::draw_phase::Phase::RecordDraw);
     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters) };
+    // TEMP (lab, MERGE_DRAWS): per-sub-draw scissors and stencil references - the record's own first.
+    let lab_stencil_dynamic = depth_stencil_plan.state.states().contains(&vk::DynamicState::STENCIL_REFERENCE);
+    let lab_dyn = |sc: Option<[u32; 4]>, st: Option<(u32, u32)>| -> bool {
+        if let Some([x, y, w, h]) = sc {
+            let x = x.min(req.width);
+            let y = y.min(req.height);
+            let rect = vk::Rect2D {
+                offset: vk::Offset2D { x: x as i32, y: y as i32 },
+                extent: vk::Extent2D { width: w.min(req.width - x), height: h.min(req.height - y) },
+            };
+            unsafe { crate::backend::vulkan::engine::cmd_sink::set_scissor(&ctx.device, cb, 0, &[rect]) };
+        }
+        if let Some((front, back)) = st {
+            if !lab_stencil_dynamic {
+                // Baked into the pipeline: only the record's own reference can be drawn.
+                return Some((front, back)) == req.lab_head_stencil;
+            }
+            unsafe {
+                crate::backend::vulkan::engine::cmd_sink::set_stencil_reference(&ctx.device, cb, vk::StencilFaceFlags::FRONT, front);
+                crate::backend::vulkan::engine::cmd_sink::set_stencil_reference(&ctx.device, cb, vk::StencilFaceFlags::BACK, back);
+            }
+        }
+        true
+    };
+    let lab_dyn_used = req.lab_head_scissor.is_some() || req.lab_head_stencil.is_some();
+    if lab_dyn_used {
+        lab_dyn(req.lab_head_scissor, req.lab_head_stencil.filter(|_| lab_stencil_dynamic));
+    }
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
             crate::backend::vulkan::engine::cmd_sink::bind_index_buffer(&ctx.device, cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk());
@@ -6421,15 +6452,39 @@ pub(crate) unsafe fn execute_draw_inner(
                 cb,
                 indexed.index_count,
                 req.instance_count.unwrap_or(1),
-                0,
+                req.lab_head_first,
                 indexed.vertex_offset,
                 req.base_instance,
             );
             // TEMP (lab, MERGE_DRAWS): the folded draws - the same state, their own index range and
             // vertexOffset.
-            for s in req.sub_draws.iter() {
+            let mut lab_pushed = false;
+            let mut lab_own_index = false;
+            let mut lab_vstage_bound: Vec<u32> = Vec::new();
+            for (i, s) in req.sub_draws.iter().enumerate() {
+                if !lab_sub_storage_push(ctx, pools, cb, pipeline_layout, push_descriptors, dsl, dset, &mut lab_extra_dsets, counters, req, i, &mut lab_pushed)? {
+                    continue;
+                }
+                match req.sub_index.get(i).and_then(|x| x.as_ref()) {
+                    Some(bytes) => {
+                        let slot = unsafe { pools.acquire_staging(ctx, bytes.len() as u64, counters)? };
+                        unsafe { pools.write_staging(ctx, &slot, bytes)? };
+                        crate::backend::vulkan::engine::cmd_sink::bind_index_buffer(&ctx.device, cb, slot.buffer, 0, indexed.index_type.vk());
+                        lab_own_index = true;
+                    }
+                    None if lab_own_index => {
+                        crate::backend::vulkan::engine::cmd_sink::bind_index_buffer(&ctx.device, cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk());
+                        lab_own_index = false;
+                    }
+                    None => {}
+                }
+                lab_sub_vstage(ctx, pools, cb, counters, req, i, &mut lab_vstage_bound)?;
                 if !req.sub_rebind.is_empty() {
                     unsafe { pools.lab_rebind_vertex(&ctx.device, cb, &req.sub_rebind, s.vb_delta) };
+                }
+                if lab_dyn_used && !lab_dyn(s.scissor.or(req.lab_head_scissor), s.stencil.or(req.lab_head_stencil)) {
+                    crate::runtime::drain::note_store_route("merge_sub_stencil_baked");
+                    continue;
                 }
                 crate::backend::vulkan::engine::cmd_sink::draw_indexed(&ctx.device,
                     cb,
@@ -6439,6 +6494,9 @@ pub(crate) unsafe fn execute_draw_inner(
                     indexed.vertex_offset.saturating_add(s.vertex_delta),
                     req.base_instance,
                 );
+            }
+            if lab_pushed {
+                pools.lab_forget_push();
             }
         }
         _ => {
@@ -6450,9 +6508,19 @@ pub(crate) unsafe fn execute_draw_inner(
                 req.base_instance,
             );
             // TEMP (lab, MERGE_DRAWS): the folded draws - the same state, their own vertex range.
-            for s in req.sub_draws.iter() {
+            let mut lab_pushed = false;
+            let mut lab_vstage_bound: Vec<u32> = Vec::new();
+            for (i, s) in req.sub_draws.iter().enumerate() {
+                if !lab_sub_storage_push(ctx, pools, cb, pipeline_layout, push_descriptors, dsl, dset, &mut lab_extra_dsets, counters, req, i, &mut lab_pushed)? {
+                    continue;
+                }
+                lab_sub_vstage(ctx, pools, cb, counters, req, i, &mut lab_vstage_bound)?;
                 if !req.sub_rebind.is_empty() {
                     unsafe { pools.lab_rebind_vertex(&ctx.device, cb, &req.sub_rebind, s.vb_delta) };
+                }
+                if lab_dyn_used && !lab_dyn(s.scissor.or(req.lab_head_scissor), s.stencil.or(req.lab_head_stencil)) {
+                    crate::runtime::drain::note_store_route("merge_sub_stencil_baked");
+                    continue;
                 }
                 crate::backend::vulkan::engine::cmd_sink::draw(&ctx.device,
                     cb,
@@ -6462,7 +6530,13 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.base_instance,
                 );
             }
+            if lab_pushed {
+                pools.lab_forget_push();
+            }
         }
+    }
+    if lab_dyn_used {
+        pools.lab_forget_scissor_stencil();
     }
     // Back to the remainder: the query end, the pass-close decision and
     // everything after it are the part of recording no sub-phase names.
@@ -6681,6 +6755,9 @@ pub(crate) unsafe fn execute_draw_inner(
         // Recycle transient resources before reporting loss.
         if let (Some(ds), Some(pool)) = (dset, dset_pool) {
             pools.free_descriptor_sets(&ctx.device, &[(ds, pool)]);
+        }
+        if !lab_extra_dsets.is_empty() {
+            pools.free_descriptor_sets(&ctx.device, &lab_extra_dsets);
         }
         pools.recycle_staging();
         pools.recycle_readback();
@@ -6927,7 +7004,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &ctx.device,
             (cb, fence),
             target,
-            dset.zip(dset_pool),
+            dset.zip(dset_pool).into_iter().chain(lab_extra_dsets.drain(..)).collect(),
             sampled_retains,
             counters,
         );
@@ -6965,7 +7042,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // admissions) on this ring slot in every mode; whichever entry retires
     // the slot drains it. A failed wait below leaves the slot pending, so no
     // path ever reuses an unretired fence.
-    let sealed = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), sampled_retains);
+    let sealed = pools.seal_entry(dset.zip(dset_pool).into_iter().chain(lab_extra_dsets.drain(..)).collect(), sampled_retains);
     pools.finish_entry_async(&ctx.device, sealed);
 
     // Dispose the ad-hoc per-draw framebuffers (MRT and/or depth) now that
@@ -7431,6 +7508,139 @@ fn fill_descriptor_bindings(
 ///
 /// `dst_set` is ignored by `vkCmdPushDescriptorSetKHR`, which is why the push
 /// rail passes a null handle rather than inventing one.
+/// TEMP (lab, MERGE_DRAWS): before sub-draw `i` of a merged record, bind the stage-in bytes it has instead of the
+/// record's (each staged into its own slot), or the record's own again for bindings a previous sub-draw moved.
+fn lab_sub_vstage(
+    ctx: &crate::backend::vulkan::engine::context::DeviceContext,
+    pools: &mut ResourcePools,
+    cb: vk::CommandBuffer,
+    counters: &EngineCounters,
+    req: &DrawRequest,
+    i: usize,
+    bound: &mut Vec<u32>,
+) -> Result<(), DrawError> {
+    let own = req.sub_vstage.get(i).filter(|l| !l.is_empty());
+    if !bound.is_empty() {
+        unsafe { pools.lab_rebind_vertex(&ctx.device, cb, bound, 0) };
+        bound.clear();
+    }
+    let Some(list) = own else {
+        return Ok(());
+    };
+    for (bindings, bytes) in list {
+        if bytes.is_empty() {
+            continue;
+        }
+        let slot = unsafe { pools.acquire_staging(ctx, bytes.len() as u64, counters)? };
+        unsafe { pools.write_staging(ctx, &slot, bytes)? };
+        for b in bindings.iter() {
+            unsafe {
+                crate::backend::vulkan::engine::cmd_sink::bind_vertex_buffers(&ctx.device, cb, *b, &[slot.buffer], &[0]);
+            }
+            bound.push(*b);
+        }
+    }
+    Ok(())
+}
+
+/// TEMP (lab, MERGE_DRAWS): before sub-draw `i` of a merged record, push the record's descriptors with the
+/// sub-draw's own storage bytes where it has them (each in its own staging slot), or the record's own again after a
+/// sub-draw that pushed its own. `Ok(false)`: the sub-draw cannot be drawn (no push descriptors on this layout).
+#[allow(clippy::too_many_arguments)]
+fn lab_sub_storage_push(
+    ctx: &crate::backend::vulkan::engine::context::DeviceContext,
+    pools: &mut ResourcePools,
+    cb: vk::CommandBuffer,
+    pipeline_layout: vk::PipelineLayout,
+    push_descriptors: bool,
+    dsl: vk::DescriptorSetLayout,
+    record_dset: Option<vk::DescriptorSet>,
+    extra_dsets: &mut Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
+    counters: &EngineCounters,
+    req: &DrawRequest,
+    i: usize,
+    pushed: &mut bool,
+) -> Result<bool, DrawError> {
+    let own = req.sub_storage.get(i).filter(|l| !l.is_empty());
+    if own.is_none() && !*pushed {
+        return Ok(true);
+    }
+    if !push_descriptors && own.is_none() {
+        // The record's own set again after a sub-draw that bound its own.
+        if let Some(ds) = record_dset {
+            unsafe {
+                crate::backend::vulkan::engine::cmd_sink::bind_descriptor_sets(&ctx.device, cb, vk::PipelineBindPoint::GRAPHICS, pipeline_layout, 0, &[ds], &[]);
+            }
+        }
+        *pushed = false;
+        return Ok(true);
+    }
+    if !push_descriptors && (record_dset.is_none() || dsl == vk::DescriptorSetLayout::null()) {
+        crate::runtime::drain::note_store_route("merge_sub_no_push");
+        return Ok(false);
+    }
+    // The record's bindings: on a push layout what the command buffer carries, else the list its set was written from.
+    let mut binds: Vec<super::pools::PushDescriptorBinding> = if push_descriptors {
+        pools.push_descriptor_echo().to_vec()
+    } else {
+        pools.push_descriptor_scratch_ref().to_vec()
+    };
+    if let Some(list) = own {
+        for (binding, bytes) in list {
+            if bytes.is_empty() {
+                continue;
+            }
+            let slot = unsafe { pools.acquire_staging(ctx, bytes.len() as u64, counters)? };
+            unsafe { pools.write_staging(ctx, &slot, bytes)? };
+            for e in binds.iter_mut() {
+                if let super::pools::PushDescriptorBinding::Buffer {
+                    binding: ref b,
+                    ref mut buffer,
+                    ref mut offset,
+                    ref mut range,
+                    ..
+                } = *e
+                {
+                    if *b == *binding {
+                        *buffer = slot.buffer;
+                        *offset = 0;
+                        *range = bytes.len() as u64;
+                    }
+                }
+            }
+        }
+    }
+    if !push_descriptors {
+        let (ds, pool) = unsafe { pools.alloc_descriptor_set(&ctx.device, dsl, counters)? };
+        extra_dsets.push((ds, pool));
+        with_descriptor_writes(&binds, ds, |writes| unsafe { ctx.device.update_descriptor_sets(writes, &[]) });
+        unsafe {
+            crate::backend::vulkan::engine::cmd_sink::bind_descriptor_sets(&ctx.device, cb, vk::PipelineBindPoint::GRAPHICS, pipeline_layout, 0, &[ds], &[]);
+        }
+        crate::runtime::drain::note_store_route("merge_sub_own_set");
+        *pushed = true;
+        return Ok(true);
+    }
+    let push_entry = ctx.push_descriptor.as_ref().expect("push layout requires enabled entry points");
+    with_descriptor_writes(&binds, vk::DescriptorSet::null(), |writes| unsafe {
+        crate::backend::vulkan::engine::cmd_sink::push_descriptor_set(
+            push_entry,
+            cb,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline_layout,
+            0,
+            writes,
+        );
+    });
+    counters.descriptor_pushes.fetch_add(1, Ordering::Relaxed);
+    *pushed = own.is_some();
+    if !*pushed {
+        // The record's own set is bound again; the cache's echo is right once more.
+        return Ok(true);
+    }
+    Ok(true)
+}
+
 fn with_descriptor_writes<R>(
     bindings: &[super::pools::PushDescriptorBinding],
     dst_set: vk::DescriptorSet,

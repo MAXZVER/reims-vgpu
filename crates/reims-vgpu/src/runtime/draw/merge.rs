@@ -28,11 +28,20 @@ use crate::backend::vulkan::pipeline_resolve::ResolvedRenderPipeline;
 /// Sub-draws a merged draw may carry after its own.
 pub const MAX_SUBS: usize = 1024;
 
-/// `REIMS_VGPU_LAB_MERGE_DRAWS=on` (default off). Latched.
+/// Sub-draws with their own buffers (each loads its own bytes when the record is prepared) a record may carry:
+/// a record is prepared by one worker, so piling every tile of a frame into one record serialises what the parallel
+/// preparation spread over the pool (b775: Maps 56 -> 33 fps). `REIMS_VGPU_LAB_MERGE_HEAVY` (default 16). Latched.
+pub fn max_heavy_subs() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("REIMS_VGPU_LAB_MERGE_HEAVY").ok().and_then(|v| v.parse().ok()).unwrap_or(16))
+}
+
+/// On by default since b777 (plan page 62 vs 50 fps idle, 71 vs 49 dragged; Maps +17 %; frames match);
+/// `REIMS_VGPU_LAB_MERGE_DRAWS=off` turns it off. Latched.
 pub fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = matches!(std::env::var("REIMS_VGPU_LAB_MERGE_DRAWS").as_deref(), Ok("on" | "1"));
+        let on = !matches!(std::env::var("REIMS_VGPU_LAB_MERGE_DRAWS").as_deref(), Ok("off" | "0"));
         crate::observe::off(format!("lab_merge_draws on={}", u8::from(on)));
         on
     })
@@ -44,6 +53,33 @@ pub struct Shape {
     pub index: u32,
     pub stride: u64,
 }
+
+/// One sub-draw's own device-buffer binds, where they differ from its record's.
+#[derive(Clone, Debug)]
+pub struct SubBinds {
+    pub sub: u32,
+    pub vertex: Vec<crate::runtime::draw::BufferBind>,
+    pub fragment: Vec<crate::runtime::draw::BufferBind>,
+    /// Stage-in buffers the sub-draw reads instead of the record's (whole other binds, not a move).
+    pub vstage: Vec<crate::runtime::draw::BufferBind>,
+    /// The sub-draw's own index buffer range.
+    pub index: Option<crate::runtime::draw::IndexedDrawInfo>,
+}
+
+impl PartialEq for SubBinds {
+    fn eq(&self, other: &Self) -> bool {
+        let key = |v: &Vec<crate::runtime::draw::BufferBind>| v.iter().map(|b| (b.index, b.buffer_ref, b.offset)).collect::<Vec<_>>();
+        let ik = |i: &Option<crate::runtime::draw::IndexedDrawInfo>| {
+            i.as_ref().map(|i| (i.index_type, i.index_count, i.index_buffer_ref, i.index_buffer_offset, i.base_vertex))
+        };
+        self.sub == other.sub
+            && key(&self.vertex) == key(&other.vertex)
+            && key(&self.fragment) == key(&other.fragment)
+            && key(&self.vstage) == key(&other.vstage)
+            && ik(&self.index) == ik(&other.index)
+    }
+}
+impl Eq for SubBinds {}
 
 /// Bytes a merged record's index window may span (the index-bounded vertex fetch reads gathered windows up to
 /// 64 KiB on the CPU).
@@ -65,7 +101,15 @@ pub struct MergedSubs {
     pub rebind_index: Option<u32>,
     pub subs: Vec<SubDraw>,
     pub head_count: u32,
+    /// Indexed: the record's own firstIndex into the window (a later sub-draw's indices may lie before it).
+    pub head_first: u32,
     pub window: u32,
+    /// The sub-draws that bind other device buffers than the record (sparse, by sub-draw).
+    pub overrides: Vec<SubBinds>,
+    /// The record's own scissor once a sub-draw carries another (the record's `scissors` then hold their union).
+    pub head_scissor: Option<[u32; 4]>,
+    /// The record's own stencil reference once a sub-draw carries another.
+    pub head_stencil: Option<(u32, u32)>,
     /// Not indexed: `[first, end)` of the vertices the record and its sub-draws draw (the vertex fetch bound).
     pub span: (u32, u32),
 }
@@ -196,8 +240,8 @@ pub fn stage_in_only(object: &ResolvedRenderPipeline, index: u32) -> bool {
 /// `max_of(first, count)` is the largest index of `count` indices from `first` in the window, plus the record's
 /// baseVertex, or `None` when unknown (then nothing is bounded).
 pub fn vertex_max(m: &MergedSubs, max_of: impl Fn(u32, u32) -> Option<u64>) -> Option<u64> {
-    let mut best = max_of(0, m.head_count)?;
-    for s in &m.subs {
+    let mut best = max_of(m.head_first, m.head_count)?;
+    for s in m.subs.iter().filter(|s| !s.own_index) {
         best = best.max(max_of(s.first, s.count)?.checked_add_signed(i64::from(s.vertex_delta))?);
     }
     Some(best)
