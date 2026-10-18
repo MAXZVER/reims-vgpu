@@ -5381,6 +5381,58 @@ mod lab_irq_urgent_tests {
     }
 }
 
+/// TEMP (lab, Opus 2026-10-18): does a `CmdSynchronizeResources` (0x35, synchronizeForUnwire) pay for a surface
+/// the guest retires right after? b733 (AMD, heavy WebGL, the "heavy regime"): 60 0x35 a second cost 5.3 s of a
+/// 10.9 s drain, beside 60 `CmdDeleteIOSurfaceBacking2` and `CmdMapMemory2` a second - WebKit's 5K targets
+/// recreated every frame; the light regime of the same page has neither. Counts, per mapping a 0x35 named:
+/// `unwire_sync_owed` / `unwire_sync_clean` (a debt was / was not owed), and at a retirement of that mapping
+/// `unwire_sync_then_delete_{lt2,lt10,lt50,lt500}ms` by the gap, or `unwire_delete_unsynced`.
+pub(crate) mod lab_unwire {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    static SYNCED: Mutex<Option<HashMap<u32, (Instant, bool)>>> = Mutex::new(None);
+
+    pub(crate) fn note_synced(mapping_id: u32, owed: bool) {
+        let route = if owed {
+            "unwire_sync_owed"
+        } else {
+            "unwire_sync_clean"
+        };
+        super::note_store_route(route);
+        let mut g = SYNCED.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() > 4096 {
+            m.retain(|_, (t, _)| t.elapsed().as_millis() < 500);
+        }
+        m.insert(mapping_id, (Instant::now(), owed));
+    }
+
+    pub(crate) fn note_delete(mapping_id: u32) {
+        let hit = SYNCED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .and_then(|m| m.remove(&mapping_id));
+        let route = match hit {
+            Some((t, owed)) => {
+                let ms = t.elapsed().as_millis();
+                match (owed, ms) {
+                    (true, 0..=1) => "unwire_owed_then_delete_lt2ms",
+                    (true, 2..=9) => "unwire_owed_then_delete_lt10ms",
+                    (true, 10..=49) => "unwire_owed_then_delete_lt50ms",
+                    (true, 50..=499) => "unwire_owed_then_delete_lt500ms",
+                    (false, 0..=499) => "unwire_clean_then_delete_lt500ms",
+                    _ => "unwire_delete_unsynced",
+                }
+            }
+            None => "unwire_delete_unsynced",
+        };
+        super::note_store_route(route);
+    }
+}
+
 pub(crate) mod lab_rewake {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -8208,6 +8260,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // bookkeeping. Keeping page_entries after it lets later id reuse/clear
         // write pixels into pages the guest has recycled.
         let crate::protocol::fifo::DeleteBackingCommand { object_id, task_id } = retire;
+        if census::route_census_on() {
+            lab_unwire::note_delete(object_id); // TEMP (lab_unwire census)
+        }
         // The retirement, in the model that owns the names over these bytes.
         // The contract retires the backing *and* the resources that named it,
         // so the teardowns below are the model's per-name answers rather than a
@@ -8443,6 +8498,16 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 .map(|acted| acted.at_completion.len())
                 .unwrap_or(0);
                 note_store_route_n("lifetime_discard_offered", deferred as u64);
+                // TEMP (lab_unwire census): which surfaces this payment is for.
+                if census::route_census_on() {
+                    for &oid in &cmd.object_ids {
+                        for mapping_id in state.mappings_named_by(cmd.task_id, oid).iter() {
+                            let owed = state.pending_writebacks.get(mapping_id).is_some()
+                                || state.pending_writebacks.deferred_mapping() == Some(mapping_id);
+                            lab_unwire::note_synced(mapping_id, owed);
+                        }
+                    }
+                }
                 // Synchronization is resource-scoped. Apple batches the named
                 // resources into transfer encoders; synchronizing one object
                 // does not publish every other host-valid texture in the task.
