@@ -14164,18 +14164,24 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             // them: the Store that publishes this pass stamps this, not a
             // generation read after the draws (see `GuestWriteObservation`).
             if let Some(mid) = req.colors.first().map(|c| c.mapping_id).filter(|m| *m != 0) {
+                // TEMP (lab, Opus 2026-10-18): sub-spans of seedx_currency_us, which a heavy
+                // WebGL page charges 268 ms a second (b705).
+                let _span = crate::runtime::chain_phase::CostSpan::new("seedx_cur_observe_us");
                 if let Some(state) = acc.exclusive() {
                     crate::runtime::mapper::note_pass_guest_observation(state, host, mid);
                 }
             }
-            if let Some((identity, mapping_epoch)) =
-                mapper_ref_texture_load_currency_query(acc.shared(), req)
+            let span_query = crate::runtime::chain_phase::CostSpan::new("seedx_cur_query_us");
+            let currency_query = mapper_ref_texture_load_currency_query(acc.shared(), req);
+            drop(span_query);
+            if let Some((identity, mapping_epoch)) = currency_query
             {
                 // Both arms counted, into the same one-second window as
                 // `drain_duty`. An elision count alone cannot tell "the seed was
                 // skipped" from "this record was never a candidate", and the
                 // ratio of the two is a within-boot number — the only kind that
                 // survives the 1.8x `us_per_draw` drift between boots on this rig.
+                let span_lease = crate::runtime::chain_phase::CostSpan::new("seedx_cur_lease_us");
                 let backing = req.colors.first().and_then(|c0| {
                     acc.shared()
                         .constructed_object(req.task_id, c0.texture_ref)
@@ -14186,6 +14192,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                             resource_lease::resident_target_backing(&resource, &identity)
                         })
                 });
+                drop(span_lease);
                 let (resident_current, guest_wrote) = mapper_ref_texture_load_resident_is_current(
                     backing,
                     || {
@@ -14194,8 +14201,10 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
                         let epoch_current =
                             mapper_ref_texture_resident_is_current(mapping_epoch, resident_epoch);
+                        let span_gw = crate::runtime::chain_phase::CostSpan::new("seedx_cur_gw_us");
                         let guest_wrote =
                             mapper_ref_texture_guest_wrote_since_store(acc.shared(), host, mapping_id);
+                        drop(span_gw);
                         // The resident is the surface apart from what the guest
                         // CPU painted since: lay that over it and the LOAD needs
                         // no seed, instead of paying the debt back into the pages
