@@ -2981,6 +2981,51 @@ pub fn lab_map_land_all() -> bool {
     })
 }
 
+/// [`crate::config::LAB_WBDEBT_ABANDON_ON_EXIT`] state to arm: only `on`.
+fn wbdebt_abandon_on_exit_from_switch(state: crate::config::Switch) -> bool {
+    matches!(state, crate::config::Switch::On)
+}
+
+/// `REIMS_VGPU_LAB_WBDEBT_ABANDON_ON_EXIT`, read once (default off).
+fn wbdebt_abandon_on_exit_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let (state, value) = crate::config::read(crate::config::LAB_WBDEBT_ABANDON_ON_EXIT);
+        if state == crate::config::Switch::Unrecognized {
+            crate::observe::fail(format!(
+                "wbdebt_abandon_on_exit reason=wbdebt_abandon_on_exit_env_unrecognized value={:?} (kept off)",
+                value.unwrap_or_default()
+            ));
+        }
+        let on = wbdebt_abandon_on_exit_from_switch(state);
+        crate::observe::off(format!("lab_wbdebt_abandon_on_exit on={on} switch={state:?}"));
+        on
+    })
+}
+
+/// A debt dropped unpaid because its mapping is gone or its generation moved.
+/// Under the lab switch the resident is released to the reclaim paths, as the
+/// superseded exit already does.
+fn abandon_on_dropped_exit(debt: &WritebackDebt) {
+    if wbdebt_abandon_on_exit_enabled() {
+        crate::runtime::drain::note_store_route("wbdebt_abandoned_on_dropped_exit");
+        crate::backend::selected().abandon_resident(&debt.target);
+    }
+}
+
+#[cfg(test)]
+mod wbdebt_abandon_on_exit_switch_tests {
+    #[test]
+    fn the_lab_switch_is_default_off() {
+        use crate::config::Switch;
+        assert!(!super::wbdebt_abandon_on_exit_from_switch(Switch::Unset));
+        assert!(!super::wbdebt_abandon_on_exit_from_switch(Switch::Off));
+        assert!(!super::wbdebt_abandon_on_exit_from_switch(Switch::Unrecognized));
+        assert!(super::wbdebt_abandon_on_exit_from_switch(Switch::On));
+    }
+}
+
 /// TEMP (lab PAY_DEFER): [`pay`], leaving the landing owed when the rail can
 /// defer it. Lands a payment already begun first: one at a time.
 fn pay_deferred<M: HostMemory + HostOps>(
@@ -2994,12 +3039,14 @@ fn pay_deferred<M: HostMemory + HostOps>(
     let Some(entry) = state.mappings.get(&mapping_id) else {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
         lab_pay_exit(mapping_id, &debt, "no_mapping");
+        abandon_on_dropped_exit(&debt);
         return;
     };
     let (map_generation, validity) = (entry.map_generation, entry.validity);
     if map_generation != debt.map_generation {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
         lab_pay_exit(mapping_id, &debt, "generation_moved");
+        abandon_on_dropped_exit(&debt);
         return;
     }
     let rail = crate::backend::selected();
@@ -3159,12 +3206,14 @@ fn pay<M: HostMemory + HostOps>(
     let Some(entry) = state.mappings.get(&mapping_id) else {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
         lab_pay_exit(mapping_id, &debt, "no_mapping");
+        abandon_on_dropped_exit(&debt);
         return;
     };
     let (map_generation, validity) = (entry.map_generation, entry.validity);
     if map_generation != debt.map_generation {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
         lab_pay_exit(mapping_id, &debt, "generation_moved");
+        abandon_on_dropped_exit(&debt);
         return;
     }
     // The resident the draw registered, not the one a fresh derivation would
