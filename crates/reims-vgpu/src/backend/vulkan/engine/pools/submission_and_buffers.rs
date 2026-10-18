@@ -2676,6 +2676,30 @@ impl ResourcePools {
         }
     }
 
+    /// TEMP (lab, MERGE_DRAWS): rebind `bindings` of the recording draw `delta` bytes past where
+    /// [`Self::bind_vertex_buffers`] bound them, for a folded sub-draw whose stage-in buffer started later.
+    pub(in crate::backend::vulkan::engine) unsafe fn lab_rebind_vertex(
+        &self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        bindings: &[u32],
+        delta: u64,
+    ) {
+        for (binding, bound) in self.entry.cb_graphics.vertex_binds.iter() {
+            if bindings.contains(binding) {
+                unsafe {
+                    crate::backend::vulkan::engine::cmd_sink::bind_vertex_buffers(
+                        device,
+                        cb,
+                        *binding,
+                        &[bound.buffer],
+                        &[bound.offset + delta],
+                    )
+                };
+            }
+        }
+    }
+
     /// Begin a draw's vertex-bind list, discarding the previous draw's.
     ///
     /// Paired with [`Self::stage_vertex_bind`] and consumed by

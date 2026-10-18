@@ -6425,6 +6425,21 @@ pub(crate) unsafe fn execute_draw_inner(
                 indexed.vertex_offset,
                 req.base_instance,
             );
+            // TEMP (lab, MERGE_DRAWS): the folded draws - the same state, their own index range and
+            // vertexOffset.
+            for s in req.sub_draws.iter() {
+                if !req.sub_rebind.is_empty() {
+                    unsafe { pools.lab_rebind_vertex(&ctx.device, cb, &req.sub_rebind, s.vb_delta) };
+                }
+                crate::backend::vulkan::engine::cmd_sink::draw_indexed(&ctx.device,
+                    cb,
+                    s.count,
+                    req.instance_count.unwrap_or(1),
+                    s.first,
+                    indexed.vertex_offset.saturating_add(s.vertex_delta),
+                    req.base_instance,
+                );
+            }
         }
         _ => {
             crate::backend::vulkan::engine::cmd_sink::draw(&ctx.device, 

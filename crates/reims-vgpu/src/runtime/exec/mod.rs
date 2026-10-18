@@ -117,6 +117,8 @@ struct PendingDraw {
     /// [`StreamAccum::visibility`]. `None` is the Metal default,
     /// `MTLVisibilityResultModeDisabled`.
     visibility: Option<draw::VisibilityArming>,
+    /// TEMP (lab, MERGE_DRAWS): the later draws of the stream folded into this one (`draw::merge`).
+    merged: Option<draw::merge::MergedSubs>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -484,6 +486,7 @@ impl StreamAccum {
             depth_attach: self.depth_attach,
             stencil_attach: self.stencil_attach,
             visibility: self.visibility,
+            merged: None, // TEMP (lab, MERGE_DRAWS)
         })
     }
 }
@@ -4685,20 +4688,254 @@ fn handle_render_draw<M: HostMemory + HostOps, S: WalkState>(
         acc.dropped_zero_count = acc.dropped_zero_count.saturating_add(1);
     } else {
         match acc.bind_snapshot() {
-            Ok(snapshot) => acc.draws.push(PendingDraw {
-                pipeline_ref: acc.pipeline_ref,
-                draw: DrawArgs {
-                    vertex_count: count,
-                    instance_count,
-                    primitive_type: primitive,
-                    first_vertex,
-                    base_instance,
-                },
-                ..snapshot
-            }),
+            Ok(snapshot) => {
+                let pending = PendingDraw {
+                    pipeline_ref: acc.pipeline_ref,
+                    draw: DrawArgs {
+                        vertex_count: count,
+                        instance_count,
+                        primitive_type: primitive,
+                        first_vertex,
+                        base_instance,
+                    },
+                    ..snapshot
+                };
+                // TEMP (lab, MERGE_DRAWS): fold into the previous draw when only one vertex buffer moved.
+                let folded = draw::merge::on()
+                    && acc
+                        .draws
+                        .last_mut()
+                        .is_some_and(|head| lab_merge_fold(state.shared(), task_id, head, &pending));
+                if folded {
+                    crate::runtime::drain::note_store_route("merge_folded");
+                } else {
+                    acc.draws.push(pending);
+                }
+            }
             Err(over) => note_draw_refused(over, acc.pipeline_ref, "draw"),
         }
     }
+}
+
+/// TEMP (lab, MERGE_DRAWS): fold `d` into `head` as a sub-draw when the two differ only in where one vertex buffer
+/// starts, by whole elements of the stride the pipeline's learned shape names (`draw::merge`). The comparison is
+/// against the head's own state, so every sub-draw is the head with that one offset moved.
+fn lab_merge_fold(state: &DeviceState, task_id: u32, head: &mut PendingDraw, d: &PendingDraw) -> bool {
+    use std::sync::Arc;
+    // TEMP (lab, MERGE_DRAWS diagnosis): each refusal counted by reason (ROUTES only).
+    let no = |why: &'static str| {
+        crate::runtime::drain::note_store_route(why);
+        false
+    };
+    if head.pipeline_ref != d.pipeline_ref {
+        return no("mf_pipe");
+    }
+    if head.merged.as_ref().is_some_and(|m| m.subs.len() >= draw::merge::MAX_SUBS) {
+        return no("mf_full");
+    }
+    if head.visibility.is_some() || d.visibility.is_some() {
+        return no("mf_vis");
+    }
+    if head.draw.primitive_type != d.draw.primitive_type
+        || head.draw.instance_count != d.draw.instance_count
+        || head.draw.base_instance != d.draw.base_instance
+        || head.draw.vertex_count != d.draw.vertex_count
+        || head.draw.first_vertex != d.draw.first_vertex
+    {
+        return no("mf_args");
+    }
+    if head.viewports != d.viewports
+        || head.scissors != d.scissors
+        || head.blend_color != d.blend_color
+        || head.cull_mode != d.cull_mode
+        || head.front_facing != d.front_facing
+        || head.fill_mode != d.fill_mode
+        || head.depth_clip_mode != d.depth_clip_mode
+        || head.line_width != d.line_width
+        || head.depth_bias != d.depth_bias
+        || head.depth_stencil_ref != d.depth_stencil_ref
+        || head.stencil_ref != d.stencil_ref
+    {
+        return no("mf_state");
+    }
+    // Indexed only. The sub-draw keeps its own index range (`firstIndex` into the record's window, which must
+    // stay contiguous so the window's indices are all real ones) and its own baseVertex (as a vertexOffset delta).
+    let (Some(a), Some(b)) = (&head.indexed, &d.indexed) else {
+        return no("mf_not_idx");
+    };
+    if a.index_type != b.index_type || a.index_buffer_ref != b.index_buffer_ref {
+        return no("mf_idx_buf");
+    }
+    let isz: u64 = match u16::try_from(a.index_type).ok().and_then(crate::protocol::render::IndexType::parse) {
+        Some(crate::protocol::render::IndexType::Uint16) => 2,
+        Some(crate::protocol::render::IndexType::Uint32) => 4,
+        None => return no("mf_idx_type"),
+    };
+    let (head_count, window) = match head.merged.as_ref() {
+        Some(m) => (m.head_count, u64::from(m.window)),
+        None => (a.index_count, u64::from(a.index_count)),
+    };
+    if b.index_count != head_count {
+        return no("mf_idx_count");
+    }
+    if b.index_buffer_offset < a.index_buffer_offset || (b.index_buffer_offset - a.index_buffer_offset) % isz != 0 {
+        return no("mf_idx_off");
+    }
+    let first = (b.index_buffer_offset - a.index_buffer_offset) / isz;
+    let new_window = window.max(first + u64::from(b.index_count));
+    if new_window * isz > draw::merge::MAX_WINDOW_BYTES {
+        return no("mf_idx_window");
+    }
+    let Some(bv_delta) = b.base_vertex.checked_sub(a.base_vertex).filter(|v| (0..=i64::from(i32::MAX / 2)).contains(v))
+    else {
+        return no("mf_idx_bv");
+    };
+    let same_res = |x: &Option<Arc<crate::model::TaskResource>>, y: &Option<Arc<crate::model::TaskResource>>| match (x, y)
+    {
+        (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+        (None, None) => true,
+        _ => false,
+    };
+    let tex_same = |a: &[draw::TextureBind], b: &[draw::TextureBind]| {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| x.index == y.index && x.texture_ref == y.texture_ref && same_res(&x.resource, &y.resource))
+    };
+    let smp_same = |a: &[draw::SamplerBind], b: &[draw::SamplerBind]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.index == y.index && x.sampler_ref == y.sampler_ref)
+    };
+    let buf_same = |x: &draw::BufferBind, y: &draw::BufferBind| {
+        x.index == y.index
+            && x.buffer_ref == y.buffer_ref
+            && x.offset == y.offset
+            && x.attribute_stride == y.attribute_stride
+            && same_res(&x.resource, &y.resource)
+    };
+    if !tex_same(&head.vertex_textures, &d.vertex_textures) || !tex_same(&head.fragment_textures, &d.fragment_textures)
+    {
+        return no("mf_tex");
+    }
+    if !smp_same(&head.vertex_samplers, &d.vertex_samplers) || !smp_same(&head.fragment_samplers, &d.fragment_samplers)
+    {
+        return no("mf_smp");
+    }
+    if head.fragment_buffers.len() != d.fragment_buffers.len()
+        || !head.fragment_buffers.iter().zip(d.fragment_buffers.iter()).all(|(x, y)| buf_same(x, y))
+    {
+        return no("mf_fbuf");
+    }
+    if head.vertex_buffers.len() != d.vertex_buffers.len() {
+        return no("mf_vcount");
+    }
+    let mut moved: Option<(u32, u64)> = None;
+    for (x, y) in head.vertex_buffers.iter().zip(d.vertex_buffers.iter()) {
+        if buf_same(x, y) {
+            continue;
+        }
+        if x.index != y.index || x.buffer_ref != y.buffer_ref || x.attribute_stride != y.attribute_stride {
+            return no("mf_vref");
+        }
+        if !same_res(&x.resource, &y.resource) {
+            return no("mf_vres");
+        }
+        if y.offset <= x.offset {
+            return no("mf_vback");
+        }
+        if moved.is_some() {
+            return no("mf_vmulti");
+        }
+        moved = Some((x.index, y.offset - x.offset));
+    }
+    // A moved vertex buffer becomes a vertexOffset move, valid only under the pipeline's learned shape.
+    let mut moved_shape = None;
+    let mut rebind: Option<(u32, u64)> = None;
+    let mut elems: u64 = 0;
+    let rebind_ok = |index: u32| {
+        crate::backend::vulkan::pipeline_resolve::retained(state)
+            .and_then(|s| s.get(task_id, head.pipeline_ref))
+            .is_some_and(|obj| draw::merge::stage_in_only(&obj, index))
+    };
+    if let Some((index, delta)) = moved.filter(|(index, _)| rebind_ok(*index)) {
+        // Rebind path: the sub-draw binds the stage-in buffer `delta` bytes later, as the guest did.
+        if head.merged.as_ref().is_some_and(|m| m.shape.is_some() || m.rebind_index.is_some_and(|i| i != index)) {
+            return no("mf_rebind_mix");
+        }
+        crate::runtime::drain::note_store_route("mf_ok_rebind");
+        rebind = Some((index, delta));
+    } else if let Some((index, delta)) = moved {
+        let Some(obj) = crate::backend::vulkan::pipeline_resolve::retained(state)
+            .and_then(|s| s.get(task_id, head.pipeline_ref))
+        else {
+            return no("mf_noobj");
+        };
+        if head.merged.as_ref().is_some_and(|m| m.rebind_index.is_some()) {
+            return no("mf_rebind_mix");
+        }
+        let Some(shape) = draw::merge::shape(task_id, head.pipeline_ref, &obj) else {
+            return no("mf_noshape");
+        };
+        if shape.index != index {
+            return no("mf_index");
+        }
+        if delta % shape.stride != 0 {
+            // TEMP (lab, MERGE_DRAWS diagnosis): what the moves look like.
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                let offs: Vec<String> =
+                    d.vertex_buffers.iter().map(|v| format!("{}:{}+{}", v.index, v.buffer_ref, v.offset)).collect();
+                crate::observe::off(format!(
+                    "merge_stride_sample pipe={} index={} delta={} stride={} idx_off={}->{} idx_ref={} bv={}->{} vbs=[{}] fbs={}",
+                    head.pipeline_ref,
+                    index,
+                    delta,
+                    shape.stride,
+                    a.index_buffer_offset,
+                    b.index_buffer_offset,
+                    a.index_buffer_ref,
+                    a.base_vertex,
+                    b.base_vertex,
+                    offs.join(" "),
+                    d.fragment_buffers.len()
+                ));
+            }
+            return no("mf_stride");
+        }
+        elems = delta / shape.stride;
+        // Quads keep vertex_id % 4 (corner arithmetic in the shader) only on multiples of four.
+        if elems % 4 != 0 || elems > (i32::MAX / 2) as u64 {
+            return no("mf_quad");
+        }
+        if head.merged.as_ref().and_then(|m| m.shape).is_some_and(|s| s != shape) {
+            return no("mf_reshape");
+        }
+        moved_shape = Some(shape);
+    } else {
+        crate::runtime::drain::note_store_route("mf_ok_unmoved");
+    }
+    let vertex_delta = (elems as i64 + bv_delta) as i32;
+    let m = head.merged.get_or_insert_with(|| draw::merge::MergedSubs {
+        shape: None,
+        rebind_index: None,
+        subs: Vec::new(),
+        head_count,
+        window: head_count,
+    });
+    if m.shape.is_none() {
+        m.shape = moved_shape;
+    }
+    if let Some((index, _)) = rebind {
+        m.rebind_index = Some(index);
+    }
+    m.subs.push(draw::merge::SubDraw {
+        first: first as u32,
+        count: b.index_count,
+        vertex_delta,
+        vb_delta: rebind.map_or(0, |(_, d)| d),
+    });
+    m.window = new_window as u32;
+    if let Some(ix) = head.indexed.as_mut() {
+        ix.index_count = new_window as u32;
+    }
+    true
 }
 
 fn handle_render_record<M: HostMemory + HostOps, S: WalkState>(
@@ -7311,6 +7548,7 @@ fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingD
     req.depth_attach = pd.depth_attach;
     req.stencil_attach = pd.stencil_attach;
     req.visibility = pd.visibility;
+    req.merged = pd.merged.clone().map(std::sync::Arc::new); // TEMP (lab, MERGE_DRAWS)
     // Cleared with the arming it belongs to. `req` is reused across the draws
     // of a chain, so a stale count from draw N-1 would otherwise be read as
     // draw N's — and an occlusion count that is silently the previous draw's is

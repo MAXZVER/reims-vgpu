@@ -8138,6 +8138,27 @@ fn lab_index_runs_max() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_INDEX_RUNS_MAX").map_or(true, |v| v != "off"))
 }
 
+/// TEMP (lab, MERGE_DRAWS): [`indexed_vertex_max`] of a record, over each of its draws' index ranges when it
+/// carries folded sub-draws (`draw::merge::vertex_max`).
+fn lab_merged_vertex_max(
+    info: &IndexedDrawInfo,
+    bytes: &[u8],
+    merged: Option<&crate::runtime::draw::merge::MergedSubs>,
+) -> Option<u64> {
+    let Some(m) = merged else {
+        return indexed_vertex_max(info, bytes);
+    };
+    use crate::protocol::render::IndexType as Contract;
+    let isz = match Contract::parse(u16::try_from(info.index_type).ok()?)? {
+        Contract::Uint16 => 2usize,
+        Contract::Uint32 => 4usize,
+    };
+    crate::runtime::draw::merge::vertex_max(m, |first, count| {
+        let one = IndexedDrawInfo { index_count: count, ..info.clone() };
+        indexed_vertex_max(&one, bytes.get((first as usize).checked_mul(isz)?..)?)
+    })
+}
+
 fn indexed_vertex_max(info: &IndexedDrawInfo, bytes: &[u8]) -> Option<u64> {
     use crate::protocol::render::IndexType as Contract;
     let count = info.index_count as usize;
@@ -12075,6 +12096,87 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
     let pd = &resolved.desc;
     let v_shader = resolved.vertex.clone();
     let f_shader = resolved.fragment.clone();
+    // TEMP (lab, MERGE_DRAWS): every indexed draw teaches the walk this pipeline object's merge shape; a merged
+    // record is drawn as merged only when the shape it was folded under still holds (`draw::merge`).
+    let mut lab_merge_deltas: std::sync::Arc<[crate::runtime::draw::merge::SubDraw]> =
+        std::sync::Arc::from(Vec::new());
+    let mut lab_merge_max: u64 = 0;
+    let mut lab_merge_rebind: std::sync::Arc<[u32]> = std::sync::Arc::from(Vec::new());
+    let mut lab_merge_extra_vertices: u64 = 0;
+    if crate::runtime::draw::merge::on() && req.indexed.is_some() {
+        let shape_r = crate::runtime::draw::merge::pipeline_shape(
+            &pd.vertex_attributes,
+            &v_shader.reflection,
+            &req.vertex_buffers,
+        );
+        // TEMP (lab, MERGE_DRAWS diagnosis): why a pipeline has no shape, once per pipeline.
+        if let Err(why) = shape_r {
+            crate::runtime::drain::note_store_route(why);
+            if crate::observe::first_sight("merge_no_shape", u64::from(req.pipeline_ref)) {
+                crate::observe::off(format!(
+                    "merge_no_shape why={} task={} pipe={} {}",
+                    why,
+                    req.task_id,
+                    req.pipeline_ref,
+                    crate::runtime::draw::merge::describe(&pd.vertex_attributes, &v_shader.reflection, &req.vertex_buffers)
+                ));
+            }
+        } else {
+            crate::runtime::drain::note_store_route("merge_shape_ok");
+            if crate::observe::first_sight("merge_shape_seen", u64::from(req.pipeline_ref)) {
+                crate::observe::off(format!(
+                    "merge_shape_seen shape={:?} task={} pipe={} {}",
+                    shape_r,
+                    req.task_id,
+                    req.pipeline_ref,
+                    crate::runtime::draw::merge::describe(&pd.vertex_attributes, &v_shader.reflection, &req.vertex_buffers)
+                ));
+            }
+        }
+        let shape = shape_r.ok();
+        crate::runtime::draw::merge::learn(req.task_id, req.pipeline_ref, &resolved, shape);
+        if let Some(m) = req.merged.as_ref() {
+            // Rebind path: every binding of the moved stage-in buffer (one Vulkan binding per location), and
+            // the fetch extended by the largest move in that buffer's stride.
+            let rebind_ok = m.rebind_index.is_none_or(|idx| {
+                if !crate::runtime::draw::merge::stage_in_only(&resolved, idx) {
+                    return false;
+                }
+                let on_idx = || pd.vertex_attributes.iter().filter(|a| a.buffer_index == idx);
+                lab_merge_rebind = on_idx().map(|a| a.location).collect::<Vec<_>>().into();
+                let stride = on_idx()
+                    .map(|a| {
+                        u64::from(crate::runtime::draw::bind_attribute_stride(&req.vertex_buffers, idx, a.stride))
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let max_move = m.subs.iter().map(|s| s.vb_delta).max().unwrap_or(0);
+                if stride == 0 {
+                    return false;
+                }
+                lab_merge_extra_vertices = max_move.div_ceil(stride);
+                true
+            });
+            if rebind_ok && (m.shape.is_none() || shape == m.shape) {
+                lab_merge_max = m.subs.iter().map(|s| s.vertex_delta).max().unwrap_or(0).max(0) as u64;
+                lab_merge_deltas = std::sync::Arc::from(m.subs.clone());
+                crate::runtime::drain::note_store_route_n("merge_subs_drawn", m.subs.len() as u64);
+            } else {
+                crate::runtime::drain::note_store_route_n("merge_subs_dropped", m.subs.len() as u64);
+                if crate::observe::first_sight("merge_shape_changed", u64::from(req.pipeline_ref)) {
+                    crate::observe::fail(format!(
+                        "merge_shape_changed task={} pipe={} folded_under={:?} now={:?} subs={} (the record's \
+                         sub-draws are not drawn)",
+                        req.task_id,
+                        req.pipeline_ref,
+                        m.shape,
+                        shape,
+                        m.subs.len()
+                    ));
+                }
+            }
+        }
+    }
 
     // Request construction obtains the attachment count from this immutable
     // pipeline before LOAD/CLEAR and Store policy can inspect it. Keep the
@@ -12271,14 +12373,14 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         // TEMP (lab): `REIMS_VGPU_LAB_INDEX_RUNS_MAX=off` reads byte content only.
         let indexed_vertex_max = match (req.indexed.as_ref(), early_index.as_ref()) {
             (Some(idx), Some(Ok(crate::backend::vulkan::engine::BufferContent::Bytes(bytes)))) => {
-                indexed_vertex_max(idx, bytes)
+                lab_merged_vertex_max(idx, bytes, req.merged.as_deref())
             }
             (
                 Some(idx),
                 Some(Ok(content @ crate::backend::vulkan::engine::BufferContent::GuestRuns(src))),
             ) if lab_index_runs_max() && src.total_len <= INDEX_RUNS_READ_MAX_BYTES => {
                 crate::runtime::drain::note_store_route("lab_index_runs_max");
-                indexed_vertex_max(idx, &content.cpu_bytes())
+                lab_merged_vertex_max(idx, &content.cpu_bytes(), req.merged.as_deref())
             }
             _ => None,
         };
@@ -12289,7 +12391,9 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             req.instance_count,
             req.indexed.is_some(),
         )
-        .with_indexed_vertex_max(indexed_vertex_max);
+        // TEMP (lab, MERGE_DRAWS): a merged record's bound already covers its sub-draws' indices (per range);
+        // a rebound stage-in buffer is fetched as far as the largest move further.
+        .with_indexed_vertex_max(indexed_vertex_max.map(|v| v.saturating_add(lab_merge_extra_vertices)));
         let mut vtx_storage: Vec<(u32, crate::backend::vulkan::engine::BufferContent)> = Vec::new();
         // The three `bind_phase` spans below divide `chain_phase`'s `binds_us`,
         // which is this draw path's largest column and covered three costs with
@@ -14724,6 +14828,8 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         let mut resources = crate::backend::vulkan::engine::DrawRequest {
             pipeline_object: resolved.pipeline_object.clone(),
+            sub_draws: lab_merge_deltas.clone(), // TEMP (lab, MERGE_DRAWS)
+            sub_rebind: lab_merge_rebind.clone(),
             // The four fixed-function encoder states, as the guest wrote
             // them. `None` is the state it never set, which takes Metal's own
             // default — and an out-of-contract *value* is a different thing
@@ -14986,7 +15092,8 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             note_inflight_buffer_read(req.task_id, idx.index_buffer_ref, &content);
             resources.indexed = Some(crate::backend::vulkan::engine::IndexedDrawResource {
                 index_type,
-                index_count: idx.index_count,
+                // TEMP (lab, MERGE_DRAWS): a merged record's info spans its sub-draws' indices too.
+                index_count: req.merged.as_ref().map_or(idx.index_count, |m| m.head_count),
                 // Vulkan's vertexOffset is a signed 32-bit field where Metal's
                 // baseVertex is 64-bit, so a value that cannot fit is declined
                 // rather than wrapped into an index somewhere else in the

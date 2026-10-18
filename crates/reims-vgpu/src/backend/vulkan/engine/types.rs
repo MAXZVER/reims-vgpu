@@ -516,6 +516,11 @@ pub struct DrawRequest {
     /// one place instead of once per backend.
     pub occlusion_query: Option<VisibilityResultMode>,
     pub indexed: Option<IndexedDrawResource>,
+    /// TEMP (lab, MERGE_DRAWS): after the draw, one more `vkCmdDrawIndexed` per entry, with its own
+    /// `firstIndex` and `indexCount` and `vertexOffset` moved by its delta (`runtime::draw::merge`).
+    pub sub_draws: std::sync::Arc<[LabSubDraw]>,
+    /// TEMP (lab, MERGE_DRAWS): the vertex input bindings a sub-draw's `vb_delta` moves.
+    pub sub_rebind: std::sync::Arc<[u32]>,
     pub vertex_attributes: Vec<VertexAttributeResource>,
     pub storage_buffers: Vec<StorageBufferResource>,
     pub sampled_images: Vec<SampledImageResource>,
@@ -1042,6 +1047,19 @@ pub use reims_vgpu_core::vertex_format::VertexFormat as VertexAttributeFormat;
 /// happens now, because whether a step function has a `VkVertexInputRate` is a
 /// fact about Vulkan and not about `MTLVertexStepFunction`.
 pub use reims_vgpu_core::vertex_step::StepFunction as VertexStepFunction;
+
+/// TEMP (lab, MERGE_DRAWS): one draw folded into the record before it - see [`DrawRequest::sub_draws`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LabSubDraw {
+    /// `firstIndex` into the record's index window (indexed), or `firstVertex` (not indexed).
+    pub first: u32,
+    /// `indexCount` (indexed) or `vertexCount` (not indexed).
+    pub count: u32,
+    /// Added to the record's own `vertexOffset`.
+    pub vertex_delta: i32,
+    /// Bytes added to the bound offset of every binding in [`DrawRequest::sub_rebind`] for this sub-draw.
+    pub vb_delta: u64,
+}
 
 #[derive(Debug)]
 pub struct VertexAttributeResource {

@@ -67,6 +67,7 @@ use reims_vgpu_protocol::pass_action::{
 pub mod vulkan;
 #[cfg(feature = "backend-vulkan")]
 pub mod synthesized_sampled;
+pub mod merge;   // TEMP (lab MERGE_DRAWS)
 // Only for `exec`'s pass-extent census, which declares its own copy of these
 // bands because it runs on every backend. See
 // `the_two_coverage_censuses_use_the_same_bands`.
@@ -656,6 +657,8 @@ pub struct DrawEncodeRequest {
     /// the backend that cannot names its own refusal.
     pub visibility_samples: Option<u64>,
     pub indexed: Option<IndexedDrawInfo>,
+    /// TEMP (lab, MERGE_DRAWS): the sub-draws this record carries after its own (see [`merge`]).
+    pub merged: Option<std::sync::Arc<merge::MergedSubs>>,
     pub blend_color: Option<[f32; 4]>,
     pub cull_mode: Option<u32>,
     pub front_facing: Option<u32>,
