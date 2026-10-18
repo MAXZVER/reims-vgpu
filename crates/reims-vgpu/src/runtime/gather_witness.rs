@@ -448,7 +448,24 @@ struct Entry {
     /// no compare at all, so a generation that outlives its content by one bind
     /// is a wrong picture that then persists.
     generation: u64,
+    /// TEMP (lab, VOLATILE): binds in a row the guest had rewritten the window at.
+    volatile_run: u32,
+    /// TEMP (lab, VOLATILE): binds left that skip the generation read (see [`lab_volatile`]).
+    volatile_skip: u32,
 }
+
+/// TEMP (lab, Opus 2026-10-19, VOLATILE, on by default; `REIMS_VGPU_LAB_VOLATILE=off`): a window the guest rewrote at
+/// each of its last [`VOLATILE_RUN`] binds - a playing video's frame, an animated canvas - is gathered at the next
+/// [`VOLATILE_SKIP`] binds without reading its generation (a dirty-bitmap sync over every page of the window, the
+/// largest single cost of a video frame in b755's profile: dirty_gen 13 % of the drain) and without auditing it. The
+/// bind is answered as a guest-store refusal with a fresh generation, so the engine reads the bytes - never a vouch.
+/// After the skips one bind reads the generation again, so a window that went quiet is cached again.
+fn lab_volatile() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_VOLATILE").map_or(true, |v| v != "off"))
+}
+const VOLATILE_RUN: u32 = 8;
+const VOLATILE_SKIP: u32 = 30;
 
 /// Per-device witness state: one entry per sampled window seen.
 #[derive(Debug)]
@@ -691,6 +708,8 @@ impl GatherWitness {
                 stated_gen: None,
                 last_seen: 0,
                 generation: 0,
+                volatile_run: 0,
+                volatile_skip: 0,
             },
         );
     }
@@ -2603,6 +2622,8 @@ fn observe<M: crate::runtime::host::HostOps>(
                 stated_gen: stated_now,
                 last_seen: witness.binds,
                 generation: fresh_generation,
+                volatile_run: 0,
+                volatile_skip: 0,
             },
         );
         return GatherObservation {
@@ -2700,6 +2721,28 @@ fn decide_warm<M: crate::runtime::host::HostOps>(
     // generation as of its last sync instead of waiting for this epoch's; a
     // write the guest did not state is then refused one bind late. A stated
     // write refuses whatever the hypervisor says.
+    if lab_volatile() && entry.token != 0 && entry.volatile_run >= VOLATILE_RUN && entry.volatile_skip > 0 {
+        entry.volatile_skip -= 1;
+        routes.push("gw_volatile_skip");
+        entry.audit_armed = false;
+        entry.fold_valid = false;
+        entry.rebaselines = 0;
+        entry.binds_since_fold = 0;
+        entry.generation = fresh_generation;
+        entry.pages_epoch = pages_epoch;
+        // `entry.gen` stays: the next read compares against it and sees every write since.
+        return GatherObservation {
+            verdict: GatherVerdict::Refused {
+                guest_wrote: true,
+                host_wrote_pages: !host_quiet,
+            },
+            audit: ContentAudit::Skipped,
+            generation: entry.generation,
+            vouch: GatherVouch::Fresh,
+            evidence: None,
+            stated,
+        };
+    }
     let lab_stated = lab_stated_vouch();
     let lab_verify = lab_stated_verify();
     let lab_candidate = (lab_stated || lab_verify)
@@ -2785,6 +2828,15 @@ fn decide_warm<M: crate::runtime::host::HostOps>(
         }
     }
     let vouched = matches!(verdict, GatherVerdict::Vouched);
+    // TEMP (lab, VOLATILE): count the binds in a row the guest had rewritten the window at.
+    if matches!(verdict, GatherVerdict::Refused { guest_wrote: true, .. }) {
+        entry.volatile_run = entry.volatile_run.saturating_add(1);
+        if entry.volatile_run >= VOLATILE_RUN {
+            entry.volatile_skip = VOLATILE_SKIP;
+        }
+    } else {
+        entry.volatile_run = 0;
+    }
 
     // SAFETY (every `fold_runs` below): `runs` describe the window this draw is
     // about to gather from, so their pointers are live here for the same reason
