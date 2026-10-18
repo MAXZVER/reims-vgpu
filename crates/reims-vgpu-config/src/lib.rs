@@ -1583,6 +1583,16 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// pointer, and never reaches a captured frame. `off` keeps the host's own arrow
 /// and never moves the host pointer — the behavior before this existed.
 pub const HOST_CURSOR: &str = "REIMS_VGPU_HOST_CURSOR";
+
+/// **Default on.** A multisample-resolve pass lays its attachments out
+/// as `[multisample colour, resolve, depth]`, but the clear values were built
+/// as `[colour, secondaries.., depth]` with no entry for the resolve, so the
+/// depth clear landed on the resolve slot and the depth attachment read past
+/// the end of the array (every Simulator MSAA pass carries depth). On, a
+/// placeholder entry is pushed for the resolve attachment
+/// (`msaa_resolve_clear_slot_filled`). `off` (`0`) restores legacy behavior;
+/// logged once as `msaa_resolve_clear_slot_disabled`.
+pub const MSAA_RESOLVE_CLEAR_SLOT: &str = "REIMS_VGPU_MSAA_RESOLVE_CLEAR_SLOT";
 }
 
 counts! {

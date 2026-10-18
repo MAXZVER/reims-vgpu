@@ -7153,6 +7153,14 @@ fn clear_values(req: &DrawRequest) -> Result<ClearValues, DrawError> {
             color: sec.attachment.clear().vk(),
         })?;
     }
+    // The render pass places the resolve attachment after the colour
+    // slots and before depth (`caches::get_or_create_pass`). Its load op is
+    // DONT_CARE, so the value is never read; the entry exists so depth's lands
+    // at depth's index.
+    if resolve_clear_slot(req.multisample_resolve, msaa_resolve_clear_slot_enabled()) {
+        crate::runtime::drain::note_store_route("msaa_resolve_clear_slot_filled");
+        clear.push(vk::ClearValue::default())?;
+    }
     if let Some(d) = &req.depth {
         clear.push(vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
@@ -7162,6 +7170,32 @@ fn clear_values(req: &DrawRequest) -> Result<ClearValues, DrawError> {
         })?;
     }
     Ok(clear)
+}
+
+/// Whether [`clear_values`] owes the resolve attachment an entry.
+pub(crate) fn resolve_clear_slot(multisample_resolve: bool, enabled: bool) -> bool {
+    multisample_resolve && enabled
+}
+
+/// `REIMS_VGPU_MSAA_RESOLVE_CLEAR_SLOT`, read once (default on).
+pub(crate) fn msaa_resolve_clear_slot_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match crate::config::read(crate::config::MSAA_RESOLVE_CLEAR_SLOT) {
+        (crate::config::Switch::Off, _) => {
+            crate::observe::fail(
+                "msaa_resolve_clear_slot_disabled reason=disabled_by_env (a multisample pass's depth clear lands on the resolve slot)",
+            );
+            false
+        }
+        (crate::config::Switch::Unrecognized, value) => {
+            crate::observe::fail(format!(
+                "msaa_resolve_clear_slot reason=msaa_resolve_clear_slot_env_unrecognized value={:?} (kept on)",
+                value.unwrap_or_default()
+            ));
+            true
+        }
+        _ => true,
+    })
 }
 
 /// The clear values of one draw, held inline.
@@ -9128,6 +9162,32 @@ mod tests {
             "one attachment past the bound is a refusal, not a short array"
         );
     }
+
+    /// v14: a multisample-resolve pass with depth has three attachments
+    /// (colour, resolve, depth) and depth's clear value sits at index 2.
+    #[test]
+    fn a_multisample_resolve_pass_gives_depth_its_own_index() {
+        assert!(super::resolve_clear_slot(true, true));
+        assert!(!super::resolve_clear_slot(true, false), "the kill switch restores v13");
+        assert!(!super::resolve_clear_slot(false, true), "single-sample passes are unchanged");
+        let req = DrawRequest {
+            multisample_resolve: true,
+            depth: Some(super::super::types::DepthState {
+                identity: None,
+                test_enable: true,
+                write_enable: true,
+                compare: super::super::types::SamplerCompareFunction::Less,
+                clear_value: 0.5,
+                load: false,
+                stencil: None,
+            }),
+            ..DrawRequest::default()
+        };
+        let clear = clear_values(&req).expect("three attachments");
+        assert_eq!(clear.len(), 3, "colour, resolve, depth");
+        unsafe { assert_eq!(clear[2].depth_stencil.depth, 0.5) };
+    }
+
 
     /// A default request still clears to transparent black, which is what every
     /// draw that names no colour has always got.
