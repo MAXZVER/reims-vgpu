@@ -28,7 +28,7 @@
 
 #[cfg(target_os = "macos")]
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -910,6 +910,7 @@ struct App {
     /// Frame seq the drawable currently holds, or `None` before the first
     /// present.
     last_presented_seq: Option<u64>,
+    last_presented_atomic: Arc<AtomicU64>,
     /// Force the next present regardless of seq: first frame, resize, or a
     /// swapchain that reported suboptimal.
     redraw_required: bool,
@@ -1109,6 +1110,14 @@ impl ApplicationHandler<FramePublished> for App {
         match Self::attach_presenter(&window) {
             Ok(()) => {
                 self.presenter_attached = true;
+                #[cfg(target_os = "windows")]
+                if win32_drag_hook_enabled() {
+                    win32_drag::install_win32_drag_hook(
+                        &window,
+                        self.frames.clone(),
+                        self.last_presented_atomic.clone(),
+                    );
+                }
                 // Kick the first frame; RedrawRequested re-arms each subsequent
                 // one, so without this the window would never draw.
                 window.request_redraw();
@@ -1343,6 +1352,26 @@ impl ApplicationHandler<FramePublished> for App {
     }
 }
 
+/// [`crate::config::LAB_WIN32_DRAG_HOOK`] state to arm: only an explicit `on`.
+fn win32_drag_hook_from_switch(state: crate::config::Switch) -> bool {
+    matches!(state, crate::config::Switch::On)
+}
+
+/// `REIMS_VGPU_LAB_WIN32_DRAG_HOOK`, read once (default off).
+fn win32_drag_hook_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let (state, value) = crate::config::read(crate::config::LAB_WIN32_DRAG_HOOK);
+        if state == crate::config::Switch::Unrecognized {
+            crate::observe::fail(format!(
+                "win32_drag_hook reason=win32_drag_hook_env_unrecognized value={:?} (kept off)",
+                value.unwrap_or_default()
+            ));
+        }
+        win32_drag_hook_from_switch(state)
+    })
+}
+
 /// TEMP (lab): see `user_event`. Latched.
 fn lab_direct_redraw() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1432,6 +1461,7 @@ impl App {
             frame_pending: true,
             next_backstop: std::time::Instant::now(),
             last_presented_seq: None,
+            last_presented_atomic: Arc::new(AtomicU64::new(0)),
             redraw_required: true,
             guest_extent: None,
             pending_guest_resize: None,
@@ -1788,6 +1818,14 @@ impl App {
             return;
         }
         let incoming_seq = frame.as_ref().map(|frame| frame.seq);
+        let drag_seq = if win32_drag_hook_enabled() {
+            self.last_presented_atomic.load(Ordering::Acquire)
+        } else {
+            0
+        };
+        if drag_seq != 0 {
+            self.last_presented_seq = Some(drag_seq);
+        }
         if !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq) {
             self.loop_census.draws_stale += 1;
             return;
@@ -1817,6 +1855,9 @@ impl App {
                 // after the third. See [`presenter_rebuild_budget`].
                 self.presenter_rebuilds = 0;
                 self.last_presented_seq = incoming_seq;
+                if let Some(seq) = incoming_seq {
+                    self.last_presented_atomic.store(seq, Ordering::Release);
+                }
                 // A suboptimal present armed a swapchain recreation; redraw
                 // promptly so the corrected drawable replaces this one even if
                 // no new guest frame arrives for seconds. The assignment clears
@@ -2479,5 +2520,197 @@ mod tests {
     #[test]
     fn a_resize_with_nothing_pending_is_not_an_answer() {
         assert_eq!(guest_resize_settled(None, (1920, 1080)), None);
+    }
+
+    #[test]
+    fn the_win32_drag_hook_switch_is_default_off() {
+        use crate::config::Switch;
+        assert!(!super::win32_drag_hook_from_switch(Switch::Unset));
+        assert!(!super::win32_drag_hook_from_switch(Switch::Off));
+        assert!(!super::win32_drag_hook_from_switch(Switch::Unrecognized));
+        assert!(super::win32_drag_hook_from_switch(Switch::On));
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod win32_drag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use crate::backend::Backend as _;
+    use crate::host_window::present::{window_cpu_frame, FrameSlot};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    type HWND = isize;
+    type UINT = u32;
+    type WPARAM = usize;
+    type LPARAM = isize;
+    type LRESULT = isize;
+    type UintPtr = usize;
+    type DwordPtr = usize;
+
+    const WM_ENTERSIZEMOVE: u32 = 0x0231;
+    const WM_EXITSIZEMOVE: u32 = 0x0232;
+    const WM_MOVING: u32 = 0x0216;
+    const WM_SIZING: u32 = 0x0214;
+    const WM_TIMER: u32 = 0x0113;
+    const WM_NCDESTROY: u32 = 0x0082;
+    const DRAG_TIMER_ID: usize = 0x5245_494D; // "REIM"
+    const SUBCLASS_ID: usize = 0x5245_494D;
+
+    struct DragHookState {
+        frames: FrameSlot,
+        last_presented_seq: Arc<AtomicU64>,
+    }
+
+    type FnSetWindowSubclass = unsafe extern "system" fn(
+        HWND,
+        unsafe extern "system" fn(HWND, UINT, WPARAM, LPARAM, UintPtr, DwordPtr) -> LRESULT,
+        UintPtr,
+        DwordPtr,
+    ) -> i32;
+    type FnRemoveWindowSubclass = unsafe extern "system" fn(
+        HWND,
+        unsafe extern "system" fn(HWND, UINT, WPARAM, LPARAM, UintPtr, DwordPtr) -> LRESULT,
+        UintPtr,
+    ) -> i32;
+    type FnDefSubclassProc = unsafe extern "system" fn(HWND, UINT, WPARAM, LPARAM) -> LRESULT;
+
+    struct ComCtl {
+        set_window_subclass: FnSetWindowSubclass,
+        remove_window_subclass: FnRemoveWindowSubclass,
+        def_subclass_proc: FnDefSubclassProc,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(lpLibFileName: *const u8) -> *mut std::ffi::c_void;
+        fn GetProcAddress(hModule: *mut std::ffi::c_void, lpProcName: *const u8) -> *mut std::ffi::c_void;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetTimer(
+            hwnd: HWND,
+            nIDEvent: UintPtr,
+            uElapse: u32,
+            lpTimerFunc: Option<unsafe extern "system" fn()>,
+        ) -> UintPtr;
+        fn KillTimer(hwnd: HWND, uIDEvent: UintPtr) -> i32;
+    }
+
+    fn comctl() -> Option<&'static ComCtl> {
+        static COMCTL: std::sync::OnceLock<Option<ComCtl>> = std::sync::OnceLock::new();
+        COMCTL
+            .get_or_init(|| unsafe {
+                let hmod = LoadLibraryA(b"comctl32.dll\0".as_ptr());
+                if hmod.is_null() {
+                    return None;
+                }
+                let set = GetProcAddress(hmod, b"SetWindowSubclass\0".as_ptr());
+                let rem = GetProcAddress(hmod, b"RemoveWindowSubclass\0".as_ptr());
+                let def = GetProcAddress(hmod, b"DefSubclassProc\0".as_ptr());
+                if set.is_null() || rem.is_null() || def.is_null() {
+                    return None;
+                }
+                Some(ComCtl {
+                    set_window_subclass: std::mem::transmute(set),
+                    remove_window_subclass: std::mem::transmute(rem),
+                    def_subclass_proc: std::mem::transmute(def),
+                })
+            })
+            .as_ref()
+    }
+
+    unsafe extern "system" fn drag_subclass_proc(
+        hwnd: HWND,
+        msg: UINT,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        uid: UintPtr,
+        ref_data: DwordPtr,
+    ) -> LRESULT {
+        let fallback = |h, m, w, l| {
+            comctl().map_or(0, |c| unsafe { (c.def_subclass_proc)(h, m, w, l) })
+        };
+
+        if ref_data == 0 {
+            return fallback(hwnd, msg, wparam, lparam);
+        }
+        let state = unsafe { &*(ref_data as *const DragHookState) };
+
+        match msg {
+            WM_ENTERSIZEMOVE => {
+                // Windows entered synchronous modal drag/move loop.
+                // Start a 16ms timer so frames present smoothly while held.
+                unsafe { SetTimer(hwnd, DRAG_TIMER_ID, 16, None) };
+            }
+            WM_TIMER if wparam == DRAG_TIMER_ID => {
+                present_latest_frame(state);
+                return 0;
+            }
+            WM_MOVING | WM_SIZING => {
+                present_latest_frame(state);
+            }
+            WM_EXITSIZEMOVE => {
+                unsafe { KillTimer(hwnd, DRAG_TIMER_ID) };
+                present_latest_frame(state);
+            }
+            WM_NCDESTROY => {
+                unsafe {
+                    KillTimer(hwnd, DRAG_TIMER_ID);
+                    if let Some(c) = comctl() {
+                        (c.remove_window_subclass)(hwnd, drag_subclass_proc, uid);
+                    }
+                    drop(Box::from_raw(ref_data as *mut DragHookState));
+                    return fallback(hwnd, msg, wparam, lparam);
+                }
+            }
+            _ => {}
+        }
+
+        fallback(hwnd, msg, wparam, lparam)
+    }
+
+    fn present_latest_frame(state: &DragHookState) {
+        if let Ok(guard) = state.frames.lock() {
+            if let Some(frame) = guard.as_ref() {
+                let seq = frame.seq;
+                let prev = state.last_presented_seq.load(Ordering::Acquire);
+                if seq != prev && state.last_presented_seq.compare_exchange(prev, seq, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    let cpu_frame = window_cpu_frame(frame);
+                    let resident = frame.resident.as_ref();
+                    let _ = crate::backend::selected().window_present(resident, Some(cpu_frame));
+                }
+            }
+        }
+    }
+
+    pub(super) fn install_win32_drag_hook(
+        window: &winit::window::Window,
+        frames: FrameSlot,
+        last_presented: Arc<AtomicU64>,
+    ) {
+        let Some(c) = comctl() else {
+            crate::observe::fail("win32_drag_hook_unavailable reason=comctl32_subclass_entry_points_missing");
+            return;
+        };
+        if let Ok(handle) = window.window_handle() {
+            if let RawWindowHandle::Win32(win32) = handle.as_raw() {
+                let hwnd = win32.hwnd.get() as HWND;
+                let state = Box::new(DragHookState {
+                    frames,
+                    last_presented_seq: last_presented,
+                });
+                let ref_data = Box::into_raw(state) as DwordPtr;
+                let ok = unsafe { (c.set_window_subclass)(hwnd, drag_subclass_proc, SUBCLASS_ID, ref_data) };
+                if ok == 0 {
+                    // Not installed: the box is ours again.
+                    drop(unsafe { Box::from_raw(ref_data as *mut DragHookState) });
+                    crate::observe::fail("win32_drag_hook_unavailable reason=set_window_subclass_failed");
+                } else {
+                    crate::observe::off("win32_drag_hook_installed");
+                }
+            }
+        }
     }
 }

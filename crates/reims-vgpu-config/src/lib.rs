@@ -1583,6 +1583,19 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// pointer, and never reaches a captured frame. `off` keeps the host's own arrow
 /// and never moves the host pointer — the behavior before this existed.
 pub const HOST_CURSOR: &str = "REIMS_VGPU_HOST_CURSOR";
+
+/// **Default off (lab).** Windows only. `on` subclasses the host window so
+/// that while Windows runs its modal move/size loop (`WM_ENTERSIZEMOVE` ..
+/// `WM_EXITSIZEMOVE`, i.e. the HOST window dragged or resized by its title bar
+/// or border) a 16 ms timer keeps presenting the latest guest frame; winit's
+/// event pumping is suspended inside that loop. A guest-window drag with the
+/// pointer inside the host window does not enter the modal loop and is not
+/// affected. Logs `win32_drag_hook_installed` or
+/// `win32_drag_hook_unavailable`.
+///
+/// Unset or `off` installs nothing. Stays opt-in until a title-bar drag A/B
+/// with and without it says otherwise.
+pub const LAB_WIN32_DRAG_HOOK: &str = "REIMS_VGPU_LAB_WIN32_DRAG_HOOK";
 }
 
 counts! {
