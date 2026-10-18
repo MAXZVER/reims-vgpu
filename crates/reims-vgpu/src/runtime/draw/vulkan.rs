@@ -12103,7 +12103,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
     let mut lab_merge_max: u64 = 0;
     let mut lab_merge_rebind: std::sync::Arc<[u32]> = std::sync::Arc::from(Vec::new());
     let mut lab_merge_extra_vertices: u64 = 0;
-    if crate::runtime::draw::merge::on() && req.indexed.is_some() {
+    if crate::runtime::draw::merge::on() && req.indexed.is_some() && !crate::runtime::draw::merge::learned(req.task_id, req.pipeline_ref, &resolved) {
         let shape_r = crate::runtime::draw::merge::pipeline_shape(
             &pd.vertex_attributes,
             &v_shader.reflection,
@@ -12123,18 +12123,13 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             }
         } else {
             crate::runtime::drain::note_store_route("merge_shape_ok");
-            if crate::observe::first_sight("merge_shape_seen", u64::from(req.pipeline_ref)) {
-                crate::observe::off(format!(
-                    "merge_shape_seen shape={:?} task={} pipe={} {}",
-                    shape_r,
-                    req.task_id,
-                    req.pipeline_ref,
-                    crate::runtime::draw::merge::describe(&pd.vertex_attributes, &v_shader.reflection, &req.vertex_buffers)
-                ));
-            }
         }
-        let shape = shape_r.ok();
-        crate::runtime::draw::merge::learn(req.task_id, req.pipeline_ref, &resolved, shape);
+        if req.indexed.is_some() {
+            crate::runtime::draw::merge::learn(req.task_id, req.pipeline_ref, &resolved, shape_r.ok());
+        }
+    }
+    if crate::runtime::draw::merge::on() && req.merged.is_some() {
+        let shape = crate::runtime::draw::merge::shape(req.task_id, req.pipeline_ref, &resolved);
         if let Some(m) = req.merged.as_ref() {
             // Rebind path: every binding of the moved stage-in buffer (one Vulkan binding per location), and
             // the fetch extended by the largest move in that buffer's stride.
@@ -12384,9 +12379,15 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             }
             _ => None,
         };
+        // TEMP (lab, MERGE_DRAWS): a merged non-indexed record fetches its sub-draws' vertices too, and as far
+        // past them as its largest stage-in move.
+        let (lab_first, lab_count) = match (req.merged.as_deref(), req.indexed.is_none()) {
+            (Some(m), true) => (m.span.0, (m.span.1 - m.span.0).saturating_add(lab_merge_extra_vertices as u32)),
+            _ => (req.first_vertex, req.vertex_count),
+        };
         let render_buffer_bounds = crate::runtime::spirv_bind::RenderBufferIndexBounds::new(
-            req.first_vertex,
-            req.vertex_count,
+            lab_first,
+            lab_count,
             req.base_instance,
             req.instance_count,
             req.indexed.is_some(),

@@ -66,6 +66,8 @@ pub struct MergedSubs {
     pub subs: Vec<SubDraw>,
     pub head_count: u32,
     pub window: u32,
+    /// Not indexed: `[first, end)` of the vertices the record and its sub-draws draw (the vertex fetch bound).
+    pub span: (u32, u32),
 }
 
 type Learned = HashMap<(u32, u32), (Weak<ResolvedRenderPipeline>, Option<Shape>)>;
@@ -85,6 +87,14 @@ pub fn learn(task_id: u32, pipeline_ref: u32, object: &Arc<ResolvedRenderPipelin
         }
         map.insert((task_id, pipeline_ref), (Arc::downgrade(object), shape));
     });
+}
+
+/// Whether the engine already taught this pipeline object's shape (learning is once per object).
+pub fn learned(task_id: u32, pipeline_ref: u32, object: &Arc<ResolvedRenderPipeline>) -> bool {
+    with_learned(|map| {
+        map.get(&(task_id, pipeline_ref))
+            .is_some_and(|(weak, _)| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(object)) && weak.strong_count() > 0)
+    })
 }
 
 /// The learned shape for this pipeline object, when the engine has prepared one of its draws and found it mergeable.

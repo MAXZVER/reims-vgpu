@@ -6449,6 +6449,19 @@ pub(crate) unsafe fn execute_draw_inner(
                 req.first_vertex,
                 req.base_instance,
             );
+            // TEMP (lab, MERGE_DRAWS): the folded draws - the same state, their own vertex range.
+            for s in req.sub_draws.iter() {
+                if !req.sub_rebind.is_empty() {
+                    unsafe { pools.lab_rebind_vertex(&ctx.device, cb, &req.sub_rebind, s.vb_delta) };
+                }
+                crate::backend::vulkan::engine::cmd_sink::draw(&ctx.device,
+                    cb,
+                    s.count,
+                    req.instance_count.unwrap_or(1),
+                    s.first,
+                    req.base_instance,
+                );
+            }
         }
     }
     // Back to the remainder: the query end, the pass-close decision and
