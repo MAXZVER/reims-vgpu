@@ -9998,7 +9998,7 @@ fn guest_runs_are_zero(source: &super::GuestRunSource) -> bool {
 /// 32.7 GB scanned in 15 s, `acq_seed_us` 1.52 s of a 15.1 s drain - 1.8 ms a
 /// seed on one thread at ~21 GB/s, all of it on the draw's critical path. Above
 /// [`ZERO_SCAN_PAR_MIN`] the spans are cut into byte-balanced parts scanned by
-/// scoped threads, which stop at the first non-zero word any of them finds; the
+/// workers and the caller, which stop at the first non-zero word any finds; the
 /// answer is the same as the serial scan's. `REIMS_VGPU_LAB_ZERO_SCAN_THREADS`
 /// (default 4, `1` = the serial scan) sets the width; live `ZERO_SCAN_PAR=off`
 /// forces the serial scan within a boot for A/B.
@@ -10033,25 +10033,78 @@ fn zero_scan_spans(spans: &[(usize, usize)], total: usize) -> bool {
             }
         }
     }
-    let found = std::sync::atomic::AtomicBool::new(false);
-    std::thread::scope(|s| {
-        let mut parts = parts.into_iter().filter(|p| !p.is_empty());
-        let first = parts.next();
-        for part in parts {
-            let found = &found;
-            s.spawn(move || {
-                if !part.iter().all(|&(p, n)| zero_scan_bytes(p, n, Some(found))) {
-                    found.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            });
-        }
-        if let Some(part) = first {
-            if !part.iter().all(|&(p, n)| zero_scan_bytes(p, n, Some(&found))) {
-                found.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
+    let mut parts = parts.into_iter().filter(|p| !p.is_empty());
+    let first = parts.next().unwrap_or_default();
+    let job = std::sync::Arc::new(ZeroScanJob {
+        found: std::sync::atomic::AtomicBool::new(false),
+        left: std::sync::Mutex::new(0),
+        done: std::sync::Condvar::new(),
     });
-    !found.load(std::sync::atomic::Ordering::Relaxed)
+    let pool = zero_scan_pool(threads - 1);
+    for (i, part) in parts.enumerate() {
+        let Some(tx) = pool.get(i) else {
+            job.scan(&part);
+            continue;
+        };
+        *job.left.lock().expect("zero scan count") += 1;
+        let sent = tx.lock().expect("zero scan worker").send((part, job.clone()));
+        if let Err(std::sync::mpsc::SendError((part, _))) = sent {
+            // A worker that died: its part is scanned here instead.
+            *job.left.lock().expect("zero scan count") -= 1;
+            job.scan(&part);
+        }
+    }
+    job.scan(&first);
+    let mut left = job.left.lock().expect("zero scan count");
+    while *left > 0 {
+        left = job.done.wait(left).expect("zero scan wait");
+    }
+    !job.found.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One threaded scan: the shared early-stop flag and the count of parts the
+/// workers still hold.
+struct ZeroScanJob {
+    found: std::sync::atomic::AtomicBool,
+    left: std::sync::Mutex<usize>,
+    done: std::sync::Condvar,
+}
+
+impl ZeroScanJob {
+    fn scan(&self, part: &[(usize, usize)]) {
+        if !part.iter().all(|&(p, n)| zero_scan_bytes(p, n, Some(&self.found))) {
+            self.found.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+type ZeroScanTx = std::sync::mpsc::Sender<(Vec<(usize, usize)>, std::sync::Arc<ZeroScanJob>)>;
+
+/// Persistent scan workers, spawned on first use (b714: a scoped spawn per seed
+/// cost the canvas ~2.5 % against the serial scan's gain on webgl).
+fn zero_scan_pool(n: usize) -> &'static [std::sync::Mutex<ZeroScanTx>] {
+    static POOL: std::sync::OnceLock<Vec<std::sync::Mutex<ZeroScanTx>>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        (0..n)
+            .filter_map(|i| {
+                let (tx, rx) = std::sync::mpsc::channel::<(Vec<(usize, usize)>, std::sync::Arc<ZeroScanJob>)>();
+                std::thread::Builder::new()
+                    .name(format!("zero-scan-{i}"))
+                    .spawn(move || {
+                        while let Ok((part, job)) = rx.recv() {
+                            job.scan(&part);
+                            let mut left = job.left.lock().expect("zero scan count");
+                            *left -= 1;
+                            if *left == 0 {
+                                job.done.notify_all();
+                            }
+                        }
+                    })
+                    .ok()
+                    .map(|_| std::sync::Mutex::new(tx))
+            })
+            .collect()
+    })
 }
 
 /// Below this the serial scan wins over spawning threads (a 5K target is ~39 MB).
