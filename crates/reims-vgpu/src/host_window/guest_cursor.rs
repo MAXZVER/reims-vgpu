@@ -183,11 +183,16 @@ const MAX_CURSOR: u32 = 2048;
 /// pixel, with its hot spot: `(rgba, width, height, hot_x, hot_y)`. `None` for
 /// an empty glyph.
 ///
-/// Nearest-neighbour: the guest draws its cursors for the pixel grid it renders
-/// at, and an integer scale (2x for a 1080p mode on a 2160-line monitor) keeps
-/// every edge sharp. The guest's words may be premultiplied; when no colour
-/// channel exceeds its alpha anywhere in the glyph they are taken to be and are
-/// unpremultiplied, because the window system takes straight alpha and a
+/// Nearest-neighbour at an integer scale: the guest draws its cursors for the
+/// pixel grid it renders at, and an integer scale (2x for a 1080p mode on a
+/// 2160-line monitor) keeps every edge sharp. A fractional scale (4608x1944 on a
+/// 5120x2160 window is 1.11x) duplicates some rows and columns and not others,
+/// which turns the arrow's edges into stairs (field report 2026-10-18), so it is
+/// resampled with Catmull-Rom - the filter the scaled frame itself is presented
+/// with (`PRESENT_SHARP`) - in premultiplied alpha, outside the glyph read as
+/// transparent. The guest's words may be premultiplied; when no colour channel
+/// exceeds its alpha anywhere in the glyph they are taken to be. The result is
+/// straight alpha, because the window system takes straight alpha and a
 /// premultiplied shadow read as straight comes out darker than the guest drew it.
 pub fn glyph_rgba(glyph: &GuestCursorGlyph, scale: f64) -> Option<(Vec<u8>, u16, u16, u16, u16)> {
     let (w, h) = (u32::from(glyph.width), u32::from(glyph.height));
@@ -205,25 +210,91 @@ pub fn glyph_rgba(glyph: &GuestCursorGlyph, scale: f64) -> Option<(Vec<u8>, u16,
         let a = p >> 24;
         (p >> 16) & 0xff <= a && (p >> 8) & 0xff <= a && p & 0xff <= a
     });
+    let integer = (scale - scale.round()).abs() < 1e-3;
     let mut rgba = Vec::with_capacity((ow * oh * 4) as usize);
-    for oy in 0..oh {
-        let sy = ((u64::from(oy) * u64::from(h)) / u64::from(oh)) as u32;
-        for ox in 0..ow {
-            let sx = ((u64::from(ox) * u64::from(w)) / u64::from(ow)) as u32;
-            let p = glyph.argb[(sy * w + sx) as usize];
-            let a = (p >> 24) as u8;
-            let mut c = [(p >> 16) as u8, (p >> 8) as u8, p as u8];
-            if premultiplied && a != 0 && a != 255 {
-                for v in &mut c {
-                    *v = ((u32::from(*v) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8;
+    if integer {
+        for oy in 0..oh {
+            let sy = ((u64::from(oy) * u64::from(h)) / u64::from(oh)) as u32;
+            for ox in 0..ow {
+                let sx = ((u64::from(ox) * u64::from(w)) / u64::from(ow)) as u32;
+                let p = glyph.argb[(sy * w + sx) as usize];
+                let a = (p >> 24) as u8;
+                let mut c = [(p >> 16) as u8, (p >> 8) as u8, p as u8];
+                if premultiplied && a != 0 && a != 255 {
+                    for v in &mut c {
+                        *v = ((u32::from(*v) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8;
+                    }
                 }
+                rgba.extend_from_slice(&[c[0], c[1], c[2], a]);
             }
-            rgba.extend_from_slice(&[c[0], c[1], c[2], a]);
+        }
+    } else {
+        // Premultiplied RGBA in [0, 1], one entry per guest pixel.
+        let pm: Vec<[f32; 4]> = glyph.argb[..(w * h) as usize]
+            .iter()
+            .map(|&p| {
+                let a = ((p >> 24) & 0xff) as f32 / 255.0;
+                let c = [((p >> 16) & 0xff) as f32 / 255.0, ((p >> 8) & 0xff) as f32 / 255.0, (p & 0xff) as f32 / 255.0];
+                if premultiplied {
+                    [c[0], c[1], c[2], a]
+                } else {
+                    [c[0] * a, c[1] * a, c[2] * a, a]
+                }
+            })
+            .collect();
+        let texel = |x: i64, y: i64| -> [f32; 4] {
+            if x < 0 || y < 0 || x >= i64::from(w) || y >= i64::from(h) {
+                [0.0; 4]
+            } else {
+                pm[(y as u32 * w + x as u32) as usize]
+            }
+        };
+        let (kx, ky) = (f64::from(w) / f64::from(ow), f64::from(h) / f64::from(oh));
+        for oy in 0..oh {
+            let fy = (f64::from(oy) + 0.5) * ky - 0.5;
+            let (y0, ty) = (fy.floor() as i64, (fy - fy.floor()) as f32);
+            let wy = catmull_rom_weights(ty);
+            for ox in 0..ow {
+                let fx = (f64::from(ox) + 0.5) * kx - 0.5;
+                let (x0, tx) = (fx.floor() as i64, (fx - fx.floor()) as f32);
+                let wx = catmull_rom_weights(tx);
+                let mut acc = [0.0f32; 4];
+                for (j, wyj) in wy.iter().enumerate() {
+                    for (i, wxi) in wx.iter().enumerate() {
+                        let t = texel(x0 - 1 + i as i64, y0 - 1 + j as i64);
+                        let k = wxi * wyj;
+                        for (a, v) in acc.iter_mut().zip(t) {
+                            *a += k * v;
+                        }
+                    }
+                }
+                // Catmull-Rom overshoots at hard edges: clamp alpha, then each colour to it.
+                let a = acc[3].clamp(0.0, 1.0);
+                let a8 = (a * 255.0 + 0.5) as u8;
+                let mut px = [0u8, 0, 0, a8];
+                if a8 != 0 {
+                    for (c, v) in px.iter_mut().zip(acc).take(3) {
+                        *c = ((v.clamp(0.0, a) / a) * 255.0 + 0.5).min(255.0) as u8;
+                    }
+                }
+                rgba.extend_from_slice(&px);
+            }
         }
     }
     let hx = ((f64::from(glyph.hot_x) * f64::from(ow) / f64::from(w)) as u32).min(ow - 1);
     let hy = ((f64::from(glyph.hot_y) * f64::from(oh) / f64::from(h)) as u32).min(oh - 1);
     Some((rgba, ow as u16, oh as u16, hx as u16, hy as u16))
+}
+
+/// Catmull-Rom (cubic, a = -0.5) weights of the four taps around a sample `t` in [0, 1) past the second tap.
+fn catmull_rom_weights(t: f32) -> [f32; 4] {
+    let (t2, t3) = (t * t, t * t * t);
+    [
+        -0.5 * t3 + t2 - 0.5 * t,
+        1.5 * t3 - 2.5 * t2 + 1.0,
+        -1.5 * t3 + 2.0 * t2 + 0.5 * t,
+        0.5 * t3 - 0.5 * t2,
+    ]
 }
 
 /// How long the host pointer must have been still before the guest's position
@@ -378,6 +449,25 @@ mod tests {
         let g = glyph(2, 1, vec![0x80ff_ffff, 0xff00_00ff]);
         let (rgba, ..) = glyph_rgba(&g, 1.0).unwrap();
         assert_eq!(&rgba[0..4], &[255, 255, 255, 0x80]);
+    }
+
+    #[test]
+    fn a_fractional_scale_filters_edges_instead_of_repeating_columns() {
+        // 4608x1944 on a 5120x2160 window: 10/9. Opaque black on the left half, transparent on the right.
+        let mut argb = vec![0xff00_0000u32; 5];
+        argb.extend(vec![0u32; 5]);
+        let g = glyph(10, 1, argb);
+        let (rgba, w, h, _, _) = glyph_rgba(&g, 10.0 / 9.0).unwrap();
+        assert_eq!((w, h), (11, 1));
+        let alpha: Vec<u8> = rgba.chunks(4).map(|p| p[3]).collect();
+        // Far from the edge the glyph keeps its coverage; at the edge it ramps instead of stepping.
+        assert_eq!(alpha[1], 255, "{alpha:?}");
+        assert_eq!(alpha[10], 0, "{alpha:?}");
+        assert!(alpha.iter().any(|&a| a > 0 && a < 255), "{alpha:?}");
+        // Straight alpha out: an opaque or partly covered black pixel stays black.
+        for p in rgba.chunks(4).filter(|p| p[3] > 0) {
+            assert_eq!(&p[0..3], &[0, 0, 0], "{rgba:?}");
+        }
     }
 
     #[test]
