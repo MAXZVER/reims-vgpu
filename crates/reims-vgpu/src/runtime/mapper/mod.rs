@@ -1808,6 +1808,29 @@ pub fn commit_guest_write_stamp(
             && m.guest_write_token_gen == m.map_generation;
         m.guest_write_gen_at_store = if current { seen.gen_ } else { 0 };
         m.guest_stated_at_stamp = seen.stated;
+        // TEMP (lab, Opus 2026-10-20, REIMS_VGPU_LAB_BIG_SEED): why a large surface's Store stamped 0.
+        if m.guest_write_gen_at_store == 0 && u64::from(m.width) * u64::from(m.height) >= 4_000_000 {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let max = *MAX.get_or_init(|| {
+                std::env::var("REIMS_VGPU_LAB_BIG_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            });
+            if N.fetch_add(1, Ordering::Relaxed) < max {
+                crate::observe::fail(format!(
+                    "lab_big_stamp0 mid={mapping_id} {}x{} seen_token={} token={} seen_mapgen={} mapgen={} token_gen={} seen_gen={} t={}",
+                    m.width,
+                    m.height,
+                    seen.token,
+                    m.guest_write_token,
+                    seen.map_generation,
+                    m.map_generation,
+                    m.guest_write_token_gen,
+                    seen.gen_,
+                    crate::observe::elapsed_us() / 1000
+                ));
+            }
+        }
     }
 }
 

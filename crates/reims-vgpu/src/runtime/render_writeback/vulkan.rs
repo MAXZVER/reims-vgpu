@@ -783,6 +783,36 @@ fn store_render_frame_inner<M: HostMemory + HostOps>(
 ) -> bool {
     let started = std::time::Instant::now();
     crate::runtime::drain::note_store_route("surface_flush");
+    // TEMP (lab, Opus 2026-10-20, REIMS_VGPU_LAB_BIG_SEED): heavy WebGL spends half its slow tranches flushing its
+    // 20 MB canvas back to guest pages every frame - name who asks (first few, with the call stack).
+    if u64::from(width) * u64::from(height) >= 4_000_000 {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let max = *MAX.get_or_init(|| {
+            std::env::var("REIMS_VGPU_LAB_BIG_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        });
+        static GATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let gate_open = GATE
+            .get_or_init(|| std::env::var("REIMS_VGPU_LAB_GATE").ok())
+            .as_deref()
+            .is_none_or(|path| std::path::Path::new(path).exists());
+        let n = if max > 0 && gate_open { N.fetch_add(1, Ordering::Relaxed) } else { u32::MAX };
+        if n < max / 10 {
+            let bt = std::backtrace::Backtrace::force_capture().to_string();
+            let frames: Vec<&str> = bt
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.contains("reims_vgpu::") && !l.contains("backtrace"))
+                .map(|l| l.split_once(": ").map_or(l, |(_, f)| f))
+                .take(14)
+                .collect();
+            crate::observe::fail(format!(
+                "lab_big_flush #{n} mid={mapping_id} {width}x{height} stack={}",
+                frames.join(" < ")
+            ));
+        }
+    }
     if let Some(m) = state.mappings.get_mut(&mapping_id) {
         let now = crate::observe::elapsed_us();
         // TEMP (lab, b037): which surfaces the 1.4 GB a Safari phase of render

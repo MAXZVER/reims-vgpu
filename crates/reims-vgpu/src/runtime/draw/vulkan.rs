@@ -22988,7 +22988,7 @@ fn lab_big_seed_census<M: HostOps>(
     let m = state.mappings.get(&mid);
     let debt = mid != 0 && state.pending_writebacks.get(mid).is_some();
     crate::observe::fail(format!(
-        "lab_big_seed #{n} task={task_id} door={door} declared={declared:?} ref={} {w}x{h} fmt={} mid={mid}          gva={:#x} verdict={verdict:?} stamp={} token={} token_gen={} map_gen={} stated={}/{} cpu_shared={}          presented={} video={} debt={debt} t={}",
+        "lab_big_seed #{n} task={task_id} door={door} declared={declared:?} ref={} {w}x{h} fmt={} mid={mid} gva={:#x} verdict={verdict:?} stamp={} token={} token_gen={} map_gen={} stated={}/{} cpu_shared={} presented={} video={} debt={debt} idgen={} contentgen={} bump={}:{} bump_age_ms={} pages={} t={}",
         c0.texture_ref,
         c0.format,
         c0.target_gva,
@@ -23001,6 +23001,18 @@ fn lab_big_seed_census<M: HostOps>(
         m.is_some_and(|m| m.guest_cpu_shared),
         m.is_some_and(|m| m.scanout_presented),
         m.is_some_and(|m| m.is_video_stream),
+        m.map_or(0, |m| m.identity_generation),
+        m.map_or(0, |m| m.content_generation),
+        m.map_or("", |m| m.lab_bump_site.0.rsplit(['/', '\\']).next().unwrap_or("")),
+        m.map_or(0, |m| m.lab_bump_site.1),
+        m.map_or(-1, |m| {
+            if m.lab_bump_us == 0 {
+                -1
+            } else {
+                (crate::observe::elapsed_us().saturating_sub(m.lab_bump_us) / 1000) as i64
+            }
+        }),
+        m.map_or(0, |m| m.page_entries.len()),
         crate::observe::elapsed_us() / 1000
     ));
 }

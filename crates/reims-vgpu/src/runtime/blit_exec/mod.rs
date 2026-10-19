@@ -3709,6 +3709,16 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     BlitStatus::Ok
 }
 
+/// TEMP (lab): the `REIMS_VGPU_LAB_GATE` file is present (or no gate is set), so the T2T censuses spend their
+/// budget inside the window the queue opens rather than on the boot's own copies.
+fn lab_t2t_gate_open() -> bool {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    match PATH.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GATE").ok()) {
+        Some(path) => std::path::Path::new(path).exists(),
+        None => true,
+    }
+}
+
 /// TEMP (lab, Opus 2026-10-20, WebGPU x1 texture->canvas copy black): `REIMS_VGPU_LAB_T2T=N` names the
 /// first N staged texture copies of at least 256x256 outside WindowServer and writes what each read from its
 /// source to `/tmp/labdump/t2t-NNN.rgba` (the `lab_dump` header), so a black canvas can be split into "the
@@ -3728,7 +3738,7 @@ fn lab_t2t_census(
     let max = *MAX.get_or_init(|| {
         std::env::var("REIMS_VGPU_LAB_T2T").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
     });
-    if max == 0 || task_id == 1 || copy_w < 256 || copy_h < 256 {
+    if max == 0 || task_id == 1 || copy_w < 256 || copy_h < 256 || !lab_t2t_gate_open() {
         return;
     }
     let n = N.fetch_add(1, Ordering::Relaxed);
@@ -4440,6 +4450,22 @@ pub fn execute_blit<M: HostMemory + HostOps>(
     crate::runtime::draw::vulkan::stale_watch::blit_note(task_id, || {
         format!("{record:?} -> {status:?}")
     });
+    // TEMP (lab, Opus 2026-10-20): `REIMS_VGPU_LAB_T2T=N` also names every texture copy record outside
+    // WindowServer with its outcome, whichever arm ran (b844: no staged copy reached the census).
+    if matches!(record, BlitRecord::TextureRegion(_) | BlitRecord::TextureSlices(_)) && task_id != 1 {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let max = *MAX.get_or_init(|| {
+            std::env::var("REIMS_VGPU_LAB_T2T").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        }) * 10;
+        if max > 0 && lab_t2t_gate_open() && N.fetch_add(1, Ordering::Relaxed) < max {
+            crate::observe::fail(format!(
+                "lab_t2t_record task={task_id} {record:?} -> {status:?} t={}",
+                crate::observe::elapsed_us() / 1000
+            ));
+        }
+    }
     status
 }
 

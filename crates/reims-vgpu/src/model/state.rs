@@ -6320,6 +6320,25 @@ impl DeviceState {
         // different plan = genuine new surface, bump + drop there). Geometry
         // stays cleared either way — samples fail-closed until re-resolve, so
         // a genuinely new surface can never be served the old resident.
+        // TEMP (lab, Opus 2026-10-20, REIMS_VGPU_LAB_BIG_SEED): a MAP notify on a large surface, with what it held.
+        if e.page_entries.len() >= 4096 || e.condemned_entries.as_ref().is_some_and(|c| c.len() >= 4096) {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let max = *MAX.get_or_init(|| {
+                std::env::var("REIMS_VGPU_LAB_BIG_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            });
+            if N.fetch_add(1, Ordering::Relaxed) < max {
+                crate::observe::fail(format!(
+                    "lab_big_map_notify mid={mapping_id} pages={} condemned={:?} map_gen={} token={} t={}",
+                    e.page_entries.len(),
+                    e.condemned_entries.as_ref().map(|c| c.len()),
+                    e.map_generation,
+                    e.guest_write_token,
+                    crate::observe::elapsed_us() / 1000
+                ));
+            }
+        }
         if !e.page_entries.is_empty() && e.condemned_entries.is_none() {
             e.condemned_entries = Some(std::mem::take(&mut e.page_entries));
         } else {
