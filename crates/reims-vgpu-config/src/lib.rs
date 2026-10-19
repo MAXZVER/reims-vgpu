@@ -1583,6 +1583,19 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// pointer, and never reaches a captured frame. `off` keeps the host's own arrow
 /// and never moves the host pointer — the behavior before this existed.
 pub const HOST_CURSOR: &str = "REIMS_VGPU_HOST_CURSOR";
+
+/// **Default off (lab).** `on` makes the two writeback-debt exits that drop a
+/// debt without paying it — the mapping is gone (`no_mapping`) or its
+/// generation moved (`generation_moved`), both counted as
+/// `wbdebt_generation_moved` — also call `abandon_resident` on the debt's
+/// target, as the `abandoned_guest_wrote` exit already does, in both `pay` and
+/// `pay_deferred`. `abandon_resident` is what lets the reclaim paths take the
+/// resident; without it the resident is retained. Each such call notes
+/// `wbdebt_abandoned_on_dropped_exit`.
+///
+/// Unset or `off` is the shipping behaviour. Stays opt-in until a 30-minute
+/// Simulator A/B of retained VRAM says otherwise.
+pub const LAB_WBDEBT_ABANDON_ON_EXIT: &str = "REIMS_VGPU_LAB_WBDEBT_ABANDON_ON_EXIT";
 }
 
 counts! {
