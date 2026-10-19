@@ -7192,6 +7192,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
         multisample_source_ref: 0,
         multisample_source_gva: 0,
         multisample_source_format: 0,
+        multisample_source_row_stride: 0,
     };
 
     let armed = sync_store_allowed_pages(&state, &host, 1, Some(&c0), true)
@@ -7402,6 +7403,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
         multisample_source_ref: 0,
         multisample_source_gva: 0,
         multisample_source_format: 0,
+        multisample_source_row_stride: 0,
     };
     // Full height, left half only: the partial store the Load seed forces, and
     // it crosses the page boundary at row 64.

@@ -12152,6 +12152,24 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             None => worker_bail!(Bail::PassInvariants),
         },
     };
+    // The resolve source's own allocation generation, so a resolving pass names
+    // the resident the source's earlier passes rendered into. Only the drain can
+    // walk it; a worker leaves 0 and the pass takes the persistent source image.
+    req.multisample_source_gen = match (acc.exclusive(), req.colors.first()) {
+        (Some(state), Some(c0)) if c0.multisample_source_ref != 0 && c0.multisample_source_gva != 0 => {
+            crate::runtime::writeback_debt::gva_resource_generation(
+                state,
+                host,
+                crate::runtime::writeback_debt::GvaResourceKey {
+                    task_id: req.task_id,
+                    texture_ref: c0.multisample_source_ref,
+                },
+                c0.multisample_source_gva,
+                u64::from(c0.multisample_source_row_stride).saturating_mul(u64::from(c0.height)),
+            )
+        }
+        _ => 0,
+    };
     // One call for the pipeline descriptor and both translated shaders. It is
     // memoized on the three objects' list entries — see
     // `crate::backend::vulkan::pipeline_resolve` for what that identity is and what it
@@ -15192,12 +15210,15 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 color.multisample_source_ref != 0 && color.load_action == MTL_LOAD_ACTION_LOAD
             }),
             multisample_source_identity: req.colors.first().and_then(|color| {
-                (color.multisample_source_ref != 0 && color.multisample_source_gva != 0).then(|| {
+                (color.multisample_source_ref != 0
+                    && color.multisample_source_gva != 0
+                    && req.multisample_source_gen != 0)
+                    .then(|| {
                     crate::backend::vulkan::engine::TargetIdentity::Gva {
                         gva: color.multisample_source_gva,
                         width: color.width,
                         height: color.height,
-                        generation: req.gva_alloc_gen,
+                        generation: req.multisample_source_gen,
                         format: gva_resident_format(color.multisample_source_format),
                     }
                 })

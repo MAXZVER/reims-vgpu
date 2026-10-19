@@ -4228,6 +4228,7 @@ mod tests {
             multisample_source_ref: 7,
             multisample_source_gva: 0,
             multisample_source_format: 0,
+            multisample_source_row_stride: 0,
             ..Default::default()
         };
         assert!(

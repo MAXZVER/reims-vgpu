@@ -7551,6 +7551,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
             multisample_source_ref: c.multisample_source_ref,
             multisample_source_gva: c.multisample_source_gva,
             multisample_source_format: c.multisample_source_format,
+            multisample_source_row_stride: c.multisample_source_row_stride,
         })
         .collect();
     draw::DrawEncodeRequest {
