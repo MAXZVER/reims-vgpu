@@ -3172,6 +3172,108 @@ impl ResourcePools {
         freed + trimmed
     }
 
+    /// TEMP (lab, Opus 2026-10-19, Retina 3456 crashes): give VRAM back before the device-local heap overruns.
+    ///
+    /// [`Self::reclaim_for_allocation_retry`] waits for the driver to refuse an allocation. WDDM does not refuse:
+    /// past the card's memory it demotes allocations to system memory, the process stalls for seconds, and on Mish's
+    /// work VM (guest 3456x1458 HiDPI on a 6912x2916 backing, registry 3.9-5.2 GiB + slab 3 GiB on an 8 GiB RTX 4060)
+    /// the NVIDIA driver then crashed inside `vkCmdBeginRenderPass` twice (nvoglv64+0xe94a7c, NULL+0x1f0), with no
+    /// `OUT_OF_DEVICE_MEMORY` ever returned. So ask `VK_EXT_memory_budget` on the maintenance tick, and while the
+    /// device-local heaps are past `REIMS_VGPU_LAB_VRAM_HIGH_PCT` (default 85) of their budget, empty the recycle pools
+    /// and retire the least recently touched recoverable residents (not pinned, not the only copy of their pixels,
+    /// untouched for a second) until the estimate is back under 75 %. Frees land when their slots retire, so a relief
+    /// is followed by a 1 s pause before the next reading is acted on. `REIMS_VGPU_LAB_VRAM_HIGH_PCT=off` disables it.
+    pub(super) unsafe fn relieve_vram_pressure(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+    ) -> usize {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static HIGH_PCT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static NEXT_MS: AtomicU64 = AtomicU64::new(0);
+        const LOW_PCT: u64 = 75;
+        const RECENT_MS: u64 = 1000;
+        const PAUSE_MS: u64 = 1000;
+        let Some(high) = *HIGH_PCT.get_or_init(|| match std::env::var("REIMS_VGPU_LAB_VRAM_HIGH_PCT") {
+            Ok(v) if v == "off" => None,
+            Ok(v) => v.parse::<u64>().ok().filter(|p| (LOW_PCT + 1..=100).contains(p)).or(Some(85)),
+            Err(_) => Some(85),
+        }) else {
+            return 0;
+        };
+        let supported = *SUPPORTED.get_or_init(|| unsafe {
+            ctx.instance
+                .enumerate_device_extension_properties(ctx.pd)
+                .map(|exts| {
+                    exts.iter().any(|e| {
+                        e.extension_name_as_c_str().ok() == Some(ash::ext::memory_budget::NAME)
+                    })
+                })
+                .unwrap_or(false)
+        });
+        let now = self.idle_clock_ms;
+        if !supported || now < NEXT_MS.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        unsafe { ctx.instance.get_physical_device_memory_properties2(ctx.pd, &mut props2) };
+        let heaps = props2.memory_properties.memory_heap_count as usize;
+        let local = props2.memory_properties.memory_heaps[..heaps]
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|(i, _)| i);
+        let (mut usage, mut limit) = (0u64, 0u64);
+        for i in local {
+            usage += budget.heap_usage[i];
+            limit += budget.heap_budget[i];
+        }
+        if limit == 0 || usage * 100 <= limit * high {
+            return 0;
+        }
+        let want = usage.saturating_sub(limit * LOW_PCT / 100);
+        let recycled = self.trim_recycle_pools(&ctx.device, usize::MAX, true);
+        let mut victims: Vec<(u64, TargetIdentity)> = self
+            .recoverable_residents()
+            .into_iter()
+            .filter_map(|id| {
+                let slot = self.registry.get(&id)?;
+                (now.saturating_sub(slot.last_touch_ms) >= RECENT_MS).then_some((slot.last_touch_ms, id))
+            })
+            .collect();
+        victims.sort_by_key(|(touch, _)| *touch);
+        let (mut freed, mut retired) = (0u64, 0usize);
+        for (_, id) in &victims {
+            if freed >= want {
+                break;
+            }
+            let bytes = self.registry.get(id).map_or(0, Self::slot_attachment_bytes);
+            if unsafe { self.retire_resident(ctx, id, ResidentReclaim::AllocationReclaimed, counters) }.is_some() {
+                freed += bytes;
+                retired += 1;
+            }
+        }
+        NEXT_MS.store(now + PAUSE_MS, Ordering::Relaxed);
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 50 || n % 100 == 0 {
+            crate::observe::fail(format!(
+                "lab_vram_relief #{n} usage_mib={} budget_mib={} high_pct={high} want_mib={} retired={retired} \
+                 freed_mib~{} recycled={recycled} candidates={} live={} t={}",
+                usage >> 20,
+                limit >> 20,
+                want >> 20,
+                freed >> 20,
+                victims.len(),
+                self.registry.len(),
+                now
+            ));
+        }
+        retired + recycled
+    }
+
     /// Fold the current non-pinned and sole-copy populations into their
     /// high-water bands.
     ///
