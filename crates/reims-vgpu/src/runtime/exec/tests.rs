@@ -2494,6 +2494,7 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
     acc.color_slots.push((0, att));
     acc.draws.push(PendingDraw {
         visibility: None,
+        merged: None,
         pipeline_ref: 1,
         draw: DrawArgs {
             vertex_count: 3,
@@ -2603,6 +2604,7 @@ fn nometal_draw_falls_back_to_backing_clear() {
     acc.color_slots.push((0, att));
     acc.draws.push(PendingDraw {
         visibility: None,
+        merged: None,
         pipeline_ref: 7,
         draw: DrawArgs {
             vertex_count: 3,
@@ -9141,6 +9143,7 @@ fn pass_prep_on_and_off_report_the_same_counters() {
                 objects::resolve_resource(&state, &host, 1, refs[which]).expect("fixture ref");
             acc.draws.push(PendingDraw {
                 visibility: None,
+                merged: None,
                 pipeline_ref: 7,
                 draw: DrawArgs {
                     vertex_count: 3,

@@ -42,7 +42,12 @@ pub fn max_heavy_subs() -> usize {
 pub fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = !matches!(std::env::var("REIMS_VGPU_LAB_MERGE_DRAWS").as_deref(), Ok("off" | "0"));
+        // Unit tests pin the walk's one-record-per-draw invariants, so there it is opt-in (`=on`).
+        let on = if cfg!(test) {
+            matches!(std::env::var("REIMS_VGPU_LAB_MERGE_DRAWS").as_deref(), Ok("on" | "1"))
+        } else {
+            !matches!(std::env::var("REIMS_VGPU_LAB_MERGE_DRAWS").as_deref(), Ok("off" | "0"))
+        };
         crate::observe::off(format!("lab_merge_draws on={}", u8::from(on)));
         on
     })

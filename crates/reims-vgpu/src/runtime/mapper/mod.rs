@@ -2179,9 +2179,58 @@ pub(crate) fn mapping_page_gpas_revalidated(
 /// other side. It reads the same fields the check reads, in the same order, so
 /// a region the check starts comparing must be added here too. A changed key
 /// only re-runs the check; it never skips one.
+/// TEMP (lab, Opus 2026-10-19): bumped wherever a child ring's page list is installed or reset, so
+/// [`control_layout_key`] can stand on a cheap pre-key instead of re-hashing every ring page per mapping write
+/// (b794, VS Code scrolling: 8.5 % of the drain self time in this key).
+static RING_LAYOUT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) fn bump_ring_layout() {
+    RING_LAYOUT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn control_layout_key(state: &DeviceState, pages: usize) -> u64 {
     fn mix(h: u64, x: u64) -> u64 {
         // splitmix64 finalizer over the running state.
+        let mut z = (h ^ x).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+    // TEMP (lab): the pre-key - every field the full key reads except the ring page lists themselves, which only
+    // change with the ring install generation (plus each list's length and ends, for writers that bypass it).
+    let mut p = mix(pages as u64, state.page_shift as u64);
+    p = mix(p, state.gfx.root_page as u64);
+    p = mix(p, state.gfx.fifo_base_page as u64);
+    p = mix(p, state.gfx.fifo_length as u64);
+    p = mix(p, state.iosfc.ring_base);
+    p = mix(p, RING_LAYOUT_GEN.load(std::sync::atomic::Ordering::Relaxed));
+    for (i, ring) in state.child_rings.iter().enumerate() {
+        if ring.page_gpas.is_empty() {
+            continue;
+        }
+        p = mix(p, ((i as u64) << 32) | ring.page_gpas.len() as u64);
+        p = mix(p, (u64::from(ring.base_pfn) << 32) | u64::from(ring.length));
+        p = mix(p, ring.page_gpas[0]);
+        p = mix(p, ring.page_gpas[ring.page_gpas.len() - 1]);
+    }
+    for (id, task) in state.tasks.live() {
+        if task.directory_pfn != 0 {
+            p = mix(p, ((id as u64) << 32) | task.directory_pfn as u64);
+        }
+    }
+    thread_local! {
+        static LAST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    let (last_pre, last_key) = LAST.with(|l| l.get());
+    if last_pre == p && p != 0 {
+        return last_key;
+    }
+    let key = control_layout_key_full(state, pages);
+    LAST.with(|l| l.set((p, key)));
+    key
+}
+
+fn control_layout_key_full(state: &DeviceState, pages: usize) -> u64 {
+    fn mix(h: u64, x: u64) -> u64 {
         let mut z = (h ^ x).wrapping_add(0x9e37_79b9_7f4a_7c15);
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);

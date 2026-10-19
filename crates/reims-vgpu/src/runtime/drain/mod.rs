@@ -791,6 +791,7 @@ fn forget_child_channel(state: &mut DeviceState, channel: u32, bit: u32) {
     state.translation_order_hold_mask &= !bit;
     state.present_translation_hold_mask &= !bit;
     state.child_rings[channel as usize] = Default::default();
+    crate::runtime::mapper::bump_ring_layout(); // TEMP (lab)
     crate::runtime::ring_ingest::reset(state.id.0, channel);
 }
 
@@ -6482,6 +6483,7 @@ fn ensure_child_ring<M: HostMemory>(
         length,
         page_gpas,
     };
+    crate::runtime::mapper::bump_ring_layout(); // TEMP (lab)
     length
 }
 
