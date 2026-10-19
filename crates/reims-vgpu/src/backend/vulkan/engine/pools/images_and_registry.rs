@@ -893,13 +893,42 @@ impl ResourcePools {
     ) -> Result<Option<(vk::Image, vk::ImageView, ResidentAccess)>, DrawError> {
         let resident = translate::pixel::ResidentFormat::of(format);
         let Some(slot) = self.registry.get(identity) else {
+            // TEMP (lab): which resolves found no resident of their source, and the
+            // nearest one registered at the same GVA if any.
+            let near = self.registry.iter().find(|(id, _)| match (id, identity) {
+                (TargetIdentity::Gva { gva: a, .. }, TargetIdentity::Gva { gva: b, .. }) => a == b,
+                _ => false,
+            });
+            if crate::observe::first_sight("lab_msaa_registry_source_miss", identity.generation() ^ (width as u64) << 32) {
+                crate::observe::off(format!(
+                    "lab_msaa_registry_source_miss want={identity:?} near={:?}",
+                    near.map(|(id, s)| (id.clone(), s.sample_count, s.content_ready, s.width, s.height))
+                ));
+            }
             return Ok(None);
         };
         if sample_count < 2
             || !slot.reusable_for(width, height, sample_count, identity.generation(), resident)
             || !slot.content_ready
         {
+            if crate::observe::first_sight("lab_msaa_registry_source_unfit", identity.generation() ^ (width as u64) << 32) {
+                crate::observe::off(format!(
+                    "lab_msaa_registry_source_unfit want={identity:?} samples={sample_count}/{} gen={}/{} \
+                     size={width}x{height}/{}x{} content={} fmt={:?}/{:?}",
+                    slot.sample_count,
+                    identity.generation(),
+                    slot.generation,
+                    slot.width,
+                    slot.height,
+                    slot.content_ready,
+                    resident.allocation(),
+                    slot.format.allocation()
+                ));
+            }
             return Ok(None);
+        }
+        if crate::observe::first_sight("lab_msaa_registry_source_hit", identity.generation() ^ (width as u64) << 32) {
+            crate::observe::off(format!("lab_msaa_registry_source_hit {identity:?}"));
         }
         let (image, access) = (slot.image, slot.access);
         let Some(view) = (unsafe { self.registry_view(ctx, identity, resident.declared(), counters)? }) else {
