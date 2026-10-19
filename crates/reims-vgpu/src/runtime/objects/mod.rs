@@ -4494,11 +4494,36 @@ fn apply_backing<M: HostMemory>(
             if N.fetch_add(1, Ordering::Relaxed) < max {
                 let first_diff = prior.iter().zip(entries.iter()).position(|(a, b)| a != b);
                 let moved = prior.iter().zip(entries.iter()).filter(|(a, b)| a != b).count();
+                // Did the guest carry the content to the new pages (equal), or hand out fresh ones (new zero)?
+                // 32 pages spread over the plan, 256 bytes from the middle of each.
+                let (mut equal, mut new_zero, mut old_zero, mut sampled) = (0u32, 0u32, 0u32, 0u32);
+                if prior.len() == entries.len() {
+                    let step = (entries.len() / 32).max(1);
+                    for i in (0..entries.len()).step_by(step).take(32) {
+                        let (Some(a), Some(b)) = (
+                            entry_gpa_shift(prior[i], state_page_shift),
+                            entry_gpa_shift(entries[i], state_page_shift),
+                        ) else {
+                            continue;
+                        };
+                        let (mut x, mut y) = ([0u8; 256], [0u8; 256]);
+                        if host.read_gpa(a + 1024, &mut x).is_ok() && host.read_gpa(b + 1024, &mut y).is_ok() {
+                            sampled += 1;
+                            equal += u32::from(x == y);
+                            new_zero += u32::from(y.iter().all(|&v| v == 0));
+                            old_zero += u32::from(x.iter().all(|&v| v == 0));
+                        }
+                    }
+                }
+                let runs = |v: &[u32]| 1 + v.windows(2).filter(|w| w[1] != w[0].wrapping_add(1 << PAGE_ENTRY_PFN_SHIFT)).count();
                 crate::observe::fail(format!(
                     "lab_big_readopt sid={surface_id} task={task_id} prior={} new={} first_diff={first_diff:?} \
-                     moved={moved} map_gen={} t={}",
+                     moved={moved} sampled={sampled} equal={equal} new_zero={new_zero} old_zero={old_zero} \
+                     runs={}->{} map_gen={} t={}",
                     prior.len(),
                     entries.len(),
+                    runs(&prior),
+                    runs(&entries),
                     m.map_generation,
                     crate::observe::elapsed_us() / 1000
                 ));
