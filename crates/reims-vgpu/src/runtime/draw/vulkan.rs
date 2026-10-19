@@ -15145,6 +15145,9 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         target_rgba8.is_some() || target_guest_seed.is_some() || zero_seed_cleared,
                         seed_door,
                     );
+                    if target_rgba8.is_some() || target_guest_seed.is_some() {
+                        lab_big_seed_census(acc.shared(), &*host, req.task_id, c0, w, h, seed_door, declared);
+                    }
                     if matches!(declared, LoadAction::DontCare) {
                         // The widened arm's own instrument, and it is a counter
                         // rather than the latched line below it. DontCare now
@@ -22950,6 +22953,56 @@ fn lab_draw_sig(req: &DrawEncodeRequest) {
     w.state.insert(state);
     w.bufs.insert(bufs);
     w.full.insert(full);
+}
+
+/// TEMP (lab, Opus 2026-10-20, heavy-scene seed loads): `REIMS_VGPU_LAB_BIG_SEED=N` names the first N
+/// (then every 250th) LOAD seeds of at least 4 Mpx that were read rather than elided - which door, which
+/// surface, and every term the currency test refused on - so a 44 MB-per-frame seed can be pinned to the
+/// owner whose stamp is missing.
+#[allow(clippy::too_many_arguments)]
+fn lab_big_seed_census<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    c0: &ColorRtRequest,
+    w: u32,
+    h: u32,
+    door: &str,
+    declared: reims_vgpu_protocol::pass_action::LoadAction,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static N: AtomicU32 = AtomicU32::new(0);
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_BIG_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if max == 0 || u64::from(w) * u64::from(h) < 4_000_000 {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= max && n % 250 != 0 {
+        return;
+    }
+    let mid = c0.mapping_id;
+    let verdict = if mid != 0 { Some(mapping_guest_write_verdict(state, host, mid)) } else { None };
+    let m = state.mappings.get(&mid);
+    let debt = mid != 0 && state.pending_writebacks.get(mid).is_some();
+    crate::observe::fail(format!(
+        "lab_big_seed #{n} task={task_id} door={door} declared={declared:?} ref={} {w}x{h} fmt={} mid={mid}          gva={:#x} verdict={verdict:?} stamp={} token={} token_gen={} map_gen={} stated={}/{} cpu_shared={}          presented={} video={} debt={debt} t={}",
+        c0.texture_ref,
+        c0.format,
+        c0.target_gva,
+        m.map_or(0, |m| m.guest_write_gen_at_store),
+        m.map_or(0, |m| m.guest_write_token),
+        m.map_or(0, |m| m.guest_write_token_gen),
+        m.map_or(0, |m| m.map_generation),
+        m.map_or(0, |m| m.guest_stated_gen),
+        m.map_or(0, |m| m.guest_stated_at_stamp),
+        m.is_some_and(|m| m.guest_cpu_shared),
+        m.is_some_and(|m| m.scanout_presented),
+        m.is_some_and(|m| m.is_video_stream),
+        crate::observe::elapsed_us() / 1000
+    ));
 }
 
 pub(crate) fn note_compositor_plane_pass(
