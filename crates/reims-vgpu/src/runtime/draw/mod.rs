@@ -556,6 +556,16 @@ pub struct ColorRtRequest {
     /// Multisample attachment discarded into this request's single-sample
     /// target at pass end. Zero for an ordinary colour attachment.
     pub multisample_source_ref: u32,
+    /// The multisample source's own task GVA and declared format, when it is a
+    /// task-local texture (mapping 0): the same address a pass that renders
+    /// into that texture *without* resolving keys its resident by, so a later
+    /// resolving pass can load the samples those passes left there.
+    pub multisample_source_gva: u64,
+    pub multisample_source_format: u16,
+    /// The multisample source's row stride: with its GVA and height, the span
+    /// its allocation generation is resolved over (the one a pass rendering into
+    /// that texture resolves as its own `gva_alloc_gen`).
+    pub multisample_source_row_stride: u32,
 }
 
 impl ColorRtRequest {
@@ -735,6 +745,11 @@ pub struct DrawEncodeRequest {
     /// 0 means "no allocation named": color0 is not a GVA target, or the span
     /// does not fully walk. Vulkan rail only; the Metal arm never reads it.
     pub gva_alloc_gen: u64,
+    /// [`Self::gva_alloc_gen`] for colour0's multisample source texture, when it
+    /// is a task-local texture this draw resolves: the generation the source's
+    /// own passes keyed its resident with. 0 when there is none or it could not
+    /// be resolved here.
+    pub multisample_source_gen: u64,
     /// TEMP (lab, `REIMS_VGPU_LAB_PASS_INVARIANTS`): the pass invariants draw
     /// 0's Vulkan commit recorded once (design 2026-10-03 §6 C3). An out-field
     /// on draw 0 — the exec chain loop harvests it into the attachment
@@ -2752,6 +2767,9 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         clear_color: [0.0; 4],
         target_seed_rgba: None,
         multisample_source_ref: 0,
+        multisample_source_gva: 0,
+        multisample_source_format: 0,
+        multisample_source_row_stride: 0,
     };
     Some(DrawEncodeRequest {
         task_id,
@@ -2895,6 +2913,12 @@ pub fn mrt_draw_request_with<M: HostMemory + HostOps, S: crate::runtime::exec::w
         } else {
             (att.texture_ref, 0, source_target)
         };
+        let (multisample_source_gva, multisample_source_format, multisample_source_row_stride) =
+            if multisample_source_ref != 0 && source_target.mapping_id == 0 {
+                (source_target.target_gva, source_target.format, source_target.row_stride)
+            } else {
+                (0, 0, 0)
+            };
         let ResolvedRenderTarget {
             mapping_id,
             target_gva: gva,
@@ -3205,6 +3229,9 @@ pub fn mrt_draw_request_with<M: HostMemory + HostOps, S: crate::runtime::exec::w
             clear_color,
             target_seed_rgba: seed,
             multisample_source_ref,
+            multisample_source_gva,
+            multisample_source_format,
+            multisample_source_row_stride,
         });
     }
     if colors.is_empty() {

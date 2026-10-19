@@ -2748,6 +2748,9 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
             clear_color: [0.1, 0.2, 0.3, 1.0],
             target_seed_rgba: Some(vec![0xbb; 16]),
             multisample_source_ref: 0,
+            multisample_source_gva: 0,
+            multisample_source_format: 0,
+            multisample_source_row_stride: 0,
         }],
         ..Default::default()
     };

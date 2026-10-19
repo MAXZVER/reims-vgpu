@@ -3993,8 +3993,38 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     pass_key.sample_count = raster_sample_count;
     pass_key.multisample_resolve = req.multisample_resolve;
+    // The multisample texture's own resident, when earlier passes rendered into
+    // that texture without resolving: those samples are the texture's contents,
+    // and the persistent per-source image below would be a second, empty copy.
+    let registry_multisample_source = match req.multisample_source_identity.as_ref() {
+        Some(identity) if req.multisample_resolve => unsafe {
+            pools.registry_multisample_source(
+                ctx,
+                identity,
+                req.width,
+                req.height,
+                raster_sample_count,
+                color0_format,
+                counters,
+            )?
+        },
+        _ => None,
+    };
     let mut multisample_cold_clear = false;
-    if req.multisample_resolve && req.multisample_source != 0 {
+    if req.multisample_resolve && registry_multisample_source.is_some() {
+        let wants_prior = req.multisample_load || pass_key.color0_load == Color0Load::Preserve;
+        // The resident has content (`registry_multisample_source` asks), and the
+        // barrier below moves it from wherever the last pass left it into this
+        // pass's attachment layout - so a Load always finds the samples.
+        crate::runtime::drain::note_store_route(if wants_prior {
+            "msaa_load_registry_resident"
+        } else {
+            "msaa_source_registry_fresh"
+        });
+        if wants_prior {
+            pass_key.color0_load = Color0Load::Preserve;
+        }
+    } else if req.multisample_resolve && req.multisample_source != 0 {
         let wants_prior = req.multisample_load || pass_key.color0_load == Color0Load::Preserve;
         let outcome = multisample_source_load(
             wants_prior,
@@ -4654,7 +4684,19 @@ pub(crate) unsafe fn execute_draw_inner(
                 .as_ref()
                 .is_some_and(|depth| depth.owned.is_some()),
         };
-        let (image, _view, framebuffer) = if req.multisample_source != 0 {
+        let (image, _view, framebuffer) = if let Some((image, view, _)) = registry_multisample_source {
+            let mut views = vec![view, target_view];
+            views.extend(multisample_key.depth_view);
+            let framebuffer = unsafe {
+                pools.ensure_ad_hoc_framebuffer(ctx, render_pass, &views, req.width, req.height, counters)
+            }?;
+            if let Some(identity) = req.multisample_source_identity.as_ref() {
+                // Recorded at acquisition, as the persistent image's layout is:
+                // the pass that follows leaves the samples in this layout.
+                pools.registry_mark_ready_at(identity, pass_key.color_final_layout(0));
+            }
+            (image, view, framebuffer)
+        } else if req.multisample_source != 0 {
             pools.acquire_multisample_source(
                 ctx,
                 req.multisample_source,
@@ -5624,6 +5666,42 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &[],
         );
+    }
+
+    // The multisample source's own resident (see `registry_multisample_source`):
+    // from the access the last pass left it in into this pass's attachment
+    // layout, with that pass's writes made visible - unless this draw continues
+    // the open pass that already holds it. A pass that does not load it begins
+    // from UNDEFINED, which discards nothing it wanted.
+    if let Some((ms_image, _, ms_access)) = registry_multisample_source {
+        if !(req.continues_render_pass && pools.open_pass_echoes(&echo)) {
+            unsafe { outside_pass.before_record(PassObstacle::TargetLayout, pools, &ctx.device, cb) };
+            let (src_stage, src_access) = ms_access.source_scope();
+            let old_layout = if pass_key.color0_load == Color0Load::Preserve {
+                ms_access.layout()
+            } else {
+                vk::ImageLayout::UNDEFINED
+            };
+            let barrier = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(
+                    vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                )
+                .old_layout(old_layout)
+                .new_layout(pass_key.color_final_layout(0))
+                .image(ms_image)
+                .subresource_range(super::color_subresource_range())];
+            crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(
+                &ctx.device,
+                cb,
+                src_stage,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barrier,
+            );
+        }
     }
 
     // Resident samples: transition the persistent target in place. Duplicate

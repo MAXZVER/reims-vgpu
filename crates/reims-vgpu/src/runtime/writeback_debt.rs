@@ -816,6 +816,11 @@ impl PendingWritebacks {
 
     /// Whether a plane at these guest coordinates holds its attachment's only
     /// copy by contract. A scan, for [`Self::gva_for_window`]'s reason.
+    /// TEMP (lab, Opus 2026-10-19): every sole-copy window recorded at `gva`, for the multisampled-read census.
+    pub fn lab_sole_copies_at_gva(&self, gva: u64) -> Vec<GvaWindow> {
+        self.gva_sole_copies.values().map(|r| r.window()).filter(|w| w.gva == gva).collect()
+    }
+
     fn gva_sole_copy_at(&self, window: GvaWindow) -> bool {
         self.gva_sole_copies
             .values()
@@ -4226,6 +4231,9 @@ mod tests {
             format: debt.format,
             sample_count: 4,
             multisample_source_ref: 7,
+            multisample_source_gva: 0,
+            multisample_source_format: 0,
+            multisample_source_row_stride: 0,
             ..Default::default()
         };
         assert!(

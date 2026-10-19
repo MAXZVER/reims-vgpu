@@ -871,6 +871,72 @@ impl ResourcePools {
     /// A caller asking for the format the slot was allocated in gets
     /// `slot.view` and no allocation happens, which is every format this device
     /// renders to except the two sRGB spellings.
+    /// The resident a multisample texture keeps its samples in, for a pass that
+    /// resolves that texture: its image, an attachment view in `format`, and the
+    /// access the last pass left it in. `None` unless the identity is registered
+    /// at exactly this geometry, sample count and allocation, and has content -
+    /// a resident some other shape names another texture's samples, and an empty
+    /// one has nothing a Load could keep.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the resident is matched on every field a reuse is"
+    )]
+    pub(crate) unsafe fn registry_multisample_source(
+        &mut self,
+        ctx: &DeviceContext,
+        identity: &TargetIdentity,
+        width: u32,
+        height: u32,
+        sample_count: u32,
+        format: vk::Format,
+        counters: &EngineCounters,
+    ) -> Result<Option<(vk::Image, vk::ImageView, ResidentAccess)>, DrawError> {
+        let resident = translate::pixel::ResidentFormat::of(format);
+        let Some(slot) = self.registry.get(identity) else {
+            // TEMP (lab): which resolves found no resident of their source, and the
+            // nearest one registered at the same GVA if any.
+            let near = self.registry.iter().find(|(id, _)| match (id, identity) {
+                (TargetIdentity::Gva { gva: a, .. }, TargetIdentity::Gva { gva: b, .. }) => a == b,
+                _ => false,
+            });
+            if crate::observe::first_sight("lab_msaa_registry_source_miss", identity.generation() ^ (width as u64) << 32) {
+                crate::observe::off(format!(
+                    "lab_msaa_registry_source_miss want={identity:?} near={:?}",
+                    near.map(|(id, s)| (id.clone(), s.sample_count, s.content_ready, s.width, s.height))
+                ));
+            }
+            return Ok(None);
+        };
+        if sample_count < 2
+            || !slot.reusable_for(width, height, sample_count, identity.generation(), resident)
+            || !slot.content_ready
+        {
+            if crate::observe::first_sight("lab_msaa_registry_source_unfit", identity.generation() ^ (width as u64) << 32) {
+                crate::observe::off(format!(
+                    "lab_msaa_registry_source_unfit want={identity:?} samples={sample_count}/{} gen={}/{} \
+                     size={width}x{height}/{}x{} content={} fmt={:?}/{:?}",
+                    slot.sample_count,
+                    identity.generation(),
+                    slot.generation,
+                    slot.width,
+                    slot.height,
+                    slot.content_ready,
+                    resident.allocation(),
+                    slot.format.allocation()
+                ));
+            }
+            return Ok(None);
+        }
+        if crate::observe::first_sight("lab_msaa_registry_source_hit", identity.generation() ^ (width as u64) << 32) {
+            crate::observe::off(format!("lab_msaa_registry_source_hit {identity:?}"));
+        }
+        let (image, access) = (slot.image, slot.access);
+        let Some(view) = (unsafe { self.registry_view(ctx, identity, resident.declared(), counters)? }) else {
+            return Ok(None);
+        };
+        Ok(Some((image, view, access)))
+    }
+
     unsafe fn registry_view(
         &mut self,
         ctx: &DeviceContext,

@@ -3224,15 +3224,15 @@ fn lab_resolve_census(
     crate::observe::fail(line);
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_SPV_ALL=1` writes every fragment module once per
+/// TEMP (lab): `REIMS_VGPU_LAB_SPV_ALL=1` writes every fragment and vertex module once per
 /// (task, pipeline) to `E:/tmp/labspv/tTASK-pPIPE-ENTRY-wWORDS.spv`.
-fn lab_spv_all(req: &DrawEncodeRequest, entry: Option<&str>, spirv: &[u8]) {
+fn lab_spv_all(req: &DrawEncodeRequest, stage: &str, entry: Option<&str>, spirv: &[u8]) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SPV_ALL").is_ok()) {
         return;
     }
     if !crate::observe::first_sight(
-        "lab_spv_all",
+        if stage == "v" { "lab_spv_all_v" } else { "lab_spv_all" },
         (u64::from(req.task_id) << 32) | u64::from(req.pipeline_ref),
     ) {
         return;
@@ -3252,7 +3252,7 @@ fn lab_spv_all(req: &DrawEncodeRequest, entry: Option<&str>, spirv: &[u8]) {
         .collect();
     let _ = std::fs::write(
         format!(
-            "/tmp/labspv/t{}-p{}-{name}-w{}.spv",
+            "/tmp/labspv/t{}-p{}-{stage}-{name}-w{}.spv",
             req.task_id,
             req.pipeline_ref,
             spirv.len() / 4
@@ -12152,6 +12152,24 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             None => worker_bail!(Bail::PassInvariants),
         },
     };
+    // The resolve source's own allocation generation, so a resolving pass names
+    // the resident the source's earlier passes rendered into. Only the drain can
+    // walk it; a worker leaves 0 and the pass takes the persistent source image.
+    req.multisample_source_gen = match (acc.exclusive(), req.colors.first()) {
+        (Some(state), Some(c0)) if c0.multisample_source_ref != 0 && c0.multisample_source_gva != 0 => {
+            crate::runtime::writeback_debt::gva_resource_generation(
+                state,
+                host,
+                crate::runtime::writeback_debt::GvaResourceKey {
+                    task_id: req.task_id,
+                    texture_ref: c0.multisample_source_ref,
+                },
+                c0.multisample_source_gva,
+                u64::from(c0.multisample_source_row_stride).saturating_mul(u64::from(c0.height)),
+            )
+        }
+        _ => 0,
+    };
     // One call for the pipeline descriptor and both translated shaders. It is
     // memoized on the three objects' list entries — see
     // `crate::backend::vulkan::pipeline_resolve` for what that identity is and what it
@@ -12252,6 +12270,43 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
     // equality explicit at the backend boundary: reaching here with a different
     // count is an internal contract violation, not a shape Vulkan may repair.
     let pipeline_sample_count = pd.raster_sample_count.max(1);
+    // TEMP (lab, Opus 2026-10-19, `REIMS_VGPU_LAB_MSAA_DRAW_CENSUS=N`): the first N multisampled draws in full -
+    // Chrome/Graphite loses every tessellated path (fills and curved strokes) while analytic shapes draw.
+    if pipeline_sample_count > 1 {
+        static CENSUS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let cap = *CENSUS.get_or_init(|| {
+            std::env::var("REIMS_VGPU_LAB_MSAA_DRAW_CENSUS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        });
+        if cap > 0 && SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < cap {
+            crate::observe::off(format!(
+                "lab_msaa_draw task={} pipe={} vtx={} inst={} first_vtx={} base_inst={} prim={} idx={:?}                  merged={} cont={} ds_state={} sref={:?} depth={:?} stencil={:?} cull={:?} fill={:?}                  vp={:?} sc={:?} color={}x{} load={} vbufs={} t={}",
+                req.task_id,
+                req.pipeline_ref,
+                req.vertex_count,
+                req.instance_count,
+                req.first_vertex,
+                req.base_instance,
+                req.primitive_type,
+                req.indexed.as_ref().map(|i| (i.index_type, i.index_count, i.index_buffer_offset, i.base_vertex)),
+                req.merged.as_ref().map_or(0, |m| m.subs.len()),
+                req.continues_render_pass,
+                req.depth_stencil_ref,
+                req.stencil_ref,
+                req.depth_attach.as_ref().map(|d| (d.texture_ref, d.load_action, d.store_action)),
+                req.stencil_attach.as_ref().map(|s| (s.texture_ref, s.load_action, s.store_action)),
+                req.cull_mode,
+                req.fill_mode,
+                req.viewports.first(),
+                req.scissors.first().map(|s| (s.x, s.y, s.width, s.height)),
+                req.colors.first().map_or(0, |c| c.width),
+                req.colors.first().map_or(0, |c| c.height),
+                req.colors.first().map_or(0, |c| c.load_action),
+                req.vertex_buffers.iter().count(),
+                crate::observe::elapsed_us() / 1000
+            ));
+        }
+    }
     if pipeline_sample_count > 1 {
         let color = req.colors.first();
         let key = (u64::from(req.pipeline_ref) << 32)
@@ -12741,8 +12796,15 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         drop(fragment_span);
         lab_spv_all(
             req,
+            "f",
             f_shader.reflection.entry_point.as_deref(),
             &f_shader.spirv,
+        );
+        lab_spv_all(
+            req,
+            "v",
+            v_shader.reflection.entry_point.as_deref(),
+            &v_shader.spirv,
         );
         lab_cover_draw(req, f_shader.reflection.entry_point.as_deref());
         lab_repeat_draw(
@@ -13755,6 +13817,30 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 // handed the guest's own bytes over untouched.
                 let mut sampled_components = pixel_format::swizzle_identity();
                 let mut source_planes = 1;
+                // TEMP (lab, Opus 2026-10-19, Graphite path loss): every texture a multisampled draw binds -
+                // Chrome's icons are drawn by sampling a coverage atlas into small 4x targets, and come out empty.
+                if pipeline_sample_count > 1 {
+                    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+                        let kind = match &loaded {
+                            SampledSourceRequest::Bytes(b, id, fmt, origin) => {
+                                let nz = b.iter().filter(|&&x| x != 0).count();
+                                format!("bytes len={} nonzero={nz} fmt={fmt:?} origin={origin:?} id={}", b.len(), id.is_some())
+                            }
+                            SampledSourceRequest::Target(id, f) => format!("target {id:?} {f:?}"),
+                            SampledSourceRequest::TargetRegion(..) => "target_region".to_string(),
+                            #[allow(unreachable_patterns)]
+                            _ => "other".to_string(),
+                        };
+                        crate::observe::off(format!(
+                            "lab_msaa_bind task={} pipe={} frag={} idx={index} ref={texture_ref} {tw}x{th} {kind} t={}",
+                            req.task_id,
+                            req.pipeline_ref,
+                            u8::from(frag_stage),
+                            crate::observe::elapsed_us() / 1000
+                        ));
+                    }
+                }
                 let source_is_target = matches!(
                     &loaded,
                     SampledSourceRequest::Target(_, _) | SampledSourceRequest::TargetRegion(..)
@@ -13897,6 +13983,29 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                     // single-sample, or the content is the clear colour in guest RAM). Every sample is that
                     // pixel, so the single-sample read is the resolve's exact answer - and refusing here used
                     // to drop the whole pass with it, leaving Electron windows with empty tiles.
+                    // TEMP (lab, Opus 2026-10-19, Graphite path loss): which plane the read named and which
+                    // multisample residents the ledger holds at that address as the only copy.
+                    {
+                        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
+                            let st = acc.shared();
+                            let plane = texture_resource.as_ref().and_then(|r| match r.decoded() {
+                                Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => tex
+                                    .level_gva(0, st.page_shift)
+                                    .map(|(gva, l)| (gva, l.row_stride, l.width, l.height, tex.pixel_format)),
+                                _ => None,
+                            });
+                            let sole = plane.map(|p| st.pending_writebacks.lab_sole_copies_at_gva(p.0));
+                            crate::observe::off(format!(
+                                "lab_ms_read_demoted task={} pipe={} ref={texture_ref} idx={index} plane={plane:?}                                  sole={sole:?} src={}x{} t={}",
+                                req.task_id,
+                                req.pipeline_ref,
+                                tw,
+                                th,
+                                crate::observe::elapsed_us() / 1000
+                            ));
+                        }
+                    }
                     frag_ms_demote = true;
                     multisampled = false;
                     crate::runtime::drain::note_store_route("frag_ms_demoted_bind");
@@ -15190,6 +15299,20 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 }),
             multisample_load: req.colors.first().is_some_and(|color| {
                 color.multisample_source_ref != 0 && color.load_action == MTL_LOAD_ACTION_LOAD
+            }),
+            multisample_source_identity: req.colors.first().and_then(|color| {
+                (color.multisample_source_ref != 0
+                    && color.multisample_source_gva != 0
+                    && req.multisample_source_gen != 0)
+                    .then(|| {
+                    crate::backend::vulkan::engine::TargetIdentity::Gva {
+                        gva: color.multisample_source_gva,
+                        width: color.width,
+                        height: color.height,
+                        generation: req.multisample_source_gen,
+                        format: gva_resident_format(color.multisample_source_format),
+                    }
+                })
             }),
             ..crate::backend::vulkan::engine::DrawRequest::default()
         };
@@ -16694,11 +16817,15 @@ fn depth_state_for(
 ) -> crate::backend::vulkan::engine::DepthState {
     use crate::backend::vulkan::engine::SamplerCompareFunction;
 
-    let (clear_value, load_action) = req
-        .depth_attach
-        .as_ref()
-        .map(|d| (d.clear_depth as f32, d.load_action))
-        .unwrap_or((1.0, MTL_LOAD_ACTION_CLEAR));
+    // A stencil-only pass (`stencil8`) declares its load action on the stencil
+    // attachment alone. Reading it from the absent depth attachment answered
+    // CLEAR, so the second of two passes sharing a stencil buffer wiped what the
+    // first wrote: WebGPU's `stencil8` multi-pass cover drew nothing (lab, b829).
+    let (clear_value, load_action) = match (req.depth_attach.as_ref(), req.stencil_attach.as_ref()) {
+        (Some(d), _) => (d.clear_depth as f32, d.load_action),
+        (None, Some(s)) => (1.0, s.load_action),
+        (None, None) => (1.0, MTL_LOAD_ACTION_CLEAR),
+    };
     // A record that continues a serialized render pass shares the pass's depth
     // attachment with the records before it, so it LOADs whatever they tested
     // and wrote — the exact rule the record loop already forces on every colour
@@ -16734,6 +16861,21 @@ fn depth_state_for(
                 clear_value: s.clear_stencil,
             })
     });
+    // TEMP (lab, Opus 2026-10-19, `REIMS_VGPU_LAB_STENCIL_TEST_OFF=1`): every stencil test passes (diagnostic only,
+    // Chrome/Graphite path loss): a stencil-then-cover fill then paints its whole cover geometry, which says whether
+    // the cover draws run and the stencil pass is what is empty.
+    static STENCIL_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let stencil = if *STENCIL_OFF
+        .get_or_init(|| std::env::var("REIMS_VGPU_LAB_STENCIL_TEST_OFF").as_deref() == Ok("1"))
+    {
+        stencil.map(|mut s| {
+            s.front.compare = SamplerCompareFunction::Always;
+            s.back.compare = SamplerCompareFunction::Always;
+            s
+        })
+    } else {
+        stencil
+    };
     // TEMP (lab, `REIMS_VGPU_LAB_DEPTH_TEST_OFF=1`): no depth test, no depth
     // writes (diagnostic only: Metal ordering by depth is lost).
     static TEST_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -16775,7 +16917,21 @@ pub(super) fn depth_chain_identity(
     if width == 0 || height == 0 {
         return None;
     }
-    if let Some(depth) = req.depth_attach.as_ref().filter(|d| d.texture_ref != 0) {
+    // The pass's named depth-stencil texture: its depth attachment, or for a
+    // stencil-only format its stencil attachment, which is then the only name
+    // the guest gives the buffer two passes share.
+    let named = req
+        .depth_attach
+        .as_ref()
+        .map(|d| d.texture_ref)
+        .filter(|&r| r != 0)
+        .or_else(|| {
+            req.stencil_attach
+                .as_ref()
+                .map(|s| s.texture_ref)
+                .filter(|&r| r != 0)
+        });
+    if let Some(texture_ref) = named {
         // TEMP (lab, `REIMS_VGPU_LAB_DEPTH_PER_TARGET=1`): one depth resident per
         // colour target, so passes into different tiles never share depth.
         static PER_TARGET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -16790,7 +16946,7 @@ pub(super) fn depth_chain_identity(
             0
         };
         return Some(crate::backend::vulkan::engine::TargetIdentity::Texture {
-            ref_: depth.texture_ref,
+            ref_: texture_ref,
             width,
             height,
             generation,
@@ -21072,6 +21228,38 @@ mod vulkan_split_tests {
         );
         assert_eq!(stencil.front, STENCIL_PASS_THROUGH);
         assert_eq!(stencil.back, STENCIL_PASS_THROUGH);
+    }
+
+    /// A `stencil8` pass names its buffer and its load action on the stencil
+    /// attachment alone; both used to be read from the absent depth attachment,
+    /// so a LOAD pass cleared the stencil the previous pass wrote.
+    #[test]
+    fn a_stencil_only_pass_loads_and_names_its_stencil_texture() {
+        let mut req = DrawEncodeRequest::default();
+        req.colors.push(ColorRtRequest {
+            width: 8,
+            height: 8,
+            ..Default::default()
+        });
+        req.stencil_attach = Some(crate::runtime::render_pass::StencilAttachment {
+            texture_ref: 11,
+            load_action: MTL_LOAD_ACTION_LOAD,
+            ..Default::default()
+        });
+
+        let depth = depth_state_for(&req, None);
+        assert!(depth.load, "the stencil attachment declared LOAD");
+        assert_eq!(
+            depth.identity,
+            Some(crate::backend::vulkan::engine::TargetIdentity::Texture {
+                ref_: 11,
+                width: 8,
+                height: 8,
+                generation: 0,
+                stencil: true,
+            }),
+            "the buffer is the stencil attachment's texture"
+        );
     }
 
     /// A bound stencil test wins over the pass's no-op default — the pass
