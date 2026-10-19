@@ -464,6 +464,12 @@ fn lab_volatile() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_VOLATILE").map_or(true, |v| v != "off"))
 }
+/// TEMP (lab, VOLATILE): see the run update in `decide_warm`. On by default since b786 (spacesvid 95.1 vs 90.9 fps,
+/// 2-3x the skips); `REIMS_VGPU_LAB_VOLATILE_DECAY=off` restores the reset. Latched.
+fn lab_volatile_decay() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("REIMS_VGPU_LAB_VOLATILE_DECAY").as_deref(), Ok("off" | "0")))
+}
 const VOLATILE_RUN: u32 = 8;
 const VOLATILE_SKIP: u32 = 30;
 
@@ -2829,11 +2835,15 @@ fn decide_warm<M: crate::runtime::host::HostOps>(
     }
     let vouched = matches!(verdict, GatherVerdict::Vouched);
     // TEMP (lab, VOLATILE): count the binds in a row the guest had rewritten the window at.
+    // With the decay (default) a refusal adds two and a quiet bind takes one away, so a window bound
+    // twice per guest frame (rewritten, then the same bytes again) still reads as volatile.
     if matches!(verdict, GatherVerdict::Refused { guest_wrote: true, .. }) {
-        entry.volatile_run = entry.volatile_run.saturating_add(1);
+        entry.volatile_run = entry.volatile_run.saturating_add(if lab_volatile_decay() { 2 } else { 1 });
         if entry.volatile_run >= VOLATILE_RUN {
             entry.volatile_skip = VOLATILE_SKIP;
         }
+    } else if lab_volatile_decay() {
+        entry.volatile_run = entry.volatile_run.saturating_sub(1);
     } else {
         entry.volatile_run = 0;
     }
