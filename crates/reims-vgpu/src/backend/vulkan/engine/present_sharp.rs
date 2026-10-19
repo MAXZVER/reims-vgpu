@@ -74,6 +74,29 @@ pub(crate) fn nis_sharp() -> Option<f32> {
     })
 }
 
+/// `REIMS_VGPU_LAB_PRESENT_DUMP=DIR` (diagnosis, 2026-10-19): when DIR/snap
+/// exists, the next scaled present copies its source frame and its first
+/// pass's result (EASU's or NVScaler's, what the window pass shows 1:1) to
+/// host memory and writes them as DIR/NNN-src.ppm and DIR/NNN-out.ppm once
+/// that present's frame entry comes round (its fence retired). Latched.
+fn dump_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PRESENT_DUMP").ok().filter(|d| !d.is_empty()))
+        .as_deref()
+}
+
+/// One requested dump in flight: a host-visible buffer holding the source
+/// (BGRA) and then the first pass's result.
+struct PresentDump {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ix: usize,
+    src: (u32, u32),
+    out: (u32, u32),
+    /// Whether the result is RGBA (NVScaler's storage image) or BGRA (EASU's).
+    out_rgba: bool,
+}
+
 /// NVScaler's constants for one present (`NVScalerUpdateConfig`, SDR), as the
 /// 28 words of `present_nis.comp`'s push block; `None` outside 1x..2x.
 fn nis_config(sharpness: f32, src: (u32, u32), dst: (u32, u32)) -> Option<[u8; 112]> {
@@ -215,6 +238,9 @@ pub(crate) struct PresentSharp {
     /// Images a size change replaced, with the `records` count at retirement.
     retired: Vec<(MidImage, u64)>,
     records: u64,
+    /// `REIMS_VGPU_LAB_PRESENT_DUMP`: the dump in flight, and how many written.
+    dump: Option<PresentDump>,
+    dumps: u32,
 }
 
 /// The guest frame one scaled present reads.
@@ -256,6 +282,8 @@ impl PresentSharp {
             mid: None,
             retired: Vec::new(),
             records: 0,
+            dump: None,
+            dumps: 0,
         };
         if let Err(e) = made.build(device, format, frames) {
             made.destroy(device);
@@ -485,7 +513,7 @@ impl PresentSharp {
     unsafe fn ensure_nis_coef(
         &mut self,
         device: &ash::Device,
-        memory_type: &dyn Fn(u32, u64) -> Option<u32>,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
     ) -> Result<(), vk::Result> {
         if self.nis_coef.is_some() {
             return Ok(());
@@ -515,7 +543,7 @@ impl PresentSharp {
                     None,
                 )?;
                 let req = device.get_image_memory_requirements(slot.0);
-                let mt = memory_type(req.memory_type_bits, req.size).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+                let mt = memory_type(req.memory_type_bits, req.size, false).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
                 slot.1 = device.allocate_memory(
                     &vk::MemoryAllocateInfo::default()
                         .allocation_size(req.size)
@@ -539,7 +567,7 @@ impl PresentSharp {
                 None,
             )?;
             let req = device.get_buffer_memory_requirements(made.buffer);
-            let mt = memory_type(req.memory_type_bits, req.size).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+            let mt = memory_type(req.memory_type_bits, req.size, false).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
             made.buffer_memory = device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(req.size)
@@ -747,6 +775,7 @@ impl PresentSharp {
         for (old, _) in self.retired.drain(..) {
             old.destroy(device);
         }
+        self.finish_dump(device, None);
     }
 
     /// `mid` at `width` x `height`, made (and the old one retired) on a size
@@ -757,7 +786,7 @@ impl PresentSharp {
         format: vk::Format,
         width: u32,
         height: u32,
-        memory_type: &dyn Fn(u32, u64) -> Option<u32>,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
     ) -> Result<(), vk::Result> {
         if self.mid.as_ref().is_some_and(|m| (m.width, m.height) == (width, height)) {
             return Ok(());
@@ -778,9 +807,9 @@ impl PresentSharp {
         let nis = self.nis.is_some();
         let format = if nis { vk::Format::R8G8B8A8_UNORM } else { format };
         let usage = if nis {
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC
         } else {
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC
         };
         let r = (|| -> Result<(), vk::Result> {
             made.image = device.create_image(
@@ -797,7 +826,7 @@ impl PresentSharp {
                 None,
             )?;
             let req = device.get_image_memory_requirements(made.image);
-            let mt = memory_type(req.memory_type_bits, req.size).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+            let mt = memory_type(req.memory_type_bits, req.size, false).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
             made.memory = device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(req.size)
@@ -897,7 +926,7 @@ impl PresentSharp {
         extent: vk::Extent2D,
         vp: (u32, u32, u32, u32),
         clear: [f32; 4],
-        memory_type: &dyn Fn(u32, u64) -> Option<u32>,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
     ) -> Result<(), vk::Result> {
         self.release(device, ix);
         self.records += 1;
@@ -913,6 +942,7 @@ impl PresentSharp {
             }
         }
         self.retired = keep;
+        self.finish_dump(device, Some(ix));
         // NIS: its constants for this scale and its coefficient images, or
         // EASU alone this present (outside 1x..2x, or no memory).
         let mut nis_cfg = match self.nis {
@@ -968,6 +998,19 @@ impl PresentSharp {
         self.transient[ix] = Some((view, fb));
         let set = self.sets[ix];
         self.write_set(device, set, src.view);
+        // REIMS_VGPU_LAB_PRESENT_DUMP: the source as this present reads it.
+        let dumping = rcas.is_some()
+            && self.begin_dump(
+                device,
+                ix,
+                (src.width, src.height),
+                (vp.2, vp.3),
+                self.nis.is_some() && nis_cfg.is_some(),
+                memory_type,
+            );
+        if let (true, Some(d)) = (dumping, self.dump.as_ref()) {
+            Self::dump_copy(device, cmd, src.image, src.layout, d.buffer, 0, (src.width, src.height));
+        }
         let to_read = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
@@ -1139,6 +1182,41 @@ impl PresentSharp {
             device.cmd_draw(cmd, 3, 1, 0, 0);
             device.cmd_end_render_pass(cmd);
         }
+        // REIMS_VGPU_LAB_PRESENT_DUMP: the first pass's result, as the window
+        // pass just read it.
+        if let (true, Some(d), Some(mid)) = (dumping, self.dump.as_ref(), self.mid.as_ref()) {
+            let to_src = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(mid.image)
+                .subresource_range(super::color_subresource_range())];
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_src,
+            );
+            let offset = src.width as u64 * src.height as u64 * 4;
+            Self::dump_copy(device, cmd, mid.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, d.buffer, offset, (mid.width, mid.height));
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                &[],
+                &[],
+            );
+        }
         let back = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -1184,6 +1262,128 @@ impl PresentSharp {
                 .clear_values(&clear_values),
             vk::SubpassContents::INLINE,
         );
+    }
+
+    /// `REIMS_VGPU_LAB_PRESENT_DUMP`: a buffer for this present's dump when
+    /// DIR/snap asks for one and none is in flight; the request file is
+    /// consumed.
+    unsafe fn begin_dump(
+        &mut self,
+        device: &ash::Device,
+        ix: usize,
+        src: (u32, u32),
+        out: (u32, u32),
+        out_rgba: bool,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> bool {
+        let Some(dir) = dump_dir() else {
+            return false;
+        };
+        if self.dump.is_some() {
+            return false;
+        }
+        let snap = format!("{dir}/snap");
+        if std::fs::remove_file(&snap).is_err() {
+            return false;
+        }
+        let size = (src.0 as u64 * src.1 as u64 + out.0 as u64 * out.1 as u64) * 4;
+        let Ok(buffer) = device.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST),
+            None,
+        ) else {
+            return false;
+        };
+        let req = device.get_buffer_memory_requirements(buffer);
+        let memory = memory_type(req.memory_type_bits, req.size, true).and_then(|mt| {
+            device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(mt),
+                    None,
+                )
+                .ok()
+        });
+        let Some(memory) = memory else {
+            device.destroy_buffer(buffer, None);
+            crate::observe::fail("present_dump_refused memory".to_string());
+            return false;
+        };
+        if device.bind_buffer_memory(buffer, memory, 0).is_err() {
+            device.destroy_buffer(buffer, None);
+            device.free_memory(memory, None);
+            return false;
+        }
+        self.dump = Some(PresentDump { buffer, memory, ix, src, out, out_rgba });
+        true
+    }
+
+    /// Write the dump in flight once its frame entry `ix` comes round again.
+    unsafe fn finish_dump(&mut self, device: &ash::Device, ix: Option<usize>) {
+        let Some(d) = self.dump.as_ref() else {
+            return;
+        };
+        if ix.is_some_and(|i| i != d.ix) {
+            return;
+        }
+        let d = self.dump.take().unwrap();
+        let size = (d.src.0 as u64 * d.src.1 as u64 + d.out.0 as u64 * d.out.1 as u64) * 4;
+        if let (Some(dir), Ok(ptr)) = (dump_dir(), device.map_memory(d.memory, 0, size, vk::MemoryMapFlags::empty())) {
+            let _ = device.invalidate_mapped_memory_ranges(&[vk::MappedMemoryRange::default()
+                .memory(d.memory)
+                .offset(0)
+                .size(vk::WHOLE_SIZE)]);
+            let bytes = std::slice::from_raw_parts(ptr as *const u8, size as usize);
+            let src_len = (d.src.0 * d.src.1 * 4) as usize;
+            let n = self.dumps;
+            self.dumps += 1;
+            let write = |name: String, (w, h): (u32, u32), px: &[u8], rgba: bool| {
+                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                out.reserve((w * h * 3) as usize);
+                for p in px.chunks_exact(4) {
+                    if rgba {
+                        out.extend_from_slice(&[p[0], p[1], p[2]]);
+                    } else {
+                        out.extend_from_slice(&[p[2], p[1], p[0]]);
+                    }
+                }
+                let _ = std::fs::write(name, out);
+            };
+            write(format!("{dir}/{n:03}-src.ppm"), d.src, &bytes[..src_len], false);
+            write(format!("{dir}/{n:03}-out.ppm"), d.out, &bytes[src_len..], d.out_rgba);
+            device.unmap_memory(d.memory);
+            crate::observe::fail(format!(
+                "present_dump {n:03} src={}x{} out={}x{} rgba={}",
+                d.src.0, d.src.1, d.out.0, d.out.1, d.out_rgba
+            ));
+        }
+        device.destroy_buffer(d.buffer, None);
+        device.free_memory(d.memory, None);
+    }
+
+    /// Copy `image` (in `layout`, a transfer-readable one) into the dump
+    /// buffer at `offset`.
+    unsafe fn dump_copy(
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        image: vk::Image,
+        layout: vk::ImageLayout,
+        buffer: vk::Buffer,
+        offset: u64,
+        (w, h): (u32, u32),
+    ) {
+        let region = [vk::BufferImageCopy::default()
+            .buffer_offset(offset)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_extent(vk::Extent3D { width: w, height: h, depth: 1 })];
+        device.cmd_copy_image_to_buffer(cmd, image, layout, buffer, &region);
     }
 
     pub(crate) unsafe fn destroy(&mut self, device: &ash::Device) {

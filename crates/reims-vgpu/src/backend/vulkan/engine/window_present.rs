@@ -1446,11 +1446,15 @@ impl WindowPresenter {
                                 self.extent,
                                 (vp.x, vp.y, vp.width, vp.height),
                                 SLATE_CLEAR,
-                                &|bits, bytes| {
+                                &|bits, bytes, host| {
                                     ctx.memory_type_for(
                                         bits,
                                         bytes,
-                                        reims_vgpu_vulkan::memory::MemoryClass::DeviceLocal,
+                                        if host {
+                                            reims_vgpu_vulkan::memory::MemoryClass::Readback
+                                        } else {
+                                            reims_vgpu_vulkan::memory::MemoryClass::DeviceLocal
+                                        },
                                     )
                                 },
                             )
