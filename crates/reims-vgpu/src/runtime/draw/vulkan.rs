@@ -16726,11 +16726,15 @@ fn depth_state_for(
 ) -> crate::backend::vulkan::engine::DepthState {
     use crate::backend::vulkan::engine::SamplerCompareFunction;
 
-    let (clear_value, load_action) = req
-        .depth_attach
-        .as_ref()
-        .map(|d| (d.clear_depth as f32, d.load_action))
-        .unwrap_or((1.0, MTL_LOAD_ACTION_CLEAR));
+    // A stencil-only pass (`stencil8`) declares its load action on the stencil
+    // attachment alone. Reading it from the absent depth attachment answered
+    // CLEAR, so the second of two passes sharing a stencil buffer wiped what the
+    // first wrote: WebGPU's `stencil8` multi-pass cover drew nothing (lab, b829).
+    let (clear_value, load_action) = match (req.depth_attach.as_ref(), req.stencil_attach.as_ref()) {
+        (Some(d), _) => (d.clear_depth as f32, d.load_action),
+        (None, Some(s)) => (1.0, s.load_action),
+        (None, None) => (1.0, MTL_LOAD_ACTION_CLEAR),
+    };
     // A record that continues a serialized render pass shares the pass's depth
     // attachment with the records before it, so it LOADs whatever they tested
     // and wrote — the exact rule the record loop already forces on every colour
@@ -16807,7 +16811,21 @@ pub(super) fn depth_chain_identity(
     if width == 0 || height == 0 {
         return None;
     }
-    if let Some(depth) = req.depth_attach.as_ref().filter(|d| d.texture_ref != 0) {
+    // The pass's named depth-stencil texture: its depth attachment, or for a
+    // stencil-only format its stencil attachment, which is then the only name
+    // the guest gives the buffer two passes share.
+    let named = req
+        .depth_attach
+        .as_ref()
+        .map(|d| d.texture_ref)
+        .filter(|&r| r != 0)
+        .or_else(|| {
+            req.stencil_attach
+                .as_ref()
+                .map(|s| s.texture_ref)
+                .filter(|&r| r != 0)
+        });
+    if let Some(texture_ref) = named {
         // TEMP (lab, `REIMS_VGPU_LAB_DEPTH_PER_TARGET=1`): one depth resident per
         // colour target, so passes into different tiles never share depth.
         static PER_TARGET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -16822,7 +16840,7 @@ pub(super) fn depth_chain_identity(
             0
         };
         return Some(crate::backend::vulkan::engine::TargetIdentity::Texture {
-            ref_: depth.texture_ref,
+            ref_: texture_ref,
             width,
             height,
             generation,
@@ -21104,6 +21122,38 @@ mod vulkan_split_tests {
         );
         assert_eq!(stencil.front, STENCIL_PASS_THROUGH);
         assert_eq!(stencil.back, STENCIL_PASS_THROUGH);
+    }
+
+    /// A `stencil8` pass names its buffer and its load action on the stencil
+    /// attachment alone; both used to be read from the absent depth attachment,
+    /// so a LOAD pass cleared the stencil the previous pass wrote.
+    #[test]
+    fn a_stencil_only_pass_loads_and_names_its_stencil_texture() {
+        let mut req = DrawEncodeRequest::default();
+        req.colors.push(ColorRtRequest {
+            width: 8,
+            height: 8,
+            ..Default::default()
+        });
+        req.stencil_attach = Some(crate::runtime::render_pass::StencilAttachment {
+            texture_ref: 11,
+            load_action: MTL_LOAD_ACTION_LOAD,
+            ..Default::default()
+        });
+
+        let depth = depth_state_for(&req, None);
+        assert!(depth.load, "the stencil attachment declared LOAD");
+        assert_eq!(
+            depth.identity,
+            Some(crate::backend::vulkan::engine::TargetIdentity::Texture {
+                ref_: 11,
+                width: 8,
+                height: 8,
+                generation: 0,
+                stencil: true,
+            }),
+            "the buffer is the stencil attachment's texture"
+        );
     }
 
     /// A bound stencil test wins over the pass's no-op default — the pass
