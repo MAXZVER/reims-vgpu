@@ -556,6 +556,12 @@ pub struct ColorRtRequest {
     /// Multisample attachment discarded into this request's single-sample
     /// target at pass end. Zero for an ordinary colour attachment.
     pub multisample_source_ref: u32,
+    /// The multisample source's own task GVA and declared format, when it is a
+    /// task-local texture (mapping 0): the same address a pass that renders
+    /// into that texture *without* resolving keys its resident by, so a later
+    /// resolving pass can load the samples those passes left there.
+    pub multisample_source_gva: u64,
+    pub multisample_source_format: u16,
 }
 
 impl ColorRtRequest {
@@ -2752,6 +2758,8 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         clear_color: [0.0; 4],
         target_seed_rgba: None,
         multisample_source_ref: 0,
+        multisample_source_gva: 0,
+        multisample_source_format: 0,
     };
     Some(DrawEncodeRequest {
         task_id,
@@ -2895,6 +2903,12 @@ pub fn mrt_draw_request_with<M: HostMemory + HostOps, S: crate::runtime::exec::w
         } else {
             (att.texture_ref, 0, source_target)
         };
+        let (multisample_source_gva, multisample_source_format) =
+            if multisample_source_ref != 0 && source_target.mapping_id == 0 {
+                (source_target.target_gva, source_target.format)
+            } else {
+                (0, 0)
+            };
         let ResolvedRenderTarget {
             mapping_id,
             target_gva: gva,
@@ -3205,6 +3219,8 @@ pub fn mrt_draw_request_with<M: HostMemory + HostOps, S: crate::runtime::exec::w
             clear_color,
             target_seed_rgba: seed,
             multisample_source_ref,
+            multisample_source_gva,
+            multisample_source_format,
         });
     }
     if colors.is_empty() {

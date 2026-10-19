@@ -15191,6 +15191,17 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             multisample_load: req.colors.first().is_some_and(|color| {
                 color.multisample_source_ref != 0 && color.load_action == MTL_LOAD_ACTION_LOAD
             }),
+            multisample_source_identity: req.colors.first().and_then(|color| {
+                (color.multisample_source_ref != 0 && color.multisample_source_gva != 0).then(|| {
+                    crate::backend::vulkan::engine::TargetIdentity::Gva {
+                        gva: color.multisample_source_gva,
+                        width: color.width,
+                        height: color.height,
+                        generation: req.gva_alloc_gen,
+                        format: gva_resident_format(color.multisample_source_format),
+                    }
+                })
+            }),
             ..crate::backend::vulkan::engine::DrawRequest::default()
         };
         let resolving_colors = req

@@ -491,6 +491,14 @@ pub struct DrawRequest {
     pub multisample_source: u64,
     /// The guest asked `MTLLoadActionLoad` for the multisample source.
     pub multisample_load: bool,
+    /// The registry identity of the multisample source texture itself, when it
+    /// has one: the resident a pass that renders into that texture without
+    /// resolving keeps its samples in. A resolving pass renders through that
+    /// resident, so the samples earlier passes left there are the ones it loads
+    /// and resolves (Skia Graphite draws into a multisample texture over several
+    /// Load/Store passes and resolves in a later one). `None` keeps the
+    /// per-source persistent image of [`Self::multisample_source`].
+    pub multisample_source_identity: Option<TargetIdentity>,
     /// Every viewport the guest bound, in its order. Empty takes the
     /// full-target default, and so does any slot past the end of this list when
     /// [`Self::scissors`] is longer — the two counts are independent in Metal

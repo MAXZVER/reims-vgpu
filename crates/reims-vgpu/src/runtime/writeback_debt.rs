@@ -4226,6 +4226,8 @@ mod tests {
             format: debt.format,
             sample_count: 4,
             multisample_source_ref: 7,
+            multisample_source_gva: 0,
+            multisample_source_format: 0,
             ..Default::default()
         };
         assert!(
