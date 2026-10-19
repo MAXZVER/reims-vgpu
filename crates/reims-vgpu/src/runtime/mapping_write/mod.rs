@@ -821,6 +821,89 @@ enum CacheOutcome<'a> {
     Invalidate,
 }
 
+/// Frames below this land on the caller: a fork-join round trip costs what one
+/// thread copies in ~64 KiB, and the landing is worth splitting only when it is
+/// many of those.
+const PAR_CONTIG_LAND_MIN_BYTES: usize = 1 << 20;
+/// Bytes one landing job copies (whole rows, at least one).
+const PAR_CONTIG_LAND_JOB_BYTES: usize = 512 * 1024;
+
+/// TEMP (lab, Opus 2026-10-20, PAR_CONTIG_LAND, default on; `REIMS_VGPU_LAB_PAR_CONTIG_LAND=off` keeps the serial
+/// loop): land an unconverted, unskipped frame into a contiguous surface view row-parallel on the device's worker
+/// pool, with the streaming copy the fragmented rail's parallel landing already uses. The serial loop moved ~3 GB/s
+/// into cold guest pages - 7.2 ms for each 20 MB canvas a heavy WebGL page flushes on every frame's
+/// SynchronizeResources (b851 readback_split write_us), a third of each second on the drain.
+///
+/// `false` hands the frame back to the serial loop untouched: switched off, no pool, too small, or a source
+/// shorter than the frame (the serial loop names that refusal).
+fn par_contig_land(
+    state: &DeviceState,
+    src: &[u8],
+    src_stride: u32,
+    base: *mut u8,
+    bpr: usize,
+    tight: usize,
+    rows: u32,
+) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PAR_CONTIG_LAND").map_or(true, |v| v != "off")) {
+        return false;
+    }
+    let rows = rows as usize;
+    let src_stride = src_stride as usize;
+    if rows == 0 || tight == 0 || rows.saturating_mul(tight) < PAR_CONTIG_LAND_MIN_BYTES {
+        return false;
+    }
+    let Some(need) = (rows - 1).checked_mul(src_stride).and_then(|v| v.checked_add(tight)) else {
+        return false;
+    };
+    if src.len() < need {
+        return false;
+    }
+    let Some(pool) = state.par().filter(|pool| pool.workers() > 0) else {
+        return false;
+    };
+    // The pool's workers write guest pages, and `write_guest_bytes`' own settle
+    // only joins on the drain thread: a draw the recorder still holds may read
+    // these pages, so the drain settles it here, before it forks.
+    crate::backend::settle_deferred_draws_for_guest_write();
+    let per_job = (PAR_CONTIG_LAND_JOB_BYTES / tight).max(1);
+    let jobs: Vec<std::ops::Range<usize>> =
+        (0..rows).step_by(per_job).map(|y| y..(y + per_job).min(rows)).collect();
+    // Addresses as integers so the closure can cross to the workers; the rows
+    // jobs name are disjoint, and the view and `src` outlive the scope.
+    let (src_addr, dst_addr) = (src.as_ptr() as usize, base as usize);
+    let land = move |range: &std::ops::Range<usize>| {
+        for y in range.clone() {
+            // SAFETY: row `y < rows` reads `tight` bytes at `y * src_stride`,
+            // inside `src` (`need` checked above), and writes `tight` bytes at
+            // `y * bpr` of the caller's view, which covers the plane's span; no
+            // two jobs share a row.
+            unsafe {
+                crate::runtime::mapper::write_guest_bytes_raw(
+                    (src_addr + y * src_stride) as *const u8,
+                    (dst_addr + y * bpr) as *mut u8,
+                    tight,
+                );
+            }
+        }
+    };
+    let done = pool.scope(&(), &jobs, |_, _, range: &std::ops::Range<usize>| land(range));
+    // A job that panicked may have stopped part way; its rows land again here,
+    // which writes the same bytes.
+    for (range, outcome) in jobs.iter().zip(&done.results) {
+        if outcome.is_err() {
+            land(range);
+        }
+    }
+    crate::runtime::drain::note_store_route(if done.serial {
+        "lab_par_contig_land_serial_scope"
+    } else {
+        "lab_par_contig_land"
+    });
+    true
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the geometry the frame is in, its owner when it has one, plus the \
@@ -982,6 +1065,15 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
+        if direct_rows
+            && skip.is_empty()
+            && par_contig_land(state, src, src_stride, base, bpr, tight, mh)
+        {
+            note_surface_write_phase(
+                SurfaceWritePhase::Land,
+                land_started.elapsed().as_micros() as u64,
+            );
+        } else {
         for y in 0..mh {
             let src_off = (y as usize) * (src_stride as usize);
             let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
@@ -1032,6 +1124,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             SurfaceWritePhase::Land,
             land_started.elapsed().as_micros() as u64,
         );
+        }
     } else {
         note_surface_write_path(false, frame_bytes);
         let stage_started = std::time::Instant::now();

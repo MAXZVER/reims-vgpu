@@ -3076,6 +3076,19 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         host.unmap_pages(ptr, total);
     }
     let import_us = import_started.elapsed().as_micros() as u64;
+    // TEMP (lab, Opus 2026-10-20): a large copy that took the serial walk (no pool, unstable views, a read).
+    if len >= 4_000_000 {
+        static SERIAL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if std::env::var_os("REIMS_VGPU_LAB_BIG_SEED").is_some()
+            && SERIAL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20
+        {
+            crate::observe::fail(format!(
+                "lab_runs_serial site={site} mid={mapping_id} write={} bytes={len} runs={} us={import_us}",
+                copy.is_write(),
+                runs.len()
+            ));
+        }
+    }
     if mapping_run_import_is_slow(import_us) {
         crate::observe::off(format!(
             "{site}_runs mid={mapping_id} us={import_us} bytes={len} pages={} runs={}",
@@ -3201,6 +3214,7 @@ fn par_land_write_in<H: HostMemory + HostOps>(
     let page_size = state.page_size();
     let page_sz = page_size as usize;
     let len = buf.len();
+    let lab_t0 = std::time::Instant::now(); // TEMP (lab): phase split below
     let mut mapped: Vec<(usize, usize)> = Vec::new();
     let mut spans: Vec<LandSpan> = Vec::new();
     let unmap_all = |host: &mut H, mapped: &[(usize, usize)]| {
@@ -3250,6 +3264,7 @@ fn par_land_write_in<H: HostMemory + HostOps>(
             });
         }
     }
+    let lab_t1 = std::time::Instant::now();
     let disjoint = {
         let mut by_gpa: Vec<(u64, u64)> = spans.iter().map(|s| (s.gpa, s.n as u64)).collect();
         by_gpa.sort_unstable();
@@ -3298,11 +3313,48 @@ fn par_land_write_in<H: HostMemory + HostOps>(
         }
         crate::runtime::drain::note_store_route("lab_par_land_overlap_serial");
     }
+    let lab_t2 = std::time::Instant::now();
     for s in &spans {
         crate::observe::footprint::note_written_range(s.gpa, s.n as u64);
     }
     unmap_all(host, &mapped);
+    lab_par_land_census(mapping_id, selected, runs.len(), mapped.len(), spans.len(), lab_t0, lab_t1, lab_t2);
     Some(true)
+}
+
+/// TEMP (lab, Opus 2026-10-20, REIMS_VGPU_LAB_BIG_SEED): where a large parallel landing spends its time - mapping
+/// the runs (serial, coordinator), copying (pool), marking + unmapping (serial). Heavy WebGL lands 20 MB at ~3 GB/s.
+#[allow(clippy::too_many_arguments)]
+fn lab_par_land_census(
+    mapping_id: u32,
+    selected: u64,
+    runs: usize,
+    mapped: usize,
+    spans: usize,
+    t0: std::time::Instant,
+    t1: std::time::Instant,
+    t2: std::time::Instant,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    if selected < 4_000_000 {
+        return;
+    }
+    static N: AtomicU32 = AtomicU32::new(0);
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_BIG_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= max && n % 200 != 0 {
+        return;
+    }
+    let now = std::time::Instant::now();
+    crate::observe::fail(format!(
+        "lab_par_land #{n} mid={mapping_id} bytes={selected} runs={runs} mapped={mapped} spans={spans}          map_us={} copy_us={} unmap_us={}",
+        (t1 - t0).as_micros(),
+        (t2 - t1).as_micros(),
+        (now - t2).as_micros()
+    ));
 }
 
 /// Write `buf` into mapping linear offset `off` via packed map_pages runs.
