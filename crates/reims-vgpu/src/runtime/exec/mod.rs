@@ -6312,6 +6312,32 @@ fn finish_stream_g<M: HostMemory + HostOps>(
     // pass seed inside encode (mrt_draw_request solid seed) — not a pre-draw
     // guest store that would expose intermediate pixels to DisplaySwap.
     let will_draw = acc.saw_draw && !acc.color_slots.is_empty() && !acc.draws.is_empty();
+    // TEMP (lab, Opus 2026-10-19, Chrome/Skia Graphite icons missing): a pass with no draws whose colour attachment
+    // LOADs a multisample texture and resolves it - the resolve itself is the pass's whole work (Metal resolves at the
+    // end of a pass with or without draws). Only clears were applied on this arm; this names what else was dropped.
+    if !will_draw {
+        for (slot, att) in acc.color_slots.iter() {
+            if att.load_action == MTL_LOAD_ACTION_LOAD
+                && matches!(
+                    att.store_action,
+                    MTL_STORE_ACTION_MULTISAMPLE_RESOLVE | MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
+                )
+            {
+                static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 40 || n % 500 == 0 {
+                    crate::observe::fail(format!(
+                        "lab_resolve_only_pass #{n} task={task_id} slot={slot} ref={} resolve_ref={} store={} draws_seen={} t={}",
+                        att.texture_ref,
+                        att.resolve_texture_ref,
+                        att.store_action,
+                        acc.saw_draw,
+                        crate::observe::elapsed_us() / 1000
+                    ));
+                }
+            }
+        }
+    }
     if !will_draw {
         // TEMP (lab, PASS_PREP): the clear-only guest stores get their own bar
         // (`fin_prelude_clear`), the first of the prelude split (design §8.1,
