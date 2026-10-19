@@ -4411,33 +4411,14 @@ pub(crate) unsafe fn execute_draw_inner(
         Some((rgba8, layout))
     });
     let seed_slot = if let Some((rgba8, layout)) = seed_wide {
-        // The seed's own order first, because `expand_rgba8_to_texel` reads
-        // semantic RGBA8 — the same normalization the four-byte arm folds into
-        // its copy, done here as a step because a widening pass cannot also
-        // exchange in place.
-        let mut semantic;
-        let src = if matches!(req.target_seed_order, SeedOrder::Bgra8) {
-            semantic = rgba8.to_vec();
-            for px in semantic.chunks_exact_mut(4) {
-                px.swap(0, 2);
-            }
-            &semantic[..]
-        } else {
-            rgba8
-        };
         let pixels = req.width.saturating_mul(req.height);
-        let mut wide = vec![0u8; (pixels as usize) * (layout.bytes_per_texel() as usize)];
-        if src.len() == wide.len() {
-            // Already native wide texels (e.g. RG16Float 4 BPP or RGBA16Float 8 BPP loaded directly from GVA pages);
-            // copy directly without passing through expand_rgba8_to_texel which destroys half-float distance vectors.
-            wide.copy_from_slice(src);
-        } else if !crate::protocol::pixel_format::expand_rgba8_to_texel(layout, src, pixels, &mut wide) {
+        let Some(wide) = restate_seed_as_texels(layout, req.target_seed_order, rgba8, pixels) else {
             return Err(DrawError::DrawExecution(
                 DrawExecutionDecline::SeedFormatUnwritable {
                     format: color0_format,
                 },
             ));
-        }
+        };
         let slot = {
             let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
             pools.acquire_staging(ctx, wide.len() as u64, counters)?
@@ -10539,5 +10520,77 @@ mod multisample_source_load_tests {
         slugs.sort_unstable();
         slugs.dedup();
         assert_eq!(slugs.len(), all.len());
+    }
+}
+
+/// A Load seed restated as the attachment's own texels.
+///
+/// A seed is semantic RGBA8 (or scanout BGRA8) unless its bytes are already the attachment's texels,
+/// and only the length can say which: an RGBA8 seed is `pixels * 4` bytes. For a texel wider than four
+/// bytes a seed of exactly `pixels * texel` bytes cannot be RGBA8, so it is copied as it is - before any
+/// R/B exchange, which would scramble native half-float data. For a four-byte texel the two are the same
+/// length, and the seed is RGBA8: copying it verbatim used to seed an RG16Float attachment with eight-bit
+/// colour bytes read as half floats (the case Nouradawy's MAXZVER/reims-vgpu#19 found).
+///
+/// `None` when the RGBA8 seed cannot be written as this texel.
+pub(super) fn restate_seed_as_texels(
+    layout: crate::protocol::pixel_format::TexelLayout,
+    order: SeedOrder,
+    seed: &[u8],
+    pixels: u32,
+) -> Option<Vec<u8>> {
+    let texel = layout.bytes_per_texel() as usize;
+    let wide_len = (pixels as usize) * texel;
+    if texel > 4 && seed.len() == wide_len {
+        crate::runtime::drain::note_store_route("wide_seed_native_copied");
+        return Some(seed.to_vec());
+    }
+    // The seed's own order first, because `expand_rgba8_to_texel` reads semantic RGBA8 - the same
+    // normalization the four-byte arm folds into its copy, done here as a step because a widening
+    // pass cannot also exchange in place.
+    let semantic;
+    let src = if matches!(order, SeedOrder::Bgra8) {
+        let mut swapped = seed.to_vec();
+        for px in swapped.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        semantic = swapped;
+        &semantic[..]
+    } else {
+        seed
+    };
+    let mut wide = vec![0u8; wide_len];
+    crate::protocol::pixel_format::expand_rgba8_to_texel(layout, src, pixels, &mut wide).then_some(wide)
+}
+
+#[cfg(test)]
+mod restate_seed_tests {
+    use super::{restate_seed_as_texels, SeedOrder};
+    use crate::protocol::pixel_format::TexelLayout;
+
+    fn layout_of(format: ash::vk::Format) -> TexelLayout {
+        crate::backend::vulkan::translate::pixel::texel_layout_of(format).expect("a texel layout")
+    }
+
+    /// An RGBA8 seed into a four-byte non-colour texel has the attachment's length, and is still
+    /// widened rather than copied: red 255 is half-float 1.0 (0x3C00), not the bytes FF 00.
+    #[test]
+    fn an_rgba8_seed_into_rg16float_is_converted_not_copied() {
+        let layout = layout_of(ash::vk::Format::R16G16_SFLOAT);
+        let seed = [255u8, 0, 0, 255];
+        let out = restate_seed_as_texels(layout, SeedOrder::Rgba8, &seed, 1).expect("writable");
+        assert_eq!(out.len(), 4);
+        assert_ne!(out, seed, "the colour bytes are not half floats");
+        assert_eq!(u16::from_le_bytes([out[0], out[1]]), 0x3C00, "red 1.0");
+    }
+
+    /// A seed of eight bytes a texel into RGBA16Float can only be native texels: it is copied as it
+    /// is, and a BGRA order flag does not exchange its halves.
+    #[test]
+    fn native_wide_texels_are_copied_without_an_exchange() {
+        let layout = layout_of(ash::vk::Format::R16G16B16A16_SFLOAT);
+        let seed: Vec<u8> = (1..=8).collect();
+        let out = restate_seed_as_texels(layout, SeedOrder::Bgra8, &seed, 1).expect("writable");
+        assert_eq!(out, seed);
     }
 }
