@@ -12270,6 +12270,43 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
     // equality explicit at the backend boundary: reaching here with a different
     // count is an internal contract violation, not a shape Vulkan may repair.
     let pipeline_sample_count = pd.raster_sample_count.max(1);
+    // TEMP (lab, Opus 2026-10-19, `REIMS_VGPU_LAB_MSAA_DRAW_CENSUS=N`): the first N multisampled draws in full -
+    // Chrome/Graphite loses every tessellated path (fills and curved strokes) while analytic shapes draw.
+    if pipeline_sample_count > 1 {
+        static CENSUS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let cap = *CENSUS.get_or_init(|| {
+            std::env::var("REIMS_VGPU_LAB_MSAA_DRAW_CENSUS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        });
+        if cap > 0 && SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < cap {
+            crate::observe::off(format!(
+                "lab_msaa_draw task={} pipe={} vtx={} inst={} first_vtx={} base_inst={} prim={} idx={:?}                  merged={} cont={} ds_state={} sref={:?} depth={:?} stencil={:?} cull={:?} fill={:?}                  vp={:?} sc={:?} color={}x{} load={} vbufs={} t={}",
+                req.task_id,
+                req.pipeline_ref,
+                req.vertex_count,
+                req.instance_count,
+                req.first_vertex,
+                req.base_instance,
+                req.primitive_type,
+                req.indexed.as_ref().map(|i| (i.index_type, i.index_count, i.index_buffer_offset, i.base_vertex)),
+                req.merged.as_ref().map_or(0, |m| m.subs.len()),
+                req.continues_render_pass,
+                req.depth_stencil_ref,
+                req.stencil_ref,
+                req.depth_attach.as_ref().map(|d| (d.texture_ref, d.load_action, d.store_action)),
+                req.stencil_attach.as_ref().map(|s| (s.texture_ref, s.load_action, s.store_action)),
+                req.cull_mode,
+                req.fill_mode,
+                req.viewports.first(),
+                req.scissors.first().map(|s| (s.x, s.y, s.width, s.height)),
+                req.colors.first().map_or(0, |c| c.width),
+                req.colors.first().map_or(0, |c| c.height),
+                req.colors.first().map_or(0, |c| c.load_action),
+                req.vertex_buffers.iter().count(),
+                crate::observe::elapsed_us() / 1000
+            ));
+        }
+    }
     if pipeline_sample_count > 1 {
         let color = req.colors.first();
         let key = (u64::from(req.pipeline_ref) << 32)
@@ -16770,6 +16807,21 @@ fn depth_state_for(
                 clear_value: s.clear_stencil,
             })
     });
+    // TEMP (lab, Opus 2026-10-19, `REIMS_VGPU_LAB_STENCIL_TEST_OFF=1`): every stencil test passes (diagnostic only,
+    // Chrome/Graphite path loss): a stencil-then-cover fill then paints its whole cover geometry, which says whether
+    // the cover draws run and the stencil pass is what is empty.
+    static STENCIL_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let stencil = if *STENCIL_OFF
+        .get_or_init(|| std::env::var("REIMS_VGPU_LAB_STENCIL_TEST_OFF").as_deref() == Ok("1"))
+    {
+        stencil.map(|mut s| {
+            s.front.compare = SamplerCompareFunction::Always;
+            s.back.compare = SamplerCompareFunction::Always;
+            s
+        })
+    } else {
+        stencil
+    };
     // TEMP (lab, `REIMS_VGPU_LAB_DEPTH_TEST_OFF=1`): no depth test, no depth
     // writes (diagnostic only: Metal ordering by depth is lost).
     static TEST_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
