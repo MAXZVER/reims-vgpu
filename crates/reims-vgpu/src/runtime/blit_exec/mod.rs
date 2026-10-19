@@ -1431,6 +1431,12 @@ fn write_texture_rect<M: HostMemory + HostOps>(
     }
 }
 
+/// TEMP (lab, B2T_RECT): see `exec_copy_buffer_to_texture`. Latched.
+fn lab_b2t_rect() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_B2T_RECT").map_or(true, |v| v != "off"))
+}
+
 /// The mapping-rail sample window a mapper-ref-texture backing names.
 ///
 /// Spelled once so the four rect/row call sites cannot drift on which of the
@@ -2736,6 +2742,67 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
         Ok(v) => v,
         Err(st) => return st,
     };
+    // TEMP (lab, Opus 2026-10-19, B2T_RECT; `REIMS_VGPU_LAB_B2T_RECT=off`): a mapper-ref-texture destination takes
+    // the whole region as one rect - the mapping rail's unit; every per-call cost it carries (settle, mapping
+    // lookup, window revalidation, the write's vouch and page witness) was paid per row (b794, VS Code scrolling:
+    // blit_kind_b2t_us 7.5 s of a 20 s slice).
+    if let TextureBacking::MapperRefTexture(t) = &dst {
+        if copy_d == 1 && t.bpp != 0 && lab_b2t_rect() && ox <= u32::MAX as u64 && oy <= u32::MAX as u64 {
+            let rows = copy_h as usize;
+            let rb = row_bytes as usize;
+            let Some(total) = rows.checked_mul(rb) else {
+                return br(BlitFailure::Capacity, "b2t_t11_rect_cap");
+            };
+            let mut buf = vec![0u8; total];
+            let Some(s0) = src.gva.checked_add(cmd.source_offset) else {
+                return br(BlitFailure::Bounds, "b2t_t11_src_gva_overflow");
+            };
+            if src_bpr == row_bytes {
+                if gva_mem::read_task_gva_by_id(host, &state.tasks, task_id, s0, &mut buf, state.page_shift).is_err() {
+                    return br(BlitFailure::GuestIo, "b2t_t11_read_io");
+                }
+            } else {
+                for y in 0..rows {
+                    let Some(sy) = s0.checked_add((y as u64).saturating_mul(src_bpr)) else {
+                        return br(BlitFailure::Bounds, "b2t_t11_src_gva_overflow");
+                    };
+                    if gva_mem::read_task_gva_by_id(
+                        host,
+                        &state.tasks,
+                        task_id,
+                        sy,
+                        &mut buf[y * rb..(y + 1) * rb],
+                        state.page_shift,
+                    )
+                    .is_err()
+                    {
+                        return br(BlitFailure::GuestIo, "b2t_t11_read_io");
+                    }
+                }
+            }
+            let Ok(height) = u32::try_from(copy_h) else {
+                return br(BlitFailure::Bounds, "b2t_t11_rect_height");
+            };
+            if !mapping_write::write_rect_raw_at(
+                state,
+                host,
+                t.mapping_id,
+                t11_window(t),
+                mapping_write::Rect {
+                    origin_x: ox as u32,
+                    origin_y: oy as u32,
+                    width: (row_bytes / t.bpp as u64) as u32,
+                    height,
+                },
+                &buf,
+                row_bytes as u32,
+            ) {
+                return br(BlitFailure::GuestIo, "wr_rect_t11_io");
+            }
+            crate::runtime::drain::note_store_route("b2t_t11_rect");
+            return BlitStatus::Ok;
+        }
+    }
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {

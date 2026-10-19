@@ -3591,6 +3591,12 @@ pub fn stamp_resident_content_epoch(identity: &TargetIdentity, epoch: u32) -> bo
     guard.pools.registry_stamp_content_epoch(identity, epoch)
 }
 
+/// TEMP (lab, Opus 2026-10-19, GPU mapping clears): whether a resident is registered under `identity` and is an
+/// image of its own (not an import of guest memory), asked from the readiness table without the engine lock.
+pub fn lab_resident_is_plain(identity: &TargetIdentity) -> bool {
+    matches!(pools::readiness::lookup(identity).map(|r| r.guest_imported), Some(false))
+}
+
 /// TEMP (lab, DEFER_SURFACE_STORE): whether the resident registered under
 /// `identity` is (or, absent, would be made) an import of guest memory, asked
 /// without the engine lock or a join: the readiness table when the resident
@@ -4171,6 +4177,7 @@ unsafe fn copy_image_level0_to_host(
     height: u32,
     rb_size: u64,
     ops: ReadbackOps,
+    region: Option<[u32; 4]>,
 ) -> Result<Vec<u8>, DrawError> {
     match copy_image_level0_to_host_delivered(
         ctx,
@@ -4185,6 +4192,7 @@ unsafe fn copy_image_level0_to_host(
         rb_size,
         ops,
         ReadbackDelivery::Copy,
+        region,
     )? {
         ReadbackResult::Copied(bytes) => Ok(bytes),
         // Unreachable by construction — `Copy` was asked for one line above —
@@ -4216,6 +4224,8 @@ unsafe fn copy_image_level0_to_host_delivered(
     rb_size: u64,
     ops: ReadbackOps,
     delivery: ReadbackDelivery,
+    // TEMP (lab, RECT_READ): `[x, y, w, h]` of level 0 to read instead of the whole image.
+    region: Option<[u32; 4]>,
 ) -> Result<ReadbackResult, DrawError> {
     let submit_started = std::time::Instant::now();
     // The slot is claimed *after* the entry, and the order is load-bearing.
@@ -4358,11 +4368,13 @@ unsafe fn copy_image_level0_to_host_delivered(
     // separates them: everything before it has reached TRANSFER, which after the
     // barrier means the draws are done.
     unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1) };
+    let (rx, ry, rw, rh) = region.map_or((0, 0, width, height), |[x, y, w, h]| (x, y, w, h));
     let region = [ash::vk::BufferImageCopy::default()
         .image_subresource(color_subresource_layers())
+        .image_offset(ash::vk::Offset3D { x: rx as i32, y: ry as i32, z: 0 })
         .image_extent(ash::vk::Extent3D {
-            width,
-            height,
+            width: rw,
+            height: rh,
             depth: 1,
         })];
     // The whole level, every time: nothing upstream tells this call which part
@@ -5848,6 +5860,7 @@ fn read_target_leased_inner(identity: &TargetIdentity) -> Result<Option<LeasedFr
             rb_size,
             target_readback_ops(),
             ReadbackDelivery::Lease,
+            None,
         )?;
         pools.registry_note_access(identity, read_access);
         counters.note_target_read(rb_size, TargetReadDelivery::Host);
@@ -8919,6 +8932,52 @@ pub enum TargetRead {
 /// texels of layout `keep` is handed back as its own bytes instead of being
 /// widened to RGBA8 - for a writeback into a mapping of that same layout, which
 /// can land them as they are. One readback either way.
+/// TEMP (lab, Opus 2026-10-19, RECT_READ): read `[x, y, w, h]` of `identity`'s level 0, tightly packed, in the
+/// resident's own texel order - for a CPU reader that needs a rectangle of a surface whose newest content is this
+/// resident (an owed writeback debt), without paying the whole surface into its pages. `None` for a resident that
+/// is absent, not ready, not a four-byte BGRA8 image, or a rect outside it; the caller then pays as before.
+pub fn read_resident_rect_bgra(identity: &TargetIdentity, rect: [u32; 4]) -> Option<Vec<u8>> {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters).ok()?;
+    unsafe { pools.ensure_init(ctx, counters).ok()? };
+    let (snap, layout) = readback_snapshot(pools, identity).ok()?;
+    let [x, y, w, h] = rect;
+    if w == 0 || h == 0 || !layout.is_four_byte_color() || !snap.bgra() {
+        return None;
+    }
+    if x.checked_add(w)? > snap.width || y.checked_add(h)? > snap.height {
+        return None;
+    }
+    let rb_size = u64::from(w) * u64::from(h) * u64::from(layout.bytes_per_texel());
+    let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
+    unsafe {
+        let out = copy_image_level0_to_host(
+            ctx,
+            pools,
+            counters,
+            snap.image,
+            snap.layout,
+            read_access.layout(),
+            RESIDENT_READ_SRC_ACCESS,
+            snap.width,
+            snap.height,
+            rb_size,
+            target_readback_ops(),
+            Some(rect),
+        )
+        .ok()?;
+        pools.registry_note_access(identity, read_access);
+        counters.note_target_read(rb_size, TargetReadDelivery::Host);
+        (out.len() as u64 >= rb_size).then_some(out)
+    }
+}
+
 pub fn read_target_keeping(
     identity: &TargetIdentity,
     keep: Option<crate::protocol::pixel_format::TexelLayout>,
@@ -8952,6 +9011,7 @@ pub fn read_target_keeping(
             snap.height,
             rb_size,
             target_readback_ops(),
+            None,
         )?;
         pools.registry_note_access(identity, read_access);
         counters.note_target_read(rb_size, TargetReadDelivery::Host);

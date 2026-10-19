@@ -2220,6 +2220,10 @@ fn control_layout_key(state: &DeviceState, pages: usize) -> u64 {
     thread_local! {
         static LAST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
     }
+    static CKEY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*CKEY.get_or_init(|| std::env::var("REIMS_VGPU_LAB_CKEY").map_or(true, |v| v != "off")) {
+        return control_layout_key_full(state, pages);
+    }
     let (last_pre, last_key) = LAST.with(|l| l.get());
     if last_pre == p && p != 0 {
         return last_key;

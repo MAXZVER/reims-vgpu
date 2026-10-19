@@ -8188,6 +8188,14 @@ fn apply_clear<M: HostMemory + HostOps>(
     if c0.mapping_id == 0 {
         return false;
     }
+    #[cfg(feature = "backend-vulkan")]
+    if crate::backend::selected().rail() == crate::backend::Rail::Vulkan
+        && crate::runtime::draw::vulkan::lab_gpu_clear_enabled()
+        && crate::runtime::draw::vulkan::lab_gpu_clear_mapping(state, host, &req, att.clear_color)
+    {
+        state.note_surface_clear(c0.mapping_id);
+        return true;
+    }
     let ok = match clear.encoding() {
         ClearImageEncoding::Rgba8 => mapping_write::write_rgba8_image_changed(
             state,

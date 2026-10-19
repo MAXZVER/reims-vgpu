@@ -8537,6 +8537,75 @@ pub(crate) fn lab_gpu_clear_gva<M: HostMemory + HostOps>(
     true
 }
 
+/// TEMP (lab, Opus 2026-10-19, `REIMS_VGPU_LAB_GPU_CLEAR` like [`lab_gpu_clear_gva`]): a clear-only pass over a
+/// mapper-ref-texture (IOSurface) target lands in the surface's resident on the GPU and the guest pages are owed
+/// through the same writeback debt a render Store into that surface arms ([`arm_surface_writeback_debt`]), instead
+/// of the drain filling them on the CPU. VS Code (Electron) scrolling cleared 2.1 G pixels of such surfaces in one
+/// 20 s slice (b794: clear_us 5.3 s). Only for a resident that exists and is its own image (an import of guest
+/// memory would be written by the GPU clear itself, outside this debt), and only with lazy writeback; `false`
+/// leaves the caller's CPU fill, which then also matches the resident if the clear landed.
+pub(crate) fn lab_gpu_clear_mapping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    req: &DrawEncodeRequest,
+    clear_color: [f64; 4],
+) -> bool {
+    use crate::backend::vulkan::translate::pixel;
+    let note = crate::runtime::drain::note_store_route;
+    let Some(c0) = req.colors.first() else {
+        return false;
+    };
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GPU_CLEAR_MAP").map_or(true, |v| v != "off")) {
+        return false;
+    }
+    if c0.mapping_id == 0 || c0.sample_count > 1 {
+        note("lab_gpu_clear_map_unnamed");
+        return false;
+    }
+    if !crate::runtime::writeback_debt::lazy_writeback_enabled() {
+        note("lab_gpu_clear_map_eager");
+        return false;
+    }
+    let Ok((attachment, _)) = pixel::color_attachment(c0.format) else {
+        note("lab_gpu_clear_map_format_untranslated");
+        return false;
+    };
+    let Some(identity) = mapper_ref_texture_render_identity(state, req) else {
+        note("lab_gpu_clear_map_no_identity");
+        return false;
+    };
+    if !crate::backend::vulkan::engine::lab_resident_is_plain(&identity) {
+        note("lab_gpu_clear_map_not_plain");
+        return false;
+    }
+    match crate::backend::vulkan::engine::clear_resident(
+        &identity,
+        attachment.vk,
+        attachment.clear_value(clear_color),
+    ) {
+        Ok(Ok(())) => {}
+        Ok(Err(decline)) => {
+            note(decline.slug());
+            return false;
+        }
+        Err(e) => {
+            note("lab_gpu_clear_map_engine_error");
+            if crate::observe::first_sight("lab_gpu_clear_map_engine_error", 0) {
+                crate::observe::fail(format!("lab_gpu_clear_map_engine_error {e:?}"));
+            }
+            return false;
+        }
+    }
+    if !arm_surface_writeback_debt(state, host, c0.mapping_id, &identity, c0.width, c0.height) {
+        note("lab_gpu_clear_map_unarmed");
+        return false;
+    }
+    crate::runtime::mapper::commit_pass_guest_stamp(state, host, c0.mapping_id);
+    note("lab_gpu_clear_map_armed");
+    true
+}
+
 /// Why [`clear_multisample_gva`] could not land a clear-only pass in a
 /// multisample target's resident.
 #[derive(Debug)]

@@ -2210,6 +2210,79 @@ pub fn read_rect_raw<M: HostMemory + HostOps>(
     read_rect_raw_at(state, host, mapping_id, window, rect, dst, dst_stride)
 }
 
+/// TEMP (lab, RECT_READ): see [`read_rect_raw_at`].
+#[cfg(feature = "backend-vulkan")]
+fn lab_rect_read() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !cfg!(test) && std::env::var("REIMS_VGPU_LAB_RECT_READ").map_or(true, |v| v != "off"))
+}
+
+/// TEMP (lab, RECT_READ): `rect` of `mapping_id` read from the resident its owed frame is in, when the mapping is a
+/// BGRA8 plane with that frame owed (after landing any deferred T2T frame for it, as a payment does first).
+/// `false` leaves the caller's payment and page read.
+#[cfg(feature = "backend-vulkan")]
+fn read_rect_from_owed_resident<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    window: SurfaceWindow,
+    rect: Rect,
+    dst: &mut [u8],
+    dst_stride: u32,
+) -> bool {
+    let note = crate::runtime::drain::note_store_route;
+    if window.bpp != 4 {
+        return false;
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return false;
+    };
+    if mapping_store_format(m) != pixel_format::MTL_FORMAT_BGRA8_UNORM {
+        return false;
+    }
+    if state.pending_writebacks.get(mapping_id).is_none() {
+        return false;
+    }
+    // A deferred T2T frame is newer than the pages and is landed first, as `pay_for_mapping` does.
+    crate::runtime::render_writeback::land_t2t(state, host, Some(mapping_id));
+    crate::runtime::render_writeback::land_t2t_over_mapping(state, host, mapping_id);
+    let Some(debt) = state.pending_writebacks.get(mapping_id) else {
+        return false;
+    };
+    let Some(identity) = debt.target.get::<crate::backend::vulkan::engine::TargetIdentity>() else {
+        note("rectrd_resident_no_identity");
+        return false;
+    };
+    let Rect {
+        origin_x,
+        origin_y,
+        width,
+        height,
+    } = rect;
+    if origin_x.saturating_add(width) > debt.width || origin_y.saturating_add(height) > debt.height {
+        note("rectrd_resident_outside");
+        return false;
+    }
+    let started = std::time::Instant::now();
+    let Some(px) = crate::backend::vulkan::engine::read_resident_rect_bgra(identity, [origin_x, origin_y, width, height])
+    else {
+        note("rectrd_resident_unread");
+        return false;
+    };
+    let row = width as usize * 4;
+    let stride = dst_stride as usize;
+    if stride < row || dst.len() < stride * (height as usize - 1) + row || px.len() < row * height as usize {
+        note("rectrd_resident_short");
+        return false;
+    }
+    for r in 0..height as usize {
+        dst[r * stride..r * stride + row].copy_from_slice(&px[r * row..(r + 1) * row]);
+    }
+    note("rectrd_resident");
+    crate::runtime::drain::note_store_route_us("rectrd_resident_us", started.elapsed().as_micros() as u64);
+    true
+}
+
 /// Read a rect using an explicit sample window (plane base + bpr + span).
 /// Contig HostOps view when possible; else multi-import.
 #[allow(
@@ -2257,6 +2330,14 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // `flush_intersecting` returns immediately when nothing is armed, so this
     // costs a map-empty check per read. It must also precede `contig_for_span`:
     // the flush writes through the mapping and can retire the cached view.
+    // TEMP (lab, Opus 2026-10-19, RECT_READ; `REIMS_VGPU_LAB_RECT_READ=off`): a surface whose newest content is an
+    // owed frame in a resident has only the rectangle asked for read back from that resident, and stays owed -
+    // instead of the whole surface landing in its pages first (b794, VS Code: 586 such payments, 4.2 s of a 20 s
+    // slice, each ~2 ms of GPU wait plus a whole-surface write and rehash for a blit of a few rows).
+    #[cfg(feature = "backend-vulkan")]
+    if lab_rect_read() && read_rect_from_owed_resident(state, host, mapping_id, window, rect, dst, dst_stride) {
+        return true;
+    }
     let settle_started = std::time::Instant::now();
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
