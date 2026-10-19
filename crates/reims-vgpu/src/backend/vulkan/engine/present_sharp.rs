@@ -57,7 +57,107 @@ pub(crate) fn rcas_sharp() -> Option<f32> {
     })
 }
 
-/// The EASU result RCAS reads: device-local, the size of the visible part.
+/// `REIMS_VGPU_LAB_PRESENT_NIS`: NVIDIA Image Scaling (NVScaler) instead of
+/// EASU (+RCAS), with its sharpness slider: `on` = 0.5 (the SDK samples'
+/// default), or a number in 0..=1. `None` when unset/off. Latched; only read
+/// with `PRESENT_SHARP` on. NVScaler upscales 1x..2x; outside that the present
+/// keeps EASU.
+pub(crate) fn nis_sharp() -> Option<f32> {
+    static SHARP: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *SHARP.get_or_init(|| {
+        let v = std::env::var("REIMS_VGPU_LAB_PRESENT_NIS").ok()?;
+        match v.trim() {
+            "on" => Some(0.5),
+            "off" | "" => None,
+            s => s.parse::<f32>().ok().filter(|x| (0.0..=1.0).contains(x)),
+        }
+    })
+}
+
+/// NVScaler's constants for one present (`NVScalerUpdateConfig`, SDR), as the
+/// 28 words of `present_nis.comp`'s push block; `None` outside 1x..2x.
+fn nis_config(sharpness: f32, src: (u32, u32), dst: (u32, u32)) -> Option<[u8; 112]> {
+    let sharpen_slider = sharpness.clamp(0.0, 1.0) - 0.5;
+    let (max_scale, min_scale, limit_scale) = if sharpen_slider >= 0.0 { (1.25, 1.25, 1.25) } else { (1.75, 1.0, 1.0) };
+    let detect_ratio = 2.0 * 1127.0 / 1024.0;
+    let detect_thres = 64.0 / 1024.0;
+    let (min_contrast, max_contrast) = (2.0f32, 10.0f32);
+    let (sharp_start_y, sharp_end_y) = (0.45f32, 0.9f32);
+    let strength_min = (0.4 + sharpen_slider * min_scale * 1.2).max(0.0);
+    let strength_max = 1.6 + sharpen_slider * max_scale * 1.8;
+    let limit_min = (0.14 + sharpen_slider * limit_scale * 0.32).max(0.1);
+    let limit_max = 0.5 + sharpen_slider * limit_scale * 0.6;
+    let scale_x = src.0 as f32 / dst.0 as f32;
+    let scale_y = src.1 as f32 / dst.1 as f32;
+    if !(0.5..=1.0).contains(&scale_x) || !(0.5..=1.0).contains(&scale_y) {
+        return None;
+    }
+    let floats = [
+        detect_ratio,
+        detect_thres,
+        min_contrast,
+        1.0 / (max_contrast - min_contrast),
+        1.0,
+        1.0 / 255.0,
+        sharp_start_y,
+        1.0 / (sharp_end_y - sharp_start_y),
+        strength_min,
+        strength_max - strength_min,
+        limit_min,
+        limit_max - limit_min,
+        scale_x,
+        scale_y,
+        1.0 / dst.0 as f32,
+        1.0 / dst.1 as f32,
+        1.0 / src.0 as f32,
+        1.0 / src.1 as f32,
+    ];
+    let uints = [0u32, 0, src.0, src.1, 0, 0, dst.0, dst.1];
+    let mut out = [0u8; 112];
+    for (i, f) in floats.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+    }
+    for (i, u) in uints.iter().enumerate() {
+        let o = 72 + i * 4;
+        out[o..o + 4].copy_from_slice(&u.to_le_bytes());
+    }
+    Some(out)
+}
+
+/// NVScaler's two coefficient tables as 2 x 64 `R32G32B32A32_SFLOAT` images,
+/// filled once from `buffer` by the first present that uses them.
+struct NisCoef {
+    images: [(vk::Image, vk::DeviceMemory, vk::ImageView); 2],
+    buffer: vk::Buffer,
+    buffer_memory: vk::DeviceMemory,
+    uploaded: bool,
+}
+
+impl NisCoef {
+    unsafe fn destroy(self, device: &ash::Device) {
+        for (image, memory, view) in self.images {
+            if view != vk::ImageView::null() {
+                device.destroy_image_view(view, None);
+            }
+            if image != vk::Image::null() {
+                device.destroy_image(image, None);
+            }
+            if memory != vk::DeviceMemory::null() {
+                device.free_memory(memory, None);
+            }
+        }
+        if self.buffer != vk::Buffer::null() {
+            device.destroy_buffer(self.buffer, None);
+        }
+        if self.buffer_memory != vk::DeviceMemory::null() {
+            device.free_memory(self.buffer_memory, None);
+        }
+    }
+}
+
+/// The first pass's result the window pass reads, the size of the visible
+/// part: EASU's (a colour attachment, `fb`) or NVScaler's (a storage image,
+/// no framebuffer).
 struct MidImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -95,8 +195,18 @@ pub(crate) struct PresentSharp {
     sets: Vec<vk::DescriptorSet>,
     /// The swapchain-image view and framebuffer each entry's last draw used.
     transient: Vec<Option<(vk::ImageView, vk::Framebuffer)>>,
-    /// RCAS: its linear strength, or `None` (one EASU draw, as before).
+    /// RCAS: its linear strength, or `None` (one EASU draw, as before). With
+    /// NIS `Some(0.0)`: the window pass is then an exact copy of `mid`.
     rcas: Option<f32>,
+    /// NIS: its sharpness, or `None` (EASU).
+    nis: Option<f32>,
+    nis_set_layout: vk::DescriptorSetLayout,
+    nis_layout: vk::PipelineLayout,
+    nis_pipeline: vk::Pipeline,
+    nis_pool: vk::DescriptorPool,
+    /// NIS: one per frame entry.
+    nis_sets: Vec<vk::DescriptorSet>,
+    nis_coef: Option<NisCoef>,
     /// RCAS: EASU into `mid` (`UNDEFINED -> SHADER_READ_ONLY_OPTIMAL`).
     mid_pass: vk::RenderPass,
     rcas_pipeline: vk::Pipeline,
@@ -133,7 +243,14 @@ impl PresentSharp {
             pool: vk::DescriptorPool::null(),
             sets: Vec::new(),
             transient: vec![None; frames],
-            rcas: rcas_sharp(),
+            rcas: if nis_sharp().is_some() { Some(0.0) } else { rcas_sharp() },
+            nis: nis_sharp(),
+            nis_set_layout: vk::DescriptorSetLayout::null(),
+            nis_layout: vk::PipelineLayout::null(),
+            nis_pipeline: vk::Pipeline::null(),
+            nis_pool: vk::DescriptorPool::null(),
+            nis_sets: Vec::new(),
+            nis_coef: None,
             mid_pass: vk::RenderPass::null(),
             rcas_pipeline: vk::Pipeline::null(),
             rcas_sets: Vec::new(),
@@ -145,7 +262,9 @@ impl PresentSharp {
             made.destroy(device);
             return Err(e);
         }
-        if let Some(sharp) = made.rcas {
+        if let Some(sharp) = made.nis {
+            crate::observe::off(format!("present_sharp nis sharpness={sharp:.3}"));
+        } else if let Some(sharp) = made.rcas {
             crate::observe::off(format!("present_sharp rcas sharp={sharp:.3}"));
         }
         Ok(made)
@@ -288,7 +407,253 @@ impl PresentSharp {
                 None,
             )?;
         }
+        if self.nis.is_some() {
+            self.build_nis(device, frames)?;
+        }
         Ok(())
+    }
+
+    /// NVScaler: set layout (sampler, source, output, two coefficient images),
+    /// push range, compute pipeline, one set per frame entry.
+    unsafe fn build_nis(&mut self, device: &ash::Device, frames: usize) -> Result<(), vk::Result> {
+        let kinds = [
+            (1, vk::DescriptorType::SAMPLER),
+            (2, vk::DescriptorType::SAMPLED_IMAGE),
+            (3, vk::DescriptorType::STORAGE_IMAGE),
+            (4, vk::DescriptorType::SAMPLED_IMAGE),
+            (5, vk::DescriptorType::SAMPLED_IMAGE),
+        ];
+        let bindings: Vec<_> = kinds
+            .iter()
+            .map(|&(b, t)| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b)
+                    .descriptor_type(t)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            })
+            .collect();
+        self.nis_set_layout = device.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+            None,
+        )?;
+        let push = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(112)];
+        let set_layouts = [self.nis_set_layout];
+        self.nis_layout = device.create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts)
+                .push_constant_ranges(&push),
+            None,
+        )?;
+        let module = device.create_shader_module(
+            &vk::ShaderModuleCreateInfo::default().code(&super::present_sharp_shader::PRESENT_NIS_COMP_SPIRV),
+            None,
+        )?;
+        let info = [vk::ComputePipelineCreateInfo::default()
+            .stage(
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::COMPUTE)
+                    .module(module)
+                    .name(c"main"),
+            )
+            .layout(self.nis_layout)];
+        let made = device.create_compute_pipelines(vk::PipelineCache::null(), &info, None);
+        device.destroy_shader_module(module, None);
+        self.nis_pipeline = made.map_err(|(_, e)| e)?[0];
+        let n = frames as u32;
+        let sizes = [
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::SAMPLER).descriptor_count(n),
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(3 * n),
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(n),
+        ];
+        self.nis_pool = device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default().max_sets(n).pool_sizes(&sizes),
+            None,
+        )?;
+        let layouts = vec![self.nis_set_layout; frames];
+        self.nis_sets = device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.nis_pool)
+                .set_layouts(&layouts),
+        )?;
+        Ok(())
+    }
+
+    /// The coefficient images, made on first use.
+    unsafe fn ensure_nis_coef(
+        &mut self,
+        device: &ash::Device,
+        memory_type: &dyn Fn(u32, u64) -> Option<u32>,
+    ) -> Result<(), vk::Result> {
+        if self.nis_coef.is_some() {
+            return Ok(());
+        }
+        let mut made = NisCoef {
+            images: [(vk::Image::null(), vk::DeviceMemory::null(), vk::ImageView::null()); 2],
+            buffer: vk::Buffer::null(),
+            buffer_memory: vk::DeviceMemory::null(),
+            uploaded: false,
+        };
+        let r = (|| -> Result<(), vk::Result> {
+            for slot in made.images.iter_mut() {
+                slot.0 = device.create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(vk::Format::R32G32B32A32_SFLOAT)
+                        .extent(vk::Extent3D {
+                            width: (super::present_nis_coef::NIS_TAPS / 4) as u32,
+                            height: super::present_nis_coef::NIS_PHASES as u32,
+                            depth: 1,
+                        })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )?;
+                let req = device.get_image_memory_requirements(slot.0);
+                let mt = memory_type(req.memory_type_bits, req.size).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+                slot.1 = device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(mt),
+                    None,
+                )?;
+                device.bind_image_memory(slot.0, slot.1, 0)?;
+                slot.2 = device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(slot.0)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::R32G32B32A32_SFLOAT)
+                        .subresource_range(super::color_subresource_range()),
+                    None,
+                )?;
+            }
+            made.buffer = device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(Self::NIS_COEF_BYTES * 2)
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST),
+                None,
+            )?;
+            let req = device.get_buffer_memory_requirements(made.buffer);
+            let mt = memory_type(req.memory_type_bits, req.size).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+            made.buffer_memory = device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(mt),
+                None,
+            )?;
+            device.bind_buffer_memory(made.buffer, made.buffer_memory, 0)?;
+            Ok(())
+        })();
+        match r {
+            Ok(()) => {
+                self.nis_coef = Some(made);
+                Ok(())
+            }
+            Err(e) => {
+                made.destroy(device);
+                Err(e)
+            }
+        }
+    }
+
+    /// Bytes of one coefficient table.
+    const NIS_COEF_BYTES: u64 =
+        (super::present_nis_coef::NIS_PHASES * super::present_nis_coef::NIS_TAPS * 4) as u64;
+
+    /// Record the coefficient upload (`vkCmdUpdateBuffer`, then buffer ->
+    /// image) the first time; leaves both images in `SHADER_READ_ONLY_OPTIMAL`
+    /// ordered before compute reads.
+    unsafe fn upload_nis_coef(&mut self, device: &ash::Device, cmd: vk::CommandBuffer) {
+        let Some(coef) = self.nis_coef.as_mut() else {
+            return;
+        };
+        if coef.uploaded {
+            return;
+        }
+        coef.uploaded = true;
+        let tables = [&super::present_nis_coef::NIS_COEF_SCALE, &super::present_nis_coef::NIS_COEF_USM];
+        for (i, t) in tables.iter().enumerate() {
+            let mut bytes = Vec::with_capacity(Self::NIS_COEF_BYTES as usize);
+            for row in t.iter() {
+                for v in row {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            device.cmd_update_buffer(cmd, coef.buffer, i as u64 * Self::NIS_COEF_BYTES, &bytes);
+        }
+        let to_dst: Vec<_> = coef
+            .images
+            .iter()
+            .map(|&(image, _, _)| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(super::color_subresource_range())
+            })
+            .collect();
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)],
+            &[],
+            &to_dst,
+        );
+        for (i, &(image, _, _)) in coef.images.iter().enumerate() {
+            let region = [vk::BufferImageCopy::default()
+                .buffer_offset(i as u64 * Self::NIS_COEF_BYTES)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: (super::present_nis_coef::NIS_TAPS / 4) as u32,
+                    height: super::present_nis_coef::NIS_PHASES as u32,
+                    depth: 1,
+                })];
+            device.cmd_copy_buffer_to_image(cmd, coef.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &region);
+        }
+        let to_read: Vec<_> = coef
+            .images
+            .iter()
+            .map(|&(image, _, _)| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(super::color_subresource_range())
+            })
+            .collect();
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_read,
+        );
     }
 
     /// One full-screen-triangle pipeline with `frag`, against `render_pass`.
@@ -394,6 +759,15 @@ impl PresentSharp {
             width,
             height,
         };
+        // NVScaler writes `mid` as an rgba8 storage image; EASU renders it in
+        // the window's format.
+        let nis = self.nis.is_some();
+        let format = if nis { vk::Format::R8G8B8A8_UNORM } else { format };
+        let usage = if nis {
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED
+        } else {
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED
+        };
         let r = (|| -> Result<(), vk::Result> {
             made.image = device.create_image(
                 &vk::ImageCreateInfo::default()
@@ -404,7 +778,7 @@ impl PresentSharp {
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+                    .usage(usage)
                     .initial_layout(vk::ImageLayout::UNDEFINED),
                 None,
             )?;
@@ -425,6 +799,9 @@ impl PresentSharp {
                     .subresource_range(super::color_subresource_range()),
                 None,
             )?;
+            if nis {
+                return Ok(());
+            }
             let views = [made.view];
             made.fb = device.create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
@@ -522,7 +899,22 @@ impl PresentSharp {
             }
         }
         self.retired = keep;
-        let rcas = match self.rcas {
+        // NIS: its constants for this scale and its coefficient images, or
+        // EASU alone this present (outside 1x..2x, or no memory).
+        let mut nis_cfg = match self.nis {
+            Some(sharpness) => nis_config(sharpness, (src.width, src.height), (vp.2, vp.3)),
+            None => None,
+        };
+        if nis_cfg.is_some() {
+            if let Err(e) = self.ensure_nis_coef(device, memory_type) {
+                if crate::observe::first_sight("present_nis_coef_refused", 0) {
+                    crate::observe::fail(format!("present_nis_coef_refused err={e:?}"));
+                }
+                nis_cfg = None;
+            }
+        }
+        let second = if self.nis.is_some() && nis_cfg.is_none() { None } else { self.rcas };
+        let rcas = match second {
             Some(sharp) => match self.ensure_mid(device, format, vp.2, vp.3, memory_type) {
                 Ok(()) => Some(sharp),
                 Err(e) => {
@@ -571,10 +963,16 @@ impl PresentSharp {
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(src.image)
             .subresource_range(super::color_subresource_range())];
+        let nis_cfg = if rcas.is_some() { nis_cfg } else { None };
+        let reader = if nis_cfg.is_some() {
+            vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER
+        } else {
+            vk::PipelineStageFlags::FRAGMENT_SHADER
+        };
         device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            reader,
             vk::DependencyFlags::empty(),
             &[],
             &[],
@@ -584,7 +982,104 @@ impl PresentSharp {
         let mut easu_push = [0u8; 8];
         easu_push[..4].copy_from_slice(&size[0].to_le_bytes());
         easu_push[4..].copy_from_slice(&size[1].to_le_bytes());
-        if let (Some(sharp), Some(mid)) = (rcas, self.mid.as_ref()) {
+        if let (Some(cfg), Some(mid)) = (nis_cfg, self.mid.as_ref()) {
+            // NVScaler into `mid`, then an exact copy into the window (the
+            // RCAS pass at strength 0).
+            let (mid_image, mid_view, mid_w, mid_h) = (mid.image, mid.view, mid.width, mid.height);
+            self.upload_nis_coef(device, cmd);
+            let coef = self
+                .nis_coef
+                .as_ref()
+                .map(|c| (c.images[0].2, c.images[1].2))
+                .unwrap_or_default();
+            let set = self.nis_sets[ix];
+            let sampler_info = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
+            let src_info = [vk::DescriptorImageInfo::default()
+                .image_view(src.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let out_info = [vk::DescriptorImageInfo::default()
+                .image_view(mid_view)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let scale_info = [vk::DescriptorImageInfo::default()
+                .image_view(coef.0)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let usm_info = [vk::DescriptorImageInfo::default()
+                .image_view(coef.1)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let w = |b: u32, t: vk::DescriptorType| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(b)
+                    .descriptor_type(t)
+            };
+            device.update_descriptor_sets(
+                &[
+                    w(1, vk::DescriptorType::SAMPLER).image_info(&sampler_info),
+                    w(2, vk::DescriptorType::SAMPLED_IMAGE).image_info(&src_info),
+                    w(3, vk::DescriptorType::STORAGE_IMAGE).image_info(&out_info),
+                    w(4, vk::DescriptorType::SAMPLED_IMAGE).image_info(&scale_info),
+                    w(5, vk::DescriptorType::SAMPLED_IMAGE).image_info(&usm_info),
+                ],
+                &[],
+            );
+            // In: the previous present's window-pass read of `mid` (any earlier
+            // submission) before NVScaler overwrites it.
+            let to_general = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(mid_image)
+                .subresource_range(super::color_subresource_range())];
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_general,
+            );
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.nis_pipeline);
+            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.nis_layout, 0, &[set], &[]);
+            device.cmd_push_constants(cmd, self.nis_layout, vk::ShaderStageFlags::COMPUTE, 0, &cfg);
+            // NIS_BLOCK_WIDTH x NIS_BLOCK_HEIGHT output pixels per group.
+            device.cmd_dispatch(cmd, mid_w.div_ceil(32), mid_h.div_ceil(24), 1);
+            let mid_read = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(mid_image)
+                .subresource_range(super::color_subresource_range())];
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &mid_read,
+            );
+            let rcas_set = self.rcas_sets[ix];
+            self.write_set(device, rcas_set, mid_view);
+            let mut push = [0u8; 20];
+            for (i, v) in [vp.0, vp.1, vp.2, vp.3].iter().enumerate() {
+                push[i * 4..i * 4 + 4].copy_from_slice(&(*v as i32).to_le_bytes());
+            }
+            push[16..].copy_from_slice(&0.0f32.to_le_bytes());
+            self.begin_window_pass(device, cmd, fb, extent, clear);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rcas_pipeline);
+            Self::set_rect(device, cmd, vp.0, vp.1, vp.2, vp.3);
+            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
+            device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
+            device.cmd_draw(cmd, 3, 1, 0, 0);
+            device.cmd_end_render_pass(cmd);
+        } else if let (Some(sharp), Some(mid)) = (rcas.filter(|_| self.nis.is_none()), self.mid.as_ref()) {
             // EASU over the whole of `mid`.
             device.cmd_begin_render_pass(
                 cmd,
@@ -641,7 +1136,7 @@ impl PresentSharp {
             .subresource_range(super::color_subresource_range())];
         device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            reader,
             vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
             &[],
@@ -700,6 +1195,22 @@ impl PresentSharp {
         if self.set_layout != vk::DescriptorSetLayout::null() {
             device.destroy_descriptor_set_layout(self.set_layout, None);
         }
+        if let Some(coef) = self.nis_coef.take() {
+            coef.destroy(device);
+        }
+        if self.nis_pool != vk::DescriptorPool::null() {
+            device.destroy_descriptor_pool(self.nis_pool, None);
+        }
+        if self.nis_pipeline != vk::Pipeline::null() {
+            device.destroy_pipeline(self.nis_pipeline, None);
+        }
+        if self.nis_layout != vk::PipelineLayout::null() {
+            device.destroy_pipeline_layout(self.nis_layout, None);
+        }
+        if self.nis_set_layout != vk::DescriptorSetLayout::null() {
+            device.destroy_descriptor_set_layout(self.nis_set_layout, None);
+        }
+        self.nis_sets.clear();
         if self.mid_pass != vk::RenderPass::null() {
             device.destroy_render_pass(self.mid_pass, None);
         }
