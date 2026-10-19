@@ -6634,6 +6634,17 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
         psz,
     );
     shared_w32(host, gpa, DISPLAY_DESC_FEATURES, 0, psz);
+    // TEMP (lab, Opus 2026-10-19): the display's scale factor. AppleParavirtDisplayPipe::process_online reads a u8 at
+    // descriptor +0x50 (beside originX/originY, u16 at +0x4c/+0x4e) and AppleParavirtFramebuffer::connectionChange
+    // publishes it as "scaleFactor" in the framebuffer's "ParavirtDisplayPrefs" dictionary, which the guest's display
+    // stack reads - the route Virtualization.framework's HiDPI displays take. This device never wrote it (0).
+    // REIMS_VGPU_LAB_DISPLAY_SCALE=N writes N (2 = Retina).
+    if let Some(scale) = std::env::var("REIMS_VGPU_LAB_DISPLAY_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok())
+    {
+        let _ = gpa_map::write_bytes(host, gpa + 0x50, &[scale], psz);
+    }
 
     // HW cursor capability so the guest doorbells glyph/show/move.
     let max_wh = (CURSOR_MAX_DIM & 0xffff) | ((CURSOR_MAX_DIM & 0xffff) << 16);
@@ -6729,10 +6740,17 @@ fn display_panel() -> &'static DisplayPanel {
         }
         let (rw, rh) = (u32::from(w) / a, u32::from(h) / a);
         let k = (64 / rw.max(1)).max(1);
+        // TEMP (lab, Opus 2026-10-19): REIMS_VGPU_LAB_DISPLAY_MM=WxH announces another physical size - the
+        // density from which a Mac guest decides whether to offer HiDPI ("Retina") modes, as Virtualization.framework's
+        // pixelsPerInch does for its guests. Whole centimetres reach the guest's EDID.
+        let lab_mm = std::env::var("REIMS_VGPU_LAB_DISPLAY_MM").ok().and_then(|v| {
+            let (a, b) = v.trim().split_once('x')?;
+            Some((a.trim().parse::<u16>().ok()?, b.trim().parse::<u16>().ok()?))
+        });
         let panel = DisplayPanel {
             native: (w, h),
-            width_mm: (rw * k * 10).min(u32::from(u16::MAX)) as u16,
-            height_mm: (rh * k * 10).min(u32::from(u16::MAX)) as u16,
+            width_mm: lab_mm.map_or((rw * k * 10).min(u32::from(u16::MAX)) as u16, |m| m.0),
+            height_mm: lab_mm.map_or((rh * k * 10).min(u32::from(u16::MAX)) as u16, |m| m.1),
             serial: DISPLAY_SERIAL_NUMBER.wrapping_add((u32::from(w) << 16) | u32::from(h)),
         };
         crate::observe::off(format!(
