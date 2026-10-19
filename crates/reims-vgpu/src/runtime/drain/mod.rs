@@ -6793,11 +6793,12 @@ fn sample_cursor_position<M: HostMemory>(state: &mut DeviceState, mem: &M) {
     }
     let packed = ld32(&pos);
     if packed == 0xffff_ffff {
-        state.cursor.show = false;
+        state.cursor.set_show(false);
         return;
     }
-    state.cursor.x = (packed & 0xffff) as u16;
-    state.cursor.y = ((packed >> 16) & 0xffff) as u16;
+    state
+        .cursor
+        .set_xy((packed & 0xffff) as u16, ((packed >> 16) & 0xffff) as u16);
     let mut show = [0u8; 4];
     if mem
         .read_gpa(
@@ -6807,7 +6808,7 @@ fn sample_cursor_position<M: HostMemory>(state: &mut DeviceState, mem: &M) {
         .is_ok()
     {
         // Guest may only write a byte; treat non-zero low byte as show.
-        state.cursor.show = show[0] != 0 || ld32(&show) != 0;
+        state.cursor.set_show(show[0] != 0 || ld32(&show) != 0);
     }
 }
 
@@ -9007,10 +9008,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
         }
         CHILD_OP_CURSOR_SHOW => match crate::protocol::fifo::decode_cursor_show(&packet.payload) {
             Ok(show) => {
-                state.cursor.show = show;
+                state.cursor.set_show(show);
                 sample_cursor_position(state, host);
-                host.enqueue(HostAction::cursor(state.cursor.x, state.cursor.y, show));
-                host.guest_cursor_position(state.id.0, state.cursor.x, state.cursor.y, show);
+                host.enqueue(HostAction::cursor(state.cursor.x(), state.cursor.y(), show));
+                host.guest_cursor_position(state.id.0, state.cursor.x(), state.cursor.y(), show);
             }
             Err(short) => note_short_payload("cursor_show", Some(channel_id), &short),
         },
@@ -9018,18 +9019,18 @@ fn process_child_packet<H: HostMemory + HostOps>(
             if load_cursor_glyph(state, host, packet) {
                 host.enqueue(HostAction::cursor_glyph());
                 host.enqueue(HostAction::cursor(
-                    state.cursor.x,
-                    state.cursor.y,
-                    state.cursor.show,
+                    state.cursor.x(),
+                    state.cursor.y(),
+                    state.cursor.show(),
                 ));
                 if let Some(glyph) = crate::runtime::host::CursorGlyphRef::of(&state.cursor) {
                     host.guest_cursor_glyph(state.id.0, glyph);
                 }
                 host.guest_cursor_position(
                     state.id.0,
-                    state.cursor.x,
-                    state.cursor.y,
-                    state.cursor.show,
+                    state.cursor.x(),
+                    state.cursor.y(),
+                    state.cursor.show(),
                 );
             }
         }

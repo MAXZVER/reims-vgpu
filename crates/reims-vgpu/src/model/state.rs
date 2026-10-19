@@ -2770,12 +2770,71 @@ pub struct PresentState {
     pub light_captures: u64,
 }
 
+/// The hardware cursor's position and visibility, as one atomic word.
+///
+/// Port of 570c6ab8 (MAXZVER/reims-vgpu#3 Step B). The single copy of
+/// x/y/show, shared by `Arc` between [`CursorState::pos`] and the device
+/// registry slot (as the interrupt-status registers are), so the 0x1220 cursor
+/// doorbell can be served from the vCPU thread without the device lock when
+/// `REIMS_VGPU_LAB_CURSOR_LOCKFREE=on`. With the switch off only the locked
+/// paths touch it, through [`CursorState`]'s accessors, which is behaviourally
+/// the same as the plain fields it replaces.
+///
+/// Layout: bits 0..16 x, 16..32 y, bit 32 show.
+#[derive(Debug, Default)]
+pub struct CursorMirror(AtomicU64);
+
+impl CursorMirror {
+    const SHOW: u64 = 1 << 32;
+    const XY: u64 = 0xffff_ffff;
+
+    fn pack(x: u16, y: u16, show: bool) -> u64 {
+        u64::from(x) | (u64::from(y) << 16) | if show { Self::SHOW } else { 0 }
+    }
+
+    /// `(x, y, show)` from one load.
+    pub fn load(&self) -> (u16, u16, bool) {
+        let w = self.0.load(Ordering::Acquire);
+        (w as u16, (w >> 16) as u16, w & Self::SHOW != 0)
+    }
+
+    /// Replace all three at once.
+    pub fn store(&self, x: u16, y: u16, show: bool) {
+        self.0.store(Self::pack(x, y, show), Ordering::Release);
+    }
+
+    /// Move the cursor, keeping its visibility.
+    pub fn set_xy(&self, x: u16, y: u16) {
+        let xy = Self::pack(x, y, false);
+        // Explicit CAS loop rather than `fetch_update` (deprecated/renamed on
+        // newer toolchains); builds warning-free on both.
+        let mut cur = self.0.load(Ordering::Acquire);
+        loop {
+            let next = (cur & !Self::XY) | xy;
+            match self.0.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// Show or hide the cursor, keeping its position.
+    pub fn set_show(&self, show: bool) {
+        if show {
+            self.0.fetch_or(Self::SHOW, Ordering::AcqRel);
+        } else {
+            self.0.fetch_and(!Self::SHOW, Ordering::AcqRel);
+        }
+    }
+}
+
 /// Hardware cursor model.
 #[derive(Clone, Debug, Default)]
 pub struct CursorState {
-    pub show: bool,
-    pub x: u16,
-    pub y: u16,
+    /// Position and visibility: the one copy, shared with the registry slot.
+    /// See [`CursorMirror`]. Read through [`Self::x`], [`Self::y`] and
+    /// [`Self::show`].
+    pub pos: Arc<CursorMirror>,
     pub width: u16,
     pub height: u16,
     pub hot_x: u16,
@@ -2784,6 +2843,24 @@ pub struct CursorState {
     pub pixels: Vec<u32>,
     /// True when `pixels` holds a complete glyph for the host console.
     pub glyph_ready: bool,
+}
+
+impl CursorState {
+    pub fn x(&self) -> u16 {
+        self.pos.load().0
+    }
+    pub fn y(&self) -> u16 {
+        self.pos.load().1
+    }
+    pub fn show(&self) -> bool {
+        self.pos.load().2
+    }
+    pub fn set_xy(&self, x: u16, y: u16) {
+        self.pos.set_xy(x, y);
+    }
+    pub fn set_show(&self, show: bool) {
+        self.pos.set_show(show);
+    }
 }
 
 /// Display shared-state handshake (archive setupSharedState + online poll).
@@ -3890,9 +3967,10 @@ impl DeviceState {
             fence_flushed_mappings: std::collections::BTreeSet::new(),
             surface_write_kind: BTreeMap::new(),
             present: PresentState::default(),
-            cursor: CursorState {
-                show: true,
-                ..Default::default()
+            cursor: {
+                let cursor = CursorState::default();
+                cursor.set_show(true);
+                cursor
             },
             mapper_capture: None,
             mapper_device_kva: 0,
@@ -4289,6 +4367,9 @@ impl DeviceState {
         let intr_fault = Arc::clone(&self.gfx.interrupt_fault);
         let fifo_read = Arc::clone(&self.gfx.fifo_read);
         let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
+        // The cursor mirror is wired to the registry slot the same way; it is
+        // kept and reset to whatever a fresh state starts with (below).
+        let cursor_pos = Arc::clone(&self.cursor.pos);
         // The pool's threads belong to the device, and a reset is a guest
         // lifetime boundary, not the device's.
         let par = self.par.take();
@@ -4306,6 +4387,9 @@ impl DeviceState {
         self.gfx.interrupt_fault = intr_fault;
         self.gfx.fifo_read = fifo_read;
         self.gfx.child_doorbell_rung = child_rung;
+        let (x, y, show) = self.cursor.pos.load();
+        cursor_pos.store(x, y, show);
+        self.cursor.pos = cursor_pos;
     }
 
     /// Queue the engine-unpin for a dying linear cache entry that still owns a

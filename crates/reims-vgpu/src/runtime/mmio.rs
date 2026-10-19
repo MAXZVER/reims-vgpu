@@ -228,42 +228,18 @@ pub fn gfx_write<H: HostMemory + HostOps>(
         GFX_REG_EFI_FB_MODE => state.gfx.efi_fb_mode = val,
         GFX_REG_EFI_DISPLAY_IRQ => {
             // Dual-use: cursor sample doorbell + display IRQ bit.
-            if val < 32 {
-                state
-                    .gfx
-                    .interrupt_status_disp
-                    .fetch_or(1u32 << val, std::sync::atomic::Ordering::AcqRel);
-                // Sample cursor position from display shared page (GPA).
-                if state.display.shared_gpa != 0 {
-                    let mut pos = [0u8; 4];
-                    if host
-                        .read_gpa(
-                            state.display.shared_gpa + DISPLAY_SHARED_CURSOR_POS,
-                            &mut pos,
-                        )
-                        .is_ok()
-                    {
-                        let packed = u32::from_le_bytes(pos);
-                        if packed != 0xffff_ffff {
-                            state.cursor.x = (packed & 0xffff) as u16;
-                            state.cursor.y = ((packed >> 16) & 0xffff) as u16;
-                        }
-                    }
-                    host.enqueue(HostAction::cursor(
-                        state.cursor.x,
-                        state.cursor.y,
-                        state.cursor.show,
-                    ));
-                    host.guest_cursor_position(
-                        state.id.0,
-                        state.cursor.x,
-                        state.cursor.y,
-                        state.cursor.show,
-                    );
-                }
-                host.enqueue(HostAction::irq_gfx());
-                host.schedule_bh();
-            }
+            // One body, shared with the lock-free arm in
+            // `crate::device::device_gfx_write` (REIMS_VGPU_LAB_CURSOR_LOCKFREE):
+            // see [`cursor_doorbell`].
+            let device = state.id.0;
+            cursor_doorbell(
+                host,
+                device,
+                &state.gfx.interrupt_status_disp,
+                &state.cursor.pos,
+                state.display.shared_gpa,
+                val,
+            );
         }
         GFX_REG_EFI_FB_STRIDE => {
             state.gfx.efi_fb_stride = val;
@@ -271,6 +247,53 @@ pub fn gfx_write<H: HostMemory + HostOps>(
         }
         _ => state.gfx.sparse_set(offset, val),
     }
+}
+
+/// The cursor doorbell (0x1220): the whole effect of one guest write.
+///
+/// Port of 570c6ab8 (MAXZVER/reims-vgpu#3 Step B), keeping this tree's
+/// host-window `guest_cursor_position` publish. Both arms call this: the locked
+/// handler above (queued writes applied at `lock_for_drain`, and direct writes
+/// that found the device lock free) and, with
+/// `REIMS_VGPU_LAB_CURSOR_LOCKFREE=on`, the lock-free arm in
+/// `crate::device::device_gfx_write`, which passes the registry slot's clones
+/// of the same `Arc`s. One spelling of what the register does.
+///
+/// It touches no surface, mapping, FIFO or ring state: it ORs the display
+/// interrupt bit, reads the 4-byte cursor position from the display shared
+/// page, updates the [`CursorMirror`], queues `CursorUpdate`, publishes the
+/// position to the host window, then queues `IrqGfx` and schedules the BH (the
+/// same order as before). A `val` of 32 or more names no bit and does nothing.
+pub(crate) fn cursor_doorbell<H: HostMemory + HostOps>(
+    host: &mut H,
+    device: u64,
+    interrupt_status_disp: &std::sync::atomic::AtomicU32,
+    cursor: &CursorMirror,
+    shared_gpa: u64,
+    val: u32,
+) {
+    if val >= 32 {
+        return;
+    }
+    interrupt_status_disp.fetch_or(1u32 << val, std::sync::atomic::Ordering::AcqRel);
+    // Sample cursor position from display shared page (GPA).
+    if shared_gpa != 0 {
+        let mut pos = [0u8; 4];
+        if host
+            .read_gpa(shared_gpa + DISPLAY_SHARED_CURSOR_POS, &mut pos)
+            .is_ok()
+        {
+            let packed = u32::from_le_bytes(pos);
+            if packed != 0xffff_ffff {
+                cursor.set_xy((packed & 0xffff) as u16, ((packed >> 16) & 0xffff) as u16);
+            }
+        }
+        let (x, y, show) = cursor.load();
+        host.enqueue(HostAction::cursor(x, y, show));
+        host.guest_cursor_position(device, x, y, show);
+    }
+    host.enqueue(HostAction::irq_gfx());
+    host.schedule_bh();
 }
 
 /// Iosfc MMIO read.

@@ -91,6 +91,13 @@ struct BoundDevice {
     /// Child channels the guest has rung, OR'd from the vCPU thread with no
     /// device lock; see [`crate::model::GfxRegs::child_doorbell_rung`].
     child_doorbell_rung: Arc<AtomicU32>,
+    /// Lock-free clone of the hardware cursor mirror (`state.cursor.pos`), the
+    /// one copy of x/y/show. Written from the vCPU thread by the 0x1220
+    /// lock-free arm in [`device_gfx_write`] when `cursor_lockfree` is set.
+    cursor_pos: Arc<crate::model::CursorMirror>,
+    /// `REIMS_VGPU_LAB_CURSOR_LOCKFREE` (default off), latched at create. An
+    /// atomic only so tests can arm it per device.
+    cursor_lockfree: AtomicBool,
     /// Lock-free clone of the fault status (0x102c) — the ISR's third read.
     intr_fault: Arc<AtomicU32>,
     /// Lock-free clone of the main-FIFO consumer counter (0x100c): the guest
@@ -427,6 +434,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
     let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
+    let cursor_pos = Arc::clone(&dev.state.cursor.pos);
     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
     DEVICES.lock().insert(
@@ -443,6 +451,8 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             intr_disp,
             intr_gpu,
             child_doorbell_rung,
+            cursor_pos,
+            cursor_lockfree: AtomicBool::new(cursor_lockfree_enabled()),
             intr_fault,
             fifo_read_live,
             present_action_pending: AtomicBool::new(false),
@@ -666,6 +676,33 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             }
             return true;
         }
+        // The cursor doorbell (0x1220), REIMS_VGPU_LAB_CURSOR_LOCKFREE=on only
+        // (port of 570c6ab8, MAXZVER/reims-vgpu#3 Step B). macOS writes it on
+        // every hardware-cursor move (190-290 a second while the pointer moves)
+        // and the queued arm below waits behind the drain tranche, so the
+        // cursor sample and display IRQ can reach the guest late.
+        //
+        // It can be taken here for the same reason the child doorbell can: it
+        // carries no state the decode depends on. Its whole effect is
+        // `crate::runtime::mmio::cursor_doorbell`, and every piece of state that
+        // touches is a lock-free clone on this slot. When the slot cannot serve
+        // it the write takes the queued arm below, unchanged, under its own
+        // `lock_free_cursor_doorbell_fallback_*` slug.
+        if offset == crate::model::GFX_REG_EFI_DISPLAY_IRQ
+            && slot.cursor_lockfree.load(Ordering::Relaxed)
+        {
+            match lock_free_cursor_doorbell(&slot, id, data as u32) {
+                Ok(()) => {
+                    crate::runtime::drain::note_store_route("lock_free_cursor_doorbell");
+                    return true;
+                }
+                Err(fallback) => crate::runtime::drain::note_store_route(fallback.slug()),
+            }
+        }
+    } else if offset == crate::model::GFX_REG_EFI_DISPLAY_IRQ
+        && slot.cursor_lockfree.load(Ordering::Relaxed)
+    {
+        crate::runtime::drain::note_store_route(CursorDoorbellFallback::Size.slug());
     }
     let mut write = QueuedGfxWrite {
         offset,
@@ -688,6 +725,91 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
     drop(ingress);
     schedule_device(&slot);
     true
+}
+
+/// `REIMS_VGPU_LAB_CURSOR_LOCKFREE`, read once (default off: only an explicit
+/// `1`/`on`/`true`/`yes` arms it). Prints `reims-cursor: lockfree on|off`.
+fn cursor_lockfree_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let (state, value) = crate::config::read(crate::config::LAB_CURSOR_LOCKFREE);
+        if state == crate::config::Switch::Unrecognized {
+            crate::observe::fail(format!(
+                "cursor_lockfree reason=cursor_lockfree_env_unrecognized value={:?} (kept off)",
+                value.unwrap_or_default()
+            ));
+        }
+        let on = matches!(state, crate::config::Switch::On);
+        eprintln!("reims-cursor: lockfree {}", if on { "on" } else { "off" });
+        crate::observe::off(format!("reims_cursor lockfree={}", if on { "on" } else { "off" }));
+        on
+    })
+}
+
+/// Why a cursor doorbell (0x1220) took the queued arm instead of the lock-free
+/// one. Each reason is its own greppable `store_routes` slug.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorDoorbellFallback {
+    /// Not a 4-byte write; the locked handler splits or refuses it.
+    Size,
+    /// `val` names no interrupt bit. The locked handler ignores it.
+    BitRange,
+    /// No QEMU host ops (unit tests, headless create).
+    NoHost,
+    /// No locked `device_poll` has published the display shared page yet.
+    NoSharedGpa,
+}
+
+impl CursorDoorbellFallback {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Size => "lock_free_cursor_doorbell_fallback_size",
+            Self::BitRange => "lock_free_cursor_doorbell_fallback_bit_range",
+            Self::NoHost => "lock_free_cursor_doorbell_fallback_no_host",
+            Self::NoSharedGpa => "lock_free_cursor_doorbell_fallback_no_shared_gpa",
+        }
+    }
+}
+
+/// Serve a cursor doorbell without the device lock (switch on only).
+///
+/// The same body the locked handler runs
+/// ([`crate::runtime::mmio::cursor_doorbell`]), handed the slot's lock-free
+/// clones: `intr_disp`, the cursor mirror (`cursor_pos`) and the shared-page
+/// address the last locked `device_poll` published (`vbl_shared_gpa`, the
+/// snapshot the contended VBL pulse already relies on). Actions go to
+/// `prompt_actions` through a scratch-backed `QemuHost`. Never takes `inner` or
+/// the engine lock.
+fn lock_free_cursor_doorbell(
+    slot: &BoundDevice,
+    id: u64,
+    val: u32,
+) -> Result<(), CursorDoorbellFallback> {
+    if val >= 32 {
+        return Err(CursorDoorbellFallback::BitRange);
+    }
+    let Some(ops) = slot.ops else {
+        return Err(CursorDoorbellFallback::NoHost);
+    };
+    let shared_gpa = slot.vbl_shared_gpa.load(Ordering::Acquire);
+    if shared_gpa == 0 {
+        return Err(CursorDoorbellFallback::NoSharedGpa);
+    }
+    let mut scratch = VecDeque::new();
+    let mut host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
+    crate::runtime::mmio::cursor_doorbell(
+        &mut host,
+        id,
+        &slot.intr_disp,
+        &slot.cursor_pos,
+        shared_gpa,
+        val,
+    );
+    drop(host);
+    // Neither action this body queues is a device-lock action; anything that
+    // landed in the scratch queue would be one, and would be lost here.
+    debug_assert!(scratch.is_empty(), "cursor doorbell queued a lock-owning action");
+    Ok(())
 }
 
 /// Take the device lock from the vCPU thread, measuring the wait.
