@@ -6665,6 +6665,21 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     ];
     let mut modes = vec![panel.native];
     modes.extend(BUILT_IN.iter().copied().filter(|&m| m != panel.native));
+    // TEMP (lab, Opus 2026-10-19): REIMS_VGPU_LAB_DISPLAY_EXTRA_MODES=WxH[,WxH..] appends timings. The guest offers
+    // every timing twice - 1x and HiDPI at half its size in points - so a 6400x2700 timing is "looks like 3200x1350"
+    // rendered at 2x, which the host present scales onto the window (a Retina Mac's scaled modes).
+    if let Ok(extra) = std::env::var("REIMS_VGPU_LAB_DISPLAY_EXTRA_MODES") {
+        for item in extra.split(',') {
+            let parsed = item.trim().to_ascii_lowercase().split_once('x').and_then(|(w, h)| {
+                Some((w.trim().parse::<u16>().ok()?, h.trim().parse::<u16>().ok()?))
+            });
+            if let Some(m) = parsed.filter(|&(w, h)| (1..=8192).contains(&w) && (1..=8192).contains(&h)) {
+                if !modes.contains(&m) {
+                    modes.push(m);
+                }
+            }
+        }
+    }
     let modes: &[(u16, u16)] = &modes;
     shared_w16(
         host,
