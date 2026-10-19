@@ -13817,6 +13817,30 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 // handed the guest's own bytes over untouched.
                 let mut sampled_components = pixel_format::swizzle_identity();
                 let mut source_planes = 1;
+                // TEMP (lab, Opus 2026-10-19, Graphite path loss): every texture a multisampled draw binds -
+                // Chrome's icons are drawn by sampling a coverage atlas into small 4x targets, and come out empty.
+                if pipeline_sample_count > 1 {
+                    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+                        let kind = match &loaded {
+                            SampledSourceRequest::Bytes(b, id, fmt, origin) => {
+                                let nz = b.iter().filter(|&&x| x != 0).count();
+                                format!("bytes len={} nonzero={nz} fmt={fmt:?} origin={origin:?} id={}", b.len(), id.is_some())
+                            }
+                            SampledSourceRequest::Target(id, f) => format!("target {id:?} {f:?}"),
+                            SampledSourceRequest::TargetRegion(..) => "target_region".to_string(),
+                            #[allow(unreachable_patterns)]
+                            _ => "other".to_string(),
+                        };
+                        crate::observe::off(format!(
+                            "lab_msaa_bind task={} pipe={} frag={} idx={index} ref={texture_ref} {tw}x{th} {kind} t={}",
+                            req.task_id,
+                            req.pipeline_ref,
+                            u8::from(frag_stage),
+                            crate::observe::elapsed_us() / 1000
+                        ));
+                    }
+                }
                 let source_is_target = matches!(
                     &loaded,
                     SampledSourceRequest::Target(_, _) | SampledSourceRequest::TargetRegion(..)
