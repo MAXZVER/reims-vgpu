@@ -3224,15 +3224,15 @@ fn lab_resolve_census(
     crate::observe::fail(line);
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_SPV_ALL=1` writes every fragment module once per
+/// TEMP (lab): `REIMS_VGPU_LAB_SPV_ALL=1` writes every fragment and vertex module once per
 /// (task, pipeline) to `E:/tmp/labspv/tTASK-pPIPE-ENTRY-wWORDS.spv`.
-fn lab_spv_all(req: &DrawEncodeRequest, entry: Option<&str>, spirv: &[u8]) {
+fn lab_spv_all(req: &DrawEncodeRequest, stage: &str, entry: Option<&str>, spirv: &[u8]) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SPV_ALL").is_ok()) {
         return;
     }
     if !crate::observe::first_sight(
-        "lab_spv_all",
+        if stage == "v" { "lab_spv_all_v" } else { "lab_spv_all" },
         (u64::from(req.task_id) << 32) | u64::from(req.pipeline_ref),
     ) {
         return;
@@ -3252,7 +3252,7 @@ fn lab_spv_all(req: &DrawEncodeRequest, entry: Option<&str>, spirv: &[u8]) {
         .collect();
     let _ = std::fs::write(
         format!(
-            "/tmp/labspv/t{}-p{}-{name}-w{}.spv",
+            "/tmp/labspv/t{}-p{}-{stage}-{name}-w{}.spv",
             req.task_id,
             req.pipeline_ref,
             spirv.len() / 4
@@ -12796,8 +12796,15 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         drop(fragment_span);
         lab_spv_all(
             req,
+            "f",
             f_shader.reflection.entry_point.as_deref(),
             &f_shader.spirv,
+        );
+        lab_spv_all(
+            req,
+            "v",
+            v_shader.reflection.entry_point.as_deref(),
+            &v_shader.spirv,
         );
         lab_cover_draw(req, f_shader.reflection.entry_point.as_deref());
         lab_repeat_draw(
