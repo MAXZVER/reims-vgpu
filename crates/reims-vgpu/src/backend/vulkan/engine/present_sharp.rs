@@ -218,7 +218,7 @@ pub(crate) struct PresentSharp {
     /// The swapchain-image view and framebuffer each entry's last draw used.
     transient: Vec<Option<(vk::ImageView, vk::Framebuffer)>>,
     /// RCAS: its linear strength, or `None` (one EASU draw, as before). With
-    /// NIS `Some(0.0)`: the window pass is then an exact copy of `mid`.
+    /// NIS `Some(0.0)` (an exact copy of `mid`) unless PRESENT_RCAS is set too.
     rcas: Option<f32>,
     /// NIS: its sharpness, or `None` (EASU).
     nis: Option<f32>,
@@ -268,7 +268,9 @@ impl PresentSharp {
             pool: vk::DescriptorPool::null(),
             sets: Vec::new(),
             transient: vec![None; frames],
-            rcas: if nis_sharp().is_some() { Some(0.0) } else { rcas_sharp() },
+            // With NIS the window pass is RCAS too: an exact copy unless
+            // REIMS_VGPU_LAB_PRESENT_RCAS also asks for its sharpening.
+            rcas: if nis_sharp().is_some() { Some(rcas_sharp().unwrap_or(0.0)) } else { rcas_sharp() },
             nis: nis_sharp(),
             nis_set_layout: vk::DescriptorSetLayout::null(),
             nis_layout: vk::PipelineLayout::null(),
@@ -1128,7 +1130,7 @@ impl PresentSharp {
             for (i, v) in [vp.0, vp.1, vp.2, vp.3].iter().enumerate() {
                 push[i * 4..i * 4 + 4].copy_from_slice(&(*v as i32).to_le_bytes());
             }
-            push[16..].copy_from_slice(&0.0f32.to_le_bytes());
+            push[16..].copy_from_slice(&rcas.unwrap_or(0.0).to_le_bytes());
             self.begin_window_pass(device, cmd, fb, extent, clear);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rcas_pipeline);
             Self::set_rect(device, cmd, vp.0, vp.1, vp.2, vp.3);
