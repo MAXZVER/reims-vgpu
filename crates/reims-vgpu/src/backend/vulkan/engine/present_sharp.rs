@@ -125,12 +125,11 @@ fn nis_config(sharpness: f32, src: (u32, u32), dst: (u32, u32)) -> Option<[u8; 1
 }
 
 /// NVScaler's two coefficient tables as 2 x 64 `R32G32B32A32_SFLOAT` images,
-/// filled once from `buffer` by the first present that uses them.
+/// refilled from `buffer` by every present that uses them.
 struct NisCoef {
     images: [(vk::Image, vk::DeviceMemory, vk::ImageView); 2],
     buffer: vk::Buffer,
     buffer_memory: vk::DeviceMemory,
-    uploaded: bool,
 }
 
 impl NisCoef {
@@ -495,7 +494,6 @@ impl PresentSharp {
             images: [(vk::Image::null(), vk::DeviceMemory::null(), vk::ImageView::null()); 2],
             buffer: vk::Buffer::null(),
             buffer_memory: vk::DeviceMemory::null(),
-            uploaded: false,
         };
         let r = (|| -> Result<(), vk::Result> {
             for slot in made.images.iter_mut() {
@@ -568,16 +566,32 @@ impl PresentSharp {
         (super::present_nis_coef::NIS_PHASES * super::present_nis_coef::NIS_TAPS * 4) as u64;
 
     /// Record the coefficient upload (`vkCmdUpdateBuffer`, then buffer ->
-    /// image) the first time; leaves both images in `SHADER_READ_ONLY_OPTIMAL`
-    /// ordered before compute reads.
+    /// image) into this present; leaves both images in
+    /// `SHADER_READ_ONLY_OPTIMAL` ordered before compute reads.
+    ///
+    /// Every present, not once: the first version marked the tables uploaded
+    /// when it recorded them, and a present whose command buffer never reached
+    /// the queue (a swapchain recreated at the guest's mode switch) left them
+    /// undefined for the rest of the boot - NVScaler then filtered with garbage
+    /// weights: flat areas striped every few columns, the whole interface
+    /// smeared (Mish 2026-10-19; the harness, whose one submit always lands,
+    /// stayed clean). 4 KiB of updates per present cost nothing.
     unsafe fn upload_nis_coef(&mut self, device: &ash::Device, cmd: vk::CommandBuffer) {
         let Some(coef) = self.nis_coef.as_mut() else {
             return;
         };
-        if coef.uploaded {
-            return;
-        }
-        coef.uploaded = true;
+        // The previous present's copy out of the buffer and NVScaler's reads of
+        // the images finish before this one rewrites them (write after read:
+        // an execution dependency, chained by the barriers below).
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[],
+        );
         let tables = [&super::present_nis_coef::NIS_COEF_SCALE, &super::present_nis_coef::NIS_COEF_USM];
         for (i, t) in tables.iter().enumerate() {
             let mut bytes = Vec::with_capacity(Self::NIS_COEF_BYTES as usize);
