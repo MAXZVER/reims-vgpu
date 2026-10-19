@@ -13952,6 +13952,29 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                     // single-sample, or the content is the clear colour in guest RAM). Every sample is that
                     // pixel, so the single-sample read is the resolve's exact answer - and refusing here used
                     // to drop the whole pass with it, leaving Electron windows with empty tiles.
+                    // TEMP (lab, Opus 2026-10-19, Graphite path loss): which plane the read named and which
+                    // multisample residents the ledger holds at that address as the only copy.
+                    {
+                        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
+                            let st = acc.shared();
+                            let plane = texture_resource.as_ref().and_then(|r| match r.decoded() {
+                                Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => tex
+                                    .level_gva(0, st.page_shift)
+                                    .map(|(gva, l)| (gva, l.row_stride, l.width, l.height, tex.pixel_format)),
+                                _ => None,
+                            });
+                            let sole = plane.map(|p| st.pending_writebacks.lab_sole_copies_at_gva(p.0));
+                            crate::observe::off(format!(
+                                "lab_ms_read_demoted task={} pipe={} ref={texture_ref} idx={index} plane={plane:?}                                  sole={sole:?} src={}x{} t={}",
+                                req.task_id,
+                                req.pipeline_ref,
+                                tw,
+                                th,
+                                crate::observe::elapsed_us() / 1000
+                            ));
+                        }
+                    }
                     frag_ms_demote = true;
                     multisampled = false;
                     crate::runtime::drain::note_store_route("frag_ms_demoted_bind");
