@@ -597,7 +597,6 @@ impl ResourcePools {
             return;
         }
         self.retire_released_residents(ctx, counters, super::released_retire_per_pass());
-        unsafe { self.relieve_vram_pressure(ctx, counters) };
         if let Some(max) = super::stale_retire_per_pass() {
             unsafe { self.retire_stale_generation_residents(ctx, counters, max) };
         }
