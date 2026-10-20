@@ -208,6 +208,12 @@ impl MidImage {
     }
 }
 
+const DLSS_DEPTH_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
+const DLSS_MVEC_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
+const DLSS_AUX_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::SAMPLED.as_raw() | vk::ImageUsageFlags::STORAGE.as_raw() | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
+);
+
 pub(crate) struct PresentSharp {
     render_pass: vk::RenderPass,
     set_layout: vk::DescriptorSetLayout,
@@ -252,6 +258,11 @@ pub(crate) struct PresentSharp {
     vsr_created: bool,
     /// VSR: a create or evaluate refused; the present keeps EASU from here on.
     vsr_failed: bool,
+    /// TEMP (lab, PRESENT_DLSS_SR): DLSS Super Resolution in VSR's place - its zero depth and motion vectors at
+    /// the input size, and whether they were cleared (and the history reset) since they were made.
+    dlss_depth: Option<MidImage>,
+    dlss_mvec: Option<MidImage>,
+    dlss_cleared: bool,
     /// TEMP (lab, PRESENT_VSR_TILES): VSR on the still cells, and whether the
     /// present being recorded draws its overlay.
     refine: Option<super::present_refine::TileRefine>,
@@ -316,6 +327,9 @@ impl PresentSharp {
             vsr_in: None,
             vsr_created: false,
             vsr_failed: false,
+            dlss_depth: None,
+            dlss_mvec: None,
+            dlss_cleared: false,
             refine: None,
             refine_failed: false,
             refine_active: false,
@@ -970,6 +984,145 @@ impl PresentSharp {
         }
     }
 
+    /// TEMP (lab, PRESENT_DLSS_SR): the zero depth (R32F) and motion vectors (RG16F) at the input size.
+    unsafe fn ensure_dlss_aux(
+        &mut self,
+        device: &ash::Device,
+        width: u32,
+        height: u32,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> Result<(), vk::Result> {
+        if self.dlss_depth.as_ref().is_some_and(|m| (m.width, m.height) == (width, height)) && self.dlss_mvec.is_some() {
+            return Ok(());
+        }
+        for old in [self.dlss_depth.take(), self.dlss_mvec.take()].into_iter().flatten() {
+            self.retired.push((old, self.records));
+        }
+        self.dlss_cleared = false;
+        let make = |format: vk::Format| -> Result<MidImage, vk::Result> {
+            let mut made = MidImage {
+                image: vk::Image::null(),
+                memory: vk::DeviceMemory::null(),
+                view: vk::ImageView::null(),
+                fb: vk::Framebuffer::null(),
+                width,
+                height,
+            };
+            let r = (|| -> Result<(), vk::Result> {
+                made.image = device.create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(format)
+                        .extent(vk::Extent3D { width, height, depth: 1 })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(DLSS_AUX_USAGE)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )?;
+                let req = device.get_image_memory_requirements(made.image);
+                let mt = memory_type(req.memory_type_bits, req.size, false).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+                made.memory = device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt),
+                    None,
+                )?;
+                device.bind_image_memory(made.image, made.memory, 0)?;
+                made.view = device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(made.image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(format)
+                        .subresource_range(super::color_subresource_range()),
+                    None,
+                )?;
+                Ok(())
+            })();
+            match r {
+                Ok(()) => Ok(made),
+                Err(e) => {
+                    made.destroy(device);
+                    Err(e)
+                }
+            }
+        };
+        let depth = make(DLSS_DEPTH_FORMAT)?;
+        match make(DLSS_MVEC_FORMAT) {
+            Ok(mvec) => {
+                self.dlss_depth = Some(depth);
+                self.dlss_mvec = Some(mvec);
+                Ok(())
+            }
+            Err(e) => {
+                depth.destroy(device);
+                Err(e)
+            }
+        }
+    }
+
+    /// TEMP (lab, PRESENT_DLSS_SR): DLSS from `vin` (shader-read, rgba8) into `mid` (general, rgba8). Clears the
+    /// depth and motion vectors to zero the first time (and resets the history then): a desktop's content does
+    /// not move between two presents of a still screen, which is where DLSS accumulates.
+    unsafe fn dlss_evaluate(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        vin: (vk::Image, vk::ImageView, u32, u32),
+        mid: (vk::Image, vk::ImageView, u32, u32),
+    ) -> i32 {
+        let (Some(depth), Some(mvec)) = (self.dlss_depth.as_ref(), self.dlss_mvec.as_ref()) else {
+            return -102;
+        };
+        let range = super::color_subresource_range();
+        let reset = !self.dlss_cleared;
+        if !self.dlss_cleared {
+            let to_dst = [depth.image, mvec.image].map(|image| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range)
+            });
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_dst);
+            for image in [depth.image, mvec.image] {
+                device.cmd_clear_color_image(cmd, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: [0.0; 4] }, &[range]);
+            }
+            let to_general = [depth.image, mvec.image].map(|image| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range)
+            });
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &to_general);
+            self.dlss_cleared = true;
+        }
+        let image = |(image, view, width, height): (vk::Image, vk::ImageView, u32, u32), layout, format, usage| {
+            super::present_dlssg::DlssSrImage { image, view, memory: vk::DeviceMemory::null(), layout, format, width, height, usage }
+        };
+        let rgba = vk::Format::R8G8B8A8_UNORM;
+        let vin_usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE;
+        let mid_usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        let aux = |m: &MidImage, format| image((m.image, m.view, m.width, m.height), vk::ImageLayout::GENERAL, format, DLSS_AUX_USAGE);
+        super::present_dlssg::dlss_sr_evaluate(
+            cmd,
+            &image(vin, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, rgba, vin_usage),
+            &image(mid, vk::ImageLayout::GENERAL, rgba, mid_usage),
+            &aux(depth, DLSS_DEPTH_FORMAT),
+            &aux(mvec, DLSS_MVEC_FORMAT),
+            reset,
+        )
+    }
+
     unsafe fn write_set(&self, device: &ash::Device, set: vk::DescriptorSet, view: vk::ImageView) {
         let image_info = [vk::DescriptorImageInfo::default()
             .sampler(self.sampler)
@@ -1143,7 +1296,10 @@ impl PresentSharp {
             .subresource_range(super::color_subresource_range())];
         let nis_cfg = if rcas.is_some() { nis_cfg } else { None };
         // VSR this present: ready, a `mid`, and its input image.
-        let vsr = match (self.vsr.filter(|_| vsr_this), rcas.is_some() && !self.vsr_failed && super::present_vsr::ready()) {
+        // TEMP (lab, PRESENT_DLSS_SR): DLSS Super Resolution takes VSR's place (same input, same `mid`).
+        let dlss = super::present_dlssg::dlss_sr_active();
+        let upscaler_ready = if dlss { true } else { super::present_vsr::ready() };
+        let vsr = match (self.vsr.filter(|_| vsr_this), rcas.is_some() && !self.vsr_failed && upscaler_ready) {
             (Some(q), true) => match self.ensure_vsr_in(device, src.width, src.height, memory_type) {
                 Ok(()) => Some(q),
                 Err(e) => {
@@ -1158,7 +1314,18 @@ impl PresentSharp {
         if let (Some(q), Some(vin), Some(mid)) = (vsr, self.vsr_in.as_ref(), self.mid.as_ref()) {
             let (vin_image, vin_view, vin_w, vin_h) = (vin.image, vin.view, vin.width, vin.height);
             let (mid_image, mid_view, mid_w, mid_h) = (mid.image, mid.view, mid.width, mid.height);
-            if !self.vsr_created {
+            if dlss {
+                // Streamline creates its feature on the first evaluate; only its inputs are made here.
+                self.vsr_created = match self.ensure_dlss_aux(device, vin_w, vin_h, memory_type) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        crate::observe::fail(format!("present_dlss_sr_refused reason=aux err={e:?} {vin_w}x{vin_h}"));
+                        self.vsr_failed = true;
+                        false
+                    }
+                };
+            }
+            if !self.vsr_created && !dlss {
                 self.vsr_created = super::present_vsr::create_feature(device, cmd);
                 if !self.vsr_created {
                     self.vsr_failed = true;
@@ -1235,7 +1402,9 @@ impl PresentSharp {
                     &[],
                     &vin_read,
                 );
-                let r = super::present_vsr::evaluate(
+                let r = if dlss {
+                    self.dlss_evaluate(device, cmd, (vin_image, vin_view, vin_w, vin_h), (mid_image, mid_view, mid_w, mid_h))
+                } else { super::present_vsr::evaluate(
                     cmd,
                     &super::present_vsr::VsrImage {
                         image: vin_image,
@@ -1252,7 +1421,7 @@ impl PresentSharp {
                         height: mid_h,
                     },
                     q,
-                );
+                ) };
                 {
                     // TEMP (lab): how often VSR ran (with a settle time: once per settled frame).
                     static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

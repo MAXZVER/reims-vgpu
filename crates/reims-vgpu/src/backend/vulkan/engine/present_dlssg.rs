@@ -28,6 +28,49 @@ pub(crate) fn on() -> bool {
     })
 }
 
+/// TEMP (lab): `REIMS_VGPU_LAB_PRESENT_DLSS_SR=dlaa|quality|balanced|performance|ultra` - the present's upscale
+/// (where VSR runs) by DLSS Super Resolution through Streamline instead; `REIMS_VGPU_LAB_PRESENT_DLSS_PRESET`
+/// K/L/M (the DLSS 4.5 transformer presets L and M) or unset for the mode's default. `(sl::DLSSMode, sl::DLSSPreset)`.
+pub(crate) fn dlss_sr() -> Option<(i32, i32)> {
+    static SR: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    *SR.get_or_init(|| {
+        let mode = match std::env::var("REIMS_VGPU_LAB_PRESENT_DLSS_SR").ok()?.as_str() {
+            "performance" => 1,
+            "balanced" => 2,
+            "quality" => 3,
+            "ultra" => 4,
+            "dlaa" => 6,
+            other => {
+                crate::observe::fail(format!("present_dlss_sr_refused reason=mode_unrecognized value={other}"));
+                return None;
+            }
+        };
+        let preset = match std::env::var("REIMS_VGPU_LAB_PRESENT_DLSS_PRESET").as_deref() {
+            Ok("K" | "k") => 11,
+            Ok("L" | "l") => 12,
+            Ok("M" | "m") => 13,
+            _ => 0,
+        };
+        Some((mode, preset))
+    })
+}
+
+/// Streamline is wanted: DLSS-G or the DLSS upscale.
+fn sl_wanted() -> bool {
+    on() || dlss_sr().is_some()
+}
+
+static PRESENT_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A new present: the Streamline frame index both features of this present use.
+pub(crate) fn begin_present() {
+    PRESENT_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn present_index() -> u32 {
+    PRESENT_INDEX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn dir() -> String {
     std::env::var("REIMS_VGPU_LAB_PRESENT_DLSSG_DIR").unwrap_or_else(|_| "E:/reims-lab/dlssg".into())
 }
@@ -52,6 +95,16 @@ type FnMarker = unsafe extern "C" fn(*mut c_void, u32) -> i32;
 type FnTag = unsafe extern "C" fn(*mut c_void, vk::CommandBuffer, *const RslgImage, *const RslgImage, *const RslgImage, u32, u32) -> i32;
 type FnConstants = unsafe extern "C" fn(*mut c_void, f32, f32, i32) -> i32;
 type FnState = unsafe extern "C" fn(*mut u32, *mut u32, *mut u64) -> i32;
+type FnDlss = unsafe extern "C" fn(i32, u32, u32, i32) -> i32;
+type FnDlssEval = unsafe extern "C" fn(
+    *mut c_void,
+    vk::CommandBuffer,
+    *const RslgImage,
+    *const RslgImage,
+    *const RslgImage,
+    *const RslgImage,
+    i32,
+) -> i32;
 
 struct Api {
     init: FnInit,
@@ -63,6 +116,8 @@ struct Api {
     tag: FnTag,
     constants: FnConstants,
     state: FnState,
+    dlss: FnDlss,
+    dlss_eval: FnDlssEval,
 }
 
 #[cfg(target_os = "windows")]
@@ -79,7 +134,7 @@ fn wide(s: &str) -> Vec<u16> {
 fn api() -> Option<&'static Api> {
     static API: std::sync::OnceLock<Option<Api>> = std::sync::OnceLock::new();
     API.get_or_init(|| {
-        if !on() {
+        if !sl_wanted() {
             return None;
         }
         #[cfg(target_os = "windows")]
@@ -107,6 +162,8 @@ fn api() -> Option<&'static Api> {
                     tag: std::mem::transmute::<*mut c_void, FnTag>(sym(b"rslg_tag\0")?),
                     constants: std::mem::transmute::<*mut c_void, FnConstants>(sym(b"rslg_constants\0")?),
                     state: std::mem::transmute::<*mut c_void, FnState>(sym(b"rslg_state\0")?),
+                    dlss: std::mem::transmute::<*mut c_void, FnDlss>(sym(b"rslg_dlss\0")?),
+                    dlss_eval: std::mem::transmute::<*mut c_void, FnDlssEval>(sym(b"rslg_dlss_eval\0")?),
                 })
             })();
             if made.is_none() {
@@ -148,6 +205,79 @@ pub(crate) fn loader() -> Option<std::path::PathBuf> {
 /// Whether the device came up through Streamline (DLSS-G active).
 pub(crate) fn active() -> bool {
     on() && loader().is_some()
+}
+
+/// Whether the DLSS upscale can run: asked for and the device came up through Streamline.
+pub(crate) fn dlss_sr_active() -> bool {
+    dlss_sr().is_some() && loader().is_some()
+}
+
+/// One image handed to the DLSS upscale (the layout it is in when the evaluate runs).
+pub(crate) struct DlssSrImage {
+    pub image: vk::Image,
+    pub view: vk::ImageView,
+    pub memory: vk::DeviceMemory,
+    pub layout: vk::ImageLayout,
+    pub format: vk::Format,
+    pub width: u32,
+    pub height: u32,
+    pub usage: vk::ImageUsageFlags,
+}
+
+fn rslg_image(i: &DlssSrImage) -> RslgImage {
+    RslgImage {
+        image: i.image,
+        view: i.view,
+        memory: i.memory,
+        layout: i.layout.as_raw() as u32,
+        format: i.format.as_raw() as u32,
+        width: i.width,
+        height: i.height,
+        usage: i.usage.as_raw(),
+    }
+}
+
+/// Record a DLSS upscale of `input` into `output` (zero depth and motion vectors at the input size) into `cmd`,
+/// setting the options first whenever the output size changed. 0, or the shim's / Streamline's code.
+pub(crate) unsafe fn dlss_sr_evaluate(
+    cmd: vk::CommandBuffer,
+    input: &DlssSrImage,
+    output: &DlssSrImage,
+    depth: &DlssSrImage,
+    mvec: &DlssSrImage,
+    reset: bool,
+) -> i32 {
+    static SET_FOR: std::sync::Mutex<Option<(u32, u32)>> = std::sync::Mutex::new(None);
+    let (Some(api), Some((mode, preset))) = (api(), dlss_sr()) else {
+        return -100;
+    };
+    {
+        let mut set = SET_FOR.lock().unwrap_or_else(|e| e.into_inner());
+        if *set != Some((output.width, output.height)) {
+            let r = (api.dlss)(mode, output.width, output.height, preset);
+            crate::observe::off(format!(
+                "present_dlss_sr options sl={r} mode={mode} preset={preset} {}x{}->{}x{}",
+                input.width, input.height, output.width, output.height
+            ));
+            if r != 0 {
+                return r;
+            }
+            *set = Some((output.width, output.height));
+        }
+    }
+    let token = (api.frame)(present_index());
+    if token.is_null() {
+        return -101;
+    }
+    (api.dlss_eval)(
+        token,
+        cmd,
+        &rslg_image(input),
+        &rslg_image(output),
+        &rslg_image(depth),
+        &rslg_image(mvec),
+        i32::from(reset),
+    )
 }
 
 struct DlssgImage {
@@ -266,7 +396,7 @@ impl Dlssg {
                 return None;
             }
         }
-        let token = (api.frame)(self.frame);
+        let token = (api.frame)(present_index());
         self.frame = self.frame.wrapping_add(1);
         if token.is_null() {
             return None;

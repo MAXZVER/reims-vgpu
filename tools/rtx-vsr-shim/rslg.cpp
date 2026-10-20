@@ -22,6 +22,7 @@
 
 #include "sl.h"
 #include "sl_consts.h"
+#include "sl_dlss.h"
 #include "sl_dlss_g.h"
 #include "sl_helpers_vk.h"
 #include "sl_pcl.h"
@@ -40,7 +41,7 @@ static int rc(sl::Result r) {
 // `log_dir`: SL's log (may be null). Returns 0 or 1000 + sl::Result.
 RSLG_API int rslg_init(const wchar_t* plugin_dir, const wchar_t* log_dir, int verbose) {
     if (g_inited) return 0;
-    static const sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
+    static const sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL, sl::kFeatureDLSS};
     const wchar_t* paths[] = {plugin_dir};
     sl::Preferences pref{};
     pref.showConsole = false;
@@ -53,7 +54,7 @@ RSLG_API int rslg_init(const wchar_t* plugin_dir, const wchar_t* log_dir, int ve
     pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eDisableDebugText |
                  sl::PreferenceFlags::eUseFrameBasedResourceTagging;
     pref.featuresToLoad = features;
-    pref.numFeaturesToLoad = 3;
+    pref.numFeaturesToLoad = 4;
     pref.engine = sl::EngineType::eCustom;
     pref.engineVersion = "reims-vgpu";
     pref.projectId = "a8f1c3d2-6b4e-4f7a-9d2c-3e5b7a9c1f04";
@@ -86,13 +87,20 @@ RSLG_API int rslg_dlssg(int on) {
     return rc(slDLSSGSetOptions(g_viewport, o));
 }
 
-// A new frame: its token (opaque, valid until the next call), Reflex sleep and the simulation markers.
+// A new frame: its token (opaque, valid until the next call), Reflex sleep and the simulation markers. Idempotent per
+// index: DLSS Super Resolution (in the present's filter) and DLSS-G (at present) share one frame's token, whichever
+// asks first opens the frame.
+static uint32_t g_frame_index = UINT32_MAX;
+static sl::FrameToken* g_frame_token = nullptr;
 RSLG_API void* rslg_frame(uint32_t index) {
+    if (g_frame_token && index == g_frame_index) return g_frame_token;
     sl::FrameToken* token = nullptr;
     if (slGetNewFrameToken(token, &index) != sl::Result::eOk) return nullptr;
     slReflexSleep(*token);
     slPCLSetMarker(sl::PCLMarker::eSimulationStart, *token);
     slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *token);
+    g_frame_index = index;
+    g_frame_token = token;
     return token;
 }
 
@@ -177,6 +185,52 @@ RSLG_API int rslg_constants(void* token, float mvec_scale_x, float mvec_scale_y,
     c.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     c.orthographicProjection = sl::Boolean::eTrue;
     return rc(slSetConstants(c, *static_cast<sl::FrameToken*>(token), g_viewport));
+}
+
+// Whether DLSS Super Resolution is supported on `pd` (0) or why not (1000 + sl::Result).
+RSLG_API int rslg_dlss_supported(VkPhysicalDevice pd) {
+    sl::AdapterInfo info{};
+    info.vkPhysicalDevice = pd;
+    return rc(slIsFeatureSupported(sl::kFeatureDLSS, info));
+}
+
+// DLSS Super Resolution options for the one viewport: `mode` an sl::DLSSMode value, the output size, `preset` an
+// sl::DLSSPreset value for every mode (0 = default; 11 = K, 12 = L, 13 = M - the DLSS 4.5 transformer presets).
+// The guest frame is LDR sRGB-encoded 8-bit.
+RSLG_API int rslg_dlss(int mode, uint32_t out_w, uint32_t out_h, int preset) {
+    sl::DLSSOptions o{};
+    o.mode = sl::DLSSMode(mode);
+    o.outputWidth = out_w;
+    o.outputHeight = out_h;
+    o.colorBuffersHDR = sl::Boolean::eFalse;
+    sl::DLSSPreset p = sl::DLSSPreset(preset);
+    o.dlaaPreset = o.qualityPreset = o.balancedPreset = o.performancePreset = o.ultraPerformancePreset =
+        o.ultraQualityPreset = p;
+    return rc(slDLSSSetOptions(g_viewport, o));
+}
+
+// Upscale `in` into `out` with DLSS for this frame: tags (input colour, output colour, depth and motion vectors at
+// the input size), the frame's constants (`reset` drops the history), then the evaluate recorded into `cb`.
+RSLG_API int rslg_dlss_eval(void* token, VkCommandBuffer cb, const RslgImage* in, const RslgImage* out,
+                            const RslgImage* depth, const RslgImage* mvec, int reset) {
+    if (!token) return -1;
+    sl::Resource i = resource(*in), o = resource(*out), d = resource(*depth), m = resource(*mvec);
+    sl::Extent ein{0, 0, in->width, in->height};
+    sl::Extent eout{0, 0, out->width, out->height};
+    sl::ResourceTag tags[] = {
+        sl::ResourceTag(&i, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilPresent, &ein),
+        sl::ResourceTag(&o, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilPresent, &eout),
+        sl::ResourceTag(&d, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &ein),
+        sl::ResourceTag(&m, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &ein),
+    };
+    sl::FrameToken& t = *static_cast<sl::FrameToken*>(token);
+    sl::CommandBuffer* slcb = reinterpret_cast<sl::CommandBuffer*>(cb);
+    sl::Result r = slSetTagForFrame(t, g_viewport, tags, 4, slcb);
+    if (r != sl::Result::eOk) return rc(r);
+    int c = rslg_constants(token, 1.0f / float(in->width), 1.0f / float(in->height), reset);
+    if (c) return c;
+    const sl::BaseStructure* inputs[] = {&g_viewport};
+    return rc(slEvaluateFeature(sl::kFeatureDLSS, t, inputs, 1, slcb));
 }
 
 // DLSS-G's state: frames presented per host present and its status bits.

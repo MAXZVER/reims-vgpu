@@ -1418,6 +1418,9 @@ impl WindowPresenter {
                 .map_err(|error| {
                     DrawError::VkCall(VkCall::new(VkOp::WindowBeginCommandBuffer, error))
                 })?;
+            // TEMP (lab, PRESENT_DLSSG / PRESENT_DLSS_SR): one Streamline frame per present, shared by the
+            // filter's DLSS upscale and DLSS-G at present.
+            super::present_dlssg::begin_present();
             // TEMP (lab, PRESENT_GPU_TIME): the top stamp of this present.
             if lab_present_gpu_time() && self.lab_gpu.is_none() {
                 self.lab_gpu = LabGpuTime::create(ctx, self.frames.len());
@@ -1474,7 +1477,8 @@ impl WindowPresenter {
                     {
                         // TEMP (lab, PRESENT_VSR): NGX bound to this device once, before the
                         // filter that records it is built.
-                        if super::present_vsr::quality().is_some() {
+                        // (Not with PRESENT_DLSS_SR: DLSS takes VSR's place and NGX belongs to Streamline.)
+                        if super::present_vsr::quality().is_some() && !super::present_dlssg::dlss_sr_active() {
                             super::present_vsr::init(&ctx._entry, &ctx.instance, ctx.pd, &ctx.device, ctx.generation);
                         }
                         if self.sharp.is_none() && !self.sharp_failed {
