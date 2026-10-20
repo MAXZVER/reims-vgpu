@@ -920,6 +920,72 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     height: u32,
     skip: SkipRanges<'_>,
 ) -> bool {
+    // TEMP (lab, Opus 2026-10-20, REIMS_VGPU_LAB_BIG_SEED): where a 20 MB surface write spends its 6.5 ms.
+    let big = u64::from(width) * u64::from(height) >= 4_000_000;
+    let t_in = std::time::Instant::now();
+    if big {
+        LAB_W_MARKS.with(|m| m.set([None; 4]));
+    }
+    let ok = write_bgra8_inner_body(state, host, mapping_id, src, cache, src_stride, width, height, skip);
+    if big {
+        lab_big_write_census(mapping_id, t_in, ok);
+    }
+    ok
+}
+
+thread_local! {
+    /// TEMP (lab): [pre-settle start, contig decided, land done, tail start] of the write in flight.
+    static LAB_W_MARKS: std::cell::Cell<[Option<std::time::Instant>; 4]> = const { std::cell::Cell::new([None; 4]) };
+}
+
+fn lab_w_mark(i: usize) {
+    LAB_W_MARKS.with(|m| {
+        let mut v = m.get();
+        v[i] = Some(std::time::Instant::now());
+        m.set(v);
+    });
+}
+
+fn lab_big_write_census(mapping_id: u32, t_in: std::time::Instant, ok: bool) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_BIG_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if max == 0 || (n >= max && n % 100 != 0) {
+        return;
+    }
+    let end = std::time::Instant::now();
+    let m = LAB_W_MARKS.with(|m| m.get());
+    let us = |a: Option<std::time::Instant>, b: Option<std::time::Instant>| match (a, b) {
+        (Some(a), Some(b)) if b >= a => (b - a).as_micros() as i64,
+        _ => -1,
+    };
+    crate::observe::fail(format!(
+        "lab_big_write #{n} mid={mapping_id} ok={ok} total_us={} pre_us={} settle_vouch_contig_us={} land_us={}          mid_us={} tail_us={}",
+        (end - t_in).as_micros(),
+        us(Some(t_in), m[0]),
+        us(m[0], m[1]),
+        us(m[1], m[2]),
+        us(m[2], m[3]),
+        us(m[3], Some(end)),
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_bgra8_inner_body<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    cache: CacheOutcome<'_>,
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
+) -> bool {
     // TEMP (lab T2T_DEFER): an older blit frame owed to this mapping lands first,
     // so it cannot land on top of this one later. The landing's own write took
     // its entry out before writing, so this finds nothing for it.
@@ -982,6 +1048,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // geometry (`GeometryMoved` above refuses anything else), so the owed frame
     // is superseded rather than lost.
     let lab_t0 = std::time::Instant::now();
+    lab_w_mark(0);
     if skip.is_empty() {
         crate::runtime::writeback_debt::settle_for_mapping(
             state,
@@ -1060,6 +1127,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // Fast path: one packed view, poke rows in place.
     let lab_contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
     let lab_t3 = std::time::Instant::now();
+    lab_w_mark(1);
     if let Some((ptr, _)) = lab_contig {
         note_surface_write_path(true, frame_bytes);
         let land_started = std::time::Instant::now();
@@ -1267,6 +1335,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             land_started.elapsed().as_micros() as u64,
         );
     }
+    lab_w_mark(2);
     lab_mapw_diag(lab_t0, lab_t1, lab_t2, lab_t3);
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
@@ -1316,6 +1385,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
         return true;
     }
+    lab_w_mark(3);
     let cache_started = std::time::Instant::now();
     let tight_frame = (mw as usize)
         .saturating_mul(mh as usize)

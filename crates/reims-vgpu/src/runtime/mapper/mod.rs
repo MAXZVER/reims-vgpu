@@ -3405,6 +3405,7 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
     if buf.is_empty() {
         return true;
     }
+    let lab_mw0 = std::time::Instant::now(); // TEMP (lab): big-write split
     // Deferred-writeback flush-on-access: land any pending resident content
     // in these pages first so this write applies on top of it, not under it.
     crate::runtime::writeback_debt::settle_for_mapping(
@@ -3433,6 +3434,7 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
         ));
         return false;
     }
+    let lab_c0 = std::time::Instant::now(); // TEMP (lab): big-write split
     let ok = copy_mapping_runs(
         state,
         host,
@@ -3442,8 +3444,22 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
         only,
         "mapping_write",
     );
+    let lab_c1 = std::time::Instant::now();
     if ok {
         rebase_device_write(state, &*host, mapping_id, off, off.saturating_add(buf.len() as u64), only);
+    }
+    if buf.len() >= 4_000_000 && std::env::var_os("REIMS_VGPU_LAB_BIG_SEED").is_some() {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 40 || n % 100 == 0 {
+            crate::observe::fail(format!(
+                "lab_big_mapw #{n} mid={mapping_id} bytes={} prologue_us={} copy_us={} rebase_us={}",
+                buf.len(),
+                (lab_c0 - lab_mw0).as_micros(),
+                (lab_c1 - lab_c0).as_micros(),
+                lab_c1.elapsed().as_micros()
+            ));
+        }
     }
     if let Some(m) = state.mappings.get_mut(&mapping_id) {
         m.guest_bytes_seq = m.guest_bytes_seq.wrapping_add(1);
