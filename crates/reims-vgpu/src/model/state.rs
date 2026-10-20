@@ -3774,8 +3774,9 @@ pub struct DeviceState {
     /// Task-GVA HostOps views (zero-copy import substrate). Dropped on
     /// overlapping UnmapMemory/MapMemory2; flushed via `retired_views`.
     pub gva_host_views: Vec<GvaHostView>,
-    /// Linear-window residency keys whose `host_linear_textures` entry died
-    /// (task/object delete). `DeviceState` cannot reach the engine; the
+    /// Residency keys whose owner died (task/object delete): linear windows
+    /// whose `host_linear_textures` entry went, and heap textures whose
+    /// mirror key was dropped. `DeviceState` cannot reach the engine; the
     /// runtime unpins these
     /// ([`crate::runtime::render_writeback::retire_linear_residents`]) so the
     /// pinned images become LRU-evictable instead of leaking.
@@ -4436,6 +4437,38 @@ impl DeviceState {
         }
     }
 
+    /// Drop a deleted heap texture's residency-mirror key and queue the engine
+    /// release for the resident it named. A heap texture has no guest window to
+    /// re-read, so the engine's copy is the only content the key can point at:
+    /// a key that outlives its object either seeds the next texture created at
+    /// the same `(task, ref)` with the deleted one's pixels (silently — the
+    /// serve path finds the stale generation) or, once the resident was
+    /// reclaimed, refuses every dispatch bound to it forever
+    /// (`compute_stage_tex_heap_resident_lost`) because nothing ever removes
+    /// the key. `None` retires the task's whole heap population (task delete
+    /// and redefine); the engine release is the linear rail's pair — unpin
+    /// plus content-retire through `retired_linear_residents`.
+    fn retire_heap_residents(&mut self, task_id: u32, only_ref: Option<u32>) {
+        let doomed: Vec<ComputeStorageResidencyKey> = self
+            .compute_storage_residency
+            .keys()
+            .filter(|key| {
+                key.is_heap()
+                    && key.map_generation == task_id
+                    && only_ref.is_none_or(|ref_| key.texture_ref == ref_)
+            })
+            .copied()
+            .collect();
+        for key in doomed {
+            self.compute_storage_residency.remove(&key);
+            self.retired_linear_residents.push(key);
+        }
+    }
+
+    fn retire_task_heap_residents(&mut self, task_id: u32) {
+        self.retire_heap_residents(task_id, None);
+    }
+
     /// Install the guest's task under `task_id`, replacing any previous one.
     ///
     /// Returns nothing: it used to return `bool`, and the only `false` it could
@@ -4497,6 +4530,7 @@ impl DeviceState {
         // TEMP (lab): the census ring goes with the address space it describes.
         self.ch2ret.remove(&task_id);
         self.retire_task_linear_residents(task_id);
+        self.retire_task_heap_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
@@ -4546,6 +4580,7 @@ impl DeviceState {
             rail.delete_task(task_id);
         }
         self.retire_task_linear_residents(task_id);
+        self.retire_task_heap_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         self.host_texture_surfaces.retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
@@ -5913,6 +5948,7 @@ impl DeviceState {
         };
         if removed || resource_removed {
             self.invalidate_object_host_copies(task_id, ref_);
+            self.retire_heap_residents(task_id, Some(ref_));
             self.texture_to_mapping.remove(&(task_id, ref_));
             bump_names_gen();
             // The incarnation is deliberately not advanced here. Releasing a
@@ -8615,5 +8651,56 @@ mod sampled_generation_tests {
             std::ptr::eq(state.par().expect("the pool survived the reset"), &*pool),
             "the same pool, not a rebuilt one"
         );
+    }
+
+    /// A deleted heap texture's residency-mirror key must leave with the
+    /// object and reach the engine release queue: the engine's copy is the
+    /// only content a heap texture has, so a key that survives either seeds
+    /// the next texture at the same `(task, ref)` with the deleted one's
+    /// pixels or refuses its dispatches forever. Siblings (another ref, a
+    /// mapping-keyed window, another task's heap key) survive the retire.
+    #[test]
+    fn deleting_a_heap_texture_retires_its_residency_mirror() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.define_task(7, 0x1000, 5);
+        assert!(state.insert_object(7, 12));
+        let key = ComputeStorageResidencyKey::heap(7, 12, 64, 64, 0x7d);
+        state.compute_storage_residency.insert(key, 5);
+        let other_ref = ComputeStorageResidencyKey::heap(7, 13, 64, 64, 0x7d);
+        let other_task = ComputeStorageResidencyKey::heap(8, 12, 64, 64, 0x7d);
+        let mut window = key;
+        window.mapping_id = 9; // a real mapping id: a window key, not heap
+        window.surface_offset = 0x2000;
+        state.compute_storage_residency.insert(other_ref, 6);
+        state.compute_storage_residency.insert(other_task, 7);
+        state.compute_storage_residency.insert(window, 8);
+
+        assert!(state.delete_object(7, 12));
+        assert!(
+            !state.compute_storage_residency.contains_key(&key),
+            "the deleted texture's heap key left the mirror"
+        );
+        assert_eq!(state.retired_linear_residents, vec![key]);
+        assert!(
+            state.compute_storage_residency.contains_key(&other_ref),
+            "another ref's heap key survives an object delete"
+        );
+        assert!(
+            state.compute_storage_residency.contains_key(&other_task),
+            "another task's heap key survives an object delete"
+        );
+        assert!(
+            state.compute_storage_residency.contains_key(&window),
+            "a mapping-keyed window survives an object delete"
+        );
+
+        // Task teardown retires the task's whole heap population and nothing
+        // else's.
+        state.retired_linear_residents.clear();
+        assert!(state.delete_task(7));
+        assert!(!state.compute_storage_residency.contains_key(&other_ref));
+        assert_eq!(state.retired_linear_residents, vec![other_ref]);
+        assert!(state.compute_storage_residency.contains_key(&other_task));
+        assert!(state.compute_storage_residency.contains_key(&window));
     }
 }
