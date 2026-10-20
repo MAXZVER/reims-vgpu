@@ -433,6 +433,12 @@ struct Instruction {
 /// cannot drive a stream that fails this parse; only a translator bug produces
 /// one, which is exactly why the failure had to stop being a panic. The coverage
 /// for those is `tests::a_module_that_does_not_walk_reflects_nothing`.
+/// The largest SPIR-V id bound this module sizes a per-id table by. The bound
+/// is a header word; every table below is `vec![_; bound]`, and a bound of a few
+/// billion (a translator fault) would be an allocation that aborts the process.
+/// A translated shader's ids number in the thousands.
+const MAX_ID_BOUND: usize = 1 << 22;
+
 fn instructions(words: &[u32]) -> Option<Vec<Instruction>> {
     if words.len() < HEADER_WORDS {
         return None;
@@ -478,7 +484,7 @@ fn descriptor_root(
     storage_class: u32,
 ) -> Option<Root> {
     let bound = *words.get(3)? as usize;
-    if bound == 0 {
+    if bound == 0 || bound > MAX_ID_BOUND {
         return None;
     }
     let mut bindings = vec![None; bound];
@@ -1433,7 +1439,7 @@ pub fn validate_memo(digest: (u64, u64), words: &[u32]) -> SpirvValidation {
 /// pixel format when the shader uses a raw integer view.
 pub fn image_format(words: &[u32], wanted_binding: u32) -> Option<ImageFormat> {
     let bound = *words.get(3)? as usize;
-    if words.len() < HEADER_WORDS || bound == 0 {
+    if words.len() < HEADER_WORDS || bound == 0 || bound > MAX_ID_BOUND {
         return None;
     }
     let mut bindings = vec![None; bound];
@@ -1506,7 +1512,7 @@ pub fn specialize_image_formats(
     let bound = *words
         .get(3)
         .ok_or(ImageFormatSpecializeError::MalformedModule)? as usize;
-    if words.len() < HEADER_WORDS || bound == 0 {
+    if words.len() < HEADER_WORDS || bound == 0 || bound > MAX_ID_BOUND {
         return Err(ImageFormatSpecializeError::MalformedModule);
     }
     let mut bindings = vec![None; bound];
@@ -1730,6 +1736,9 @@ fn verify_load_types(words: &[u32]) -> Result<(), ImageFormatSpecializeError> {
     let bound = *words
         .get(3)
         .ok_or(ImageFormatSpecializeError::MalformedModule)? as usize;
+    if bound > MAX_ID_BOUND {
+        return Err(ImageFormatSpecializeError::MalformedModule);
+    }
     let mut pointer_pointee = vec![None; bound];
     let mut variable_type = vec![None; bound];
     let mut i = HEADER_WORDS;
@@ -2548,7 +2557,7 @@ fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
         return Vec::new();
     };
     let bound = bound as usize;
-    if words.len() < HEADER_WORDS || bound == 0 {
+    if words.len() < HEADER_WORDS || bound == 0 || bound > MAX_ID_BOUND {
         return Vec::new();
     }
     // Class of a *type* id, the pointee a descriptor pointer names.
