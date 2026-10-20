@@ -4,3 +4,7 @@ rvsr.dll
 *.exp
 vsrbench.exe
 vulkan-1.lib
+frucbench.exe
+NvOFFRUC.dll
+cudart64_110.dll
+nvngx_vsr.dll
