@@ -2943,6 +2943,7 @@ pub fn mrt_draw_request_with<M: HostMemory + HostOps, S: crate::runtime::exec::w
                 att.load_action, att.store_action
             ));
         }
+        lab_big_rt_census(task_id, target_ref, mapping_id, gva, mw, mh, bpr as u32, mfmt as u32, att.load_action as u32, att.store_action as u32);
         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
         note_attachment_sample_count_override(
             pipeline_ref,
@@ -4819,3 +4820,42 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
 
 #[cfg(test)]
 mod tests;
+
+/// TEMP (lab, Opus 2026-10-20, Safari 0x520000 canvas loss): `REIMS_VGPU_LAB_T2T=N` also names every render target
+/// a non-WindowServer pass resolves to while the `REIMS_VGPU_LAB_GATE` file exists (no first-sight dedupe), so the
+/// strips QuartzCore's CA::OGL renders a large 2D canvas through can be seen with their windows.
+#[allow(clippy::too_many_arguments)]
+fn lab_big_rt_census(
+    task_id: u32,
+    target_ref: u32,
+    mapping_id: u32,
+    gva: u64,
+    w: u32,
+    h: u32,
+    bpr: u32,
+    fmt: u32,
+    load: u32,
+    store: u32,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static GATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if task_id == 1 || u64::from(w) * u64::from(h) < 256 * 256 {
+        return;
+    }
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_T2T").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    }) * 10;
+    let Some(gate) = GATE.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GATE").ok()) else {
+        return;
+    };
+    if max == 0 || !std::path::Path::new(gate).exists() || N.fetch_add(1, Ordering::Relaxed) >= max {
+        return;
+    }
+    crate::observe::fail(format!(
+        "lab_big_rt task={task_id} ref={target_ref} mid={mapping_id} gva={gva:#x} {w}x{h} bpr={bpr} fmt={fmt:#x} \
+         load={load} store={store} t={}",
+        crate::observe::elapsed_us() / 1000
+    ));
+}
