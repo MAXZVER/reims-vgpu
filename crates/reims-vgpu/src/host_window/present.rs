@@ -2083,7 +2083,18 @@ impl App {
         );
         lab_host_present_note(lab_t0.elapsed());
         match result {
-            Ok(WindowPresentOutcome::Busy) => {}
+            Ok(WindowPresentOutcome::Busy) => {
+                // TEMP (lab, PRESENT_FG / PRESENT_VSR_TILES): a deadline that came
+                // due retries shortly instead of every loop tick (a past deadline
+                // that no present consumes keeps the loop polling).
+                let retry = std::time::Instant::now() + std::time::Duration::from_millis(1);
+                if self.lab_fg.next_at.is_some() {
+                    self.lab_fg.next_at = Some(retry);
+                }
+                if tiles_due {
+                    lab_note_tiles_due(Some(retry));
+                }
+            }
             Ok(WindowPresentOutcome::Presented {
                 direct,
                 width,
