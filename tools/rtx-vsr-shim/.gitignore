@@ -2,3 +2,5 @@ rvsr.dll
 *.obj
 *.lib
 *.exp
+vsrbench.exe
+vulkan-1.lib
