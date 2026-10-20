@@ -2423,7 +2423,9 @@ fn solid_bytes(len: usize, unit: &[u8]) -> Option<Vec<u8>> {
     if unit.is_empty() || !len.is_multiple_of(unit.len()) {
         return None;
     }
-    let mut bytes = Vec::with_capacity(len);
+    // Guest-sized: a refused reservation is a refusal, not a process abort.
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).ok()?;
     bytes.extend_from_slice(unit);
     while bytes.len() < len {
         let take = (len - bytes.len()).min(bytes.len());
@@ -2463,7 +2465,13 @@ fn solid_image8(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
         // is no first texel to double from.
         return Vec::new();
     }
-    let mut img = Vec::with_capacity(n);
+    // Guest-sized: a reservation the host refuses yields the same empty image
+    // as saturated geometry, which every caller already refuses on length,
+    // instead of aborting the process.
+    let mut img = Vec::new();
+    if img.try_reserve_exact(n).is_err() {
+        return Vec::new();
+    }
     img.extend_from_slice(&px);
     while img.len() < n {
         let take = (n - img.len()).min(img.len());

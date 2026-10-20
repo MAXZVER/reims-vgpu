@@ -34,6 +34,8 @@ const OP_TYPE_IMAGE: u16 = 25;
 const OP_TYPE_SAMPLER: u16 = 26;
 const OP_TYPE_SAMPLED_IMAGE: u16 = 27;
 const OP_TYPE_POINTER: u16 = 32;
+const OP_TYPE_ARRAY: u16 = 28;
+const OP_TYPE_RUNTIME_ARRAY: u16 = 29;
 const OP_FUNCTION: u16 = 54;
 const OP_VARIABLE: u16 = 59;
 const OP_FUNCTION_CALL: u16 = 57;
@@ -2564,6 +2566,10 @@ fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
     let mut type_class: Vec<Option<BindingClass>> = vec![None; bound];
     let mut pointee: Vec<Option<usize>> = vec![None; bound];
     let mut var_type: Vec<Option<usize>> = vec![None; bound];
+    // The translator declares a texture array as `UniformConstant OpTypeArray
+    // %image N`; its class is its element's. Without this a texture array fell
+    // through to `Buffer` and moved with the buffer band, not the texture one.
+    let mut element: Vec<Option<usize>> = vec![None; bound];
 
     let mut i = HEADER_WORDS;
     while i < words.len() {
@@ -2601,6 +2607,12 @@ fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
                     pointee[id] = Some(words[i + 3] as usize);
                 }
             }
+            OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY if word_count >= 3 => {
+                let id = words[i + 1] as usize;
+                if id < bound {
+                    element[id] = Some(words[i + 2] as usize);
+                }
+            }
             OP_VARIABLE if word_count >= 4 => {
                 let id = words[i + 2] as usize;
                 if id < bound {
@@ -2615,7 +2627,15 @@ fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
     (0..bound)
         .map(|id| {
             let pointer = var_type[id]?;
-            let pointee = pointee.get(pointer).copied().flatten()?;
+            let mut pointee = pointee.get(pointer).copied().flatten()?;
+            // Types are declared before use, so a well-formed chain is short;
+            // the bound only keeps a malformed cycle from spinning.
+            for _ in 0..8 {
+                match element.get(pointee).copied().flatten() {
+                    Some(inner) => pointee = inner,
+                    None => break,
+                }
+            }
             // A resolved chain that named no image or sampler type is a buffer;
             // an unresolved one is `None` and stays unnamed.
             Some(
@@ -5980,6 +6000,27 @@ mod more_tests {
             bindings.contains(&(TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET))
         );
         assert!(bindings.contains(&(M2V_DEFAULT_DESCRIPTOR_LAYOUT.storage_textures.start + 3)));
+    }
+
+    /// A texture array (`OpTypeArray %image N`, how the translator declares
+    /// one) is classed by its element: it moves with the texture band and
+    /// never with the buffer band, which would sample whatever sits there.
+    #[test]
+    fn a_texture_array_relocates_as_a_texture_not_a_buffer() {
+        const IMAGE: u32 = 10;
+        const ARRAY: u32 = 11;
+        const LENGTH: u32 = 12;
+        let mut words = module_header();
+        words.extend(image_type(IMAGE, 1));
+        words.extend([(4u32 << 16) | OP_TYPE_ARRAY as u32, ARRAY, IMAGE, LENGTH]);
+        words.extend(typed_descriptor(30, ARRAY, TEXTURE_BINDING_BASE + 3));
+
+        assert_eq!(variable_classes(&words)[30], Some(BindingClass::SampledTexture));
+        let mut buffers_moved = words.clone();
+        assert_eq!(offset_fragment_buffer_bindings(&mut buffers_moved), 0);
+        assert_eq!(offset_fragment_sampled_resource_bindings(&mut words), 1);
+        assert!(declared_binding_numbers(&words)
+            .contains(&(TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET)));
     }
 
     /// The type rule replaces the band rule, so on the layout the band rule was

@@ -8320,7 +8320,11 @@ fn apply_clear<M: HostMemory + HostOps>(
             (true, ClearImageEncoding::Rgba8) => {
                 let converts =
                     pixel_format::tight_row_bytes(c0.width, c0.format).is_some_and(|tight| {
-                        converted.resize(tight as usize, 0);
+                        // Guest-sized row: a refused allocation drops the clear by name.
+                        let Some(row) = draw::guest_zeroed(tight as usize) else {
+                            return false;
+                        };
+                        converted = row;
                         pixel_format::Rgba8ToRow::for_format(c0.format).is_some_and(|rail| {
                             rail.convert(clear.pixels(), c0.width, &mut converted)
                         })
@@ -8457,7 +8461,10 @@ pub(crate) fn lab_fill_gva_solid<M: HostMemory + HostOps>(
         (true, ClearImageEncoding::Native) => draw::FrameRows::Repeat(clear.pixels()),
         (true, ClearImageEncoding::Rgba8) => {
             let converts = pixel_format::tight_row_bytes(width, format).is_some_and(|tight| {
-                converted.resize(tight as usize, 0);
+                let Some(row) = draw::guest_zeroed(tight as usize) else {
+                    return false;
+                };
+                converted = row;
                 pixel_format::Rgba8ToRow::for_format(format)
                     .is_some_and(|rail| rail.convert(clear.pixels(), width, &mut converted))
             });

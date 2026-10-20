@@ -563,6 +563,24 @@ pub(crate) unsafe fn execute_compute_inner(
                 },
             ));
         }
+        let max = f.max_image_dimension_2d;
+        let images = req
+            .sampled_images
+            .iter()
+            .map(|i| (i.binding, i.width, i.height))
+            .chain(req.storage_images.iter().map(|i| (i.binding, i.width, i.height)));
+        for (binding, width, height) in images {
+            if width > max || height > max {
+                return Err(DrawError::ComputeValidation(
+                    ComputeValidationDecline::ImageOverDeviceLimit {
+                        binding,
+                        width,
+                        height,
+                        max,
+                    },
+                ));
+            }
+        }
     }
 
     // Storage buffers: host-visible staging used as SSBOs (same as draw path).
@@ -1464,6 +1482,16 @@ pub(crate) unsafe fn execute_compute_inner(
     // nothing to read back, so it belongs on the deferred side exactly as a
     // read-only SSBO does. Its ordering does not come from this wait — see
     // `ComputeImageDestination::GuestPages` for the stamp chain that carries it.
+    // The submitted command buffer leaves every resident storage image in
+    // TRANSFER_SRC with this dispatch's output, whether or not the wait below
+    // succeeds: the registry records that now, so a failed wait cannot leave
+    // it naming the layout and generation the image had before.
+    for prepared in &simg_slots {
+        if let Some(residency) = prepared.residency {
+            pools.mark_resident_storage_image(&residency.identity, residency.output_generation);
+        }
+    }
+
     let all_writeback_deferred = storage_slots.iter().all(|(_, _, _, writable)| !writable)
         && simg_slots
             .iter()
@@ -1482,12 +1510,6 @@ pub(crate) unsafe fn execute_compute_inner(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
         pools.retire_all(ctx, counters)?;
-    }
-
-    for prepared in &simg_slots {
-        if let Some(residency) = prepared.residency {
-            pools.mark_resident_storage_image(&residency.identity, residency.output_generation);
-        }
     }
 
     let mut buffers = Vec::with_capacity(
