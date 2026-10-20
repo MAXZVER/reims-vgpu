@@ -2535,6 +2535,11 @@ pub struct HostSurface {
     /// Unused (and left at 0) by the surface_id and texture_ref caches, which
     /// have no cap.
     pub last_touch: u64,
+    /// The task whose Store produced a GVA-keyed entry (0: not recorded). Kept
+    /// apart from `backing` because an entry whose walk did not resolve has no
+    /// backing, and the seed door then could not tell another task's picture at
+    /// the same address from this task's own.
+    pub producer_task: u32,
     /// Guest pages these bytes were produced from, for GVA-keyed entries.
     /// `None` on the surface_id/texture_ref caches (their key is not a guest
     /// virtual address) and on any GVA store whose walk did not resolve.

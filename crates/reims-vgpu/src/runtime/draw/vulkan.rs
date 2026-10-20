@@ -11321,7 +11321,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
     if gva != 0 {
         let backing =
             crate::runtime::surface_cache::gva_backing(state, host, task_id, gva, width, height);
-        crate::runtime::surface_cache::store_gva_owned(
+        crate::runtime::surface_cache::store_gva_owned_by(
             state,
             gva,
             width,
@@ -11330,6 +11330,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
             object_type,
             backing,
             guest_holds_bytes,
+            task_id,
         );
     }
 }
