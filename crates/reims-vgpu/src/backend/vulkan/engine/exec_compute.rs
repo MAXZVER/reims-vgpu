@@ -369,12 +369,19 @@ fn resident_sample_exact(
 /// for anything that is not a `UniformConstant` descriptor, so a storage buffer,
 /// whose root this walk cannot resolve, is never refused on a guess.
 fn used_binding_absent_from_layout(spirv: &[u32], layout: &[BindingSig]) -> Option<u32> {
-    crate::runtime::spirv_bind::declared_binding_numbers(spirv)
-        .into_iter()
-        .find(|binding| {
-            !layout.iter().any(|b| b.binding == *binding)
-                && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding).is_violation()
-        })
+    // A frame that does not walk whole has an unknowable used-binding list;
+    // the sentinel sits in no layout, so this refuses the dispatch by name
+    // rather than letting a used binding past the backstop on a partial scan.
+    crate::runtime::spirv_bind::declared_binding_numbers(spirv).map_or_else(
+        || Some(crate::runtime::spirv_bind::BROKEN_FRAME_BINDING),
+        |declared| {
+            declared.into_iter().find(|binding| {
+                !layout.iter().any(|b| b.binding == *binding)
+                    && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding)
+                        .is_violation()
+            })
+        },
+    )
 }
 
 pub(crate) unsafe fn execute_compute_inner(

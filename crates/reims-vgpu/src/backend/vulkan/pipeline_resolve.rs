@@ -844,7 +844,7 @@ mod tests {
             .expect("one entry point");
         assert_eq!(entry[1], 4, "execution model Fragment");
         assert_eq!(entry[3..5], [0x6e69_616d, 0], "named main");
-        assert!(crate::runtime::spirv_bind::declared_binding_numbers(words).is_empty());
+        assert!(crate::runtime::spirv_bind::declared_binding_numbers(words).unwrap_or_default().is_empty());
         assert_eq!(
             crate::runtime::spirv_bind::validate(words),
             crate::runtime::spirv_bind::SpirvValidation::Accepted,

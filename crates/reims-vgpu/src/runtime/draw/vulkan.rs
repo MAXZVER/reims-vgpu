@@ -16233,8 +16233,12 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         } else {
             f_words
         };
-        let frag_declared_bindings =
-            crate::runtime::spirv_bind::declared_binding_numbers_memoized(&f_words);
+        let frag_declared_bindings = crate::runtime::spirv_bind::declared_binding_numbers_memoized(
+            &f_words,
+        )
+        // A refused frame keeps the sentinel entry: the hang trail's gap count
+        // then names it and the layout backstop refuses the draws by name.
+        .unwrap_or_else(|| std::sync::Arc::from(vec![crate::runtime::spirv_bind::BROKEN_FRAME_BINDING]));
         let frag_layout_bindings: Vec<u32> = resources
             .storage_buffers
             .iter()

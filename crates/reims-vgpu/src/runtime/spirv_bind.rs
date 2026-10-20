@@ -2075,12 +2075,14 @@ pub fn required_image_capabilities(words: &[u32]) -> RequiredImageCapabilities {
     let mut has_unknown_storage_image = false;
     let mut has_image_write = false;
     let mut has_image_read = false;
+    let mut whole = true;
 
     let mut i = HEADER_WORDS;
     while i < words.len() {
         let word_count = (words[i] >> 16) as usize;
         let opcode = (words[i] & 0xffff) as u16;
         if word_count == 0 || i + word_count > words.len() {
+            whole = false;
             break;
         }
         match opcode {
@@ -2103,6 +2105,24 @@ pub fn required_image_capabilities(words: &[u32]) -> RequiredImageCapabilities {
             _ => {}
         }
         i += word_count;
+    }
+    if !whole {
+        // The frame stopped framing, so whatever follows the break point is
+        // invisible to this walk. Over-approximate rather than under-declare:
+        // a redundant capability is valid SPIR-V (this function's own doc),
+        // a missing one is an invalid module. The caller's feature gate turns
+        // the over-ask into a named decline on a host that cannot honour it.
+        if crate::observe::first_sight("spirv_frame_broken_caps", words.len() as u64) {
+            crate::observe::fail(format!(
+                "spirv_frame_broken_caps len={} (the capability scan stopped on a framing \
+                 refusal; every image capability is being required)",
+                words.len()
+            ));
+        }
+        need.extended_formats = true;
+        need.write_without_format = true;
+        need.read_without_format = true;
+        return need;
     }
     need.write_without_format = has_unknown_storage_image && has_image_write;
     need.read_without_format = has_unknown_storage_image && has_image_read;
@@ -2199,7 +2219,12 @@ fn sampler_descriptor_bindings(words: &[u32], include_combined: bool) -> Vec<u32
         let word_count = (word0 >> 16) as usize;
         let opcode = (word0 & 0xffff) as u16;
         if word_count == 0 || i + word_count > words.len() {
-            break;
+            // A truncated frame hands back the empty set rather than a partial
+            // one: the callers of this answer are backstops and neutral
+            // provisioners, and both degrade into named refusals on "no
+            // samplers" - a wrong frame served them worse.
+            note_frame_broken("spirv_frame_broken_sampler_scan", words);
+            return Vec::new();
         }
         match opcode {
             OP_TYPE_SAMPLER if word_count >= 2 => {
@@ -2506,17 +2531,17 @@ pub(crate) fn test_module_with_separate_and_combined_samplers() -> Vec<u32> {
 /// a leak.
 pub fn declared_binding_numbers_memoized(
     words: &std::sync::Arc<Vec<u32>>,
-) -> std::sync::Arc<[u32]> {
+) -> Option<std::sync::Arc<[u32]>> {
     let key = std::sync::Arc::as_ptr(words) as usize;
     let mut guard = match DECLARED_BINDINGS.lock() {
         Ok(guard) => guard,
         // A poisoned memo is a cache, not state: answer from the walk rather
         // than refusing a draw over it.
-        Err(_) => return std::sync::Arc::from(declared_binding_numbers(words)),
+        Err(_) => return declared_binding_numbers(words).map(std::sync::Arc::from),
     };
     let memo = guard.get_or_insert_with(std::collections::HashMap::new);
     if let Some((_, declared)) = memo.get(&key) {
-        return std::sync::Arc::clone(declared);
+        return Some(std::sync::Arc::clone(declared));
     }
     if memo.len() >= DECLARED_BINDING_ENTRIES {
         crate::observe::off(format!(
@@ -2526,7 +2551,10 @@ pub fn declared_binding_numbers_memoized(
         ));
         memo.clear();
     }
-    let declared: std::sync::Arc<[u32]> = std::sync::Arc::from(declared_binding_numbers(words));
+    // A refused frame is not cached: it is a property of the walk, and the
+    // fail-once line above should keep answering for it while the (immutable)
+    // module is asked again.
+    let declared: std::sync::Arc<[u32]> = declared_binding_numbers(words)?.into();
     memo.insert(
         key,
         (
@@ -2534,7 +2562,7 @@ pub fn declared_binding_numbers_memoized(
             std::sync::Arc::clone(&declared),
         ),
     );
-    declared
+    Some(declared)
 }
 
 /// Modules the memo holds before it starts over. Sized as the engine's
@@ -2553,16 +2581,63 @@ type DeclaredBindingMemo =
 static DECLARED_BINDINGS: std::sync::Mutex<Option<DeclaredBindingMemo>> =
     std::sync::Mutex::new(None);
 
-pub fn declared_binding_numbers(words: &[u32]) -> Vec<u32> {
+/// A used-binding list entry no layout can contain, for a module whose frame
+/// does not walk whole: the `UsedBindingAbsentFromLayout` backstop sees it
+/// absent from every layout and refuses each draw of that shader by name —
+/// fail-closed without threading a second flag through every request.
+pub const BROKEN_FRAME_BINDING: u32 = u32::MAX;
+
+/// One fail-once line, for a scan that stopped on a framing refusal and
+/// answered empty rather than partial.
+fn note_frame_broken(slug: &'static str, words: &[u32]) {
+    if crate::observe::first_sight(slug, words.len() as u64) {
+        crate::observe::fail(format!(
+            "{slug} len={} (a scan stopped on a framing refusal and answered empty)",
+            words.len()
+        ));
+    }
+}
+
+/// Whether an instruction walk of `words` reaches its end without a framing
+/// refusal.
+///
+/// The scans below used to `break` here and hand back what they had found as
+/// though it were the whole answer. For `declared_binding_numbers` that is a
+/// partial used-binding list behind the layout backstop whose whole purpose is
+/// the Mesa `SIGFPE`; for the capability walk it is an under-declared
+/// requirement. One predicate, so every walker refuses the same frame.
+fn frame_walks_whole(words: &[u32]) -> bool {
+    if words.len() < HEADER_WORDS {
+        return false;
+    }
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        if word_count == 0 || i + word_count > words.len() {
+            return false;
+        }
+        i += word_count;
+    }
+    true
+}
+
+pub fn declared_binding_numbers(words: &[u32]) -> Option<Vec<u32>> {
+    if !frame_walks_whole(words) {
+        if crate::observe::first_sight("spirv_frame_broken", words.len() as u64) {
+            crate::observe::fail(format!(
+                "spirv_frame_broken len={} (a binding scan stopped on a framing refusal; \
+                 every draw of this module will be refused by name)",
+                words.len()
+            ));
+        }
+        return None;
+    }
     let mut bindings = Vec::new();
     let mut i = HEADER_WORDS;
     while i < words.len() {
         let word0 = words[i];
         let word_count = (word0 >> 16) as usize;
         let opcode = (word0 & 0xffff) as u16;
-        if word_count == 0 || i + word_count > words.len() {
-            break;
-        }
         if opcode == OP_DECORATE && word_count >= 4 && words[i + 2] == DECORATION_BINDING {
             bindings.push(words[i + 3]);
         }
@@ -2570,7 +2645,7 @@ pub fn declared_binding_numbers(words: &[u32]) -> Vec<u32> {
     }
     bindings.sort_unstable();
     bindings.dedup();
-    bindings
+    Some(bindings)
 }
 
 /// SPIR-V `OpTypeImage` `Sampled` operand value 1 — "will be used with a
@@ -2614,7 +2689,12 @@ pub fn sampled_image_bindings(words: &[u32]) -> Vec<u32> {
         let word_count = (word0 >> 16) as usize;
         let opcode = (word0 & 0xffff) as u16;
         if word_count == 0 || i + word_count > words.len() {
-            break;
+            // As the sampler scan: the caller provisions neutral images for the
+            // bindings this names, and a partial list would leave a used
+            // binding unprovisioned - the layout backstop refuses that by name,
+            // which an empty list reaches without the partial middle.
+            note_frame_broken("spirv_frame_broken_image_scan", words);
+            return Vec::new();
         }
         match opcode {
             // OpTypeImage: result, sampled type, Dim, Depth, Arrayed, MS,
@@ -2694,13 +2774,13 @@ pub enum BindingClass {
 /// variable → pointer → pointee chain did not resolve", and the two are the same
 /// answer to the only question asked here: this walk cannot name that variable's
 /// class. Callers must not treat `None` as a class.
-fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
+fn variable_classes(words: &[u32]) -> Option<Vec<Option<BindingClass>>> {
     let Some(&bound) = words.get(3) else {
-        return Vec::new();
+        return None;
     };
     let bound = bound as usize;
     if words.len() < HEADER_WORDS || bound == 0 || bound > MAX_ID_BOUND {
-        return Vec::new();
+        return None;
     }
     // Class of a *type* id, the pointee a descriptor pointer names.
     let mut type_class: Vec<Option<BindingClass>> = vec![None; bound];
@@ -2717,7 +2797,11 @@ fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
         let word_count = (word0 >> 16) as usize;
         let opcode = (word0 & 0xffff) as u16;
         if word_count == 0 || i + word_count > words.len() {
-            break;
+            // A partial class table would misclassify every variable declared
+            // past the break point (the Buffer default), relocating bindings by
+            // a guess. The caller declines the whole rewrite instead.
+            note_frame_broken("spirv_frame_broken_class_scan", words);
+            return None;
         }
         let mut set_type = |id: u32, class: BindingClass| {
             if (id as usize) < bound {
@@ -2764,7 +2848,7 @@ fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
         i += word_count;
     }
 
-    (0..bound)
+    let classes = (0..bound)
         .map(|id| {
             let pointer = var_type[id]?;
             let mut pointee = pointee.get(pointer).copied().flatten()?;
@@ -2786,7 +2870,8 @@ fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
                     .unwrap_or(BindingClass::Buffer),
             )
         })
-        .collect()
+        .collect();
+    Some(classes)
 }
 
 /// A `Binding` decoration whose variable [`variable_classes`] could not name, so
@@ -2827,7 +2912,16 @@ fn relocate_by_class(
     if offset == 0 {
         return 0;
     }
-    let by_variable = variable_classes(words);
+    let by_variable = match variable_classes(words) {
+        Some(by_variable) => by_variable,
+        None => {
+            // The class table could not be walked whole; relocating on the
+            // partial one would move bindings by guesswork (see the scan's own
+            // break comment), and leaving them unmoved keeps every layout
+            // backstop in charge of the refusal.
+            return 0;
+        }
+    };
     let mut rewritten = 0usize;
     let mut i = HEADER_WORDS;
     while i < words.len() {
@@ -4839,16 +4933,21 @@ mod more_tests {
     fn the_memoized_binding_sweep_answers_per_module_and_not_per_first_call() {
         let a = std::sync::Arc::new(test_module_with_two_sampled_images(33, 34));
         let b = std::sync::Arc::new(test_module_with_two_sampled_images(40, 41));
-        let walk = |m: &std::sync::Arc<Vec<u32>>| declared_binding_numbers(m);
+        let walk =
+            |m: &std::sync::Arc<Vec<u32>>| declared_binding_numbers(m).expect("a whole frame");
 
         for _ in 0..2 {
             assert_eq!(
-                declared_binding_numbers_memoized(&a).to_vec(),
+                declared_binding_numbers_memoized(&a)
+                    .expect("a whole frame")
+                    .to_vec(),
                 walk(&a),
                 "the first module keeps its own answer"
             );
             assert_eq!(
-                declared_binding_numbers_memoized(&b).to_vec(),
+                declared_binding_numbers_memoized(&b)
+                    .expect("a whole frame")
+                    .to_vec(),
                 walk(&b),
                 "and the second is not served the first one's"
             );
@@ -4868,7 +4967,10 @@ mod more_tests {
     #[test]
     fn the_binding_sweep_is_class_blind_and_the_use_test_narrows_it() {
         let words = test_module_with_two_sampled_images(33, 34);
-        assert_eq!(declared_binding_numbers(&words), vec![33, 34]);
+        assert_eq!(
+            declared_binding_numbers(&words).expect("a whole frame"),
+            vec![33, 34]
+        );
         assert_eq!(descriptor_static_use(&words, 33), DescriptorUse::Used);
         assert_eq!(
             descriptor_static_use(&words, 34),
@@ -6040,23 +6142,34 @@ mod more_tests {
 
     #[test]
     fn offset_buffer_bindings_only_in_band() {
-        // Minimal fake module: header + one OpDecorate Binding 3 (4 words).
-        let mut words = vec![0u32; 5];
-        words[0] = 0x0723_0203; // magic-ish
-                                // OpDecorate: opcode 71, wordcount 4 → word0 = (4<<16)|71
-        words.push((4u32 << 16) | 71);
-        words.push(1); // target id
-        words.push(DECORATION_BINDING);
-        words.push(3); // binding
-                       // Binding 40 (texture band) must not move
-        words.push((4u32 << 16) | 71);
-        words.push(2);
-        words.push(DECORATION_BINDING);
-        words.push(40);
+        // Typed descriptors: a buffer-classed variable relocates, a
+        // texture-classed one does not. (The pre-type-rule form of this test
+        // decorated bare ids and exercised the numeric band fallback, which an
+        // unclassified binding no longer takes — see relocate_by_class.)
+        let mut words = module_header();
+        words.extend(typed_descriptor(1, 50, 3)); // pointee 50 names no image/sampler → Buffer
+        words.extend(image_type(10, 2));
+        words.extend(typed_descriptor(2, 10, 40)); // → SampledTexture, not the buffer band
         let n = offset_fragment_buffer_bindings(&mut words);
         assert_eq!(n, 1);
-        assert_eq!(words[8], 3 + FRAG_BUFFER_BINDING_OFFSET);
-        assert_eq!(words[12], 40);
+        let binding_of = |var: u32| {
+            let mut i = HEADER_WORDS;
+            let mut found = None;
+            while i < words.len() {
+                let wc = (words[i] >> 16) as usize;
+                if (words[i] & 0xffff) as u16 == OP_DECORATE
+                    && wc >= 4
+                    && words[i + 1] == var
+                    && words[i + 2] == DECORATION_BINDING
+                {
+                    found = Some(words[i + 3]);
+                }
+                i += wc;
+            }
+            found.unwrap()
+        };
+        assert_eq!(binding_of(1), 3 + FRAG_BUFFER_BINDING_OFFSET);
+        assert_eq!(binding_of(2), 40, "the texture band does not move");
     }
 
     #[test]
@@ -6071,38 +6184,49 @@ mod more_tests {
         // it — the engine binds the input attachment at its un-relocated number.
         //
         // These are DEVICE bindings, the numbering `widen_sampled_bands` leaves
-        // behind, because that is what the fragment relocations run on. The
-        // decorations carry no types, so this also exercises the band-predicate
-        // fallback that a variable the type walk cannot name falls back to.
-        let decorate = |id: u32, binding: u32| {
-            vec![
-                (4u32 << 16) | OP_DECORATE as u32,
-                id,
-                DECORATION_BINDING,
-                binding,
-            ]
-        };
-        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 7, 0];
-        words.extend(decorate(1, 1)); // fragment buffer → relocates
-        words.extend(decorate(2, COLOR_INPUT_BINDING_BASE + 1)); // ColorInput → stays
-        words.extend(decorate(3, TEXTURE_BINDING_BASE + 3)); // texture → sampled reloc
-        words.extend(decorate(4, SAMPLER_BINDING_BASE)); // sampler → sampled reloc
+        // behind, because that is what the fragment relocations run on. Every
+        // decoration rides a typed descriptor — the class rule relocated by;
+        // an untyped id is left alone by it.
+        let mut words = module_header();
+        words.extend(typed_descriptor(1, 50, 1)); // buffer → relocates (pointee names no image)
+        words.extend(image_type(10, DIM_SUBPASS_DATA));
+        words.extend(typed_descriptor(2, 10, COLOR_INPUT_BINDING_BASE + 1)); // ColorInput → stays
+        words.extend(image_type(11, 2));
+        words.extend(typed_descriptor(3, 11, TEXTURE_BINDING_BASE + 3)); // texture → sampled reloc
+        words.extend([(2u32 << 16) | OP_TYPE_SAMPLER as u32, 12]);
+        words.extend(typed_descriptor(4, 12, SAMPLER_BINDING_BASE)); // sampler → sampled reloc
 
         assert_eq!(offset_fragment_sampled_resource_bindings(&mut words), 2);
         assert_eq!(offset_fragment_buffer_bindings(&mut words), 1);
 
-        let bindings = [words[8], words[12], words[16], words[20]];
-        assert_eq!(bindings[0], 1 + FRAG_BUFFER_BINDING_OFFSET);
-        assert_eq!(bindings[1], COLOR_INPUT_BINDING_BASE + 1);
+        let binding_of = |var: u32| {
+            let mut i = HEADER_WORDS;
+            let mut found = None;
+            while i < words.len() {
+                let wc = (words[i] >> 16) as usize;
+                if (words[i] & 0xffff) as u16 == OP_DECORATE
+                    && wc >= 4
+                    && words[i + 1] == var
+                    && words[i + 2] == DECORATION_BINDING
+                {
+                    found = Some(words[i + 3]);
+                }
+                i += wc;
+            }
+            found.unwrap()
+        };
+        assert_eq!(binding_of(1), 1 + FRAG_BUFFER_BINDING_OFFSET);
+        assert_eq!(binding_of(2), COLOR_INPUT_BINDING_BASE + 1);
         assert_eq!(
-            bindings[2],
+            binding_of(3),
             TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
         );
         assert_eq!(
-            bindings[3],
+            binding_of(4),
             SAMPLER_BINDING_BASE + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
         );
         // All four distinct — no merged-set duplicate bindings.
+        let bindings = [binding_of(1), binding_of(2), binding_of(3), binding_of(4)];
         let mut sorted = bindings;
         sorted.sort_unstable();
         assert!(sorted.windows(2).all(|w| w[0] != w[1]));
@@ -6192,7 +6316,7 @@ mod more_tests {
         words.extend(typed_descriptor(30, IMAGE, TEXTURE_BINDING));
         words.extend(typed_descriptor(31, SAMPLER, SAMPLER_BINDING));
 
-        let classes = variable_classes(&words);
+        let classes = variable_classes(&words).expect("a whole test frame");
         assert_eq!(classes[30], Some(BindingClass::SampledTexture));
         assert_eq!(classes[31], Some(BindingClass::Sampler));
 
@@ -6233,7 +6357,7 @@ mod more_tests {
         words.extend(typed_descriptor(30, SUBPASS, COLOR_INPUT_BINDING_BASE + 1));
         words.extend(typed_descriptor(31, SAMPLED, TEXTURE_BINDING_BASE + 3));
 
-        let classes = variable_classes(&words);
+        let classes = variable_classes(&words).expect("a whole test frame");
         assert_eq!(classes[30], Some(BindingClass::ColorInput));
         assert_eq!(classes[31], Some(BindingClass::SampledTexture));
     }
@@ -6252,11 +6376,12 @@ mod more_tests {
             M2V_DEFAULT_DESCRIPTOR_LAYOUT.storage_textures.start + 3,
         ));
 
-        let classes = variable_classes(&words);
+        let classes = variable_classes(&words).expect("a whole test frame");
         assert_eq!(classes[30], Some(BindingClass::SampledTexture));
         assert_eq!(classes[31], Some(BindingClass::StorageTexture));
         assert_eq!(offset_fragment_sampled_resource_bindings(&mut words), 1);
-        let bindings = declared_binding_numbers(&words);
+        let bindings =
+            declared_binding_numbers(&words).expect("a whole test frame");
         assert!(
             bindings.contains(&(TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET))
         );
@@ -6276,12 +6401,49 @@ mod more_tests {
         words.extend([(4u32 << 16) | OP_TYPE_ARRAY as u32, ARRAY, IMAGE, LENGTH]);
         words.extend(typed_descriptor(30, ARRAY, TEXTURE_BINDING_BASE + 3));
 
-        assert_eq!(variable_classes(&words)[30], Some(BindingClass::SampledTexture));
+        assert_eq!(
+            variable_classes(&words).expect("a whole test frame")[30],
+            Some(BindingClass::SampledTexture)
+        );
         let mut buffers_moved = words.clone();
         assert_eq!(offset_fragment_buffer_bindings(&mut buffers_moved), 0);
         assert_eq!(offset_fragment_sampled_resource_bindings(&mut words), 1);
         assert!(declared_binding_numbers(&words)
+            .expect("a whole test frame")
             .contains(&(TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET)));
+    }
+
+    /// A frame that stops framing mid-module is refused by the binding scan,
+    /// over-asked by the capability scan, and left unrelocated by the class
+    /// pass — three fail-closed answers where each used to hand back a partial
+    /// one as though it were whole.
+    #[test]
+    fn a_broken_frame_is_refused_rather_than_answered_partially() {
+        let mut words = module_header();
+        words.extend(image_type(10, 2));
+        words.extend(typed_descriptor(30, 10, TEXTURE_BINDING_BASE));
+        // A zero word stops every walk partway through the module.
+        words.push(0);
+        words.extend(typed_descriptor(31, 10, TEXTURE_BINDING_BASE + 1));
+
+        assert!(
+            declared_binding_numbers(&words).is_none(),
+            "the binding sweep refuses rather than listing a prefix"
+        );
+        let caps = required_image_capabilities(&words);
+        assert!(caps.extended_formats);
+        assert!(caps.write_without_format);
+        assert!(caps.read_without_format);
+        assert!(
+            variable_classes(&words).is_none(),
+            "the class table refuses rather than defaulting a suffix to Buffer"
+        );
+        let mut relocated = words.clone();
+        assert_eq!(
+            offset_fragment_sampled_resource_bindings(&mut relocated),
+            0,
+            "nothing is relocated on a broken frame"
+        );
     }
 
     /// The type rule replaces the band rule, so on the layout the band rule was
