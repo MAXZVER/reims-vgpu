@@ -12689,6 +12689,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 content
             };
             lab_note_bind_bytes("vtx", cap.is_some(), &content);
+            lab_vtx_bind_census(req, b.index, b.buffer_ref, b.offset, cap, feeds_stage_in, &content, &pd.vertex_attributes, render_buffer_bounds);
             note_inflight_buffer_read(req.task_id, b.buffer_ref, &content);
             stale_watch::vtx_dump(req, "v", b.index, b.buffer_ref, b.offset, &content);
             stale_watch::vtx_layout(req.task_id, req.pipeline_ref, || format!("{:?}", pd.vertex_attributes));
@@ -24000,5 +24001,49 @@ fn lab_dump_draw_shape(req: &DrawEncodeRequest, n: u32) {
             .iter()
             .map(|s| (s.x, s.y, s.width, s.height))
             .collect::<Vec<_>>()
+    ));
+}
+
+/// TEMP (lab, Opus 2026-10-20, Safari 0x520000 canvas loss): each vertex-stage buffer bind of a draw into a target
+/// of 2 Mpx or more outside WindowServer, while the `REIMS_VGPU_LAB_GATE` file exists - the extent the device
+/// computed, the bytes it staged, the stage-in attributes - for the QuartzCore batches that land nothing.
+#[allow(clippy::too_many_arguments)]
+fn lab_vtx_bind_census<A: std::fmt::Debug>(
+    req: &DrawEncodeRequest,
+    index: u32,
+    buffer_ref: u32,
+    offset: u64,
+    cap: Option<u64>,
+    feeds_stage_in: bool,
+    content: &crate::backend::vulkan::engine::BufferContent,
+    attrs: &[A],
+    bounds: crate::runtime::spirv_bind::RenderBufferIndexBounds,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    static GATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(c0) = req.colors.first() else {
+        return;
+    };
+    if req.task_id == 1 || u64::from(c0.width) * u64::from(c0.height) < 2_000_000 {
+        return;
+    }
+    let Some(gate) = GATE.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GATE").ok()) else {
+        return;
+    };
+    if !std::path::Path::new(gate).exists() || N.fetch_add(1, Ordering::Relaxed) >= 120 {
+        return;
+    }
+    let kind = match content {
+        crate::backend::vulkan::engine::BufferContent::Bytes(_) => "bytes",
+        crate::backend::vulkan::engine::BufferContent::GuestRuns(_) => "runs",
+        crate::backend::vulkan::engine::BufferContent::Staged(_) => "staged",
+    };
+    crate::observe::fail(format!(
+        "lab_vtx_bind pipe={} idx={index} r{buffer_ref}+{offset} cap={cap:?} stage_in={feeds_stage_in} \
+         content={kind}:{} vmax={:?} attrs={attrs:?}",
+        req.pipeline_ref,
+        content.len(),
+        bounds.vertex_max()
     ));
 }
