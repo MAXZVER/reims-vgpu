@@ -12516,6 +12516,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         // Each own-index sub-draw's own vertex reach; its overridden buffers are read that far, not the record's.
         let mut lab_sub_vmax: Vec<Option<u64>> = Vec::new();
         let mut indexed_vertex_max = indexed_vertex_max;
+        lab_early_index_census(req, early_index.as_ref(), indexed_vertex_max);
         if let (Some(m), true) = (req.merged.as_deref(), !lab_merge_deltas.is_empty()) {
             if m.overrides.iter().any(|o| o.index.is_some()) {
                 lab_sub_index = vec![None; m.subs.len()];
@@ -24045,5 +24046,50 @@ fn lab_vtx_bind_census<A: std::fmt::Debug>(
         req.pipeline_ref,
         content.len(),
         bounds.vertex_max()
+    ));
+}
+
+/// TEMP (lab, Opus 2026-10-20, Safari 0x520000 canvas loss): the index content the device itself read for a big
+/// draw outside WindowServer (kind, length, max index it found) and the vertex bound it derived from it.
+fn lab_early_index_census<E: std::fmt::Debug>(
+    req: &DrawEncodeRequest,
+    early: Option<&Result<crate::backend::vulkan::engine::BufferContent, E>>,
+    vmax: Option<u64>,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    static GATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let (Some(c0), Some(info)) = (req.colors.first(), req.indexed.as_ref()) else {
+        return;
+    };
+    if req.task_id == 1 || u64::from(c0.width) * u64::from(c0.height) < 2_000_000 {
+        return;
+    }
+    let Some(gate) = GATE.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GATE").ok()) else {
+        return;
+    };
+    if !std::path::Path::new(gate).exists() || N.fetch_add(1, Ordering::Relaxed) >= 60 {
+        return;
+    }
+    let what = match early {
+        None => "none".to_string(),
+        Some(Err(e)) => format!("err {e:?}"),
+        Some(Ok(content)) => {
+            let bytes = content.cpu_bytes();
+            let max16 = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).max();
+            let kind = match content {
+                crate::backend::vulkan::engine::BufferContent::Bytes(_) => "bytes",
+                crate::backend::vulkan::engine::BufferContent::GuestRuns(_) => "runs",
+                crate::backend::vulkan::engine::BufferContent::Staged(_) => "staged",
+            };
+            format!("{kind} len={} max16={max16:?}", content.len())
+        }
+    };
+    crate::observe::fail(format!(
+        "lab_early_index pipe={} count={} off={} merged={} content=[{what}] vmax={vmax:?}",
+        req.pipeline_ref,
+        info.index_count,
+        info.index_buffer_offset,
+        req.merged.is_some()
     ));
 }
