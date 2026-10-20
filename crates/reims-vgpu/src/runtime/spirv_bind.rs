@@ -2795,7 +2795,6 @@ impl crate::observe::Decline for UnclassifiedBinding {
 fn relocate_by_class(
     words: &mut [u32],
     classes: &[BindingClass],
-    band: impl Fn(u32) -> bool,
     offset: u32,
 ) -> usize {
     if offset == 0 {
@@ -2817,12 +2816,22 @@ fn relocate_by_class(
             let wanted = match by_variable.get(variable as usize).copied().flatten() {
                 Some(class) => classes.contains(&class),
                 None => {
+                    // A decoration the type walk could not classify stays where
+                    // the module put it. The band rule this used to apply is
+                    // only correct while every Metal index stays under 32 (its
+                    // own doc), so an unclassified texture past the band edge
+                    // could be relocated onto another stage's slot - or into
+                    // the engine's ColorInput band - while the reflection
+                    // still answers the old number: a silently mis-numbered
+                    // binding. Unrelocated, the layout backstops
+                    // (`UsedBindingAbsentFromLayout`, `DescriptorBindingConflict`)
+                    // refuse the draw by name instead.
                     crate::observe::Emit::decline(
                         "spirv_reloc",
                         &UnclassifiedBinding { binding, variable },
                     )
                     .fail_once(u64::from(binding));
-                    band(binding)
+                    false
                 }
             };
             if wanted {
@@ -2859,7 +2868,6 @@ pub fn offset_fragment_buffer_bindings(words: &mut [u32]) -> usize {
     relocate_by_class(
         words,
         &[BindingClass::Buffer],
-        |binding| binding < SAMPLED_RESOURCE_BINDING_BASE,
         FRAG_BUFFER_BINDING_OFFSET,
     )
 }
@@ -2904,7 +2912,6 @@ pub fn widen_sampled_bands(words: &mut [u32]) -> usize {
     relocate_by_class(
         words,
         &[BindingClass::Sampler, BindingClass::ColorInput],
-        |binding| binding >= M2V_SAMPLER_BINDING_BASE,
         SAMPLED_TAIL_WIDEN_OFFSET,
     )
 }
@@ -2924,9 +2931,6 @@ pub fn offset_fragment_sampled_resource_bindings(words: &mut [u32]) -> usize {
     relocate_by_class(
         words,
         &[BindingClass::SampledTexture, BindingClass::Sampler],
-        |binding| {
-            (SAMPLED_RESOURCE_BINDING_BASE..SAMPLED_RESOURCE_BINDING_LIMIT).contains(&binding)
-        },
         FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
     )
 }
