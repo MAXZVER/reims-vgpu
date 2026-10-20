@@ -6171,6 +6171,82 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
+    // The sampled residents' registry notes, taken at the last barrier rather
+    // than after the submit. The render rail's notes used to sit in a batch at
+    // the end of the draw, which is the right order only for a draw that
+    // reaches the end: a joiner into an open batch records these barriers into
+    // the batch's shared command buffer and can still fail after them
+    // (`clear_values` below, a query-pool create) - the barriers execute at the
+    // batch's flush either way, and a registry still naming the layouts they
+    // moved the images out of hands the next barrier a false `oldLayout`
+    // (undefined behaviour, not a validation error). At this point every
+    // sampled/seed barrier this draw owes is recorded and no fallible step has
+    // run since; the compute rail has always noted at the barrier.
+    for image in &sampled {
+        match image {
+            PreparedSampled::Resident {
+                identity,
+                next_access,
+                ..
+            } => pools.registry_note_access(identity, *next_access),
+            PreparedSampled::Snapshot {
+                identity,
+                next_access,
+                ..
+            } if req.attachment_slot(identity).is_none() => {
+                pools.registry_note_access(identity, *next_access)
+            }
+            PreparedSampled::Pyramid { levels, .. } => {
+                for level in levels {
+                    if req.attachment_slot(&level.identity).is_none() {
+                        pools.registry_note_access(&level.identity, level.next_access);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((_, _, next_access)) = seed_from_resolved {
+        if let Some(seed_identity) = &req.seed_from_target {
+            pools.registry_note_access(seed_identity, next_access);
+        }
+    }
+    // MRT secondaries' ready-marks move with the same argument: their
+    // layout-transition barriers above (the `MrtLayout` obstacle) are recorded
+    // before the fallible steps below, so a joiner that fails after them
+    // leaves recorded transitions with no registry record. The marks describe
+    // what the flushed batch's command buffer produces, which is the order the
+    // deferred path already records in.
+    //
+    // The target's own mark stays at the submit: its transition is the render
+    // pass itself, recorded only past every production fallible step below, so
+    // an earlier move would claim a pass this draw may still refuse to open.
+    if is_mrt {
+        for (secondary_index, (identity, _image, _old)) in mrt_secondaries.iter().enumerate() {
+            let attachment_index = secondary_index + 1;
+            if pass_key.color_feedback(attachment_index) {
+                // An MRT secondary is a write this accounting does not follow:
+                // every row.
+                pools.registry_mark_ready_with_access(
+                    identity,
+                    super::pools::ResidentAccess::ColorFeedback(
+                        pass_key.color_final_layout(attachment_index),
+                    ),
+                    super::pay_band::RowBand::Full,
+                );
+            } else {
+                // The pass's own `finalLayout` for this slot, asked of the key
+                // rather than respelled. The feedback arm beside it already
+                // derives; this one carried a hand-written
+                // `COLOR_ATTACHMENT_OPTIMAL`, which is the second spelling
+                // `color0_pass_exit_layout` exists to remove — a registry record
+                // naming a layout the pass did not leave the image in is a later
+                // barrier's wrong `oldLayout`.
+                pools.registry_mark_ready_at(identity, pass_key.color_final_layout(attachment_index));
+            }
+        }
+    }
+
     let mut clear = clear_values(req)?;
     if multisample_cold_clear {
         clear.values[0] = vk::ClearValue {
@@ -6950,39 +7026,9 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     let guest_store_recorded = guest_store_footprint.is_some();
     phase.enter(super::draw_phase::Phase::PostTarget);
-    // MRT secondary attachments settle at COLOR_ATTACHMENT_OPTIMAL (the pass
-    // final layout) and become sampleable residents; the consumer's
-    // resident-sample barrier then transitions COLOR_ATTACHMENT→SHADER_READ,
-    // carrying the color-write→shader-read dependency. (The ad-hoc MRT
-    // framebuffer is disposed below, after `finish_entry_async` — see there.)
-    if is_mrt {
-        for (secondary_index, (identity, _image, _old)) in mrt_secondaries.iter().enumerate() {
-            let attachment_index = secondary_index + 1;
-            if pass_key.color_feedback(attachment_index) {
-                // An MRT secondary is a write this accounting does not follow:
-                // every row.
-                pools.registry_mark_ready_with_access(
-                    identity,
-                    super::pools::ResidentAccess::ColorFeedback(
-                        pass_key.color_final_layout(attachment_index),
-                    ),
-                    super::pay_band::RowBand::Full,
-                );
-            } else {
-                // The pass's own `finalLayout` for this slot, asked of the key
-                // rather than respelled. The feedback arm beside it already
-                // derives; this one carried a hand-written
-                // `COLOR_ATTACHMENT_OPTIMAL`, which is the second spelling
-                // `color0_pass_exit_layout` exists to remove — a registry record
-                // naming a layout the pass did not leave the image in is a later
-                // barrier's wrong `oldLayout`.
-                pools.registry_mark_ready_at(
-                    identity,
-                    pass_key.color_final_layout(attachment_index),
-                );
-            }
-        }
-    }
+    // MRT secondaries' ready-marks were taken at their barriers, above the
+    // fallible steps; the deferred-submit comment below is what makes that
+    // order safe.
     // The depth pass stores unconditionally and settles at
     // DEPTH_STENCIL_ATTACHMENT_OPTIMAL, so after this draw the resident holds
     // depth a later pass can load and sits in the layout that pass will name.
@@ -7032,35 +7078,6 @@ pub(crate) unsafe fn execute_draw_inner(
                 });
             }
             _ => {}
-        }
-    }
-    for image in &sampled {
-        match image {
-            PreparedSampled::Resident {
-                identity,
-                next_access,
-                ..
-            } => pools.registry_note_access(identity, *next_access),
-            PreparedSampled::Snapshot {
-                identity,
-                next_access,
-                ..
-            } if req.attachment_slot(identity).is_none() => {
-                pools.registry_note_access(identity, *next_access)
-            }
-            PreparedSampled::Pyramid { levels, .. } => {
-                for level in levels {
-                    if req.attachment_slot(&level.identity).is_none() {
-                        pools.registry_note_access(&level.identity, level.next_access);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if let Some((_, _, next_access)) = seed_from_resolved {
-        if let Some(seed_identity) = &req.seed_from_target {
-            pools.registry_note_access(seed_identity, next_access);
         }
     }
     // Deferred-submit draw: park the per-draw descriptor set on the open batch
