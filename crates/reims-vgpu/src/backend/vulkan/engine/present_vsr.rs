@@ -213,11 +213,30 @@ pub(crate) struct VsrImage {
 /// Record one super-resolution pass: the whole of `input` (SHADER_READ_ONLY)
 /// into the whole of `output` (GENERAL, storage).
 pub(crate) unsafe fn evaluate(cmd: vk::CommandBuffer, input: &VsrImage, output: &VsrImage, quality: i32) -> i32 {
+    evaluate_rect(
+        cmd,
+        input,
+        output,
+        [0, 0, input.width, input.height],
+        [0, 0, output.width, output.height],
+        quality,
+    )
+}
+
+/// [`evaluate`] from the `in_rect` part of `input` into the `out_rect` part
+/// of `output` (`[x, y, width, height]` each); the rest of `output` is left
+/// alone. TEMP (lab, PRESENT_VSR_TILES).
+pub(crate) unsafe fn evaluate_rect(
+    cmd: vk::CommandBuffer,
+    input: &VsrImage,
+    output: &VsrImage,
+    in_rect: [u32; 4],
+    out_rect: [u32; 4],
+    quality: i32,
+) -> i32 {
     let Some(api) = api() else {
         return -100;
     };
-    let in_rect = [0, 0, input.width, input.height];
-    let out_rect = [0, 0, output.width, output.height];
     (api.evaluate)(
         cmd,
         input.image,

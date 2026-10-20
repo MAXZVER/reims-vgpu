@@ -1491,6 +1491,11 @@ impl WindowPresenter {
                             layout: fg_src.as_ref().map_or(src_layout, |s| s.layout),
                             width: base_width,
                             height: base_height,
+                            real: fg_src.as_ref().map(|_| super::present_refine::RefineFrame {
+                                image: blit.image(),
+                                view,
+                                layout: src_layout,
+                            }),
                         };
                         sharp
                             .record(

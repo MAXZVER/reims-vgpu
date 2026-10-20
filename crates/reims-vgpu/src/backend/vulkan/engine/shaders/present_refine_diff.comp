@@ -1,0 +1,54 @@
+#version 450
+// TEMP (lab, REIMS_VGPU_LAB_PRESENT_VSR_TILES): which cells of the guest frame changed since the last present.
+//
+// One workgroup per cell. `prev` holds the last frame this pass saw (rgba8, alpha forced to 1 - it is also VSR's
+// input); a pixel that differs is stored over it, and a cell with any differing pixel gets this present's stamp and
+// loses its refined copy (`valid` = 0) - in the same command buffer as the present that shows the change, so a
+// stale refined cell is never drawn over new content.
+layout(local_size_x = 256) in;
+
+layout(binding = 0) uniform sampler2D frame;
+layout(binding = 1, rgba8) uniform image2D prev;
+// [0, count): the stamp of each cell's last change; [count, 2 * count): 1 while the cache holds the cell refined.
+layout(std430, binding = 2) buffer Cells {
+    uint cells[];
+};
+
+layout(push_constant) uniform Push {
+    ivec2 size;  // frame size in pixels
+    int cell;    // cell side in pixels
+    int cols;    // cells per row
+    int count;   // cells in all
+    uint stamp;  // this present's stamp
+} pc;
+
+shared uint changed;
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        changed = 0u;
+    }
+    barrier();
+    ivec2 base = ivec2(gl_WorkGroupID.xy) * pc.cell;
+    ivec2 ext = min(ivec2(pc.cell), pc.size - base);
+    int n = ext.x * ext.y;
+    bool mine = false;
+    for (int i = int(gl_LocalInvocationIndex); i < n; i += 256) {
+        ivec2 p = base + ivec2(i % ext.x, i / ext.x);
+        vec4 c = vec4(texelFetch(frame, p, 0).rgb, 1.0);
+        vec4 o = imageLoad(prev, p);
+        if (any(greaterThan(abs(c - o), vec4(0.5 / 255.0)))) {
+            imageStore(prev, p, c);
+            mine = true;
+        }
+    }
+    if (mine) {
+        atomicOr(changed, 1u);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && changed != 0u) {
+        uint idx = gl_WorkGroupID.y * uint(pc.cols) + gl_WorkGroupID.x;
+        cells[idx] = pc.stamp;
+        cells[uint(pc.count) + idx] = 0u;
+    }
+}

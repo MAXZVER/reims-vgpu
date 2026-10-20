@@ -499,6 +499,27 @@ pub(crate) fn lab_take_fg_request() -> Option<(u64, bool)> {
     (v != 0).then_some((v >> 1, v & 1 == 1))
 }
 
+/// TEMP (lab, PRESENT_VSR_TILES): when the rail wants another present to
+/// refine more still cells - microseconds after [`lab_epoch`] plus one, 0 for
+/// none. Set by the rail after every present that refines; taken by the window.
+static LAB_TILES_DUE_US: AtomicU64 = AtomicU64::new(0);
+
+fn lab_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// TEMP (lab, PRESENT_VSR_TILES): the rail's next refine deadline.
+pub(crate) fn lab_note_tiles_due(at: Option<std::time::Instant>) {
+    let v = at.map_or(0, |at| at.saturating_duration_since(lab_epoch()).as_micros() as u64 + 1);
+    LAB_TILES_DUE_US.store(v, Ordering::Release);
+}
+
+fn lab_tiles_due() -> Option<std::time::Instant> {
+    let v = LAB_TILES_DUE_US.load(Ordering::Acquire);
+    (v != 0).then(|| lab_epoch() + std::time::Duration::from_micros(v - 1))
+}
+
 /// TEMP (lab, PRESENT_FG): set by the rail when the present it just made
 /// showed a generated midpoint; only then is the frame itself owed a present.
 static LAB_FG_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -585,15 +606,31 @@ fn guest_resize_request(
     mode == WindowMode::Sized && observed != Some(incoming) && incoming != window && !lab_fixed_window()
 }
 
-/// TEMP (lab, `REIMS_VGPU_LAB_FIXED_WINDOW=1`): the window keeps the size it
-/// opened at and the presenter scales every guest mode into it — the scaled
-/// present path (`REIMS_VGPU_LAB_PRESENT_SHARP`) without a full-screen window.
+/// TEMP (lab, `REIMS_VGPU_LAB_FIXED_WINDOW=1` or `=WxH`): the window keeps
+/// the size it opened at (with `WxH`, opens at that size) and the presenter
+/// scales every guest mode into it — the scaled present path
+/// (`REIMS_VGPU_LAB_PRESENT_SHARP`) without a full-screen window, e.g. the
+/// work VM's 5120x2160 screen for an off-screen lab window.
 fn lab_fixed_window() -> bool {
     if cfg!(test) {
         return false;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("REIMS_VGPU_LAB_FIXED_WINDOW").as_deref(), Ok("1" | "on")))
+    lab_fixed_window_value().is_some()
+}
+
+/// `Some(None)` for `1`/`on`, `Some(Some((w, h)))` for `WxH`. Latched.
+fn lab_fixed_window_value() -> Option<Option<(u32, u32)>> {
+    static V: std::sync::OnceLock<Option<Option<(u32, u32)>>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let v = std::env::var("REIMS_VGPU_LAB_FIXED_WINDOW").ok()?;
+        match v.trim() {
+            "1" | "on" => Some(None),
+            s => {
+                let (w, h) = s.split_once('x')?;
+                Some(Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+            }
+        }
+    })
 }
 
 /// How a `Resized` event answers an outstanding guest-driven request, or
@@ -1127,12 +1164,14 @@ impl ApplicationHandler<FramePublished> for App {
         // host's mouse moving over this window unfocused, its `CursorMoved`
         // is still input.
         event_loop.listen_device_events(DeviceEvents::Always);
+        // TEMP (lab): `REIMS_VGPU_LAB_FIXED_WINDOW=WxH` opens at that size.
+        let (open_w, open_h) = match lab_fixed_window_value() {
+            Some(Some(size)) if !cfg!(test) => size,
+            _ => (self.config.width, self.config.height),
+        };
         let mut attrs = Window::default_attributes()
             .with_title(self.config.title.clone())
-            .with_inner_size(winit::dpi::PhysicalSize::new(
-                self.config.width,
-                self.config.height,
-            ));
+            .with_inner_size(winit::dpi::PhysicalSize::new(open_w, open_h));
         // TEMP (lab): `REIMS_VGPU_LAB_WINDOW_BACKGROUND=1` opens the window off
         // screen, without activating it and without a taskbar button, so lab
         // runs (device-side frame dumps, census, QMP input) can go on while the
@@ -1388,15 +1427,18 @@ impl ApplicationHandler<FramePublished> for App {
             // TEMP (lab, PRESENT_FG): the owed present is a deadline of its own.
             let owed_at = self.lab_fg.owed.map(|(_, at)| at);
             let owed_due = owed_at.is_some_and(|at| now >= at);
-            if redraw_due(pending || owed_due, now, self.next_backstop) {
+            // TEMP (lab, PRESENT_VSR_TILES): so is the next refine.
+            let tiles_at = lab_tiles_due();
+            let tiles_now = tiles_at.is_some_and(|at| now >= at);
+            if redraw_due(pending || owed_due || tiles_now, now, self.next_backstop) {
                 window.request_redraw();
                 self.loop_census.redraws_asked += 1;
                 self.next_backstop = now + WINDOW_REDRAW_BACKSTOP;
             }
-            let wake = match owed_at.filter(|_| !owed_due) {
-                Some(at) => at.min(self.next_backstop),
-                None => self.next_backstop,
-            };
+            let wake = [owed_at.filter(|_| !owed_due), tiles_at.filter(|_| !tiles_now)]
+                .into_iter()
+                .flatten()
+                .fold(self.next_backstop, std::cmp::Ord::min);
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(wake));
         }
     }
@@ -1904,6 +1946,18 @@ impl App {
                 .lab_fg
                 .owed
                 .is_some_and(|(seq, at)| Some(seq) == incoming_seq && std::time::Instant::now() >= at);
+        // TEMP (lab, PRESENT_VSR_TILES): still cells are waiting for a present
+        // to be refined in.
+        let tiles_due = !fg_owed
+            && incoming_seq.is_some()
+            && lab_tiles_due().is_some_and(|at| std::time::Instant::now() >= at);
+        if tiles_due {
+            LAB_TILES_DUE_US.store(0, Ordering::Release);
+        }
+        // A new frame presents anyway (and keeps its midpoint); only a still
+        // one is re-presented for the refine.
+        let refining = refining
+            || (tiles_due && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq));
         if !refining && !fg_owed && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq) {
             self.loop_census.draws_stale += 1;
             return;

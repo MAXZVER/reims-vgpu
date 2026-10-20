@@ -57,6 +57,8 @@ mod present_nis_coef;
 mod present_vsr;
 #[cfg(feature = "host-window")]
 mod present_fg;
+#[cfg(feature = "host-window")]
+mod present_refine;
 
 /// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_FG`): the `VK_NV_optical_flow` queue and
 /// entry points the host window's frame generation submits to.

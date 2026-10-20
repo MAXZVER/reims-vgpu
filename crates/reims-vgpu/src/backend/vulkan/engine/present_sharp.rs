@@ -250,6 +250,11 @@ pub(crate) struct PresentSharp {
     vsr_created: bool,
     /// VSR: a create or evaluate refused; the present keeps EASU from here on.
     vsr_failed: bool,
+    /// TEMP (lab, PRESENT_VSR_TILES): VSR on the still cells, and whether the
+    /// present being recorded draws its overlay.
+    refine: Option<super::present_refine::TileRefine>,
+    refine_failed: bool,
+    refine_active: bool,
 }
 
 /// The guest frame one scaled present reads.
@@ -260,6 +265,9 @@ pub(crate) struct SharpSource {
     pub layout: vk::ImageLayout,
     pub width: u32,
     pub height: u32,
+    /// TEMP (lab, PRESENT_VSR_TILES): the guest frame behind `image` when that
+    /// is a generated midpoint (PRESENT_FG); `None` when `image` is the frame.
+    pub real: Option<super::present_refine::RefineFrame>,
 }
 
 impl PresentSharp {
@@ -303,6 +311,9 @@ impl PresentSharp {
             vsr_in: None,
             vsr_created: false,
             vsr_failed: false,
+            refine: None,
+            refine_failed: false,
+            refine_active: false,
         };
         if let Err(e) = made.build(device, format, frames) {
             made.destroy(device);
@@ -1045,6 +1056,7 @@ impl PresentSharp {
         // TEMP (lab, PRESENT_VSR_SETTLE): with a settle time VSR runs only on the
         // present that refines a settled frame; the others take EASU alone.
         let vsr_this = self.vsr.is_some()
+            && !super::present_refine::on()
             && (crate::host_window::present::lab_present_settle().is_none()
                 || crate::host_window::present::lab_take_refine_present());
         let second = if (self.nis.is_some() && nis_cfg.is_none()) || (self.vsr.is_some() && !vsr_this) {
@@ -1093,18 +1105,26 @@ impl PresentSharp {
         let set = self.sets[ix];
         self.write_set(device, set, src.view);
         // REIMS_VGPU_LAB_PRESENT_DUMP: the source as this present reads it.
-        let dumping = rcas.is_some()
+        // With PRESENT_VSR_TILES the "out" half is the refined-cell cache.
+        let dumping = (rcas.is_some() || super::present_refine::on())
             && self.begin_dump(
                 device,
                 ix,
                 (src.width, src.height),
                 (vp.2, vp.3),
-                // `mid` is rgba8 under NVScaler and VSR alike.
+                // `mid` is rgba8 under NVScaler and VSR alike, and so is the cache.
                 (self.nis.is_some() && nis_cfg.is_some()) || self.vsr.is_some(),
                 memory_type,
             );
         if let (true, Some(d)) = (dumping, self.dump.as_ref()) {
             Self::dump_copy(device, cmd, src.image, src.layout, d.buffer, 0, (src.width, src.height));
+        }
+        // TEMP (lab, PRESENT_VSR_TILES): stamp the changed cells, refine still
+        // ones; the window pass draws the refined cells over its own result.
+        self.refine_active = false;
+        if super::present_refine::on() {
+            let due = self.record_refine(device, cmd, ix, src, vp, memory_type);
+            crate::host_window::present::lab_note_tiles_due(due);
         }
         let to_read = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
@@ -1272,7 +1292,7 @@ impl PresentSharp {
                 device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
                 device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
                 device.cmd_draw(cmd, 3, 1, 0, 0);
-                device.cmd_end_render_pass(cmd);
+                self.end_window_pass(device, cmd, vp);
                 if dumping {
                     self.record_mid_dump(device, cmd, src.width, src.height);
                 }
@@ -1393,7 +1413,7 @@ impl PresentSharp {
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
             device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
             device.cmd_draw(cmd, 3, 1, 0, 0);
-            device.cmd_end_render_pass(cmd);
+            self.end_window_pass(device, cmd, vp);
         } else if let (Some(sharp), Some(mid)) = (rcas.filter(|_| self.nis.is_none()), self.mid.as_ref()) {
             // EASU over the whole of `mid`.
             device.cmd_begin_render_pass(
@@ -1430,7 +1450,7 @@ impl PresentSharp {
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
             device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
             device.cmd_draw(cmd, 3, 1, 0, 0);
-            device.cmd_end_render_pass(cmd);
+            self.end_window_pass(device, cmd, vp);
         } else {
             self.begin_window_pass(device, cmd, fb, extent, clear);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
@@ -1438,7 +1458,7 @@ impl PresentSharp {
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[set], &[]);
             device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &easu_push);
             device.cmd_draw(cmd, 3, 1, 0, 0);
-            device.cmd_end_render_pass(cmd);
+            self.end_window_pass(device, cmd, vp);
         }
         // REIMS_VGPU_LAB_PRESENT_DUMP: the first pass's result, as the window
         // pass just read it.
@@ -1469,6 +1489,35 @@ impl PresentSharp {
     /// REIMS_VGPU_LAB_PRESENT_DUMP: `mid` (in SHADER_READ_ONLY) after the
     /// source copy the dump already holds.
     unsafe fn record_mid_dump(&self, device: &ash::Device, cmd: vk::CommandBuffer, src_w: u32, src_h: u32) {
+        // TEMP (lab, PRESENT_VSR_TILES): the refined cells (others undefined).
+        if let (Some(d), true, Some(refine)) = (self.dump.as_ref(), self.refine_active, self.refine.as_ref()) {
+            let (image, w, h) = refine.cache_image();
+            let offset = src_w as u64 * src_h as u64 * 4;
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)],
+                &[],
+                &[],
+            );
+            Self::dump_copy(device, cmd, image, vk::ImageLayout::GENERAL, d.buffer, offset, (w, h));
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                &[],
+                &[],
+            );
+            return;
+        }
         let (Some(d), Some(mid)) = (self.dump.as_ref(), self.mid.as_ref()) else {
             return;
         };
@@ -1529,6 +1578,79 @@ impl PresentSharp {
                 .clear_values(&clear_values),
             vk::SubpassContents::INLINE,
         );
+    }
+
+    /// TEMP (lab, PRESENT_VSR_TILES): steps 1 and 2 of [`super::present_refine`]
+    /// for this present; when the window should present again for more.
+    unsafe fn record_refine(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        ix: usize,
+        src: &SharpSource,
+        vp: (u32, u32, u32, u32),
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> Option<std::time::Instant> {
+        let q = self.vsr.filter(|_| !self.refine_failed && !self.vsr_failed && super::present_vsr::ready())?;
+        let Some(geo) = super::present_refine::Geometry::new(src.width, src.height, vp.2, vp.3) else {
+            if crate::observe::first_sight("present_refine_refused_geometry", 0) {
+                crate::observe::fail(format!(
+                    "present_refine_refused reason=geometry {}x{}->{}x{}",
+                    src.width, src.height, vp.2, vp.3
+                ));
+            }
+            return None;
+        };
+        if self.refine.as_ref().is_some_and(|r| r.geometry() != geo) {
+            // A new size: rare; the old cells go with an idle queue.
+            let _ = device.device_wait_idle();
+            if let Some(mut old) = self.refine.take() {
+                old.destroy(device);
+            }
+        }
+        if self.refine.is_none() {
+            match super::present_refine::TileRefine::create(device, geo, self.render_pass, self.transient.len(), memory_type) {
+                Ok(r) => self.refine = Some(r),
+                Err(e) => {
+                    self.refine_failed = true;
+                    crate::observe::fail(format!("present_refine_refused reason=build err={e:?}"));
+                    return None;
+                }
+            }
+        }
+        if !self.vsr_created {
+            self.vsr_created = super::present_vsr::create_feature(device, cmd);
+            if !self.vsr_created {
+                self.vsr_failed = true;
+                return None;
+            }
+        }
+        let refine = self.refine.as_mut()?;
+        let frame = match src.real.as_ref() {
+            Some(real) => super::present_refine::RefineFrame {
+                image: real.image,
+                view: real.view,
+                layout: real.layout,
+            },
+            None => super::present_refine::RefineFrame {
+                image: src.image,
+                view: src.view,
+                layout: src.layout,
+            },
+        };
+        refine.record_diff(device, cmd, ix, &frame);
+        let due = refine.record_refine(device, cmd, q);
+        self.refine_active = true;
+        due
+    }
+
+    /// Ends a window pass, drawing the refined cells over it first
+    /// (PRESENT_VSR_TILES).
+    unsafe fn end_window_pass(&self, device: &ash::Device, cmd: vk::CommandBuffer, vp: (u32, u32, u32, u32)) {
+        if let (true, Some(refine)) = (self.refine_active, self.refine.as_ref()) {
+            refine.record_overlay(device, cmd, vp);
+        }
+        device.cmd_end_render_pass(cmd);
     }
 
     /// `REIMS_VGPU_LAB_PRESENT_DUMP`: a buffer for this present's dump when
@@ -1655,6 +1777,9 @@ impl PresentSharp {
 
     pub(crate) unsafe fn destroy(&mut self, device: &ash::Device) {
         self.release_all(device);
+        if let Some(mut refine) = self.refine.take() {
+            refine.destroy(device);
+        }
         if let Some(mid) = self.mid.take() {
             mid.destroy(device);
         }
