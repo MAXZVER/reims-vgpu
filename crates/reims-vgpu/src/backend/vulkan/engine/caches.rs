@@ -2553,56 +2553,6 @@ impl ObjectCaches {
             }
         }
 
-        // Every colour attachment, parsed once and planned once.
-        //
-        // Built here rather than beside the create-info below because both
-        // things that can go wrong are refusals of the whole pipeline, and a
-        // refusal belongs with the other capability checks in this run: typed
-        // decline, cached negatively so a replay returns this exact reason.
-        //
-        // Every attachment participates, not just slot 0. The secondaries
-        // carry their own decoded blend, and both questions are asked of the
-        // set: a pipeline is invalid if *any* attachment names a `SRC1_*`
-        // factor without `dualSrcBlend`, and invalid if they *disagree*
-        // without `independentBlend` — which no single attachment can be
-        // blamed for, which is why the second check takes the list.
-        let blend_cell = reims_vgpu_vulkan::blend::BlendCell {
-            dual_source: ctx.features.dual_src_blend,
-            independent: ctx.features.independent_blend,
-        };
-        let mut blend_plans = Vec::with_capacity(1 + key.pass.secondary_count());
-        {
-            let refuse = |reason: super::reason::DrawReason| {
-                crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
-                DrawError::Unsupported(reason)
-            };
-            for slot in 0..=key.pass.secondary_count() {
-                let blend = if slot == 0 {
-                    key.blend
-                } else {
-                    key.secondary_blend[slot - 1]
-                };
-                let attempt = color_attachment_state(blend, key.color_write_mask[slot])
-                    .map_err(|r| refuse(super::reason::DrawReason::BlendDeclaration(r)))
-                    .and_then(|state| {
-                        reims_vgpu_vulkan::blend::plan(&state, blend_cell)
-                            .map_err(|r| refuse(super::reason::DrawReason::BlendDevice(r)))
-                    });
-                match attempt {
-                    Ok(plan) => blend_plans.push(plan),
-                    Err(err) => {
-                        self.pipelines.insert_negative(key.clone(), err.clone());
-                        return Err(err);
-                    }
-                }
-            }
-            if let Err(r) = reims_vgpu_vulkan::blend::independent(&blend_plans, blend_cell) {
-                let err = refuse(super::reason::DrawReason::BlendDevice(r));
-                self.pipelines.insert_negative(key.clone(), err.clone());
-                return Err(err);
-            }
-        }
-
         // Resolve every attribute against what this device accepts as a vertex
         // buffer format. Vulkan makes the three-component 8/16-bit formats
         // optional, so the format the guest decoded is not automatically
