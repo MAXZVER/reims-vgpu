@@ -479,24 +479,45 @@ pub(crate) fn lab_take_refine_present() -> bool {
     LAB_REFINE_PRESENT.swap(false, Ordering::AcqRel)
 }
 
-/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_FG=on`): frame generation - every new
-/// guest frame is first shown as the midpoint between it and the previous one
-/// (built by the rail from the hardware optical flow), and the frame itself half
-/// a frame interval later. Latched.
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_FG=on`): frame generation - while the
+/// guest draws slower than the monitor, the window presents at the monitor's
+/// rate and each present shows the guest's motion at that moment, built by the
+/// rail between the two newest guest frames from the hardware optical flow at
+/// the matching phase. Latched.
 pub(crate) fn lab_present_fg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| matches!(std::env::var("REIMS_VGPU_LAB_PRESENT_FG").as_deref(), Ok("on" | "1")))
 }
 
-/// TEMP (lab, PRESENT_FG): `seq << 1 | midpoint` of the present the window is
-/// about to make, 0 when none; taken by the rail.
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_FG_DELAY`): how far behind the newest
+/// guest frame the shown motion runs, in guest frame intervals: 1.0 (default)
+/// interpolates every present smoothly at any guest rate; 0.5 halves the delay
+/// and is exact only for a guest at half the monitor's rate. Latched.
+fn lab_fg_delay() -> f64 {
+    static D: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PRESENT_FG_DELAY")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|d| (0.25..=1.0).contains(d))
+            .unwrap_or(1.0)
+    })
+}
+
+/// TEMP (lab, PRESENT_FG): the phase that means "the guest frame itself".
+const LAB_FG_PHASE_REAL: u16 = u16::MAX;
+
+/// TEMP (lab, PRESENT_FG): `seq << 17 | flow << 16 | phase` of the present the
+/// window is about to make, 0 when none; taken by the rail.
 static LAB_FG_REQUEST: AtomicU64 = AtomicU64::new(0);
 
-/// TEMP (lab, PRESENT_FG): the frame sequence this present shows and whether it
-/// should show the midpoint leading up to it.
-pub(crate) fn lab_take_fg_request() -> Option<(u64, bool)> {
+/// TEMP (lab, PRESENT_FG): the frame sequence this present shows, whether a
+/// new frame should get the flow from the one before it, and the phase between
+/// the two to show (`None`: the frame itself).
+pub(crate) fn lab_take_fg_request() -> Option<(u64, bool, Option<f32>)> {
     let v = LAB_FG_REQUEST.swap(0, Ordering::AcqRel);
-    (v != 0).then_some((v >> 1, v & 1 == 1))
+    let q = (v & 0xFFFF) as u16;
+    (v != 0).then_some((v >> 17, v & (1 << 16) != 0, (q != LAB_FG_PHASE_REAL).then(|| f32::from(q) / 65534.0)))
 }
 
 /// TEMP (lab, PRESENT_VSR_TILES): when the rail wants another present to
@@ -521,23 +542,34 @@ fn lab_tiles_due() -> Option<std::time::Instant> {
 }
 
 /// TEMP (lab, PRESENT_FG): set by the rail when the present it just made
-/// showed a generated midpoint; only then is the frame itself owed a present.
+/// showed a generated frame; otherwise the window stops interpolating that pair.
 static LAB_FG_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// TEMP (lab, PRESENT_FG): the rail drew a midpoint into this present.
+/// TEMP (lab, PRESENT_FG): the rail drew a generated frame into this present.
 pub(crate) fn lab_note_fg_shown() {
     LAB_FG_SHOWN.store(true, Ordering::Release);
 }
 
-/// TEMP (lab, PRESENT_FG): when the last new frame arrived, and the frame still
-/// owed its own present after its midpoint was shown.
+/// TEMP (lab, PRESENT_FG): the two newest guest frames as the window saw
+/// them arrive, and the presents the interpolation between them still wants.
 #[derive(Default)]
 struct LabFg {
-    arrived_at: Option<std::time::Instant>,
-    owed: Option<(u64, std::time::Instant)>,
-    /// The window's monitor refresh period, asked once; a midpoint closer to
-    /// its frames than this never reaches the screen.
+    /// The newest guest frame and when the window first saw it.
+    cur: Option<(u64, std::time::Instant)>,
+    /// The interval from the frame before it, when one to interpolate across
+    /// (short enough, and the guest slower than the monitor).
+    interval: Option<std::time::Duration>,
+    /// When the next interpolated present is due (`None`: none pending).
+    next_at: Option<std::time::Instant>,
+    /// The (frame, phase) last presented.
+    shown: Option<(u64, u16)>,
+    /// The window's monitor refresh period, asked once.
     monitor_period: Option<std::time::Duration>,
+    /// The guest's own frame rate (published frames per second over ~250 ms,
+    /// from the frame sequence - not what the window picked up), and where
+    /// the current measurement started.
+    guest_hz: f64,
+    rate_from: Option<(std::time::Instant, u64)>,
 }
 
 /// TEMP (lab, PRESENT_VSR_SETTLE): when the last fresh frame reached the screen
@@ -1424,8 +1456,8 @@ impl ApplicationHandler<FramePublished> for App {
             }
             let now = std::time::Instant::now();
             let pending = std::mem::take(&mut self.frame_pending);
-            // TEMP (lab, PRESENT_FG): the owed present is a deadline of its own.
-            let owed_at = self.lab_fg.owed.map(|(_, at)| at);
+            // TEMP (lab, PRESENT_FG): the next interpolated present is a deadline of its own.
+            let owed_at = self.lab_fg.next_at;
             let owed_due = owed_at.is_some_and(|at| now >= at);
             // TEMP (lab, PRESENT_VSR_TILES): so is the next refine.
             let tiles_at = lab_tiles_due();
@@ -1910,6 +1942,79 @@ impl App {
     /// presenter before the loop ends, and an attach that failed never stored a
     /// window at all. Both already named themselves where they happened, so a
     /// redraw arriving after either is expected control flow and stays quiet.
+    /// TEMP (lab, PRESENT_FG): what a present now shows for guest frame `seq`:
+    /// `(seq, phase, flow)` - the phase between the frame before it and it
+    /// ([`LAB_FG_PHASE_REAL`] for the frame itself), and whether the frame,
+    /// when new to the rail, should get the flow from the one before it.
+    fn lab_fg_plan(&mut self, seq: u64) -> (u64, u16, bool) {
+        let now = std::time::Instant::now();
+        if self.lab_fg.monitor_period.is_none() {
+            self.lab_fg.monitor_period = self
+                .window
+                .as_ref()
+                .and_then(|w| w.current_monitor())
+                .and_then(|m| m.refresh_rate_millihertz())
+                .filter(|&mhz| mhz > 0)
+                .map(|mhz| std::time::Duration::from_secs_f64(1000.0 / f64::from(mhz)));
+        }
+        match self.lab_fg.rate_from {
+            Some((at, from)) if now.duration_since(at) >= std::time::Duration::from_millis(250) => {
+                self.lab_fg.guest_hz = seq.saturating_sub(from) as f64 / now.duration_since(at).as_secs_f64();
+                self.lab_fg.rate_from = Some((now, seq));
+            }
+            Some(_) => {}
+            None => self.lab_fg.rate_from = Some((now, seq)),
+        }
+        if self.lab_fg.cur.map(|(s, _)| s) != Some(seq) {
+            let before = self.lab_fg.cur.map(|(_, at)| at);
+            self.lab_fg.cur = Some((seq, now));
+            let period = self.lab_fg.monitor_period.unwrap_or(std::time::Duration::from_micros(8333));
+            // Interpolate across a gap of motion (not the first frame after a
+            // pause, which shows at once) while the guest is slower than the
+            // monitor (at its rate every present has a new frame already).
+            self.lab_fg.interval = before
+                .map(|at| now.duration_since(at))
+                .filter(|d| *d >= period && *d <= std::time::Duration::from_millis(50))
+                .filter(|_| self.lab_fg.guest_hz * period.as_secs_f64() < 0.9);
+        }
+        let Some((_, at)) = self.lab_fg.cur else {
+            return (seq, LAB_FG_PHASE_REAL, false);
+        };
+        let Some(interval) = self.lab_fg.interval else {
+            return (seq, LAB_FG_PHASE_REAL, false);
+        };
+        let phase = now.duration_since(at).as_secs_f64() / interval.as_secs_f64() + (1.0 - lab_fg_delay());
+        let q = if phase >= 0.995 { LAB_FG_PHASE_REAL } else { (phase.max(0.0) * 65534.0) as u16 };
+        (seq, q, true)
+    }
+
+    /// TEMP (lab, PRESENT_FG): a present showed `(seq, phase)`; schedule the
+    /// next one while the shown motion has not reached the frame itself.
+    fn lab_fg_presented(&mut self, seq: u64, phase: u16) {
+        let now = std::time::Instant::now();
+        let drew = LAB_FG_SHOWN.swap(false, Ordering::AcqRel);
+        let phase = if phase != LAB_FG_PHASE_REAL && !drew {
+            // The rail showed the frame itself (no scaled present, no pair):
+            // nothing more to interpolate for it.
+            if crate::observe::first_sight("present_fg_not_shown", 0) {
+                crate::observe::fail("present_fg_not_shown (no scaled present or no flow)".to_string());
+            }
+            LAB_FG_PHASE_REAL
+        } else {
+            phase
+        };
+        self.lab_fg.shown = Some((seq, phase));
+        self.lab_fg.next_at = match (phase != LAB_FG_PHASE_REAL, self.lab_fg.cur, self.lab_fg.interval) {
+            (true, Some((_, at)), Some(interval)) => {
+                let period = self.lab_fg.monitor_period.unwrap_or(std::time::Duration::from_micros(8333));
+                // The present where the motion reaches the frame itself.
+                let real_at = at + interval.mul_f64(lab_fg_delay());
+                Some((now + period).min(real_at.max(now)))
+            }
+            _ => None,
+        };
+    }
+
     fn draw(&mut self) {
         if !self.presenter_attached {
             return;
@@ -1939,13 +2044,13 @@ impl App {
             && lab_present_settle().is_some_and(|settle| {
                 self.lab_settle.fresh_at.is_some_and(|at| at.elapsed() >= settle)
             });
-        // TEMP (lab, PRESENT_FG): the frame whose midpoint was shown is owed its
-        // own present once its time has come and nothing newer arrived.
-        let fg_owed = lab_present_fg()
-            && self
-                .lab_fg
-                .owed
-                .is_some_and(|(seq, at)| Some(seq) == incoming_seq && std::time::Instant::now() >= at);
+        // TEMP (lab, PRESENT_FG): what this present would show between the two
+        // newest guest frames, and whether the interpolation wants it now.
+        let fg_plan = incoming_seq.filter(|_| lab_present_fg()).map(|seq| self.lab_fg_plan(seq));
+        let fg_owed = fg_plan.is_some_and(|(seq, phase, _)| {
+            self.lab_fg.shown != Some((seq, phase))
+                && self.lab_fg.next_at.is_some_and(|at| std::time::Instant::now() >= at)
+        });
         // TEMP (lab, PRESENT_VSR_TILES): still cells are waiting for a present
         // to be refined in.
         let tiles_due = !fg_owed
@@ -1962,30 +2067,9 @@ impl App {
             self.loop_census.draws_stale += 1;
             return;
         }
-        // TEMP (lab, PRESENT_FG): a new frame is shown as its midpoint first -
-        // unless the guest already outpaces the monitor's half rate, where the
-        // midpoint would be wasted work the monitor never shows.
-        let fg_new = lab_present_fg() && !fg_owed && !refining && incoming_seq != self.last_presented_seq;
-        if fg_new && self.lab_fg.monitor_period.is_none() {
-            self.lab_fg.monitor_period = self
-                .window
-                .as_ref()
-                .and_then(|w| w.current_monitor())
-                .and_then(|m| m.refresh_rate_millihertz())
-                .filter(|&mhz| mhz > 0)
-                .map(|mhz| std::time::Duration::from_secs_f64(1000.0 / f64::from(mhz)));
-        }
-        let fg_fresh = fg_new
-            && self.lab_fg.arrived_at.is_none_or(|at| {
-                let period = self.lab_fg.monitor_period.unwrap_or(std::time::Duration::from_micros(4167));
-                at.elapsed() >= period * 2 * 9 / 10
-            });
-        if let Some(seq) = incoming_seq.filter(|_| lab_present_fg()) {
+        if let Some((seq, phase, flow)) = fg_plan {
             LAB_FG_SHOWN.store(false, Ordering::Release);
-            LAB_FG_REQUEST.store(seq << 1 | u64::from(fg_fresh), Ordering::Release);
-        }
-        if fg_owed {
-            self.lab_fg.owed = None;
+            LAB_FG_REQUEST.store(seq << 17 | u64::from(flow) << 16 | u64::from(phase), Ordering::Release);
         }
         if refining {
             LAB_REFINE_PRESENT.store(true, Ordering::Release);
@@ -2018,22 +2102,8 @@ impl App {
                 if !refining {
                     self.lab_settle.fresh_at = Some(std::time::Instant::now());
                 }
-                if fg_new {
-                    let now = std::time::Instant::now();
-                    let shown = LAB_FG_SHOWN.swap(false, Ordering::AcqRel);
-                    if fg_fresh && !shown && crate::observe::first_sight("present_fg_not_shown", 0) {
-                        crate::observe::fail("present_fg_not_shown (no scaled present or no flow)".to_string());
-                    }
-                    if let (true, true, Some(seq)) = (fg_fresh, shown, incoming_seq) {
-                        let half = self
-                            .lab_fg
-                            .arrived_at
-                            .map(|at| now.duration_since(at) / 2)
-                            .unwrap_or(std::time::Duration::from_millis(8))
-                            .clamp(std::time::Duration::from_millis(2), std::time::Duration::from_millis(40));
-                        self.lab_fg.owed = Some((seq, now + half));
-                    }
-                    self.lab_fg.arrived_at = Some(now);
+                if let Some((seq, phase, _)) = fg_plan {
+                    self.lab_fg_presented(seq, phase);
                 }
                 self.last_presented_seq = incoming_seq;
                 if let Some(seq) = incoming_seq {

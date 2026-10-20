@@ -1446,7 +1446,7 @@ impl WindowPresenter {
                 };
                 let src_layout = blit.record_read_barrier(&ctx.device, frame_cmd);
                 let mut fg_src: Option<super::present_fg::FgSource> = None;
-                if let (Some((image, access)), Some((seq, want_mid))) =
+                if let (Some((image, access)), Some((seq, want_flow, phase))) =
                     (fg_input, fg_input.and_then(|_| crate::host_window::present::lab_take_fg_request()))
                 {
                     if !self.fg_failed && self.fg.as_ref().is_none_or(|fg| !fg.matches(base_width, base_height)) {
@@ -1467,15 +1467,18 @@ impl WindowPresenter {
                     }
                     if let Some(fg) = self.fg.as_mut() {
                         let (stage, acc) = access.source_scope();
-                        match fg.submit_flow(ctx, frame_ix, image, access.layout(), stage, acc, seq, want_mid) {
-                            Ok(Some(sem)) => {
-                                fg_src = fg.record_warp(&ctx.device, frame_cmd, frame_ix);
-                                if fg_src.is_some() {
-                                    crate::host_window::present::lab_note_fg_shown();
+                        match fg.submit_flow(ctx, frame_ix, image, access.layout(), stage, acc, seq, want_flow) {
+                            Ok(flowed) => {
+                                // The flow just submitted (a new pair) is waited on by
+                                // this present; later presents of the pair follow it.
+                                fg_wait = flowed;
+                                if let Some(phase) = phase {
+                                    fg_src = fg.record_warp(&ctx.device, frame_cmd, frame_ix, seq, phase);
+                                    if fg_src.is_some() {
+                                        crate::host_window::present::lab_note_fg_shown();
+                                    }
                                 }
-                                fg_wait = Some(sem);
                             }
-                            Ok(None) => {}
                             Err(e) => {
                                 self.fg_failed = true;
                                 crate::observe::fail(format!("present_fg_refused submit={e:?}"));

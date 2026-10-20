@@ -66,8 +66,10 @@ pub(crate) struct PresentFg {
     have_prev: bool,
     /// The guest frame sequence last copied (a re-present of it copies nothing).
     last_seq: u64,
-    /// The input pair (previous, current) the last flow ran on, for the warp.
+    /// The input pair (previous, current) the last flow ran on, for the warp,
+    /// and the guest frame sequence of its current half.
     pair: Option<(usize, usize)>,
+    pair_seq: u64,
     gfx_pool: vk::CommandPool,
     of_pool: vk::CommandPool,
     copy_cmds: Vec<vk::CommandBuffer>,
@@ -145,6 +147,7 @@ impl PresentFg {
             have_prev: false,
             last_seq: 0,
             pair: None,
+            pair_seq: 0,
             gfx_pool: vk::CommandPool::null(),
             of_pool: vk::CommandPool::null(),
             copy_cmds: Vec::new(),
@@ -544,14 +547,25 @@ impl PresentFg {
             vk::Fence::null(),
         )?;
         self.pair = Some((prev, cur));
+        self.pair_seq = seq;
         Ok(Some(self.flowed[ix]))
     }
 
-    /// Step 3, recorded into the frame's command buffer (which waits on the
-    /// semaphore [`Self::submit_flow`] returned): the midpoint into `mid`, left
-    /// in `TRANSFER_SRC_OPTIMAL` like a guest frame the present reads.
-    pub(crate) unsafe fn record_warp(&self, device: &ash::Device, cmd: vk::CommandBuffer, ix: usize) -> Option<FgSource> {
-        let (prev, cur) = self.pair?;
+    /// Step 3, recorded into the frame's command buffer: the frame at `phase`
+    /// (0 = the previous guest frame, 1 = `seq`) into `mid`, left in
+    /// `TRANSFER_SRC_OPTIMAL` like a guest frame the present reads. The first
+    /// present of a pair waits on the semaphore [`Self::submit_flow`] returned;
+    /// later ones follow it on the queue (the barrier below waits for all
+    /// earlier commands). `None` when the pair is not `seq`'s.
+    pub(crate) unsafe fn record_warp(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        ix: usize,
+        seq: u64,
+        phase: f32,
+    ) -> Option<FgSource> {
+        let (prev, cur) = self.pair.filter(|_| self.pair_seq == seq)?;
         let range = super::color_subresource_range();
         let to_general = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
@@ -564,7 +578,7 @@ impl PresentFg {
             .subresource_range(range)];
         device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::ALL_COMMANDS,
             vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             &[vk::MemoryBarrier::default()
@@ -608,7 +622,7 @@ impl PresentFg {
         push[0..4].copy_from_slice(&(self.width as i32).to_le_bytes());
         push[4..8].copy_from_slice(&(self.height as i32).to_le_bytes());
         push[8..12].copy_from_slice(&(GRID as i32).to_le_bytes());
-        push[12..16].copy_from_slice(&0.5f32.to_le_bytes());
+        push[12..16].copy_from_slice(&phase.clamp(0.0, 1.0).to_le_bytes());
         device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
         device.cmd_dispatch(cmd, self.width.div_ceil(16), self.height.div_ceil(16), 1);
         let to_src = [vk::ImageMemoryBarrier::default()
