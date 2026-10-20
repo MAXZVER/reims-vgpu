@@ -1014,8 +1014,14 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     let first_fn = ins.iter().position(|x| op(x) == OP_FUNCTION)?;
     let mut bound = words[3];
     let mut next = || {
-        bound += 1;
-        bound - 1
+        // Release overflow-checks are off, so a plain `bound += 1` wraps past
+        // u32::MAX onto ids the module already defines, and the bound sizes the
+        // per-id tables the walkers build (MAX_ID_BOUND). A refused allocation
+        // declines the rewrite exactly as a malformed module does.
+        (bound < MAX_ID_BOUND as u32).then(|| {
+            bound += 1;
+            bound - 1
+        })
     };
     let globals = &ins[..first_fn];
     let find = |pred: &dyn Fn(&[u32]) -> bool| globals.iter().find(|x| pred(x)).map(|x| x[1]);
@@ -1023,7 +1029,7 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     let t_void = match find(&|x| op(x) == OP_TYPE_VOID) {
         Some(t) => t,
         None => {
-            let t = next();
+            let t = next()?;
             added.push(vec![OP_TYPE_VOID, t]);
             t
         }
@@ -1031,7 +1037,7 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     let t_uint = match find(&|x| op(x) == OP_TYPE_INT && x.len() == 4 && x[2] == 32 && x[3] == 0) {
         Some(t) => t,
         None => {
-            let t = next();
+            let t = next()?;
             added.push(vec![OP_TYPE_INT, t, 32, 0]);
             t
         }
@@ -1039,7 +1045,7 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     let t_bool = match find(&|x| op(x) == OP_TYPE_BOOL) {
         Some(t) => t,
         None => {
-            let t = next();
+            let t = next()?;
             added.push(vec![OP_TYPE_BOOL, t]);
             t
         }
@@ -1049,7 +1055,7 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     }) {
         Some(t) => t,
         None => {
-            let t = next();
+            let t = next()?;
             added.push(vec![OP_TYPE_POINTER, t, STORAGE_FUNCTION, t_uint]);
             t
         }
@@ -1057,16 +1063,16 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     let t_fn = match find(&|x| op(x) == OP_TYPE_FUNCTION && x.len() == 4 && x[2] == t_void && x[3] == t_uint) {
         Some(t) => t,
         None => {
-            let t = next();
+            let t = next()?;
             added.push(vec![OP_TYPE_FUNCTION, t, t_void, t_uint]);
             t
         }
     };
-    let (c0, c1, ccap) = (next(), next(), next());
+    let (c0, c1, ccap) = (next()?, next()?, next()?);
     added.push(vec![OP_CONSTANT, t_uint, c0, 0]);
     added.push(vec![OP_CONSTANT, t_uint, c1, 1]);
     added.push(vec![OP_CONSTANT, t_uint, ccap, cap]);
-    let fcheck = next();
+    let fcheck = next()?;
 
     let mut out: Vec<Vec<u32>> = globals.iter().map(|x| x.to_vec()).collect();
     out.extend(added);
@@ -1091,12 +1097,12 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
                 out.push(ins[k].to_vec());
                 k += 1;
             }
-            cnt = next();
+            cnt = next()?;
             out.push(vec![OP_VARIABLE, t_ptr, cnt, STORAGE_FUNCTION, c0]);
             continue;
         }
         if op(x) == OP_LOOP_MERGE && cnt != 0 {
-            let (a, b, r) = (next(), next(), next());
+            let (a, b, r) = (next()?, next()?, next()?);
             out.push(vec![OP_LOAD, t_uint, a, cnt]);
             out.push(vec![OP_IADD, t_uint, b, a, c1]);
             out.push(vec![OP_STORE, cnt, b]);
@@ -1106,7 +1112,7 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
         out.push(x.to_vec());
         k += 1;
     }
-    let (p, l0, lk, lr, over) = (next(), next(), next(), next(), next());
+    let (p, l0, lk, lr, over) = (next()?, next()?, next()?, next()?, next()?);
     out.push(vec![OP_FUNCTION, t_void, fcheck, 0, t_fn]);
     out.push(vec![OP_FUNCTION_PARAMETER, t_uint, p]);
     out.push(vec![OP_LABEL, l0]);
@@ -1199,8 +1205,14 @@ pub fn demote_multisampled_images(words: &[u32]) -> Option<Vec<u32>> {
         .collect();
     let mut bound = words[3];
     let mut next = || {
-        bound += 1;
-        bound - 1
+        // Release overflow-checks are off, so a plain `bound += 1` wraps past
+        // u32::MAX onto ids the module already defines, and the bound sizes the
+        // per-id tables the walkers build (MAX_ID_BOUND). A refused allocation
+        // declines the rewrite exactly as a malformed module does.
+        (bound < MAX_ID_BOUND as u32).then(|| {
+            bound += 1;
+            bound - 1
+        })
     };
     let mut added: Vec<Vec<u32>> = Vec::new();
     let globals: Vec<Vec<u32>> = ins[..first_fn].to_vec();
@@ -1211,24 +1223,28 @@ pub fn demote_multisampled_images(words: &[u32]) -> Option<Vec<u32>> {
     let int_ty = match int_ty {
         Some(t) => t,
         None => {
-            let t = next();
+            let t = next()?;
             added.push(vec![(4 << 16) | OP_TYPE_INT, t, 32, 1]);
             t
         }
     };
-    let constant = |ty: u32, value: u32, added: &mut Vec<Vec<u32>>, next: &mut dyn FnMut() -> u32| {
-        globals
+    let constant = |ty: u32,
+                    value: u32,
+                    added: &mut Vec<Vec<u32>>,
+                    next: &mut dyn FnMut() -> Option<u32>|
+     -> Option<u32> {
+        if let Some(found) = globals
             .iter()
             .chain(added.iter())
             .find(|x| op(x) == OP_CONSTANT && x.len() == 4 && x[1] == ty && x[3] == value)
-            .map(|x| x[2])
-            .unwrap_or_else(|| {
-                let id = next();
-                added.push(vec![(4 << 16) | OP_CONSTANT, ty, id, value]);
-                id
-            })
+        {
+            return Some(found[2]);
+        }
+        let id = next()?;
+        added.push(vec![(4 << 16) | OP_CONSTANT, ty, id, value]);
+        Some(id)
     };
-    let zero = constant(int_ty, 0, &mut added, &mut next);
+    let zero = constant(int_ty, 0, &mut added, &mut next)?;
     let mut rewritten = 0usize;
     for x in ins.iter_mut() {
         if op(x) == u32::from(OP_TYPE_IMAGE) && x.len() >= 9 && x[6] == 1 {
@@ -1279,7 +1295,7 @@ pub fn demote_multisampled_images(words: &[u32]) -> Option<Vec<u32>> {
             body.push(vec![(5 << 16) | u32::from(OP_IMAGE_QUERY_SIZE_LOD), x[1], x[2], x[3], zero]);
             rewritten += 1;
         } else if o == u32::from(OP_IMAGE_QUERY_SAMPLES) && x.len() == 4 && ms_values.contains(&x[3]) {
-            let one = constant(x[1], 1, &mut added, &mut next);
+            let one = constant(x[1], 1, &mut added, &mut next)?;
             body.push(vec![(4 << 16) | u32::from(OP_COPY_OBJECT), x[1], x[2], one]);
             rewritten += 1;
         } else {
@@ -4438,6 +4454,44 @@ mod tests {
             .copied()
             .collect();
         assert!(refuse_unrepaired_image_consumers(&named, &retyped).is_ok());
+    }
+
+    /// The rewrites' id allocator hands out `bound + 1` upward; in a release
+    /// build that wraps past `u32::MAX` onto ids the module already defines,
+    /// and any bound past `MAX_ID_BOUND` would also size the walkers' per-id
+    /// tables past their own refusal. A spent bound declines the rewrite.
+    #[test]
+    fn a_module_whose_id_bound_is_spent_declines_the_rewrites() {
+        // Minimal fragment module: a void type, a fragment entry point, a
+        // loop merge, then the function section. No int type exists, so the
+        // first id the rewrite allocates is taken immediately - with the
+        // declared bound already past every cap the allocator may use.
+        let module = vec![
+            0x0723_0203,
+            0,
+            0,
+            u32::MAX - 1,
+            0,
+            (2 << 16) | 19,
+            7, // OpTypeVoid %7
+            (4 << 16) | 15,
+            4,
+            8,
+            0, // OpEntryPoint Fragment %8 ""
+            (4 << 16) | 246,
+            9,
+            10,
+            0, // OpLoopMerge %9 %10 None
+            (5 << 16) | 54,
+            7,
+            11,
+            0,
+            12, // OpFunction %7 %11 None %12
+        ];
+        assert!(
+            loop_budget_words(&module, 16384).is_none(),
+            "a spent bound declines rather than wrapping"
+        );
     }
 
     /// The product walk names only separate samplers; the test oracle names both
