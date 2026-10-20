@@ -24068,9 +24068,22 @@ fn lab_early_index_census<E: std::fmt::Debug>(
     let Some(gate) = GATE.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GATE").ok()) else {
         return;
     };
-    if !std::path::Path::new(gate).exists() || N.fetch_add(1, Ordering::Relaxed) >= 60 {
+    static SKIP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let skip = *SKIP.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_IDX_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if !std::path::Path::new(gate).exists() {
         return;
     }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < skip || n >= skip + 60 {
+        return;
+    }
+    let vb: Vec<String> = req
+        .vertex_buffers
+        .iter()
+        .map(|b| format!("{}:r{}+{}", b.index, b.buffer_ref, b.offset))
+        .collect();
     let what = match early {
         None => "none".to_string(),
         Some(Err(e)) => format!("err {e:?}"),
@@ -24086,10 +24099,15 @@ fn lab_early_index_census<E: std::fmt::Debug>(
         }
     };
     crate::observe::fail(format!(
-        "lab_early_index pipe={} count={} off={} merged={} content=[{what}] vmax={vmax:?}",
+        "lab_early_index #{n} pipe={} count={} ibuf=r{} off={} base_vertex={} merged={} content=[{what}] vmax={vmax:?}          vb=[{}] first={} vtx={}",
         req.pipeline_ref,
         info.index_count,
+        info.index_buffer_ref,
         info.index_buffer_offset,
-        req.merged.is_some()
+        info.base_vertex,
+        req.merged.is_some(),
+        vb.join(" "),
+        req.first_vertex,
+        req.vertex_count
     ));
 }
