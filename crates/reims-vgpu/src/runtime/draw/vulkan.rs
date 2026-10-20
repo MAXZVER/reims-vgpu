@@ -269,6 +269,8 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // clock: `drain_duty`'s `draw_us` brackets exactly this function, and the
     // whole reading is that the phases sum to it.
     let _phase = crate::runtime::chain_phase::ChainTimer::start();
+    super::lab_index_census(state, host, req); // TEMP (lab)
+    lab_big_draw_seq_note(req); // TEMP (lab)
     // The local copy is read for geometry, store actions and Store routing,
     // never for the seeds, and a seed is a whole attachment of pixels: Mission
     // Control's cleared MRT attachments made this clone ~7 % of the drain. The
@@ -370,6 +372,14 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         // happened. Deriving the outcome from the one value that knows makes
         // that class of drift unrepresentable.
         engine_outcome = EngineDrawOutcome::of(&engine);
+        lab_big_draw_outcome(req, engine_outcome, match &engine {
+            Ok(M2vDrawSpan::None) => "none",
+            Ok(M2vDrawSpan::Pixels { .. }) => "pixels",
+            Ok(M2vDrawSpan::ResidentChain) => "chain",
+            Ok(M2vDrawSpan::ResidentGvaStore { .. }) => "gvastore",
+            Ok(M2vDrawSpan::ResidentSurfaceStore { .. }) => "surface",
+            Err(_) => "err",
+        }); // TEMP (lab)
         if let Some(c) = req.colors.first().filter(|c| c.mapping_id != 0 && req.task_id != 1) {
             // TEMP (lab, `REIMS_VGPU_LAB_DRAW_WAIT=1`): the device idle after every
             // direct app draw into a tile-sized mapped surface.
@@ -3342,8 +3352,64 @@ fn lab_dump_admit(req: &DrawEncodeRequest, w: u32, h: u32) -> Option<u32> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(80)
     });
+    // TEMP (lab): `REIMS_VGPU_LAB_DUMP_SKIP=N` dumps only big draws N.. of the gated window (the
+    // `lab_big_draw_seq_note` sequence, which counts every draw the encoder starts, whatever arm it takes).
+    static SKIP: OnceLock<Option<u32>> = OnceLock::new();
+    let skip = *SKIP.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_DUMP_SKIP").ok().and_then(|v| v.parse().ok())
+    });
+    if let Some(skip) = skip {
+        let seq = LAB_BIG_DRAW_SEQ.load(Ordering::Relaxed).saturating_sub(1);
+        return (seq >= skip && seq < skip.saturating_add(max)).then_some(seq);
+    }
     let n = N.fetch_add(1, Ordering::Relaxed);
     (n < max).then_some(n)
+}
+
+/// TEMP (lab): sequence of draws into a >= 2 Mpx colour-0 target outside WindowServer while the gate is open.
+static LAB_BIG_DRAW_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// TEMP (lab): the engine's answer for each big draw of the `REIMS_VGPU_LAB_DUMP_SKIP` window.
+fn lab_big_draw_outcome(req: &DrawEncodeRequest, outcome: EngineDrawOutcome, span: &str) {
+    use std::sync::atomic::Ordering;
+    static SKIP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let Some(skip) = *SKIP.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_DUMP_SKIP").ok().and_then(|v| v.parse().ok())
+    }) else {
+        return;
+    };
+    let Some(c0) = req.colors.first() else {
+        return;
+    };
+    if req.task_id == 1 || u64::from(c0.width) * u64::from(c0.height) < 2_000_000 || !lab_gate_open() {
+        return;
+    }
+    let seq = LAB_BIG_DRAW_SEQ.load(Ordering::Relaxed).saturating_sub(1);
+    if seq < skip || seq >= skip + 80 {
+        return;
+    }
+    crate::observe::fail(format!(
+        "lab_big_draw seq={seq} pipe={} span={span} outcome={outcome:?} continues={} established={}          load={} store={} mid={} ref={} t={}",
+        req.pipeline_ref,
+        req.render_pass_continues,
+        req.chain_resident_established,
+        c0.load_action,
+        c0.store_action,
+        c0.mapping_id,
+        c0.texture_ref,
+        crate::observe::elapsed_us() / 1000
+    ));
+}
+
+/// TEMP (lab): advance [`LAB_BIG_DRAW_SEQ`] for one draw the encoder starts.
+fn lab_big_draw_seq_note(req: &DrawEncodeRequest) {
+    let Some(c0) = req.colors.first() else {
+        return;
+    };
+    if req.task_id == 1 || u64::from(c0.width) * u64::from(c0.height) < 2_000_000 || !lab_gate_open() {
+        return;
+    }
+    LAB_BIG_DRAW_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// TEMP (lab): write one colour-0 dump and its `lab_dump` line.
@@ -3362,6 +3428,7 @@ fn lab_dump_write(req: &DrawEncodeRequest, n: u32, w: u32, h: u32, rgba: &[u8], 
         req.colors.first().map(|c| c.texture_ref).unwrap_or(0)
     );
     let _ = std::fs::write(dir.join(&name), out);
+    lab_dump_draw_shape(req, n);
     crate::observe::fail(format!(
         "lab_dump file={name} fmt={} rt=[{}] load={} srcs={:?} t={}",
         req.colors.first().map(|c| c.format).unwrap_or(0),
@@ -12514,6 +12581,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         // Each own-index sub-draw's own vertex reach; its overridden buffers are read that far, not the record's.
         let mut lab_sub_vmax: Vec<Option<u64>> = Vec::new();
         let mut indexed_vertex_max = indexed_vertex_max;
+        lab_early_index_census(req, early_index.as_ref(), indexed_vertex_max);
         if let (Some(m), true) = (req.merged.as_deref(), !lab_merge_deltas.is_empty()) {
             if m.overrides.iter().any(|o| o.index.is_some()) {
                 lab_sub_index = vec![None; m.subs.len()];
@@ -12687,6 +12755,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 content
             };
             lab_note_bind_bytes("vtx", cap.is_some(), &content);
+            lab_vtx_bind_census(req, b.index, b.buffer_ref, b.offset, cap, feeds_stage_in, &content, &pd.vertex_attributes, render_buffer_bounds);
             note_inflight_buffer_read(req.task_id, b.buffer_ref, &content);
             stale_watch::vtx_dump(req, "v", b.index, b.buffer_ref, b.offset, &content);
             stale_watch::vtx_layout(req.task_id, req.pipeline_ref, || format!("{:?}", pd.vertex_attributes));
@@ -15145,6 +15214,9 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         target_rgba8.is_some() || target_guest_seed.is_some() || zero_seed_cleared,
                         seed_door,
                     );
+                    if target_rgba8.is_some() || target_guest_seed.is_some() {
+                        lab_big_seed_census(acc.shared(), &*host, req.task_id, c0, w, h, seed_door, declared);
+                    }
                     if matches!(declared, LoadAction::DontCare) {
                         // The widened arm's own instrument, and it is a counter
                         // rather than the latched line below it. DontCare now
@@ -22952,6 +23024,68 @@ fn lab_draw_sig(req: &DrawEncodeRequest) {
     w.full.insert(full);
 }
 
+/// TEMP (lab, Opus 2026-10-20, heavy-scene seed loads): `REIMS_VGPU_LAB_BIG_SEED=N` names the first N
+/// (then every 250th) LOAD seeds of at least 4 Mpx that were read rather than elided - which door, which
+/// surface, and every term the currency test refused on - so a 44 MB-per-frame seed can be pinned to the
+/// owner whose stamp is missing.
+#[allow(clippy::too_many_arguments)]
+fn lab_big_seed_census<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    c0: &ColorRtRequest,
+    w: u32,
+    h: u32,
+    door: &str,
+    declared: reims_vgpu_protocol::pass_action::LoadAction,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static N: AtomicU32 = AtomicU32::new(0);
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_BIG_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if max == 0 || u64::from(w) * u64::from(h) < 4_000_000 {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= max && n % 250 != 0 {
+        return;
+    }
+    let mid = c0.mapping_id;
+    let verdict = if mid != 0 { Some(mapping_guest_write_verdict(state, host, mid)) } else { None };
+    let m = state.mappings.get(&mid);
+    let debt = mid != 0 && state.pending_writebacks.get(mid).is_some();
+    crate::observe::fail(format!(
+        "lab_big_seed #{n} task={task_id} door={door} declared={declared:?} ref={} {w}x{h} fmt={} mid={mid} gva={:#x} verdict={verdict:?} stamp={} token={} token_gen={} map_gen={} stated={}/{} cpu_shared={} presented={} video={} debt={debt} idgen={} contentgen={} bump={}:{} bump_age_ms={} pages={} t={}",
+        c0.texture_ref,
+        c0.format,
+        c0.target_gva,
+        m.map_or(0, |m| m.guest_write_gen_at_store),
+        m.map_or(0, |m| m.guest_write_token),
+        m.map_or(0, |m| m.guest_write_token_gen),
+        m.map_or(0, |m| m.map_generation),
+        m.map_or(0, |m| m.guest_stated_gen),
+        m.map_or(0, |m| m.guest_stated_at_stamp),
+        m.is_some_and(|m| m.guest_cpu_shared),
+        m.is_some_and(|m| m.scanout_presented),
+        m.is_some_and(|m| m.is_video_stream),
+        m.map_or(0, |m| m.identity_generation),
+        m.map_or(0, |m| m.content_generation),
+        m.map_or("", |m| m.lab_bump_site.0.rsplit(['/', '\\']).next().unwrap_or("")),
+        m.map_or(0, |m| m.lab_bump_site.1),
+        m.map_or(-1, |m| {
+            if m.lab_bump_us == 0 {
+                -1
+            } else {
+                (crate::observe::elapsed_us().saturating_sub(m.lab_bump_us) / 1000) as i64
+            }
+        }),
+        m.map_or(0, |m| m.page_entries.len()),
+        crate::observe::elapsed_us() / 1000
+    ));
+}
+
 pub(crate) fn note_compositor_plane_pass(
     color: &ColorRtRequest,
     width: u32,
@@ -23902,3 +24036,156 @@ mod storage_texture_admission_tests {
     }
 }
 
+/// TEMP (lab, Opus 2026-10-20, Safari 0x520000 canvas loss): with each `lab_dump`, the draw that produced it - its
+/// counts, every vertex/fragment buffer bind with its offset, the viewports and scissors - so a draw that lands
+/// nothing past canvas row 656 can be told apart from one that never asked for those rows.
+fn lab_dump_draw_shape(req: &DrawEncodeRequest, n: u32) {
+    let vb: Vec<String> = req
+        .vertex_buffers
+        .iter()
+        .map(|b| format!("{}:r{}+{}", b.index, b.buffer_ref, b.offset))
+        .collect();
+    let fb: Vec<String> = req
+        .fragment_buffers
+        .iter()
+        .map(|b| format!("{}:r{}+{}", b.index, b.buffer_ref, b.offset))
+        .collect();
+    crate::observe::fail(format!(
+        "lab_dump_shape #{n} pipe={} vtx={} inst={} first={} base_inst={} prim={} indexed={:?} merged={} vb=[{}] fb=[{}]          viewports={:?} scissors={:?}",
+        req.pipeline_ref,
+        req.vertex_count,
+        req.instance_count,
+        req.first_vertex,
+        req.base_instance,
+        req.primitive_type,
+        req.indexed.as_ref().map(|i| (i.index_count, i.index_buffer_ref, i.index_buffer_offset)),
+        req.merged.is_some(),
+        vb.join(" "),
+        fb.join(" "),
+        req.viewports,
+        req.scissors
+            .iter()
+            .map(|s| (s.x, s.y, s.width, s.height))
+            .collect::<Vec<_>>()
+    ));
+}
+
+/// TEMP (lab, Opus 2026-10-20, Safari 0x520000 canvas loss): each vertex-stage buffer bind of a draw into a target
+/// of 2 Mpx or more outside WindowServer, while the `REIMS_VGPU_LAB_GATE` file exists - the extent the device
+/// computed, the bytes it staged, the stage-in attributes - for the QuartzCore batches that land nothing.
+#[allow(clippy::too_many_arguments)]
+fn lab_vtx_bind_census<A: std::fmt::Debug>(
+    req: &DrawEncodeRequest,
+    index: u32,
+    buffer_ref: u32,
+    offset: u64,
+    cap: Option<u64>,
+    feeds_stage_in: bool,
+    content: &crate::backend::vulkan::engine::BufferContent,
+    attrs: &[A],
+    bounds: crate::runtime::spirv_bind::RenderBufferIndexBounds,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    static GATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(c0) = req.colors.first() else {
+        return;
+    };
+    if req.task_id == 1 || u64::from(c0.width) * u64::from(c0.height) < 2_000_000 {
+        return;
+    }
+    let Some(gate) = GATE.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GATE").ok()) else {
+        return;
+    };
+    static SKIP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let skip = *SKIP.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_IDX_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if !std::path::Path::new(gate).exists() || index != 1 {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < skip || n >= skip + 120 {
+        return;
+    }
+    let bytes = content.cpu_bytes();
+    let f = |i: usize| bytes.get(i * 4..i * 4 + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let pos: Vec<String> = (0..4).map(|v| format!("{:?},{:?}", f(v * 12), f(v * 12 + 1))).collect();
+    let kind = match content {
+        crate::backend::vulkan::engine::BufferContent::Bytes(_) => "bytes",
+        crate::backend::vulkan::engine::BufferContent::GuestRuns(_) => "runs",
+        crate::backend::vulkan::engine::BufferContent::Staged(_) => "staged",
+    };
+    crate::observe::fail(format!(
+        "lab_vtx_bind #{n} pipe={} idx={index} r{buffer_ref}+{offset} cap={cap:?} stage_in={feeds_stage_in} \
+         content={kind}:{} vmax={:?} pos=[{}] attrs={}",
+        req.pipeline_ref,
+        content.len(),
+        bounds.vertex_max(),
+        pos.join(" "),
+        attrs.len()
+    ));
+}
+
+/// TEMP (lab, Opus 2026-10-20, Safari 0x520000 canvas loss): the index content the device itself read for a big
+/// draw outside WindowServer (kind, length, max index it found) and the vertex bound it derived from it.
+fn lab_early_index_census<E: std::fmt::Debug>(
+    req: &DrawEncodeRequest,
+    early: Option<&Result<crate::backend::vulkan::engine::BufferContent, E>>,
+    vmax: Option<u64>,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    static GATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let (Some(c0), Some(info)) = (req.colors.first(), req.indexed.as_ref()) else {
+        return;
+    };
+    if req.task_id == 1 || u64::from(c0.width) * u64::from(c0.height) < 2_000_000 {
+        return;
+    }
+    let Some(gate) = GATE.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GATE").ok()) else {
+        return;
+    };
+    static SKIP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let skip = *SKIP.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_IDX_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if !std::path::Path::new(gate).exists() {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < skip || n >= skip + 60 {
+        return;
+    }
+    let vb: Vec<String> = req
+        .vertex_buffers
+        .iter()
+        .map(|b| format!("{}:r{}+{}", b.index, b.buffer_ref, b.offset))
+        .collect();
+    let what = match early {
+        None => "none".to_string(),
+        Some(Err(e)) => format!("err {e:?}"),
+        Some(Ok(content)) => {
+            let bytes = content.cpu_bytes();
+            let max16 = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).max();
+            let kind = match content {
+                crate::backend::vulkan::engine::BufferContent::Bytes(_) => "bytes",
+                crate::backend::vulkan::engine::BufferContent::GuestRuns(_) => "runs",
+                crate::backend::vulkan::engine::BufferContent::Staged(_) => "staged",
+            };
+            format!("{kind} len={} max16={max16:?}", content.len())
+        }
+    };
+    crate::observe::fail(format!(
+        "lab_early_index #{n} pipe={} count={} ibuf=r{} off={} base_vertex={} merged={} content=[{what}] vmax={vmax:?}          vb=[{}] first={} vtx={}",
+        req.pipeline_ref,
+        info.index_count,
+        info.index_buffer_ref,
+        info.index_buffer_offset,
+        info.base_vertex,
+        req.merged.is_some(),
+        vb.join(" "),
+        req.first_vertex,
+        req.vertex_count
+    ));
+}

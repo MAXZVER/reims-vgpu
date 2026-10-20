@@ -239,6 +239,146 @@ struct StreamAccum {
     lab_target_extent: Option<(u32, u32)>,
     /// What this stream's walk has already resolved. See [`walk_memo`].
     memo: walk_memo::StreamMemo,
+    /// TEMP (lab, Safari large-canvas loss): a segment of this stream continues the previous stream's encoder /
+    /// continues into the next one, and how many segments the stream framed.
+    lab_seg_prev: bool,
+    lab_seg_next: bool,
+    lab_segments: u32,
+    /// The render-pass descriptor record (`0x1a`, header included) this stream's encoder runs under: the one it
+    /// wrote, or the one it took from the stream it continues. What an encoder continued into the next stream
+    /// hands on, see [`carry_render_pass`].
+    pass_record: Option<Vec<u8>>,
+    /// The stream's first segment is a render segment continuing the previous stream's encoder.
+    first_render_continues_previous: bool,
+    /// The stream's last segment is a render segment whose encoder continues into the next stream.
+    last_render_continues_into_next: bool,
+}
+
+/// Record a render segment's encoder lifetime on the stream: whether its first
+/// segment continues the previous stream's encoder and whether its last one
+/// continues into the next stream's.
+fn note_render_segment_lifetime(
+    acc: &mut StreamAccum,
+    kind: SegmentKind,
+    first_segment: bool,
+    lifetime: reims_vgpu_protocol::segment::SegmentLifetime,
+) {
+    let render = matches!(kind, SegmentKind::Render);
+    if first_segment {
+        acc.first_render_continues_previous = render && lifetime.continues_previous;
+    }
+    acc.last_render_continues_into_next = render && lifetime.continues_into_next;
+}
+
+/// Whether `stream` opens with a render segment continuing the previous
+/// stream's encoder. One header read; a stream that will not frame is the
+/// walk's to report.
+fn stream_continues_render_encoder(stream: &[u8]) -> bool {
+    let Ok(mut segments) = SegmentStream::new(stream) else {
+        return false;
+    };
+    match segments.next() {
+        Some(Ok(framed)) => {
+            framed.lifetime.continues_previous
+                && matches!(framed.body, SegmentBody::Encoder { kind: SegmentKind::Render, .. })
+        }
+        _ => false,
+    }
+}
+
+/// Open a continuation stream under the pass its encoder began with.
+///
+/// The encoder's attachments, clears and store actions belong to the encoder,
+/// not to the command buffer the guest happened to cut it into: Metal applies
+/// the load action once, when the encoder begins, and the store action once,
+/// when it ends. A continuation that carried no descriptor of its own used to
+/// reach `finish_stream` with no colour target, and every draw in it was lost
+/// without a line - Safari's 2D canvas dropped everything past its first
+/// 128 KiB of commands (about 2 600 fillRects). The carried descriptor is
+/// replayed through the record handler so its decode and its census are the
+/// ones a stated descriptor gets, then every attachment loads: the previous
+/// stream stored the encoder's content so far (see
+/// [`hold_pass_for_continuation`]).
+fn carry_render_pass<M: HostMemory + HostOps>(sink: &mut StreamSink<'_, M>, record: &[u8]) {
+    if !sink.acc.color_slots.is_empty() || sink.acc.depth_attach.is_some() {
+        return;
+    }
+    crate::runtime::drain::note_store_route("render_pass_carried");
+    sink.record(SegmentKind::Render, wire_pass::OPCODE_RENDER_PASS, record);
+    for (_, att) in sink.acc.color_slots.iter_mut() {
+        att.load_action = MTL_LOAD_ACTION_LOAD;
+    }
+    sink.acc.clears.clear();
+    if let Some(d) = sink.acc.depth_attach.as_mut() {
+        d.load_action = MTL_LOAD_ACTION_LOAD;
+    }
+    if let Some(st) = sink.acc.stencil_attach.as_mut() {
+        st.load_action = MTL_LOAD_ACTION_LOAD;
+    }
+}
+
+/// A stream whose encoder continues into the next one stores what it drew,
+/// whatever the encoder's own store action: that action belongs to the
+/// encoder's end, which is in a later stream, and a resolve or a discard here
+/// would resolve or discard the half-drawn content the continuation loads.
+fn hold_pass_for_continuation(acc: &mut StreamAccum) {
+    for (_, att) in acc.color_slots.iter_mut() {
+        att.store_action = MTL_STORE_ACTION_STORE;
+    }
+    if let Some(d) = acc.depth_attach.as_mut() {
+        d.store_action = MTL_STORE_ACTION_STORE;
+    }
+    if let Some(st) = acc.stencil_attach.as_mut() {
+        st.store_action = MTL_STORE_ACTION_STORE;
+    }
+    for pd in acc.draws.iter_mut() {
+        if let Some(d) = pd.depth_attach.as_mut() {
+            d.store_action = MTL_STORE_ACTION_STORE;
+        }
+        if let Some(st) = pd.stencil_attach.as_mut() {
+            st.store_action = MTL_STORE_ACTION_STORE;
+        }
+    }
+}
+
+/// TEMP (lab, Opus 2026-10-20, Safari large-canvas loss): one line per stream that splits or continues an encoder,
+/// or carries 1000+ draws, outside WindowServer - its place in the packet, its pass, and what finishing it did.
+fn lab_stream_census(
+    task_id: u32,
+    si: usize,
+    streams: usize,
+    bytes: usize,
+    acc: &StreamAccum,
+    before: (u32, u32, u32),
+    out: &ExecResult,
+) {
+    if task_id == 1 || !(acc.lab_seg_prev || acc.lab_seg_next || acc.draws.len() >= 1000) {
+        return;
+    }
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 200 {
+        return;
+    }
+    crate::observe::fail(format!(
+        "lab_stream task={task_id} stream={si}/{streams} bytes={bytes} segs={} prev={} next={} draws={} saw={}          pipe={} inherited={} dropped_no_pipe={} unrep={} slots={:?} ok+{} fail+{} clears+{} t={}",
+        acc.lab_segments,
+        acc.lab_seg_prev,
+        acc.lab_seg_next,
+        acc.draws.len(),
+        acc.saw_draw,
+        acc.pipeline_ref,
+        acc.lab_inherited,
+        acc.dropped_no_pipeline,
+        acc.unrepresentable.is_some(),
+        acc.color_slots
+            .iter()
+            .map(|(slot, a)| (*slot, a.texture_ref, a.load_action, a.store_action))
+            .collect::<Vec<_>>(),
+        out.metal_draws_ok.saturating_sub(before.0),
+        out.metal_draws_fail.saturating_sub(before.1),
+        out.clears_applied.saturating_sub(before.2),
+        crate::observe::elapsed_us() / 1000
+    ));
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_PASS_EXTENT=on` gives a draw with no viewport or
@@ -1324,17 +1464,25 @@ fn execute_submission_g<M: HostMemory + HostOps>(
     // compare the second buffer's records against the first buffer's answers.
     let mut resolved = resolved.map(ResolvedCursor::new);
 
+    // The pass of a render encoder the previous stream continued into this one.
+    // The guest splits a long encoder across command buffers (128 KiB each on
+    // macOS 26) and states the render-pass descriptor only in the first; the
+    // continuation streams start straight with their draws.
+    let mut carry: Option<Vec<u8>> = None;
     for (si, stream) in streams.iter().enumerate() {
         let walk_started = crate::lab_clock::LabInstant::now();
+        let carried = carry.take().filter(|_| stream_continues_render_encoder(stream));
         // TEMP (lab, WALK_AHEAD): the helper's walk of this stream, when what it
-        // read still holds; `WALK_AHEAD_CHECK` walks anyway and compares.
-        let spec = lab_walks.get_mut(si).and_then(Option::take);
+        // read still holds; `WALK_AHEAD_CHECK` walks anyway and compares. A
+        // continuation stream is walked here: the helper walked it without the
+        // carried pass.
+        let spec = lab_walks.get_mut(si).and_then(Option::take).filter(|_| carried.is_none());
         if spec.is_some() {
             crate::runtime::drain::note_store_route("gate_walk_ahead_ready");
         }
         // TEMP (lab, FRAME_GATE): no helper walk - the drain walks it itself
         // under the shared state, with the gate open for the frame's jobs.
-        let spec = if spec.is_none() && g.has_frame() && gate_walk_open_on() {
+        let spec = if spec.is_none() && carried.is_none() && g.has_frame() && gate_walk_open_on() {
             g.open();
             let walked = walk_ahead::walk_stream_spec(g.sh(), &*host, task_id, stream);
             if walked.is_some() {
@@ -1370,7 +1518,7 @@ fn execute_submission_g<M: HostMemory + HostOps>(
             (spec, None) => match spec {
             Some(spec) if check => {
                 let mut acc = StreamAccum::default();
-                walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut());
+                walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut(), carried.as_deref());
                 walk_ahead::check_walk(&*state, spec, &acc);
                 acc
             }
@@ -1383,23 +1531,28 @@ fn execute_submission_g<M: HostMemory + HostOps>(
                 }
                 None => {
                     let mut acc = StreamAccum::default();
-                    walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut());
+                    walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut(), carried.as_deref());
                     acc
                 }
             },
             None => {
                 crate::runtime::par::ahead::note_all();
                 let mut acc = StreamAccum::default();
-                walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut());
+                walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut(), carried.as_deref());
                 acc
             }
             },
         };
         acc.memo.flush();
+        if acc.last_render_continues_into_next {
+            hold_pass_for_continuation(&mut acc);
+            carry = acc.pass_record.clone();
+        }
         let walk_ns = walk_started.elapsed().as_nanos() as u64;
         *measured_ns += walk_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
         let finish_started = crate::lab_clock::LabInstant::now();
+        let lab_before = (out.metal_draws_ok, out.metal_draws_fail, out.clears_applied);
         finish_stream_g(
             g,
             host,
@@ -1409,6 +1562,7 @@ fn execute_submission_g<M: HostMemory + HostOps>(
             #[cfg(feature = "backend-vulkan")]
             ahead,
         );
+        lab_stream_census(task_id, si, streams.len(), stream.len(), &acc, lab_before, out);
         let state = g.st();
         let finish_ns = finish_started.elapsed().as_nanos() as u64;
         *measured_ns += finish_ns;
@@ -2233,6 +2387,7 @@ fn walk_stream<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     acc: &mut StreamAccum,
     mut resolved: Option<&mut ResolvedCursor<'_>>,
+    carried_pass: Option<&[u8]>,
 ) {
     // **The one place this crate frames an exec stream, counted.** Seam 6 asks
     // for zero re-scans of already resolved EXEC bytes, and the shape the
@@ -2308,7 +2463,22 @@ fn walk_stream<M: HostMemory + HostOps>(
         // on that rail and the reading was a rail-dependent multiple of the
         // truth.
         crate::runtime::drain::note_store_route(segment_chain_route(framed.lifetime));
+        sink.acc.lab_seg_prev |= framed.lifetime.continues_previous;
+        sink.acc.lab_seg_next |= framed.lifetime.continues_into_next;
+        let first_segment = sink.acc.lab_segments == 0;
+        sink.acc.lab_segments += 1;
+        note_render_segment_lifetime(sink.acc, kind, first_segment, framed.lifetime);
         sink.begin_segment(kind);
+        if first_segment && sink.acc.first_render_continues_previous {
+            // The encoder's state first: a continuation's records can rebind a
+            // buffer offset before its first draw, and a rebind finding no
+            // binding to move is lost - the first draw then renders with the
+            // previous stream's last offset, over the previous draw.
+            lab_inherit_encoder_state(task_id, sink.acc);
+            if let Some(record) = carried_pass {
+                carry_render_pass(&mut sink, record);
+            }
+        }
         walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
             // Stepped for every record this walk reaches, whether or not the
             // arm below has anything to do with the answer: the two walks stay
@@ -4229,6 +4399,7 @@ fn handle_render_pass_state<M: HostMemory + HostOps, S: WalkState>(
     };
     match record {
         RenderRecord::WriteDescriptor(r) => {
+            acc.pass_record = Some(cmd_bytes.to_vec());
             let descriptor = r.descriptor;
             let target_extent = (
                 descriptor.render_target_width.get(),

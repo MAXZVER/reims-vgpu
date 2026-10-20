@@ -3581,6 +3581,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                 return BlitStatus::Ok;
             }
         }
+        lab_t2t_census(task_id, cmd, &src, &dst, copy_w, copy_h, &[]);
         return match copy_row_region(
             host,
             state,
@@ -3699,12 +3700,82 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
             return st;
         }
     }
+    lab_t2t_census(task_id, cmd, &src, &dst, copy_w, copy_h, &staged);
     crate::runtime::drain::note_store_route_us(
         "blit_t2t_stage_us",
         t2t_stage_started.elapsed().as_micros() as u64,
     );
     crate::runtime::drain::note_store_route_n("blit_t2t_stage_rows", copy_h.saturating_mul(copy_d));
     BlitStatus::Ok
+}
+
+/// TEMP (lab): the `REIMS_VGPU_LAB_GATE` file is present (or no gate is set), so the T2T censuses spend their
+/// budget inside the window the queue opens rather than on the boot's own copies.
+fn lab_t2t_gate_open() -> bool {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    match PATH.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GATE").ok()) {
+        Some(path) => std::path::Path::new(path).exists(),
+        None => true,
+    }
+}
+
+/// TEMP (lab, Opus 2026-10-20, WebGPU x1 texture->canvas copy black): `REIMS_VGPU_LAB_T2T=N` names the
+/// first N staged texture copies of at least 256x256 outside WindowServer and writes what each read from its
+/// source to `/tmp/labdump/t2t-NNN.rgba` (the `lab_dump` header), so a black canvas can be split into "the
+/// source bytes were empty" and "the canvas lost a correct write".
+fn lab_t2t_census(
+    task_id: u32,
+    cmd: &TextureRegion,
+    src: &TextureBacking,
+    dst: &TextureBacking,
+    copy_w: u64,
+    copy_h: u64,
+    staged: &[u8],
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static N: AtomicU32 = AtomicU32::new(0);
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_T2T").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if max == 0 || task_id == 1 || copy_w < 256 || copy_h < 256 || !lab_t2t_gate_open() {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= max {
+        return;
+    }
+    let kind = |t: &TextureBacking| match t {
+        TextureBacking::Linear(l) => format!("linear:gva={:#x}:stride={}", l.base_gva, l.row_stride),
+        TextureBacking::MapperRefTexture(m) => {
+            format!("t11:mid={}:off={}:stride={}", m.mapping_id, m.surface_offset, m.row_stride)
+        }
+    };
+    let nonzero = staged.chunks(4).filter(|px| px.iter().any(|&b| b != 0)).count();
+    let name = format!("t2t-{n:03}-t{task_id}.rgba");
+    let bpp = src.bpp();
+    if bpp == 4 && staged.len() as u64 >= copy_w * copy_h * 4 {
+        let mut out = Vec::with_capacity(16 + staged.len());
+        for v in [copy_w as u32, copy_h as u32, 0, 0] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&staged[..(copy_w * copy_h * 4) as usize]);
+        let dir = std::path::Path::new("/tmp/labdump");
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(dir.join(&name), out);
+    }
+    crate::observe::fail(format!(
+        "lab_t2t #{n} task={task_id} src_ref={} dst_ref={} {}x{} fmt={}->{} src={} dst={} nonzero_px={nonzero} file={name} t={}",
+        cmd.source.texture_ref,
+        cmd.dest.texture_ref,
+        copy_w,
+        copy_h,
+        src.pixel_format(),
+        dst.pixel_format(),
+        kind(src),
+        kind(dst),
+        crate::observe::elapsed_us() / 1000
+    ));
 }
 
 /// `0x13e copyFromTexture:…sliceCount:levelCount:` — whole-surface multi-slice/level.
@@ -4379,6 +4450,22 @@ pub fn execute_blit<M: HostMemory + HostOps>(
     crate::runtime::draw::vulkan::stale_watch::blit_note(task_id, || {
         format!("{record:?} -> {status:?}")
     });
+    // TEMP (lab, Opus 2026-10-20): `REIMS_VGPU_LAB_T2T=N` also names every texture copy record outside
+    // WindowServer with its outcome, whichever arm ran (b844: no staged copy reached the census).
+    if !matches!(record, BlitRecord::GenerateMipmaps(_)) && task_id != 1 {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let max = *MAX.get_or_init(|| {
+            std::env::var("REIMS_VGPU_LAB_T2T").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        }) * 10;
+        if max > 0 && lab_t2t_gate_open() && N.fetch_add(1, Ordering::Relaxed) < max {
+            crate::observe::fail(format!(
+                "lab_t2t_record task={task_id} {record:?} -> {status:?} t={}",
+                crate::observe::elapsed_us() / 1000
+            ));
+        }
+    }
     status
 }
 

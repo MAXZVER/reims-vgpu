@@ -393,6 +393,15 @@ pub(crate) fn walk_stream_spec<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route("walk_ahead_abort_segment");
             return None;
         }
+        let first_segment = acc.lab_segments == 0;
+        acc.lab_segments += 1;
+        super::note_render_segment_lifetime(&mut acc, kind, first_segment, framed.lifetime);
+        // A continuation needs the pass the previous stream's encoder carries,
+        // which only the drain's packet walk holds; it walks this stream itself.
+        if acc.first_render_continues_previous {
+            crate::runtime::drain::note_store_route("walk_ahead_abort_continuation");
+            return None;
+        }
         super::walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
             if spec.aborted.is_none() {
                 // TEMP (lab, FRAME_GATE): a helper's walk gives way to a

@@ -716,7 +716,12 @@ pub fn resident_gpu_plane(m: &MappingEntry, width: u32, height: u32) -> Option<(
 /// BGRA8 frame lands in byte for byte - the mapping's plane is BGRA8 (no
 /// conversion), its rows are tight and it starts at the mapping's first byte -
 /// or `None` when the landing is anything else.
-pub(crate) fn lab_t2t_alias_window(state: &DeviceState, mapping_id: u32, width: u32, height: u32) -> Option<(Vec<u64>, u64)> {
+pub(crate) fn lab_t2t_alias_window(
+    state: &DeviceState,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> Option<(Vec<u64>, u64)> {
     let m = state.mappings.get(&mapping_id)?;
     let (mw, mh, format) = mapping_write_geometry(m, width, height);
     if mw != width
@@ -821,12 +826,183 @@ enum CacheOutcome<'a> {
     Invalidate,
 }
 
+/// TEMP (lab, Opus 2026-10-20, RECT_LAND, default on; `REIMS_VGPU_LAB_RECT_LAND=off` stages as before): a
+/// packed-rows frame into a padded guest pitch lands straight from its source rows (`mapper::write_mapping_rect_only`)
+/// instead of being staged into a pitch-shaped copy first. Latched.
+fn lab_rect_land() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_RECT_LAND").map_or(true, |v| v != "off"))
+}
+
+/// Frames below this land on the caller: a fork-join round trip costs what one
+/// thread copies in ~64 KiB, and the landing is worth splitting only when it is
+/// many of those.
+const PAR_CONTIG_LAND_MIN_BYTES: usize = 1 << 20;
+/// Bytes one landing job copies (whole rows, at least one).
+const PAR_CONTIG_LAND_JOB_BYTES: usize = 512 * 1024;
+
+/// TEMP (lab, Opus 2026-10-20, PAR_CONTIG_LAND, default on; `REIMS_VGPU_LAB_PAR_CONTIG_LAND=off` keeps the serial
+/// loop): land an unconverted, unskipped frame into a contiguous surface view row-parallel on the device's worker
+/// pool, with the streaming copy the fragmented rail's parallel landing already uses. The serial loop moved ~3 GB/s
+/// into cold guest pages - 7.2 ms for each 20 MB canvas a heavy WebGL page flushes on every frame's
+/// SynchronizeResources (b851 readback_split write_us), a third of each second on the drain.
+///
+/// `false` hands the frame back to the serial loop untouched: switched off, no pool, too small, or a source
+/// shorter than the frame (the serial loop names that refusal).
+fn par_contig_land(
+    state: &DeviceState,
+    src: &[u8],
+    src_stride: u32,
+    base: *mut u8,
+    bpr: usize,
+    tight: usize,
+    rows: u32,
+) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PAR_CONTIG_LAND").map_or(true, |v| v != "off")
+    }) {
+        return false;
+    }
+    let rows = rows as usize;
+    let src_stride = src_stride as usize;
+    if rows == 0 || tight == 0 || rows.saturating_mul(tight) < PAR_CONTIG_LAND_MIN_BYTES {
+        return false;
+    }
+    let Some(need) = (rows - 1)
+        .checked_mul(src_stride)
+        .and_then(|v| v.checked_add(tight))
+    else {
+        return false;
+    };
+    if src.len() < need {
+        return false;
+    }
+    let Some(pool) = state.par().filter(|pool| pool.workers() > 0) else {
+        return false;
+    };
+    // The pool's workers write guest pages, and `write_guest_bytes`' own settle
+    // only joins on the drain thread: a draw the recorder still holds may read
+    // these pages, so the drain settles it here, before it forks.
+    crate::backend::settle_deferred_draws_for_guest_write();
+    let per_job = (PAR_CONTIG_LAND_JOB_BYTES / tight).max(1);
+    let jobs: Vec<std::ops::Range<usize>> = (0..rows)
+        .step_by(per_job)
+        .map(|y| y..(y + per_job).min(rows))
+        .collect();
+    // Addresses as integers so the closure can cross to the workers; the rows
+    // jobs name are disjoint, and the view and `src` outlive the scope.
+    let (src_addr, dst_addr) = (src.as_ptr() as usize, base as usize);
+    let land = move |range: &std::ops::Range<usize>| {
+        for y in range.clone() {
+            // SAFETY: row `y < rows` reads `tight` bytes at `y * src_stride`,
+            // inside `src` (`need` checked above), and writes `tight` bytes at
+            // `y * bpr` of the caller's view, which covers the plane's span; no
+            // two jobs share a row.
+            unsafe {
+                crate::runtime::mapper::write_guest_bytes_raw(
+                    (src_addr + y * src_stride) as *const u8,
+                    (dst_addr + y * bpr) as *mut u8,
+                    tight,
+                );
+            }
+        }
+    };
+    let done = pool.scope(&(), &jobs, |_, _, range: &std::ops::Range<usize>| {
+        land(range)
+    });
+    // A job that panicked may have stopped part way; its rows land again here,
+    // which writes the same bytes.
+    for (range, outcome) in jobs.iter().zip(&done.results) {
+        if outcome.is_err() {
+            land(range);
+        }
+    }
+    crate::runtime::drain::note_store_route(if done.serial {
+        "lab_par_contig_land_serial_scope"
+    } else {
+        "lab_par_contig_land"
+    });
+    true
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the geometry the frame is in, its owner when it has one, plus the \
               ranges that owner may not overwrite"
 )]
 fn write_bgra8_inner<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    cache: CacheOutcome<'_>,
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
+) -> bool {
+    // TEMP (lab, Opus 2026-10-20, REIMS_VGPU_LAB_BIG_SEED): where a 20 MB surface write spends its 6.5 ms.
+    let big = u64::from(width) * u64::from(height) >= 4_000_000;
+    let t_in = std::time::Instant::now();
+    if big {
+        LAB_W_MARKS.with(|m| m.set([None; 4]));
+    }
+    let ok = write_bgra8_inner_body(
+        state, host, mapping_id, src, cache, src_stride, width, height, skip,
+    );
+    if big {
+        lab_big_write_census(mapping_id, t_in, ok);
+    }
+    ok
+}
+
+thread_local! {
+    /// TEMP (lab): [pre-settle start, contig decided, land done, tail start] of the write in flight.
+    static LAB_W_MARKS: std::cell::Cell<[Option<std::time::Instant>; 4]> = const { std::cell::Cell::new([None; 4]) };
+}
+
+fn lab_w_mark(i: usize) {
+    LAB_W_MARKS.with(|m| {
+        let mut v = m.get();
+        v[i] = Some(std::time::Instant::now());
+        m.set(v);
+    });
+}
+
+fn lab_big_write_census(mapping_id: u32, t_in: std::time::Instant, ok: bool) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_BIG_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if max == 0 || (n >= max && n % 100 != 0) {
+        return;
+    }
+    let end = std::time::Instant::now();
+    let m = LAB_W_MARKS.with(|m| m.get());
+    let us = |a: Option<std::time::Instant>, b: Option<std::time::Instant>| match (a, b) {
+        (Some(a), Some(b)) if b >= a => (b - a).as_micros() as i64,
+        _ => -1,
+    };
+    crate::observe::fail(format!(
+        "lab_big_write #{n} mid={mapping_id} ok={ok} total_us={} pre_us={} settle_vouch_contig_us={} land_us={}          mid_us={} tail_us={}",
+        (end - t_in).as_micros(),
+        us(Some(t_in), m[0]),
+        us(m[0], m[1]),
+        us(m[1], m[2]),
+        us(m[2], m[3]),
+        us(m[3], Some(end)),
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_bgra8_inner_body<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
@@ -852,7 +1028,8 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             SurfaceWriteRefusal::SourceStride { src_stride, width },
         );
     }
-    lab_pay_px(mapping_id, src, src_stride, width, height); // TEMP (lab)
+    // TEMP (lab)
+    lab_pay_px(mapping_id, src, src_stride, width, height);
     // Before the landing: the stamps below vouch for pages this write puts in
     // place, and a generation read after it could fold in a guest write that
     // landed meanwhile (see `GuestWriteObservation`).
@@ -899,6 +1076,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // geometry (`GeometryMoved` above refuses anything else), so the owed frame
     // is superseded rather than lost.
     let lab_t0 = std::time::Instant::now();
+    lab_w_mark(0);
     if skip.is_empty() {
         crate::runtime::writeback_debt::settle_for_mapping(
             state,
@@ -977,203 +1155,262 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // Fast path: one packed view, poke rows in place.
     let lab_contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
     let lab_t3 = std::time::Instant::now();
+    lab_w_mark(1);
     if let Some((ptr, _)) = lab_contig {
         note_surface_write_path(true, frame_bytes);
         let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
-        for y in 0..mh {
-            let src_off = (y as usize) * (src_stride as usize);
-            let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
-            if src_off + src_row_len > src.len() {
+        if direct_rows
+            && skip.is_empty()
+            && par_contig_land(state, src, src_stride, base, bpr, tight, mh)
+        {
+            note_surface_write_phase(
+                SurfaceWritePhase::Land,
+                land_started.elapsed().as_micros() as u64,
+            );
+        } else {
+            for y in 0..mh {
+                let src_off = (y as usize) * (src_stride as usize);
+                let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
+                if src_off + src_row_len > src.len() {
+                    return refuse(
+                        mapping_id,
+                        SurfaceWriteRefusal::SourceShort {
+                            need: src_off + src_row_len,
+                            have: src.len(),
+                            row: y,
+                        },
+                    );
+                }
+                let src_row = &src[src_off..src_off + src_row_len];
+                let row_bytes: &[u8] = if direct_rows {
+                    &src_row[..tight]
+                } else {
+                    if let Some(ref mut rgba_row) = rgba {
+                        if !RowToRgba8::Bgra8.convert(src_row, mw, rgba_row)
+                            || !store_rail.is_some_and(|rail| rail.convert(rgba_row, mw, &mut row))
+                        {
+                            return refuse(
+                                mapping_id,
+                                SurfaceWriteRefusal::RowConvert { format, row: y },
+                            );
+                        }
+                    } else {
+                        let n = src_row_len.min(row.len());
+                        row[..n].copy_from_slice(&src_row[..n]);
+                    }
+                    &row
+                };
+                // The row's destination in mapping-offset space, so the skip list —
+                // which is in that space — is subtracted before any pointer exists.
+                let row_off = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
+                for (lo, hi) in unskipped(row_off, row_off.saturating_add(tight as u64), skip) {
+                    let within = (lo - row_off) as usize;
+                    let len = (hi - lo) as usize;
+                    let dst = unsafe { base.add((y as usize).saturating_mul(bpr) + within) };
+                    // SAFETY: `within + len <= tight <= row_bytes.len()`, and the
+                    // view covers span_end which is at or past this row's last byte.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(row_bytes.as_ptr().add(within), dst, len);
+                    }
+                }
+            }
+            note_surface_write_phase(
+                SurfaceWritePhase::Land,
+                land_started.elapsed().as_micros() as u64,
+            );
+        }
+    } else {
+        note_surface_write_path(false, frame_bytes);
+        // Packed source rows into a padded guest pitch: the rows land at the
+        // guest's stride straight out of `src`, rather than being staged into a
+        // frame-sized copy at that pitch first (2.2 ms of a 3.8 ms 20 MB canvas
+        // flush, b856) and then copied again into the pages.
+        let mut rect_landed = false;
+        if direct_rows
+            && skip.is_empty()
+            && src_stride as usize == tight
+            && bpr != tight
+            && lab_rect_land()
+        {
+            if let Some(rect) = mapper::RectStride::new(bpr as u64, tight as u64, u64::from(mh)) {
+                let land_started = std::time::Instant::now();
+                let runs: Vec<(u64, u64)> = (0..u64::from(mh))
+                    .map(|y| {
+                        let lo = base_off.saturating_add(y.saturating_mul(bpr as u64));
+                        (lo, lo.saturating_add(tight as u64))
+                    })
+                    .collect();
+                if !mapper::write_mapping_rect_only(
+                    state,
+                    host,
+                    mapping_id,
+                    base_off,
+                    src,
+                    rect,
+                    Some(&runs),
+                    &vouched,
+                ) {
+                    return refuse(
+                        mapping_id,
+                        SurfaceWriteRefusal::MapperWrite {
+                            lo: base_off,
+                            len: rect.span(),
+                        },
+                    );
+                }
+                crate::runtime::drain::note_store_route("surface_write_rect_landed");
+                note_surface_write_phase(
+                    SurfaceWritePhase::Land,
+                    land_started.elapsed().as_micros() as u64,
+                );
+                rect_landed = true;
+            }
+        }
+        if !rect_landed {
+            let stage_started = std::time::Instant::now();
+            // Fragmented: stage native rows then multi-import (one map_pages pass set).
+            // The sample window ends at the final row's last texel, not at
+            // `bpr * height`; padding after the final row is outside the texture
+            // contract and may belong to another guest allocation.
+            let Some(frame_len) = (mh as usize)
+                .checked_sub(1)
+                .and_then(|rows| bpr.checked_mul(rows))
+                .and_then(|prefix| prefix.checked_add(tight))
+            else {
                 return refuse(
                     mapping_id,
-                    SurfaceWriteRefusal::SourceShort {
-                        need: src_off + src_row_len,
-                        have: src.len(),
-                        row: y,
+                    SurfaceWriteRefusal::FrameExtent { bpr, height: mh },
+                );
+            };
+            // The staged buffer is `src` itself whenever the layout it would be
+            // built into is the layout `src` already has: no conversion (the rows go
+            // through untouched) and a source pitch equal to the mapping's row pitch
+            // (so row `y` is already at `y * bpr`). Under both, byte `i` of the
+            // staged frame is byte `i` of `src` for every `i < frame_len`, and
+            // building it copies 8 MB to produce a slice we are holding.
+            //
+            // What `src` has in the gaps between rows does not enter into it: the
+            // store below names the texel runs only, so those bytes are never read
+            // out of this buffer whichever way it was built.
+            let staged: std::borrow::Cow<'_, [u8]> =
+                if direct_rows && bpr == src_stride as usize && src.len() >= frame_len {
+                    std::borrow::Cow::Borrowed(&src[..frame_len])
+                } else {
+                    let mut frame = vec![0u8; frame_len];
+                    for y in 0..mh {
+                        let src_off = (y as usize) * (src_stride as usize);
+                        let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
+                        if src_off + src_row_len > src.len() {
+                            return refuse(
+                                mapping_id,
+                                SurfaceWriteRefusal::SourceShort {
+                                    need: src_off + src_row_len,
+                                    have: src.len(),
+                                    row: y,
+                                },
+                            );
+                        }
+                        let src_row = &src[src_off..src_off + src_row_len];
+                        let row_bytes: &[u8] = if direct_rows {
+                            &src_row[..tight]
+                        } else {
+                            if let Some(ref mut rgba_row) = rgba {
+                                if !RowToRgba8::Bgra8.convert(src_row, mw, rgba_row)
+                                    || !store_rail
+                                        .is_some_and(|rail| rail.convert(rgba_row, mw, &mut row))
+                                {
+                                    return refuse(
+                                        mapping_id,
+                                        SurfaceWriteRefusal::RowConvert { format, row: y },
+                                    );
+                                }
+                            } else {
+                                let n = src_row_len.min(row.len());
+                                row[..n].copy_from_slice(&src_row[..n]);
+                            }
+                            &row
+                        };
+                        let dst_off = (y as usize).saturating_mul(bpr);
+                        if dst_off + tight > frame.len() {
+                            return refuse(
+                                mapping_id,
+                                SurfaceWriteRefusal::StagedShort {
+                                    need: dst_off + tight,
+                                    have: frame.len(),
+                                    row: y,
+                                },
+                            );
+                        }
+                        frame[dst_off..dst_off + tight].copy_from_slice(&row_bytes[..tight]);
+                    }
+                    note_surface_write_phase(
+                        SurfaceWritePhase::Stage,
+                        stage_started.elapsed().as_micros() as u64,
+                    );
+                    std::borrow::Cow::Owned(frame)
+                };
+            let frame: &[u8] = staged.as_ref();
+            let land_started = std::time::Instant::now();
+            // One call for the whole frame, carrying the runs it should store,
+            // rather than one call per surviving run: every call re-runs
+            // `flush_intersecting` over the deferred windows and re-resolves the
+            // mapping's page list, both `O(pages)`, so the per-run shape pays that
+            // twice-over walk for each hole the skip list cuts. The selection
+            // travels into the walk instead, so the resolution happens once and
+            // each imported page run moves only the parts of itself the runs name.
+            //
+            // The runs are the `tight` bytes at the head of each of `mh` rows, not
+            // the frame's whole extent. A row pitch wider than the packed row leaves
+            // padding between rows, and that padding is not a texel this call was
+            // given: the contig arm above writes row by row and never touches it,
+            // so storing the staged frame entire would zero it here and leave it
+            // alone there — the same call landing different guest memory depending
+            // only on whether the guest's pages happened to be adjacent.
+            //
+            // Those bytes do belong to this plane (`sample_window_from_device_plane`
+            // requires the plane's own `plane_size` to cover `bpr * (mh - 1) +
+            // tight`), so this is not an overrun into a neighbouring allocation. It
+            // is content the guest put there and the device was never asked to
+            // replace.
+            let mut runs: Vec<(u64, u64)> = Vec::new();
+            for y in 0..mh {
+                let row_lo = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
+                for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(tight as u64), skip) {
+                    match runs.last_mut() {
+                        // A packed pitch makes consecutive rows adjacent; coalescing
+                        // keeps that frame the single run it was before the split,
+                        // which is the shape the hot 8 MB composite surface takes.
+                        Some(last) if last.1 == lo => last.1 = hi,
+                        _ => runs.push((lo, hi)),
+                    }
+                }
+            }
+            if !mapper::write_mapping_bytes_only(
+                state,
+                host,
+                mapping_id,
+                base_off,
+                frame,
+                Some(&runs),
+                &vouched,
+            ) {
+                return refuse(
+                    mapping_id,
+                    SurfaceWriteRefusal::MapperWrite {
+                        lo: base_off,
+                        len: frame.len(),
                     },
                 );
             }
-            let src_row = &src[src_off..src_off + src_row_len];
-            let row_bytes: &[u8] = if direct_rows {
-                &src_row[..tight]
-            } else {
-                if let Some(ref mut rgba_row) = rgba {
-                    if !RowToRgba8::Bgra8.convert(src_row, mw, rgba_row)
-                        || !store_rail.is_some_and(|rail| rail.convert(rgba_row, mw, &mut row))
-                    {
-                        return refuse(
-                            mapping_id,
-                            SurfaceWriteRefusal::RowConvert { format, row: y },
-                        );
-                    }
-                } else {
-                    let n = src_row_len.min(row.len());
-                    row[..n].copy_from_slice(&src_row[..n]);
-                }
-                &row
-            };
-            // The row's destination in mapping-offset space, so the skip list —
-            // which is in that space — is subtracted before any pointer exists.
-            let row_off = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
-            for (lo, hi) in unskipped(row_off, row_off.saturating_add(tight as u64), skip) {
-                let within = (lo - row_off) as usize;
-                let len = (hi - lo) as usize;
-                let dst = unsafe { base.add((y as usize).saturating_mul(bpr) + within) };
-                // SAFETY: `within + len <= tight <= row_bytes.len()`, and the
-                // view covers span_end which is at or past this row's last byte.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(row_bytes.as_ptr().add(within), dst, len);
-                }
-            }
-        }
-        note_surface_write_phase(
-            SurfaceWritePhase::Land,
-            land_started.elapsed().as_micros() as u64,
-        );
-    } else {
-        note_surface_write_path(false, frame_bytes);
-        let stage_started = std::time::Instant::now();
-        // Fragmented: stage native rows then multi-import (one map_pages pass set).
-        // The sample window ends at the final row's last texel, not at
-        // `bpr * height`; padding after the final row is outside the texture
-        // contract and may belong to another guest allocation.
-        let Some(frame_len) = (mh as usize)
-            .checked_sub(1)
-            .and_then(|rows| bpr.checked_mul(rows))
-            .and_then(|prefix| prefix.checked_add(tight))
-        else {
-            return refuse(
-                mapping_id,
-                SurfaceWriteRefusal::FrameExtent { bpr, height: mh },
-            );
-        };
-        // The staged buffer is `src` itself whenever the layout it would be
-        // built into is the layout `src` already has: no conversion (the rows go
-        // through untouched) and a source pitch equal to the mapping's row pitch
-        // (so row `y` is already at `y * bpr`). Under both, byte `i` of the
-        // staged frame is byte `i` of `src` for every `i < frame_len`, and
-        // building it copies 8 MB to produce a slice we are holding.
-        //
-        // What `src` has in the gaps between rows does not enter into it: the
-        // store below names the texel runs only, so those bytes are never read
-        // out of this buffer whichever way it was built.
-        let staged: std::borrow::Cow<'_, [u8]> =
-            if direct_rows && bpr == src_stride as usize && src.len() >= frame_len {
-                std::borrow::Cow::Borrowed(&src[..frame_len])
-            } else {
-                let mut frame = vec![0u8; frame_len];
-                for y in 0..mh {
-                    let src_off = (y as usize) * (src_stride as usize);
-                    let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
-                    if src_off + src_row_len > src.len() {
-                        return refuse(
-                            mapping_id,
-                            SurfaceWriteRefusal::SourceShort {
-                                need: src_off + src_row_len,
-                                have: src.len(),
-                                row: y,
-                            },
-                        );
-                    }
-                    let src_row = &src[src_off..src_off + src_row_len];
-                    let row_bytes: &[u8] = if direct_rows {
-                        &src_row[..tight]
-                    } else {
-                        if let Some(ref mut rgba_row) = rgba {
-                            if !RowToRgba8::Bgra8.convert(src_row, mw, rgba_row)
-                                || !store_rail
-                                    .is_some_and(|rail| rail.convert(rgba_row, mw, &mut row))
-                            {
-                                return refuse(
-                                    mapping_id,
-                                    SurfaceWriteRefusal::RowConvert { format, row: y },
-                                );
-                            }
-                        } else {
-                            let n = src_row_len.min(row.len());
-                            row[..n].copy_from_slice(&src_row[..n]);
-                        }
-                        &row
-                    };
-                    let dst_off = (y as usize).saturating_mul(bpr);
-                    if dst_off + tight > frame.len() {
-                        return refuse(
-                            mapping_id,
-                            SurfaceWriteRefusal::StagedShort {
-                                need: dst_off + tight,
-                                have: frame.len(),
-                                row: y,
-                            },
-                        );
-                    }
-                    frame[dst_off..dst_off + tight].copy_from_slice(&row_bytes[..tight]);
-                }
-                note_surface_write_phase(
-                    SurfaceWritePhase::Stage,
-                    stage_started.elapsed().as_micros() as u64,
-                );
-                std::borrow::Cow::Owned(frame)
-            };
-        let frame: &[u8] = staged.as_ref();
-        let land_started = std::time::Instant::now();
-        // One call for the whole frame, carrying the runs it should store,
-        // rather than one call per surviving run: every call re-runs
-        // `flush_intersecting` over the deferred windows and re-resolves the
-        // mapping's page list, both `O(pages)`, so the per-run shape pays that
-        // twice-over walk for each hole the skip list cuts. The selection
-        // travels into the walk instead, so the resolution happens once and
-        // each imported page run moves only the parts of itself the runs name.
-        //
-        // The runs are the `tight` bytes at the head of each of `mh` rows, not
-        // the frame's whole extent. A row pitch wider than the packed row leaves
-        // padding between rows, and that padding is not a texel this call was
-        // given: the contig arm above writes row by row and never touches it,
-        // so storing the staged frame entire would zero it here and leave it
-        // alone there — the same call landing different guest memory depending
-        // only on whether the guest's pages happened to be adjacent.
-        //
-        // Those bytes do belong to this plane (`sample_window_from_device_plane`
-        // requires the plane's own `plane_size` to cover `bpr * (mh - 1) +
-        // tight`), so this is not an overrun into a neighbouring allocation. It
-        // is content the guest put there and the device was never asked to
-        // replace.
-        let mut runs: Vec<(u64, u64)> = Vec::new();
-        for y in 0..mh {
-            let row_lo = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
-            for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(tight as u64), skip) {
-                match runs.last_mut() {
-                    // A packed pitch makes consecutive rows adjacent; coalescing
-                    // keeps that frame the single run it was before the split,
-                    // which is the shape the hot 8 MB composite surface takes.
-                    Some(last) if last.1 == lo => last.1 = hi,
-                    _ => runs.push((lo, hi)),
-                }
-            }
-        }
-        if !mapper::write_mapping_bytes_only(
-            state,
-            host,
-            mapping_id,
-            base_off,
-            frame,
-            Some(&runs),
-            &vouched,
-        ) {
-            return refuse(
-                mapping_id,
-                SurfaceWriteRefusal::MapperWrite {
-                    lo: base_off,
-                    len: frame.len(),
-                },
+            note_surface_write_phase(
+                SurfaceWritePhase::Land,
+                land_started.elapsed().as_micros() as u64,
             );
         }
-        note_surface_write_phase(
-            SurfaceWritePhase::Land,
-            land_started.elapsed().as_micros() as u64,
-        );
     }
+    lab_w_mark(2);
     lab_mapw_diag(lab_t0, lab_t1, lab_t2, lab_t3);
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
@@ -1223,6 +1460,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
         return true;
     }
+    lab_w_mark(3);
     let cache_started = std::time::Instant::now();
     let tight_frame = (mw as usize)
         .saturating_mul(mh as usize)
@@ -2214,7 +2452,9 @@ pub fn read_rect_raw<M: HostMemory + HostOps>(
 #[cfg(feature = "backend-vulkan")]
 fn lab_rect_read() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !cfg!(test) && std::env::var("REIMS_VGPU_LAB_RECT_READ").map_or(true, |v| v != "off"))
+    *ON.get_or_init(|| {
+        !cfg!(test) && std::env::var("REIMS_VGPU_LAB_RECT_READ").map_or(true, |v| v != "off")
+    })
 }
 
 /// TEMP (lab, RECT_READ): `rect` of `mapping_id` read from the resident its owed frame is in, when the mapping is a
@@ -2249,7 +2489,10 @@ fn read_rect_from_owed_resident<M: HostMemory + HostOps>(
     let Some(debt) = state.pending_writebacks.get(mapping_id) else {
         return false;
     };
-    let Some(identity) = debt.target.get::<crate::backend::vulkan::engine::TargetIdentity>() else {
+    let Some(identity) = debt
+        .target
+        .get::<crate::backend::vulkan::engine::TargetIdentity>()
+    else {
         note("rectrd_resident_no_identity");
         return false;
     };
@@ -2259,19 +2502,25 @@ fn read_rect_from_owed_resident<M: HostMemory + HostOps>(
         width,
         height,
     } = rect;
-    if origin_x.saturating_add(width) > debt.width || origin_y.saturating_add(height) > debt.height {
+    if origin_x.saturating_add(width) > debt.width || origin_y.saturating_add(height) > debt.height
+    {
         note("rectrd_resident_outside");
         return false;
     }
     let started = std::time::Instant::now();
-    let Some(px) = crate::backend::vulkan::engine::read_resident_rect_bgra(identity, [origin_x, origin_y, width, height])
-    else {
+    let Some(px) = crate::backend::vulkan::engine::read_resident_rect_bgra(
+        identity,
+        [origin_x, origin_y, width, height],
+    ) else {
         note("rectrd_resident_unread");
         return false;
     };
     let row = width as usize * 4;
     let stride = dst_stride as usize;
-    if stride < row || dst.len() < stride * (height as usize - 1) + row || px.len() < row * height as usize {
+    if stride < row
+        || dst.len() < stride * (height as usize - 1) + row
+        || px.len() < row * height as usize
+    {
         note("rectrd_resident_short");
         return false;
     }
@@ -2279,7 +2528,10 @@ fn read_rect_from_owed_resident<M: HostMemory + HostOps>(
         dst[r * stride..r * stride + row].copy_from_slice(&px[r * row..(r + 1) * row]);
     }
     note("rectrd_resident");
-    crate::runtime::drain::note_store_route_us("rectrd_resident_us", started.elapsed().as_micros() as u64);
+    crate::runtime::drain::note_store_route_us(
+        "rectrd_resident_us",
+        started.elapsed().as_micros() as u64,
+    );
     true
 }
 
@@ -2335,7 +2587,9 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // instead of the whole surface landing in its pages first (b794, VS Code: 586 such payments, 4.2 s of a 20 s
     // slice, each ~2 ms of GPU wait plus a whole-surface write and rehash for a blit of a few rows).
     #[cfg(feature = "backend-vulkan")]
-    if lab_rect_read() && read_rect_from_owed_resident(state, host, mapping_id, window, rect, dst, dst_stride) {
+    if lab_rect_read()
+        && read_rect_from_owed_resident(state, host, mapping_id, window, rect, dst, dst_stride)
+    {
         return true;
     }
     let settle_started = std::time::Instant::now();

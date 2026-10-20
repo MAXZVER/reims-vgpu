@@ -1587,12 +1587,19 @@ impl PreparedSampled {
 /// shape can bind it directly. Every other source retains the copy-backed
 /// snapshot, including depth: capability support must only remove work from a
 /// shape whose Vulkan contract is fully represented here.
+/// TEMP (lab, Safari large-canvas loss): `REIMS_VGPU_LAB_NO_FEEDBACK=1` takes the attachment-snapshot arm for a
+/// draw sampling its own colour attachment instead of the feedback-loop layout.
+fn lab_no_feedback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_NO_FEEDBACK").is_ok_and(|v| v == "1"))
+}
+
 fn feedback_color_index(
     req: &DrawRequest,
     resource: &super::types::SampledImageResource,
     supported: bool,
 ) -> Option<usize> {
-    if !supported || !SampledKey::of(resource).is_plain_2d_identity_view() {
+    if !supported || !SampledKey::of(resource).is_plain_2d_identity_view() || lab_no_feedback() {
         return None;
     }
     let SampledSource::Target(identity) = &resource.source else {

@@ -6793,11 +6793,12 @@ fn sample_cursor_position<M: HostMemory>(state: &mut DeviceState, mem: &M) {
     }
     let packed = ld32(&pos);
     if packed == 0xffff_ffff {
-        state.cursor.show = false;
+        state.cursor.set_show(false);
         return;
     }
-    state.cursor.x = (packed & 0xffff) as u16;
-    state.cursor.y = ((packed >> 16) & 0xffff) as u16;
+    state
+        .cursor
+        .set_xy((packed & 0xffff) as u16, ((packed >> 16) & 0xffff) as u16);
     let mut show = [0u8; 4];
     if mem
         .read_gpa(
@@ -6807,7 +6808,7 @@ fn sample_cursor_position<M: HostMemory>(state: &mut DeviceState, mem: &M) {
         .is_ok()
     {
         // Guest may only write a byte; treat non-zero low byte as show.
-        state.cursor.show = show[0] != 0 || ld32(&show) != 0;
+        state.cursor.set_show(show[0] != 0 || ld32(&show) != 0);
     }
 }
 
@@ -8307,6 +8308,12 @@ fn apply_map_family<H: HostMemory + HostOps>(
         use crate::runtime::resource_validity::{apply, ValiditySite};
         match decode_invalidate_resources(&packet.payload) {
             Ok(cmd) => {
+                lab_map_family_census(
+                    "InvalidateResources",
+                    packet.opcode,
+                    cmd.task_id,
+                    &cmd.records.iter().map(|rec| rec.object_id).collect::<Vec<_>>(),
+                );
                 // Read-only, and taken before anything is applied: whether the
                 // model's list join could have resolved this packet at all. See
                 // `objects::note_lifetime_refs_named`.
@@ -8496,6 +8503,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
                     }
                 }
                 let oid = cmd.object_ids.first().copied().unwrap_or(0);
+                lab_map_family_census(name, packet.opcode, cmd.task_id, &cmd.object_ids);
                 crate::observe::verbose(|| {
                     format!(
                         "map_family op={name} opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x}",
@@ -9007,10 +9015,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
         }
         CHILD_OP_CURSOR_SHOW => match crate::protocol::fifo::decode_cursor_show(&packet.payload) {
             Ok(show) => {
-                state.cursor.show = show;
+                state.cursor.set_show(show);
                 sample_cursor_position(state, host);
-                host.enqueue(HostAction::cursor(state.cursor.x, state.cursor.y, show));
-                host.guest_cursor_position(state.id.0, state.cursor.x, state.cursor.y, show);
+                host.enqueue(HostAction::cursor(state.cursor.x(), state.cursor.y(), show));
+                host.guest_cursor_position(state.id.0, state.cursor.x(), state.cursor.y(), show);
             }
             Err(short) => note_short_payload("cursor_show", Some(channel_id), &short),
         },
@@ -9018,18 +9026,18 @@ fn process_child_packet<H: HostMemory + HostOps>(
             if load_cursor_glyph(state, host, packet) {
                 host.enqueue(HostAction::cursor_glyph());
                 host.enqueue(HostAction::cursor(
-                    state.cursor.x,
-                    state.cursor.y,
-                    state.cursor.show,
+                    state.cursor.x(),
+                    state.cursor.y(),
+                    state.cursor.show(),
                 ));
                 if let Some(glyph) = crate::runtime::host::CursorGlyphRef::of(&state.cursor) {
                     host.guest_cursor_glyph(state.id.0, glyph);
                 }
                 host.guest_cursor_position(
                     state.id.0,
-                    state.cursor.x,
-                    state.cursor.y,
-                    state.cursor.show,
+                    state.cursor.x(),
+                    state.cursor.y(),
+                    state.cursor.show(),
                 );
             }
         }
@@ -12542,4 +12550,30 @@ mod lab_chan {
         }
         crate::observe::off(line);
     }
+}
+
+/// TEMP (lab, Opus 2026-10-20, heavy WebGL): `REIMS_VGPU_LAB_BIG_SEED=N` names the synchronise packets (family,
+/// opcode, task, objects) while the `REIMS_VGPU_LAB_GATE` file exists, so the per-frame canvas flush can be tied to
+/// SynchronizeResources or SynchronizeAndDiscardResources and to the re-backing that follows it.
+fn lab_map_family_census(name: &str, opcode: u16, task_id: u32, object_ids: &[u32]) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static GATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let max = *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_BIG_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    let Some(gate) = GATE.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GATE").ok()) else {
+        return;
+    };
+    if max == 0 || !std::path::Path::new(gate).exists() || N.fetch_add(1, Ordering::Relaxed) >= max {
+        return;
+    }
+    let ids: Vec<String> = object_ids.iter().take(8).map(|id| format!("{id:#x}")).collect();
+    crate::observe::fail(format!(
+        "lab_map_family op={name} opcode={opcode:#x} task={task_id} n={} oids=[{}] t={}",
+        object_ids.len(),
+        ids.join(","),
+        crate::observe::elapsed_us() / 1000
+    ));
 }
