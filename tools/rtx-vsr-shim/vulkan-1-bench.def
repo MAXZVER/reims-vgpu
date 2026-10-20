@@ -27,3 +27,5 @@ vkResetCommandBuffer
 vkCmdResetQueryPool
 vkCmdWriteTimestamp
 vkGetQueryPoolResults
+vkEnumerateDeviceExtensionProperties
+vkGetPhysicalDeviceQueueFamilyProperties
