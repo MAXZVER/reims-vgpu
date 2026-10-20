@@ -205,6 +205,9 @@ pub(crate) struct TileRefine {
     scheduled: Vec<u32>,
     /// The guest frame sequence the cells were last compared against.
     diffed_seq: Option<u64>,
+    /// A VSR evaluate refused: no more refines (the diff and overlay go on,
+    /// so the cells already refined stay correct until they change).
+    failed: bool,
     /// Census: refines recorded, cells refined, presents that refined.
     rects: u64,
     cells_refined: u64,
@@ -263,6 +266,7 @@ impl TileRefine {
             created_at: Instant::now(),
             scheduled: vec![0; count],
             diffed_seq: None,
+            failed: false,
             rects: 0,
             cells_refined: 0,
         };
@@ -676,7 +680,7 @@ impl TileRefine {
         // Cells that want a refine now, and the earliest one still settling.
         let mut ready = vec![false; count];
         let mut next_due: Option<Instant> = None;
-        for i in 0..count {
+        for i in (0..count).filter(|_| !self.failed) {
             if words[count + i] != 0 {
                 continue;
             }
@@ -783,11 +787,12 @@ impl TileRefine {
             ];
             // FRAGMENT in the first scope: the previous present's overlay read
             // the cache this refine's copies write (with the diff skipped there
-            // is no other barrier to carry that dependency).
+            // is no other barrier to carry that dependency). NGX's stages are
+            // its own, so its side of every barrier here is ALL_COMMANDS.
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
@@ -824,7 +829,7 @@ impl TileRefine {
                     device.cmd_pipeline_barrier(
                         cmd,
                         vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::DependencyFlags::empty(),
                         &war,
                         &[],
@@ -835,15 +840,18 @@ impl TileRefine {
                 let out_rect = [g.to_out(in_rect[0]), g.to_out(in_rect[1]), g.to_out(in_rect[2]), g.to_out(in_rect[3])];
                 let r = super::present_vsr::evaluate_rect(cmd, &input, &output, in_rect, out_rect, quality);
                 if r != 0 {
+                    // No copy, no flags for this or later rectangles; the closing
+                    // barrier below still covers the diff's writes.
                     crate::observe::fail(format!("present_refine_refused reason=evaluate ngx={r:#x} in={in_rect:?} out={out_rect:?}"));
-                    return None;
+                    self.failed = true;
+                    break;
                 }
                 let raw = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
                 device.cmd_pipeline_barrier(
                     cmd,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
                     &raw,
@@ -905,6 +913,9 @@ impl TileRefine {
             &[],
             &[],
         );
+        if self.failed {
+            return None;
+        }
         if left_over {
             // More is ready: the next present, about a monitor period on (a
             // mailbox swapchain would otherwise take presents as fast as asked).
