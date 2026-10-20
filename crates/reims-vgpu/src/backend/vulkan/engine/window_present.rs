@@ -457,6 +457,79 @@ impl PendingWindowPresent {
     }
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_GPU_TIME=1`). Latched.
+fn lab_present_gpu_time() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("REIMS_VGPU_LAB_PRESENT_GPU_TIME").as_deref(), Ok("1" | "on")))
+}
+
+/// TEMP (lab, PRESENT_GPU_TIME): a top and a bottom timestamp per frame entry,
+/// read when the entry's fence has signalled; reported with the cadence line.
+struct LabGpuTime {
+    pool: vk::QueryPool,
+    scale: super::context::TickScale,
+    written: Vec<bool>,
+    sum_ns: u64,
+    max_ns: u64,
+    n: u32,
+}
+
+impl LabGpuTime {
+    unsafe fn create(ctx: &DeviceContext, frames: usize) -> Option<Self> {
+        let scale = ctx.timestamps.as_ref()?.scale;
+        let pool = ctx
+            .device
+            .create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2 * frames as u32),
+                None,
+            )
+            .ok()?;
+        Some(Self { pool, scale, written: vec![false; frames], sum_ns: 0, max_ns: 0, n: 0 })
+    }
+
+    unsafe fn begin(&mut self, device: &ash::Device, cmd: vk::CommandBuffer, ix: usize) {
+        device.cmd_reset_query_pool(cmd, self.pool, 2 * ix as u32, 2);
+        device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.pool, 2 * ix as u32);
+        self.written[ix] = true;
+    }
+
+    unsafe fn end(&self, device: &ash::Device, cmd: vk::CommandBuffer, ix: usize) {
+        device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.pool, 2 * ix as u32 + 1);
+    }
+
+    unsafe fn retire(&mut self, device: &ash::Device, ix: usize) {
+        if !std::mem::take(&mut self.written[ix]) {
+            return;
+        }
+        let mut stamps = [0u64; 2];
+        if device
+            .get_query_pool_results(self.pool, 2 * ix as u32, &mut stamps, vk::QueryResultFlags::TYPE_64)
+            .is_ok()
+        {
+            let ns = self.scale.elapsed_ns(stamps[0], stamps[1]);
+            self.sum_ns += ns;
+            self.max_ns = self.max_ns.max(ns);
+            self.n += 1;
+        }
+    }
+
+    fn report(&mut self) {
+        if self.n > 0 {
+            crate::observe::off(format!(
+                "lab_present_gpu n={} avg_ms={:.2} max_ms={:.2}",
+                self.n,
+                self.sum_ns as f64 / f64::from(self.n) / 1e6,
+                self.max_ns as f64 / 1e6
+            ));
+        }
+        self.sum_ns = 0;
+        self.max_ns = 0;
+        self.n = 0;
+    }
+}
+
 pub(crate) struct WindowPresenter {
     surface_loader: ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
@@ -580,6 +653,9 @@ pub(crate) struct WindowPresenter {
     /// TEMP (lab, PRESENT_DLSSG): DLSS Frame Generation's per-present state.
     dlssg: Option<super::present_dlssg::Dlssg>,
     dlssg_failed: bool,
+    /// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_GPU_TIME=1`): GPU time of each
+    /// present's command buffer.
+    lab_gpu: Option<LabGpuTime>,
 }
 
 /// Everything one in-flight present owns for as long as its blit is running.
@@ -848,6 +924,7 @@ impl WindowPresenter {
             fg: None,
             dlssg: None,
             dlssg_failed: false,
+            lab_gpu: None,
             fg_failed: false,
         };
         // A window created while minimized has no swapchain yet, which is not a
@@ -892,6 +969,9 @@ impl WindowPresenter {
             }
             end_present_in_flight(&mut self.frames[ix]);
             lab_probe_retire(ctx, ix);
+            if let Some(gpu) = self.lab_gpu.as_mut() {
+                gpu.retire(&ctx.device, ix);
+            }
         }
         lab_probe_flush();
         Ok(!self.frames[self.frame_ix].submitted)
@@ -1337,6 +1417,13 @@ impl WindowPresenter {
                 .map_err(|error| {
                     DrawError::VkCall(VkCall::new(VkOp::WindowBeginCommandBuffer, error))
                 })?;
+            // TEMP (lab, PRESENT_GPU_TIME): the top stamp of this present.
+            if lab_present_gpu_time() && self.lab_gpu.is_none() {
+                self.lab_gpu = LabGpuTime::create(ctx, self.frames.len());
+            }
+            if let Some(gpu) = self.lab_gpu.as_mut() {
+                gpu.begin(&ctx.device, frame_cmd, frame_ix);
+            }
 
             let color_range = vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1646,6 +1733,10 @@ impl WindowPresenter {
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
             );
+            // TEMP (lab, PRESENT_GPU_TIME): the bottom stamp of this present.
+            if let Some(gpu) = self.lab_gpu.as_ref() {
+                gpu.end(&ctx.device, frame_cmd, frame_ix);
+            }
             // TEMP (lab, PRESENT_DLSSG): this frame's token, tags and constants.
             let dlssg_token = if super::present_dlssg::active() && !self.dlssg_failed {
                 let (w, h) = (self.extent.width, self.extent.height);
@@ -2067,6 +2158,9 @@ impl WindowPresenter {
             self.cadence_offered,
         ));
         lab_present_gap_report();
+        if let Some(gpu) = self.lab_gpu.as_mut() {
+            gpu.report();
+        }
         self.cadence_started = Instant::now();
         self.cadence_presents = 0;
         self.cadence_direct = 0;
@@ -2107,6 +2201,9 @@ impl WindowPresenter {
         }
         if let Some(mut dlssg) = self.dlssg.take() {
             dlssg.destroy(&ctx.device);
+        }
+        if let Some(gpu) = self.lab_gpu.take() {
+            ctx.device.destroy_query_pool(gpu.pool, None);
         }
         // Drained rather than iterated, so a second `destroy` — `create` calls
         // it on a failed `recreate_swapchain`, and the caller may call it again
