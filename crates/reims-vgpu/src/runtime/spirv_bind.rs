@@ -851,6 +851,26 @@ pub fn validate(words: &[u32]) -> SpirvValidation {
     validate_inner(words).0
 }
 
+/// Whether a `spirv_val_bytes` error is the *process* failing to run rather
+/// than the validator rejecting the module.
+///
+/// Spawn-failure spellings only: the io layer's own words for "there is no
+/// such program" on the hosts this runs on. Validator *diagnoses* must not
+/// match — SPIRV-Tools writes "id ... not found" for a dangling reference,
+/// and folding that onto "tool absent" let a rejected module through
+/// unvalidated on a host that has the tool.
+fn validator_process_absent(why: &str) -> bool {
+    const SPAWN_FAILURES: [&str; 4] = [
+        "No such file",       // POSIX exec
+        "program not found",  // Windows CreateProcess
+        "os error 2",         // either, as rendered by the io layer
+        "Access is denied",   // present but not executable
+    ];
+    // "spawn" alone is dropped: it appears in backtrace-y wrapper text that a
+    // diagnosis could quote.
+    SPAWN_FAILURES.iter().any(|pat| why.contains(pat))
+}
+
 /// [`validate`], and whether a validator actually ran: an `Accepted` from an
 /// absent tool is not evidence and must not be remembered as a verdict.
 fn validate_inner(words: &[u32]) -> (SpirvValidation, bool) {
@@ -887,7 +907,14 @@ fn validate_inner(words: &[u32]) -> (SpirvValidation, bool) {
             // as a rejected module, and the two must not be confused: one is a
             // module that would take the process down, the other is a laptop
             // without SPIRV-Tools installed.
-            if why.contains("No such file") || why.contains("spawn") || why.contains("not found") {
+            //
+            // The patterns are the *process-spawn* spellings only. The bare
+            // "not found" this used to match is also a validator diagnosis
+            // ("id 42 not found"), which on a host that HAS the tool turned a
+            // genuine rejection into "tool absent" - the module reached the
+            // driver unvalidated, strictly worse than the case this arm
+            // exists for.
+            if validator_process_absent(&why) {
                 if crate::observe::first_sight("spirv_val_absent", 0) {
                     crate::observe::fail(format!(
                         "spirv_validate reason=validator_unavailable detail={}",
@@ -4454,6 +4481,29 @@ mod tests {
             .chain(decorate)
             .collect();
         assert!(refuse_unrepaired_image_consumers(&named, &retyped).is_ok());
+    }
+
+    /// The absent-tool sniff must not match a validator *diagnosis*: "id not
+    /// found" is a rejection, and reading it as "tool absent" hands the module
+    /// to the driver unvalidated on hosts that have the tool.
+    #[test]
+    fn the_absent_validator_sniff_matches_spawn_failures_only() {
+        for absent in [
+            "No such file or directory (os error 2)",
+            "program not found",
+            "Access is denied (os error 5)",
+        ] {
+            assert!(validator_process_absent(absent), "{absent} is a spawn failure");
+        }
+        for rejection in [
+            "spirv-val failed: error: line 12: ID 42 not found",
+            "error: 4: OpLoad: Result Type is not a type",
+        ] {
+            assert!(
+                !validator_process_absent(rejection),
+                "{rejection} is a validator verdict, not an absent tool"
+            );
+        }
     }
 
     /// The rewrites' id allocator hands out `bound + 1` upward; in a release
