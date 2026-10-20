@@ -532,6 +532,39 @@ pub(crate) unsafe fn execute_compute_inner(
         }
     }
 
+    // Device limits, before anything is recorded: a grid or a workgroup the
+    // device cannot dispatch is refused by name rather than issued.
+    {
+        let f = &ctx.features;
+        let over = |local: Option<[u32; 3]>, count: [u32; 3]| {
+            (0..3).any(|i| count[i] > f.max_compute_workgroup_count[i])
+                || local.is_some_and(|l| {
+                    (0..3).any(|i| l[i] > f.max_compute_workgroup_size[i])
+                        || u64::from(l[0]) * u64::from(l[1]) * u64::from(l[2])
+                            > u64::from(f.max_compute_workgroup_invocations)
+                })
+        };
+        let regions: Vec<(Option<[u32; 3]>, [u32; 3])> = match &req.dispatch {
+            ComputeDispatch::Workgroups(grid) => vec![(None, *grid)],
+            ComputeDispatch::Regions { regions, .. } => {
+                regions.iter().map(|r| (Some(r.local_size), r.group_count)).collect()
+            }
+        };
+        if let Some((region, (local, count))) =
+            regions.iter().enumerate().find(|(_, (l, c))| over(*l, *c))
+        {
+            return Err(DrawError::ComputeValidation(
+                ComputeValidationDecline::DispatchOverDeviceLimit {
+                    region,
+                    local_size: local.unwrap_or([0; 3]),
+                    group_count: *count,
+                    max_count: f.max_compute_workgroup_count,
+                    max_size: f.max_compute_workgroup_size,
+                },
+            ));
+        }
+    }
+
     // Storage buffers: host-visible staging used as SSBOs (same as draw path).
     let mut storage_slots = Vec::new();
     for resource in &req.storage_buffers {

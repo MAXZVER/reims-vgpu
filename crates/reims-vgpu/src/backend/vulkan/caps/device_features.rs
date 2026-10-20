@@ -191,6 +191,10 @@ pub struct DeviceFeatures {
     /// [`Self::max_compute_workgroup_invocations`], which bounds their product:
     /// a device can allow 1024 in x and still refuse 1024x1024x64 threads.
     pub max_compute_workgroup_size: [u32; 3],
+    /// `VkPhysicalDeviceLimits::maxComputeWorkGroupCount` - the most workgroups
+    /// one `vkCmdDispatch` may name per axis (65535 on y and z on every desktop
+    /// GPU). A guest grid past it is not a dispatch Vulkan can issue.
+    pub max_compute_workgroup_count: [u32; 3],
     /// `VkPhysicalDeviceLimits::maxComputeSharedMemorySize` — the guest's
     /// `maxThreadgroupMemoryLength`. The Vulkan 1.2 floor is 16 KiB, so
     /// answering a fixed 32 KiB is an over-promise on any device at the floor:
@@ -746,6 +750,7 @@ impl DeviceFeatures {
             max_compute_workgroup_invocations,
             subgroup_size,
             max_compute_workgroup_size,
+            max_compute_workgroup_count,
             max_compute_shared_memory_bytes,
             max_sample_count,
             d24_unorm_s8_attachment,
@@ -814,7 +819,7 @@ impl DeviceFeatures {
              max_image_dimension_2d={max_image_dimension_2d} \
              max_compute_workgroup_invocations={max_compute_workgroup_invocations} \
              subgroup_size={subgroup_size} \
-             max_compute_workgroup_size={max_compute_workgroup_size:?} \
+             max_compute_workgroup_size={max_compute_workgroup_size:?}              max_compute_workgroup_count={max_compute_workgroup_count:?} \
              max_compute_shared_memory_bytes={max_compute_shared_memory_bytes} \
              max_sample_count={max_sample_count} d24_unorm_s8_attachment={d24_unorm_s8_attachment} \
              shader_int16={shader_int16} shader_int64={shader_int64} \
@@ -1126,6 +1131,9 @@ pub unsafe fn query(
         // cannot make the guest oversize a dispatch.
         subgroup_size: subgroup.subgroup_size.max(1),
         max_compute_workgroup_size: props.limits.max_compute_work_group_size,
+        // The Vulkan 1.2 floor is 65535 on every axis; a device reporting less
+        // is out of spec, and the floor is what every one honours.
+        max_compute_workgroup_count: props.limits.max_compute_work_group_count.map(|n| n.max(65535)),
         max_compute_shared_memory_bytes: props.limits.max_compute_shared_memory_size,
         max_sample_count,
         d24_unorm_s8_attachment,
@@ -1195,6 +1203,7 @@ mod tests {
             max_compute_workgroup_invocations: 1024,
             subgroup_size: 64,
             max_compute_workgroup_size: [1024, 1024, 64],
+            max_compute_workgroup_count: [65535, 65535, 65535],
             max_compute_shared_memory_bytes: 32768,
             max_sample_count: 8,
             d24_unorm_s8_attachment: true,

@@ -25,6 +25,17 @@ pub enum ComputeValidationDecline {
         local_size: [u32; 3],
         group_count: [u32; 3],
     },
+    /// A dispatch whose workgroup count or workgroup size exceeds what the
+    /// device allows (`maxComputeWorkGroupCount` / `maxComputeWorkGroupSize` /
+    /// `maxComputeWorkGroupInvocations`). Issuing it is invalid usage - work
+    /// silently cut short, a hang, or a lost device - so it is refused.
+    DispatchOverDeviceLimit {
+        region: usize,
+        local_size: [u32; 3],
+        group_count: [u32; 3],
+        max_count: [u32; 3],
+        max_size: [u32; 3],
+    },
     DuplicateStorageBufferBinding {
         binding: u32,
     },
@@ -86,6 +97,7 @@ impl Decline for ComputeValidationDecline {
             Self::ZeroGrid { .. } => "vk_compute_validate_zero_grid",
             Self::NoDispatchRegions => "vk_compute_validate_no_dispatch_regions",
             Self::ZeroDispatchRegion { .. } => "vk_compute_validate_zero_dispatch_region",
+            Self::DispatchOverDeviceLimit { .. } => "vk_compute_validate_dispatch_over_device_limit",
             Self::DuplicateStorageBufferBinding { .. } => {
                 "vk_compute_validate_duplicate_storage_buffer_binding"
             }
@@ -190,6 +202,25 @@ impl Decline for ComputeValidationDecline {
                     "group_count",
                     format!("{}x{}x{}", group_count[0], group_count[1], group_count[2]),
                 ),
+            ],
+            Self::DispatchOverDeviceLimit {
+                region,
+                local_size,
+                group_count,
+                max_count,
+                max_size,
+            } => vec![
+                ("region", region.to_string()),
+                (
+                    "local_size",
+                    format!("{}x{}x{}", local_size[0], local_size[1], local_size[2]),
+                ),
+                (
+                    "group_count",
+                    format!("{}x{}x{}", group_count[0], group_count[1], group_count[2]),
+                ),
+                ("max_count", format!("{}x{}x{}", max_count[0], max_count[1], max_count[2])),
+                ("max_size", format!("{}x{}x{}", max_size[0], max_size[1], max_size[2])),
             ],
             Self::EmptySpirv
             | Self::EmptyEntry
