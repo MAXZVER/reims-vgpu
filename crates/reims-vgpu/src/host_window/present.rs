@@ -877,7 +877,26 @@ pub fn spawn(
 ) -> std::thread::JoinHandle<Result<(), WindowError>> {
     std::thread::Builder::new()
         .name("reims-vgpu-window".to_string())
-        .spawn(move || run(config, on_input, frames, stop, wake, guest_cursor))
+        .spawn(move || {
+            // The VM keeps running whatever this thread does, so how the window
+            // ended is said on the failure channel the moment it ends: an early
+            // `Err` (no display, a second event loop in the process) or a panic
+            // used to surface only at `window_stop`'s join, if ever - a frozen
+            // or absent window and a clean log.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(config, on_input, frames, stop, wake, guest_cursor)
+            })) {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => {
+                    crate::observe::fail(format!("host_window_thread_failed reason={e:?}"));
+                    Err(e)
+                }
+                Err(payload) => {
+                    crate::observe::panic::report("host_window_thread", payload.as_ref());
+                    Err(WindowError::RunApp("window thread panicked".to_string()))
+                }
+            }
+        })
         .expect("spawn reims-vgpu-window thread")
 }
 
