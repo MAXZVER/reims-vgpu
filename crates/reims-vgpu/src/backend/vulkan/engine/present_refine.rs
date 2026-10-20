@@ -203,6 +203,8 @@ pub(crate) struct TileRefine {
     created_at: Instant,
     /// The stamp at which each cell's refine was recorded (0: none pending).
     scheduled: Vec<u32>,
+    /// The guest frame sequence the cells were last compared against.
+    diffed_seq: Option<u64>,
     /// Census: refines recorded, cells refined, presents that refined.
     rects: u64,
     cells_refined: u64,
@@ -260,6 +262,7 @@ impl TileRefine {
             stamps: VecDeque::new(),
             created_at: Instant::now(),
             scheduled: vec![0; count],
+            diffed_seq: None,
             rects: 0,
             cells_refined: 0,
         };
@@ -514,7 +517,20 @@ impl TileRefine {
     /// Step 1, every present: stamp the cells the guest frame changed since
     /// the last present and drop their refined copies. Records nothing on a
     /// layout it cannot read.
-    pub(crate) unsafe fn record_diff(&mut self, device: &ash::Device, cmd: vk::CommandBuffer, ix: usize, frame: &RefineFrame) {
+    pub(crate) unsafe fn record_diff(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        ix: usize,
+        frame: &RefineFrame,
+        seq: Option<u64>,
+    ) {
+        // The same guest frame again (a generated or refine present): nothing
+        // can have changed since its own comparison.
+        if seq.is_some() && seq == self.diffed_seq {
+            return;
+        }
+        self.diffed_seq = seq;
         self.stamp = self.stamp.wrapping_add(1).max(1);
         let now = Instant::now();
         self.stamps.push_back((self.stamp, now));
@@ -746,9 +762,10 @@ impl TileRefine {
         if !rects.is_empty() {
             // prev (written by the diff) to VSR's input; scratch to its output.
             let images = [
+                // (Already there when this present skipped the diff.)
                 image_barrier(
                     self.prev.image,
-                    vk::ImageLayout::GENERAL,
+                    self.prev_layout,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     vk::AccessFlags::SHADER_WRITE,
                     vk::AccessFlags::SHADER_READ,

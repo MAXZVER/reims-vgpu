@@ -270,6 +270,9 @@ pub(crate) struct SharpSource {
     /// TEMP (lab, PRESENT_VSR_TILES): the guest frame behind `image` when that
     /// is a generated midpoint (PRESENT_FG); `None` when `image` is the frame.
     pub real: Option<super::present_refine::RefineFrame>,
+    /// TEMP (lab, PRESENT_VSR_TILES): the guest frame's sequence, when known (a
+    /// present of the frame the cells were already compared against skips it).
+    pub seq: Option<u64>,
 }
 
 impl PresentSharp {
@@ -1641,7 +1644,7 @@ impl PresentSharp {
                 layout: src.layout,
             },
         };
-        refine.record_diff(device, cmd, ix, &frame);
+        refine.record_diff(device, cmd, ix, &frame, src.seq);
         let due = refine.record_refine(device, cmd, q);
         self.refine_active = true;
         due

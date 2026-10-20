@@ -1223,7 +1223,8 @@ impl WindowPresenter {
         source: Option<&WindowPresentSource>,
         cpu: Option<WindowCpuFrame<'_>>,
     ) -> Result<WindowPresentDispatch, DrawError> {
-        if let Some(seq) = cpu.map(|frame| frame.seq) {
+        let frame_seq = cpu.map(|frame| frame.seq);
+        if let Some(seq) = frame_seq {
             if self.cadence_last_offered != Some(seq) {
                 self.cadence_last_offered = Some(seq);
                 self.cadence_offered = self.cadence_offered.saturating_add(1);
@@ -1591,6 +1592,7 @@ impl WindowPresenter {
                                 view,
                                 layout: src_layout,
                             }),
+                            seq: frame_seq,
                         };
                         sharp
                             .record(
