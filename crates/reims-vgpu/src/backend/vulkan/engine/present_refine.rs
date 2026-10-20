@@ -881,7 +881,9 @@ impl TileRefine {
             &[],
         );
         if left_over {
-            Some(now)
+            // More is ready: the next present, about a monitor period on (a
+            // mailbox swapchain would otherwise take presents as fast as asked).
+            Some(now + Duration::from_millis(6))
         } else {
             next_due
         }
