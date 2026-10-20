@@ -651,6 +651,8 @@ fn land_where<M: HostMemory + HostOps>(
                 } else {
                     None
                 };
+                // The pages hold exactly the frame only when nothing was skipped.
+                let landed_whole = guest_owned.is_none();
                 let ok = match guest_owned {
                     Some(skip) => crate::runtime::mapping_write::write_bgra8_skipping_uncached(
                         state,
@@ -673,8 +675,13 @@ fn land_where<M: HostMemory + HostOps>(
                     ),
                 };
                 drop(frame);
-                // TEMP (lab, T2T_ALIAS): name the landed pages and the frame in them.
-                if ok && crate::runtime::gather_witness::t2t_alias::on() {
+                // TEMP (lab, T2T_ALIAS): name the landed pages and the frame in them -
+                // only when that is what they hold. Landed around the guest's own
+                // stores, they are the frame *and* those stores, and naming them
+                // as the pure resident let the next gather of that window confirm
+                // an alias that drops the guest's writes (host-only verdict, then
+                // `note_decided`).
+                if ok && landed_whole && crate::runtime::gather_witness::t2t_alias::on() {
                     if let (Some(version), Some((gpas, span))) = (
                         p.source_version,
                         crate::runtime::mapping_write::lab_t2t_alias_window(state, p.mapping_id, p.width, p.height),
