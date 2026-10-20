@@ -238,6 +238,7 @@ fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
         &mut out,
         &mut acc,
         None,
+        None,
     );
     let added = sink_body()[before..].to_string();
     assert!(
@@ -394,7 +395,7 @@ fn an_unknown_segment_family_ends_the_walk_and_the_envelope_does_not() {
     let task_id = 0x5731_0002;
     let cap = crate::observe::FailCapture::start();
     walk_stream(
-        &mut state, &mut host, task_id, &stream, &mut out, &mut acc, None,
+        &mut state, &mut host, task_id, &stream, &mut out, &mut acc, None, None,
     );
     let lines = cap.lines();
 
@@ -463,7 +464,7 @@ fn event_segment_signal_wait_in_stream() {
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
-    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc, None);
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc, None, None);
 
     // The signal landed, and the pending wait for 8 left it alone. The
     // three per-op counters this used to assert had no product reader; the
@@ -515,7 +516,7 @@ fn a_bounded_event_wait_is_refused_by_contract_and_leaves_the_generation_alone()
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
     let cap = crate::observe::FailCapture::start();
-    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc, None);
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc, None, None);
     let lines = cap.lines();
 
     assert!(
@@ -5493,7 +5494,7 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
-    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc, None);
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc, None, None);
 
     // Two updates: the first seeds the generation, the second advances it. A
     // dropped fence leaves `None` here, which is what this used to read.
@@ -6838,6 +6839,16 @@ fn each_render_state_record_writes_the_one_field_it_names_and_no_other() {
             lab_inherited: _,
             // What the walk resolved for itself; not a render-state field.
             memo: _,
+            // TEMP (lab): the stream census's segment bookkeeping.
+            lab_seg_prev: _,
+            lab_seg_next: _,
+            lab_segments: _,
+            // The encoder's lifetime across streams and the descriptor it hands
+            // on: bookkeeping of the packet walk, not the pass state itself
+            // (`color_slots`, `clears` and the attachments above are).
+            pass_record: _,
+            first_render_continues_previous: _,
+            last_render_continues_into_next: _,
         } = acc;
         vec![
             ("pipeline_ref", format!("{pipeline_ref:?}")),
@@ -9372,4 +9383,72 @@ fn pass_invariants_on_and_off_report_the_same_counters() {
         before,
         "a pass that never reaches its seed phase must not touch the pass census"
     );
+}
+
+/// A render encoder the guest cut across two command buffers keeps its pass.
+///
+/// macOS 26 closes a command buffer at 128 KiB and continues the open encoder
+/// in the next one, stating the render-pass descriptor only in the first: the
+/// continuation's segment header says `continues_previous` and its records
+/// start with draws. Before the carry, the continuation reached
+/// `finish_stream` with no colour target and every draw in it was lost
+/// (Safari's 2D canvas past ~2 600 fillRects).
+#[test]
+fn a_continued_render_encoder_keeps_its_pass_in_the_next_stream() {
+    use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_DONT_CARE};
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+    let mut payload = vec![0u8; wire_pass::RENDER_PASS_TOTAL_LEN as usize - OP_HEADER_LEN];
+    st32(&mut payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_TEXREF..], 41);
+    st16(&mut payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_LOAD_ACTION..], MTL_LOAD_ACTION_CLEAR);
+    st16(&mut payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_STORE_ACTION..], MTL_STORE_ACTION_DONT_CARE);
+    let mut pass = vec![0u8; OP_HEADER_LEN + payload.len()];
+    st32(&mut pass[0..], wire_pass::OPCODE_RENDER_PASS);
+    st32(&mut pass[4..], (OP_HEADER_LEN + payload.len()) as u32);
+    pass[OP_HEADER_LEN..].copy_from_slice(&payload);
+    // Header: length, type, `beginSegment:` flag (continues the previous
+    // stream's encoder), then the byte the guest sets on a segment whose
+    // encoder continues into the next stream.
+    let segment = |records: &[u8], continues_previous: u8, continues_into_next: u8| {
+        let mut s = vec![0u8; SEGMENT_HEADER_LEN];
+        st32(&mut s[0..4], (SEGMENT_HEADER_LEN + records.len()) as u32);
+        s[4] = SegmentKind::Render.wire_type();
+        s[5] = continues_previous;
+        s[6] = continues_into_next;
+        s.extend_from_slice(records);
+        s
+    };
+    let first = segment(&pass, 0, 1);
+    let continuation = segment(&[], 1, 0);
+    assert!(!stream_continues_render_encoder(&first));
+    assert!(stream_continues_render_encoder(&continuation));
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    walk_stream(&mut state, &mut host, 1, &first, &mut out, &mut acc, None, None);
+    assert!(acc.last_render_continues_into_next && !acc.first_render_continues_previous);
+    assert_eq!(acc.clears.len(), 1, "the encoder's own first stream clears");
+    hold_pass_for_continuation(&mut acc);
+    assert_eq!(
+        acc.color_slots[0].1.store_action,
+        MTL_STORE_ACTION_STORE,
+        "the half-drawn encoder is stored for its continuation whatever its own store action"
+    );
+    let carried = acc.pass_record.clone().expect("the stream kept its descriptor record");
+
+    let mut lost = StreamAccum::default();
+    walk_stream(&mut state, &mut host, 1, &continuation, &mut out, &mut lost, None, None);
+    assert!(lost.color_slots.is_empty(), "no descriptor in the continuation itself");
+
+    let mut next = StreamAccum::default();
+    walk_stream(&mut state, &mut host, 1, &continuation, &mut out, &mut next, None, Some(&carried));
+    assert!(next.first_render_continues_previous);
+    assert_eq!(next.color_slots.len(), 1);
+    let att = next.color_slots[0].1;
+    assert_eq!(att.texture_ref, 41);
+    assert_eq!(att.load_action, MTL_LOAD_ACTION_LOAD, "the continuation loads what the first stream stored");
+    assert_eq!(att.store_action, MTL_STORE_ACTION_DONT_CARE, "the encoder's store action applies at its end");
+    assert!(next.clears.is_empty(), "the encoder's clear is not applied a second time");
+    assert_eq!(next.pass_record.as_deref(), Some(&carried[..]), "and it hands the pass on again");
 }
