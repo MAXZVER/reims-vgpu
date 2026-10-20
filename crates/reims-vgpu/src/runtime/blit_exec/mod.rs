@@ -4398,7 +4398,7 @@ pub fn execute_blit<M: HostMemory + HostOps>(
         // The resolve memo holds a sampled source for the stream: this write
         // ends the destination's.
         #[cfg(feature = "backend-vulkan")]
-        crate::runtime::draw::vulkan::lab_resolve_memo_wrote(task_id, dest);
+        crate::runtime::draw::vulkan::lab_resolve_memo_wrote(state, task_id, dest);
     }
     // TEMP (lab, `REIMS_VGPU_LAB_BLIT_QUIESCE=1`): a blit writes guest RAM on the
     // CPU now, but GPU work recorded before it (and not yet executed) may read

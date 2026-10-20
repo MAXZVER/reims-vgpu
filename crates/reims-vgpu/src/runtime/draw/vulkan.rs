@@ -359,7 +359,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut gva_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         record_plane_draw(req);
-        lab_resolve_memo_record(req);
+        lab_resolve_memo_record(state, req);
         lab_tile_draw_with(state, req);
         lab_draw_sig(req);
         req.chain_resident_established = false;
@@ -2977,7 +2977,7 @@ pub(super) fn lab_resolve_memo_prime<M: HostMemory + HostOps>(
     // Textures any record of these writes are not memoized in this stream: a
     // bind of one may run after that write (see `lab_resolve_memo_written`).
     for (req, _) in reqs {
-        lab_resolve_memo_written(req);
+        lab_resolve_memo_written(state, req);
     }
     for (req, _) in reqs.iter() {
         let attachments: Vec<u32> = req.colors.iter().map(|c| c.texture_ref).collect();
@@ -3063,14 +3063,41 @@ fn pass_written_refs(req: &DrawEncodeRequest) -> impl Iterator<Item = u32> + '_ 
 /// resolution outlives a pass boundary exactly when nothing has written its
 /// texture. (Clearing at every pass open instead, 6c28a911, cost Maps half its
 /// frames: 44 -> 22 fps, b614-b619.)
-pub(crate) fn lab_resolve_memo_record(req: &DrawEncodeRequest) {
-    lab_resolve_memo_written(req);
+pub(crate) fn lab_resolve_memo_record(state: &DeviceState, req: &DrawEncodeRequest) {
+    lab_resolve_memo_written(state, req);
+}
+
+/// Drop every memoized resolution of `task_id` whose texture shares a named
+/// mapping (an IOSurface) with one of `written`.
+///
+/// The memo is keyed and invalidated by texture ref, and two refs can name one
+/// storage: a second `MTLTexture` over the same IOSurface. A pass rendering into
+/// one left the other's earlier resolution in the memo for the rest of the
+/// stream, and a later bind of it sampled the bytes from before the pass.
+fn drop_storage_aliases(
+    state: &DeviceState,
+    task_id: u32,
+    written: &[u32],
+    m: &mut reims_vgpu_core::fasthash::FxHashMap<ResolveMemoKey, MemoSlot>,
+) {
+    let mut storage: Vec<u32> = Vec::new();
+    for &r in written {
+        storage.extend(state.mappings_named_by(task_id, r).iter());
+    }
+    if storage.is_empty() {
+        return;
+    }
+    m.retain(|key, _| {
+        key.0 != task_id
+            || written.contains(&key.1)
+            || !state.mappings_named_by(task_id, key.1).iter().any(|id| storage.contains(&id))
+    });
 }
 
 /// A writer other than a render pass - a blit, a mipmap chain, a compute
 /// kernel's storage image - is about to write `(task_id, reference)` in this
 /// stream: its resolution leaves the memo and is not taken again in the stream.
-pub(crate) fn lab_resolve_memo_wrote(task_id: u32, reference: u32) {
+pub(crate) fn lab_resolve_memo_wrote(state: &DeviceState, task_id: u32, reference: u32) {
     if reference == 0 || !lab_resolve_memo_on() {
         return;
     }
@@ -3078,10 +3105,11 @@ pub(crate) fn lab_resolve_memo_wrote(task_id: u32, reference: u32) {
     let mut m = RESOLVE_MEMO.write();
     if !m.is_empty() {
         m.retain(|key, _| key.0 != task_id || key.1 != reference);
+        drop_storage_aliases(state, task_id, &[reference], &mut m);
     }
 }
 
-pub(crate) fn lab_resolve_memo_written(req: &DrawEncodeRequest) {
+pub(crate) fn lab_resolve_memo_written(state: &DeviceState, req: &DrawEncodeRequest) {
     let written: Vec<u32> = pass_written_refs(req).collect();
     if written.is_empty() {
         return;
@@ -3095,6 +3123,7 @@ pub(crate) fn lab_resolve_memo_written(req: &DrawEncodeRequest) {
     let mut m = RESOLVE_MEMO.write();
     if !m.is_empty() {
         m.retain(|key, _| key.0 != req.task_id || !written.contains(&key.1));
+        drop_storage_aliases(state, req.task_id, &written, &mut m);
     }
 }
 

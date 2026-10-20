@@ -3400,7 +3400,7 @@ fn handle_blit_transfer_record<M: HostMemory + HostOps>(
             crate::backend::selected().wait_recorded_gpu_work();
         }
         #[cfg(feature = "backend-vulkan")]
-        crate::runtime::draw::vulkan::lab_resolve_memo_wrote(task_id, m.texture_ref);
+        crate::runtime::draw::vulkan::lab_resolve_memo_wrote(state, task_id, m.texture_ref);
         match mipmap::generate_mipmaps_linear(state, host, task_id, m.texture_ref) {
             MipmapStatus::Ok => {}
             st => {
@@ -7067,7 +7067,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                                         resident_chain_before_this_record;
                                     resident_chain_before_this_record = resident_chain;
                                     crate::runtime::draw::vulkan::record_plane_draw(req);
-                                    crate::runtime::draw::vulkan::lab_resolve_memo_record(req);
+                                    crate::runtime::draw::vulkan::lab_resolve_memo_record(&*st, req);
                                     crate::runtime::draw::vulkan::lab_tile_draw_with(&*st, req);
                                     crate::runtime::drain::note_store_route("draw_par_committed");
                                     fin.enter(crate::runtime::drain::FinishPhase::Result);
