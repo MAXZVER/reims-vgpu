@@ -5902,7 +5902,7 @@ impl DeviceState {
     ) -> Option<reims_vgpu_core::lifecycle::Redefinition> {
         self.bump_names_gen();
         use reims_vgpu_core::lifecycle::LifecycleOp;
-        let effects = self
+        let effects = match self
             .lifecycle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -5914,8 +5914,31 @@ impl DeviceState {
                 // registrations of slot zero rather than one.
                 kernel: task_id == 0,
                 directory: reims_vgpu_core::identity::DirectoryFrame(directory_pfn),
-            })
-            .expect("a definition opens the task it names");
+            }) {
+            Ok(effects) => effects,
+            Err(refusal) => {
+                // This is the one lifecycle op the device runs on its own door
+                // rather than through `apply_lifetime`, and its `Err` used to be
+                // an `expect` — a panic at an FFI entry over a refusal every
+                // sibling door reports. The refusal is not reachable from
+                // today's core (`live_names` builds ids from the current slot
+                // generations, so the redefine arm's `delete_resource` calls
+                // always resolve); the typed answer is for the day that stops
+                // being true, which is a core edit away and nothing else.
+                // The task does not open; packets against it refuse by name,
+                // which is the same answer `apply_lifetime` gives.
+                crate::runtime::drain::note_store_route(refusal.slug());
+                if crate::observe::first_sight("define_task_refused", u64::from(task_id)) {
+                    crate::observe::fail(format!(
+                        "define_task_refused task={task_id} refusal={} (the semantic model \
+                         refused to open the task's address space; its packets will refuse \
+                         by name)",
+                        refusal.slug()
+                    ));
+                }
+                return None;
+            }
+        };
         let mut acted = note_lifecycle_effects(effects, "define_task_namespace");
         crate::runtime::drain::note_store_route_n(
             "task_namespace_teardowns",
@@ -8726,5 +8749,17 @@ mod sampled_generation_tests {
             SurfaceWriteKind::Unknown,
             "the write class left with the mapping"
         );
+    }
+
+    /// The define door reports a refusal rather than panicking. The `Err` arm
+    /// is not reachable from today's core (see the door's comment), so this
+    /// holds the door's shape — a redefine through the same delete path the
+    /// refusal would come from answers, and does not abort the process.
+    #[test]
+    fn defining_a_live_task_again_answers_rather_than_panicking() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.define_task(7, 0x1000, 5);
+        state.define_task(7, 0x1000, 5);
+        assert!(state.tasks.is_active(7), "the redefine went through");
     }
 }
