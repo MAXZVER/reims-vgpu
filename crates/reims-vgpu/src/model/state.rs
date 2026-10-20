@@ -6108,7 +6108,7 @@ impl DeviceState {
         // `next_sampled_content_generation`): 0 is the "never bumped" default,
         // so a wrap that lands on it would equate a re-pointed window with a
         // fresh one and hand `BackingWindowRefs::identity` the old backing.
-        *slot = next_epoch(*slot);
+        *slot = Self::next_epoch(*slot);
     }
 
     /// Say that every name in this task now describes different pages, for the
@@ -6129,7 +6129,7 @@ impl DeviceState {
         let slot = self.task_storage_epochs.entry(task_id).or_insert(0);
         // Same 0-skip as the per-name incarnation above: 0 is this table's
         // "never bumped" default, not an incarnation.
-        *slot = next_epoch(*slot);
+        *slot = Self::next_epoch(*slot);
         self.storage_incarnations.retain(|&(t, _), _| t != task_id);
         self.backing_window_refs.delete_task(task_id);
         self.aliased_references

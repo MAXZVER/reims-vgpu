@@ -1382,6 +1382,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 || storage_images.iter().any(|x| x.binding == b)
         };
         let missing: Vec<u32> = crate::runtime::spirv_bind::declared_binding_numbers(words)
+            .unwrap_or_else(|| vec![crate::runtime::spirv_bind::BROKEN_FRAME_BINDING])
             .into_iter()
             .filter(|b| !supplied(*b))
             .filter(|b| crate::runtime::spirv_bind::descriptor_static_use(words, *b).is_violation())
