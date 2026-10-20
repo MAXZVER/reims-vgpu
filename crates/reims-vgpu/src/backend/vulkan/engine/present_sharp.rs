@@ -1042,7 +1042,16 @@ impl PresentSharp {
                 nis_cfg = None;
             }
         }
-        let second = if self.nis.is_some() && nis_cfg.is_none() { None } else { self.rcas };
+        // TEMP (lab, PRESENT_VSR_SETTLE): with a settle time VSR runs only on the
+        // present that refines a settled frame; the others take EASU alone.
+        let vsr_this = self.vsr.is_some()
+            && (crate::host_window::present::lab_present_settle().is_none()
+                || crate::host_window::present::lab_take_refine_present());
+        let second = if (self.nis.is_some() && nis_cfg.is_none()) || (self.vsr.is_some() && !vsr_this) {
+            None
+        } else {
+            self.rcas
+        };
         let rcas = match second {
             Some(sharp) => match self.ensure_mid(device, format, vp.2, vp.3, memory_type) {
                 Ok(()) => Some(sharp),
@@ -1108,7 +1117,7 @@ impl PresentSharp {
             .subresource_range(super::color_subresource_range())];
         let nis_cfg = if rcas.is_some() { nis_cfg } else { None };
         // VSR this present: ready, a `mid`, and its input image.
-        let vsr = match (self.vsr, rcas.is_some() && !self.vsr_failed && super::present_vsr::ready()) {
+        let vsr = match (self.vsr.filter(|_| vsr_this), rcas.is_some() && !self.vsr_failed && super::present_vsr::ready()) {
             (Some(q), true) => match self.ensure_vsr_in(device, src.width, src.height, memory_type) {
                 Ok(()) => Some(q),
                 Err(e) => {
@@ -1218,6 +1227,14 @@ impl PresentSharp {
                     },
                     q,
                 );
+                {
+                    // TEMP (lab): how often VSR ran (with a settle time: once per settled frame).
+                    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n <= 5 || n % 200 == 0 {
+                        crate::observe::off(format!("present_vsr evaluate #{n} {vin_w}x{vin_h}->{mid_w}x{mid_h} ngx={r:#x}"));
+                    }
+                }
                 if r != 0 {
                     self.vsr_failed = true;
                     crate::observe::fail(format!("present_vsr_refused reason=evaluate ngx={r:#x} {vin_w}x{vin_h}->{mid_w}x{mid_h}"));

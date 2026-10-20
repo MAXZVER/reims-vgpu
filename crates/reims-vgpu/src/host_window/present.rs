@@ -456,6 +456,37 @@ fn needs_present(presented: Option<u64>, redraw_required: bool, incoming: Option
     redraw_required || presented != incoming
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_VSR_SETTLE_MS=N`): the scaled present runs
+/// its cheap filter while guest frames keep arriving, and once the shown frame
+/// has stood still for N ms the window presents it once more through the
+/// expensive upscaler (RTX VSR) - motion at full rate, still content at full
+/// quality. `None` when unset: the upscaler, if on, runs on every frame.
+pub(crate) fn lab_present_settle() -> Option<std::time::Duration> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    MS.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PRESENT_VSR_SETTLE_MS").ok()?.trim().parse().ok().filter(|ms| *ms > 0)
+    })
+    .map(std::time::Duration::from_millis)
+}
+
+/// TEMP (lab, PRESENT_VSR_SETTLE): set by the window for the one present that
+/// refines a settled frame; taken by the rail's scaled present.
+static LAB_REFINE_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// TEMP (lab, PRESENT_VSR_SETTLE): whether this present is the refining one
+/// (and clears the request).
+pub(crate) fn lab_take_refine_present() -> bool {
+    LAB_REFINE_PRESENT.swap(false, Ordering::AcqRel)
+}
+
+/// TEMP (lab, PRESENT_VSR_SETTLE): when the last fresh frame reached the screen
+/// and which frame was last refined.
+#[derive(Default)]
+struct LabSettle {
+    fresh_at: Option<std::time::Instant>,
+    refined_seq: Option<u64>,
+}
+
 /// The absolute pointer event a window position becomes: `(x, y, width,
 /// height)` for [`HostAction::input_pointer_move`], whose consumer scales `x`
 /// against `width` (`min_in = 0`, `max_in = dim`).
@@ -907,6 +938,8 @@ struct App {
     /// forward by every redraw request, so a steady publish stream never lets it
     /// fire; see [`WINDOW_REDRAW_BACKSTOP`] for what it is a floor under.
     next_backstop: std::time::Instant,
+    /// TEMP (lab, PRESENT_VSR_SETTLE).
+    lab_settle: LabSettle,
     /// Frame seq the drawable currently holds, or `None` before the first
     /// present.
     last_presented_seq: Option<u64>,
@@ -1445,6 +1478,7 @@ impl App {
             // guest frame.
             frame_pending: true,
             next_backstop: std::time::Instant::now(),
+            lab_settle: LabSettle::default(),
             last_presented_seq: None,
             last_presented_atomic: Arc::new(AtomicU64::new(0)),
             redraw_required: true,
@@ -1807,9 +1841,21 @@ impl App {
         if drag_seq != 0 {
             self.last_presented_seq = Some(drag_seq);
         }
-        if !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq) {
+        // TEMP (lab, PRESENT_VSR_SETTLE): the shown frame has stood still long
+        // enough and was not refined yet - present it once more, refining.
+        let refining = !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq)
+            && incoming_seq.is_some()
+            && self.lab_settle.refined_seq != incoming_seq
+            && lab_present_settle().is_some_and(|settle| {
+                self.lab_settle.fresh_at.is_some_and(|at| at.elapsed() >= settle)
+            });
+        if !refining && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq) {
             self.loop_census.draws_stale += 1;
             return;
+        }
+        if refining {
+            LAB_REFINE_PRESENT.store(true, Ordering::Release);
+            self.lab_settle.refined_seq = incoming_seq;
         }
         self.loop_census.draws_fresh += 1;
         let lab_t0 = std::time::Instant::now(); // TEMP (lab)
@@ -1835,6 +1881,9 @@ impl App {
                 // lifetime cap and a rail that recovers eight times is left dark
                 // after the third. See [`presenter_rebuild_budget`].
                 self.presenter_rebuilds = 0;
+                if !refining {
+                    self.lab_settle.fresh_at = Some(std::time::Instant::now());
+                }
                 self.last_presented_seq = incoming_seq;
                 if let Some(seq) = incoming_seq {
                     self.last_presented_atomic.store(seq, Ordering::Release);
