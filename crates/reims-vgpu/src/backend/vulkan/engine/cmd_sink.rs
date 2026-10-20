@@ -317,6 +317,10 @@ const MAX_LANES: usize = 4;
 /// the submit order, which the queue owner keeps ([`Gate`]).
 static LANES: [Lane; MAX_LANES] = [const { Lane::new() }; MAX_LANES];
 static LOADERS: OnceLock<LoadersCell> = OnceLock::new();
+/// The loaders the lanes replay with now: the first context's, until a
+/// device recreate binds the new device's (see [`rebind`]). Read once per list.
+static CURRENT: parking_lot::RwLock<Option<std::sync::Arc<LoadersCell>>> =
+    parking_lot::RwLock::new(None);
 /// Lanes running (0 until the first [`activate`]).
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
 
@@ -636,11 +640,46 @@ pub(crate) fn activate(ctx: &super::context::DeviceContext) -> ActiveGuard {
         RUNNING.store(n, Ordering::Release);
         cell
     });
+    rebind(ctx);
     if ACTIVE.with(Cell::get) {
         return ActiveGuard(false);
     }
     ACTIVE.with(|a| a.set(true));
     ActiveGuard(true)
+}
+
+/// Bind the lanes to `ctx`'s device when it is not the one they replay with.
+///
+/// Both lane statics outlived the device they were set for. The loaders were
+/// cloned once, so after a device recreate the lanes replayed the new device's
+/// command buffers through the old device's dispatch (invalid, and wrong under
+/// a layer that keys its tables by device). And the failure latch was never
+/// cleared, so one failed reset/begin/end refused every gated submission
+/// forever: the new device's work too, each refusal a device loss, each
+/// recreate undone by the next submission - no guest GPU work until QEMU
+/// restarted. A new device has new command buffers; what failed on the old one
+/// says nothing about them.
+fn rebind(ctx: &super::context::DeviceContext) {
+    use ash::vk::Handle;
+    let want = ctx.device.handle().as_raw();
+    let bound = CURRENT.read().as_ref().map(|c| c.0.device.handle().as_raw());
+    if bound == Some(want) {
+        return;
+    }
+    // Everything handed over for the old device replays through its loaders.
+    sync();
+    *CURRENT.write() = Some(std::sync::Arc::new(LoadersCell(Loaders {
+        device: ctx.device.clone(),
+        push: ctx.push_descriptor.clone(),
+        eds: ctx.extended_dynamic_state.clone(),
+        eds3: ctx.extended_dynamic_state3.clone(),
+    })));
+    if bound.is_some() {
+        let cleared = LANE_FAILURE.lock().take();
+        crate::observe::off(format!(
+            "vk_rec_lane_rebound device={want:#x} cleared_failure={cleared:?}"
+        ));
+    }
 }
 
 /// TEMP (lab, REC_LANE_END): [`activate`] for a caller that ends a command
@@ -791,7 +830,6 @@ pub(crate) fn sync() {
 fn lane_main(index: usize) {
     super::recorder::apply_thread_priority(super::recorder::current_thread_priority());
     let lane = &LANES[index];
-    let loaders = &LOADERS.get().expect("loaders before the lane").0;
     let mut taken = 0u64;
     let mut spent: Option<List> = None;
     let mut busy = Duration::ZERO;
@@ -840,9 +878,10 @@ fn lane_main(index: usize) {
         };
         taken += 1;
         let started = Instant::now();
+        let loaders = CURRENT.read().clone().expect("loaders before the lane");
         // SAFETY: each command is the `ash` call the recorder would have made,
         // with the same handles, on the command buffer it named.
-        unsafe { replay(loaders, &mut list) };
+        unsafe { replay(&loaders.0, &mut list) };
         busy += started.elapsed();
         lists += 1;
         if busy >= Duration::from_millis(2) {

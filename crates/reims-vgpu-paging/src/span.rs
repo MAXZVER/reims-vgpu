@@ -216,6 +216,10 @@ pub fn span_chunks(
     Ok(out)
 }
 
+/// The most page entries [`span_page_bases`] reserves before the walk (a 5K
+/// framebuffer is ~10 800 pages).
+const SPAN_RESERVE_PAGES: u64 = 1 << 16;
+
 /// The page-aligned GPA of every guest page under `[gva, gva+span)`, in order,
 /// refusing the whole span if any page does not resolve.
 ///
@@ -234,7 +238,12 @@ pub fn span_page_bases(
     gva: u64,
     span: u64,
 ) -> Result<Vec<u64>, SpanRefusal> {
-    let mut out = Vec::with_capacity(pages_spanned(gva, span, geometry.page_size()) as usize);
+    // Reserved up to a bound only: `span` is a guest-declared length, and a
+    // reservation sized by it aborts the process when it fails, before the walk
+    // has refused the first unmapped page. Longer spans grow as pages resolve.
+    let mut out = Vec::with_capacity(
+        pages_spanned(gva, span, geometry.page_size()).min(SPAN_RESERVE_PAGES) as usize,
+    );
     let mut refused = None;
     walk_span(mem, geometry, task, gva, span, &mut |_, r| match r {
         Ok(page_base) => {

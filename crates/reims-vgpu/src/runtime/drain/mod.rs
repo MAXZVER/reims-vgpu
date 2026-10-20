@@ -4765,7 +4765,10 @@ fn read_ring_bytes_inner<M: HostMemory>(
     absolute: u32,
     len: u32,
 ) -> Result<Vec<u8>, MemError> {
-    let mut out = vec![0u8; len as usize];
+    // `len` is a guest packet's `total_size`; the root ring's size is a guest
+    // register (up to 4 GiB). A refused allocation reads as an overflow, like a
+    // length the ring cannot hold, instead of aborting the process.
+    let mut out = crate::runtime::draw::guest_zeroed(len as usize).ok_or(MemError::Overflow)?;
     if ring_size == 0 || len == 0 {
         return Ok(out);
     }
@@ -6894,7 +6897,12 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
         );
     };
 
-    let mut src = vec![0u8; need_host];
+    let Some(mut src) = crate::runtime::draw::guest_zeroed(need_host) else {
+        return cursor_glyph_fail(
+            "cursor_glyph_alloc",
+            format!("cursor_glyph_fail reason=cursor_glyph_alloc need={need} (host_commit)"),
+        );
+    };
     if crate::runtime::gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,

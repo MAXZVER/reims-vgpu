@@ -357,6 +357,26 @@ pub fn host_alloc_len(bytes: u64) -> Option<usize> {
         .filter(|&n| n <= isize::MAX as usize)
 }
 
+/// A zeroed buffer of `len` bytes for guest content, or `None` when the host
+/// cannot commit it.
+///
+/// `len` passed [`host_alloc_len`], which bounds it by the largest guest any
+/// host runs - not by what this host can commit now. `vec![0u8; len]` aborts
+/// the process when the allocation fails, so a torn record whose length lands
+/// between free commit and that bound (a 24 GiB guest's stale 30 GiB length on a
+/// 64 GiB host) killed QEMU the way `host_alloc_len` exists to prevent. Here
+/// the same record is skipped with the caller's line, like a refused length.
+#[track_caller]
+pub fn guest_zeroed(len: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    if v.try_reserve_exact(len).is_err() {
+        note_host_alloc_refused(len as u64, std::panic::Location::caller());
+        return None;
+    }
+    v.resize(len, 0);
+    Some(v)
+}
+
 #[cold]
 fn note_host_alloc_refused(bytes: u64, at: &'static std::panic::Location<'static>) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -366,7 +386,7 @@ fn note_host_alloc_refused(bytes: u64, at: &'static std::panic::Location<'static
     if n <= 32 || n.is_power_of_two() {
         crate::observe::fail(format!(
             "host_alloc_refused n={n} bytes={bytes:#x} max={GUEST_OBJECT_MAX_BYTES:#x} at={}:{} \
-             (a guest length above any guest object - a torn or stale record; skipped, not allocated)",
+             (a guest length above any guest object or past host commit - a torn or stale record;              skipped, not allocated)",
             at.file(),
             at.line()
         ));

@@ -1470,8 +1470,34 @@ fn translate_air_raw(air: &[u8], stage: Stage) -> M2vResult<disk::Raw> {
     // Reflected translate: byte-identical SPIR-V PLUS the stage-interface facade.
     // `reflection.datalayout` carries the source `target datalayout` the sanitizer
     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
-    metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
-        .map_err(|e| translate_decline(stage, e.to_string()))
+    contain_translator_panic(stage, || {
+        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
+            .map_err(|e| translate_decline(stage, e.to_string()))
+    })
+}
+
+/// Run one translator call with its panics turned into this stage's typed
+/// refusal.
+///
+/// The translator parses guest AIR, so a shader it cannot handle can make it
+/// panic. On the async worker that unwound the worker away with the shader's
+/// entry still `Loading` and `async_worker_running` still set: no worker was
+/// ever started again, every later queued shader stayed `Loading`, and the
+/// pre-scan that re-polls until its pipeline is ready held its guest packet at
+/// the channel head forever. On the drain it unwound to the FFI boundary, and
+/// every later drain retried the same packet into the same panic. A refusal
+/// instead resolves the ask (`Entry::Failed`) and costs one draw.
+fn contain_translator_panic<T>(
+    stage: Stage,
+    call: impl FnOnce() -> M2vResult<T>,
+) -> M2vResult<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(result) => result,
+        Err(payload) => Err(translate_decline(
+            stage,
+            format!("translator_panic {}", crate::observe::panic::payload_text(&*payload)),
+        )),
+    }
 }
 
 fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedShader> {
@@ -1503,14 +1529,16 @@ fn translate_kernel_air_raw(air: &[u8], local_size: [u32; 3]) -> M2vResult<disk:
         kernel_local_size: local_size,
         ..Default::default()
     };
-    metal2vulkan::translate_reflected_with_options(
-        path.to_str().unwrap_or("k.air"),
-        Stage::Kernel,
-        &tmp,
-        opts,
-    )
-    .map_err(|e| M2vCacheDecline::KernelTranslate {
-        detail: e.to_string(),
+    contain_translator_panic(Stage::Kernel, || {
+        metal2vulkan::translate_reflected_with_options(
+            path.to_str().unwrap_or("k.air"),
+            Stage::Kernel,
+            &tmp,
+            opts,
+        )
+        .map_err(|e| M2vCacheDecline::KernelTranslate {
+            detail: e.to_string(),
+        })
     })
 }
 
@@ -1711,10 +1739,25 @@ fn ensure_cached_async_keyed(
         }
     }
     if start_worker {
-        std::thread::spawn(async_worker);
+        // The translator recurses over the guest's AIR; a stack overflow is not a
+        // panic `contain_translator_panic` can catch, so give it room rather than
+        // the default 2 MiB.
+        let spawned = std::thread::Builder::new()
+            .name("reims-m2v-async".into())
+            .stack_size(TRANSLATOR_STACK_BYTES)
+            .spawn(async_worker);
+        if spawned.is_err() {
+            // No worker: the queued shaders would wait for one forever.
+            global().lock().unwrap_or_else(|e| e.into_inner()).async_worker_running = false;
+            crate::observe::fail("linux_m2v_async reason=worker_spawn_failed".to_string());
+        }
     }
     false
 }
+
+/// Stack for the async translation worker (see the spawn in
+/// [`ensure_cached_async_keyed`]).
+const TRANSLATOR_STACK_BYTES: usize = 64 << 20;
 
 fn async_worker() {
     loop {

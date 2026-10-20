@@ -1069,7 +1069,12 @@ fn load_command_streams<M: HostMemory + HostOps>(
             ));
             continue;
         };
-        let mut stream = vec![0u8; stream_len];
+        let Some(mut stream) = crate::runtime::draw::guest_zeroed(stream_len) else {
+            crate::observe::fail(format!(
+                "exec_cmdbuf skip task={task_id} i={i} gva={gva:#x} len={length} (host_commit)"
+            ));
+            continue;
+        };
         // Product x86 uses page_shift=12; the unshifted helper defaults to arm14
         // and silently fails every stream load on Ventura/Tahoe x86.
         if gva_mem::read_task_gva_by_id(host, &state.tasks, task_id, gva, &mut stream, page_shift)

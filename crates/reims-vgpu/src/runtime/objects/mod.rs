@@ -1607,7 +1607,7 @@ pub fn read_descriptor<M: HostMemory>(
     // Guest descriptor_length is authoritative — no product 4 KiB read clamp.
     let len =
         crate::runtime::draw::host_alloc_len(entry.descriptor_length as u64).filter(|&n| n > 0)?;
-    let mut buf = vec![0u8; len];
+    let mut buf = crate::runtime::draw::guest_zeroed(len)?;
     gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
@@ -4305,9 +4305,12 @@ fn apply_backing<M: HostMemory>(
     // not.
     let backing_base_gva = (surf.backing_pfn as u64) << page_shift;
     let page_count = ((surf.length.saturating_sub(1)) / page_size) + 1;
-    // No host MiB budget: page count follows guest `surf.length` only.
-    // Fail if zero or not host-addressable as a page-entry vector.
-    if page_count == 0 || crate::runtime::draw::host_alloc_len(page_count).is_none() {
+    // No host MiB budget: page count follows guest `surf.length` only. The bound
+    // is on the length in bytes - no guest object outgrows guest RAM - not on the
+    // page count, which `host_alloc_len` would read as bytes and so admit 4096x
+    // the largest object (a torn 2^47-byte length reserved 2^35 page entries
+    // and aborted the process on the allocation below).
+    if page_count == 0 || crate::runtime::draw::host_alloc_len(surf.length).is_none() {
         defer_backing_fail(
             surface_id,
             "page_count_oob",

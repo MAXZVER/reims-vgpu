@@ -308,7 +308,7 @@ fn load_level_tight_native<M: HostMemory + HostOps>(
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return Err(MipmapStatus::IncompleteLayout);
     }
-    let mut out = vec![0u8; need];
+    let mut out = crate::runtime::draw::guest_zeroed(need).ok_or(MipmapStatus::Capacity)?;
     let mut row = vec![0u8; tight_row as usize];
     for y in 0..h {
         let Some(row_gva) = gva.checked_add((y as u64).saturating_mul(bpr)) else {

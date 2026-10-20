@@ -3457,6 +3457,22 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
             Some(v) => v,
             None => return br(BlitFailure::Bounds, "t2t_dst_gva_overflow"),
         };
+        // The region is inside the texel grid (t2t_extent_oob above), but the
+        // bytes it lands on follow the guest's row stride and image size, which
+        // the descriptor states apart from its allocation: the same last-byte
+        // bound buffer-to-texture applies, so a stride past the allocation
+        // cannot carry the copy into the pages after it.
+        let dst_last = dst_off
+            .checked_add((copy_d - 1).saturating_mul(dst_bpi))
+            .and_then(|v| v.checked_add((copy_h - 1).saturating_mul(dl.row_stride)))
+            .and_then(|v| v.checked_add(row_bytes));
+        match dst_last {
+            None => return br(BlitFailure::Bounds, "t2t_dst_span_overflow"),
+            Some(last) if dl.alloc_size != 0 && last > dl.alloc_size => {
+                return br(BlitFailure::Bounds, "t2t_dst_alloc_oob");
+            }
+            Some(_) => {}
+        }
         // Exact identity self-copy is a no-op: source and destination name the
         // same guest bytes with the same layout, so every row reads and writes
         // the same address — the destination already holds the source content.

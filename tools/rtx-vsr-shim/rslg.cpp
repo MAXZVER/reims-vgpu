@@ -48,7 +48,10 @@ RSLG_API int rslg_init(const wchar_t* plugin_dir, const wchar_t* log_dir, int ve
     pref.pathsToPlugins = paths;
     pref.numPathsToPlugins = 1;
     pref.pathToLogsAndData = log_dir;
-    pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eDisableDebugText;
+    // rslg_tag tags per frame (slSetTagForFrame), which SL refuses with eErrorInvalidIntegration unless
+    // eUseFrameBasedResourceTagging is set here (b920c: every tag refused, DLSS-G never started).
+    pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eDisableDebugText |
+                 sl::PreferenceFlags::eUseFrameBasedResourceTagging;
     pref.featuresToLoad = features;
     pref.numFeaturesToLoad = 3;
     pref.engine = sl::EngineType::eCustom;
