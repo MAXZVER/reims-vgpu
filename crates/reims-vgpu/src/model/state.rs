@@ -4289,6 +4289,11 @@ impl DeviceState {
         // Same rule for the presented-seq witness: a recycled id must not
         // compare its first present against a predecessor's seq.
         self.present.presented_dense_seq.remove(&mapping_id);
+        // Same rule for the write class: a recycled id must not inherit its
+        // predecessor's Composite/ClearOnly, because the scanout path latches
+        // `early_front_mapping` on a Composite reading and a fresh, only-cleared
+        // surface would become the sticky early front of the old one.
+        self.surface_write_kind.remove(&mapping_id);
     }
 
     /// Last write class for present keep-prior decisions.
@@ -8702,5 +8707,24 @@ mod sampled_generation_tests {
         assert_eq!(state.retired_linear_residents, vec![other_ref]);
         assert!(state.compute_storage_residency.contains_key(&other_task));
         assert!(state.compute_storage_residency.contains_key(&window));
+    }
+
+    /// A recycled mapping id must not inherit its predecessor's write class:
+    /// the scanout path latches `early_front_mapping` on a Composite reading,
+    /// so a stale Composite would make a fresh, only-cleared surface the old
+    /// one's sticky early front.
+    #[test]
+    fn a_forgotten_mapping_leaves_no_write_class_behind() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.note_surface_composite(9);
+        assert_eq!(state.surface_write_kind(9), SurfaceWriteKind::Composite);
+        // Condemn forgets the mapping; the prune runs before the early return
+        // that would leave an unmapped id's table entries standing.
+        state.condemn_surface_backing(9);
+        assert_eq!(
+            state.surface_write_kind(9),
+            SurfaceWriteKind::Unknown,
+            "the write class left with the mapping"
+        );
     }
 }
