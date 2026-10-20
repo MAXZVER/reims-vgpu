@@ -64,8 +64,10 @@ pub(crate) struct PresentFg {
     next: usize,
     /// Whether the other input holds the previous guest frame.
     have_prev: bool,
-    /// The guest frame sequence last copied (a re-present of it copies nothing).
+    /// The guest frame sequence (and image) last copied (a re-present of it
+    /// copies nothing).
     last_seq: u64,
+    last_image: vk::Image,
     /// The input pair (previous, current) the last flow ran on, for the warp,
     /// and the guest frame sequence of its current half.
     pair: Option<(usize, usize)>,
@@ -146,6 +148,7 @@ impl PresentFg {
             next: 0,
             have_prev: false,
             last_seq: 0,
+            last_image: vk::Image::null(),
             pair: None,
             pair_seq: 0,
             gfx_pool: vk::CommandPool::null(),
@@ -391,7 +394,7 @@ impl PresentFg {
         seq: u64,
         want_mid: bool,
     ) -> Result<Option<vk::Semaphore>, vk::Result> {
-        if seq == self.last_seq {
+        if seq == self.last_seq && src == self.last_image {
             // A re-present of the frame already copied: no new pair.
             return Ok(None);
         }
@@ -495,6 +498,7 @@ impl PresentFg {
             )?,
         }
         self.last_seq = seq;
+        self.last_image = src;
         self.next = prev;
         let had_prev = self.have_prev;
         self.have_prev = true;

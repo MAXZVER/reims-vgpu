@@ -1544,7 +1544,10 @@ impl WindowPresenter {
                 {
                     if !self.fg_failed && self.fg.as_ref().is_none_or(|fg| !fg.matches(base_width, base_height)) {
                         if let Some(mut old) = self.fg.take() {
-                            let _ = ctx.queue_wait_idle();
+                            // The whole device: the optical-flow queue may still be
+                            // writing the old flow images (a queue idle covers only
+                            // the graphics queue).
+                            let _ = ctx.device.device_wait_idle();
                             old.destroy(ctx);
                         }
                         let memory_type = |bits, bytes, _host| {
@@ -1744,7 +1747,8 @@ impl WindowPresenter {
                 let (w, h) = (self.extent.width, self.extent.height);
                 if self.dlssg.as_ref().is_none_or(|d| !d.matches(w, h)) {
                     if let Some(mut old) = self.dlssg.take() {
-                        let _ = ctx.queue_wait_idle();
+                        // Streamline works on queues of its own.
+                        let _ = ctx.device.device_wait_idle();
                         old.destroy(&ctx.device);
                     }
                     let memory_type = |bits, bytes, _host| {
@@ -2197,6 +2201,11 @@ impl WindowPresenter {
         }
         if let Some(mut sharp) = self.sharp.take() {
             sharp.destroy(&ctx.device);
+        }
+        // TEMP (lab): FG's optical-flow queue and Streamline's own queues are
+        // not covered by the queue idle above.
+        if self.fg.is_some() || self.dlssg.is_some() {
+            let _ = ctx.device.device_wait_idle();
         }
         if let Some(mut fg) = self.fg.take() {
             fg.destroy(ctx);

@@ -203,8 +203,10 @@ pub(crate) struct TileRefine {
     created_at: Instant,
     /// The stamp at which each cell's refine was recorded (0: none pending).
     scheduled: Vec<u32>,
-    /// The guest frame sequence the cells were last compared against.
-    diffed_seq: Option<u64>,
+    /// The guest frame sequence the cells were last compared against, and
+    /// when that comparison was recorded.
+    diffed_seq: Option<(u64, vk::Image)>,
+    diffed_at: Option<Instant>,
     /// A VSR evaluate refused: no more refines (the diff and overlay go on,
     /// so the cells already refined stay correct until they change).
     failed: bool,
@@ -266,6 +268,7 @@ impl TileRefine {
             created_at: Instant::now(),
             scheduled: vec![0; count],
             diffed_seq: None,
+            diffed_at: None,
             failed: false,
             rects: 0,
             cells_refined: 0,
@@ -531,12 +534,16 @@ impl TileRefine {
     ) {
         // The same guest frame again (a generated or refine present): nothing
         // can have changed since its own comparison.
-        if seq.is_some() && seq == self.diffed_seq {
+        // (The image too: a sequence restarted with a new window link must not
+        // match an old frame.)
+        let key = seq.map(|s| (s, frame.image));
+        if key.is_some() && key == self.diffed_seq {
             return;
         }
-        self.diffed_seq = seq;
+        self.diffed_seq = key;
         self.stamp = self.stamp.wrapping_add(1).max(1);
         let now = Instant::now();
+        self.diffed_at = Some(now);
         self.stamps.push_back((self.stamp, now));
         while self.stamps.len() > 2048 {
             self.stamps.pop_front();
@@ -574,9 +581,12 @@ impl TileRefine {
                 vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
             ),
         ];
+        // ALL_COMMANDS: the previous present's VSR (NGX, its own stages) read
+        // prev, its overlay (fragment) read the cells, its fills (transfer)
+        // wrote them.
         device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
             vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             &memory,
@@ -916,6 +926,16 @@ impl TileRefine {
         if self.failed {
             return None;
         }
+        // The host reads the cells a present or two behind the GPU: the cells a
+        // comparison just changed may still read as refined here and get no
+        // deadline, and with the screen still afterwards no present would come
+        // to see them (they stayed soft). One look a settle time after the last
+        // comparison sees them as they are.
+        let recheck = self.diffed_at.map(|at| at + settle + Duration::from_millis(30)).filter(|&at| at > now);
+        let next_due = match (next_due, recheck) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         if left_over {
             // More is ready: the next present, about a monitor period on (a
             // mailbox swapchain would otherwise take presents as fast as asked).

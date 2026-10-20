@@ -663,7 +663,8 @@ fn lab_fixed_window_value() -> Option<Option<(u32, u32)>> {
             "1" | "on" => Some(None),
             s => {
                 let (w, h) = s.split_once('x')?;
-                Some(Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+                let (w, h): (u32, u32) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+                (w > 0 && h > 0).then_some(Some((w, h)))
             }
         }
     })
@@ -1461,10 +1462,13 @@ impl ApplicationHandler<FramePublished> for App {
             let now = std::time::Instant::now();
             let pending = std::mem::take(&mut self.frame_pending);
             // TEMP (lab, PRESENT_FG): the next interpolated present is a deadline of its own.
-            let owed_at = self.lab_fg.next_at;
+            // Not while a guest resize holds every draw (they would be asked
+            // for every tick until it settles).
+            let held = self.pending_guest_resize.is_some();
+            let owed_at = self.lab_fg.next_at.filter(|_| !held);
             let owed_due = owed_at.is_some_and(|at| now >= at);
             // TEMP (lab, PRESENT_VSR_TILES): so is the next refine.
-            let tiles_at = lab_tiles_due();
+            let tiles_at = lab_tiles_due().filter(|_| !held);
             let tiles_now = tiles_at.is_some_and(|at| now >= at);
             if redraw_due(pending || owed_due || tiles_now, now, self.next_backstop) {
                 window.request_redraw();
@@ -2061,10 +2065,11 @@ impl App {
         });
         // TEMP (lab, PRESENT_VSR_TILES): still cells are waiting for a present
         // to be refined in.
-        let tiles_due = !fg_owed
-            && incoming_seq.is_some()
-            && lab_tiles_due().is_some_and(|at| std::time::Instant::now() >= at);
-        if tiles_due {
+        let tiles_came_due = lab_tiles_due().is_some_and(|at| std::time::Instant::now() >= at);
+        let tiles_due = !fg_owed && incoming_seq.is_some() && tiles_came_due;
+        // With no frame there is nothing to refine: a deadline left standing
+        // would keep the loop asking for redraws every tick.
+        if tiles_due || (tiles_came_due && incoming_seq.is_none()) {
             LAB_TILES_DUE_US.store(0, Ordering::Release);
         }
         // A new frame presents anyway (and keeps its midpoint); only a still
