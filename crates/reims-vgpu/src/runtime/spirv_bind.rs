@@ -354,6 +354,14 @@ pub enum ImageFormatSpecializeError {
         pointer: u32,
         declared: u32,
     },
+    /// A retyped variable's image value reached an instruction the retype pass
+    /// does not repair (see [`refuse_unrepaired_image_consumers`]). The same
+    /// survival argument as `LoadTypeMismatch`: the module this device would
+    /// assemble is invalid on a host with no validator.
+    ImageValueEscapes {
+        value: u32,
+        opcode: u16,
+    },
 }
 
 impl crate::observe::Decline for ImageFormatSpecializeError {
@@ -367,6 +375,7 @@ impl crate::observe::Decline for ImageFormatSpecializeError {
             Self::MissingBinding(_) => "spirv_format_specialize_missing_binding",
             Self::AmbiguousBinding(_) => "spirv_format_specialize_ambiguous_binding",
             Self::LoadTypeMismatch { .. } => "spirv_format_specialize_load_type_mismatch",
+            Self::ImageValueEscapes { .. } => "spirv_format_specialize_image_value_escapes",
         }
     }
 
@@ -379,6 +388,10 @@ impl crate::observe::Decline for ImageFormatSpecializeError {
             Self::LoadTypeMismatch { pointer, declared } => vec![
                 ("pointer", pointer.to_string()),
                 ("declared", declared.to_string()),
+            ],
+            Self::ImageValueEscapes { value, opcode } => vec![
+                ("value", value.to_string()),
+                ("opcode", opcode.to_string()),
             ],
         }
     }
@@ -1693,6 +1706,7 @@ pub fn specialize_image_formats(
     // differently typed — and this pass is why the clone path is usable at all.
     retype_loads(words, &retyped);
     verify_load_types(words)?;
+    refuse_unrepaired_image_consumers(words, &retyped)?;
     for &(binding, format) in requested {
         if image_format(words, binding) != Some(format) {
             return Err(ImageFormatSpecializeError::MissingBinding(binding));
@@ -1724,6 +1738,89 @@ fn retype_loads(words: &mut [u32], retyped: &std::collections::BTreeMap<u32, u32
         }
         i += word_count;
     }
+}
+
+/// A retyped variable's image value may reach any instruction a module can
+/// take it to, but [`retype_loads`] repairs only the `OpLoad` itself. Every
+/// *other* consumer names the image's type in its own result type or an
+/// Image-Type operand — `OpSampledImage`, `OpPhi`, `OpSelect`, `OpCopyObject`,
+/// call arguments, a store into a function-local pointer — and would keep
+/// naming the old type after the retype, which is the invalid-module class
+/// [`ImageFormatSpecializeError::LoadTypeMismatch`] documents an NVIDIA
+/// compiler crashing on. The image ops that take the loaded object and declare
+/// no type of their own (`OpImageRead`, `OpImageWrite`,
+/// `OpImageTexelPointer`) are the whole legal consumer set; decoration and
+/// name records target the id without a typed opinion; anything else refuses
+/// the specialization, and the caller declines the dispatch by name.
+fn refuse_unrepaired_image_consumers(
+    words: &[u32],
+    retyped: &std::collections::BTreeMap<u32, u32>,
+) -> Result<(), ImageFormatSpecializeError> {
+    if retyped.is_empty() {
+        return Ok(());
+    }
+    // Pass 1: the image values this pass retyped — every OpLoad's result over
+    // a retyped variable.
+    let mut moved: std::collections::BTreeSet<u32> = Default::default();
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        if word_count == 0 || i + word_count > words.len() {
+            return Ok(());
+        }
+        if (words[i] & 0xffff) as u16 == OP_LOAD
+            && word_count >= 4
+            && retyped.contains_key(&words[i + 3])
+        {
+            moved.insert(words[i + 2]);
+        }
+        i += word_count;
+    }
+    if moved.is_empty() {
+        return Ok(());
+    }
+    // Pass 2: any appearance of a moved value outside the legal set refuses.
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        if word_count == 0 || i + word_count > words.len() {
+            return Ok(());
+        }
+        let opcode = (words[i] & 0xffff) as u16;
+        let names_or_decorates = matches!(
+            opcode,
+            OP_NAME
+                | OP_MEMBER_NAME
+                | OP_DECORATE
+                | OP_MEMBER_DECORATE
+                | OP_DECORATE_ID
+                | OP_DECORATE_STRING
+                | OP_MEMBER_DECORATE_STRING
+        );
+        if !matches!(opcode, OP_LOAD) && !names_or_decorates {
+            // The image operand's slot: 1 for OpImageWrite (no result), 3 for
+            // OpImageRead / OpImageTexelPointer (result type, result, image).
+            let legal_slot = match opcode {
+                OP_IMAGE_WRITE => Some(1),
+                OP_IMAGE_READ | OP_IMAGE_TEXEL_POINTER => Some(3),
+                _ => None,
+            };
+            for n in 1..word_count {
+                let at = i + n;
+                if legal_slot == Some(n) {
+                    continue;
+                }
+                if moved.contains(&words[at]) {
+                    return Err(ImageFormatSpecializeError::ImageValueEscapes {
+                        value: words[at],
+                        opcode,
+                    });
+                }
+            }
+        }
+        i += word_count;
+    }
+    Ok(())
 }
 
 /// Refuse a module whose loads and pointees disagree.
@@ -4282,6 +4379,66 @@ pub fn log_folded_function_constants(reflection: &ShaderReflection) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The image ops take the loaded object and declare no type of their own;
+    /// every other consumer of a retyped image value would name the old type
+    /// after the retype, so the specialization refuses it by name instead of
+    /// handing the driver an invalid module.
+    #[test]
+    fn a_retyped_image_value_refuses_any_consumer_but_the_image_ops() {
+        let retyped = std::collections::BTreeMap::from([(1u32, 8u32)]);
+        // 5-word header; %2 = OpLoad %8 %1 (a retyped variable's image value).
+        let header: [u32; 5] = [0x0723_0203, 0, 0, 16, 0];
+        let load: [u32; 4] = [(4 << 16) | u32::from(OP_LOAD), 8, 2, 1];
+        let read: [u32; 5] = [(5 << 16) | u32::from(OP_IMAGE_READ), 9, 3, 2, 5];
+        let write: [u32; 4] = [(4 << 16) | u32::from(OP_IMAGE_WRITE), 2, 5, 6];
+        let ok: Vec<u32> = header
+            .iter()
+            .chain(load)
+            .chain(read)
+            .chain(write)
+            .copied()
+            .collect();
+        assert!(refuse_unrepaired_image_consumers(&ok, &retyped).is_ok());
+
+        // OpSampledImage (87) names the image's type in its own Image-Type
+        // operand - the exact consumer the retype pass cannot follow.
+        let sampled: [u32; 6] = [(6 << 16) | 87, 9, 3, 8, 2, 4];
+        let escapes: Vec<u32> = header
+            .iter()
+            .chain(load)
+            .chain(sampled)
+            .copied()
+            .collect();
+        assert_eq!(
+            refuse_unrepaired_image_consumers(&escapes, &retyped),
+            Err(ImageFormatSpecializeError::ImageValueEscapes {
+                value: 2,
+                opcode: 87
+            })
+        );
+
+        // A copy under another id is just as typed as the phi and the select
+        // it feeds.
+        let copy: [u32; 4] = [(4 << 16) | u32::from(OP_COPY_OBJECT), 9, 3, 2];
+        let copied: Vec<u32> = header
+            .iter()
+            .chain(load)
+            .chain(copy)
+            .copied()
+            .collect();
+        assert!(refuse_unrepaired_image_consumers(&copied, &retyped).is_err());
+
+        // A decoration on the moved value carries no typed opinion.
+        let decorate: [u32; 3] = [(3 << 16) | u32::from(OP_DECORATE), 2, 0];
+        let named: Vec<u32> = header
+            .iter()
+            .chain(load)
+            .chain(decorate)
+            .copied()
+            .collect();
+        assert!(refuse_unrepaired_image_consumers(&named, &retyped).is_ok());
+    }
 
     /// The product walk names only separate samplers; the test oracle names both
     /// kinds. A combined image-sampler handed a sampler object would be a
