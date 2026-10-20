@@ -86,16 +86,19 @@ int main(int argc, char** argv) {
         // A pattern that moves 8 px per frame: stripes and a block, enough texture for the flow to track.
         std::vector<uint32_t> host(size_t(pitch / 4) * s.h);
         std::vector<double> ms;
-        for (int f = 0; f < iters + 5; f++) {
+        for (int f = 0; f < 3; f++) {
             for (uint32_t y = 0; y < s.h; y++)
                 for (uint32_t x = 0; x < s.w; x++) {
                     uint32_t xx = x + f * 8;
                     bool block = (xx / 200) % 2 == (y / 200) % 2;
                     host[size_t(y) * (pitch / 4) + x] = block ? 0xff3060a0u : (0xff000000u | ((xx * 7) & 0xff) << 8);
                 }
+            cuMemcpyHtoD(buf[f], host.data(), pitch * s.h);
+        }
+        cuCtxSynchronize();
+        auto loop0 = std::chrono::steady_clock::now();
+        for (int f = 0; f < iters + 5; f++) {
             CUdeviceptr* in = &buf[f % 3];
-            cuMemcpyHtoD(*in, host.data(), pitch * s.h);
-            cuCtxSynchronize();
             bool repeated = false;
             NvOFFRUC_PROCESS_IN_PARAMS ip{};
             ip.stFrameDataInput.pFrame = in;
@@ -117,6 +120,8 @@ int main(int argc, char** argv) {
             }
             if (f >= 5) ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
         }
+        double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loop0).count();
+        std::printf("  %ux%u: %d frames in %.0f ms = %.2f ms/frame throughput\n", s.w, s.h, iters + 5, total, total / (iters + 5));
         destroy(h);
         if (ms.empty()) continue;
         std::sort(ms.begin(), ms.end());
