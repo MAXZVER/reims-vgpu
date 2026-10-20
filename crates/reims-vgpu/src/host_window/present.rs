@@ -2004,12 +2004,12 @@ impl App {
             phase
         };
         self.lab_fg.shown = Some((seq, phase));
-        self.lab_fg.next_at = match (phase != LAB_FG_PHASE_REAL, self.lab_fg.cur, self.lab_fg.interval) {
-            (true, Some((_, at)), Some(interval)) => {
+        // The next tick of the monitor's grid; the phase there may already be
+        // the frame itself.
+        self.lab_fg.next_at = match (phase != LAB_FG_PHASE_REAL, self.lab_fg.interval) {
+            (true, Some(_)) => {
                 let period = self.lab_fg.monitor_period.unwrap_or(std::time::Duration::from_micros(8333));
-                // The present where the motion reaches the frame itself.
-                let real_at = at + interval.mul_f64(lab_fg_delay());
-                Some((now + period).min(real_at.max(now)))
+                Some(now + period)
             }
             _ => None,
         };
@@ -2063,6 +2063,22 @@ impl App {
         // one is re-presented for the refine.
         let refining = refining
             || (tiles_due && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq));
+        // TEMP (lab, PRESENT_FG): while interpolating, presents keep to the
+        // monitor's grid - a new frame waits for the next tick instead of
+        // presenting at once, where it would show phase 0 (the frame before it,
+        // already on screen).
+        if !refining
+            && !fg_owed
+            && fg_plan.is_some_and(|(_, _, flow)| flow)
+            && needs_present(self.last_presented_seq, self.redraw_required, incoming_seq)
+        {
+            if self.lab_fg.next_at.is_none() {
+                let period = self.lab_fg.monitor_period.unwrap_or(std::time::Duration::from_micros(8333));
+                self.lab_fg.next_at = Some(std::time::Instant::now() + period);
+            }
+            self.loop_census.draws_stale += 1;
+            return;
+        }
         if !refining && !fg_owed && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq) {
             self.loop_census.draws_stale += 1;
             return;
