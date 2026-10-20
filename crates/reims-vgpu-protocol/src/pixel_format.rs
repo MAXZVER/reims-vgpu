@@ -2371,16 +2371,32 @@ pub fn solid_clear_image(
 ) -> Option<ClearImage> {
     let numeric = render_target_numeric_type(format)?;
     match numeric.clear_components(*clear) {
-        ClearComponents::Float(_) => {
-            let row_bytes = width.checked_mul(RGBA8_BPP)?;
-            let pixels = solid_rgba8(width, height, clear);
-            let need = (row_bytes as usize).checked_mul(height as usize)?;
-            (pixels.len() == need).then_some(ClearImage {
-                encoding: ClearImageEncoding::Rgba8,
-                pixels,
-                row_bytes,
-            })
-        }
+        ClearComponents::Float(components) => match format {
+            // A float target whose texel is four f32 words cannot carry the
+            // clear through the eight-bit carrier at all: every handoff to
+            // `Rgba8ToRow` refused (`for_format` has no arm), so a clear-only
+            // pass on the Chromium HDR intermediate 0x7d lost its whole result
+            // behind a generic writer refusal. The clear's own texel is exact
+            // and the native writers already publish it (the rail `RG16_UINT`
+            // built).
+            MTL_FORMAT_RGBA32_FLOAT => {
+                let mut texel = [0u8; RGBA32F_BPP as usize];
+                for (dst, &value) in texel.chunks_exact_mut(4).zip(components.iter()) {
+                    dst.copy_from_slice(&value.to_ne_bytes());
+                }
+                solid_native_clear_image(format, width, height, &texel)
+            }
+            _ => {
+                let row_bytes = width.checked_mul(RGBA8_BPP)?;
+                let pixels = solid_rgba8(width, height, clear);
+                let need = (row_bytes as usize).checked_mul(height as usize)?;
+                (pixels.len() == need).then_some(ClearImage {
+                    encoding: ClearImageEncoding::Rgba8,
+                    pixels,
+                    row_bytes,
+                })
+            }
+        },
         ClearComponents::Uint(components) => match format {
             MTL_FORMAT_RG16_UINT => {
                 let mut bytes = [0u8; RG16_BPP as usize];
@@ -3574,6 +3590,29 @@ pub fn convert_rgba8_to_row(format: u16, src_rgba: &[u8], pixels: u32, dst: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clear on the four-f32 target lands its own texels, not a refused
+    /// eight-bit carrier: the clear-only pass result *is* this image, and the
+    /// range (negative halves, values past 1) is the whole reason the target
+    /// exists.
+    #[test]
+    fn a_rgba32_float_clear_lands_its_own_texels() {
+        let clear = [0.25, -0.5, 1.5, 1.0];
+        let img =
+            solid_clear_image(MTL_FORMAT_RGBA32_FLOAT, 3, 2, &clear).expect("the native clear");
+        assert_eq!(img.encoding(), ClearImageEncoding::Native);
+        assert_eq!(img.row_bytes(), 3 * RGBA32F_BPP);
+        assert_eq!(img.pixels().len(), (3 * 2 * RGBA32F_BPP) as usize);
+        for texel in img.pixels().chunks_exact(RGBA32F_BPP as usize) {
+            let word = |i: usize| {
+                f32::from_ne_bytes([texel[i * 4], texel[i * 4 + 1], texel[i * 4 + 2], texel[i * 4 + 3]])
+            };
+            assert_eq!(word(0), 0.25);
+            assert_eq!(word(1), -0.5, "the negative half survives");
+            assert_eq!(word(2), 1.5, "the past-one value survives");
+            assert_eq!(word(3), 1.0);
+        }
+    }
 
     /// [`TexelLayout::has_cpu_loader_arm`] answers for the loader it names.
     ///
