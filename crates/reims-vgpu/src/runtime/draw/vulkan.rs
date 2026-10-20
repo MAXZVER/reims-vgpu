@@ -269,6 +269,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // clock: `drain_duty`'s `draw_us` brackets exactly this function, and the
     // whole reading is that the phases sum to it.
     let _phase = crate::runtime::chain_phase::ChainTimer::start();
+    super::lab_index_census(state, host, req); // TEMP (lab)
     // The local copy is read for geometry, store actions and Store routing,
     // never for the seeds, and a seed is a whole attachment of pixels: Mission
     // Control's cleared MRT attachments made this clone ~7 % of the drain. The
