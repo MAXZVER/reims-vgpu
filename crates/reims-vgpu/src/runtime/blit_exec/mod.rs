@@ -4452,7 +4452,7 @@ pub fn execute_blit<M: HostMemory + HostOps>(
     });
     // TEMP (lab, Opus 2026-10-20): `REIMS_VGPU_LAB_T2T=N` also names every texture copy record outside
     // WindowServer with its outcome, whichever arm ran (b844: no staged copy reached the census).
-    if matches!(record, BlitRecord::TextureRegion(_) | BlitRecord::TextureSlices(_)) && task_id != 1 {
+    if !matches!(record, BlitRecord::GenerateMipmaps(_)) && task_id != 1 {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
