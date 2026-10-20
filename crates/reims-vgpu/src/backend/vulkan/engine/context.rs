@@ -812,6 +812,10 @@ pub(crate) struct DeviceContext {
     /// TEMP (lab, `REIMS_VGPU_LAB_GPU_BOOST`): `VK_NV_low_latency2` entry points,
     /// `Some` when the extension was enabled for the host window's swapchain.
     pub low_latency2: Option<ash::nv::low_latency2::Device>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_FG`): the optical-flow queue and entry points, `Some` when
+    /// frame generation is on and the device offers `VK_NV_optical_flow`. Only the host window's
+    /// thread submits to this queue.
+    pub optical_flow: Option<super::OpticalFlowQueue>,
     /// Queue family used for all engine submits (graphics draws + compute).
     pub gq: u32,
     /// True when `gq` supports both GRAPHICS and COMPUTE (required for engine compute).
@@ -1205,7 +1209,20 @@ impl DeviceContext {
         let compute_capable = plan.compute();
         let transfer_qf = plan.dedicated_transfer().map(|f| f.index);
         let prio = [1.0f32];
-        let qci = [vk::DeviceQueueCreateInfo::default()
+        // TEMP (lab, PRESENT_FG): the optical-flow-only family (`VK_NV_optical_flow`), asked for only
+        // when the present's frame generation is on.
+        #[cfg(feature = "host-window")]
+        let of_family = if super::present_fg::on() {
+            qfs.iter()
+                .position(|q| q.queue_flags.contains(vk::QueueFlags::OPTICAL_FLOW_NV))
+                .map(|i| i as u32)
+                .filter(|&i| i != gq)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "host-window"))]
+        let of_family: Option<u32> = None;
+        let mut qci = vec![vk::DeviceQueueCreateInfo::default()
             .queue_family_index(gq)
             .queue_priorities(&prio)];
         let device_extensions = instance
@@ -1355,6 +1372,18 @@ impl DeviceContext {
             }
         }
         crate::observe::off(format!("gpu_boost low_latency2={low_latency2}"));
+        // TEMP (lab, PRESENT_FG): `VK_NV_optical_flow` and its queue, where the device offers both.
+        let optical_flow = of_family.filter(|_| has_device_extension(ash::nv::optical_flow::NAME));
+        if let Some(family) = optical_flow {
+            enabled_device_extensions.push(ash::nv::optical_flow::NAME.as_ptr());
+            qci.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family)
+                    .queue_priorities(&prio),
+            );
+        }
+        let mut en_optical_flow = vk::PhysicalDeviceOpticalFlowFeaturesNV::default().optical_flow(true);
+        crate::observe::off(format!("present_fg optical_flow_family={optical_flow:?}"));
         // TEMP (lab, PRESENT_VSR): the device extensions NGX asks for, where advertised.
         #[cfg(feature = "host-window")]
         if super::present_vsr::quality().is_some() {
@@ -1438,6 +1467,9 @@ impl DeviceContext {
         if features.wants_extended_dynamic_state3() {
             dci = dci.push_next(&mut en_extended_dynamic_state3);
         }
+        if optical_flow.is_some() {
+            dci = dci.push_next(&mut en_optical_flow);
+        }
         let device = instance
             .create_device(pd, &dci, None)
             .map_err(|result| DrawError::Init(InitDecline::CreateDevice { result }))?;
@@ -1509,6 +1541,12 @@ impl DeviceContext {
             .ok()
             .flatten();
         let queue = device.get_device_queue(gq, 0);
+        let optical_flow = optical_flow.map(|family| super::OpticalFlowQueue {
+            family,
+            queue: device.get_device_queue(family, 0),
+            device: ash::nv::optical_flow::Device::new(&instance, &device),
+            instance: ash::nv::optical_flow::Instance::new(&entry, &instance),
+        });
         let queue_owner = match super::queue_owner::QueueOwner::start(&device, queue) {
             Ok(owner) => Some(owner),
             Err(error) => {
@@ -1671,6 +1709,7 @@ impl DeviceContext {
             extended_dynamic_state,
             extended_dynamic_state3,
             low_latency2,
+            optical_flow,
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,

@@ -1,0 +1,41 @@
+#version 450
+// TEMP (lab, REIMS_VGPU_LAB_PRESENT_FG): the frame halfway between two guest frames, from the hardware optical
+// flow between them (VK_NV_optical_flow, one vector per grid cell, S10.5 fixed point read as integers).
+//
+// `fwd` moves each pixel of `prev` to its place in `cur`; `bwd` moves each pixel of `cur` back to `prev`. The
+// midpoint samples `prev` half a backward vector away and `cur` half a forward vector away (both vectors read at
+// the midpoint pixel, which is exact for the translations scrolling and dragging make) and blends the two; where
+// the two samples disagree strongly (something appeared or vanished between the frames) the nearer frame wins.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D prev_frame;
+layout(binding = 1) uniform sampler2D cur_frame;
+layout(binding = 2) uniform isampler2D fwd;
+layout(binding = 3) uniform isampler2D bwd;
+layout(binding = 4, rgba8) uniform writeonly image2D mid;
+
+layout(push_constant) uniform Push {
+    ivec2 size;   // frame size in pixels
+    int grid;     // flow grid cell size in pixels
+    float phase;  // 0.5 = halfway
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.size.x || p.y >= pc.size.y) {
+        return;
+    }
+    ivec2 cell = p / pc.grid;
+    vec2 f = vec2(texelFetch(fwd, cell, 0).xy) / 32.0;
+    vec2 b = vec2(texelFetch(bwd, cell, 0).xy) / 32.0;
+    vec2 inv = 1.0 / vec2(pc.size);
+    vec2 here = vec2(p) + 0.5;
+    vec4 a = texture(prev_frame, (here + pc.phase * b) * inv);
+    vec4 c = texture(cur_frame, (here + (1.0 - pc.phase) * f) * inv);
+    // Forward-backward consistency: for a clean translation f + b is ~0.
+    float inconsistency = length(f + b);
+    vec4 blended = mix(a, c, pc.phase);
+    vec4 nearer = pc.phase < 0.5 ? a : c;
+    float w = smoothstep(2.0, 8.0, inconsistency);
+    imageStore(mid, p, mix(blended, nearer, w));
+}

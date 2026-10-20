@@ -574,6 +574,9 @@ pub(crate) struct WindowPresenter {
     /// being retried every frame.
     sharp: Option<super::present_sharp::PresentSharp>,
     sharp_failed: bool,
+    /// TEMP (lab, PRESENT_FG): frame generation for the scaled present.
+    fg: Option<super::present_fg::PresentFg>,
+    fg_failed: bool,
 }
 
 /// Everything one in-flight present owns for as long as its blit is running.
@@ -839,6 +842,8 @@ impl WindowPresenter {
             lab_restamp: None,
             sharp: None,
             sharp_failed: false,
+            fg: None,
+            fg_failed: false,
         };
         // A window created while minimized has no swapchain yet, which is not a
         // failure to attach: `begin_present` retries every frame until the
@@ -1307,6 +1312,8 @@ impl WindowPresenter {
 
         // TEMP (lab): whether this present carries a `REIMS_VGPU_LAB_PROBE` copy.
         let mut probe_armed = false;
+        // TEMP (lab, PRESENT_FG): the optical-flow work this frame's submission waits on.
+        let mut fg_wait: Option<vk::Semaphore> = None;
         let submit_result = (|| {
             ctx.device
                 .reset_fences(&[frame_in_flight])
@@ -1430,13 +1437,55 @@ impl WindowPresenter {
                         &[],
                     );
                 }
+                // TEMP (lab, PRESENT_FG): before this frame's read barrier is
+                // recorded, the guest frame is still in the layout the registry
+                // recorded - the copy into the flow inputs runs on that.
+                let fg_input = match (&blit, sharp_view.is_some() && super::present_fg::on()) {
+                    (BlitSource::Resident { image, access, .. }, true) => Some((*image, *access)),
+                    _ => None,
+                };
                 let src_layout = blit.record_read_barrier(&ctx.device, frame_cmd);
+                let mut fg_src: Option<super::present_fg::FgSource> = None;
+                if let (Some((image, access)), Some((seq, want_mid))) =
+                    (fg_input, fg_input.and_then(|_| crate::host_window::present::lab_take_fg_request()))
+                {
+                    if !self.fg_failed && self.fg.as_ref().is_none_or(|fg| !fg.matches(base_width, base_height)) {
+                        if let Some(mut old) = self.fg.take() {
+                            let _ = ctx.queue_wait_idle();
+                            old.destroy(ctx);
+                        }
+                        let memory_type = |bits, bytes, _host| {
+                            ctx.memory_type_for(bits, bytes, reims_vgpu_vulkan::memory::MemoryClass::DeviceLocal)
+                        };
+                        match super::present_fg::PresentFg::create(ctx, base_width, base_height, self.frames.len(), &memory_type) {
+                            Ok(fg) => self.fg = Some(fg),
+                            Err(e) => {
+                                self.fg_failed = true;
+                                crate::observe::fail(format!("present_fg_refused build={e:?} {base_width}x{base_height}"));
+                            }
+                        }
+                    }
+                    if let Some(fg) = self.fg.as_mut() {
+                        let (stage, acc) = access.source_scope();
+                        match fg.submit_flow(ctx, frame_ix, image, access.layout(), stage, acc, seq, want_mid) {
+                            Ok(Some(sem)) => {
+                                fg_src = fg.record_warp(&ctx.device, frame_cmd, frame_ix);
+                                fg_wait = Some(sem);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                self.fg_failed = true;
+                                crate::observe::fail(format!("present_fg_refused submit={e:?}"));
+                            }
+                        }
+                    }
+                }
                 let drew_sharp = match (sharp_view, self.sharp.as_mut()) {
                     (Some(view), Some(sharp)) => {
                         let src = super::present_sharp::SharpSource {
-                            image: blit.image(),
-                            view,
-                            layout: src_layout,
+                            image: fg_src.as_ref().map_or(blit.image(), |s| s.image),
+                            view: fg_src.as_ref().map_or(view, |s| s.view),
+                            layout: fg_src.as_ref().map_or(src_layout, |s| s.layout),
                             width: base_width,
                             height: base_height,
                         };
@@ -1584,8 +1633,12 @@ impl WindowPresenter {
             ctx.device.end_command_buffer(frame_cmd).map_err(|error| {
                 DrawError::VkCall(VkCall::new(VkOp::WindowEndCommandBuffer, error))
             })?;
-            let waits = [frame_image_available];
-            let wait_stages = [ACQUIRE_WAIT_STAGE];
+            let mut waits = vec![frame_image_available];
+            let mut wait_stages = vec![ACQUIRE_WAIT_STAGE];
+            if let Some(flowed) = fg_wait {
+                waits.push(flowed);
+                wait_stages.push(vk::PipelineStageFlags::COMPUTE_SHADER);
+            }
             let signals = [frame_render_finished];
             let commands = [frame_cmd];
             ctx.submit_present_transaction(super::context::PresentTransaction {
@@ -1997,6 +2050,9 @@ impl WindowPresenter {
         }
         if let Some(mut sharp) = self.sharp.take() {
             sharp.destroy(&ctx.device);
+        }
+        if let Some(mut fg) = self.fg.take() {
+            fg.destroy(ctx);
         }
         // Drained rather than iterated, so a second `destroy` — `create` calls
         // it on a failed `recreate_swapchain`, and the caller may call it again

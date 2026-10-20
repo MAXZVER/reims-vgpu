@@ -479,6 +479,34 @@ pub(crate) fn lab_take_refine_present() -> bool {
     LAB_REFINE_PRESENT.swap(false, Ordering::AcqRel)
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_FG=on`): frame generation - every new
+/// guest frame is first shown as the midpoint between it and the previous one
+/// (built by the rail from the hardware optical flow), and the frame itself half
+/// a frame interval later. Latched.
+pub(crate) fn lab_present_fg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("REIMS_VGPU_LAB_PRESENT_FG").as_deref(), Ok("on" | "1")))
+}
+
+/// TEMP (lab, PRESENT_FG): `seq << 1 | midpoint` of the present the window is
+/// about to make, 0 when none; taken by the rail.
+static LAB_FG_REQUEST: AtomicU64 = AtomicU64::new(0);
+
+/// TEMP (lab, PRESENT_FG): the frame sequence this present shows and whether it
+/// should show the midpoint leading up to it.
+pub(crate) fn lab_take_fg_request() -> Option<(u64, bool)> {
+    let v = LAB_FG_REQUEST.swap(0, Ordering::AcqRel);
+    (v != 0).then_some((v >> 1, v & 1 == 1))
+}
+
+/// TEMP (lab, PRESENT_FG): when the last new frame arrived, and the frame still
+/// owed its own present after its midpoint was shown.
+#[derive(Default)]
+struct LabFg {
+    arrived_at: Option<std::time::Instant>,
+    owed: Option<(u64, std::time::Instant)>,
+}
+
 /// TEMP (lab, PRESENT_VSR_SETTLE): when the last fresh frame reached the screen
 /// and which frame was last refined.
 #[derive(Default)]
@@ -940,6 +968,8 @@ struct App {
     next_backstop: std::time::Instant,
     /// TEMP (lab, PRESENT_VSR_SETTLE).
     lab_settle: LabSettle,
+    /// TEMP (lab, PRESENT_FG).
+    lab_fg: LabFg,
     /// Frame seq the drawable currently holds, or `None` before the first
     /// present.
     last_presented_seq: Option<u64>,
@@ -1343,14 +1373,19 @@ impl ApplicationHandler<FramePublished> for App {
             }
             let now = std::time::Instant::now();
             let pending = std::mem::take(&mut self.frame_pending);
-            if redraw_due(pending, now, self.next_backstop) {
+            // TEMP (lab, PRESENT_FG): the owed present is a deadline of its own.
+            let owed_at = self.lab_fg.owed.map(|(_, at)| at);
+            let owed_due = owed_at.is_some_and(|at| now >= at);
+            if redraw_due(pending || owed_due, now, self.next_backstop) {
                 window.request_redraw();
                 self.loop_census.redraws_asked += 1;
                 self.next_backstop = now + WINDOW_REDRAW_BACKSTOP;
             }
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                self.next_backstop,
-            ));
+            let wake = match owed_at.filter(|_| !owed_due) {
+                Some(at) => at.min(self.next_backstop),
+                None => self.next_backstop,
+            };
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(wake));
         }
     }
 
@@ -1479,6 +1514,7 @@ impl App {
             frame_pending: true,
             next_backstop: std::time::Instant::now(),
             lab_settle: LabSettle::default(),
+            lab_fg: LabFg::default(),
             last_presented_seq: None,
             last_presented_atomic: Arc::new(AtomicU64::new(0)),
             redraw_required: true,
@@ -1849,9 +1885,24 @@ impl App {
             && lab_present_settle().is_some_and(|settle| {
                 self.lab_settle.fresh_at.is_some_and(|at| at.elapsed() >= settle)
             });
-        if !refining && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq) {
+        // TEMP (lab, PRESENT_FG): the frame whose midpoint was shown is owed its
+        // own present once its time has come and nothing newer arrived.
+        let fg_owed = lab_present_fg()
+            && self
+                .lab_fg
+                .owed
+                .is_some_and(|(seq, at)| Some(seq) == incoming_seq && std::time::Instant::now() >= at);
+        if !refining && !fg_owed && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq) {
             self.loop_census.draws_stale += 1;
             return;
+        }
+        // TEMP (lab, PRESENT_FG): a new frame is shown as its midpoint first.
+        let fg_fresh = lab_present_fg() && !fg_owed && !refining && incoming_seq != self.last_presented_seq;
+        if let Some(seq) = incoming_seq.filter(|_| lab_present_fg()) {
+            LAB_FG_REQUEST.store(seq << 1 | u64::from(fg_fresh), Ordering::Release);
+        }
+        if fg_owed {
+            self.lab_fg.owed = None;
         }
         if refining {
             LAB_REFINE_PRESENT.store(true, Ordering::Release);
@@ -1883,6 +1934,19 @@ impl App {
                 self.presenter_rebuilds = 0;
                 if !refining {
                     self.lab_settle.fresh_at = Some(std::time::Instant::now());
+                }
+                if fg_fresh {
+                    if let Some(seq) = incoming_seq {
+                        let now = std::time::Instant::now();
+                        let half = self
+                            .lab_fg
+                            .arrived_at
+                            .map(|at| now.duration_since(at) / 2)
+                            .unwrap_or(std::time::Duration::from_millis(8))
+                            .clamp(std::time::Duration::from_millis(2), std::time::Duration::from_millis(40));
+                        self.lab_fg.arrived_at = Some(now);
+                        self.lab_fg.owed = Some((seq, now + half));
+                    }
                 }
                 self.last_presented_seq = incoming_seq;
                 if let Some(seq) = incoming_seq {

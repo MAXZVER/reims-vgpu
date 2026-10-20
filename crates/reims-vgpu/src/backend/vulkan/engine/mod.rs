@@ -55,6 +55,17 @@ mod present_sharp;
 mod present_nis_coef;
 #[cfg(feature = "host-window")]
 mod present_vsr;
+#[cfg(feature = "host-window")]
+mod present_fg;
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_FG`): the `VK_NV_optical_flow` queue and
+/// entry points the host window's frame generation submits to.
+pub(crate) struct OpticalFlowQueue {
+    pub family: u32,
+    pub queue: ash::vk::Queue,
+    pub device: ash::nv::optical_flow::Device,
+    pub instance: ash::nv::optical_flow::Instance,
+}
 pub(crate) mod stamp_completion;
 /// The requested draw-time buffer-gather working set. Re-exported for the same
 /// reason: `pools` is private, and the number this reports is what a content
