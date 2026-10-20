@@ -2421,6 +2421,18 @@ mod tests {
         words.extend(decorate(7, 3));
         words.extend(decorate(8, M2V_TEXTURE_BINDING_BASE + 8));
         words.extend(decorate(9, TOP_SAMPLER));
+        // Typed, as the translator's modules are: relocation moves a binding by
+        // its variable's class and never by band guesswork. 20 = a sampled 2D
+        // image, 21 = a sampler, 22 = the buffer's (undeclared) block type;
+        // 30-32 point at them in UniformConstant; 7-9 are the variables.
+        words.extend([(9u32 << 16) | 25, 20, 1, 1, 0, 0, 0, 1, 0]);
+        words.extend([(2u32 << 16) | 26, 21]);
+        for (pointer, pointee) in [(30, 20), (31, 21), (32, 22)] {
+            words.extend([(4u32 << 16) | 32, pointer, 0, pointee]);
+        }
+        for (variable, pointer) in [(8, 30), (9, 31), (7, 32)] {
+            words.extend([(4u32 << 16) | 59, pointer, variable, 0]);
+        }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let shader = synth_shader(Stage::Fragment, bytes);
 
