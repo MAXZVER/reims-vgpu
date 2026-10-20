@@ -499,12 +499,24 @@ pub(crate) fn lab_take_fg_request() -> Option<(u64, bool)> {
     (v != 0).then_some((v >> 1, v & 1 == 1))
 }
 
+/// TEMP (lab, PRESENT_FG): set by the rail when the present it just made
+/// showed a generated midpoint; only then is the frame itself owed a present.
+static LAB_FG_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// TEMP (lab, PRESENT_FG): the rail drew a midpoint into this present.
+pub(crate) fn lab_note_fg_shown() {
+    LAB_FG_SHOWN.store(true, Ordering::Release);
+}
+
 /// TEMP (lab, PRESENT_FG): when the last new frame arrived, and the frame still
 /// owed its own present after its midpoint was shown.
 #[derive(Default)]
 struct LabFg {
     arrived_at: Option<std::time::Instant>,
     owed: Option<(u64, std::time::Instant)>,
+    /// The window's monitor refresh period, asked once; a midpoint closer to
+    /// its frames than this never reaches the screen.
+    monitor_period: Option<std::time::Duration>,
 }
 
 /// TEMP (lab, PRESENT_VSR_SETTLE): when the last fresh frame reached the screen
@@ -1896,9 +1908,26 @@ impl App {
             self.loop_census.draws_stale += 1;
             return;
         }
-        // TEMP (lab, PRESENT_FG): a new frame is shown as its midpoint first.
-        let fg_fresh = lab_present_fg() && !fg_owed && !refining && incoming_seq != self.last_presented_seq;
+        // TEMP (lab, PRESENT_FG): a new frame is shown as its midpoint first -
+        // unless the guest already outpaces the monitor's half rate, where the
+        // midpoint would be wasted work the monitor never shows.
+        let fg_new = lab_present_fg() && !fg_owed && !refining && incoming_seq != self.last_presented_seq;
+        if fg_new && self.lab_fg.monitor_period.is_none() {
+            self.lab_fg.monitor_period = self
+                .window
+                .as_ref()
+                .and_then(|w| w.current_monitor())
+                .and_then(|m| m.refresh_rate_millihertz())
+                .filter(|&mhz| mhz > 0)
+                .map(|mhz| std::time::Duration::from_secs_f64(1000.0 / f64::from(mhz)));
+        }
+        let fg_fresh = fg_new
+            && self.lab_fg.arrived_at.is_none_or(|at| {
+                let period = self.lab_fg.monitor_period.unwrap_or(std::time::Duration::from_micros(4167));
+                at.elapsed() >= period * 2 * 9 / 10
+            });
         if let Some(seq) = incoming_seq.filter(|_| lab_present_fg()) {
+            LAB_FG_SHOWN.store(false, Ordering::Release);
             LAB_FG_REQUEST.store(seq << 1 | u64::from(fg_fresh), Ordering::Release);
         }
         if fg_owed {
@@ -1935,18 +1964,22 @@ impl App {
                 if !refining {
                     self.lab_settle.fresh_at = Some(std::time::Instant::now());
                 }
-                if fg_fresh {
-                    if let Some(seq) = incoming_seq {
-                        let now = std::time::Instant::now();
+                if fg_new {
+                    let now = std::time::Instant::now();
+                    let shown = LAB_FG_SHOWN.swap(false, Ordering::AcqRel);
+                    if fg_fresh && !shown && crate::observe::first_sight("present_fg_not_shown", 0) {
+                        crate::observe::fail("present_fg_not_shown (no scaled present or no flow)".to_string());
+                    }
+                    if let (true, true, Some(seq)) = (fg_fresh, shown, incoming_seq) {
                         let half = self
                             .lab_fg
                             .arrived_at
                             .map(|at| now.duration_since(at) / 2)
                             .unwrap_or(std::time::Duration::from_millis(8))
                             .clamp(std::time::Duration::from_millis(2), std::time::Duration::from_millis(40));
-                        self.lab_fg.arrived_at = Some(now);
                         self.lab_fg.owed = Some((seq, now + half));
                     }
+                    self.lab_fg.arrived_at = Some(now);
                 }
                 self.last_presented_seq = incoming_seq;
                 if let Some(seq) = incoming_seq {

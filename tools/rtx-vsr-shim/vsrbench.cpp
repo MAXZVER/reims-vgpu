@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <vector>
 
@@ -188,6 +189,53 @@ int main(int argc, char** argv) {
     std::printf("ngx create=%#x\n", r);
     if (r) return 1;
 
+    VkImageUsageFlags tu = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (argc > 2 && std::strcmp(argv[2], "tiles") == 0) {
+        // Tiled refine: 3456x1458 -> 5120x2160, square input tiles of side T, a row of them per command buffer;
+        // ms per tile and per output megapixel at each quality (the fixed per-call cost shows as small tiles' excess).
+        const uint32_t iw = 3456, ih = 1458, ow = 5120, oh = 2160;
+        Img in = make(iw, ih, tu), out = make(ow, oh, tu);
+        std::printf("%-6s %-4s %-7s %10s %10s %12s\n", "tile", "q", "count", "ms/call", "ms total", "ms/out-MP");
+        for (uint32_t t : {64u, 128u, 256u, 512u, 1024u}) {
+            uint32_t count = std::min<uint32_t>(32, (iw / t) * (ih / t));
+            for (int quality = 1; quality <= 4; quality += 3) {
+                std::vector<double> ms;
+                for (int i = 0; i < iters + 5; i++) {
+                    CHECK(vkResetCommandBuffer(cb, 0));
+                    CHECK(vkBeginCommandBuffer(cb, &bi));
+                    barrier(cb, in.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    barrier(cb, out.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+                    vkCmdResetQueryPool(cb, qp, 0, 2);
+                    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
+                    int e = 0;
+                    for (uint32_t k = 0; k < count && !e; k++) {
+                        uint32_t cols = iw / t, x = (k % cols) * t, y = (k / cols) * t;
+                        uint32_t ox = x * ow / iw, oy = y * oh / ih, ox2 = (x + t) * ow / iw, oy2 = (y + t) * oh / ih;
+                        uint32_t ir[4] = {x, y, t, t}, orr[4] = {ox, oy, ox2 - ox, oy2 - oy};
+                        e = eval(cb, in.image, in.view, VK_FORMAT_R8G8B8A8_UNORM, iw, ih, out.image, out.view,
+                                 VK_FORMAT_R8G8B8A8_UNORM, ow, oh, ir, orr, quality);
+                    }
+                    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
+                    CHECK(vkEndCommandBuffer(cb));
+                    if (e) {
+                        std::printf("evaluate %#x (tile %u)\n", e, t);
+                        return 1;
+                    }
+                    submit();
+                    uint64_t ts[2];
+                    vkGetQueryPoolResults(dev, qp, 0, 2, sizeof(ts), ts, sizeof(uint64_t),
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                    if (i >= 5) ms.push_back(double(ts[1] - ts[0]) * props.limits.timestampPeriod / 1e6);
+                }
+                std::sort(ms.begin(), ms.end());
+                double total = ms[ms.size() / 2];
+                double out_mp = double(count) * (t * ow / iw) * (t * oh / ih) / 1e6;
+                std::printf("%-6u %-4d %-7u %10.3f %10.3f %12.3f\n", t, quality, count, total / count, total,
+                            total / out_mp);
+            }
+        }
+        return 0;
+    }
     struct Case {
         uint32_t iw, ih, ow, oh;
     } cases[] = {

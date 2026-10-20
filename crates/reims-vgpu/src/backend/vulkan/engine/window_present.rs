@@ -1470,6 +1470,9 @@ impl WindowPresenter {
                         match fg.submit_flow(ctx, frame_ix, image, access.layout(), stage, acc, seq, want_mid) {
                             Ok(Some(sem)) => {
                                 fg_src = fg.record_warp(&ctx.device, frame_cmd, frame_ix);
+                                if fg_src.is_some() {
+                                    crate::host_window::present::lab_note_fg_shown();
+                                }
                                 fg_wait = Some(sem);
                             }
                             Ok(None) => {}
