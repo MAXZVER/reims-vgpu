@@ -1372,6 +1372,11 @@ impl WindowPresenter {
                             && *view != vk::ImageView::null()
                             && (vp.width, vp.height) != (base_width, base_height) =>
                     {
+                        // TEMP (lab, PRESENT_VSR): NGX bound to this device once, before the
+                        // filter that records it is built.
+                        if super::present_vsr::quality().is_some() {
+                            super::present_vsr::init(&ctx._entry, &ctx.instance, ctx.pd, &ctx.device);
+                        }
                         if self.sharp.is_none() && !self.sharp_failed {
                             match super::present_sharp::PresentSharp::create(
                                 &ctx.device,

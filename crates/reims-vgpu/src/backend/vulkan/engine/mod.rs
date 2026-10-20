@@ -53,6 +53,8 @@ mod present_sharp_shader;
 mod present_sharp;
 #[cfg(feature = "host-window")]
 mod present_nis_coef;
+#[cfg(feature = "host-window")]
+mod present_vsr;
 pub(crate) mod stamp_completion;
 /// The requested draw-time buffer-gather working set. Re-exported for the same
 /// reason: `pools` is private, and the number this reports is what a content

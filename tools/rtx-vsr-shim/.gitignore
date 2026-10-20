@@ -1,0 +1,4 @@
+rvsr.dll
+*.obj
+*.lib
+*.exp

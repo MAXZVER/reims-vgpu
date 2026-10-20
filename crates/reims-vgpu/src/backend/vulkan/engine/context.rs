@@ -1101,6 +1101,18 @@ impl DeviceContext {
                 }
             }
         }
+        // TEMP (lab, PRESENT_VSR): the instance extensions NGX asks for, where advertised.
+        #[cfg(feature = "host-window")]
+        if super::present_vsr::quality().is_some() {
+            let advertised = entry.enumerate_instance_extension_properties(None).unwrap_or_default();
+            for name in super::present_vsr::instance_extensions() {
+                let n = CStr::from_ptr(name);
+                let offered = advertised.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
+                if offered && !instance_extensions.iter().any(|e: &*const std::ffi::c_char| CStr::from_ptr(*e) == n) {
+                    instance_extensions.push(name);
+                }
+            }
+        }
         let mut ici = vk::InstanceCreateInfo::default()
             .application_info(&app)
             .enabled_extension_names(&instance_extensions);
@@ -1343,6 +1355,21 @@ impl DeviceContext {
             }
         }
         crate::observe::off(format!("gpu_boost low_latency2={low_latency2}"));
+        // TEMP (lab, PRESENT_VSR): the device extensions NGX asks for, where advertised.
+        #[cfg(feature = "host-window")]
+        if super::present_vsr::quality().is_some() {
+            let mut took = Vec::new();
+            for name in super::present_vsr::device_extensions(instance.handle(), pd) {
+                let n = CStr::from_ptr(name);
+                if has_device_extension(n)
+                    && !enabled_device_extensions.iter().any(|e: &*const std::ffi::c_char| CStr::from_ptr(*e) == n)
+                {
+                    enabled_device_extensions.push(name);
+                    took.push(n.to_string_lossy().into_owned());
+                }
+            }
+            crate::observe::off(format!("present_vsr device_extensions={took:?}"));
+        }
         let mut enabled_divisor_features =
             vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default()
                 .vertex_attribute_instance_rate_divisor(vertex_divisor.instance_rate_divisor)

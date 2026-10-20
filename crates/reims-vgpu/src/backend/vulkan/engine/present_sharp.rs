@@ -241,6 +241,15 @@ pub(crate) struct PresentSharp {
     /// `REIMS_VGPU_LAB_PRESENT_DUMP`: the dump in flight, and how many written.
     dump: Option<PresentDump>,
     dumps: u32,
+    /// VSR (`present_vsr`): its quality, or `None`. Like NIS it writes `mid`
+    /// (rgba8 storage) and the window pass copies it out at strength 0.
+    vsr: Option<i32>,
+    /// VSR: the guest frame converted to rgba8 at its own size (NGX's input).
+    vsr_in: Option<MidImage>,
+    /// VSR: the feature was created (recorded into an earlier present).
+    vsr_created: bool,
+    /// VSR: a create or evaluate refused; the present keeps EASU from here on.
+    vsr_failed: bool,
 }
 
 /// The guest frame one scaled present reads.
@@ -270,7 +279,11 @@ impl PresentSharp {
             transient: vec![None; frames],
             // With NIS the window pass is RCAS too: an exact copy unless
             // REIMS_VGPU_LAB_PRESENT_RCAS also asks for its sharpening.
-            rcas: if nis_sharp().is_some() { Some(rcas_sharp().unwrap_or(0.0)) } else { rcas_sharp() },
+            rcas: if nis_sharp().is_some() || super::present_vsr::quality().is_some() {
+                Some(rcas_sharp().unwrap_or(0.0))
+            } else {
+                rcas_sharp()
+            },
             nis: nis_sharp(),
             nis_set_layout: vk::DescriptorSetLayout::null(),
             nis_layout: vk::PipelineLayout::null(),
@@ -286,6 +299,10 @@ impl PresentSharp {
             records: 0,
             dump: None,
             dumps: 0,
+            vsr: super::present_vsr::quality(),
+            vsr_in: None,
+            vsr_created: false,
+            vsr_failed: false,
         };
         if let Err(e) = made.build(device, format, frames) {
             made.destroy(device);
@@ -806,7 +823,7 @@ impl PresentSharp {
         };
         // NVScaler writes `mid` as an rgba8 storage image; EASU renders it in
         // the window's format.
-        let nis = self.nis.is_some();
+        let nis = self.nis.is_some() || self.vsr.is_some();
         let format = if nis { vk::Format::R8G8B8A8_UNORM } else { format };
         let usage = if nis {
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC
@@ -862,6 +879,72 @@ impl PresentSharp {
         match r {
             Ok(()) => {
                 self.mid = Some(made);
+                Ok(())
+            }
+            Err(e) => {
+                made.destroy(device);
+                Err(e)
+            }
+        }
+    }
+
+    /// VSR's input: an rgba8 copy of the guest frame at its own size.
+    unsafe fn ensure_vsr_in(
+        &mut self,
+        device: &ash::Device,
+        width: u32,
+        height: u32,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> Result<(), vk::Result> {
+        if self.vsr_in.as_ref().is_some_and(|m| (m.width, m.height) == (width, height)) {
+            return Ok(());
+        }
+        if let Some(old) = self.vsr_in.take() {
+            self.retired.push((old, self.records));
+        }
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let mut made = MidImage {
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            fb: vk::Framebuffer::null(),
+            width,
+            height,
+        };
+        let r = (|| -> Result<(), vk::Result> {
+            made.image = device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format)
+                    .extent(vk::Extent3D { width, height, depth: 1 })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )?;
+            let req = device.get_image_memory_requirements(made.image);
+            let mt = memory_type(req.memory_type_bits, req.size, false).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+            made.memory = device.allocate_memory(
+                &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt),
+                None,
+            )?;
+            device.bind_image_memory(made.image, made.memory, 0)?;
+            made.view = device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(made.image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(super::color_subresource_range()),
+                None,
+            )?;
+            Ok(())
+        })();
+        match r {
+            Ok(()) => {
+                self.vsr_in = Some(made);
                 Ok(())
             }
             Err(e) => {
@@ -1007,7 +1090,8 @@ impl PresentSharp {
                 ix,
                 (src.width, src.height),
                 (vp.2, vp.3),
-                self.nis.is_some() && nis_cfg.is_some(),
+                // `mid` is rgba8 under NVScaler and VSR alike.
+                (self.nis.is_some() && nis_cfg.is_some()) || self.vsr.is_some(),
                 memory_type,
             );
         if let (true, Some(d)) = (dumping, self.dump.as_ref()) {
@@ -1023,6 +1107,161 @@ impl PresentSharp {
             .image(src.image)
             .subresource_range(super::color_subresource_range())];
         let nis_cfg = if rcas.is_some() { nis_cfg } else { None };
+        // VSR this present: ready, a `mid`, and its input image.
+        let vsr = match (self.vsr, rcas.is_some() && !self.vsr_failed && super::present_vsr::ready()) {
+            (Some(q), true) => match self.ensure_vsr_in(device, src.width, src.height, memory_type) {
+                Ok(()) => Some(q),
+                Err(e) => {
+                    if crate::observe::first_sight("present_vsr_in_refused", 0) {
+                        crate::observe::fail(format!("present_vsr_in_refused err={e:?}"));
+                    }
+                    None
+                }
+            },
+            _ => None,
+        };
+        if let (Some(q), Some(vin), Some(mid)) = (vsr, self.vsr_in.as_ref(), self.mid.as_ref()) {
+            let (vin_image, vin_view, vin_w, vin_h) = (vin.image, vin.view, vin.width, vin.height);
+            let (mid_image, mid_view, mid_w, mid_h) = (mid.image, mid.view, mid.width, mid.height);
+            if !self.vsr_created {
+                self.vsr_created = super::present_vsr::create_feature(device, cmd);
+                if !self.vsr_created {
+                    self.vsr_failed = true;
+                }
+            }
+            if self.vsr_created {
+                // The guest frame (in `src.layout`, a transfer-read layout) into
+                // the rgba8 input at its own size; then NGX from it into `mid`.
+                let barriers = [
+                    vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(vin_image)
+                        .subresource_range(super::color_subresource_range()),
+                    vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(mid_image)
+                        .subresource_range(super::color_subresource_range()),
+                ];
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barriers,
+                );
+                let whole = |w: u32, h: u32| [vk::Offset3D { x: 0, y: 0, z: 0 }, vk::Offset3D { x: w as i32, y: h as i32, z: 1 }];
+                let layers = vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                device.cmd_blit_image(
+                    cmd,
+                    src.image,
+                    src.layout,
+                    vin_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::ImageBlit {
+                        src_subresource: layers,
+                        src_offsets: whole(src.width, src.height),
+                        dst_subresource: layers,
+                        dst_offsets: whole(vin_w, vin_h),
+                    }],
+                    vk::Filter::NEAREST,
+                );
+                let vin_read = [vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(vin_image)
+                    .subresource_range(super::color_subresource_range())];
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &vin_read,
+                );
+                let r = super::present_vsr::evaluate(
+                    cmd,
+                    &super::present_vsr::VsrImage {
+                        image: vin_image,
+                        view: vin_view,
+                        format: vk::Format::R8G8B8A8_UNORM,
+                        width: vin_w,
+                        height: vin_h,
+                    },
+                    &super::present_vsr::VsrImage {
+                        image: mid_image,
+                        view: mid_view,
+                        format: vk::Format::R8G8B8A8_UNORM,
+                        width: mid_w,
+                        height: mid_h,
+                    },
+                    q,
+                );
+                if r != 0 {
+                    self.vsr_failed = true;
+                    crate::observe::fail(format!("present_vsr_refused reason=evaluate ngx={r:#x} {vin_w}x{vin_h}->{mid_w}x{mid_h}"));
+                }
+                // Whatever NGX did, `mid` goes to the window pass's layout
+                // (a refused evaluate shows one undefined frame, then EASU).
+                let mid_read = [vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(mid_image)
+                    .subresource_range(super::color_subresource_range())];
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &mid_read,
+                );
+                let rcas_set = self.rcas_sets[ix];
+                self.write_set(device, rcas_set, mid_view);
+                let mut push = [0u8; 20];
+                for (i, v) in [vp.0, vp.1, vp.2, vp.3].iter().enumerate() {
+                    push[i * 4..i * 4 + 4].copy_from_slice(&(*v as i32).to_le_bytes());
+                }
+                push[16..].copy_from_slice(&rcas.unwrap_or(0.0).to_le_bytes());
+                self.begin_window_pass(device, cmd, fb, extent, clear);
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rcas_pipeline);
+                Self::set_rect(device, cmd, vp.0, vp.1, vp.2, vp.3);
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
+                device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
+                device.cmd_draw(cmd, 3, 1, 0, 0);
+                device.cmd_end_render_pass(cmd);
+                if dumping {
+                    self.record_mid_dump(device, cmd, src.width, src.height);
+                }
+                return Ok(());
+            }
+        }
         let reader = if nis_cfg.is_some() {
             vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER
         } else {
@@ -1186,38 +1425,8 @@ impl PresentSharp {
         }
         // REIMS_VGPU_LAB_PRESENT_DUMP: the first pass's result, as the window
         // pass just read it.
-        if let (true, Some(d), Some(mid)) = (dumping, self.dump.as_ref(), self.mid.as_ref()) {
-            let to_src = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(mid.image)
-                .subresource_range(super::color_subresource_range())];
-            device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &to_src,
-            );
-            let offset = src.width as u64 * src.height as u64 * 4;
-            Self::dump_copy(device, cmd, mid.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, d.buffer, offset, (mid.width, mid.height));
-            device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::HOST_READ)],
-                &[],
-                &[],
-            );
+        if dumping {
+            self.record_mid_dump(device, cmd, src.width, src.height);
         }
         let back = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
@@ -1238,6 +1447,45 @@ impl PresentSharp {
             &back,
         );
         Ok(())
+    }
+
+    /// REIMS_VGPU_LAB_PRESENT_DUMP: `mid` (in SHADER_READ_ONLY) after the
+    /// source copy the dump already holds.
+    unsafe fn record_mid_dump(&self, device: &ash::Device, cmd: vk::CommandBuffer, src_w: u32, src_h: u32) {
+        let (Some(d), Some(mid)) = (self.dump.as_ref(), self.mid.as_ref()) else {
+            return;
+        };
+            let to_src = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(mid.image)
+                .subresource_range(super::color_subresource_range())];
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_src,
+            );
+            let offset = src_w as u64 * src_h as u64 * 4;
+            Self::dump_copy(device, cmd, mid.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, d.buffer, offset, (mid.width, mid.height));
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                &[],
+                &[],
+            );
     }
 
     /// The swapchain pass over the whole window, slate-cleared.
