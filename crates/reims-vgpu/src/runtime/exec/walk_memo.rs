@@ -529,6 +529,16 @@ pub(super) fn xmemo_resource_keep(
             m.resources.clear();
         }
         m.resources.insert((task_id, obj_ref), Arc::clone(resource));
+        // The answer was resolved *before* this keep read the guard, so a
+        // lifecycle change landing in between would file an old-world answer
+        // under the new generation — one stale hit until the next bump. The
+        // guard is re-read after the insert and the cell cleared on movement;
+        // the ask side's own mismatch check stays as the second half.
+        if let Some(now) = walk_guard(state) {
+            if now != guard {
+                m.clear(now);
+            }
+        }
     });
 }
 
