@@ -6104,7 +6104,11 @@ impl DeviceState {
             .storage_incarnations
             .entry((task_id, base))
             .or_insert(0);
-        *slot = slot.wrapping_add(1);
+        // The 0-skip every sibling counter here takes (`next_epoch`,
+        // `next_sampled_content_generation`): 0 is the "never bumped" default,
+        // so a wrap that lands on it would equate a re-pointed window with a
+        // fresh one and hand `BackingWindowRefs::identity` the old backing.
+        *slot = next_epoch(*slot);
     }
 
     /// Say that every name in this task now describes different pages, for the
@@ -6123,7 +6127,9 @@ impl DeviceState {
     /// by how long the device has run.
     fn bump_task_storage_incarnations(&mut self, task_id: u32) {
         let slot = self.task_storage_epochs.entry(task_id).or_insert(0);
-        *slot = slot.wrapping_add(1);
+        // Same 0-skip as the per-name incarnation above: 0 is this table's
+        // "never bumped" default, not an incarnation.
+        *slot = next_epoch(*slot);
         self.storage_incarnations.retain(|&(t, _), _| t != task_id);
         self.backing_window_refs.delete_task(task_id);
         self.aliased_references
@@ -8768,6 +8774,20 @@ mod sampled_generation_tests {
         state.define_task(7, 0x1000, 5);
         state.define_task(7, 0x1000, 5);
         assert!(state.tasks.is_active(7), "the redefine went through");
+    }
+
+    /// A storage incarnation wrapping past `u32::MAX` lands on 1, never on the
+    /// 0 that means "never bumped" - the same rule the sibling counters take.
+    #[test]
+    fn a_wrapped_storage_incarnation_skips_zero() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.storage_incarnations.insert((7, 0x10), u32::MAX);
+        state.bump_storage_incarnation(7, 0x10);
+        assert_eq!(state.storage_incarnations[&(7, 0x10)], 1, "0 is skipped");
+        state.define_task(8, 0x1000, 5); // open the task so the next define redefines
+        state.task_storage_epochs.insert(8, u32::MAX);
+        state.define_task(8, 0x1000, 5); // live: the redefine bumps the epoch
+        assert_eq!(state.task_storage_epochs[&8], 1, "0 is skipped");
     }
 
     /// A panic under the session lock is a dead device, not a dead process:
