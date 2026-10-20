@@ -3326,6 +3326,13 @@ pub struct DeviceState {
     /// instead of a public field any call site can reach into.
     /// TEMP (lab, INGRESS_AHEAD): a `RwLock`, read by [`Self::pipeline_usage`]
     /// for a whole packet walk so helpers can walk several packets at once.
+    ///
+    /// Poison discipline: every door reads through
+    /// `unwrap_or_else(|poisoned| poisoned.into_inner())`, the same rule every
+    /// `Mutex` in this file already follows. A panic under this lock is a dead
+    /// device either way; recovering the guard turns "one bad packet aborts the
+    /// process" into "the doors keep answering", which is all a poisoned
+    /// session can offer and more than an `expect` did.
     session: std::sync::RwLock<reims_vgpu_core::session::SessionModel>,
     /// TEMP (lab, pipeline ids): the pipeline table as it would be named per
     /// task, stepped beside the real one. See
@@ -4792,7 +4799,7 @@ impl DeviceState {
                 let _ = self
                     .session
                     .write()
-                    .expect("session")
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .open_channel(reims_vgpu_core::identity::ChannelId(channel));
             }
         }
@@ -4806,7 +4813,7 @@ impl DeviceState {
     pub fn child_domain_open(&self, channel: u32) -> bool {
         self.session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .channel_open(reims_vgpu_core::identity::ChannelId(channel))
     }
 
@@ -4820,7 +4827,7 @@ impl DeviceState {
         &self,
         op: reims_vgpu_core::control::ControlOp,
     ) -> Result<(), reims_vgpu_core::session::ControlRefusal> {
-        self.session.write().expect("session").apply_control(op)
+        self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).apply_control(op)
     }
 
     /// Tell the ordering plane that the guest has created a pipeline object.
@@ -4852,7 +4859,7 @@ impl DeviceState {
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
         let (declared, generation) = {
-            let mut session = self.session.write().expect("session");
+            let mut session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             let generation = session.generation();
             (session.pipelines().declare(id, generation), generation)
         };
@@ -4912,7 +4919,7 @@ impl DeviceState {
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> reims_vgpu_core::session::Ended {
         let id = self.pipeline_id(task_id, pipeline);
-        let ended = self.session.write().expect("session").pipeline_retired(id);
+        let ended = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).pipeline_retired(id);
         self.lab_shadow.retire(task_id, pipeline, &ended);
         ended
     }
@@ -4942,7 +4949,7 @@ impl DeviceState {
         let took = self
             .session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .advance(id, next);
         self.lab_shadow.advance(task_id, pipeline, next);
@@ -4963,7 +4970,7 @@ impl DeviceState {
         let took = self
             .session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .withdraw(id);
         self.lab_shadow.withdraw(task_id, pipeline, took);
@@ -4994,7 +5001,7 @@ impl DeviceState {
             // real one keeps the first published, which is what it holds when
             // the rail is not asked again.
             self.lab_shadow.publish(task_id, pipeline, &usage);
-            let mut session = self.session.write().expect("session");
+            let mut session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             if session.pipelines().usage_published(id) {
                 return false;
             }
@@ -5004,7 +5011,7 @@ impl DeviceState {
         }
         self.session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .publish_usage_to(id, usage, self.usage_scope())
     }
@@ -5025,7 +5032,7 @@ impl DeviceState {
         let real = self
             .session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .usage_published(id);
         // TEMP (lab): asked for the task, so a reflection is built for each
@@ -5045,7 +5052,7 @@ impl DeviceState {
         let real = self
             .session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .usage_wanted_by(id, self.usage_scope());
         real || (super::lab_pipeline_shadow::enabled()
@@ -5077,7 +5084,7 @@ impl DeviceState {
     #[must_use]
     pub fn pipeline_usage(&self, task_id: u32) -> PipelineUsage<'_> {
         PipelineUsage(
-            self.session.read().expect("session"),
+            self.session.read().unwrap_or_else(|poisoned| poisoned.into_inner()),
             self.pipeline_scope(task_id),
             task_id,
             &self.lab_shadow,
@@ -5097,11 +5104,11 @@ impl DeviceState {
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
         let waiters = if super::lab_pipeline_shadow::enabled() {
-            self.session.write().expect("session").pipeline_waiters(id)
+            self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).pipeline_waiters(id)
         } else {
             Vec::new()
         };
-        let took = self.session.write().expect("session").pipeline_ready(id);
+        let took = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).pipeline_ready(id);
         self.lab_shadow.ready(task_id, pipeline, &waiters, took);
         took
     }
@@ -5117,7 +5124,7 @@ impl DeviceState {
             return;
         }
         let (generation, real) = {
-            let session = self.session.write().expect("session");
+            let session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             let generation = session.generation();
             let real: Vec<reims_vgpu_core::pipeline::Lease> = leases
                 .iter()
@@ -5180,7 +5187,7 @@ impl DeviceState {
     ) -> Option<&'static str> {
         self.session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .get(id)
             .map(|entry| entry.state.name())
@@ -5199,7 +5206,7 @@ impl DeviceState {
         let id = self.pipeline_id(task_id, pipeline);
         self.session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .release_past_ended_pipeline(ingress, id)
     }
 
@@ -5212,7 +5219,7 @@ impl DeviceState {
         let id = self.pipeline_id(task_id, pipeline);
         self.session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .get(id)
             .is_some_and(|entry| entry.state.is_ready())
@@ -5235,7 +5242,7 @@ impl DeviceState {
         let ended = self
             .session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipeline_refused(id, reason);
         self.lab_shadow.refuse(task_id, pipeline, reason, &ended);
         ended
@@ -5263,7 +5270,7 @@ impl DeviceState {
         &self,
         packet: &reims_vgpu_core::session::Packet,
     ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
-        let mut session = self.session.write().expect("session");
+        let mut session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let admitted = session.admit(packet)?;
         Ok(Admission {
             epoch: session.epoch(),
@@ -5281,7 +5288,7 @@ impl DeviceState {
         &self,
         packet: reims_vgpu_core::session::Packet,
     ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
-        let mut session = self.session.write().expect("session");
+        let mut session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let admitted = session.admit_owned(packet)?;
         Ok(Admission {
             epoch: session.epoch(),
@@ -5300,7 +5307,7 @@ impl DeviceState {
     /// [`reims_vgpu_core::session::Packet::session`].
     #[must_use]
     pub fn session_generation(&self) -> reims_vgpu_core::identity::SessionGeneration {
-        self.session.write().expect("session").generation()
+        self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).generation()
     }
 
     /// The positions the model has released to run since the last ask.
@@ -5311,7 +5318,7 @@ impl DeviceState {
     /// unrepresentable — see `crate::runtime::parked::ParkedStore::release`.
     #[must_use = "a position taken off the ready list and not run is a packet that never runs"]
     pub fn take_ready(&self) -> Vec<reims_vgpu_core::identity::IngressOrdinal> {
-        self.session.write().expect("session").take_ready()
+        self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).take_ready()
     }
 
     /// A transaction finished on the host.
@@ -5337,7 +5344,7 @@ impl DeviceState {
     ) -> Result<Vec<reims_vgpu_core::publish::Release>, reims_vgpu_core::session::Refusal> {
         self.session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .complete(epoch, ingress)
     }
 
@@ -5352,7 +5359,7 @@ impl DeviceState {
         &self,
         ingress: reims_vgpu_core::identity::IngressOrdinal,
     ) -> Vec<reims_vgpu_core::publish::Release> {
-        self.session.write().expect("session").withdraw(ingress)
+        self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).withdraw(ingress)
     }
 
     /// The guest's completion word for `slot` has moved to `value`.
@@ -5370,7 +5377,7 @@ impl DeviceState {
         slot: reims_vgpu_core::identity::StampSlot,
         value: reims_vgpu_core::identity::StampValue,
     ) -> StampPublication {
-        let mut session = self.session.write().expect("session");
+        let mut session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = session.published_stamp(slot);
         session.stamp_published(reims_vgpu_core::identity::CompletionStamp { slot, value });
         let after = session.published_stamp(slot);
@@ -5389,13 +5396,13 @@ impl DeviceState {
         &self,
         slot: reims_vgpu_core::identity::StampSlot,
     ) -> Option<reims_vgpu_core::identity::StampValue> {
-        self.session.write().expect("session").published_stamp(slot)
+        self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).published_stamp(slot)
     }
 
     /// What the ordering plane holds about the pipelines this session declared.
     #[must_use]
     pub fn pipeline_census(&self) -> reims_vgpu_core::pipeline::Census {
-        self.session.write().expect("session").pipelines().census()
+        self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).pipelines().census()
     }
 
     /// The census line for what the ordering plane's pipeline table is holding
@@ -5427,7 +5434,7 @@ impl DeviceState {
         if now.saturating_sub(last) < WINDOW_MS {
             return None;
         }
-        let resting = self.session.write().expect("session").pipelines().resting();
+        let resting = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).pipelines().resting();
         if resting.total() == 0 {
             return None;
         }
@@ -5471,7 +5478,7 @@ impl DeviceState {
             return None;
         }
         let (census, live, slots) = {
-            let session = self.session.write().expect("session");
+            let session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             let graph = session.graph();
             (graph.census(), graph.live_accesses(), graph.entries())
         };
@@ -5816,7 +5823,7 @@ impl DeviceState {
         let ended = self
             .session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .task_ended(reims_vgpu_core::identity::TaskId(task_id));
         if ended.removed > 0 {
             crate::runtime::drain::note_store_route_n("pipeline_task_ended", ended.removed as u64);
@@ -8761,5 +8768,23 @@ mod sampled_generation_tests {
         state.define_task(7, 0x1000, 5);
         state.define_task(7, 0x1000, 5);
         assert!(state.tasks.is_active(7), "the redefine went through");
+    }
+
+    /// A panic under the session lock is a dead device, not a dead process:
+    /// every door recovers the guard through the poison, the discipline the
+    /// file's Mutexes already follow.
+    #[test]
+    fn a_poisoned_session_lock_does_not_kill_the_next_door() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let before = state.session_generation();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.session.write();
+            panic!("poison the session lock");
+        }));
+        assert_eq!(
+            state.session_generation(),
+            before,
+            "the door answered through the poison"
+        );
     }
 }
