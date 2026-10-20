@@ -3362,6 +3362,7 @@ fn lab_dump_write(req: &DrawEncodeRequest, n: u32, w: u32, h: u32, rgba: &[u8], 
         req.colors.first().map(|c| c.texture_ref).unwrap_or(0)
     );
     let _ = std::fs::write(dir.join(&name), out);
+    lab_dump_draw_shape(req, n);
     crate::observe::fail(format!(
         "lab_dump file={name} fmt={} rt=[{}] load={} srcs={:?} t={}",
         req.colors.first().map(|c| c.format).unwrap_or(0),
@@ -23967,3 +23968,36 @@ mod storage_texture_admission_tests {
     }
 }
 
+/// TEMP (lab, Opus 2026-10-20, Safari 0x520000 canvas loss): with each `lab_dump`, the draw that produced it - its
+/// counts, every vertex/fragment buffer bind with its offset, the viewports and scissors - so a draw that lands
+/// nothing past canvas row 656 can be told apart from one that never asked for those rows.
+fn lab_dump_draw_shape(req: &DrawEncodeRequest, n: u32) {
+    let vb: Vec<String> = req
+        .vertex_buffers
+        .iter()
+        .map(|b| format!("{}:r{}+{}", b.index, b.buffer_ref, b.offset))
+        .collect();
+    let fb: Vec<String> = req
+        .fragment_buffers
+        .iter()
+        .map(|b| format!("{}:r{}+{}", b.index, b.buffer_ref, b.offset))
+        .collect();
+    crate::observe::fail(format!(
+        "lab_dump_shape #{n} pipe={} vtx={} inst={} first={} base_inst={} prim={} indexed={:?} merged={} vb=[{}] fb=[{}]          viewports={:?} scissors={:?}",
+        req.pipeline_ref,
+        req.vertex_count,
+        req.instance_count,
+        req.first_vertex,
+        req.base_instance,
+        req.primitive_type,
+        req.indexed.as_ref().map(|i| (i.index_count, i.index_buffer_ref, i.index_buffer_offset)),
+        req.merged.is_some(),
+        vb.join(" "),
+        fb.join(" "),
+        req.viewports,
+        req.scissors
+            .iter()
+            .map(|s| (s.x, s.y, s.width, s.height))
+            .collect::<Vec<_>>()
+    ));
+}
