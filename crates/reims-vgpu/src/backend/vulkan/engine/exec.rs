@@ -4323,7 +4323,15 @@ pub(crate) unsafe fn execute_draw_inner(
             })?;
             let shifted = {
                 let _s = stage_phase::Span::moving(stage_phase::Part::Shift, len as u64);
-                let mut shifted = vec![0u8; len];
+                // `prefix` is the guest's base instance times its stride; a
+                // length the host cannot commit is the same refusal as one that
+                // overflows, not a process abort.
+                let mut shifted = crate::runtime::draw::guest_zeroed(len).ok_or(
+                    DrawError::DrawExecution(DrawExecutionDecline::ConstantVertexAllocationOverflow {
+                        prefix,
+                        bytes_len: bytes.len(),
+                    }),
+                )?;
                 shifted[prefix..].copy_from_slice(bytes);
                 shifted
             };
