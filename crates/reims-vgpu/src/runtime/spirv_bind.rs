@@ -354,6 +354,14 @@ pub enum ImageFormatSpecializeError {
         pointer: u32,
         declared: u32,
     },
+    /// A retyped variable's image value reached an instruction the retype pass
+    /// does not repair (see [`refuse_unrepaired_image_consumers`]). The same
+    /// survival argument as `LoadTypeMismatch`: the module this device would
+    /// assemble is invalid on a host with no validator.
+    ImageValueEscapes {
+        value: u32,
+        opcode: u16,
+    },
 }
 
 impl crate::observe::Decline for ImageFormatSpecializeError {
@@ -367,6 +375,7 @@ impl crate::observe::Decline for ImageFormatSpecializeError {
             Self::MissingBinding(_) => "spirv_format_specialize_missing_binding",
             Self::AmbiguousBinding(_) => "spirv_format_specialize_ambiguous_binding",
             Self::LoadTypeMismatch { .. } => "spirv_format_specialize_load_type_mismatch",
+            Self::ImageValueEscapes { .. } => "spirv_format_specialize_image_value_escapes",
         }
     }
 
@@ -379,6 +388,10 @@ impl crate::observe::Decline for ImageFormatSpecializeError {
             Self::LoadTypeMismatch { pointer, declared } => vec![
                 ("pointer", pointer.to_string()),
                 ("declared", declared.to_string()),
+            ],
+            Self::ImageValueEscapes { value, opcode } => vec![
+                ("value", value.to_string()),
+                ("opcode", opcode.to_string()),
             ],
         }
     }
@@ -838,6 +851,26 @@ pub fn validate(words: &[u32]) -> SpirvValidation {
     validate_inner(words).0
 }
 
+/// Whether a `spirv_val_bytes` error is the *process* failing to run rather
+/// than the validator rejecting the module.
+///
+/// Spawn-failure spellings only: the io layer's own words for "there is no
+/// such program" on the hosts this runs on. Validator *diagnoses* must not
+/// match — SPIRV-Tools writes "id ... not found" for a dangling reference,
+/// and folding that onto "tool absent" let a rejected module through
+/// unvalidated on a host that has the tool.
+fn validator_process_absent(why: &str) -> bool {
+    const SPAWN_FAILURES: [&str; 4] = [
+        "No such file",       // POSIX exec
+        "program not found",  // Windows CreateProcess
+        "os error 2",         // either, as rendered by the io layer
+        "Access is denied",   // present but not executable
+    ];
+    // "spawn" alone is dropped: it appears in backtrace-y wrapper text that a
+    // diagnosis could quote.
+    SPAWN_FAILURES.iter().any(|pat| why.contains(pat))
+}
+
 /// [`validate`], and whether a validator actually ran: an `Accepted` from an
 /// absent tool is not evidence and must not be remembered as a verdict.
 fn validate_inner(words: &[u32]) -> (SpirvValidation, bool) {
@@ -874,7 +907,14 @@ fn validate_inner(words: &[u32]) -> (SpirvValidation, bool) {
             // as a rejected module, and the two must not be confused: one is a
             // module that would take the process down, the other is a laptop
             // without SPIRV-Tools installed.
-            if why.contains("No such file") || why.contains("spawn") || why.contains("not found") {
+            //
+            // The patterns are the *process-spawn* spellings only. The bare
+            // "not found" this used to match is also a validator diagnosis
+            // ("id 42 not found"), which on a host that HAS the tool turned a
+            // genuine rejection into "tool absent" - the module reached the
+            // driver unvalidated, strictly worse than the case this arm
+            // exists for.
+            if validator_process_absent(&why) {
                 if crate::observe::first_sight("spirv_val_absent", 0) {
                     crate::observe::fail(format!(
                         "spirv_validate reason=validator_unavailable detail={}",
@@ -1001,8 +1041,14 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     let first_fn = ins.iter().position(|x| op(x) == OP_FUNCTION)?;
     let mut bound = words[3];
     let mut next = || {
-        bound += 1;
-        bound - 1
+        // Release overflow-checks are off, so a plain `bound += 1` wraps past
+        // u32::MAX onto ids the module already defines, and the bound sizes the
+        // per-id tables the walkers build (MAX_ID_BOUND). A refused allocation
+        // declines the rewrite exactly as a malformed module does.
+        (bound < MAX_ID_BOUND as u32).then(|| {
+            bound += 1;
+            bound - 1
+        })
     };
     let globals = &ins[..first_fn];
     let find = |pred: &dyn Fn(&[u32]) -> bool| globals.iter().find(|x| pred(x)).map(|x| x[1]);
@@ -1010,7 +1056,7 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     let t_void = match find(&|x| op(x) == OP_TYPE_VOID) {
         Some(t) => t,
         None => {
-            let t = next();
+            let t = next()?;
             added.push(vec![OP_TYPE_VOID, t]);
             t
         }
@@ -1018,7 +1064,7 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     let t_uint = match find(&|x| op(x) == OP_TYPE_INT && x.len() == 4 && x[2] == 32 && x[3] == 0) {
         Some(t) => t,
         None => {
-            let t = next();
+            let t = next()?;
             added.push(vec![OP_TYPE_INT, t, 32, 0]);
             t
         }
@@ -1026,7 +1072,7 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     let t_bool = match find(&|x| op(x) == OP_TYPE_BOOL) {
         Some(t) => t,
         None => {
-            let t = next();
+            let t = next()?;
             added.push(vec![OP_TYPE_BOOL, t]);
             t
         }
@@ -1036,7 +1082,7 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     }) {
         Some(t) => t,
         None => {
-            let t = next();
+            let t = next()?;
             added.push(vec![OP_TYPE_POINTER, t, STORAGE_FUNCTION, t_uint]);
             t
         }
@@ -1044,16 +1090,16 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
     let t_fn = match find(&|x| op(x) == OP_TYPE_FUNCTION && x.len() == 4 && x[2] == t_void && x[3] == t_uint) {
         Some(t) => t,
         None => {
-            let t = next();
+            let t = next()?;
             added.push(vec![OP_TYPE_FUNCTION, t, t_void, t_uint]);
             t
         }
     };
-    let (c0, c1, ccap) = (next(), next(), next());
+    let (c0, c1, ccap) = (next()?, next()?, next()?);
     added.push(vec![OP_CONSTANT, t_uint, c0, 0]);
     added.push(vec![OP_CONSTANT, t_uint, c1, 1]);
     added.push(vec![OP_CONSTANT, t_uint, ccap, cap]);
-    let fcheck = next();
+    let fcheck = next()?;
 
     let mut out: Vec<Vec<u32>> = globals.iter().map(|x| x.to_vec()).collect();
     out.extend(added);
@@ -1078,12 +1124,12 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
                 out.push(ins[k].to_vec());
                 k += 1;
             }
-            cnt = next();
+            cnt = next()?;
             out.push(vec![OP_VARIABLE, t_ptr, cnt, STORAGE_FUNCTION, c0]);
             continue;
         }
         if op(x) == OP_LOOP_MERGE && cnt != 0 {
-            let (a, b, r) = (next(), next(), next());
+            let (a, b, r) = (next()?, next()?, next()?);
             out.push(vec![OP_LOAD, t_uint, a, cnt]);
             out.push(vec![OP_IADD, t_uint, b, a, c1]);
             out.push(vec![OP_STORE, cnt, b]);
@@ -1093,7 +1139,7 @@ fn loop_budget_words(words: &[u32], cap: u32) -> Option<(Vec<u32>, u32)> {
         out.push(x.to_vec());
         k += 1;
     }
-    let (p, l0, lk, lr, over) = (next(), next(), next(), next(), next());
+    let (p, l0, lk, lr, over) = (next()?, next()?, next()?, next()?, next()?);
     out.push(vec![OP_FUNCTION, t_void, fcheck, 0, t_fn]);
     out.push(vec![OP_FUNCTION_PARAMETER, t_uint, p]);
     out.push(vec![OP_LABEL, l0]);
@@ -1186,8 +1232,14 @@ pub fn demote_multisampled_images(words: &[u32]) -> Option<Vec<u32>> {
         .collect();
     let mut bound = words[3];
     let mut next = || {
-        bound += 1;
-        bound - 1
+        // Release overflow-checks are off, so a plain `bound += 1` wraps past
+        // u32::MAX onto ids the module already defines, and the bound sizes the
+        // per-id tables the walkers build (MAX_ID_BOUND). A refused allocation
+        // declines the rewrite exactly as a malformed module does.
+        (bound < MAX_ID_BOUND as u32).then(|| {
+            bound += 1;
+            bound - 1
+        })
     };
     let mut added: Vec<Vec<u32>> = Vec::new();
     let globals: Vec<Vec<u32>> = ins[..first_fn].to_vec();
@@ -1198,24 +1250,28 @@ pub fn demote_multisampled_images(words: &[u32]) -> Option<Vec<u32>> {
     let int_ty = match int_ty {
         Some(t) => t,
         None => {
-            let t = next();
+            let t = next()?;
             added.push(vec![(4 << 16) | OP_TYPE_INT, t, 32, 1]);
             t
         }
     };
-    let constant = |ty: u32, value: u32, added: &mut Vec<Vec<u32>>, next: &mut dyn FnMut() -> u32| {
-        globals
+    let constant = |ty: u32,
+                    value: u32,
+                    added: &mut Vec<Vec<u32>>,
+                    next: &mut dyn FnMut() -> Option<u32>|
+     -> Option<u32> {
+        if let Some(found) = globals
             .iter()
             .chain(added.iter())
             .find(|x| op(x) == OP_CONSTANT && x.len() == 4 && x[1] == ty && x[3] == value)
-            .map(|x| x[2])
-            .unwrap_or_else(|| {
-                let id = next();
-                added.push(vec![(4 << 16) | OP_CONSTANT, ty, id, value]);
-                id
-            })
+        {
+            return Some(found[2]);
+        }
+        let id = next()?;
+        added.push(vec![(4 << 16) | OP_CONSTANT, ty, id, value]);
+        Some(id)
     };
-    let zero = constant(int_ty, 0, &mut added, &mut next);
+    let zero = constant(int_ty, 0, &mut added, &mut next)?;
     let mut rewritten = 0usize;
     for x in ins.iter_mut() {
         if op(x) == u32::from(OP_TYPE_IMAGE) && x.len() >= 9 && x[6] == 1 {
@@ -1266,7 +1322,7 @@ pub fn demote_multisampled_images(words: &[u32]) -> Option<Vec<u32>> {
             body.push(vec![(5 << 16) | u32::from(OP_IMAGE_QUERY_SIZE_LOD), x[1], x[2], x[3], zero]);
             rewritten += 1;
         } else if o == u32::from(OP_IMAGE_QUERY_SAMPLES) && x.len() == 4 && ms_values.contains(&x[3]) {
-            let one = constant(x[1], 1, &mut added, &mut next);
+            let one = constant(x[1], 1, &mut added, &mut next)?;
             body.push(vec![(4 << 16) | u32::from(OP_COPY_OBJECT), x[1], x[2], one]);
             rewritten += 1;
         } else {
@@ -1693,6 +1749,7 @@ pub fn specialize_image_formats(
     // differently typed — and this pass is why the clone path is usable at all.
     retype_loads(words, &retyped);
     verify_load_types(words)?;
+    refuse_unrepaired_image_consumers(words, &retyped)?;
     for &(binding, format) in requested {
         if image_format(words, binding) != Some(format) {
             return Err(ImageFormatSpecializeError::MissingBinding(binding));
@@ -1724,6 +1781,89 @@ fn retype_loads(words: &mut [u32], retyped: &std::collections::BTreeMap<u32, u32
         }
         i += word_count;
     }
+}
+
+/// A retyped variable's image value may reach any instruction a module can
+/// take it to, but [`retype_loads`] repairs only the `OpLoad` itself. Every
+/// *other* consumer names the image's type in its own result type or an
+/// Image-Type operand — `OpSampledImage`, `OpPhi`, `OpSelect`, `OpCopyObject`,
+/// call arguments, a store into a function-local pointer — and would keep
+/// naming the old type after the retype, which is the invalid-module class
+/// [`ImageFormatSpecializeError::LoadTypeMismatch`] documents an NVIDIA
+/// compiler crashing on. The image ops that take the loaded object and declare
+/// no type of their own (`OpImageRead`, `OpImageWrite`,
+/// `OpImageTexelPointer`) are the whole legal consumer set; decoration and
+/// name records target the id without a typed opinion; anything else refuses
+/// the specialization, and the caller declines the dispatch by name.
+fn refuse_unrepaired_image_consumers(
+    words: &[u32],
+    retyped: &std::collections::BTreeMap<u32, u32>,
+) -> Result<(), ImageFormatSpecializeError> {
+    if retyped.is_empty() {
+        return Ok(());
+    }
+    // Pass 1: the image values this pass retyped — every OpLoad's result over
+    // a retyped variable.
+    let mut moved: std::collections::BTreeSet<u32> = Default::default();
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        if word_count == 0 || i + word_count > words.len() {
+            return Ok(());
+        }
+        if (words[i] & 0xffff) as u16 == OP_LOAD
+            && word_count >= 4
+            && retyped.contains_key(&words[i + 3])
+        {
+            moved.insert(words[i + 2]);
+        }
+        i += word_count;
+    }
+    if moved.is_empty() {
+        return Ok(());
+    }
+    // Pass 2: any appearance of a moved value outside the legal set refuses.
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        if word_count == 0 || i + word_count > words.len() {
+            return Ok(());
+        }
+        let opcode = (words[i] & 0xffff) as u16;
+        let names_or_decorates = matches!(
+            opcode,
+            OP_NAME
+                | OP_MEMBER_NAME
+                | OP_DECORATE
+                | OP_MEMBER_DECORATE
+                | OP_DECORATE_ID
+                | OP_DECORATE_STRING
+                | OP_MEMBER_DECORATE_STRING
+        );
+        if !matches!(opcode, OP_LOAD) && !names_or_decorates {
+            // The image operand's slot: 1 for OpImageWrite (no result), 3 for
+            // OpImageRead / OpImageTexelPointer (result type, result, image).
+            let legal_slot = match opcode {
+                OP_IMAGE_WRITE => Some(1),
+                OP_IMAGE_READ | OP_IMAGE_TEXEL_POINTER => Some(3),
+                _ => None,
+            };
+            for n in 1..word_count {
+                let at = i + n;
+                if legal_slot == Some(n) {
+                    continue;
+                }
+                if moved.contains(&words[at]) {
+                    return Err(ImageFormatSpecializeError::ImageValueEscapes {
+                        value: words[at],
+                        opcode,
+                    });
+                }
+            }
+        }
+        i += word_count;
+    }
+    Ok(())
 }
 
 /// Refuse a module whose loads and pointees disagree.
@@ -1935,12 +2075,14 @@ pub fn required_image_capabilities(words: &[u32]) -> RequiredImageCapabilities {
     let mut has_unknown_storage_image = false;
     let mut has_image_write = false;
     let mut has_image_read = false;
+    let mut whole = true;
 
     let mut i = HEADER_WORDS;
     while i < words.len() {
         let word_count = (words[i] >> 16) as usize;
         let opcode = (words[i] & 0xffff) as u16;
         if word_count == 0 || i + word_count > words.len() {
+            whole = false;
             break;
         }
         match opcode {
@@ -1963,6 +2105,24 @@ pub fn required_image_capabilities(words: &[u32]) -> RequiredImageCapabilities {
             _ => {}
         }
         i += word_count;
+    }
+    if !whole {
+        // The frame stopped framing, so whatever follows the break point is
+        // invisible to this walk. Over-approximate rather than under-declare:
+        // a redundant capability is valid SPIR-V (this function's own doc),
+        // a missing one is an invalid module. The caller's feature gate turns
+        // the over-ask into a named decline on a host that cannot honour it.
+        if crate::observe::first_sight("spirv_frame_broken_caps", words.len() as u64) {
+            crate::observe::fail(format!(
+                "spirv_frame_broken_caps len={} (the capability scan stopped on a framing \
+                 refusal; every image capability is being required)",
+                words.len()
+            ));
+        }
+        need.extended_formats = true;
+        need.write_without_format = true;
+        need.read_without_format = true;
+        return need;
     }
     need.write_without_format = has_unknown_storage_image && has_image_write;
     need.read_without_format = has_unknown_storage_image && has_image_read;
@@ -2059,7 +2219,12 @@ fn sampler_descriptor_bindings(words: &[u32], include_combined: bool) -> Vec<u32
         let word_count = (word0 >> 16) as usize;
         let opcode = (word0 & 0xffff) as u16;
         if word_count == 0 || i + word_count > words.len() {
-            break;
+            // A truncated frame hands back the empty set rather than a partial
+            // one: the callers of this answer are backstops and neutral
+            // provisioners, and both degrade into named refusals on "no
+            // samplers" - a wrong frame served them worse.
+            note_frame_broken("spirv_frame_broken_sampler_scan", words);
+            return Vec::new();
         }
         match opcode {
             OP_TYPE_SAMPLER if word_count >= 2 => {
@@ -2366,17 +2531,17 @@ pub(crate) fn test_module_with_separate_and_combined_samplers() -> Vec<u32> {
 /// a leak.
 pub fn declared_binding_numbers_memoized(
     words: &std::sync::Arc<Vec<u32>>,
-) -> std::sync::Arc<[u32]> {
+) -> Option<std::sync::Arc<[u32]>> {
     let key = std::sync::Arc::as_ptr(words) as usize;
     let mut guard = match DECLARED_BINDINGS.lock() {
         Ok(guard) => guard,
         // A poisoned memo is a cache, not state: answer from the walk rather
         // than refusing a draw over it.
-        Err(_) => return std::sync::Arc::from(declared_binding_numbers(words)),
+        Err(_) => return declared_binding_numbers(words).map(std::sync::Arc::from),
     };
     let memo = guard.get_or_insert_with(std::collections::HashMap::new);
     if let Some((_, declared)) = memo.get(&key) {
-        return std::sync::Arc::clone(declared);
+        return Some(std::sync::Arc::clone(declared));
     }
     if memo.len() >= DECLARED_BINDING_ENTRIES {
         crate::observe::off(format!(
@@ -2386,7 +2551,10 @@ pub fn declared_binding_numbers_memoized(
         ));
         memo.clear();
     }
-    let declared: std::sync::Arc<[u32]> = std::sync::Arc::from(declared_binding_numbers(words));
+    // A refused frame is not cached: it is a property of the walk, and the
+    // fail-once line above should keep answering for it while the (immutable)
+    // module is asked again.
+    let declared: std::sync::Arc<[u32]> = declared_binding_numbers(words)?.into();
     memo.insert(
         key,
         (
@@ -2394,7 +2562,7 @@ pub fn declared_binding_numbers_memoized(
             std::sync::Arc::clone(&declared),
         ),
     );
-    declared
+    Some(declared)
 }
 
 /// Modules the memo holds before it starts over. Sized as the engine's
@@ -2413,16 +2581,63 @@ type DeclaredBindingMemo =
 static DECLARED_BINDINGS: std::sync::Mutex<Option<DeclaredBindingMemo>> =
     std::sync::Mutex::new(None);
 
-pub fn declared_binding_numbers(words: &[u32]) -> Vec<u32> {
+/// A used-binding list entry no layout can contain, for a module whose frame
+/// does not walk whole: the `UsedBindingAbsentFromLayout` backstop sees it
+/// absent from every layout and refuses each draw of that shader by name —
+/// fail-closed without threading a second flag through every request.
+pub const BROKEN_FRAME_BINDING: u32 = u32::MAX;
+
+/// One fail-once line, for a scan that stopped on a framing refusal and
+/// answered empty rather than partial.
+fn note_frame_broken(slug: &'static str, words: &[u32]) {
+    if crate::observe::first_sight(slug, words.len() as u64) {
+        crate::observe::fail(format!(
+            "{slug} len={} (a scan stopped on a framing refusal and answered empty)",
+            words.len()
+        ));
+    }
+}
+
+/// Whether an instruction walk of `words` reaches its end without a framing
+/// refusal.
+///
+/// The scans below used to `break` here and hand back what they had found as
+/// though it were the whole answer. For `declared_binding_numbers` that is a
+/// partial used-binding list behind the layout backstop whose whole purpose is
+/// the Mesa `SIGFPE`; for the capability walk it is an under-declared
+/// requirement. One predicate, so every walker refuses the same frame.
+fn frame_walks_whole(words: &[u32]) -> bool {
+    if words.len() < HEADER_WORDS {
+        return false;
+    }
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        if word_count == 0 || i + word_count > words.len() {
+            return false;
+        }
+        i += word_count;
+    }
+    true
+}
+
+pub fn declared_binding_numbers(words: &[u32]) -> Option<Vec<u32>> {
+    if !frame_walks_whole(words) {
+        if crate::observe::first_sight("spirv_frame_broken", words.len() as u64) {
+            crate::observe::fail(format!(
+                "spirv_frame_broken len={} (a binding scan stopped on a framing refusal; \
+                 every draw of this module will be refused by name)",
+                words.len()
+            ));
+        }
+        return None;
+    }
     let mut bindings = Vec::new();
     let mut i = HEADER_WORDS;
     while i < words.len() {
         let word0 = words[i];
         let word_count = (word0 >> 16) as usize;
         let opcode = (word0 & 0xffff) as u16;
-        if word_count == 0 || i + word_count > words.len() {
-            break;
-        }
         if opcode == OP_DECORATE && word_count >= 4 && words[i + 2] == DECORATION_BINDING {
             bindings.push(words[i + 3]);
         }
@@ -2430,7 +2645,7 @@ pub fn declared_binding_numbers(words: &[u32]) -> Vec<u32> {
     }
     bindings.sort_unstable();
     bindings.dedup();
-    bindings
+    Some(bindings)
 }
 
 /// SPIR-V `OpTypeImage` `Sampled` operand value 1 — "will be used with a
@@ -2474,7 +2689,12 @@ pub fn sampled_image_bindings(words: &[u32]) -> Vec<u32> {
         let word_count = (word0 >> 16) as usize;
         let opcode = (word0 & 0xffff) as u16;
         if word_count == 0 || i + word_count > words.len() {
-            break;
+            // As the sampler scan: the caller provisions neutral images for the
+            // bindings this names, and a partial list would leave a used
+            // binding unprovisioned - the layout backstop refuses that by name,
+            // which an empty list reaches without the partial middle.
+            note_frame_broken("spirv_frame_broken_image_scan", words);
+            return Vec::new();
         }
         match opcode {
             // OpTypeImage: result, sampled type, Dim, Depth, Arrayed, MS,
@@ -2554,13 +2774,13 @@ pub enum BindingClass {
 /// variable → pointer → pointee chain did not resolve", and the two are the same
 /// answer to the only question asked here: this walk cannot name that variable's
 /// class. Callers must not treat `None` as a class.
-fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
+fn variable_classes(words: &[u32]) -> Option<Vec<Option<BindingClass>>> {
     let Some(&bound) = words.get(3) else {
-        return Vec::new();
+        return None;
     };
     let bound = bound as usize;
     if words.len() < HEADER_WORDS || bound == 0 || bound > MAX_ID_BOUND {
-        return Vec::new();
+        return None;
     }
     // Class of a *type* id, the pointee a descriptor pointer names.
     let mut type_class: Vec<Option<BindingClass>> = vec![None; bound];
@@ -2577,7 +2797,11 @@ fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
         let word_count = (word0 >> 16) as usize;
         let opcode = (word0 & 0xffff) as u16;
         if word_count == 0 || i + word_count > words.len() {
-            break;
+            // A partial class table would misclassify every variable declared
+            // past the break point (the Buffer default), relocating bindings by
+            // a guess. The caller declines the whole rewrite instead.
+            note_frame_broken("spirv_frame_broken_class_scan", words);
+            return None;
         }
         let mut set_type = |id: u32, class: BindingClass| {
             if (id as usize) < bound {
@@ -2624,7 +2848,7 @@ fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
         i += word_count;
     }
 
-    (0..bound)
+    let classes = (0..bound)
         .map(|id| {
             let pointer = var_type[id]?;
             let mut pointee = pointee.get(pointer).copied().flatten()?;
@@ -2646,7 +2870,8 @@ fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
                     .unwrap_or(BindingClass::Buffer),
             )
         })
-        .collect()
+        .collect();
+    Some(classes)
 }
 
 /// A `Binding` decoration whose variable [`variable_classes`] could not name, so
@@ -2682,13 +2907,21 @@ impl crate::observe::Decline for UnclassifiedBinding {
 fn relocate_by_class(
     words: &mut [u32],
     classes: &[BindingClass],
-    band: impl Fn(u32) -> bool,
     offset: u32,
 ) -> usize {
     if offset == 0 {
         return 0;
     }
-    let by_variable = variable_classes(words);
+    let by_variable = match variable_classes(words) {
+        Some(by_variable) => by_variable,
+        None => {
+            // The class table could not be walked whole; relocating on the
+            // partial one would move bindings by guesswork (see the scan's own
+            // break comment), and leaving them unmoved keeps every layout
+            // backstop in charge of the refusal.
+            return 0;
+        }
+    };
     let mut rewritten = 0usize;
     let mut i = HEADER_WORDS;
     while i < words.len() {
@@ -2704,12 +2937,22 @@ fn relocate_by_class(
             let wanted = match by_variable.get(variable as usize).copied().flatten() {
                 Some(class) => classes.contains(&class),
                 None => {
+                    // A decoration the type walk could not classify stays where
+                    // the module put it. The band rule this used to apply is
+                    // only correct while every Metal index stays under 32 (its
+                    // own doc), so an unclassified texture past the band edge
+                    // could be relocated onto another stage's slot - or into
+                    // the engine's ColorInput band - while the reflection
+                    // still answers the old number: a silently mis-numbered
+                    // binding. Unrelocated, the layout backstops
+                    // (`UsedBindingAbsentFromLayout`, `DescriptorBindingConflict`)
+                    // refuse the draw by name instead.
                     crate::observe::Emit::decline(
                         "spirv_reloc",
                         &UnclassifiedBinding { binding, variable },
                     )
                     .fail_once(u64::from(binding));
-                    band(binding)
+                    false
                 }
             };
             if wanted {
@@ -2746,7 +2989,6 @@ pub fn offset_fragment_buffer_bindings(words: &mut [u32]) -> usize {
     relocate_by_class(
         words,
         &[BindingClass::Buffer],
-        |binding| binding < SAMPLED_RESOURCE_BINDING_BASE,
         FRAG_BUFFER_BINDING_OFFSET,
     )
 }
@@ -2791,7 +3033,6 @@ pub fn widen_sampled_bands(words: &mut [u32]) -> usize {
     relocate_by_class(
         words,
         &[BindingClass::Sampler, BindingClass::ColorInput],
-        |binding| binding >= M2V_SAMPLER_BINDING_BASE,
         SAMPLED_TAIL_WIDEN_OFFSET,
     )
 }
@@ -2811,9 +3052,6 @@ pub fn offset_fragment_sampled_resource_bindings(words: &mut [u32]) -> usize {
     relocate_by_class(
         words,
         &[BindingClass::SampledTexture, BindingClass::Sampler],
-        |binding| {
-            (SAMPLED_RESOURCE_BINDING_BASE..SAMPLED_RESOURCE_BINDING_LIMIT).contains(&binding)
-        },
         FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
     )
 }
@@ -4283,6 +4521,123 @@ pub fn log_folded_function_constants(reflection: &ShaderReflection) -> usize {
 mod tests {
     use super::*;
 
+    /// The image ops take the loaded object and declare no type of their own;
+    /// every other consumer of a retyped image value would name the old type
+    /// after the retype, so the specialization refuses it by name instead of
+    /// handing the driver an invalid module.
+    #[test]
+    fn a_retyped_image_value_refuses_any_consumer_but_the_image_ops() {
+        let retyped = std::collections::BTreeMap::from([(1u32, 8u32)]);
+        // 5-word header; %2 = OpLoad %8 %1 (a retyped variable's image value).
+        let header: [u32; 5] = [0x0723_0203, 0, 0, 16, 0];
+        let load: [u32; 4] = [(4 << 16) | u32::from(OP_LOAD), 8, 2, 1];
+        let read: [u32; 5] = [(5 << 16) | u32::from(OP_IMAGE_READ), 9, 3, 2, 5];
+        let write: [u32; 4] = [(4 << 16) | u32::from(OP_IMAGE_WRITE), 2, 5, 6];
+        let ok: Vec<u32> = header
+            .into_iter()
+            .chain(load)
+            .chain(read)
+            .chain(write)
+            .collect();
+        assert!(refuse_unrepaired_image_consumers(&ok, &retyped).is_ok());
+
+        // OpSampledImage (87) names the image's type in its own Image-Type
+        // operand - the exact consumer the retype pass cannot follow.
+        let sampled: [u32; 6] = [(6 << 16) | 87, 9, 3, 8, 2, 4];
+        let escapes: Vec<u32> = header
+            .into_iter()
+            .chain(load)
+            .chain(sampled)
+            .collect();
+        assert_eq!(
+            refuse_unrepaired_image_consumers(&escapes, &retyped),
+            Err(ImageFormatSpecializeError::ImageValueEscapes {
+                value: 2,
+                opcode: 87
+            })
+        );
+
+        // A copy under another id is just as typed as the phi and the select
+        // it feeds.
+        let copy: [u32; 4] = [(4 << 16) | u32::from(OP_COPY_OBJECT), 9, 3, 2];
+        let copied: Vec<u32> = header
+            .into_iter()
+            .chain(load)
+            .chain(copy)
+            .collect();
+        assert!(refuse_unrepaired_image_consumers(&copied, &retyped).is_err());
+
+        // A decoration on the moved value carries no typed opinion.
+        let decorate: [u32; 3] = [(3 << 16) | u32::from(OP_DECORATE), 2, 0];
+        let named: Vec<u32> = header
+            .into_iter()
+            .chain(load)
+            .chain(decorate)
+            .collect();
+        assert!(refuse_unrepaired_image_consumers(&named, &retyped).is_ok());
+    }
+
+    /// The absent-tool sniff must not match a validator *diagnosis*: "id not
+    /// found" is a rejection, and reading it as "tool absent" hands the module
+    /// to the driver unvalidated on hosts that have the tool.
+    #[test]
+    fn the_absent_validator_sniff_matches_spawn_failures_only() {
+        for absent in [
+            "No such file or directory (os error 2)",
+            "program not found",
+            "Access is denied (os error 5)",
+        ] {
+            assert!(validator_process_absent(absent), "{absent} is a spawn failure");
+        }
+        for rejection in [
+            "spirv-val failed: error: line 12: ID 42 not found",
+            "error: 4: OpLoad: Result Type is not a type",
+        ] {
+            assert!(
+                !validator_process_absent(rejection),
+                "{rejection} is a validator verdict, not an absent tool"
+            );
+        }
+    }
+
+    /// The rewrites' id allocator hands out `bound + 1` upward; in a release
+    /// build that wraps past `u32::MAX` onto ids the module already defines,
+    /// and any bound past `MAX_ID_BOUND` would also size the walkers' per-id
+    /// tables past their own refusal. A spent bound declines the rewrite.
+    #[test]
+    fn a_module_whose_id_bound_is_spent_declines_the_rewrites() {
+        // Minimal fragment module: a void type, a fragment entry point, a
+        // loop merge, then the function section. No int type exists, so the
+        // first id the rewrite allocates is taken immediately - with the
+        // declared bound already past every cap the allocator may use.
+        let module = vec![
+            0x0723_0203,
+            0,
+            0,
+            u32::MAX - 1,
+            0,
+            (2 << 16) | 19,
+            7, // OpTypeVoid %7
+            (4 << 16) | 15,
+            4,
+            8,
+            0, // OpEntryPoint Fragment %8 ""
+            (4 << 16) | 246,
+            9,
+            10,
+            0, // OpLoopMerge %9 %10 None
+            (5 << 16) | 54,
+            7,
+            11,
+            0,
+            12, // OpFunction %7 %11 None %12
+        ];
+        assert!(
+            loop_budget_words(&module, 16384).is_none(),
+            "a spent bound declines rather than wrapping"
+        );
+    }
+
     /// The product walk names only separate samplers; the test oracle names both
     /// kinds. A combined image-sampler handed a sampler object would be a
     /// descriptor of the wrong type in the layout.
@@ -4578,16 +4933,21 @@ mod more_tests {
     fn the_memoized_binding_sweep_answers_per_module_and_not_per_first_call() {
         let a = std::sync::Arc::new(test_module_with_two_sampled_images(33, 34));
         let b = std::sync::Arc::new(test_module_with_two_sampled_images(40, 41));
-        let walk = |m: &std::sync::Arc<Vec<u32>>| declared_binding_numbers(m);
+        let walk =
+            |m: &std::sync::Arc<Vec<u32>>| declared_binding_numbers(m).expect("a whole frame");
 
         for _ in 0..2 {
             assert_eq!(
-                declared_binding_numbers_memoized(&a).to_vec(),
+                declared_binding_numbers_memoized(&a)
+                    .expect("a whole frame")
+                    .to_vec(),
                 walk(&a),
                 "the first module keeps its own answer"
             );
             assert_eq!(
-                declared_binding_numbers_memoized(&b).to_vec(),
+                declared_binding_numbers_memoized(&b)
+                    .expect("a whole frame")
+                    .to_vec(),
                 walk(&b),
                 "and the second is not served the first one's"
             );
@@ -4607,7 +4967,10 @@ mod more_tests {
     #[test]
     fn the_binding_sweep_is_class_blind_and_the_use_test_narrows_it() {
         let words = test_module_with_two_sampled_images(33, 34);
-        assert_eq!(declared_binding_numbers(&words), vec![33, 34]);
+        assert_eq!(
+            declared_binding_numbers(&words).expect("a whole frame"),
+            vec![33, 34]
+        );
         assert_eq!(descriptor_static_use(&words, 33), DescriptorUse::Used);
         assert_eq!(
             descriptor_static_use(&words, 34),
@@ -5779,23 +6142,34 @@ mod more_tests {
 
     #[test]
     fn offset_buffer_bindings_only_in_band() {
-        // Minimal fake module: header + one OpDecorate Binding 3 (4 words).
-        let mut words = vec![0u32; 5];
-        words[0] = 0x0723_0203; // magic-ish
-                                // OpDecorate: opcode 71, wordcount 4 → word0 = (4<<16)|71
-        words.push((4u32 << 16) | 71);
-        words.push(1); // target id
-        words.push(DECORATION_BINDING);
-        words.push(3); // binding
-                       // Binding 40 (texture band) must not move
-        words.push((4u32 << 16) | 71);
-        words.push(2);
-        words.push(DECORATION_BINDING);
-        words.push(40);
+        // Typed descriptors: a buffer-classed variable relocates, a
+        // texture-classed one does not. (The pre-type-rule form of this test
+        // decorated bare ids and exercised the numeric band fallback, which an
+        // unclassified binding no longer takes — see relocate_by_class.)
+        let mut words = module_header();
+        words.extend(typed_descriptor(1, 50, 3)); // pointee 50 names no image/sampler → Buffer
+        words.extend(image_type(10, 2));
+        words.extend(typed_descriptor(2, 10, 40)); // → SampledTexture, not the buffer band
         let n = offset_fragment_buffer_bindings(&mut words);
         assert_eq!(n, 1);
-        assert_eq!(words[8], 3 + FRAG_BUFFER_BINDING_OFFSET);
-        assert_eq!(words[12], 40);
+        let binding_of = |var: u32| {
+            let mut i = HEADER_WORDS;
+            let mut found = None;
+            while i < words.len() {
+                let wc = (words[i] >> 16) as usize;
+                if (words[i] & 0xffff) as u16 == OP_DECORATE
+                    && wc >= 4
+                    && words[i + 1] == var
+                    && words[i + 2] == DECORATION_BINDING
+                {
+                    found = Some(words[i + 3]);
+                }
+                i += wc;
+            }
+            found.unwrap()
+        };
+        assert_eq!(binding_of(1), 3 + FRAG_BUFFER_BINDING_OFFSET);
+        assert_eq!(binding_of(2), 40, "the texture band does not move");
     }
 
     #[test]
@@ -5810,38 +6184,49 @@ mod more_tests {
         // it — the engine binds the input attachment at its un-relocated number.
         //
         // These are DEVICE bindings, the numbering `widen_sampled_bands` leaves
-        // behind, because that is what the fragment relocations run on. The
-        // decorations carry no types, so this also exercises the band-predicate
-        // fallback that a variable the type walk cannot name falls back to.
-        let decorate = |id: u32, binding: u32| {
-            vec![
-                (4u32 << 16) | OP_DECORATE as u32,
-                id,
-                DECORATION_BINDING,
-                binding,
-            ]
-        };
-        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 7, 0];
-        words.extend(decorate(1, 1)); // fragment buffer → relocates
-        words.extend(decorate(2, COLOR_INPUT_BINDING_BASE + 1)); // ColorInput → stays
-        words.extend(decorate(3, TEXTURE_BINDING_BASE + 3)); // texture → sampled reloc
-        words.extend(decorate(4, SAMPLER_BINDING_BASE)); // sampler → sampled reloc
+        // behind, because that is what the fragment relocations run on. Every
+        // decoration rides a typed descriptor — the class rule relocated by;
+        // an untyped id is left alone by it.
+        let mut words = module_header();
+        words.extend(typed_descriptor(1, 50, 1)); // buffer → relocates (pointee names no image)
+        words.extend(image_type(10, DIM_SUBPASS_DATA));
+        words.extend(typed_descriptor(2, 10, COLOR_INPUT_BINDING_BASE + 1)); // ColorInput → stays
+        words.extend(image_type(11, 2));
+        words.extend(typed_descriptor(3, 11, TEXTURE_BINDING_BASE + 3)); // texture → sampled reloc
+        words.extend([(2u32 << 16) | OP_TYPE_SAMPLER as u32, 12]);
+        words.extend(typed_descriptor(4, 12, SAMPLER_BINDING_BASE)); // sampler → sampled reloc
 
         assert_eq!(offset_fragment_sampled_resource_bindings(&mut words), 2);
         assert_eq!(offset_fragment_buffer_bindings(&mut words), 1);
 
-        let bindings = [words[8], words[12], words[16], words[20]];
-        assert_eq!(bindings[0], 1 + FRAG_BUFFER_BINDING_OFFSET);
-        assert_eq!(bindings[1], COLOR_INPUT_BINDING_BASE + 1);
+        let binding_of = |var: u32| {
+            let mut i = HEADER_WORDS;
+            let mut found = None;
+            while i < words.len() {
+                let wc = (words[i] >> 16) as usize;
+                if (words[i] & 0xffff) as u16 == OP_DECORATE
+                    && wc >= 4
+                    && words[i + 1] == var
+                    && words[i + 2] == DECORATION_BINDING
+                {
+                    found = Some(words[i + 3]);
+                }
+                i += wc;
+            }
+            found.unwrap()
+        };
+        assert_eq!(binding_of(1), 1 + FRAG_BUFFER_BINDING_OFFSET);
+        assert_eq!(binding_of(2), COLOR_INPUT_BINDING_BASE + 1);
         assert_eq!(
-            bindings[2],
+            binding_of(3),
             TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
         );
         assert_eq!(
-            bindings[3],
+            binding_of(4),
             SAMPLER_BINDING_BASE + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
         );
         // All four distinct — no merged-set duplicate bindings.
+        let bindings = [binding_of(1), binding_of(2), binding_of(3), binding_of(4)];
         let mut sorted = bindings;
         sorted.sort_unstable();
         assert!(sorted.windows(2).all(|w| w[0] != w[1]));
@@ -5931,7 +6316,7 @@ mod more_tests {
         words.extend(typed_descriptor(30, IMAGE, TEXTURE_BINDING));
         words.extend(typed_descriptor(31, SAMPLER, SAMPLER_BINDING));
 
-        let classes = variable_classes(&words);
+        let classes = variable_classes(&words).expect("a whole test frame");
         assert_eq!(classes[30], Some(BindingClass::SampledTexture));
         assert_eq!(classes[31], Some(BindingClass::Sampler));
 
@@ -5972,7 +6357,7 @@ mod more_tests {
         words.extend(typed_descriptor(30, SUBPASS, COLOR_INPUT_BINDING_BASE + 1));
         words.extend(typed_descriptor(31, SAMPLED, TEXTURE_BINDING_BASE + 3));
 
-        let classes = variable_classes(&words);
+        let classes = variable_classes(&words).expect("a whole test frame");
         assert_eq!(classes[30], Some(BindingClass::ColorInput));
         assert_eq!(classes[31], Some(BindingClass::SampledTexture));
     }
@@ -5991,11 +6376,12 @@ mod more_tests {
             M2V_DEFAULT_DESCRIPTOR_LAYOUT.storage_textures.start + 3,
         ));
 
-        let classes = variable_classes(&words);
+        let classes = variable_classes(&words).expect("a whole test frame");
         assert_eq!(classes[30], Some(BindingClass::SampledTexture));
         assert_eq!(classes[31], Some(BindingClass::StorageTexture));
         assert_eq!(offset_fragment_sampled_resource_bindings(&mut words), 1);
-        let bindings = declared_binding_numbers(&words);
+        let bindings =
+            declared_binding_numbers(&words).expect("a whole test frame");
         assert!(
             bindings.contains(&(TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET))
         );
@@ -6015,12 +6401,49 @@ mod more_tests {
         words.extend([(4u32 << 16) | OP_TYPE_ARRAY as u32, ARRAY, IMAGE, LENGTH]);
         words.extend(typed_descriptor(30, ARRAY, TEXTURE_BINDING_BASE + 3));
 
-        assert_eq!(variable_classes(&words)[30], Some(BindingClass::SampledTexture));
+        assert_eq!(
+            variable_classes(&words).expect("a whole test frame")[30],
+            Some(BindingClass::SampledTexture)
+        );
         let mut buffers_moved = words.clone();
         assert_eq!(offset_fragment_buffer_bindings(&mut buffers_moved), 0);
         assert_eq!(offset_fragment_sampled_resource_bindings(&mut words), 1);
         assert!(declared_binding_numbers(&words)
+            .expect("a whole test frame")
             .contains(&(TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET)));
+    }
+
+    /// A frame that stops framing mid-module is refused by the binding scan,
+    /// over-asked by the capability scan, and left unrelocated by the class
+    /// pass — three fail-closed answers where each used to hand back a partial
+    /// one as though it were whole.
+    #[test]
+    fn a_broken_frame_is_refused_rather_than_answered_partially() {
+        let mut words = module_header();
+        words.extend(image_type(10, 2));
+        words.extend(typed_descriptor(30, 10, TEXTURE_BINDING_BASE));
+        // A zero word stops every walk partway through the module.
+        words.push(0);
+        words.extend(typed_descriptor(31, 10, TEXTURE_BINDING_BASE + 1));
+
+        assert!(
+            declared_binding_numbers(&words).is_none(),
+            "the binding sweep refuses rather than listing a prefix"
+        );
+        let caps = required_image_capabilities(&words);
+        assert!(caps.extended_formats);
+        assert!(caps.write_without_format);
+        assert!(caps.read_without_format);
+        assert!(
+            variable_classes(&words).is_none(),
+            "the class table refuses rather than defaulting a suffix to Buffer"
+        );
+        let mut relocated = words.clone();
+        assert_eq!(
+            offset_fragment_sampled_resource_bindings(&mut relocated),
+            0,
+            "nothing is relocated on a broken frame"
+        );
     }
 
     /// The type rule replaces the band rule, so on the layout the band rule was

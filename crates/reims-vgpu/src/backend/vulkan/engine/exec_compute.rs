@@ -122,6 +122,24 @@ enum ComputeImageDst {
     Direct(super::GuestCopyPlan),
 }
 
+/// Put back the registry accesses a refused submission's notes had advanced.
+///
+/// `execute_compute_inner` notes each multisample barrier's landing access at
+/// the barrier itself — the right order for a command buffer that runs. An
+/// `end_command_buffer`/`submit` refusal (or a forced loss that never submits)
+/// means those barriers never execute, so the registry would name layouts the
+/// images are not in and the next barrier over them reads a false `oldLayout`:
+/// undefined behaviour, not a validation error, durable for the boot. This
+/// restores exactly the slots the notes moved.
+fn rollback_noted_access(
+    pools: &mut ResourcePools,
+    noted: &mut Vec<(super::types::TargetIdentity, super::pools::ResidentAccess)>,
+) {
+    for (identity, prev) in noted.drain(..) {
+        pools.registry_note_access(&identity, prev);
+    }
+}
+
 pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
     if req.spirv.is_empty() {
         return Err(DrawError::ComputeValidation(
@@ -351,12 +369,19 @@ fn resident_sample_exact(
 /// for anything that is not a `UniformConstant` descriptor, so a storage buffer,
 /// whose root this walk cannot resolve, is never refused on a guess.
 fn used_binding_absent_from_layout(spirv: &[u32], layout: &[BindingSig]) -> Option<u32> {
-    crate::runtime::spirv_bind::declared_binding_numbers(spirv)
-        .into_iter()
-        .find(|binding| {
-            !layout.iter().any(|b| b.binding == *binding)
-                && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding).is_violation()
-        })
+    // A frame that does not walk whole has an unknowable used-binding list;
+    // the sentinel sits in no layout, so this refuses the dispatch by name
+    // rather than letting a used binding past the backstop on a partial scan.
+    crate::runtime::spirv_bind::declared_binding_numbers(spirv).map_or_else(
+        || Some(crate::runtime::spirv_bind::BROKEN_FRAME_BINDING),
+        |declared| {
+            declared.into_iter().find(|binding| {
+                !layout.iter().any(|b| b.binding == *binding)
+                    && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding)
+                        .is_violation()
+            })
+        },
+    )
 }
 
 pub(crate) unsafe fn execute_compute_inner(
@@ -1222,6 +1247,16 @@ pub(crate) unsafe fn execute_compute_inner(
     // the only transition they get, and it is owed for the same reason the
     // render rail's `PreparedSampled::Resident` arm owes one: the resident's
     // last touch was a colour write by another submission.
+    //
+    // Rollback pair: each note remembers what the slot held before it, because
+    // the note is at the barrier for a command buffer that *runs* — an
+    // end/submit refusal below leaves these barriers unexecuted forever, and a
+    // registry naming layouts the images are not in hands the next barrier a
+    // false oldLayout (undefined behaviour, not a validation error).
+    let mut noted_access: Vec<(
+        super::types::TargetIdentity,
+        super::pools::ResidentAccess,
+    )> = Vec::new();
     for prepared in &sampled_slots {
         let PreparedSampledImage::MultisampleTarget {
             identity,
@@ -1242,7 +1277,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 .new_layout(next_access.layout())
                 .image(*image)
                 .subresource_range(super::color_subresource_range())];
-            crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
+            crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device,
                 cb,
                 src_stage,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1254,6 +1289,9 @@ pub(crate) unsafe fn execute_compute_inner(
         }
         // After the barrier is recorded, so the registry never claims a layout
         // this command buffer has not been told to place the image in.
+        if let Some(prev) = pools.registry_get(identity).map(|slot| slot.access) {
+            noted_access.push((identity.clone(), prev));
+        }
         pools.registry_note_access(identity, *next_access);
     }
 
@@ -1417,9 +1455,10 @@ pub(crate) unsafe fn execute_compute_inner(
 
     unsafe { pools.gpu_span_seal_current(ctx, cb) };
     crate::backend::vulkan::engine::cmd_sink::sync();
-    ctx.device
-        .end_command_buffer(cb)
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecEndCb, e)))?;
+    ctx.device.end_command_buffer(cb).map_err(|e| {
+        rollback_noted_access(pools, &mut noted_access);
+        DrawError::VkCall(VkCall::new(VkOp::ComputeExecEndCb, e))
+    })?;
 
     if force_loss {
         if let (Some(ds), Some(pool)) = (dset, dset_pool) {
@@ -1428,6 +1467,7 @@ pub(crate) unsafe fn execute_compute_inner(
         pools.recycle_staging();
         pools.recycle_readback();
         pools.recycle_storage_images();
+        rollback_noted_access(pools, &mut noted_access);
         return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedCompute));
     }
 
@@ -1440,7 +1480,13 @@ pub(crate) unsafe fn execute_compute_inner(
                 result: e,
             }));
         }
-        Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ComputeExecSubmit, e))),
+        Err(e) => {
+            // The command buffer never runs; put the registry back with the
+            // facts. A device loss needs nothing here - recovery flushes the
+            // whole registry anyway.
+            rollback_noted_access(pools, &mut noted_access);
+            return Err(DrawError::VkCall(VkCall::new(VkOp::ComputeExecSubmit, e)));
+        }
     }
 
     // The copy into guest pages is on the queue now, so the debt is owed from

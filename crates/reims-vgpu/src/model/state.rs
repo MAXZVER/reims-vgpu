@@ -3326,6 +3326,13 @@ pub struct DeviceState {
     /// instead of a public field any call site can reach into.
     /// TEMP (lab, INGRESS_AHEAD): a `RwLock`, read by [`Self::pipeline_usage`]
     /// for a whole packet walk so helpers can walk several packets at once.
+    ///
+    /// Poison discipline: every door reads through
+    /// `unwrap_or_else(|poisoned| poisoned.into_inner())`, the same rule every
+    /// `Mutex` in this file already follows. A panic under this lock is a dead
+    /// device either way; recovering the guard turns "one bad packet aborts the
+    /// process" into "the doors keep answering", which is all a poisoned
+    /// session can offer and more than an `expect` did.
     session: std::sync::RwLock<reims_vgpu_core::session::SessionModel>,
     /// TEMP (lab, pipeline ids): the pipeline table as it would be named per
     /// task, stepped beside the real one. See
@@ -3774,8 +3781,9 @@ pub struct DeviceState {
     /// Task-GVA HostOps views (zero-copy import substrate). Dropped on
     /// overlapping UnmapMemory/MapMemory2; flushed via `retired_views`.
     pub gva_host_views: Vec<GvaHostView>,
-    /// Linear-window residency keys whose `host_linear_textures` entry died
-    /// (task/object delete). `DeviceState` cannot reach the engine; the
+    /// Residency keys whose owner died (task/object delete): linear windows
+    /// whose `host_linear_textures` entry went, and heap textures whose
+    /// mirror key was dropped. `DeviceState` cannot reach the engine; the
     /// runtime unpins these
     /// ([`crate::runtime::render_writeback::retire_linear_residents`]) so the
     /// pinned images become LRU-evictable instead of leaking.
@@ -4288,6 +4296,11 @@ impl DeviceState {
         // Same rule for the presented-seq witness: a recycled id must not
         // compare its first present against a predecessor's seq.
         self.present.presented_dense_seq.remove(&mapping_id);
+        // Same rule for the write class: a recycled id must not inherit its
+        // predecessor's Composite/ClearOnly, because the scanout path latches
+        // `early_front_mapping` on a Composite reading and a fresh, only-cleared
+        // surface would become the sticky early front of the old one.
+        self.surface_write_kind.remove(&mapping_id);
     }
 
     /// Last write class for present keep-prior decisions.
@@ -4436,6 +4449,38 @@ impl DeviceState {
         }
     }
 
+    /// Drop a deleted heap texture's residency-mirror key and queue the engine
+    /// release for the resident it named. A heap texture has no guest window to
+    /// re-read, so the engine's copy is the only content the key can point at:
+    /// a key that outlives its object either seeds the next texture created at
+    /// the same `(task, ref)` with the deleted one's pixels (silently — the
+    /// serve path finds the stale generation) or, once the resident was
+    /// reclaimed, refuses every dispatch bound to it forever
+    /// (`compute_stage_tex_heap_resident_lost`) because nothing ever removes
+    /// the key. `None` retires the task's whole heap population (task delete
+    /// and redefine); the engine release is the linear rail's pair — unpin
+    /// plus content-retire through `retired_linear_residents`.
+    fn retire_heap_residents(&mut self, task_id: u32, only_ref: Option<u32>) {
+        let doomed: Vec<ComputeStorageResidencyKey> = self
+            .compute_storage_residency
+            .keys()
+            .filter(|key| {
+                key.is_heap()
+                    && key.map_generation == task_id
+                    && only_ref.is_none_or(|ref_| key.texture_ref == ref_)
+            })
+            .copied()
+            .collect();
+        for key in doomed {
+            self.compute_storage_residency.remove(&key);
+            self.retired_linear_residents.push(key);
+        }
+    }
+
+    fn retire_task_heap_residents(&mut self, task_id: u32) {
+        self.retire_heap_residents(task_id, None);
+    }
+
     /// Install the guest's task under `task_id`, replacing any previous one.
     ///
     /// Returns nothing: it used to return `bool`, and the only `false` it could
@@ -4497,6 +4542,7 @@ impl DeviceState {
         // TEMP (lab): the census ring goes with the address space it describes.
         self.ch2ret.remove(&task_id);
         self.retire_task_linear_residents(task_id);
+        self.retire_task_heap_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
@@ -4546,6 +4592,7 @@ impl DeviceState {
             rail.delete_task(task_id);
         }
         self.retire_task_linear_residents(task_id);
+        self.retire_task_heap_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         self.host_texture_surfaces.retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
@@ -4752,7 +4799,7 @@ impl DeviceState {
                 let _ = self
                     .session
                     .write()
-                    .expect("session")
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .open_channel(reims_vgpu_core::identity::ChannelId(channel));
             }
         }
@@ -4766,7 +4813,7 @@ impl DeviceState {
     pub fn child_domain_open(&self, channel: u32) -> bool {
         self.session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .channel_open(reims_vgpu_core::identity::ChannelId(channel))
     }
 
@@ -4780,7 +4827,7 @@ impl DeviceState {
         &self,
         op: reims_vgpu_core::control::ControlOp,
     ) -> Result<(), reims_vgpu_core::session::ControlRefusal> {
-        self.session.write().expect("session").apply_control(op)
+        self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).apply_control(op)
     }
 
     /// Tell the ordering plane that the guest has created a pipeline object.
@@ -4812,7 +4859,7 @@ impl DeviceState {
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
         let (declared, generation) = {
-            let mut session = self.session.write().expect("session");
+            let mut session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             let generation = session.generation();
             (session.pipelines().declare(id, generation), generation)
         };
@@ -4872,7 +4919,7 @@ impl DeviceState {
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> reims_vgpu_core::session::Ended {
         let id = self.pipeline_id(task_id, pipeline);
-        let ended = self.session.write().expect("session").pipeline_retired(id);
+        let ended = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).pipeline_retired(id);
         self.lab_shadow.retire(task_id, pipeline, &ended);
         ended
     }
@@ -4902,7 +4949,7 @@ impl DeviceState {
         let took = self
             .session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .advance(id, next);
         self.lab_shadow.advance(task_id, pipeline, next);
@@ -4923,7 +4970,7 @@ impl DeviceState {
         let took = self
             .session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .withdraw(id);
         self.lab_shadow.withdraw(task_id, pipeline, took);
@@ -4954,7 +5001,7 @@ impl DeviceState {
             // real one keeps the first published, which is what it holds when
             // the rail is not asked again.
             self.lab_shadow.publish(task_id, pipeline, &usage);
-            let mut session = self.session.write().expect("session");
+            let mut session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             if session.pipelines().usage_published(id) {
                 return false;
             }
@@ -4964,7 +5011,7 @@ impl DeviceState {
         }
         self.session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .publish_usage_to(id, usage, self.usage_scope())
     }
@@ -4985,7 +5032,7 @@ impl DeviceState {
         let real = self
             .session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .usage_published(id);
         // TEMP (lab): asked for the task, so a reflection is built for each
@@ -5005,7 +5052,7 @@ impl DeviceState {
         let real = self
             .session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .usage_wanted_by(id, self.usage_scope());
         real || (super::lab_pipeline_shadow::enabled()
@@ -5037,7 +5084,7 @@ impl DeviceState {
     #[must_use]
     pub fn pipeline_usage(&self, task_id: u32) -> PipelineUsage<'_> {
         PipelineUsage(
-            self.session.read().expect("session"),
+            self.session.read().unwrap_or_else(|poisoned| poisoned.into_inner()),
             self.pipeline_scope(task_id),
             task_id,
             &self.lab_shadow,
@@ -5057,11 +5104,11 @@ impl DeviceState {
     ) -> bool {
         let id = self.pipeline_id(task_id, pipeline);
         let waiters = if super::lab_pipeline_shadow::enabled() {
-            self.session.write().expect("session").pipeline_waiters(id)
+            self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).pipeline_waiters(id)
         } else {
             Vec::new()
         };
-        let took = self.session.write().expect("session").pipeline_ready(id);
+        let took = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).pipeline_ready(id);
         self.lab_shadow.ready(task_id, pipeline, &waiters, took);
         took
     }
@@ -5077,7 +5124,7 @@ impl DeviceState {
             return;
         }
         let (generation, real) = {
-            let session = self.session.write().expect("session");
+            let session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             let generation = session.generation();
             let real: Vec<reims_vgpu_core::pipeline::Lease> = leases
                 .iter()
@@ -5140,7 +5187,7 @@ impl DeviceState {
     ) -> Option<&'static str> {
         self.session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .get(id)
             .map(|entry| entry.state.name())
@@ -5159,7 +5206,7 @@ impl DeviceState {
         let id = self.pipeline_id(task_id, pipeline);
         self.session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .release_past_ended_pipeline(ingress, id)
     }
 
@@ -5172,7 +5219,7 @@ impl DeviceState {
         let id = self.pipeline_id(task_id, pipeline);
         self.session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipelines()
             .get(id)
             .is_some_and(|entry| entry.state.is_ready())
@@ -5195,7 +5242,7 @@ impl DeviceState {
         let ended = self
             .session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pipeline_refused(id, reason);
         self.lab_shadow.refuse(task_id, pipeline, reason, &ended);
         ended
@@ -5223,7 +5270,7 @@ impl DeviceState {
         &self,
         packet: &reims_vgpu_core::session::Packet,
     ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
-        let mut session = self.session.write().expect("session");
+        let mut session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let admitted = session.admit(packet)?;
         Ok(Admission {
             epoch: session.epoch(),
@@ -5241,7 +5288,7 @@ impl DeviceState {
         &self,
         packet: reims_vgpu_core::session::Packet,
     ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
-        let mut session = self.session.write().expect("session");
+        let mut session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let admitted = session.admit_owned(packet)?;
         Ok(Admission {
             epoch: session.epoch(),
@@ -5260,7 +5307,7 @@ impl DeviceState {
     /// [`reims_vgpu_core::session::Packet::session`].
     #[must_use]
     pub fn session_generation(&self) -> reims_vgpu_core::identity::SessionGeneration {
-        self.session.write().expect("session").generation()
+        self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).generation()
     }
 
     /// The positions the model has released to run since the last ask.
@@ -5271,7 +5318,7 @@ impl DeviceState {
     /// unrepresentable — see `crate::runtime::parked::ParkedStore::release`.
     #[must_use = "a position taken off the ready list and not run is a packet that never runs"]
     pub fn take_ready(&self) -> Vec<reims_vgpu_core::identity::IngressOrdinal> {
-        self.session.write().expect("session").take_ready()
+        self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).take_ready()
     }
 
     /// A transaction finished on the host.
@@ -5297,7 +5344,7 @@ impl DeviceState {
     ) -> Result<Vec<reims_vgpu_core::publish::Release>, reims_vgpu_core::session::Refusal> {
         self.session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .complete(epoch, ingress)
     }
 
@@ -5312,7 +5359,7 @@ impl DeviceState {
         &self,
         ingress: reims_vgpu_core::identity::IngressOrdinal,
     ) -> Vec<reims_vgpu_core::publish::Release> {
-        self.session.write().expect("session").withdraw(ingress)
+        self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).withdraw(ingress)
     }
 
     /// The guest's completion word for `slot` has moved to `value`.
@@ -5330,7 +5377,7 @@ impl DeviceState {
         slot: reims_vgpu_core::identity::StampSlot,
         value: reims_vgpu_core::identity::StampValue,
     ) -> StampPublication {
-        let mut session = self.session.write().expect("session");
+        let mut session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = session.published_stamp(slot);
         session.stamp_published(reims_vgpu_core::identity::CompletionStamp { slot, value });
         let after = session.published_stamp(slot);
@@ -5349,13 +5396,13 @@ impl DeviceState {
         &self,
         slot: reims_vgpu_core::identity::StampSlot,
     ) -> Option<reims_vgpu_core::identity::StampValue> {
-        self.session.write().expect("session").published_stamp(slot)
+        self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).published_stamp(slot)
     }
 
     /// What the ordering plane holds about the pipelines this session declared.
     #[must_use]
     pub fn pipeline_census(&self) -> reims_vgpu_core::pipeline::Census {
-        self.session.write().expect("session").pipelines().census()
+        self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).pipelines().census()
     }
 
     /// The census line for what the ordering plane's pipeline table is holding
@@ -5387,7 +5434,7 @@ impl DeviceState {
         if now.saturating_sub(last) < WINDOW_MS {
             return None;
         }
-        let resting = self.session.write().expect("session").pipelines().resting();
+        let resting = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner()).pipelines().resting();
         if resting.total() == 0 {
             return None;
         }
@@ -5431,7 +5478,7 @@ impl DeviceState {
             return None;
         }
         let (census, live, slots) = {
-            let session = self.session.write().expect("session");
+            let session = self.session.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             let graph = session.graph();
             (graph.census(), graph.live_accesses(), graph.entries())
         };
@@ -5776,7 +5823,7 @@ impl DeviceState {
         let ended = self
             .session
             .write()
-            .expect("session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .task_ended(reims_vgpu_core::identity::TaskId(task_id));
         if ended.removed > 0 {
             crate::runtime::drain::note_store_route_n("pipeline_task_ended", ended.removed as u64);
@@ -5862,7 +5909,7 @@ impl DeviceState {
     ) -> Option<reims_vgpu_core::lifecycle::Redefinition> {
         self.bump_names_gen();
         use reims_vgpu_core::lifecycle::LifecycleOp;
-        let effects = self
+        let effects = match self
             .lifecycle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -5874,8 +5921,31 @@ impl DeviceState {
                 // registrations of slot zero rather than one.
                 kernel: task_id == 0,
                 directory: reims_vgpu_core::identity::DirectoryFrame(directory_pfn),
-            })
-            .expect("a definition opens the task it names");
+            }) {
+            Ok(effects) => effects,
+            Err(refusal) => {
+                // This is the one lifecycle op the device runs on its own door
+                // rather than through `apply_lifetime`, and its `Err` used to be
+                // an `expect` — a panic at an FFI entry over a refusal every
+                // sibling door reports. The refusal is not reachable from
+                // today's core (`live_names` builds ids from the current slot
+                // generations, so the redefine arm's `delete_resource` calls
+                // always resolve); the typed answer is for the day that stops
+                // being true, which is a core edit away and nothing else.
+                // The task does not open; packets against it refuse by name,
+                // which is the same answer `apply_lifetime` gives.
+                crate::runtime::drain::note_store_route(refusal.slug());
+                if crate::observe::first_sight("define_task_refused", u64::from(task_id)) {
+                    crate::observe::fail(format!(
+                        "define_task_refused task={task_id} refusal={} (the semantic model \
+                         refused to open the task's address space; its packets will refuse \
+                         by name)",
+                        refusal.slug()
+                    ));
+                }
+                return None;
+            }
+        };
         let mut acted = note_lifecycle_effects(effects, "define_task_namespace");
         crate::runtime::drain::note_store_route_n(
             "task_namespace_teardowns",
@@ -5913,6 +5983,7 @@ impl DeviceState {
         };
         if removed || resource_removed {
             self.invalidate_object_host_copies(task_id, ref_);
+            self.retire_heap_residents(task_id, Some(ref_));
             self.texture_to_mapping.remove(&(task_id, ref_));
             bump_names_gen();
             // The incarnation is deliberately not advanced here. Releasing a
@@ -6033,7 +6104,11 @@ impl DeviceState {
             .storage_incarnations
             .entry((task_id, base))
             .or_insert(0);
-        *slot = slot.wrapping_add(1);
+        // The 0-skip every sibling counter here takes (`next_epoch`,
+        // `next_sampled_content_generation`): 0 is the "never bumped" default,
+        // so a wrap that lands on it would equate a re-pointed window with a
+        // fresh one and hand `BackingWindowRefs::identity` the old backing.
+        *slot = next_epoch(*slot);
     }
 
     /// Say that every name in this task now describes different pages, for the
@@ -6052,7 +6127,9 @@ impl DeviceState {
     /// by how long the device has run.
     fn bump_task_storage_incarnations(&mut self, task_id: u32) {
         let slot = self.task_storage_epochs.entry(task_id).or_insert(0);
-        *slot = slot.wrapping_add(1);
+        // Same 0-skip as the per-name incarnation above: 0 is this table's
+        // "never bumped" default, not an incarnation.
+        *slot = next_epoch(*slot);
         self.storage_incarnations.retain(|&(t, _), _| t != task_id);
         self.backing_window_refs.delete_task(task_id);
         self.aliased_references
@@ -8614,6 +8691,120 @@ mod sampled_generation_tests {
         assert!(
             std::ptr::eq(state.par().expect("the pool survived the reset"), &*pool),
             "the same pool, not a rebuilt one"
+        );
+    }
+
+    /// A deleted heap texture's residency-mirror key must leave with the
+    /// object and reach the engine release queue: the engine's copy is the
+    /// only content a heap texture has, so a key that survives either seeds
+    /// the next texture at the same `(task, ref)` with the deleted one's
+    /// pixels or refuses its dispatches forever. Siblings (another ref, a
+    /// mapping-keyed window, another task's heap key) survive the retire.
+    #[test]
+    fn deleting_a_heap_texture_retires_its_residency_mirror() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.define_task(7, 0x1000, 5);
+        assert!(state.insert_object(7, 12));
+        let key = ComputeStorageResidencyKey::heap(7, 12, 64, 64, 0x7d);
+        state.compute_storage_residency.insert(key, 5);
+        let other_ref = ComputeStorageResidencyKey::heap(7, 13, 64, 64, 0x7d);
+        let other_task = ComputeStorageResidencyKey::heap(8, 12, 64, 64, 0x7d);
+        let mut window = key;
+        window.mapping_id = 9; // a real mapping id: a window key, not heap
+        window.surface_offset = 0x2000;
+        state.compute_storage_residency.insert(other_ref, 6);
+        state.compute_storage_residency.insert(other_task, 7);
+        state.compute_storage_residency.insert(window, 8);
+
+        assert!(state.delete_object(7, 12));
+        assert!(
+            !state.compute_storage_residency.contains_key(&key),
+            "the deleted texture's heap key left the mirror"
+        );
+        assert_eq!(state.retired_linear_residents, vec![key]);
+        assert!(
+            state.compute_storage_residency.contains_key(&other_ref),
+            "another ref's heap key survives an object delete"
+        );
+        assert!(
+            state.compute_storage_residency.contains_key(&other_task),
+            "another task's heap key survives an object delete"
+        );
+        assert!(
+            state.compute_storage_residency.contains_key(&window),
+            "a mapping-keyed window survives an object delete"
+        );
+
+        // Task teardown retires the task's whole heap population and nothing
+        // else's.
+        state.retired_linear_residents.clear();
+        assert!(state.delete_task(7));
+        assert!(!state.compute_storage_residency.contains_key(&other_ref));
+        assert_eq!(state.retired_linear_residents, vec![other_ref]);
+        assert!(state.compute_storage_residency.contains_key(&other_task));
+        assert!(state.compute_storage_residency.contains_key(&window));
+    }
+
+    /// A recycled mapping id must not inherit its predecessor's write class:
+    /// the scanout path latches `early_front_mapping` on a Composite reading,
+    /// so a stale Composite would make a fresh, only-cleared surface the old
+    /// one's sticky early front.
+    #[test]
+    fn a_forgotten_mapping_leaves_no_write_class_behind() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.note_surface_composite(9);
+        assert_eq!(state.surface_write_kind(9), SurfaceWriteKind::Composite);
+        // Condemn forgets the mapping; the prune runs before the early return
+        // that would leave an unmapped id's table entries standing.
+        state.condemn_surface_backing(9);
+        assert_eq!(
+            state.surface_write_kind(9),
+            SurfaceWriteKind::Unknown,
+            "the write class left with the mapping"
+        );
+    }
+
+    /// The define door reports a refusal rather than panicking. The `Err` arm
+    /// is not reachable from today's core (see the door's comment), so this
+    /// holds the door's shape — a redefine through the same delete path the
+    /// refusal would come from answers, and does not abort the process.
+    #[test]
+    fn defining_a_live_task_again_answers_rather_than_panicking() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.define_task(7, 0x1000, 5);
+        state.define_task(7, 0x1000, 5);
+        assert!(state.tasks.is_active(7), "the redefine went through");
+    }
+
+    /// A storage incarnation wrapping past `u32::MAX` lands on 1, never on the
+    /// 0 that means "never bumped" - the same rule the sibling counters take.
+    #[test]
+    fn a_wrapped_storage_incarnation_skips_zero() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.storage_incarnations.insert((7, 0x10), u32::MAX);
+        state.bump_storage_incarnation(7, 0x10);
+        assert_eq!(state.storage_incarnations[&(7, 0x10)], 1, "0 is skipped");
+        state.define_task(8, 0x1000, 5); // open the task so the next define redefines
+        state.task_storage_epochs.insert(8, u32::MAX);
+        state.define_task(8, 0x1000, 5); // live: the redefine bumps the epoch
+        assert_eq!(state.task_storage_epochs[&8], 1, "0 is skipped");
+    }
+
+    /// A panic under the session lock is a dead device, not a dead process:
+    /// every door recovers the guard through the poison, the discipline the
+    /// file's Mutexes already follow.
+    #[test]
+    fn a_poisoned_session_lock_does_not_kill_the_next_door() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let before = state.session_generation();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.session.write();
+            panic!("poison the session lock");
+        }));
+        assert_eq!(
+            state.session_generation(),
+            before,
+            "the door answered through the poison"
         );
     }
 }

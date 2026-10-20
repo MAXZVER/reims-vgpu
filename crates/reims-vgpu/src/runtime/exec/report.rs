@@ -354,10 +354,14 @@ pub(super) fn note_pass_extent_for_slot(
 /// naming its own target is not a failure.
 fn note_pass_target(task_id: u32, mapping_id: u32, geom: Option<(u32, u32)>) {
     let (w, h) = geom.unwrap_or((0, 0));
-    let key = (u64::from(task_id) << 48)
-        | (u64::from(mapping_id) << 32)
-        | (u64::from(w & 0xffff) << 16)
-        | u64::from(h & 0xffff);
+    // The full tuple hashed, not packed: the packing shifted task bits past 63
+    // and let a wide mapping id spill into them, so distinct targets collided
+    // and the second one's line was deduped away - the diagnostic this exists
+    // for, lost exactly under id churn.
+    let key = crate::backend::hash::hash_u64(
+        u64::from(task_id) << 32 | u64::from(mapping_id),
+        u64::from(w) << 32 | u64::from(h),
+    );
     if crate::observe::first_sight("pass_target", key) {
         let geom = match geom {
             Some((w, h)) => format!("{w}x{h}"),

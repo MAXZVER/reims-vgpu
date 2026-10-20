@@ -350,12 +350,22 @@ impl ShaderVariant {
         words: Arc<Vec<u32>>,
         samplers: Arc<[crate::runtime::spirv_bind::ReflectedSamplerDescriptor]>,
     ) -> Arc<Self> {
+        // A module whose frame does not walk whole has an unknowable
+        // used-binding list. The sentinel below sits in no layout ever built,
+        // so the `UsedBindingAbsentFromLayout` backstop refuses each draw of
+        // this shader by name — the Mesa SIGFPE class the backstop exists for,
+        // answered fail-closed rather than guessed at from a partial scan.
         let used_descriptor_bindings = crate::runtime::spirv_bind::declared_binding_numbers(&words)
-            .into_iter()
-            .filter(|binding| {
-                crate::runtime::spirv_bind::descriptor_static_use(&words, *binding).is_violation()
+            .map(|declared| {
+                declared
+                    .into_iter()
+                    .filter(|binding| {
+                        crate::runtime::spirv_bind::descriptor_static_use(&words, *binding)
+                            .is_violation()
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>()
+            .unwrap_or_else(|| vec![crate::runtime::spirv_bind::BROKEN_FRAME_BINDING])
             .into();
         Arc::new(Self {
             words,

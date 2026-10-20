@@ -574,6 +574,18 @@ pub fn device_reset(id: u64) -> bool {
 }
 
 pub fn device_destroy(id: u64) -> bool {
+    // The host-side teardown a reset performs — host VA views unmapped, guest
+    // dirty-logging tokens released — is owed here too. The slot is about to
+    // drop its DeviceState and Drop only tells the rail; without this the
+    // views and tokens live for the life of the process, the exact leak
+    // `reset_with_host` exists to prevent, on the door that forgot it. Run
+    // while the slot and its ops are still registered — the order device_reset
+    // itself keeps.
+    if let Some(slot) = device_slot(id) {
+        if slot.ops.is_some() {
+            device_reset(id);
+        }
+    }
     let removed = DEVICES.lock().remove(&id);
     // Stop and join the worker pool here, on the destroy path, rather than
     // leaving it to the last `Arc<BoundDevice>` to drop: the shim calls this

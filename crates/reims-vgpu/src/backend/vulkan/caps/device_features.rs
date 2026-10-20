@@ -967,8 +967,22 @@ pub unsafe fn query(
         let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
         let features = unsafe { instance.get_physical_device_format_properties(pd, format) }
             .optimal_tiling_features;
+        // The table is keyed by the layout, which names the UNORM spelling,
+        // while the sampled rails bind the *declared* format - the sRGB one
+        // for the guest's two sRGB spellings over these layouts. The spec
+        // does not tie the pair together (neither BGRA8 is in a mandatory
+        // table), so a driver may filter the UNORM sibling and not the sRGB
+        // one; promising the layout's bit on the UNORM probe alone would let
+        // a guest linear sampler hit an unsupported sRGB bind. Both spellings
+        // must carry the bit; a layout with no sRGB spelling keeps the one
+        // answer.
+        let srgb_features = crate::backend::vulkan::translate::pixel::srgb_texel_layout(layout)
+            .map(|srgb| {
+                unsafe { instance.get_physical_device_format_properties(pd, srgb) }
+                    .optimal_tiling_features
+            });
         sampled_linear_filter[layout.index()] =
-            features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
+            both_spellings_filter_linear(features, srgb_features);
         // Blending is demanded only of a layout that can be blended. See the
         // field's doc: for an integer format the spec mandates no
         // `COLOR_ATTACHMENT_BLEND`, so requiring it would refuse every host.
@@ -981,9 +995,14 @@ pub unsafe fn query(
 
     // The guest is handed ONE sample-count answer and uses it for colour
     // attachments, depth attachments and sampled images alike, so the honest
-    // answer is the intersection of the three masks.
+    // answer is the intersection of the masks. The stencil mask belongs in it
+    // too: the spec guarantees each mask independently only {1,4}, and a
+    // stencil-tested pass creates its combined depth/stencil image at this
+    // count - a host with 8x colour/depth and 4x stencil would have its 8x
+    // answer refused at vkCreateImage on exactly those passes.
     let sample_mask = props.limits.framebuffer_color_sample_counts
         & props.limits.framebuffer_depth_sample_counts
+        & props.limits.framebuffer_stencil_sample_counts
         & props.limits.sampled_image_color_sample_counts;
     let max_sample_count = [
         vk::SampleCountFlags::TYPE_16,
@@ -1177,6 +1196,20 @@ pub unsafe fn query(
             == vk::TRUE,
         mirror_clamp_to_edge,
     }
+}
+
+/// Whether a layout's sampled-linear-filter promise holds across both of its
+/// format spellings: the UNORM one the layout table is keyed by, and the sRGB
+/// one the sampled rails bind for the guest's sRGB formats. `srgb` is `None`
+/// for a layout with no sRGB spelling, whose one probe is the whole answer.
+fn both_spellings_filter_linear(
+    unorm: vk::FormatFeatureFlags,
+    srgb: Option<vk::FormatFeatureFlags>,
+) -> bool {
+    let linear = |flags: vk::FormatFeatureFlags| {
+        flags.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+    };
+    linear(unorm) && srgb.is_none_or(linear)
 }
 
 #[cfg(test)]
@@ -1845,5 +1878,27 @@ mod tests {
         assert_eq!(without.shader_float16, vk::FALSE);
         assert_eq!(without.descriptor_binding_partially_bound, vk::FALSE);
         assert_eq!(without.shader_int8, vk::TRUE);
+    }
+
+    /// The linear-filter promise needs both spellings when a layout has two:
+    /// the spec does not tie the UNORM/sRGB pair, and the sampled rails bind
+    /// the sRGB one for the guest's sRGB formats.
+    #[test]
+    fn the_linear_filter_promise_needs_both_spellings() {
+        use vk::FormatFeatureFlags as F;
+        let linear = F::SAMPLED_IMAGE_FILTER_LINEAR;
+        assert!(both_spellings_filter_linear(linear, Some(linear)));
+        assert!(
+            !both_spellings_filter_linear(linear, Some(F::empty())),
+            "an sRGB spelling without the bit refuses the layout"
+        );
+        assert!(
+            !both_spellings_filter_linear(F::empty(), Some(linear)),
+            "the UNORM spelling is still required"
+        );
+        assert!(
+            both_spellings_filter_linear(linear, None),
+            "a layout with no sRGB spelling keeps its one answer"
+        );
     }
 }

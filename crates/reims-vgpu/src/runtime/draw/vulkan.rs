@@ -16233,8 +16233,12 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         } else {
             f_words
         };
-        let frag_declared_bindings =
-            crate::runtime::spirv_bind::declared_binding_numbers_memoized(&f_words);
+        let frag_declared_bindings = crate::runtime::spirv_bind::declared_binding_numbers_memoized(
+            &f_words,
+        )
+        // A refused frame keeps the sentinel entry: the hang trail's gap count
+        // then names it and the layout backstop refuses the draws by name.
+        .unwrap_or_else(|| std::sync::Arc::from(vec![crate::runtime::spirv_bind::BROKEN_FRAME_BINDING]));
         let frag_layout_bindings: Vec<u32> = resources
             .storage_buffers
             .iter()
@@ -17766,7 +17770,15 @@ pub(super) fn try_preserve_seed_from_guest_window<M: HostMemory + HostOps>(
         };
         let tight = c0.width.checked_mul(RGBA8_BPP)?;
         let task = state.tasks.get(task_id)?;
-        let mut raw = vec![0u8; tight as usize * c0.height as usize];
+        // Guest-sized frame buffer: a refused reservation is the door's counted
+        // fallback, not a process abort — the same rule the linear memo's
+        // scratch already pays.
+        let Some(mut raw) =
+            crate::runtime::draw::guest_zeroed(tight as usize * c0.height as usize)
+        else {
+            crate::runtime::drain::note_store_route("preserve_seed_fb_host_commit");
+            return None;
+        };
         let mut row = vec![0u8; tight as usize];
         for y in 0..c0.height {
             let gva = c0.target_gva + u64::from(y) * u64::from(c0.row_stride);
@@ -17829,7 +17841,11 @@ pub(super) fn try_preserve_seed_from_guest_window<M: HostMemory + HostOps>(
         }
     };
     let tight = c0.width.checked_mul(RGBA8_BPP)?;
-    let mut raw = vec![0u8; tight as usize * c0.height as usize];
+    let Some(mut raw) = crate::runtime::draw::guest_zeroed(tight as usize * c0.height as usize)
+    else {
+        crate::runtime::drain::note_store_route("preserve_seed_fb_host_commit");
+        return None;
+    };
     let read = crate::runtime::mapping_write::read_rect_raw_at(
         state,
         host,
@@ -17978,7 +17994,12 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
     }
     // A GPU copy into guest pages still in flight would tear the read below.
     crate::backend::vulkan::engine::quiesce_guest_writes();
-    let mut bytes = vec![0u8; staged as usize];
+    // The spans are guest-sized (bounded by the surface's extent): a refused
+    // reservation declines the adoption, not the process.
+    let Some(mut bytes) = crate::runtime::draw::guest_zeroed(staged as usize) else {
+        crate::runtime::drain::note_store_route("resident_overlay_host_commit");
+        return false;
+    };
     for span in &spans {
         let lo = span.staged_offset as usize;
         let hi = lo + (span.window_end - span.window_start) as usize;
@@ -23171,10 +23192,20 @@ pub(crate) fn note_compositor_plane_pass(
 /// not write it, so it is zeroed here. A recycled buffer must not carry a
 /// previous surface's tail into the memo comparison, where it would manufacture a
 /// miss and cost a full conversion.
-fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
+fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) -> bool {
     let filled = filled.min(span);
+    // Guest-sized span (the surface's own extent): a refused reservation is the
+    // memo's counted miss, not a process abort — the rule the linear memo's
+    // scratch already pays. `false` leaves the scratch empty for the caller to
+    // put back.
+    let grow = span.saturating_sub(scratch.len());
+    if scratch.try_reserve(grow).is_err() {
+        crate::runtime::drain::note_store_route("t11_memo_host_commit");
+        return false;
+    }
     scratch.resize(span, 0);
     scratch[filled..].fill(0);
+    true
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_MEMO_READ=off` reads the mapper-ref-texture memo's
@@ -23531,11 +23562,14 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
     // Taken before the read, so a write landing during it moves past the stamp.
     let stamp = lab_memo_stamp::take(state, host, mid);
     let mut scratch = std::mem::take(&mut state.mapper_ref_texture_memo_scratch);
-    prepare_memo_scratch(
+    if !prepare_memo_scratch(
         &mut scratch,
         span,
         (stride as usize).saturating_mul(h as usize),
-    );
+    ) {
+        state.mapper_ref_texture_memo_scratch = scratch;
+        return None;
+    }
     if !memo_read_bgra8(
         lab_memo_read(),
         state,
@@ -23577,12 +23611,29 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
     }
     let rgba = if bgra {
         // First sight or the native bytes changed: the bytes as read, in the
-        // order the surface holds them.
+        // order the surface holds them. Guest-sized span, so the copy is
+        // reserved fallibly — a refusal is the memo's miss, not an abort.
         crate::runtime::drain::note_store_route("t11_memo_bgra_fill");
-        scratch[..span].to_vec()
+        let mut out = match crate::runtime::draw::guest_zeroed(span) {
+            Some(out) => out,
+            None => {
+                state.mapper_ref_texture_memo_scratch = scratch;
+                crate::runtime::drain::note_store_route("t11_memo_host_commit");
+                return None;
+            }
+        };
+        out.copy_from_slice(&scratch[..span]);
+        out
     } else {
         // First sight or the native bytes changed: convert BGRA→RGBA fresh.
-        let mut rgba = vec![0u8; span];
+        let mut rgba = match crate::runtime::draw::guest_zeroed(span) {
+            Some(rgba) => rgba,
+            None => {
+                state.mapper_ref_texture_memo_scratch = scratch;
+                crate::runtime::drain::note_store_route("t11_memo_host_commit");
+                return None;
+            }
+        };
         let converted =
             pixel_format::RowToRgba8::for_format(sample_fmt).is_some_and(|row_rail| {
                 (0..h as usize).all(|y| {
@@ -23791,7 +23842,7 @@ mod memo_scratch_tests {
     fn the_rect_is_not_rezeroed_and_the_padding_is() {
         let (span, filled) = (4096, 4000);
         let mut scratch = vec![0xAAu8; span];
-        prepare_memo_scratch(&mut scratch, span, filled);
+        assert!(prepare_memo_scratch(&mut scratch, span, filled));
         assert_eq!(scratch.len(), span);
         assert!(
             scratch[..filled].iter().all(|&b| b == 0xAA),
@@ -23808,20 +23859,33 @@ mod memo_scratch_tests {
     #[test]
     fn a_recycled_buffer_resizes_either_way_with_a_clean_tail() {
         let mut scratch = vec![0xAAu8; 1024];
-        prepare_memo_scratch(&mut scratch, 8192, 8000);
+        assert!(prepare_memo_scratch(&mut scratch, 8192, 8000));
         assert_eq!(scratch.len(), 8192);
         assert!(scratch[8000..].iter().all(|&b| b == 0));
 
-        prepare_memo_scratch(&mut scratch, 512, 500);
+        assert!(prepare_memo_scratch(&mut scratch, 512, 500));
         assert_eq!(scratch.len(), 512);
         assert!(scratch[500..].iter().all(|&b| b == 0));
 
         // A rect that claims the whole span leaves no tail to zero, and a rect
         // larger than the span (impossible geometry) must not panic on the slice.
-        prepare_memo_scratch(&mut scratch, 512, 512);
+        assert!(prepare_memo_scratch(&mut scratch, 512, 512));
         assert_eq!(scratch.len(), 512);
-        prepare_memo_scratch(&mut scratch, 512, 9999);
+        assert!(prepare_memo_scratch(&mut scratch, 512, 9999));
         assert_eq!(scratch.len(), 512);
+    }
+
+    /// The span is guest-sized, so a reservation the host cannot make is a
+    /// counted miss rather than a process abort. `usize::MAX` is past every
+    /// allocator's capacity, so the reserve refuses without allocating.
+    #[test]
+    fn a_span_the_host_cannot_reserve_is_a_miss_not_an_abort() {
+        let mut scratch = vec![0xAAu8; 64];
+        assert!(
+            !prepare_memo_scratch(&mut scratch, usize::MAX, 8),
+            "the refused reservation reports the miss"
+        );
+        assert_eq!(scratch.len(), 64, "the scratch is left as it was");
     }
 
     /// The abandoned-chain recovery rail must name a lost frame.
