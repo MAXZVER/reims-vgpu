@@ -78,11 +78,19 @@ pub fn resident_target_ready_deferred(
                 crate::runtime::drain::note_store_route("resident_resource_deferred_unavailable");
                 return;
             };
-            let _ = resource.with_rail_state(|held: &mut ResidentTargets| {
-                if !held.0.get(&id).is_some_and(|l| l.matches(&id)) {
-                    held.0.insert(id.clone(), lease);
-                }
-            });
+            // Whatever lease leaves the table (a stale one replaced, or ours
+            // when one is already there) is dropped after the rail lock: a
+            // drop takes the engine lock, never under a resource's.
+            let released = resource
+                .with_rail_state(|held: &mut ResidentTargets| {
+                    if held.0.get(&id).is_some_and(|l| l.matches(&id)) {
+                        Some(lease)
+                    } else {
+                        held.0.insert(id.clone(), lease)
+                    }
+                })
+                .flatten();
+            drop(released);
         });
         crate::runtime::drain::note_store_route("resident_resource_deferred");
         // Readiness only: the caller does not read the allocation class.
@@ -139,32 +147,55 @@ fn resident_target_backing_with(
     identity: &TargetIdentity,
     retain: impl FnOnce(&TargetIdentity) -> Option<ResidentResourceLease>,
 ) -> ResidentContentBacking {
-    let retention = resource
-        .with_rail_state(|held: &mut ResidentTargets| {
-            if let Some(lease) = held.0.get(identity).filter(|lease| lease.matches(identity)) {
-                return Retention::Warm(lease.backing());
-            }
-            // An engine reset invalidates the lease under this exact identity,
-            // but another identity is another child resource, not a
-            // replacement. A texture can own several views/surfaces
-            // concurrently.
-            held.0.remove(identity);
+    // The resource's rail lock is held only to read and write the lease table,
+    // never across `retain` or a lease's drop: both take the engine lock, which
+    // on the drain first settles the recorder queue, and a RETAIN_DEFER job
+    // queued there for this same resource (`resident_target_ready_deferred`)
+    // takes this rail lock - the drain waited on the recorder while the
+    // recorder waited on the drain.
+    //
+    // An engine reset invalidates the lease under this exact identity, but
+    // another identity is another child resource, not a replacement. A texture
+    // can own several views/surfaces concurrently.
+    let warm_or_stale = resource.with_rail_state(|held: &mut ResidentTargets| {
+        if let Some(lease) = held.0.get(identity).filter(|lease| lease.matches(identity)) {
+            return Ok(lease.backing());
+        }
+        Err(held.0.remove(identity))
+    });
+    let retention = match warm_or_stale {
+        Some(Ok(backing)) => Retention::Warm(backing),
+        Some(Err(stale)) => {
+            drop(stale);
             let acquired = retain(identity);
             let backing = acquired
                 .as_ref()
                 .map(|lease| lease.backing())
                 .unwrap_or(ResidentContentBacking::NotReady);
             if let Some(lease) = acquired {
-                held.0.insert(identity.clone(), lease);
+                // Another thread may have retained it meanwhile (the deferred
+                // job): keep the one already there, release ours outside.
+                let loser = resource
+                    .with_rail_state(|held: &mut ResidentTargets| {
+                        if held.0.get(identity).is_some_and(|l| l.matches(identity)) {
+                            Some(lease)
+                        } else {
+                            held.0.insert(identity.clone(), lease);
+                            None
+                        }
+                    })
+                    .flatten();
+                drop(loser);
             }
             Retention::Acquired(backing)
-        })
+        }
         // `None` is another rail holding the slot, which `backend::select`'s
         // one-rail-per-process latch makes unreachable. It reads as an
         // acquisition that found nothing, because that is what it would mean:
         // this rail retains nothing for this resource, and the ask was not a
         // warm hit.
-        .unwrap_or(Retention::Acquired(ResidentContentBacking::NotReady));
+        None => Retention::Acquired(ResidentContentBacking::NotReady),
+    };
 
     match retention {
         Retention::Warm(backing) => backing,
