@@ -182,7 +182,19 @@ RSLG_API int rslg_constants(void* token, float mvec_scale_x, float mvec_scale_y,
 // DLSS-G's state: frames presented per host present and its status bits.
 RSLG_API int rslg_state(uint32_t* presented, uint32_t* status, uint64_t* vram) {
     sl::DLSSGState s{};
-    sl::Result r = slDLSSGGetState(g_viewport, s, nullptr);
+    sl::DLSSGOptions o{};
+    o.mode = sl::DLSSGMode::eOn;
+    o.numFramesToGenerate = 1;
+    // With the options SL also fills the VRAM estimate. numFramesActuallyPresented counts the frames presented
+    // through DLSS-G's proxy since the previous call (not per present), so the caller's sampling interval is the
+    // denominator; the rest says why generation is off when it is.
+    sl::Result r = slDLSSGGetState(g_viewport, s, &o);
+    std::fprintf(stderr,
+                 "rslg_state r=%d presented_since_last=%u status=0x%x min_wh=%u max_generate=%u vsync_avail=%d "
+                 "vram_mb=%llu\n",
+                 int(r), s.numFramesActuallyPresented, uint32_t(s.status), s.minWidthOrHeight,
+                 s.numFramesToGenerateMax, int(s.bIsVsyncSupportAvailable == sl::Boolean::eTrue),
+                 (unsigned long long)(s.estimatedVRAMUsageInBytes >> 20));
     if (presented) *presented = s.numFramesActuallyPresented;
     if (status) *status = uint32_t(s.status);
     if (vram) *vram = s.estimatedVRAMUsageInBytes;
