@@ -11,3 +11,5 @@ nvngx_vsr.dll
 ofbench.exe
 vkext.exe
 ofpair.exe
+rslg.dll
+vulkan-1.def

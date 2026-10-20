@@ -1,7 +1,7 @@
 @echo off
 rem Builds rvsr.dll (C ABI over NVIDIA RTX Video Super Resolution, Vulkan) with MSVC.
 rem Needs the RTX Video SDK (not in this repository; NVIDIA developer download) at %RTX_VIDEO_SDK%,
-rem e.g. E:\sdk\rtx-video-sdk-1.1.0, and Vulkan headers at %VULKAN_INCLUDE% (default: E:sdkulkan-headersinclude, a copy of only vulkan/ and vk_video/ - the whole MSYS2 include dir breaks MSVC).
+rem e.g. E:\sdk\rtx-video-sdk-1.1.0, and Vulkan headers at %VULKAN_INCLUDE% (default: E:\sdk\vulkan-headers\include, a copy of only vulkan/ and vk_video/ - the whole MSYS2 include dir breaks MSVC).
 rem Output: rvsr.dll next to this file; ship it with nvngx_vsr.dll from the SDK beside qemu-system-x86_64.exe.
 setlocal
 if "%RTX_VIDEO_SDK%"=="" set RTX_VIDEO_SDK=E:\sdk\rtx-video-sdk-1.1.0
