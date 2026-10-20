@@ -8056,6 +8056,7 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
     assert_eq!(
         first,
         TargetIdentity::Texture {
+            task: 0,
             ref_: 42,
             width: 1024,
             height: 768,

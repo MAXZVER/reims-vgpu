@@ -2451,8 +2451,8 @@ impl ResourcePools {
             match k {
                 TargetIdentity::Surface { id, generation, .. } => (0, u64::from(*id), *generation),
                 TargetIdentity::Texture {
-                    ref_, generation, ..
-                } => (1, u64::from(*ref_), *generation),
+                    task, ref_, generation, ..
+                } => (1, (u64::from(*task) << 32) | u64::from(*ref_), *generation),
                 TargetIdentity::Gva {
                     gva, generation, ..
                 } => (2, *gva, *generation),
@@ -2520,8 +2520,8 @@ impl ResourcePools {
                     Some((0, u64::from(*id), *generation))
                 }
                 TargetIdentity::Texture {
-                    ref_, generation, ..
-                } => Some((1, u64::from(*ref_), *generation)),
+                    task, ref_, generation, ..
+                } => Some((1, (u64::from(*task) << 32) | u64::from(*ref_), *generation)),
                 TargetIdentity::Gva {
                     gva, generation, ..
                 } => Some((2, *gva, *generation)),

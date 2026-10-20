@@ -6207,6 +6207,11 @@ impl DeviceState {
     /// zone freelist; the next Store must re-resolve before any host write or
     /// import-present DMA (freelist `0xff000000ff000000` class).
     pub fn invalidate_mapping_pages(&mut self, mapping_id: u32) -> bool {
+        // A deferred payment's copy may still be writing these pages on the
+        // landing thread: it finishes before the list (and the view over it) is
+        // given up, whichever path is giving it up.
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::render_writeback::vulkan::wait_landing_copy_for(mapping_id);
         bump_names_gen();
         // The cached BGRA frame is a host-side copy of the pages this call is
         // invalidating, and it is the only such copy whose key does not carry

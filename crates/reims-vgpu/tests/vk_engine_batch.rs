@@ -536,6 +536,7 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
         format: SURFACE_TEST_FORMAT,
     };
     let depth_identity = TargetIdentity::Texture {
+        task: 0,
         ref_: 990_105,
         width: W,
         height: H,

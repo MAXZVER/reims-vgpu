@@ -17018,6 +17018,7 @@ pub(super) fn depth_chain_identity(
             0
         };
         return Some(crate::backend::vulkan::engine::TargetIdentity::Texture {
+            task: req.task_id,
             ref_: texture_ref,
             width,
             height,
@@ -21324,6 +21325,7 @@ mod vulkan_split_tests {
         assert_eq!(
             depth.identity,
             Some(crate::backend::vulkan::engine::TargetIdentity::Texture {
+                task: 0,
                 ref_: 11,
                 width: 8,
                 height: 8,

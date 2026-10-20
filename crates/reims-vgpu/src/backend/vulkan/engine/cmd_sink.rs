@@ -319,7 +319,7 @@ static LANES: [Lane; MAX_LANES] = [const { Lane::new() }; MAX_LANES];
 static LOADERS: OnceLock<LoadersCell> = OnceLock::new();
 /// The loaders the lanes replay with now: the first context's, until a
 /// device recreate binds the new device's (see [`rebind`]). Read once per list.
-static CURRENT: parking_lot::RwLock<Option<std::sync::Arc<LoadersCell>>> =
+static CURRENT: parking_lot::RwLock<Option<(std::sync::Arc<LoadersCell>, u64)>> =
     parking_lot::RwLock::new(None);
 /// Lanes running (0 until the first [`activate`]).
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
@@ -660,24 +660,26 @@ pub(crate) fn activate(ctx: &super::context::DeviceContext) -> ActiveGuard {
 /// restarted. A new device has new command buffers; what failed on the old one
 /// says nothing about them.
 fn rebind(ctx: &super::context::DeviceContext) {
-    use ash::vk::Handle;
-    let want = ctx.device.handle().as_raw();
-    let bound = CURRENT.read().as_ref().map(|c| c.0.device.handle().as_raw());
+    let want = ctx.generation;
+    let bound = CURRENT.read().as_ref().map(|c| c.1);
     if bound == Some(want) {
         return;
     }
     // Everything handed over for the old device replays through its loaders.
     sync();
-    *CURRENT.write() = Some(std::sync::Arc::new(LoadersCell(Loaders {
-        device: ctx.device.clone(),
-        push: ctx.push_descriptor.clone(),
-        eds: ctx.extended_dynamic_state.clone(),
-        eds3: ctx.extended_dynamic_state3.clone(),
-    })));
+    *CURRENT.write() = Some((
+        std::sync::Arc::new(LoadersCell(Loaders {
+            device: ctx.device.clone(),
+            push: ctx.push_descriptor.clone(),
+            eds: ctx.extended_dynamic_state.clone(),
+            eds3: ctx.extended_dynamic_state3.clone(),
+        })),
+        want,
+    ));
     if bound.is_some() {
         let cleared = LANE_FAILURE.lock().take();
         crate::observe::off(format!(
-            "vk_rec_lane_rebound device={want:#x} cleared_failure={cleared:?}"
+            "vk_rec_lane_rebound device_generation={want} cleared_failure={cleared:?}"
         ));
     }
 }
@@ -878,7 +880,7 @@ fn lane_main(index: usize) {
         };
         taken += 1;
         let started = Instant::now();
-        let loaders = CURRENT.read().clone().expect("loaders before the lane");
+        let loaders = CURRENT.read().as_ref().map(|c| std::sync::Arc::clone(&c.0)).expect("loaders before the lane");
         // SAFETY: each command is the `ash` call the recorder would have made,
         // with the same handles, on the command buffer it named.
         unsafe { replay(&loaders.0, &mut list) };

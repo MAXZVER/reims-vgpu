@@ -1214,7 +1214,7 @@ fn t2t_park_texels(
             });
         }
     }
-    if served.readback.device != vk::Handle::as_raw(ctx.device.handle()) {
+    if served.readback.device != ctx.generation {
         crate::runtime::drain::note_store_route("t2t_park_serve_device_gone");
         return None;
     }

@@ -700,11 +700,15 @@ impl PendingWritebacks {
 
     /// Cancel any pending writeback debt for `mapping_id` (e.g. when mapping is unmapped/released).
     pub fn drop_mapping(&mut self, mapping_id: u32) -> bool {
-        let dropped = self.debts.remove(&mapping_id).is_some();
-        if dropped {
+        let dropped = self.debts.remove(&mapping_id);
+        if let Some(debt) = dropped.as_ref() {
             crate::runtime::drain::note_store_route("wbdebt_cancelled_on_refresh_or_unmap");
+            // The debt kept its resident as the sole copy of these pages; with
+            // the debt gone nothing pays it, and the reclaim paths refuse a
+            // sole copy - one full-frame image held per delete until teardown.
+            crate::backend::selected().abandon_resident(&debt.target);
         }
-        dropped
+        dropped.is_some()
     }
 
     /// Every mapping owed a frame, oldest arm first.
@@ -1550,7 +1554,10 @@ pub fn fb_copy_replay_enabled() -> bool {
 /// ([`crate::runtime::draw::vulkan::sample_plan`]'s `OwedFrame` bail) and the
 /// serial rail pays on the drain thread exactly as before.
 pub fn owes_mapping(state: &DeviceState, mapping_id: u32) -> bool {
-    !state.pending_writebacks.is_empty() && state.pending_writebacks.get(mapping_id).is_some()
+    // `owes`, not `get`: a payment begun and not landed (PAY_DEFER) is still
+    // owed to these pages - its copy may be mid-flight on the landing thread -
+    // and the serial rail lands it before reading, so a pool plan must refuse.
+    !state.pending_writebacks.is_empty() && state.pending_writebacks.owes(mapping_id)
 }
 
 /// Pay `mapping_id`'s owed frame, if it owes one.
@@ -1989,7 +1996,7 @@ pub fn owes_texture(state: &DeviceState, task_id: u32, texture_ref: u32) -> bool
     state
         .mappings_named_by(task_id, texture_ref)
         .iter()
-        .any(|mapping_id| state.pending_writebacks.get(mapping_id).is_some())
+        .any(|mapping_id| state.pending_writebacks.owes(mapping_id))
 }
 
 #[track_caller]
@@ -2831,8 +2838,10 @@ pub fn supersede_for_mapping(
     mapping_id: u32,
     site: crate::runtime::render_writeback::SettleSite,
 ) {
-    if state.pending_writebacks.take(mapping_id).is_some() {
+    if let Some(debt) = state.pending_writebacks.take(mapping_id) {
         crate::runtime::drain::note_store_route("wbdebt_superseded_by_skipping_write");
+        // Superseded, not paid: release the resident it held as the sole copy.
+        crate::backend::selected().abandon_resident(&debt.target);
     }
     crate::runtime::render_writeback::settle_guest_writes(site);
 }
@@ -3118,6 +3127,30 @@ pub fn deferred_mapping(state: &DeviceState) -> Option<u32> {
         .0
         .as_ref()
         .map(|d| d.mapping_id)
+}
+
+/// TEMP (lab PAY_DEFER): drop the begun payment owed to `mapping_id` without
+/// landing it, because the guest is deleting that mapping's backing.
+///
+/// The delete trails the guest's own release of the pages, which may already be
+/// recycled (the boot-16 PTE-corruption panic was a delete-time flush), so the
+/// ordinary debt is cancelled there and never paid. A begun payment was landed
+/// instead - the map-family prologue ran `land_deferred` for the delete of the
+/// payment's own mapping, writing the frame into pages the guest had given
+/// back. Now it is dropped like the debt: a copy already on the landing thread
+/// is waited for (it cannot be recalled), none is started, and the resident is
+/// released to the reclaim paths. Returns whether there was one to drop.
+pub fn drop_deferred_for(state: &mut DeviceState, mapping_id: u32) -> bool {
+    if state.pending_writebacks.deferred_mapping() != Some(mapping_id) {
+        return false;
+    }
+    let Some(d) = state.pending_writebacks.deferred.0.take() else {
+        return false;
+    };
+    crate::runtime::drain::note_store_route("lab_pay_defer_dropped_on_delete");
+    drop(d.pending);
+    crate::backend::selected().abandon_resident(&d.target);
+    true
 }
 
 pub fn land_deferred<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {

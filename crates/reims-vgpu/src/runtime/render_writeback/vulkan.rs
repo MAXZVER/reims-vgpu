@@ -1493,6 +1493,41 @@ impl LandJob {
     }
 }
 
+/// The landing copy in flight, if any: its mapping and its done latch.
+///
+/// The copy writes raw addresses of the mapping's packed view (or of runs it
+/// mapped) on the landing thread while the drain goes on. Its design assumed
+/// only a map-family command changes the pages under it, and lands the payment
+/// first there; a re-point (`CmdReplacePhysical`), a drifted backing, a page
+/// collision or a failed revalidation invalidate the page list too, and the
+/// view and its pages were handed back with the copy still running - into
+/// pages the guest was re-pointing (and on hosts with packed aliases, through
+/// an unmapped view). [`wait_landing_copy_for`] is what an invalidation waits on.
+static LANDING: std::sync::Mutex<Option<(u32, std::sync::Arc<LandDone>)>> =
+    std::sync::Mutex::new(None);
+
+/// Block until a landing copy into `mapping_id`'s pages is in, if one runs.
+/// Called before the mapping's page list is invalidated; the payment's own
+/// bookkeeping (and its generation check) still happens where it always did.
+pub(crate) fn wait_landing_copy_for(mapping_id: u32) {
+    let done = {
+        let g = LANDING.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_ref() {
+            Some((m, done)) if *m == mapping_id => std::sync::Arc::clone(done),
+            _ => return,
+        }
+    };
+    if done.flag.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let _span = crate::runtime::chain_phase::CostSpan::new("lab_pay_defer_invalidate_wait_us");
+    crate::runtime::drain::note_store_route("lab_pay_defer_invalidate_waited");
+    let mut g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+    while !done.flag.load(std::sync::atomic::Ordering::Acquire) {
+        g = done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
 impl Drop for LandJob {
     fn drop(&mut self) {
         self.wait();
@@ -1859,14 +1894,16 @@ fn start_landing_copy<M: HostMemory + HostOps>(
     // A draw the recorder still holds may read these pages.
     crate::backend::settle_deferred_draws_for_guest_write();
     crate::runtime::drain::note_store_route("lab_pay_defer_copy_async");
-    Some(LandJob::spawn(
+    let job = LandJob::spawn(
         spans,
         runs,
         mapped,
         changed.frame_bytes as usize,
         changed.pages.len(),
         changed.full,
-    ))
+    );
+    *LANDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((mapping_id, std::sync::Arc::clone(&job.done)));
+    Some(job)
 }
 
 /// The landing copy is in: [`land_changed_pages`]' bookkeeping, and the views it

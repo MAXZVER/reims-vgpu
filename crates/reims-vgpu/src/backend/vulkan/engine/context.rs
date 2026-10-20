@@ -772,7 +772,17 @@ fn lab_gpu_boost() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GPU_BOOST").map_or(true, |v| v != "off"))
 }
 
+/// Source of [`DeviceContext::generation`]: one value per device this process
+/// ever builds, never reused.
+static DEVICE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) struct DeviceContext {
+    /// This device's identity for anything kept across a device recreate (the
+    /// recording lanes, page-diff state, readback and compare tickets). The raw
+    /// `VkDevice` value used before is an address the driver may hand out again
+    /// to the device built right after the old one is destroyed, and then the
+    /// dead device's handles read as the new one's.
+    pub generation: u64,
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
     pub pd: vk::PhysicalDevice,
@@ -1712,6 +1722,7 @@ impl DeviceContext {
             pipeline_cache_path.display()
         ));
         Ok(Self {
+            generation: DEVICE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             _entry: entry,
             instance,
             pd,
