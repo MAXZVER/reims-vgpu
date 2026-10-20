@@ -658,15 +658,18 @@ impl TileRefine {
             .offset(0)
             .size(vk::WHOLE_SIZE)]);
         let words = self.cell_words().to_vec();
+        // Stamps are pushed one by one, so a stamp's time is at a fixed offset
+        // from the oldest in the ring (a scan per cell cost ~1M steps per
+        // present in motion).
         let oldest = self.stamps.front().map(|&(s, _)| s);
         let when = |stamp: u32| -> Instant {
             if stamp == 0 {
                 return self.created_at;
             }
-            match self.stamps.iter().rev().find(|&&(s, _)| s == stamp) {
-                Some(&(_, at)) => at,
-                // Older than the ring (or wrapped): long settled.
-                None if oldest.is_some_and(|o| stamp < o) => self.created_at,
+            match oldest {
+                // Older than the ring: long settled.
+                Some(o) if stamp < o => self.created_at,
+                Some(o) => self.stamps.get((stamp - o) as usize).map_or(now, |&(_, at)| at),
                 None => now,
             }
         };
@@ -778,9 +781,12 @@ impl TileRefine {
                     vk::AccessFlags::SHADER_WRITE,
                 ),
             ];
+            // FRAGMENT in the first scope: the previous present's overlay read
+            // the cache this refine's copies write (with the diff skipped there
+            // is no other barrier to carry that dependency).
             device.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -884,14 +890,16 @@ impl TileRefine {
                 ));
             }
         }
-        // Out: the diff's and the refine's writes to the overlay's reads.
+        // Out: the diff's and the refine's writes to the overlay's reads, and
+        // the cells' words to the host (Readback memory: without a HOST_READ
+        // dependency the CPU's next look may see them arbitrarily late).
         let memory = [vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::HOST_READ)];
         device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::HOST,
             vk::DependencyFlags::empty(),
             &memory,
             &[],

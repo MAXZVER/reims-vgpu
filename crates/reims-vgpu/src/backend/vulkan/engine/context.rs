@@ -1370,8 +1370,12 @@ impl DeviceContext {
         // wait), which reads as ~20 % utilisation, so the GPU sat at 210 MHz of
         // its 3105 (nvidia-smi, 5K light scene) and every burst ran slow.
         #[cfg(feature = "host-window")]
+        // Not under DLSS-G: Streamline's Reflex drives VK_NV_low_latency2 itself
+        // (its own low-latency-with-boost mode); two owners of the swapchain's
+        // latency state would fight.
         let low_latency2 = swapchain
             && lab_gpu_boost()
+            && !super::present_dlssg::on()
             && has_device_extension(ash::nv::low_latency2::NAME);
         #[cfg(not(feature = "host-window"))]
         let low_latency2 = false;

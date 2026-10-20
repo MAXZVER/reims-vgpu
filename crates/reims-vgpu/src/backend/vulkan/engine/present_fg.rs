@@ -423,9 +423,13 @@ impl PresentFg {
                 .image(image)
                 .subresource_range(range)
         };
+        // First scope ALL_COMMANDS: the input this copy overwrites was read by
+        // the previous pair's warps (compute, earlier frames on this queue),
+        // which `src_stage` (the guest frame's last writer) does not cover.
+        let _ = src_stage;
         device.cmd_pipeline_barrier(
             cmd,
-            src_stage | vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::ALL_COMMANDS,
             vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
             &[],

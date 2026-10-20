@@ -570,6 +570,10 @@ struct LabFg {
     /// the current measurement started.
     guest_hz: f64,
     rate_from: Option<(std::time::Instant, u64)>,
+    /// Presents in a row that asked for a generated frame and got the guest
+    /// frame (no scaled present, no optical flow): at 3 the window stops
+    /// interpolating, so it does not hold each new frame for a tick in vain.
+    not_shown: u32,
 }
 
 /// TEMP (lab, PRESENT_VSR_SETTLE): when the last fresh frame reached the screen
@@ -1980,7 +1984,7 @@ impl App {
         let Some((_, at)) = self.lab_fg.cur else {
             return (seq, LAB_FG_PHASE_REAL, false);
         };
-        let Some(interval) = self.lab_fg.interval else {
+        let Some(interval) = self.lab_fg.interval.filter(|_| self.lab_fg.not_shown < 3) else {
             return (seq, LAB_FG_PHASE_REAL, false);
         };
         let phase = now.duration_since(at).as_secs_f64() / interval.as_secs_f64() + (1.0 - lab_fg_delay());
@@ -1996,11 +2000,15 @@ impl App {
         let phase = if phase != LAB_FG_PHASE_REAL && !drew {
             // The rail showed the frame itself (no scaled present, no pair):
             // nothing more to interpolate for it.
-            if crate::observe::first_sight("present_fg_not_shown", 0) {
-                crate::observe::fail("present_fg_not_shown (no scaled present or no flow)".to_string());
+            self.lab_fg.not_shown += 1;
+            if self.lab_fg.not_shown == 3 {
+                crate::observe::fail("present_fg_not_shown x3: interpolation off for this window".to_string());
             }
             LAB_FG_PHASE_REAL
         } else {
+            if drew {
+                self.lab_fg.not_shown = 0;
+            }
             phase
         };
         self.lab_fg.shown = Some((seq, phase));
