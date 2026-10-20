@@ -9986,7 +9986,7 @@ fn native_scratch_to_upload(
     {
         let row_bytes = tight as usize;
         let rows = (fmt.tight_row_count(h) as usize).checked_mul(planes as usize)?;
-        let mut out = vec![0u8; row_bytes.checked_mul(rows)?];
+        let mut out = crate::runtime::draw::guest_zeroed(row_bytes.checked_mul(rows)?)?;
         for row_index in 0..rows {
             let src = row_index.checked_mul(bpr)?;
             let dst = row_index * row_bytes;
@@ -9999,7 +9999,7 @@ fn native_scratch_to_upload(
     let rows = (h as usize).checked_mul(planes as usize)?;
     let out_len = out_row.checked_mul(rows)?;
     let trow = tight as usize;
-    let mut out = vec![0u8; out_len];
+    let mut out = crate::runtime::draw::guest_zeroed(out_len)?;
     // This rung carries nearly all of the pathway's sampled traffic, so a
     // narrowing taken here is the one most likely to be the narrowing that
     // matters — and until this line existed the rung reported none at all while
@@ -10191,6 +10191,14 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         crate::runtime::render_writeback::SettleSite::LinearMemoRead,
     );
     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
+    // `native_len` follows the guest's descriptor (up to the 64 GiB object
+    // bound), and a growth the host cannot commit aborts the process: reserved
+    // fallibly, a torn descriptor declines this rung like a failed read does.
+    if scratch.try_reserve(native_len.saturating_sub(scratch.len())).is_err() {
+        state.guest_linear_scratch = scratch;
+        crate::runtime::drain::note_store_route("linear_memo_scratch_host_commit");
+        return None;
+    }
     scratch.resize(native_len, 0);
     let read = gva_mem::read_task_gva_by_id(
         host,
