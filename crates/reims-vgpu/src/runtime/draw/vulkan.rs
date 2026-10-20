@@ -24032,20 +24032,33 @@ fn lab_vtx_bind_census<A: std::fmt::Debug>(
     let Some(gate) = GATE.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GATE").ok()) else {
         return;
     };
-    if !std::path::Path::new(gate).exists() || N.fetch_add(1, Ordering::Relaxed) >= 120 {
+    static SKIP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let skip = *SKIP.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_IDX_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if !std::path::Path::new(gate).exists() || index != 1 {
         return;
     }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < skip || n >= skip + 120 {
+        return;
+    }
+    let bytes = content.cpu_bytes();
+    let f = |i: usize| bytes.get(i * 4..i * 4 + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let pos: Vec<String> = (0..4).map(|v| format!("{:?},{:?}", f(v * 12), f(v * 12 + 1))).collect();
     let kind = match content {
         crate::backend::vulkan::engine::BufferContent::Bytes(_) => "bytes",
         crate::backend::vulkan::engine::BufferContent::GuestRuns(_) => "runs",
         crate::backend::vulkan::engine::BufferContent::Staged(_) => "staged",
     };
     crate::observe::fail(format!(
-        "lab_vtx_bind pipe={} idx={index} r{buffer_ref}+{offset} cap={cap:?} stage_in={feeds_stage_in} \
-         content={kind}:{} vmax={:?} attrs={attrs:?}",
+        "lab_vtx_bind #{n} pipe={} idx={index} r{buffer_ref}+{offset} cap={cap:?} stage_in={feeds_stage_in} \
+         content={kind}:{} vmax={:?} pos=[{}] attrs={}",
         req.pipeline_ref,
         content.len(),
-        bounds.vertex_max()
+        bounds.vertex_max(),
+        pos.join(" "),
+        attrs.len()
     ));
 }
 
