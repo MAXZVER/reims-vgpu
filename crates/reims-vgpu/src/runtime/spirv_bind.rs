@@ -4409,11 +4409,10 @@ mod tests {
         let read: [u32; 5] = [(5 << 16) | u32::from(OP_IMAGE_READ), 9, 3, 2, 5];
         let write: [u32; 4] = [(4 << 16) | u32::from(OP_IMAGE_WRITE), 2, 5, 6];
         let ok: Vec<u32> = header
-            .iter()
+            .into_iter()
             .chain(load)
             .chain(read)
             .chain(write)
-            .copied()
             .collect();
         assert!(refuse_unrepaired_image_consumers(&ok, &retyped).is_ok());
 
@@ -4421,10 +4420,9 @@ mod tests {
         // operand - the exact consumer the retype pass cannot follow.
         let sampled: [u32; 6] = [(6 << 16) | 87, 9, 3, 8, 2, 4];
         let escapes: Vec<u32> = header
-            .iter()
+            .into_iter()
             .chain(load)
             .chain(sampled)
-            .copied()
             .collect();
         assert_eq!(
             refuse_unrepaired_image_consumers(&escapes, &retyped),
@@ -4438,20 +4436,18 @@ mod tests {
         // it feeds.
         let copy: [u32; 4] = [(4 << 16) | u32::from(OP_COPY_OBJECT), 9, 3, 2];
         let copied: Vec<u32> = header
-            .iter()
+            .into_iter()
             .chain(load)
             .chain(copy)
-            .copied()
             .collect();
         assert!(refuse_unrepaired_image_consumers(&copied, &retyped).is_err());
 
         // A decoration on the moved value carries no typed opinion.
         let decorate: [u32; 3] = [(3 << 16) | u32::from(OP_DECORATE), 2, 0];
         let named: Vec<u32> = header
-            .iter()
+            .into_iter()
             .chain(load)
             .chain(decorate)
-            .copied()
             .collect();
         assert!(refuse_unrepaired_image_consumers(&named, &retyped).is_ok());
     }
