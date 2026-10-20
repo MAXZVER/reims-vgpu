@@ -270,6 +270,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // whole reading is that the phases sum to it.
     let _phase = crate::runtime::chain_phase::ChainTimer::start();
     super::lab_index_census(state, host, req); // TEMP (lab)
+    lab_big_draw_seq_note(req); // TEMP (lab)
     // The local copy is read for geometry, store actions and Store routing,
     // never for the seeds, and a seed is a whole attachment of pixels: Mission
     // Control's cleared MRT attachments made this clone ~7 % of the drain. The
@@ -371,6 +372,14 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         // happened. Deriving the outcome from the one value that knows makes
         // that class of drift unrepresentable.
         engine_outcome = EngineDrawOutcome::of(&engine);
+        lab_big_draw_outcome(req, engine_outcome, match &engine {
+            Ok(M2vDrawSpan::None) => "none",
+            Ok(M2vDrawSpan::Pixels { .. }) => "pixels",
+            Ok(M2vDrawSpan::ResidentChain) => "chain",
+            Ok(M2vDrawSpan::ResidentGvaStore { .. }) => "gvastore",
+            Ok(M2vDrawSpan::ResidentSurfaceStore { .. }) => "surface",
+            Err(_) => "err",
+        }); // TEMP (lab)
         if let Some(c) = req.colors.first().filter(|c| c.mapping_id != 0 && req.task_id != 1) {
             // TEMP (lab, `REIMS_VGPU_LAB_DRAW_WAIT=1`): the device idle after every
             // direct app draw into a tile-sized mapped surface.
@@ -3343,8 +3352,64 @@ fn lab_dump_admit(req: &DrawEncodeRequest, w: u32, h: u32) -> Option<u32> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(80)
     });
+    // TEMP (lab): `REIMS_VGPU_LAB_DUMP_SKIP=N` dumps only big draws N.. of the gated window (the
+    // `lab_big_draw_seq_note` sequence, which counts every draw the encoder starts, whatever arm it takes).
+    static SKIP: OnceLock<Option<u32>> = OnceLock::new();
+    let skip = *SKIP.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_DUMP_SKIP").ok().and_then(|v| v.parse().ok())
+    });
+    if let Some(skip) = skip {
+        let seq = LAB_BIG_DRAW_SEQ.load(Ordering::Relaxed).saturating_sub(1);
+        return (seq >= skip && seq < skip.saturating_add(max)).then_some(seq);
+    }
     let n = N.fetch_add(1, Ordering::Relaxed);
     (n < max).then_some(n)
+}
+
+/// TEMP (lab): sequence of draws into a >= 2 Mpx colour-0 target outside WindowServer while the gate is open.
+static LAB_BIG_DRAW_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// TEMP (lab): the engine's answer for each big draw of the `REIMS_VGPU_LAB_DUMP_SKIP` window.
+fn lab_big_draw_outcome(req: &DrawEncodeRequest, outcome: EngineDrawOutcome, span: &str) {
+    use std::sync::atomic::Ordering;
+    static SKIP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let Some(skip) = *SKIP.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_DUMP_SKIP").ok().and_then(|v| v.parse().ok())
+    }) else {
+        return;
+    };
+    let Some(c0) = req.colors.first() else {
+        return;
+    };
+    if req.task_id == 1 || u64::from(c0.width) * u64::from(c0.height) < 2_000_000 || !lab_gate_open() {
+        return;
+    }
+    let seq = LAB_BIG_DRAW_SEQ.load(Ordering::Relaxed).saturating_sub(1);
+    if seq < skip || seq >= skip + 80 {
+        return;
+    }
+    crate::observe::fail(format!(
+        "lab_big_draw seq={seq} pipe={} span={span} outcome={outcome:?} continues={} established={}          load={} store={} mid={} ref={} t={}",
+        req.pipeline_ref,
+        req.render_pass_continues,
+        req.chain_resident_established,
+        c0.load_action,
+        c0.store_action,
+        c0.mapping_id,
+        c0.texture_ref,
+        crate::observe::elapsed_us() / 1000
+    ));
+}
+
+/// TEMP (lab): advance [`LAB_BIG_DRAW_SEQ`] for one draw the encoder starts.
+fn lab_big_draw_seq_note(req: &DrawEncodeRequest) {
+    let Some(c0) = req.colors.first() else {
+        return;
+    };
+    if req.task_id == 1 || u64::from(c0.width) * u64::from(c0.height) < 2_000_000 || !lab_gate_open() {
+        return;
+    }
+    LAB_BIG_DRAW_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// TEMP (lab): write one colour-0 dump and its `lab_dump` line.
