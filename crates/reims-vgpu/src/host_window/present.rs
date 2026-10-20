@@ -574,6 +574,9 @@ struct LabFg {
     /// frame (no scaled present, no optical flow): at 3 the window stops
     /// interpolating, so it does not hold each new frame for a tick in vain.
     not_shown: u32,
+    /// Presents in a row that came back Busy (a window that cannot present,
+    /// e.g. minimised): after 8 the deadlines retry every 50 ms, not every 1 ms.
+    busy_streak: u32,
 }
 
 /// TEMP (lab, PRESENT_VSR_SETTLE): when the last fresh frame reached the screen
@@ -1993,7 +1996,9 @@ impl App {
         };
         let phase = now.duration_since(at).as_secs_f64() / interval.as_secs_f64() + (1.0 - lab_fg_delay());
         let q = if phase >= 0.995 { LAB_FG_PHASE_REAL } else { (phase.max(0.0) * 65534.0) as u16 };
-        (seq, q, true)
+        // No flow for a frame whose first present already shows it whole (a late
+        // tick): the present would only wait for it.
+        (seq, q, q != LAB_FG_PHASE_REAL)
     }
 
     /// TEMP (lab, PRESENT_FG): a present showed `(seq, phase)`; schedule the
@@ -2116,7 +2121,9 @@ impl App {
                 // TEMP (lab, PRESENT_FG / PRESENT_VSR_TILES): a deadline that came
                 // due retries shortly instead of every loop tick (a past deadline
                 // that no present consumes keeps the loop polling).
-                let retry = std::time::Instant::now() + std::time::Duration::from_millis(1);
+                self.lab_fg.busy_streak = self.lab_fg.busy_streak.saturating_add(1);
+                let backoff = if self.lab_fg.busy_streak < 8 { 1 } else { 50 };
+                let retry = std::time::Instant::now() + std::time::Duration::from_millis(backoff);
                 if self.lab_fg.next_at.is_some() {
                     self.lab_fg.next_at = Some(retry);
                 }
@@ -2139,6 +2146,7 @@ impl App {
                 // lifetime cap and a rail that recovers eight times is left dark
                 // after the third. See [`presenter_rebuild_budget`].
                 self.presenter_rebuilds = 0;
+                self.lab_fg.busy_streak = 0;
                 if !refining {
                     self.lab_settle.fresh_at = Some(std::time::Instant::now());
                 }
