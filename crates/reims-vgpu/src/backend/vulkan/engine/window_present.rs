@@ -1475,7 +1475,7 @@ impl WindowPresenter {
                         // TEMP (lab, PRESENT_VSR): NGX bound to this device once, before the
                         // filter that records it is built.
                         if super::present_vsr::quality().is_some() {
-                            super::present_vsr::init(&ctx._entry, &ctx.instance, ctx.pd, &ctx.device);
+                            super::present_vsr::init(&ctx._entry, &ctx.instance, ctx.pd, &ctx.device, ctx.generation);
                         }
                         if self.sharp.is_none() && !self.sharp_failed {
                             match super::present_sharp::PresentSharp::create(

@@ -157,9 +157,35 @@ pub(crate) fn device_extensions(instance: vk::Instance, pd: vk::PhysicalDevice) 
 }
 
 static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// The [`super::context::DeviceContext::generation`] NGX was bound to.
+static BOUND_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Set once a later device asked: NGX (and the shim's feature and parameters)
+/// still belong to the device that is gone, so VSR stays off rather than
+/// evaluating against it, and the present falls back to its own filter.
+static REBOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Bind NGX to the device once; whether VSR is available on it.
-pub(crate) fn init(entry: &ash::Entry, instance: &ash::Instance, pd: vk::PhysicalDevice, device: &ash::Device) -> bool {
+pub(crate) fn init(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    device: &ash::Device,
+    generation: u64,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if let Some(ready) = READY.get() {
+        if BOUND_GENERATION.load(Ordering::Acquire) == generation {
+            return *ready;
+        }
+        if !REBOUND.swap(true, Ordering::AcqRel) {
+            crate::observe::fail(format!(
+                "present_vsr_refused reason=device_recreated bound_generation={} generation={generation}",
+                BOUND_GENERATION.load(Ordering::Acquire)
+            ));
+        }
+        return false;
+    }
+    BOUND_GENERATION.store(generation, Ordering::Release);
     *READY.get_or_init(|| {
         let Some(api) = api() else {
             return false;
@@ -188,7 +214,7 @@ pub(crate) fn init(entry: &ash::Entry, instance: &ash::Instance, pd: vk::Physica
 
 /// Whether [`init`] succeeded.
 pub(crate) fn ready() -> bool {
-    READY.get().copied().unwrap_or(false)
+    READY.get().copied().unwrap_or(false) && !REBOUND.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Record the feature's creation into `cmd` (before its first evaluate).
