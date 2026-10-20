@@ -1,0 +1,408 @@
+//! TEMP (lab, `REIMS_VGPU_LAB_PRESENT_DLSSG=on`): NVIDIA DLSS Frame Generation
+//! (with Reflex) on the host window, through Streamline - an A/B against our
+//! own frame generation (`present_fg`), which it excludes (both want the GPU's
+//! optical-flow queue).
+//!
+//! `rslg.dll` (tools/rtx-vsr-shim/rslg.cpp, a C ABI over Streamline) is loaded
+//! from `REIMS_VGPU_LAB_PRESENT_DLSSG_DIR` (default `E:/reims-lab/dlssg`, which
+//! also holds the SDK's signed `sl.*.dll`, `nvngx_dlssg.dll` and
+//! `NvLowLatencyVk.dll`). [`loader`] runs `slInit` before the Vulkan loader is
+//! opened and names `sl.interposer.dll` as the loader: Streamline's
+//! `vkCreateInstance`/`vkCreateDevice` proxies then add what DLSS-G needs and
+//! its swapchain proxies present the generated frames; every other call goes to
+//! `vulkan-1`. Per present the window records a frame token (Reflex sleep,
+//! markers), tags the frame (the swapchain image as hudless colour, a constant
+//! depth, zero motion vectors - a 2D screen has no geometry; DLSS-G's own
+//! optical flow carries the motion) and sets 2D constants.
+
+use std::ffi::c_void;
+
+use ash::vk;
+
+/// `REIMS_VGPU_LAB_PRESENT_DLSSG=on` (and PRESENT_FG off). Latched.
+pub(crate) fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(std::env::var("REIMS_VGPU_LAB_PRESENT_DLSSG").as_deref(), Ok("on" | "1"))
+            && !crate::host_window::present::lab_present_fg()
+    })
+}
+
+fn dir() -> String {
+    std::env::var("REIMS_VGPU_LAB_PRESENT_DLSSG_DIR").unwrap_or_else(|_| "E:/reims-lab/dlssg".into())
+}
+
+#[repr(C)]
+struct RslgImage {
+    image: vk::Image,
+    view: vk::ImageView,
+    memory: vk::DeviceMemory,
+    layout: u32,
+    format: u32,
+    width: u32,
+    height: u32,
+    usage: u32,
+}
+
+type FnInit = unsafe extern "C" fn(*const u16, *const u16, i32) -> i32;
+type FnSupported = unsafe extern "C" fn(vk::PhysicalDevice) -> i32;
+type FnInt = unsafe extern "C" fn(i32) -> i32;
+type FnFrame = unsafe extern "C" fn(u32) -> *mut c_void;
+type FnMarker = unsafe extern "C" fn(*mut c_void, u32) -> i32;
+type FnTag = unsafe extern "C" fn(*mut c_void, vk::CommandBuffer, *const RslgImage, *const RslgImage, *const RslgImage, u32, u32) -> i32;
+type FnConstants = unsafe extern "C" fn(*mut c_void, f32, f32, i32) -> i32;
+type FnState = unsafe extern "C" fn(*mut u32, *mut u32, *mut u64) -> i32;
+
+struct Api {
+    init: FnInit,
+    supported: FnSupported,
+    reflex: FnInt,
+    dlssg: FnInt,
+    frame: FnFrame,
+    marker: FnMarker,
+    tag: FnTag,
+    constants: FnConstants,
+    state: FnState,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn api() -> Option<&'static Api> {
+    static API: std::sync::OnceLock<Option<Api>> = std::sync::OnceLock::new();
+    API.get_or_init(|| {
+        if !on() {
+            return None;
+        }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            let path = format!("{}/rslg.dll", dir()).replace('/', "\\");
+            // LOAD_WITH_ALTERED_SEARCH_PATH: rslg's own dependency
+            // (sl.interposer.dll) resolves from its directory.
+            let module = LoadLibraryExW(wide(&path).as_ptr(), std::ptr::null_mut(), 0x8);
+            if module.is_null() {
+                crate::observe::fail(format!("present_dlssg_refused reason=dll_not_loaded path={path}"));
+                return None;
+            }
+            let sym = |name: &[u8]| {
+                let p = GetProcAddress(module, name.as_ptr());
+                (!p.is_null()).then_some(p)
+            };
+            let made = (|| {
+                Some(Api {
+                    init: std::mem::transmute::<*mut c_void, FnInit>(sym(b"rslg_init\0")?),
+                    supported: std::mem::transmute::<*mut c_void, FnSupported>(sym(b"rslg_supported\0")?),
+                    reflex: std::mem::transmute::<*mut c_void, FnInt>(sym(b"rslg_reflex\0")?),
+                    dlssg: std::mem::transmute::<*mut c_void, FnInt>(sym(b"rslg_dlssg\0")?),
+                    frame: std::mem::transmute::<*mut c_void, FnFrame>(sym(b"rslg_frame\0")?),
+                    marker: std::mem::transmute::<*mut c_void, FnMarker>(sym(b"rslg_marker\0")?),
+                    tag: std::mem::transmute::<*mut c_void, FnTag>(sym(b"rslg_tag\0")?),
+                    constants: std::mem::transmute::<*mut c_void, FnConstants>(sym(b"rslg_constants\0")?),
+                    state: std::mem::transmute::<*mut c_void, FnState>(sym(b"rslg_state\0")?),
+                })
+            })();
+            if made.is_none() {
+                crate::observe::fail(format!("present_dlssg_refused reason=dll_missing_entry path={path}"));
+            }
+            made
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    })
+    .as_ref()
+}
+
+/// Before the Vulkan loader is opened: `slInit`, and the loader to open
+/// instead of `vulkan-1` (`sl.interposer.dll`). `None` when DLSS-G is off or
+/// Streamline refused - the device then comes up as always.
+pub(crate) fn loader() -> Option<std::path::PathBuf> {
+    static LOADER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    LOADER
+        .get_or_init(|| {
+            let api = api()?;
+            let logs = std::env::temp_dir().join("reims-sl");
+            let _ = std::fs::create_dir_all(&logs);
+            let verbose = i32::from(std::env::var("REIMS_VGPU_LAB_PRESENT_DLSSG_VERBOSE").is_ok_and(|v| v == "1"));
+            let d = dir().replace('/', "\\");
+            let r = unsafe { (api.init)(wide(&d).as_ptr(), wide(&logs.to_string_lossy()).as_ptr(), verbose) };
+            crate::observe::off(format!("present_dlssg init sl={r} dir={d} logs={}", logs.display()));
+            if r != 0 {
+                crate::observe::fail(format!("present_dlssg_refused reason=sl_init sl={r}"));
+                return None;
+            }
+            Some(std::path::PathBuf::from(format!("{d}\\sl.interposer.dll")))
+        })
+        .clone()
+}
+
+/// Whether the device came up through Streamline (DLSS-G active).
+pub(crate) fn active() -> bool {
+    on() && loader().is_some()
+}
+
+struct DlssgImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+}
+
+/// The window's per-present DLSS-G state: the constant depth and zero motion
+/// vectors at the window size, views of the swapchain images, the frame count.
+pub(crate) struct Dlssg {
+    width: u32,
+    height: u32,
+    depth: DlssgImage,
+    mvec: DlssgImage,
+    cleared: bool,
+    views: Vec<(vk::Image, vk::ImageView)>,
+    frame: u32,
+    started: bool,
+    failed: bool,
+}
+
+const DEPTH_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
+const MVEC_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
+const AUX_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::SAMPLED.as_raw() | vk::ImageUsageFlags::STORAGE.as_raw() | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
+);
+
+impl Dlssg {
+    pub(crate) fn matches(&self, width: u32, height: u32) -> bool {
+        (self.width, self.height) == (width, height)
+    }
+
+    pub(crate) unsafe fn create(
+        device: &ash::Device,
+        width: u32,
+        height: u32,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> Result<Self, vk::Result> {
+        let make = |format: vk::Format| -> Result<DlssgImage, vk::Result> {
+            let mut img = DlssgImage { image: vk::Image::null(), memory: vk::DeviceMemory::null(), view: vk::ImageView::null() };
+            let r = (|| -> Result<(), vk::Result> {
+                img.image = device.create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(format)
+                        .extent(vk::Extent3D { width, height, depth: 1 })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(AUX_USAGE)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )?;
+                let req = device.get_image_memory_requirements(img.image);
+                let mt = memory_type(req.memory_type_bits, req.size, false).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+                img.memory = device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt),
+                    None,
+                )?;
+                device.bind_image_memory(img.image, img.memory, 0)?;
+                img.view = device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(img.image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(format)
+                        .subresource_range(super::color_subresource_range()),
+                    None,
+                )?;
+                Ok(())
+            })();
+            match r {
+                Ok(()) => Ok(img),
+                Err(e) => {
+                    destroy_image(device, &img);
+                    Err(e)
+                }
+            }
+        };
+        let depth = make(DEPTH_FORMAT)?;
+        let mvec = match make(MVEC_FORMAT) {
+            Ok(m) => m,
+            Err(e) => {
+                destroy_image(device, &depth);
+                return Err(e);
+            }
+        };
+        Ok(Self { width, height, depth, mvec, cleared: false, views: Vec::new(), frame: 0, started: false, failed: false })
+    }
+
+    /// Into the frame's command buffer, after the window pass drew `dst` (left
+    /// in `PRESENT_SRC_KHR`): a frame token, the tags and the constants. The
+    /// token, for the present markers; `None` when DLSS-G is not running.
+    pub(crate) unsafe fn record(
+        &mut self,
+        device: &ash::Device,
+        pd: vk::PhysicalDevice,
+        cmd: vk::CommandBuffer,
+        dst: vk::Image,
+        format: vk::Format,
+    ) -> Option<*mut c_void> {
+        if self.failed {
+            return None;
+        }
+        let api = api()?;
+        if !self.started {
+            self.started = true;
+            let supported = (api.supported)(pd);
+            let reflex = (api.reflex)(1);
+            let on = (api.dlssg)(1);
+            crate::observe::off(format!("present_dlssg start supported={supported} reflex={reflex} dlssg={on} {}x{}", self.width, self.height));
+            if supported != 0 || on != 0 {
+                self.failed = true;
+                crate::observe::fail(format!("present_dlssg_refused reason=start supported={supported} dlssg={on}"));
+                return None;
+            }
+        }
+        let token = (api.frame)(self.frame);
+        self.frame = self.frame.wrapping_add(1);
+        if token.is_null() {
+            return None;
+        }
+        let range = super::color_subresource_range();
+        if !self.cleared {
+            let to_dst = [self.depth.image, self.mvec.image].map(|image| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range)
+            });
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_dst);
+            for image in [self.depth.image, self.mvec.image] {
+                device.cmd_clear_color_image(cmd, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: [0.0; 4] }, &[range]);
+            }
+            let to_general = [self.depth.image, self.mvec.image].map(|image| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range)
+            });
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &to_general);
+            self.cleared = true;
+        }
+        let view = match self.views.iter().find(|(i, _)| *i == dst) {
+            Some(&(_, v)) => v,
+            None => {
+                let v = device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(dst)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(format)
+                            .subresource_range(range),
+                        None,
+                    )
+                    .ok()?;
+                self.views.push((dst, v));
+                v
+            }
+        };
+        let hudless = RslgImage {
+            image: dst,
+            view,
+            memory: vk::DeviceMemory::null(),
+            layout: vk::ImageLayout::PRESENT_SRC_KHR.as_raw() as u32,
+            format: format.as_raw() as u32,
+            width: self.width,
+            height: self.height,
+            usage: (vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST).as_raw(),
+        };
+        let aux = |img: &DlssgImage, format: vk::Format| RslgImage {
+            image: img.image,
+            view: img.view,
+            memory: img.memory,
+            layout: vk::ImageLayout::GENERAL.as_raw() as u32,
+            format: format.as_raw() as u32,
+            width: self.width,
+            height: self.height,
+            usage: AUX_USAGE.as_raw(),
+        };
+        let (depth, mvec) = (aux(&self.depth, DEPTH_FORMAT), aux(&self.mvec, MVEC_FORMAT));
+        let tag = (api.tag)(token, cmd, &hudless, &depth, &mvec, self.width, self.height);
+        let constants = (api.constants)(token, 1.0 / self.width as f32, 1.0 / self.height as f32, 0);
+        if (tag != 0 || constants != 0) && crate::observe::first_sight("present_dlssg_tag_refused", 0) {
+            crate::observe::fail(format!("present_dlssg_refused reason=tag tag={tag} constants={constants}"));
+        }
+        (api.marker)(token, 2); // eRenderSubmitStart
+        if self.frame % 600 == 1 {
+            let (mut presented, mut status, mut vram) = (0u32, 0u32, 0u64);
+            let r = (api.state)(&mut presented, &mut status, &mut vram);
+            crate::observe::off(format!(
+                "present_dlssg state sl={r} frame={} presented_per_present={presented} status={status:#x} vram_mb={}",
+                self.frame,
+                vram >> 20
+            ));
+        }
+        Some(token)
+    }
+
+    /// The render-submit end and present markers around the frame's submit +
+    /// present (`start`: before it).
+    pub(crate) fn mark_present(token: *mut c_void, start: bool) {
+        let Some(api) = api() else {
+            return;
+        };
+        unsafe {
+            if start {
+                (api.marker)(token, 3); // eRenderSubmitEnd
+                (api.marker)(token, 4); // ePresentStart
+            } else {
+                (api.marker)(token, 5); // ePresentEnd
+            }
+        }
+    }
+
+    /// Views of swapchain images that are gone (after a recreation), dropped.
+    pub(crate) unsafe fn keep_views_of(&mut self, device: &ash::Device, images: &[vk::Image]) {
+        self.views.retain(|(image, view)| {
+            let keep = images.contains(image);
+            if !keep {
+                device.destroy_image_view(*view, None);
+            }
+            keep
+        });
+    }
+
+    /// Only with the queue idle.
+    pub(crate) unsafe fn destroy(&mut self, device: &ash::Device) {
+        for (_, view) in self.views.drain(..) {
+            device.destroy_image_view(view, None);
+        }
+        destroy_image(device, &self.depth);
+        destroy_image(device, &self.mvec);
+    }
+}
+
+unsafe fn destroy_image(device: &ash::Device, img: &DlssgImage) {
+    if img.view != vk::ImageView::null() {
+        device.destroy_image_view(img.view, None);
+    }
+    if img.image != vk::Image::null() {
+        device.destroy_image(img.image, None);
+    }
+    if img.memory != vk::DeviceMemory::null() {
+        device.free_memory(img.memory, None);
+    }
+}

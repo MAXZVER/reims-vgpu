@@ -577,6 +577,9 @@ pub(crate) struct WindowPresenter {
     /// TEMP (lab, PRESENT_FG): frame generation for the scaled present.
     fg: Option<super::present_fg::PresentFg>,
     fg_failed: bool,
+    /// TEMP (lab, PRESENT_DLSSG): DLSS Frame Generation's per-present state.
+    dlssg: Option<super::present_dlssg::Dlssg>,
+    dlssg_failed: bool,
 }
 
 /// Everything one in-flight present owns for as long as its blit is running.
@@ -843,6 +846,8 @@ impl WindowPresenter {
             sharp: None,
             sharp_failed: false,
             fg: None,
+            dlssg: None,
+            dlssg_failed: false,
             fg_failed: false,
         };
         // A window created while minimized has no swapchain yet, which is not a
@@ -1641,6 +1646,35 @@ impl WindowPresenter {
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
             );
+            // TEMP (lab, PRESENT_DLSSG): this frame's token, tags and constants.
+            let dlssg_token = if super::present_dlssg::active() && !self.dlssg_failed {
+                let (w, h) = (self.extent.width, self.extent.height);
+                if self.dlssg.as_ref().is_none_or(|d| !d.matches(w, h)) {
+                    if let Some(mut old) = self.dlssg.take() {
+                        let _ = ctx.queue_wait_idle();
+                        old.destroy(&ctx.device);
+                    }
+                    let memory_type = |bits, bytes, _host| {
+                        ctx.memory_type_for(bits, bytes, reims_vgpu_vulkan::memory::MemoryClass::DeviceLocal)
+                    };
+                    match super::present_dlssg::Dlssg::create(&ctx.device, w, h, &memory_type) {
+                        Ok(d) => self.dlssg = Some(d),
+                        Err(e) => {
+                            self.dlssg_failed = true;
+                            crate::observe::fail(format!("present_dlssg_refused reason=build err={e:?} {w}x{h}"));
+                        }
+                    }
+                }
+                match self.dlssg.as_mut() {
+                    Some(d) => {
+                        d.keep_views_of(&ctx.device, &self.images);
+                        d.record(&ctx.device, ctx.pd, frame_cmd, dst, translate::pixel::SCANOUT_FORMAT)
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
             ctx.device.end_command_buffer(frame_cmd).map_err(|error| {
                 DrawError::VkCall(VkCall::new(VkOp::WindowEndCommandBuffer, error))
             })?;
@@ -1652,7 +1686,10 @@ impl WindowPresenter {
             }
             let signals = [frame_render_finished];
             let commands = [frame_cmd];
-            ctx.submit_present_transaction(super::context::PresentTransaction {
+            if let Some(token) = dlssg_token {
+                super::present_dlssg::Dlssg::mark_present(token, true);
+            }
+            let presented = ctx.submit_present_transaction(super::context::PresentTransaction {
                 command_buffers: &commands,
                 wait_semaphores: &waits,
                 wait_stages: &wait_stages,
@@ -1662,8 +1699,11 @@ impl WindowPresenter {
                 present_wait: frame_render_finished,
                 swapchain: self.swapchain,
                 image_index,
-            })
-            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
+            });
+            if let Some(token) = dlssg_token {
+                super::present_dlssg::Dlssg::mark_present(token, false);
+            }
+            presented.map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
         })();
         // A plain `?` now the failure arm has nothing to undo: it used to have to
         // drop the pins this present had taken before returning.
@@ -2064,6 +2104,9 @@ impl WindowPresenter {
         }
         if let Some(mut fg) = self.fg.take() {
             fg.destroy(ctx);
+        }
+        if let Some(mut dlssg) = self.dlssg.take() {
+            dlssg.destroy(&ctx.device);
         }
         // Drained rather than iterated, so a second `destroy` — `create` calls
         // it on a failed `recreate_swapchain`, and the caller may call it again

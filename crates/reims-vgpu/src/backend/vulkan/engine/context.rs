@@ -1016,7 +1016,17 @@ impl DeviceContext {
     }
 
     pub(crate) unsafe fn create() -> Result<Self, DrawError> {
-        let entry = ash::Entry::load().map_err(|e| {
+        // TEMP (lab, PRESENT_DLSSG): through Streamline's interposer when DLSS-G
+        // is on (slInit has run; its proxies set up instance, device, swapchain).
+        #[cfg(feature = "host-window")]
+        let sl_loader = super::present_dlssg::loader();
+        #[cfg(not(feature = "host-window"))]
+        let sl_loader: Option<std::path::PathBuf> = None;
+        let entry = match sl_loader {
+            Some(path) => ash::Entry::load_from(&path),
+            None => ash::Entry::load(),
+        }
+        .map_err(|e| {
             DrawError::Init(InitDecline::LoadVulkanLoader {
                 detail: e.to_string(),
             })
