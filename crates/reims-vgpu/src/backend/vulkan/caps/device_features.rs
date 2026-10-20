@@ -995,9 +995,14 @@ pub unsafe fn query(
 
     // The guest is handed ONE sample-count answer and uses it for colour
     // attachments, depth attachments and sampled images alike, so the honest
-    // answer is the intersection of the three masks.
+    // answer is the intersection of the masks. The stencil mask belongs in it
+    // too: the spec guarantees each mask independently only {1,4}, and a
+    // stencil-tested pass creates its combined depth/stencil image at this
+    // count - a host with 8x colour/depth and 4x stencil would have its 8x
+    // answer refused at vkCreateImage on exactly those passes.
     let sample_mask = props.limits.framebuffer_color_sample_counts
         & props.limits.framebuffer_depth_sample_counts
+        & props.limits.framebuffer_stencil_sample_counts
         & props.limits.sampled_image_color_sample_counts;
     let max_sample_count = [
         vk::SampleCountFlags::TYPE_16,
