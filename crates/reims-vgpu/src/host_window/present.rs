@@ -1097,6 +1097,11 @@ struct App {
     /// guest's cursor at once; unfocused, only once the host's own mouse has
     /// been left alone (see `apply_guest_cursor`).
     focused: bool,
+    /// Mouse buttons the guest was told are down. Focus loss sends no release
+    /// for them (winit synthesises none on `WM_CAPTURECHANGED` or deactivation),
+    /// so a button held through Alt+Tab stayed down in the guest until the next
+    /// click; [`WindowEvent::Focused`] releases them the way the keyboard does.
+    held_buttons: Vec<crate::runtime::input::ReimsVgpuButton>,
     /// TEMP lab: `REIMS_VGPU_LAB_WINDOW_BACKGROUND=1` — the window is off screen
     /// and never places the host pointer.
     lab_background: bool,
@@ -1351,6 +1356,11 @@ impl ApplicationHandler<FramePublished> for App {
                 // also where the desktop's shortcuts are taken and handed back.
                 let effect = self.keyboard.focus(focused);
                 self.apply_key_effect(effect);
+                if !focused {
+                    for btn in std::mem::take(&mut self.held_buttons) {
+                        (self.on_input)(HostAction::input_pointer_button(btn, false));
+                    }
+                }
                 self.focused = focused;
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1369,10 +1379,15 @@ impl ApplicationHandler<FramePublished> for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(btn) = input_map::mouse_button(button) {
-                    (self.on_input)(HostAction::input_pointer_button(
-                        btn,
-                        state == ElementState::Pressed,
-                    ));
+                    let down = state == ElementState::Pressed;
+                    if down {
+                        if !self.held_buttons.contains(&btn) {
+                            self.held_buttons.push(btn);
+                        }
+                    } else {
+                        self.held_buttons.retain(|&b| b != btn);
+                    }
+                    (self.on_input)(HostAction::input_pointer_button(btn, down));
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1627,6 +1642,7 @@ impl App {
             host_pointer: None,
             warp: WarpGate::default(),
             focused: false,
+            held_buttons: Vec::new(),
             lab_background: false,
         }
     }
@@ -2962,8 +2978,13 @@ mod win32_drag {
     }
 
     fn present_latest_frame(state: &DragHookState) {
-        if let Ok(guard) = state.frames.lock() {
-            if let Some(frame) = guard.as_ref() {
+        // The frame is cloned out and the slot's lock let go before the present,
+        // as `draw` does: held through `window_present` (its fence wait, a
+        // swapchain recreate) it stalled the drain's `window_write_frame` - with
+        // the device lock held - for every move and resize step of the window.
+        let latest = state.frames.lock().ok().and_then(|guard| guard.clone());
+        {
+            if let Some(frame) = latest.as_ref() {
                 let seq = frame.seq;
                 let prev = state.last_presented_seq.load(Ordering::Acquire);
                 if seq != prev && state.last_presented_seq.compare_exchange(prev, seq, Ordering::AcqRel, Ordering::Acquire).is_ok() {

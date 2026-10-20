@@ -1771,10 +1771,22 @@ fn async_worker() {
                 }
             }
         };
-        let result = match task.kernel_local_size {
-            Some(local_size) => translate_kernel_air(&task.air, local_size),
-            None => translate_air(&task.air, task.stage),
-        };
+        // The whole translation, not only the translator call: the
+        // post-processing around it (`finish_translated`, the capture) runs on
+        // guest-derived SPIR-V too, and a panic there would leave the entry
+        // `Loading` and this worker gone exactly as a translator panic did.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match task.kernel_local_size {
+                Some(local_size) => translate_kernel_air(&task.air, local_size),
+                None => translate_air(&task.air, task.stage),
+            }
+        }))
+        .unwrap_or_else(|payload| {
+            Err(translate_decline(
+                task.stage,
+                format!("translation_panic {}", crate::observe::panic::payload_text(&*payload)),
+            ))
+        });
         let (hits, misses, detail, failure) = {
             let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
             let (detail, failure) = match result {
