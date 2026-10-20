@@ -58,11 +58,18 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 static void take_foreground(HWND hwnd) {
     // A background process may not take the foreground; an Alt tap makes this the last input owner first.
+    // Joining the foreground thread's input queue lifts the foreground lock as well.
     keybd_event(VK_MENU, 0, 0, 0);
     keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    DWORD fg = GetWindowThreadProcessId(GetForegroundWindow(), nullptr), me = GetCurrentThreadId();
+    bool joined = fg && fg != me && AttachThreadInput(fg, me, TRUE);
     ShowWindow(hwnd, SW_SHOWNORMAL);
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    BringWindowToTop(hwnd);
     SetForegroundWindow(hwnd);
     SetFocus(hwnd);
+    SetActiveWindow(hwnd);
+    if (joined) AttachThreadInput(fg, me, FALSE);
 }
 
 int main(int argc, char** argv) {
