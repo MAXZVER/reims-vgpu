@@ -95,6 +95,8 @@ struct PresentDump {
     out: (u32, u32),
     /// Whether the result is RGBA (NVScaler's storage image) or BGRA (EASU's).
     out_rgba: bool,
+    /// The source is rgba8 too (a PRESENT_FG frame), not the BGRA guest frame.
+    src_rgba: bool,
 }
 
 /// NVScaler's constants for one present (`NVScalerUpdateConfig`, SDR), as the
@@ -1116,7 +1118,8 @@ impl PresentSharp {
                 (self.nis.is_some() && nis_cfg.is_some()) || self.vsr.is_some(),
                 memory_type,
             );
-        if let (true, Some(d)) = (dumping, self.dump.as_ref()) {
+        if let (true, Some(d)) = (dumping, self.dump.as_mut()) {
+            d.src_rgba = src.real.is_some();
             Self::dump_copy(device, cmd, src.image, src.layout, d.buffer, 0, (src.width, src.height));
         }
         // TEMP (lab, PRESENT_VSR_TILES): stamp the changed cells, refine still
@@ -1705,7 +1708,7 @@ impl PresentSharp {
             device.free_memory(memory, None);
             return false;
         }
-        self.dump = Some(PresentDump { buffer, memory, ix, src, out, out_rgba });
+        self.dump = Some(PresentDump { buffer, memory, ix, src, out, out_rgba, src_rgba: false });
         true
     }
 
@@ -1740,7 +1743,7 @@ impl PresentSharp {
                 }
                 let _ = std::fs::write(name, out);
             };
-            write(format!("{dir}/{n:03}-src.ppm"), d.src, &bytes[..src_len], false);
+            write(format!("{dir}/{n:03}-src.ppm"), d.src, &bytes[..src_len], d.src_rgba);
             write(format!("{dir}/{n:03}-out.ppm"), d.out, &bytes[src_len..], d.out_rgba);
             device.unmap_memory(d.memory);
             crate::observe::fail(format!(
