@@ -1809,12 +1809,16 @@ pub fn commit_guest_write_stamp(
         m.guest_write_gen_at_store = if current { seen.gen_ } else { 0 };
         m.guest_stated_at_stamp = seen.stated;
         // TEMP (lab, Opus 2026-10-20, REIMS_VGPU_LAB_BIG_SEED): why a large surface's Store stamped 0.
-        if m.guest_write_gen_at_store == 0 && u64::from(m.width) * u64::from(m.height) >= 4_000_000 {
+        if m.guest_write_gen_at_store == 0 && u64::from(m.width) * u64::from(m.height) >= 4_000_000
+        {
             use std::sync::atomic::{AtomicU32, Ordering};
             static N: AtomicU32 = AtomicU32::new(0);
             static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
             let max = *MAX.get_or_init(|| {
-                std::env::var("REIMS_VGPU_LAB_BIG_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+                std::env::var("REIMS_VGPU_LAB_BIG_SEED")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
             });
             if N.fetch_add(1, Ordering::Relaxed) < max {
                 crate::observe::fail(format!(
@@ -2225,7 +2229,10 @@ fn control_layout_key(state: &DeviceState, pages: usize) -> u64 {
     p = mix(p, state.gfx.fifo_base_page as u64);
     p = mix(p, state.gfx.fifo_length as u64);
     p = mix(p, state.iosfc.ring_base);
-    p = mix(p, RING_LAYOUT_GEN.load(std::sync::atomic::Ordering::Relaxed));
+    p = mix(
+        p,
+        RING_LAYOUT_GEN.load(std::sync::atomic::Ordering::Relaxed),
+    );
     for (i, ring) in state.child_rings.iter().enumerate() {
         if ring.page_gpas.is_empty() {
             continue;
@@ -3004,9 +3011,14 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     }
     flush_retired_views(state, host);
     let runs = reims_vgpu_paging::runs::contig_page_runs(&gpas, page_size);
-    if let RunCopy::Write(src) = &copy {
+    let par_source = match &copy {
+        RunCopy::Write(src) => Some((*src, None)),
+        RunCopy::WriteRect(src, rect) => Some((*src, Some(*rect))),
+        _ => None,
+    };
+    if let Some((src, rect)) = par_source {
         if let Some(done) = par_land_write(
-            &*state, host, mapping_id, off, src, only, &gpas, &runs, site,
+            &*state, host, mapping_id, off, src, rect, len, only, &gpas, &runs, site,
         ) {
             return done;
         }
@@ -3161,6 +3173,8 @@ fn par_land_write<H: HostMemory + HostOps>(
     mapping_id: u32,
     off: u64,
     buf: &[u8],
+    rect: Option<RectStride>,
+    span_len: usize,
     only: Option<&[(u64, u64)]>,
     gpas: &[u64],
     runs: &[std::ops::Range<usize>],
@@ -3173,6 +3187,8 @@ fn par_land_write<H: HostMemory + HostOps>(
         mapping_id,
         off,
         buf,
+        rect,
+        span_len,
         only,
         gpas,
         runs,
@@ -3190,11 +3206,20 @@ fn par_land_write_in<H: HostMemory + HostOps>(
     mapping_id: u32,
     off: u64,
     buf: &[u8],
+    rect: Option<RectStride>,
+    span_len: usize,
     only: Option<&[(u64, u64)]>,
     gpas: &[u64],
     runs: &[std::ops::Range<usize>],
     site: &str,
 ) -> Option<bool> {
+    // A rectangle source is packed rows landing at the guest's row stride: the
+    // walk covers its span (`span_len`), and each selected stretch is split into
+    // the row pieces `RectStride::for_each_piece` names, the padding between rows
+    // untouched. A linear source is its own span.
+    if rect.is_some_and(|r| buf.len() < r.packed()) || (rect.is_none() && span_len != buf.len()) {
+        return None;
+    }
     if !enabled || !host.map_pages_stable() {
         return None;
     }
@@ -3204,7 +3229,7 @@ fn par_land_write_in<H: HostMemory + HostOps>(
     // the recorder still holds may read these pages, so the drain settles it
     // here, before it forks.
     crate::backend::settle_deferred_draws_for_guest_write();
-    let need_end = off.saturating_add(buf.len() as u64);
+    let need_end = off.saturating_add(span_len as u64);
     let selected: u64 = selected_within(only, off, need_end)
         .map(|(lo, hi)| hi - lo)
         .sum();
@@ -3213,7 +3238,7 @@ fn par_land_write_in<H: HostMemory + HostOps>(
     }
     let page_size = state.page_size();
     let page_sz = page_size as usize;
-    let len = buf.len();
+    let len = span_len;
     let lab_t0 = std::time::Instant::now(); // TEMP (lab): phase split below
     let mut mapped: Vec<(usize, usize)> = Vec::new();
     let mut spans: Vec<LandSpan> = Vec::new();
@@ -3254,6 +3279,24 @@ fn par_land_write_in<H: HostMemory + HostOps>(
         }
         for (sel_lo, sel_hi) in selected_within(only, copy_lo, copy_hi) {
             let host_off = (sel_lo - run_mlo) as usize;
+            if let Some(rect) = rect {
+                rect.for_each_piece(
+                    (sel_lo - off) as usize,
+                    host_off,
+                    (sel_hi - sel_lo) as usize,
+                    |packed_off, host_at, n| {
+                        spans.push(LandSpan {
+                            // SAFETY: a piece lies inside the selected stretch,
+                            // which lies inside the checked window.
+                            dst: unsafe { (ptr as *mut u8).add(host_at) },
+                            src: packed_off,
+                            n,
+                            gpa: run_gpas[0].saturating_add(host_at as u64),
+                        });
+                    },
+                );
+                continue;
+            }
             spans.push(LandSpan {
                 // SAFETY: `host_off + n <= total` for the enclosing window was
                 // checked above and the selection is inside it.
@@ -3318,7 +3361,16 @@ fn par_land_write_in<H: HostMemory + HostOps>(
         crate::observe::footprint::note_written_range(s.gpa, s.n as u64);
     }
     unmap_all(host, &mapped);
-    lab_par_land_census(mapping_id, selected, runs.len(), mapped.len(), spans.len(), lab_t0, lab_t1, lab_t2);
+    lab_par_land_census(
+        mapping_id,
+        selected,
+        runs.len(),
+        mapped.len(),
+        spans.len(),
+        lab_t0,
+        lab_t1,
+        lab_t2,
+    );
     Some(true)
 }
 
@@ -3342,7 +3394,10 @@ fn lab_par_land_census(
     static N: AtomicU32 = AtomicU32::new(0);
     static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let max = *MAX.get_or_init(|| {
-        std::env::var("REIMS_VGPU_LAB_BIG_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        std::env::var("REIMS_VGPU_LAB_BIG_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     });
     let n = N.fetch_add(1, Ordering::Relaxed);
     if n >= max && n % 200 != 0 {
@@ -3402,12 +3457,55 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
     only: Option<&[(u64, u64)]>,
     vouched: &PagesVouched,
 ) -> bool {
-    if buf.is_empty() {
+    write_mapping_copy_only(
+        state,
+        host,
+        mapping_id,
+        off,
+        RunCopy::Write(buf),
+        only,
+        vouched,
+    )
+}
+
+/// [`write_mapping_bytes_only`] for packed rows landing at the guest's row
+/// stride: `src` holds `rect`'s rows back to back, and they land at `off`,
+/// `off + stride`, ... with the padding between them untouched. For a frame
+/// whose rows are already packed this is the staged copy's whole job, done
+/// inside the landing instead of as a second pass over the frame.
+pub fn write_mapping_rect_only<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    src: &[u8],
+    rect: RectStride,
+    only: Option<&[(u64, u64)]>,
+    vouched: &PagesVouched,
+) -> bool {
+    match RunCopy::write_rect(src, rect) {
+        Some(copy) => write_mapping_copy_only(state, host, mapping_id, off, copy, only, vouched),
+        None => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_mapping_copy_only<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    copy: RunCopy<'_>,
+    only: Option<&[(u64, u64)]>,
+    vouched: &PagesVouched,
+) -> bool {
+    let span = copy.len();
+    if span == 0 {
         return true;
     }
     let lab_mw0 = std::time::Instant::now(); // TEMP (lab): big-write split
-    // Deferred-writeback flush-on-access: land any pending resident content
-    // in these pages first so this write applies on top of it, not under it.
+                                             // Deferred-writeback flush-on-access: land any pending resident content
+                                             // in these pages first so this write applies on top of it, not under it.
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
         host,
@@ -3416,11 +3514,7 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
     );
     // Exact-window residency invalidation: guest pages in this range no
     // longer mirror any resident storage image (disjoint windows survive).
-    state.invalidate_storage_residency_window(
-        mapping_id,
-        off,
-        off.saturating_add(buf.len() as u64),
-    );
+    state.invalidate_storage_residency_window(mapping_id, off, off.saturating_add(span as u64));
     // The flush above can invalidate this mapping — that is exactly what it does
     // when its own drift check refuses — so the proof is re-checked after it and
     // not before. A stale token here is not a lost frame to mourn: the list it
@@ -3428,33 +3522,29 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
     // corruption this token exists to prevent.
     if !vouched.covers(state, mapping_id) {
         crate::observe::fail(format!(
-            "mapping_write fail reason=vouch_stale mid={mapping_id} off={off:#x} len={:#x} \
-             (the page list was cleared or replaced between the walk and this write)",
-            buf.len()
+            "mapping_write fail reason=vouch_stale mid={mapping_id} off={off:#x} len={span:#x}              (the page list was cleared or replaced between the walk and this write)"
         ));
         return false;
     }
     let lab_c0 = std::time::Instant::now(); // TEMP (lab): big-write split
-    let ok = copy_mapping_runs(
-        state,
-        host,
-        mapping_id,
-        off,
-        RunCopy::Write(buf),
-        only,
-        "mapping_write",
-    );
+    let ok = copy_mapping_runs(state, host, mapping_id, off, copy, only, "mapping_write");
     let lab_c1 = std::time::Instant::now();
     if ok {
-        rebase_device_write(state, &*host, mapping_id, off, off.saturating_add(buf.len() as u64), only);
+        rebase_device_write(
+            state,
+            &*host,
+            mapping_id,
+            off,
+            off.saturating_add(span as u64),
+            only,
+        );
     }
-    if buf.len() >= 4_000_000 && std::env::var_os("REIMS_VGPU_LAB_BIG_SEED").is_some() {
+    if span >= 4_000_000 && std::env::var_os("REIMS_VGPU_LAB_BIG_SEED").is_some() {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 40 || n % 100 == 0 {
             crate::observe::fail(format!(
-                "lab_big_mapw #{n} mid={mapping_id} bytes={} prologue_us={} copy_us={} rebase_us={}",
-                buf.len(),
+                "lab_big_mapw #{n} mid={mapping_id} bytes={span} prologue_us={} copy_us={} rebase_us={}",
                 (lab_c0 - lab_mw0).as_micros(),
                 (lab_c1 - lab_c0).as_micros(),
                 lab_c1.elapsed().as_micros()

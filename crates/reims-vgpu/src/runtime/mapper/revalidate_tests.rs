@@ -724,12 +724,72 @@ mod par_land {
             mid,
             off,
             &buf,
+            None,
+            buf.len(),
             Some(only),
             &gpas,
             &runs,
             "par_land_test",
         );
         (ram(&s_host), ram(&p_host), answer)
+    }
+
+    /// The same comparison for a packed-rows source landing at a wider guest
+    /// row stride: the serial rectangle walk and the parallel landing must put
+    /// the same bytes in the same pages and leave the padding alone.
+    fn land_rect_both_ways(
+        order: &[usize],
+        off: u64,
+        stride: u64,
+        row: u64,
+        rows: u64,
+    ) -> (Vec<u8>, Vec<u8>, Option<bool>) {
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let rect = RectStride::new(stride, row, rows).expect("a rectangle");
+        assert!(off + rect.span() as u64 <= PAGES as u64 * page);
+        let buf: Vec<u8> = (0..rect.packed())
+            .map(|i| (i * 7 + i / 977) as u8)
+            .collect();
+        let only: Vec<(u64, u64)> = (0..rows)
+            .map(|y| (off + y * stride, off + y * stride + row))
+            .collect();
+        let (mut s_state, mut s_host, mid) = fixture(order, false);
+        assert!(copy_mapping_runs(
+            &mut s_state,
+            &mut s_host,
+            mid,
+            off,
+            RunCopy::write_rect(&buf, rect).expect("long enough"),
+            Some(&only),
+            "par_land_rect_test"
+        ));
+        let (mut p_state, mut p_host, mid) = fixture(order, true);
+        let gpas = mapping_page_gpas(&mut p_state, &mut p_host, mid).expect("a valid list");
+        let runs = reims_vgpu_paging::runs::contig_page_runs(&gpas, page);
+        let answer = par_land_write_in(
+            true,
+            &p_state,
+            &mut p_host,
+            mid,
+            off,
+            &buf,
+            Some(rect),
+            rect.span(),
+            Some(&only),
+            &gpas,
+            &runs,
+            "par_land_rect_test",
+        );
+        (ram(&s_host), ram(&p_host), answer)
+    }
+
+    #[test]
+    fn a_packed_rows_frame_lands_in_parallel_exactly_as_the_serial_rectangle_walk() {
+        let order: Vec<usize> = (0..PAGES).rev().collect();
+        // 3000-texel BGRA rows (12000 bytes) at a 12032-byte guest pitch.
+        let (serial, parallel, answer) = land_rect_both_ways(&order, 64, 12032, 12000, 30);
+        assert_eq!(answer, Some(true));
+        assert_eq!(serial, parallel);
     }
 
     fn selection() -> Vec<(u64, u64)> {
