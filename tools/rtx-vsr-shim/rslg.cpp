@@ -35,7 +35,7 @@ static sl::ViewportHandle g_viewport{0};
 // DLSS Super Resolution runs on its own viewport: with DLSS-G on viewport 0 in the same frame, the two set different
 // tags (depth / motion vectors at the guest frame's size vs the window's) and constants (mvecScale), and a viewport
 // holds one set of each per frame.
-static sl::ViewportHandle g_viewport_sr{1};
+// (rslg_dlss_vp / rslg_dlss_eval_vp take the viewport; the plain entry points use 1.)
 
 static int rc(sl::Result r) {
     return r == sl::Result::eOk ? 0 : int(r) + 1000;
@@ -207,7 +207,16 @@ RSLG_API int rslg_dlss_supported(VkPhysicalDevice pd) {
 // DLSS Super Resolution options for the one viewport: `mode` an sl::DLSSMode value, the output size, `preset` an
 // sl::DLSSPreset value for every mode (0 = default; 11 = K, 12 = L, 13 = M - the DLSS 4.5 transformer presets).
 // The guest frame is LDR sRGB-encoded 8-bit.
+RSLG_API int rslg_dlss_vp(int vp, int mode, uint32_t out_w, uint32_t out_h, int preset);
+
 RSLG_API int rslg_dlss(int mode, uint32_t out_w, uint32_t out_h, int preset) {
+    return rslg_dlss_vp(1, mode, out_w, out_h, preset);
+}
+
+// rslg_dlss on viewport `vp` (>= 1; 0 is DLSS-G's): one DLSS instance per viewport, each with its own preset and
+// history - a cheap preset for moving frames beside an expensive one for settled frames, without re-creating the
+// feature on every switch.
+RSLG_API int rslg_dlss_vp(int vp, int mode, uint32_t out_w, uint32_t out_h, int preset) {
     sl::DLSSOptions o{};
     o.mode = sl::DLSSMode(mode);
     o.outputWidth = out_w;
@@ -216,14 +225,24 @@ RSLG_API int rslg_dlss(int mode, uint32_t out_w, uint32_t out_h, int preset) {
     sl::DLSSPreset p = sl::DLSSPreset(preset);
     o.dlaaPreset = o.qualityPreset = o.balancedPreset = o.performancePreset = o.ultraPerformancePreset =
         o.ultraQualityPreset = p;
-    return rc(slDLSSSetOptions(g_viewport_sr, o));
+    return rc(slDLSSSetOptions(sl::ViewportHandle(uint32_t(vp)), o));
 }
 
 // Upscale `in` into `out` with DLSS for this frame: tags (input colour, output colour, depth and motion vectors at
 // the input size), the frame's constants (`reset` drops the history), then the evaluate recorded into `cb`.
+RSLG_API int rslg_dlss_eval_vp(int vp, void* token, VkCommandBuffer cb, const RslgImage* in, const RslgImage* out,
+                               const RslgImage* depth, const RslgImage* mvec, int reset);
+
 RSLG_API int rslg_dlss_eval(void* token, VkCommandBuffer cb, const RslgImage* in, const RslgImage* out,
                             const RslgImage* depth, const RslgImage* mvec, int reset) {
+    return rslg_dlss_eval_vp(1, token, cb, in, out, depth, mvec, reset);
+}
+
+// rslg_dlss_eval on viewport `vp` (see rslg_dlss_vp).
+RSLG_API int rslg_dlss_eval_vp(int vp, void* token, VkCommandBuffer cb, const RslgImage* in, const RslgImage* out,
+                               const RslgImage* depth, const RslgImage* mvec, int reset) {
     if (!token) return -1;
+    sl::ViewportHandle viewport{uint32_t(vp)};
     sl::Resource i = resource(*in), o = resource(*out), d = resource(*depth), m = resource(*mvec);
     sl::Extent ein{0, 0, in->width, in->height};
     sl::Extent eout{0, 0, out->width, out->height};
@@ -235,11 +254,11 @@ RSLG_API int rslg_dlss_eval(void* token, VkCommandBuffer cb, const RslgImage* in
     };
     sl::FrameToken& t = *static_cast<sl::FrameToken*>(token);
     sl::CommandBuffer* slcb = reinterpret_cast<sl::CommandBuffer*>(cb);
-    sl::Result r = slSetTagForFrame(t, g_viewport_sr, tags, 4, slcb);
+    sl::Result r = slSetTagForFrame(t, viewport, tags, 4, slcb);
     if (r != sl::Result::eOk) return rc(r);
-    int c = set_constants(token, 1.0f / float(in->width), 1.0f / float(in->height), reset, g_viewport_sr);
+    int c = set_constants(token, 1.0f / float(in->width), 1.0f / float(in->height), reset, viewport);
     if (c) return c;
-    const sl::BaseStructure* inputs[] = {&g_viewport_sr};
+    const sl::BaseStructure* inputs[] = {&viewport};
     return rc(slEvaluateFeature(sl::kFeatureDLSS, t, inputs, 1, slcb));
 }
 

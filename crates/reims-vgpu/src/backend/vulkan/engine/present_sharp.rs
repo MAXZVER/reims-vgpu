@@ -263,6 +263,8 @@ pub(crate) struct PresentSharp {
     dlss_depth: Option<MidImage>,
     dlss_mvec: Option<MidImage>,
     dlss_cleared: bool,
+    /// TEMP (lab, PRESENT_DLSS_PRESET_MOTION): which instance ran the last evaluate (`Some(true)` = motion).
+    dlss_last_moving: Option<bool>,
     /// TEMP (lab, PRESENT_DLSS_SR): the pass that writes `dlss_mvec` from the optical flow
     /// (`shaders/present_dlss_mvec.comp`), made on the first present with a flow pair; whether the vectors in
     /// `dlss_mvec` are not all zero (a present without a fresh pair clears them); a build that refused.
@@ -448,6 +450,7 @@ impl PresentSharp {
             dlss_depth: None,
             dlss_mvec: None,
             dlss_cleared: false,
+            dlss_last_moving: None,
             dlss_mvec_pass: None,
             dlss_mvec_moving: false,
             dlss_mvec_failed: false,
@@ -1196,6 +1199,7 @@ impl PresentSharp {
         vin: (vk::Image, vk::ImageView, u32, u32),
         mid: (vk::Image, vk::ImageView, u32, u32),
         motion: Option<&super::present_fg::FgMotion>,
+        moving: bool,
     ) -> i32 {
         let (Some(depth), Some(mvec)) = (self.dlss_depth.as_ref(), self.dlss_mvec.as_ref()) else {
             return -102;
@@ -1205,7 +1209,13 @@ impl PresentSharp {
         // frame that stood still (the moving frames take EASU, ~1 ms of GPU against preset M's ~11 ms at 5K out -
         // b942a canvas 45 fps; Mish: 60 real frames for DLSS-G to make 120). The frames between two such presents
         // never reached DLSS, so its history is another picture: every settled evaluate starts it afresh.
-        let reset = !self.dlss_cleared || crate::host_window::present::lab_present_settle().is_some();
+        // With a motion instance (PRESENT_DLSS_PRESET_MOTION) the moving frames run consecutively through it, so its
+        // history holds - it starts afresh only after a settled present (or a gap) came between.
+        let reset = if moving {
+            !self.dlss_cleared || self.dlss_last_moving != Some(true)
+        } else {
+            !self.dlss_cleared || crate::host_window::present::lab_present_settle().is_some()
+        };
         if !self.dlss_cleared {
             let to_dst = [depth.image, mvec.image].map(|image| {
                 vk::ImageMemoryBarrier::default()
@@ -1248,14 +1258,17 @@ impl PresentSharp {
         let vin_usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE;
         let mid_usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
         let aux = |m: &MidImage, format| image((m.image, m.view, m.width, m.height), vk::ImageLayout::GENERAL, format, DLSS_AUX_USAGE);
-        super::present_dlssg::dlss_sr_evaluate(
+        let r = super::present_dlssg::dlss_sr_evaluate(
             cmd,
             &image(vin, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, rgba, vin_usage),
             &image(mid, vk::ImageLayout::GENERAL, rgba, mid_usage),
             &aux(depth, DLSS_DEPTH_FORMAT),
             &aux(mvec, DLSS_MVEC_FORMAT),
             reset,
-        )
+            moving,
+        );
+        self.dlss_last_moving = Some(moving);
+        r
     }
 
     /// TEMP (lab, PRESENT_DLSS_SR): `dlss_mvec` (`GENERAL`, `width` x `height`) for this present - from the flow
@@ -1474,10 +1487,11 @@ impl PresentSharp {
         }
         // TEMP (lab, PRESENT_VSR_SETTLE): with a settle time VSR runs only on the
         // present that refines a settled frame; the others take EASU alone.
-        let vsr_this = self.vsr.is_some()
-            && !super::present_refine::on()
-            && (crate::host_window::present::lab_present_settle().is_none()
-                || crate::host_window::present::lab_take_refine_present());
+        let refine_present = crate::host_window::present::lab_present_settle().is_none()
+            || crate::host_window::present::lab_take_refine_present();
+        // TEMP (lab, PRESENT_DLSS_PRESET_MOTION): the moving frames take DLSS's motion instance instead of EASU.
+        let dlss_moving = !refine_present && super::present_dlssg::dlss_motion_active();
+        let vsr_this = self.vsr.is_some() && !super::present_refine::on() && (refine_present || dlss_moving);
         let second = if (self.nis.is_some() && nis_cfg.is_none()) || (self.vsr.is_some() && !vsr_this) {
             None
         } else {
@@ -1666,7 +1680,7 @@ impl PresentSharp {
                 let r = if dlss {
                     // The flow ran at the guest frame's size; vectors only when `vin` is that size too.
                     let motion = src.motion.as_ref().filter(|_| (vin_w, vin_h) == (src.width, src.height));
-                    self.dlss_evaluate(device, cmd, ix, (vin_image, vin_view, vin_w, vin_h), (mid_image, mid_view, mid_w, mid_h), motion)
+                    self.dlss_evaluate(device, cmd, ix, (vin_image, vin_view, vin_w, vin_h), (mid_image, mid_view, mid_w, mid_h), motion, dlss_moving)
                 } else { super::present_vsr::evaluate(
                     cmd,
                     &super::present_vsr::VsrImage {

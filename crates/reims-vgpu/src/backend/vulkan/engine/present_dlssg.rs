@@ -55,6 +55,19 @@ pub(crate) fn dlss_sr() -> Option<(i32, i32)> {
     })
 }
 
+/// TEMP (lab, 10-21): `REIMS_VGPU_LAB_PRESENT_DLSS_PRESET_MOTION=K|L|M` - with PRESENT_VSR_SETTLE the moving frames
+/// take DLSS with this preset (its own instance, viewport 2) instead of EASU, and the settled present keeps the main
+/// preset (viewport 1): Mish's "K in motion, M on still". `sl::DLSSPreset`.
+pub(crate) fn dlss_motion_preset() -> Option<i32> {
+    static P: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    *P.get_or_init(|| match std::env::var("REIMS_VGPU_LAB_PRESENT_DLSS_PRESET_MOTION").as_deref() {
+        Ok("K" | "k") => Some(11),
+        Ok("L" | "l") => Some(12),
+        Ok("M" | "m") => Some(13),
+        _ => None,
+    })
+}
+
 /// Streamline is wanted: DLSS-G or the DLSS upscale.
 fn sl_wanted() -> bool {
     on() || dlss_sr().is_some()
@@ -96,6 +109,17 @@ type FnTag = unsafe extern "C" fn(*mut c_void, vk::CommandBuffer, *const RslgIma
 type FnConstants = unsafe extern "C" fn(*mut c_void, f32, f32, i32) -> i32;
 type FnState = unsafe extern "C" fn(*mut u32, *mut u32, *mut u64) -> i32;
 type FnDlss = unsafe extern "C" fn(i32, u32, u32, i32) -> i32;
+type FnDlssVp = unsafe extern "C" fn(i32, i32, u32, u32, i32) -> i32;
+type FnDlssEvalVp = unsafe extern "C" fn(
+    i32,
+    *mut c_void,
+    vk::CommandBuffer,
+    *const RslgImage,
+    *const RslgImage,
+    *const RslgImage,
+    *const RslgImage,
+    i32,
+) -> i32;
 type FnDlssEval = unsafe extern "C" fn(
     *mut c_void,
     vk::CommandBuffer,
@@ -118,6 +142,9 @@ struct Api {
     state: FnState,
     dlss: FnDlss,
     dlss_eval: FnDlssEval,
+    /// The per-viewport pair (an older rslg.dll lacks them: no motion instance then).
+    dlss_vp: Option<FnDlssVp>,
+    dlss_eval_vp: Option<FnDlssEvalVp>,
 }
 
 #[cfg(target_os = "windows")]
@@ -164,6 +191,8 @@ fn api() -> Option<&'static Api> {
                     state: std::mem::transmute::<*mut c_void, FnState>(sym(b"rslg_state\0")?),
                     dlss: std::mem::transmute::<*mut c_void, FnDlss>(sym(b"rslg_dlss\0")?),
                     dlss_eval: std::mem::transmute::<*mut c_void, FnDlssEval>(sym(b"rslg_dlss_eval\0")?),
+                    dlss_vp: sym(b"rslg_dlss_vp\0").map(|p| std::mem::transmute::<*mut c_void, FnDlssVp>(p)),
+                    dlss_eval_vp: sym(b"rslg_dlss_eval_vp\0").map(|p| std::mem::transmute::<*mut c_void, FnDlssEvalVp>(p)),
                 })
             })();
             if made.is_none() {
@@ -237,8 +266,15 @@ fn rslg_image(i: &DlssSrImage) -> RslgImage {
     }
 }
 
-/// Record a DLSS upscale of `input` into `output` (zero depth and motion vectors at the input size) into `cmd`,
-/// setting the options first whenever the output size changed. 0, or the shim's / Streamline's code.
+/// Whether the motion instance can run: a motion preset asked for and an rslg.dll with the per-viewport pair.
+pub(crate) fn dlss_motion_active() -> bool {
+    dlss_sr_active() && dlss_motion_preset().is_some() && api().is_some_and(|a| a.dlss_vp.is_some() && a.dlss_eval_vp.is_some())
+}
+
+/// Record a DLSS upscale of `input` into `output` (depth and motion vectors at the input size) into `cmd`, setting
+/// the options first whenever the output size changed. `moving` picks the motion instance (viewport 2, the motion
+/// preset - [`dlss_motion_active`]) over the main one (viewport 1). 0, or the shim's / Streamline's code.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn dlss_sr_evaluate(
     cmd: vk::CommandBuffer,
     input: &DlssSrImage,
@@ -246,17 +282,33 @@ pub(crate) unsafe fn dlss_sr_evaluate(
     depth: &DlssSrImage,
     mvec: &DlssSrImage,
     reset: bool,
+    moving: bool,
 ) -> i32 {
-    static SET_FOR: std::sync::Mutex<Option<(u32, u32)>> = std::sync::Mutex::new(None);
-    let (Some(api), Some((mode, preset))) = (api(), dlss_sr()) else {
+    static SET_FOR: [std::sync::Mutex<Option<(u32, u32)>>; 2] = [std::sync::Mutex::new(None), std::sync::Mutex::new(None)];
+    let (Some(api), Some((mode, main_preset))) = (api(), dlss_sr()) else {
         return -100;
     };
+    let motion = if moving {
+        match (dlss_motion_preset(), api.dlss_vp, api.dlss_eval_vp) {
+            (Some(p), Some(set), Some(eval)) => Some((p, set, eval)),
+            _ => return -103,
+        }
+    } else {
+        None
+    };
+    let (slot, vp, preset) = match motion {
+        Some((p, _, _)) => (1usize, 2i32, p),
+        None => (0usize, 1i32, main_preset),
+    };
     {
-        let mut set = SET_FOR.lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = SET_FOR[slot].lock().unwrap_or_else(|e| e.into_inner());
         if *set != Some((output.width, output.height)) {
-            let r = (api.dlss)(mode, output.width, output.height, preset);
+            let r = match motion {
+                Some((_, set_vp, _)) => set_vp(vp, mode, output.width, output.height, preset),
+                None => (api.dlss)(mode, output.width, output.height, preset),
+            };
             crate::observe::off(format!(
-                "present_dlss_sr options sl={r} mode={mode} preset={preset} {}x{}->{}x{}",
+                "present_dlss_sr options sl={r} viewport={vp} mode={mode} preset={preset} {}x{}->{}x{}",
                 input.width, input.height, output.width, output.height
             ));
             if r != 0 {
@@ -269,15 +321,11 @@ pub(crate) unsafe fn dlss_sr_evaluate(
     if token.is_null() {
         return -101;
     }
-    (api.dlss_eval)(
-        token,
-        cmd,
-        &rslg_image(input),
-        &rslg_image(output),
-        &rslg_image(depth),
-        &rslg_image(mvec),
-        i32::from(reset),
-    )
+    let (i, o, d, m) = (rslg_image(input), rslg_image(output), rslg_image(depth), rslg_image(mvec));
+    match motion {
+        Some((_, _, eval_vp)) => eval_vp(vp, token, cmd, &i, &o, &d, &m, i32::from(reset)),
+        None => (api.dlss_eval)(token, cmd, &i, &o, &d, &m, i32::from(reset)),
+    }
 }
 
 struct DlssgImage {
