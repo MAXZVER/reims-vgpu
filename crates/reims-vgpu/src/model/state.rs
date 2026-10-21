@@ -6298,6 +6298,8 @@ impl DeviceState {
         // given up, whichever path is giving it up.
         #[cfg(feature = "backend-vulkan")]
         crate::runtime::render_writeback::vulkan::wait_landing_copy_for(mapping_id);
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::render_writeback::vulkan::wait_lazy_copy_for(mapping_id); // TEMP (lab LAZY_SYNC)
         bump_names_gen();
         // The cached BGRA frame is a host-side copy of the pages this call is
         // invalidating, and it is the only such copy whose key does not carry

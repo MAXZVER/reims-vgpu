@@ -21,7 +21,10 @@
 extern "C" {
 #endif
 
-/* v28: ReimsVgpuHostOps.guest_write_rebase - the device itself just stored into these pages of a
+/* v29: ReimsVgpuHostOps.guest_fence_close / guest_fence_open - TEMP lab LAZY_SYNC: take guest pages away
+ *      from the guest while the device lands a frame in them after completing a synchronize; a vCPU
+ *      touching them waits until the fence opens. NULL: no fences (the synchronize lands as before).
+ * v28: ReimsVgpuHostOps.guest_write_rebase - the device itself just stored into these pages of a
  *      tracked set (a writeback landing a GPU frame): a set the tracker answers for by hashing page
  *      content takes their content as its baseline, so the device's own stores do not read back as
  *      the guest writing the surface. NULL: no rebase (a hashed set reports them, as before).
@@ -132,7 +135,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 28u
+#define REIMS_VGPU_QEMU_ABI_VERSION 29u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -489,6 +492,15 @@ typedef struct ReimsVgpuHostOps {
      * a sync of the set already running. Safe from any thread. NULL: no rebase.
      */
     void (*guest_write_rebase)(void *ctx, uint64_t token, const uint64_t *gpas, size_t count);
+    /*
+     * TEMP lab LAZY_SYNC (v29): take `count` page-aligned GPAs away from the guest - any guest access waits until
+     * guest_fence_open of the returned token - and return a non-zero token, or 0 when the shim refuses (no
+     * hypervisor support, too many physical runs). The device keeps writing them through its own mappings. Safe
+     * from any thread. NULL: no fences.
+     */
+    uint64_t (*guest_fence_close)(void *ctx, const uint64_t *gpas, size_t count, size_t page_size);
+    /* TEMP lab LAZY_SYNC (v29): give a fence's pages back to the guest; waiting vCPUs run on. Safe from any thread. */
+    void (*guest_fence_open)(void *ctx, uint64_t token);
 } ReimsVgpuHostOps;
 
 /*

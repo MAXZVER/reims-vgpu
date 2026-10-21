@@ -480,6 +480,33 @@ impl<'a> CursorGlyphRef<'a> {
 
 /// Services the device cannot provide itself (time, wake, action enqueue,
 /// guest CPU / KVA access for the IOSurface mapper path).
+/// TEMP (lab, LAZY_SYNC): pages [`HostOps::guest_fence_close`] took away from
+/// the guest. Opening is the shim's thread-safe callback, so the fence is owned
+/// by whoever lands the frame - the landing thread opens it the moment the last
+/// byte is in, with no drain in between. Dropping it opens it.
+pub struct GuestFence {
+    open: unsafe extern "C" fn(ctx: *mut std::ffi::c_void, token: u64),
+    ctx: usize,
+    token: u64,
+}
+
+impl GuestFence {
+    pub(crate) fn new(open: unsafe extern "C" fn(ctx: *mut std::ffi::c_void, token: u64), ctx: usize, token: u64) -> Self {
+        Self { open, ctx, token }
+    }
+
+    /// Give the pages back.
+    pub fn open(self) {}
+}
+
+impl Drop for GuestFence {
+    fn drop(&mut self) {
+        // SAFETY: the shim keeps ctx for the device lifetime and its open is safe
+        // from any thread; the token is this fence's, opened once.
+        unsafe { (self.open)(self.ctx as *mut std::ffi::c_void, self.token) }
+    }
+}
+
 pub trait HostOps {
     fn mono_ns(&self) -> u64;
     fn enqueue(&mut self, action: HostAction);
@@ -736,6 +763,15 @@ pub trait HostOps {
     /// write-protected page written through the host's own mapping) does
     /// nothing, which is also the default.
     fn guest_write_rebase(&self, _token: u64, _gpas: &[u64]) {}
+
+    /// TEMP (lab, LAZY_SYNC): take these page-aligned GPAs away from the guest
+    /// until the returned fence is opened (or dropped): a vCPU touching them
+    /// waits. The device keeps writing them through its own mappings - the
+    /// fence is what lets a synchronize complete before its frame has landed.
+    /// `None` when this host has no fences or refuses these pages.
+    fn guest_fence_close(&self, _gpas: &[u64], _page_size: usize) -> Option<GuestFence> {
+        None
+    }
 
     /// TEMP (lab, `REIMS_VGPU_LAB_ASYNC_BASELINE`): start the
     /// [`Self::guest_write_gen`] read of `token` on another thread and return

@@ -1421,6 +1421,7 @@ pub fn lab_pay_after_stamp<M: HostMemory + HostOps>(
     if !guest_waiting {
         land_deferred_if_ready(state, host);
     }
+    crate::runtime::render_writeback::lazy_land(state, host, None, false); // TEMP (lab LAZY_SYNC)
     let mapping_id = LAB_PAY_AFTER_STAMP.swap(0, Relaxed);
     if mapping_id != 0 && lab_pay_settling() {
         // TEMP (lab PAY_SETTLE): the screen still moves; the frame stays owed.
@@ -1557,7 +1558,8 @@ pub fn owes_mapping(state: &DeviceState, mapping_id: u32) -> bool {
     // `owes`, not `get`: a payment begun and not landed (PAY_DEFER) is still
     // owed to these pages - its copy may be mid-flight on the landing thread -
     // and the serial rail lands it before reading, so a pool plan must refuse.
-    !state.pending_writebacks.is_empty() && state.pending_writebacks.owes(mapping_id)
+    (!state.pending_writebacks.is_empty() && state.pending_writebacks.owes(mapping_id))
+        || crate::runtime::render_writeback::lazy_pending(mapping_id) // TEMP (lab LAZY_SYNC)
 }
 
 /// Pay `mapping_id`'s owed frame, if it owes one.
@@ -1574,6 +1576,7 @@ pub fn pay_for_mapping<M: HostMemory + HostOps>(
     crate::runtime::render_writeback::land_t2t(state, host, Some(mapping_id)); // TEMP (lab T2T_DEFER)
     // TEMP (lab, T2T_PARK): a parked frame owed to these pages through another mapping.
     crate::runtime::render_writeback::land_t2t_over_mapping(state, host, mapping_id);
+    crate::runtime::render_writeback::lazy_land(state, host, Some(mapping_id), true); // TEMP (lab LAZY_SYNC)
     pay_for_mapping_debt(state, host, mapping_id);
 }
 
@@ -1587,6 +1590,7 @@ pub fn pay_for_mapping_gathered<M: HostMemory + HostOps>(
     mapping_id: u32,
 ) {
     crate::runtime::render_writeback::land_t2t_unparked(state, host, mapping_id);
+    crate::runtime::render_writeback::lazy_land(state, host, Some(mapping_id), true); // TEMP (lab LAZY_SYNC)
     pay_for_mapping_debt(state, host, mapping_id);
 }
 
@@ -1633,6 +1637,7 @@ fn pay_for_mapping_debt<M: HostMemory + HostOps>(state: &mut DeviceState, host: 
 /// it would be worth it; read its doc before building one.
 pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
     crate::runtime::render_writeback::land_t2t(state, host, None); // TEMP (lab T2T_DEFER)
+    crate::runtime::render_writeback::lazy_land(state, host, None, true); // TEMP (lab LAZY_SYNC)
     if state.pending_writebacks.is_empty() {
         return;
     }
@@ -1981,6 +1986,15 @@ pub fn lab_pay_after_first_arm<M: HostMemory + HostOps>(
 /// would let a worker plan a bind whose debt the drain then skips by the lab
 /// switch's own choice — the conservative side is the one that cannot diverge.
 pub fn owes_texture(state: &DeviceState, task_id: u32, texture_ref: u32) -> bool {
+    // TEMP (lab LAZY_SYNC): a lazily landing frame is owed too.
+    if crate::runtime::render_writeback::vulkan_lazy_any()
+        && state
+            .mappings_named_by(task_id, texture_ref)
+            .iter()
+            .any(crate::runtime::render_writeback::lazy_pending)
+    {
+        return true;
+    }
     if state.pending_writebacks.is_empty() {
         return false;
     }
@@ -2012,6 +2026,12 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
             crate::runtime::render_writeback::land_t2t(state, host, Some(mapping_id));
             // TEMP (lab, T2T_PARK): the same pages through another mapping.
             crate::runtime::render_writeback::land_t2t_over_mapping(state, host, mapping_id);
+        }
+    }
+    // TEMP (lab LAZY_SYNC): a lazily landing frame for either surface spelling lands before a reader looks.
+    if crate::runtime::render_writeback::vulkan_lazy_any() {
+        for mapping_id in state.mappings_named_by(task_id, texture_ref).iter() {
+            crate::runtime::render_writeback::lazy_land(state, host, Some(mapping_id), true);
         }
     }
     if state.pending_writebacks.is_empty() {
@@ -2950,6 +2970,12 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
             lab_sync_skip(state, task_id, object_id, min_px);
         }
     }
+    #[cfg(feature = "backend-vulkan")]
+    if let Some(min_px) = crate::runtime::render_writeback::vulkan::lazy_sync_px() {
+        for &object_id in object_ids {
+            lab_lazy_sync(state, host, task_id, object_id, min_px);
+        }
+    }
     for &object_id in object_ids {
         pay_for_texture(state, host, task_id, object_id);
     }
@@ -2969,6 +2995,62 @@ fn lab_sync_skip_px() -> Option<u64> {
         crate::observe::off(format!("lab_sync_skip px={px:?}"));
         px
     })
+}
+
+/// TEMP (lab, LAZY_SYNC): a synchronize's owed frame of a big never-presented surface lands behind a guest fence
+/// (`render_writeback::vulkan::begin_lazy_store`). Every exit `pay` would take instead of writing leaves the debt
+/// where it is, so the payment below takes it as before; so does a frame the lazy door declines.
+#[cfg(feature = "backend-vulkan")]
+fn lab_lazy_sync<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, task_id: u32, texture_ref: u32, min_px: u64) {
+    for mapping_id in state.mappings_named_by(task_id, texture_ref).iter() {
+        let Some(debt) = state.pending_writebacks.get(mapping_id) else {
+            continue;
+        };
+        if u64::from(debt.width) * u64::from(debt.height) < min_px
+            || state.pending_writebacks.deferred_mapping() == Some(mapping_id)
+        {
+            continue;
+        }
+        let Some(entry) = state.mappings.get(&mapping_id) else {
+            continue;
+        };
+        if entry.scanout_presented
+            || entry.released_since_resolve
+            || entry.map_generation != debt.map_generation
+            || crate::runtime::resource_validity::licence_of(entry.validity)
+                == crate::runtime::resource_validity::WritebackLicence::Superseded
+        {
+            continue;
+        }
+        let gpas: Vec<u64> = entry
+            .page_entries
+            .iter()
+            .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, state.page_shift))
+            .collect();
+        if state.host_writes.first_armed(&gpas).is_some() {
+            continue;
+        }
+        let Some(identity) = debt.target.get::<crate::backend::vulkan::engine::TargetIdentity>().cloned() else {
+            continue;
+        };
+        // An older lazy frame for these pages lands first.
+        crate::runtime::render_writeback::lazy_land(state, host, Some(mapping_id), true);
+        let Some(debt) = state.pending_writebacks.take(mapping_id) else {
+            continue;
+        };
+        let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);
+        if !crate::runtime::render_writeback::vulkan::begin_lazy_store(
+            state,
+            host,
+            mapping_id,
+            &identity,
+            debt.width,
+            debt.height,
+            seen,
+        ) {
+            state.pending_writebacks.put_back(mapping_id, debt);
+        }
+    }
 }
 
 fn lab_sync_skip(state: &mut DeviceState, task_id: u32, texture_ref: u32, min_px: u64) {

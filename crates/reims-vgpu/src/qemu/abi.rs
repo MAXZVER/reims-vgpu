@@ -106,7 +106,7 @@ use std::slice;
 /// shim falls back to QEMU's own display.
 /// v20 gives `map_pages` a structured per-call failure output.
 /// v28 adds `guest_write_rebase` (the device's own stores into a hashed set).
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 28;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 29;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -1109,9 +1109,17 @@ mod tests {
             std::mem::offset_of!(ReimsVgpuHostOps, guest_write_sync_ahead) + word
         );
         assert_eq!(
+            std::mem::offset_of!(ReimsVgpuHostOps, guest_fence_close),
+            std::mem::offset_of!(ReimsVgpuHostOps, guest_write_rebase) + word
+        );
+        assert_eq!(
+            std::mem::offset_of!(ReimsVgpuHostOps, guest_fence_open),
+            std::mem::offset_of!(ReimsVgpuHostOps, guest_fence_close) + word
+        );
+        assert_eq!(
             std::mem::size_of::<ReimsVgpuHostOps>(),
-            std::mem::offset_of!(ReimsVgpuHostOps, guest_write_rebase) + word,
-            "nothing may follow the rebase (v28) on either side"
+            std::mem::offset_of!(ReimsVgpuHostOps, guest_fence_open) + word,
+            "nothing may follow the fence pair (v29) on either side"
         );
     }
 

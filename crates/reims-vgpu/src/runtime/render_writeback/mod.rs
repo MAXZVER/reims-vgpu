@@ -565,6 +565,39 @@ pub fn vulkan_t2t_pending() -> bool {
 /// `only` (or to every mapping). Free when none is owed: one atomic load.
 #[inline]
 #[track_caller]
+/// TEMP (lab, LAZY_SYNC): finish the lazy landings owed to `only` (all when `None`) - see
+/// `vulkan::lazy_land`. Free when none runs: one atomic load.
+pub fn lazy_land<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    only: Option<u32>,
+    block: bool,
+) {
+    #[cfg(feature = "backend-vulkan")]
+    vulkan::lazy_land(state, host, only, block);
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = (state, host, only, block);
+}
+
+/// TEMP (lab, LAZY_SYNC): whether any lazily landing frame is in flight (one atomic load).
+pub fn vulkan_lazy_any() -> bool {
+    #[cfg(feature = "backend-vulkan")]
+    return vulkan::LAZY_N.load(std::sync::atomic::Ordering::Acquire) != 0;
+    #[cfg(not(feature = "backend-vulkan"))]
+    false
+}
+
+/// TEMP (lab, LAZY_SYNC): whether a lazily landing frame is owed to `mapping_id`'s pages.
+pub fn lazy_pending(mapping_id: u32) -> bool {
+    #[cfg(feature = "backend-vulkan")]
+    return vulkan::lazy_pending(mapping_id);
+    #[cfg(not(feature = "backend-vulkan"))]
+    {
+        let _ = mapping_id;
+        false
+    }
+}
+
 pub fn land_t2t<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(state: &mut DeviceState, host: &mut M, only: Option<u32>) {
     #[cfg(feature = "backend-vulkan")]
     if vulkan::T2T_PENDING_N.load(std::sync::atomic::Ordering::Acquire) != 0 {
