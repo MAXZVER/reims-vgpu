@@ -3006,20 +3006,33 @@ fn lab_lazy_sync<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M,
         let Some(debt) = state.pending_writebacks.get(mapping_id) else {
             continue;
         };
-        if u64::from(debt.width) * u64::from(debt.height) < min_px
-            || state.pending_writebacks.deferred_mapping() == Some(mapping_id)
-        {
+        if u64::from(debt.width) * u64::from(debt.height) < min_px {
+            continue;
+        }
+        use crate::runtime::render_writeback::vulkan::lazy_why;
+        if state.pending_writebacks.deferred_mapping() == Some(mapping_id) {
+            lazy_why("deferred", 0);
             continue;
         }
         let Some(entry) = state.mappings.get(&mapping_id) else {
+            lazy_why("no_entry", 0);
             continue;
         };
-        if entry.scanout_presented
-            || entry.released_since_resolve
-            || entry.map_generation != debt.map_generation
-            || crate::runtime::resource_validity::licence_of(entry.validity)
-                == crate::runtime::resource_validity::WritebackLicence::Superseded
+        let why = if entry.scanout_presented {
+            "presented"
+        } else if entry.released_since_resolve {
+            "released"
+        } else if entry.map_generation != debt.map_generation {
+            "generation"
+        } else if crate::runtime::resource_validity::licence_of(entry.validity)
+            == crate::runtime::resource_validity::WritebackLicence::Superseded
         {
+            "superseded"
+        } else {
+            ""
+        };
+        if !why.is_empty() {
+            lazy_why(why, 0);
             continue;
         }
         let gpas: Vec<u64> = entry
@@ -3028,14 +3041,17 @@ fn lab_lazy_sync<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M,
             .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, state.page_shift))
             .collect();
         if state.host_writes.first_armed(&gpas).is_some() {
+            lazy_why("host_armed", 0);
             continue;
         }
         let Some(identity) = debt.target.get::<crate::backend::vulkan::engine::TargetIdentity>().cloned() else {
+            lazy_why("no_identity", 0);
             continue;
         };
         // An older lazy frame for these pages lands first.
         crate::runtime::render_writeback::lazy_land(state, host, Some(mapping_id), true);
         let Some(debt) = state.pending_writebacks.take(mapping_id) else {
+            lazy_why("gone_after_land", 0);
             continue;
         };
         let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);

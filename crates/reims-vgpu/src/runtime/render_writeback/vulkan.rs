@@ -1574,6 +1574,46 @@ fn lazy_fence_max_runs() -> usize {
     })
 }
 
+/// TEMP (lab LAZY_SYNC, Opus 10-21 b950a: 2 of ~40 synchronizes a second went lazy with the route census off): why
+/// each big synchronize did or did not go lazy, and the fence's page runs, as one `lab_lazy_why` line a second
+/// whatever `REIMS_VGPU_LAB_ROUTES` says (a few dozen calls a second).
+pub(crate) fn lazy_why(reason: &'static str, runs: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static SINCE: AtomicU64 = AtomicU64::new(0);
+    static WHY: std::sync::Mutex<(Vec<(&'static str, u64)>, u64, u64, u64)> =
+        std::sync::Mutex::new((Vec::new(), 0, 0, 0));
+    let line = {
+        let mut g = WHY.lock().unwrap_or_else(|e| e.into_inner());
+        match g.0.iter_mut().find(|(r, _)| *r == reason) {
+            Some((_, n)) => *n += 1,
+            None => g.0.push((reason, 1)),
+        }
+        if runs != 0 {
+            g.1 += 1;
+            g.2 += runs as u64;
+            g.3 = g.3.max(runs as u64);
+        }
+        let now = crate::observe::elapsed_us();
+        let since = SINCE.load(Relaxed);
+        if since == 0 {
+            SINCE.store(now.max(1), Relaxed);
+        }
+        (since != 0 && now >= since + 1_000_000).then(|| {
+            SINCE.store(now, Relaxed);
+            let (why, n, sum, max) = std::mem::take(&mut *g);
+            let mut s = String::from("lab_lazy_why");
+            for (r, c) in why {
+                s.push_str(&format!(" {r}={c}"));
+            }
+            s.push_str(&format!(" runs_n={n} runs_avg={} runs_max={max}", sum / n.max(1)));
+            s
+        })
+    };
+    if let Some(line) = line {
+        crate::observe::off(line);
+    }
+}
+
 /// A synchronize's frame landing behind a guest fence (the fence and the lease ride with the copy; the payment's
 /// bookkeeping was done when it began).
 struct LazyStore {
@@ -1649,17 +1689,18 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
     use crate::runtime::drain::note_store_route;
     let started = std::time::Instant::now();
     let Some(m) = state.mappings.get(&mapping_id) else {
+        lazy_why("no_mapping", 0);
         return false;
     };
     let Some((base_off, bpr, format)) = crate::runtime::mapping_write::resident_gpu_plane(m, width, height) else {
-        note_store_route("lab_lazy_sync_no_plane");
+        note_store_route("lab_lazy_sync_no_plane"); lazy_why("no_plane", 0);
         return false;
     };
     if u64::from(bpr) != u64::from(width) * 4
         || (format != crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
             && format != crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB)
     {
-        note_store_route("lab_lazy_sync_not_packed_bgra");
+        note_store_route("lab_lazy_sync_not_packed_bgra"); lazy_why("not_packed_bgra", 0);
         return false;
     }
     let frame_bytes = u64::from(width) * u64::from(height) * 4;
@@ -1673,41 +1714,41 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
     let need_end = base_off + frame_bytes;
     state.invalidate_storage_residency_window(mapping_id, base_off, need_end);
     let Some(vouched) = crate::runtime::mapper::vouch_mapping_pages_verdict(state, host, mapping_id).1 else {
-        note_store_route("lab_lazy_sync_vouch_refused");
+        note_store_route("lab_lazy_sync_vouch_refused"); lazy_why("vouch_refused", 0);
         return false;
     };
     if !vouched.covers(state, mapping_id) {
-        note_store_route("lab_lazy_sync_vouch_stale");
+        note_store_route("lab_lazy_sync_vouch_stale"); lazy_why("vouch_stale", 0);
         return false;
     }
     // The fence's page runs, counted before anything is read back: the shim refuses past its run cap (one
     // hypervisor remap per run each way), and a surface that fragmented pays only the synchronous store.
     let page = state.page_size();
     let Some(gpas) = crate::runtime::mapper::mapping_page_gpas(state, host, mapping_id) else {
-        note_store_route("lab_lazy_sync_no_gpas");
+        note_store_route("lab_lazy_sync_no_gpas"); lazy_why("no_gpas", 0);
         return false;
     };
     let (p0, p1) = ((base_off / page) as usize, need_end.div_ceil(page) as usize);
     if p1 > gpas.len() || p0 >= p1 {
-        note_store_route("lab_lazy_sync_short_gpas");
+        note_store_route("lab_lazy_sync_short_gpas"); lazy_why("short_gpas", 0);
         return false;
     }
     let fence_runs = 1 + gpas[p0..p1].windows(2).filter(|w| w[1] != w[0] + page).count();
     if fence_runs > lazy_fence_max_runs() {
-        note_store_route("lab_lazy_sync_fragmented");
+        note_store_route("lab_lazy_sync_fragmented"); lazy_why("fragmented", fence_runs);
         return false;
     }
     let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
         Ok(Some(l)) if l.bgra && l.bytes().len() as u64 >= frame_bytes => l,
         _ => {
-            note_store_route("lab_lazy_sync_no_lease");
+            note_store_route("lab_lazy_sync_no_lease"); lazy_why("no_lease", fence_runs);
             return false;
         }
     };
     let runs = vec![(base_off, need_end)];
     let src_base = leased.bytes().as_ptr() as usize;
     let Some((spans, mapped)) = land_spans(state, host, mapping_id, &runs, base_off, need_end, src_base) else {
-        note_store_route("lab_lazy_sync_no_spans");
+        note_store_route("lab_lazy_sync_no_spans"); lazy_why("no_spans", fence_runs);
         return false;
     };
     let unmap = |host: &mut M, mapped: &[(usize, usize)]| {
@@ -1719,7 +1760,7 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
     // list the GPAs above were taken from must still be the vouched one.
     if !vouched.covers(state, mapping_id) {
         unmap(host, &mapped);
-        note_store_route("lab_lazy_sync_vouch_moved");
+        note_store_route("lab_lazy_sync_vouch_moved"); lazy_why("vouch_moved", fence_runs);
         return false;
     }
     // Everything that may still read guest memory runs before the fence closes: from the close to the spawn
@@ -1732,7 +1773,7 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
         // synchronously from the same lease, as `store_render_frame`'s leased arm would, rather than read it twice.
         unmap(host, &mapped);
         drop(spans);
-        note_store_route("lab_lazy_sync_fence_refused");
+        note_store_route("lab_lazy_sync_fence_refused"); lazy_why("fence_refused", fence_runs);
         let ok = crate::runtime::mapping_write::write_bgra8_uncached(
             state,
             host,
@@ -1787,7 +1828,7 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
     let mut g = LAZY.lock().unwrap_or_else(|e| e.into_inner());
     g.push(LazyStore { mapping_id, base_off, job });
     LAZY_N.store(g.len(), std::sync::atomic::Ordering::Release);
-    note_store_route("lab_lazy_sync_begun");
+    note_store_route("lab_lazy_sync_begun"); lazy_why("begun", fence_runs);
     true
 }
 
