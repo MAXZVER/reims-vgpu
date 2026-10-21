@@ -2945,8 +2945,48 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
     task_id: u32,
     object_ids: &[u32],
 ) {
+    if let Some(min_px) = lab_sync_skip_px() {
+        for &object_id in object_ids {
+            lab_sync_skip(state, task_id, object_id, min_px);
+        }
+    }
     for &object_id in object_ids {
         pay_for_texture(state, host, task_id, object_id);
+    }
+}
+
+/// TEMP (lab, Opus 10-21, `REIMS_VGPU_LAB_SYNC_SKIP_PX=<pixels>`): a CEILING arm, not a fix. The WebGL canvas
+/// (5120x2070, 42 MB) is synchronized (0x35) every frame and the payment is ~55 % of the drain at 5K - yet ~5-20 ms
+/// later the kernel re-backs the surface on fresh zero pages (b851/chain852 census), so the bytes may never be read.
+/// With this set, a synchronize naming a never-presented surface of at least that many pixels abandons its owed frame
+/// instead of landing it: the fps it buys is the prize of a lazy (trap-on-access) landing, and a wrong picture says
+/// somebody does read those pages.
+fn lab_sync_skip_px() -> Option<u64> {
+    use std::sync::OnceLock;
+    static PX: OnceLock<Option<u64>> = OnceLock::new();
+    *PX.get_or_init(|| {
+        let px = std::env::var("REIMS_VGPU_LAB_SYNC_SKIP_PX").ok().and_then(|v| v.trim().parse().ok());
+        crate::observe::off(format!("lab_sync_skip px={px:?}"));
+        px
+    })
+}
+
+fn lab_sync_skip(state: &mut DeviceState, task_id: u32, texture_ref: u32, min_px: u64) {
+    for mapping_id in state.mappings_named_by(task_id, texture_ref).iter() {
+        let Some(debt) = state.pending_writebacks.get(mapping_id) else {
+            continue;
+        };
+        if u64::from(debt.width) * u64::from(debt.height) < min_px
+            || state.pending_writebacks.deferred_mapping() == Some(mapping_id)
+            || state.mappings.get(&mapping_id).is_none_or(|m| m.scanout_presented)
+        {
+            continue;
+        }
+        let Some(debt) = state.pending_writebacks.take(mapping_id) else {
+            continue;
+        };
+        crate::runtime::drain::note_store_route("lab_sync_skipped");
+        crate::backend::selected().abandon_resident(&debt.target);
     }
 }
 
