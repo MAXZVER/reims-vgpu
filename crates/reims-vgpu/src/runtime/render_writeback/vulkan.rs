@@ -1605,9 +1605,26 @@ pub(crate) fn wait_landing_copies() {
             g = done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
-    if LAZY_N.load(std::sync::atomic::Ordering::Acquire) != 0 {
-        for l in LAZY.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-            l.job.wait();
+    lazy_wait_where(|_| true);
+}
+
+/// Wait for the lazy copies `pick` names, without holding [`LAZY`] across the wait (pool planners ask
+/// [`lazy_pending`] from other threads).
+fn lazy_wait_where(pick: impl Fn(&LazyStore) -> bool) {
+    if LAZY_N.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let dones: Vec<std::sync::Arc<LandDone>> = LAZY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|l| pick(l))
+        .map(|l| std::sync::Arc::clone(&l.job.done))
+        .collect();
+    for done in dones {
+        let mut g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !done.flag.load(std::sync::atomic::Ordering::Acquire) {
+            g = done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -1615,13 +1632,7 @@ pub(crate) fn wait_landing_copies() {
 /// Block until a lazy copy into `mapping_id`'s pages is in (an invalidation of its page list; the bookkeeping waits
 /// for the next [`lazy_land`]).
 pub(crate) fn wait_lazy_copy_for(mapping_id: u32) {
-    if LAZY_N.load(std::sync::atomic::Ordering::Acquire) == 0 {
-        return;
-    }
-    let g = LAZY.lock().unwrap_or_else(|e| e.into_inner());
-    for l in g.iter().filter(|l| l.mapping_id == mapping_id) {
-        l.job.wait();
-    }
+    lazy_wait_where(|l| l.mapping_id == mapping_id);
 }
 
 /// Start the lazy landing of `mapping_id`'s owed frame (held by `identity`). `false` when this frame cannot take
