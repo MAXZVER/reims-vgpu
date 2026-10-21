@@ -896,6 +896,43 @@ pub(crate) fn pending_writer(identity: &super::types::TargetIdentity) -> bool {
     PENDING_TARGETS.lock().iter().any(|(id, _)| id == identity)
 }
 
+/// TEMP (lab, REAP, on unless `REIMS_VGPU_LAB_REAP=off`): drop `value` on a
+/// background thread instead of the caller's. A deferred draw's request owns
+/// its stage-in bytes (`Arc<Vec<u8>>`, ~125 KB a Maps tile); freeing them at the
+/// end of the job cost the recorder 10.5 % of its samples on 5K Maps (b937,
+/// `drop_glue` -> `Arc::drop_slow` -> `RtlFreeHeap` / `ZwFreeVirtualMemory`), and
+/// the recorder is what the drain waits on. Nothing a request owns needs its
+/// drop ordered against later work: its buffers are plain memory, a lease or a
+/// staged window it holds only delays its slot's reclaim, and the targets a job
+/// holds pending are released by the job itself, not by the request.
+pub(crate) fn reap<T: Send + 'static>(value: T) {
+    use std::sync::mpsc::{channel, Sender};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static TX: parking_lot::Mutex<Option<Sender<Box<dyn Send>>>> = parking_lot::Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_REAP").as_deref() != Ok("off")) {
+        return;
+    }
+    let mut tx = TX.lock();
+    if tx.is_none() {
+        let (sender, receiver) = channel::<Box<dyn Send>>();
+        let spawned = std::thread::Builder::new()
+            .name("vgpu-reaper".into())
+            .spawn(move || {
+                for garbage in receiver {
+                    drop(garbage);
+                }
+            });
+        if spawned.is_err() {
+            return;
+        }
+        *tx = Some(sender);
+    }
+    if let Some(sender) = tx.as_ref() {
+        // A send fails only once the reaper is gone; the value then drops here.
+        let _ = sender.send(Box::new(value));
+    }
+}
+
 /// TEMP (lab, RETAIN_DEFER): run `f` on the recorder after every job already
 /// queued (a resident's writers included), without holding any target.
 pub(crate) fn submit_after_queued(f: impl FnOnce() + Send + 'static) {

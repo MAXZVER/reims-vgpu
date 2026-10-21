@@ -1785,6 +1785,8 @@ pub fn submit_deferred_draw(
                 recorder::JobResult::Failed(Box::new(recorder::DeferredFailure { error, meta }))
             }
         };
+        // TEMP (lab, REAP): the request's buffers are freed off the recorder.
+        recorder::reap(recorder::AssertSend(req));
         result
     });
     recorder::DRAW.submit(job);
