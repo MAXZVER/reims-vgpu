@@ -7635,8 +7635,24 @@ fn lab_sub_vstage(
                     offset: slice.window.offset,
                 }
             }
-            other => {
-                let bytes = other.cpu_bytes();
+            // TEMP (lab, MERGE_DRAWS, Opus 10-22): bound as the record's own guest-runs binds are - the import itself
+            // where the host has one, else the CPU gather straight into the staging slot. b944MR (Maps, scene window):
+            // `cpu_bytes()` here - a heap Vec of the runs, then a second copy into staging - was 37 % of the recorder's
+            // draw time, and the recorder's bursts are what the Maps drain waits on. No GPU gather: a sub-draw is
+            // recorded inside the render pass, where a copy cannot go.
+            BufferContent::GuestRuns(src) => {
+                let role = BufferGatherRole { vertex: true, ..BufferGatherRole::default() };
+                if let Some(bound) = unsafe { import_guest_buffer_window(ctx, pools, src, role) } {
+                    pools.note_guest_read_recorded();
+                    counters.note_buffer_guest_import(src.total_len, role);
+                    bound
+                } else {
+                    let slot = unsafe { pools.acquire_staging(ctx, src.total_len, counters)? };
+                    unsafe { pools.write_staging_from_runs(ctx, &slot, &src.runs, src.source_offset, src.total_len)? };
+                    BoundBuffer::from(slot)
+                }
+            }
+            BufferContent::Bytes(bytes) => {
                 let slot = unsafe { pools.acquire_staging(ctx, bytes.len() as u64, counters)? };
                 unsafe { pools.write_staging(ctx, &slot, &bytes)? };
                 BoundBuffer::from(slot)
