@@ -2020,6 +2020,21 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
 ) {
+    pay_for_texture_with(state, host, task_id, texture_ref, true);
+}
+
+/// [`pay_for_texture`]; `land_lazy` false for the synchronize that may just have started a lazy landing of this
+/// texture (TEMP lab LAZY_SYNC, b956a: lazy_wait@ submit_for_resources 682 of 685 copies, 2.4 ms each - the command
+/// waited for its own copy). Not a reader of that frame: a payment of a newer frame into the same pages still lands
+/// the older copy first (`pay_for_mapping`).
+#[track_caller]
+fn pay_for_texture_with<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    land_lazy: bool,
+) {
     // TEMP (lab T2T_DEFER): a reader of either surface spelling of this texture.
     if crate::runtime::render_writeback::vulkan_t2t_pending() {
         for mapping_id in state.mappings_named_by(task_id, texture_ref).iter() {
@@ -2029,7 +2044,7 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
         }
     }
     // TEMP (lab LAZY_SYNC): a lazily landing frame for either surface spelling lands before a reader looks.
-    if crate::runtime::render_writeback::vulkan_lazy_any() {
+    if land_lazy && crate::runtime::render_writeback::vulkan_lazy_any() {
         for mapping_id in state.mappings_named_by(task_id, texture_ref).iter() {
             crate::runtime::render_writeback::lazy_land(state, host, Some(mapping_id), true);
         }
@@ -2977,7 +2992,7 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
         }
     }
     for &object_id in object_ids {
-        pay_for_texture(state, host, task_id, object_id);
+        pay_for_texture_with(state, host, task_id, object_id, false);
     }
 }
 
