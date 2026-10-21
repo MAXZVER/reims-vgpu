@@ -30,11 +30,13 @@ pub const MAX_SUBS: usize = 1024;
 
 /// Sub-draws with their own buffers (each loads its own bytes when the record is prepared) a record may carry:
 /// a record is prepared by one worker, so piling every tile of a frame into one record serialises what the parallel
-/// preparation spread over the pool (b775: Maps 56 -> 33 fps). `REIMS_VGPU_LAB_MERGE_HEAVY` (default 8: b782/b784 Maps
-/// 0/4/8 = 54.5/53.6/53.4, 16 = 49.5, 32 = 52.5 fps). Latched.
+/// preparation spread over the pool (b775: Maps 56 -> 33 fps). `REIMS_VGPU_LAB_MERGE_HEAVY` (b782/b784 Maps
+/// 0/4/8 = 54.5/53.6/53.4, 16 = 49.5, 32 = 52.5 fps). Default 0 since b933 (10-21, Maps 5K with every encoder piece
+/// drawn: 0 = 34.7 / 36.2 fps, 8 = 31.6 / 31.4): each heavy sub-draw's stage-in bytes (~125 KB a tile) are copied
+/// into staging on the serial recorder (b932 sampler: 57 % of its draw execution), which the drain waits on. Latched.
 pub fn max_heavy_subs() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| std::env::var("REIMS_VGPU_LAB_MERGE_HEAVY").ok().and_then(|v| v.parse().ok()).unwrap_or(8))
+    *N.get_or_init(|| std::env::var("REIMS_VGPU_LAB_MERGE_HEAVY").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 /// On by default since b777 (plan page 62 vs 50 fps idle, 71 vs 49 dragged; Maps +17 %; frames match);
