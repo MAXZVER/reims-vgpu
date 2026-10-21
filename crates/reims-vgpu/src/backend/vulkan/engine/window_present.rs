@@ -1538,9 +1538,10 @@ impl WindowPresenter {
                 // recorded, the guest frame is still in the layout the registry
                 // recorded - the copy into the flow inputs runs on that.
                 // TEMP (lab, PRESENT_DLSS_SR): without PRESENT_FG the same flow, run on every new guest frame, gives
-                // DLSS its motion vectors (no midpoint, no FG request).
+                // DLSS its motion vectors (no midpoint, no FG request). Not beside DLSS-G: the GPU has one
+                // optical-flow queue and DLSS-G's own flow holds it - the upscale then gets zero vectors.
                 let fg_on = super::present_fg::on();
-                let dlss_flow = !fg_on && super::present_dlssg::dlss_sr_active();
+                let dlss_flow = !fg_on && super::present_dlssg::dlss_sr_active() && !super::present_dlssg::active();
                 let fg_input = match (&blit, sharp_view.is_some() && (fg_on || dlss_flow)) {
                     (BlitSource::Resident { image, access, .. }, true) => Some((*image, *access)),
                     _ => None,

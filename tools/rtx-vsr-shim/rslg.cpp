@@ -32,6 +32,10 @@
 
 static bool g_inited = false;
 static sl::ViewportHandle g_viewport{0};
+// DLSS Super Resolution runs on its own viewport: with DLSS-G on viewport 0 in the same frame, the two set different
+// tags (depth / motion vectors at the guest frame's size vs the window's) and constants (mvecScale), and a viewport
+// holds one set of each per frame.
+static sl::ViewportHandle g_viewport_sr{1};
 
 static int rc(sl::Result r) {
     return r == sl::Result::eOk ? 0 : int(r) + 1000;
@@ -154,7 +158,13 @@ RSLG_API int rslg_tag(void* token, VkCommandBuffer cb, const RslgImage* hudless,
 // The common constants of a 2D screen: identity camera, motion vectors in pixels of the mvec image (scaled by
 // mvec_scale to [-1, 1]), depth not inverted, camera motion included; `reset` when the frame has no connection to
 // the previous one.
+static int set_constants(void* token, float mvec_scale_x, float mvec_scale_y, int reset, const sl::ViewportHandle& vp);
+
 RSLG_API int rslg_constants(void* token, float mvec_scale_x, float mvec_scale_y, int reset) {
+    return set_constants(token, mvec_scale_x, mvec_scale_y, reset, g_viewport);
+}
+
+static int set_constants(void* token, float mvec_scale_x, float mvec_scale_y, int reset, const sl::ViewportHandle& vp) {
     if (!token) return -1;
     sl::Constants c{};
     auto identity = [](sl::float4x4& m) {
@@ -184,7 +194,7 @@ RSLG_API int rslg_constants(void* token, float mvec_scale_x, float mvec_scale_y,
     c.motionVectors3D = sl::Boolean::eFalse;
     c.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     c.orthographicProjection = sl::Boolean::eTrue;
-    return rc(slSetConstants(c, *static_cast<sl::FrameToken*>(token), g_viewport));
+    return rc(slSetConstants(c, *static_cast<sl::FrameToken*>(token), vp));
 }
 
 // Whether DLSS Super Resolution is supported on `pd` (0) or why not (1000 + sl::Result).
@@ -206,7 +216,7 @@ RSLG_API int rslg_dlss(int mode, uint32_t out_w, uint32_t out_h, int preset) {
     sl::DLSSPreset p = sl::DLSSPreset(preset);
     o.dlaaPreset = o.qualityPreset = o.balancedPreset = o.performancePreset = o.ultraPerformancePreset =
         o.ultraQualityPreset = p;
-    return rc(slDLSSSetOptions(g_viewport, o));
+    return rc(slDLSSSetOptions(g_viewport_sr, o));
 }
 
 // Upscale `in` into `out` with DLSS for this frame: tags (input colour, output colour, depth and motion vectors at
@@ -225,11 +235,11 @@ RSLG_API int rslg_dlss_eval(void* token, VkCommandBuffer cb, const RslgImage* in
     };
     sl::FrameToken& t = *static_cast<sl::FrameToken*>(token);
     sl::CommandBuffer* slcb = reinterpret_cast<sl::CommandBuffer*>(cb);
-    sl::Result r = slSetTagForFrame(t, g_viewport, tags, 4, slcb);
+    sl::Result r = slSetTagForFrame(t, g_viewport_sr, tags, 4, slcb);
     if (r != sl::Result::eOk) return rc(r);
-    int c = rslg_constants(token, 1.0f / float(in->width), 1.0f / float(in->height), reset);
+    int c = set_constants(token, 1.0f / float(in->width), 1.0f / float(in->height), reset, g_viewport_sr);
     if (c) return c;
-    const sl::BaseStructure* inputs[] = {&g_viewport};
+    const sl::BaseStructure* inputs[] = {&g_viewport_sr};
     return rc(slEvaluateFeature(sl::kFeatureDLSS, t, inputs, 1, slcb));
 }
 
