@@ -3587,7 +3587,7 @@ fn lab_gw_rebase() -> bool {
 /// page this write touched, made since the set's last sync, is taken in with
 /// the device's: the same window in which a guest store into the written part
 /// is already lost under the device's bytes.
-fn rebase_device_write<H: HostOps>(
+pub(crate) fn rebase_device_write<H: HostOps>(
     state: &DeviceState,
     host: &H,
     mapping_id: u32,

@@ -7973,8 +7973,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
     // its pages (b298: landing every parked frame on every map-family command
     // landed all of them ~10 ms later, on the commands WindowServer waits for).
     lab_park_land_for_map_family(state, host, packet, family);
-    // TEMP (lab LAZY_SYNC): a lazily landing frame is in before any page moves (its copy writes them).
-    crate::runtime::render_writeback::lazy_land(state, host, None, true);
+    // TEMP (lab LAZY_SYNC): a lazily landing frame is in before any page moves (its copy writes them) - the rule
+    // PAY_DEFER keeps: a MapMemory2 moves none, so it only books the copies already in, without waiting.
+    crate::runtime::render_writeback::lazy_land(state, host, None, family != MapFamily::MapMemory2);
     // The delete of the payment's own backing drops it instead of landing it:
     // the guest has released those pages (see `drop_deferred_for`).
     let deleting_owed = family == MapFamily::DeleteIOSurfaceBacking2

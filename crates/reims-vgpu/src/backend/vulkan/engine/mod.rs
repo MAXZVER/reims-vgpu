@@ -3666,6 +3666,13 @@ pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
     guard.pools.registry_note_content_copied_out(identity)
 }
 
+/// TEMP (lab PAY_DEFER): undo [`note_resident_content_copied_out`] for a resident that holds a newer frame than
+/// the one whose landing booked it - that frame is owed, and the image is again its only copy.
+pub fn note_resident_content_sole_copy(identity: &TargetIdentity) -> bool {
+    let mut guard = lock_engine();
+    guard.pools.registry_note_content_sole_copy(identity)
+}
+
 /// Whether this backend may leave guest-visible content only in GPU-resident
 /// engine state.
 ///

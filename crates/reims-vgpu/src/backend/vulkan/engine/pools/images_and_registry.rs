@@ -2633,6 +2633,12 @@ impl ResourcePools {
         self.set_sole_copy(identity, false)
     }
 
+    /// TEMP (lab PAY_DEFER): the inverse, for a resident whose pixels became the only copy again after a
+    /// copy-out of an older frame was booked against it (a newer frame drawn into it meanwhile).
+    pub(crate) fn registry_note_content_sole_copy(&mut self, identity: &TargetIdentity) -> bool {
+        self.set_sole_copy(identity, true)
+    }
+
     /// Record that this resident's pixels are the mapping's content as of
     /// `epoch`. Refuses (returns false) unless the slot exists and is
     /// content_ready — stamping an image no draw has stored into would vouch

@@ -1565,10 +1565,20 @@ pub fn lazy_sync_px() -> Option<u64> {
     })
 }
 
+/// The shim's run cap, mirrored (`REIMS_VGPU_LAB_FENCE_MAX_RUNS`, default 64), so a fragmented surface is turned
+/// away before its frame is read back.
+fn lazy_fence_max_runs() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_FENCE_MAX_RUNS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64).max(1)
+    })
+}
+
 /// A synchronize's frame landing behind a guest fence (the fence and the lease ride with the copy; the payment's
 /// bookkeeping was done when it began).
 struct LazyStore {
     mapping_id: u32,
+    base_off: u64,
     job: LandJob,
 }
 
@@ -1622,13 +1632,6 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
         return false;
     }
     let frame_bytes = u64::from(width) * u64::from(height) * 4;
-    let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
-        Ok(Some(l)) if l.bgra && l.bytes().len() as u64 >= frame_bytes => l,
-        _ => {
-            note_store_route("lab_lazy_sync_no_lease");
-            return false;
-        }
-    };
     // `write_mapping_bytes_only`'s prologue, in its order (as `start_landing_copy`).
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
@@ -1646,6 +1649,30 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
         note_store_route("lab_lazy_sync_vouch_stale");
         return false;
     }
+    // The fence's page runs, counted before anything is read back: the shim refuses past its run cap (one
+    // hypervisor remap per run each way), and a surface that fragmented pays only the synchronous store.
+    let page = state.page_size();
+    let Some(gpas) = crate::runtime::mapper::mapping_page_gpas(state, host, mapping_id) else {
+        note_store_route("lab_lazy_sync_no_gpas");
+        return false;
+    };
+    let (p0, p1) = ((base_off / page) as usize, need_end.div_ceil(page) as usize);
+    if p1 > gpas.len() || p0 >= p1 {
+        note_store_route("lab_lazy_sync_short_gpas");
+        return false;
+    }
+    let fence_runs = 1 + gpas[p0..p1].windows(2).filter(|w| w[1] != w[0] + page).count();
+    if fence_runs > lazy_fence_max_runs() {
+        note_store_route("lab_lazy_sync_fragmented");
+        return false;
+    }
+    let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
+        Ok(Some(l)) if l.bgra && l.bytes().len() as u64 >= frame_bytes => l,
+        _ => {
+            note_store_route("lab_lazy_sync_no_lease");
+            return false;
+        }
+    };
     let runs = vec![(base_off, need_end)];
     let src_base = leased.bytes().as_ptr() as usize;
     let Some((spans, mapped)) = land_spans(state, host, mapping_id, &runs, base_off, need_end, src_base) else {
@@ -1657,27 +1684,36 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
             host.unmap_pages(p, len);
         }
     };
-    let page = state.page_size();
-    let Some(gpas) = crate::runtime::mapper::mapping_page_gpas(state, host, mapping_id) else {
-        unmap(host, &mapped);
-        note_store_route("lab_lazy_sync_no_gpas");
-        return false;
-    };
-    let (p0, p1) = ((base_off / page) as usize, need_end.div_ceil(page) as usize);
-    if p1 > gpas.len() {
-        unmap(host, &mapped);
-        note_store_route("lab_lazy_sync_short_gpas");
-        return false;
-    }
     // Everything that may still read guest memory runs before the fence closes: from the close to the spawn
     // nothing may, or the drain would wait on a fence whose copy is not yet started. `copy_mapping_runs`'
     // host-write note, before any byte moves; a draw the recorder still holds may read these pages.
     state.note_host_wrote_mapping_selected(mapping_id, &runs, base_off, need_end);
     crate::backend::settle_deferred_draws_for_guest_write();
     let Some(fence) = host.guest_fence_close(&gpas[p0..p1], page as usize) else {
+        // Refused by the shim (a remap in progress, the hypervisor): the frame is read back already - land it
+        // synchronously from the same lease, as `store_render_frame`'s leased arm would, rather than read it twice.
         unmap(host, &mapped);
+        drop(spans);
         note_store_route("lab_lazy_sync_fence_refused");
-        return false;
+        let ok = crate::runtime::mapping_write::write_bgra8_uncached(
+            state,
+            host,
+            mapping_id,
+            leased.bytes(),
+            width.saturating_mul(4),
+            width,
+            height,
+        );
+        drop(leased);
+        if !ok {
+            crate::observe::fail(format!(
+                "render_store_lost mapping={mapping_id} {width}x{height} reason=lazy_sync_fallback_write_refused"
+            ));
+            return true; // the debt is spent either way, as a refused synchronous store spends it
+        }
+        finish(state, mapping_id, identity, frame_bytes as usize, started, false);
+        crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
+        return true;
     };
     let job = LandJob::spawn(
         spans,
@@ -1707,7 +1743,7 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
     finish(state, mapping_id, identity, frame_bytes as usize, started, false);
     crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
     let mut g = LAZY.lock().unwrap_or_else(|e| e.into_inner());
-    g.push(LazyStore { mapping_id, job });
+    g.push(LazyStore { mapping_id, base_off, job });
     LAZY_N.store(g.len(), std::sync::atomic::Ordering::Release);
     note_store_route("lab_lazy_sync_begun");
     true
@@ -1715,7 +1751,7 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
 
 /// Finish lazy landings on the drain: those for `only` (every one when `None`), waiting for their copies when
 /// `block`, else only those whose copy is in - the views the copy wrote through unmapped.
-pub fn lazy_land<M: HostMemory + HostOps>(_state: &mut DeviceState, host: &mut M, only: Option<u32>, block: bool) {
+pub fn lazy_land<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, only: Option<u32>, block: bool) {
     if LAZY_N.load(std::sync::atomic::Ordering::Acquire) == 0 {
         return;
     }
@@ -1736,6 +1772,10 @@ pub fn lazy_land<M: HostMemory + HostOps>(_state: &mut DeviceState, host: &mut M
         for (p, len) in std::mem::take(&mut l.job.mapped) {
             host.unmap_pages(p, len);
         }
+        // `write_mapping_copy_only`'s tail: a set the tracker answers for by hashing takes the landed bytes as its
+        // baseline (LAZY_SYNC_PX sizes are past DIRTY_HASH_MAX, so normally a no-op - kept for the parity).
+        let end = l.base_off + l.job.frame_len as u64;
+        crate::runtime::mapper::rebase_device_write(state, host, l.mapping_id, l.base_off, end, None);
         crate::runtime::drain::note_store_route("lab_lazy_sync_landed");
     }
 }

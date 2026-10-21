@@ -3251,6 +3251,19 @@ pub fn deferred_mapping(state: &DeviceState) -> Option<u32> {
         .map(|d| d.mapping_id)
 }
 
+/// TEMP (lab PAY_DEFER, Opus 10-21 review): a begun payment's landing ends in `finish`, which releases its
+/// resident's sole-copy flag - but when a newer frame was drawn into that resident meanwhile (the `newer` debt
+/// `land_deferred` holds aside), the image is that frame's only copy and the reclaim paths must not take it.
+fn lab_newer_still_sole(newer: &WritebackDebt) {
+    #[cfg(feature = "backend-vulkan")]
+    if let Some(identity) = newer.target.get::<crate::backend::vulkan::engine::TargetIdentity>() {
+        crate::backend::vulkan::engine::note_resident_content_sole_copy(identity);
+        crate::runtime::drain::note_store_route("lab_pay_defer_newer_kept_sole");
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = newer;
+}
+
 /// TEMP (lab PAY_DEFER): drop the begun payment owed to `mapping_id` without
 /// landing it, because the guest is deleting that mapping's backing.
 ///
@@ -3300,6 +3313,7 @@ pub fn land_deferred<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             }
             crate::runtime::mapper::commit_guest_write_stamp(state, d.mapping_id, d.seen);
             if let Some(newer) = newer {
+                lab_newer_still_sole(&newer);
                 state.pending_writebacks.put_back(d.mapping_id, newer);
             }
         }
@@ -3348,6 +3362,9 @@ pub fn land_deferred_if_ready<M: HostMemory + HostOps>(state: &mut DeviceState, 
         rail.advance_surface_writeback(state, host, &mut d.pending)
     };
     if let Some(newer) = newer {
+        if step.is_some() {
+            lab_newer_still_sole(&newer);
+        }
         state.pending_writebacks.put_back(d.mapping_id, newer);
     }
     match step {
