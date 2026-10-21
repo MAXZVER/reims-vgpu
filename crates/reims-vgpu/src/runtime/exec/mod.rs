@@ -286,43 +286,6 @@ fn stream_continues_render_encoder(stream: &[u8]) -> bool {
     }
 }
 
-/// Whether `stream` is nothing but the continuation of the previous stream's
-/// render encoder: one render segment (protection envelopes aside) that
-/// continues the previous stream's encoder. Such a stream can join the pass the
-/// encoder already runs in (see [`render_encoder_merge_on`]): it executes no
-/// blit, compute or event work that the deferred pass would have to precede.
-fn stream_is_render_continuation_only(stream: &[u8]) -> bool {
-    let Ok(segments) = SegmentStream::new(stream) else {
-        return false;
-    };
-    let mut encoders = 0u32;
-    for framed in segments {
-        let Ok(framed) = framed else {
-            return false;
-        };
-        match framed.body {
-            SegmentBody::ProtectionEnvelope { .. } => continue,
-            SegmentBody::Encoder { kind: SegmentKind::Render, .. } if encoders == 0 && framed.lifetime.continues_previous => {
-                encoders += 1;
-            }
-            SegmentBody::Encoder { .. } => return false,
-        }
-    }
-    encoders == 1
-}
-
-/// TEMP (lab, `REIMS_VGPU_LAB_ENCODER_MERGE`, on unless `=off`): a render
-/// encoder the guest cut into several command buffers of one packet runs as one
-/// pass. Metal applies the load action when the encoder begins and the store
-/// action when it ends; the carry (below) gave every 128 KiB piece its own pass,
-/// each loading and storing the whole target - Maps at 5K cuts one encoder into
-/// eight (b926d: 139 of 200 census streams continue both ways), and 20z
-/// (carry) drew Maps 21-24 fps where 20i (pieces lost) drew 29-31.
-fn render_encoder_merge_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_ENCODER_MERGE").map_or(true, |v| v != "off"))
-}
-
 /// Open a continuation stream under the pass its encoder began with.
 ///
 /// The encoder's attachments, clears and store actions belong to the encoder,
@@ -1511,31 +1474,20 @@ fn execute_submission_g<M: HostMemory + HostOps>(
     // macOS 26) and states the render-pass descriptor only in the first; the
     // continuation streams start straight with their draws.
     let mut carry: Option<Vec<u8>> = None;
-    // TEMP (lab, ENCODER_MERGE): the open pass of an encoder the previous stream
-    // continued into this one, still accumulating (see `render_encoder_merge_on`).
-    let mut merging: Option<StreamAccum> = None;
     for (si, stream) in streams.iter().enumerate() {
         let walk_started = crate::lab_clock::LabInstant::now();
-        let continuing = merging.take();
-        let carried = if continuing.is_some() {
-            None
-        } else {
-            carry.take().filter(|_| stream_continues_render_encoder(stream))
-        };
+        let carried = carry.take().filter(|_| stream_continues_render_encoder(stream));
         // TEMP (lab, WALK_AHEAD): the helper's walk of this stream, when what it
         // read still holds; `WALK_AHEAD_CHECK` walks anyway and compares. A
         // continuation stream is walked here: the helper walked it without the
         // carried pass.
-        let spec = lab_walks
-            .get_mut(si)
-            .and_then(Option::take)
-            .filter(|_| carried.is_none() && continuing.is_none());
+        let spec = lab_walks.get_mut(si).and_then(Option::take).filter(|_| carried.is_none());
         if spec.is_some() {
             crate::runtime::drain::note_store_route("gate_walk_ahead_ready");
         }
         // TEMP (lab, FRAME_GATE): no helper walk - the drain walks it itself
         // under the shared state, with the gate open for the frame's jobs.
-        let spec = if spec.is_none() && carried.is_none() && continuing.is_none() && g.has_frame() && gate_walk_open_on() {
+        let spec = if spec.is_none() && carried.is_none() && g.has_frame() && gate_walk_open_on() {
             g.open();
             let walked = walk_ahead::walk_stream_spec(g.sh(), &*host, task_id, stream);
             if walked.is_some() {
@@ -1566,15 +1518,9 @@ fn execute_submission_g<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         let ahead = lab_ahead.get_mut(si).and_then(Option::take).filter(|_| taken.is_some());
         let state = g.st();
-        let mut acc = match (spec, taken, continuing) {
-            // TEMP (lab, ENCODER_MERGE): the continuation walks into the pass it
-            // continues; its encoder state is the accumulator's own.
-            (_, _, Some(mut acc)) => {
-                walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut(), None);
-                acc
-            }
-            (_, Some(acc), None) => acc,
-            (spec, None, None) => match spec {
+        let mut acc = match (spec, taken) {
+            (_, Some(acc)) => acc,
+            (spec, None) => match spec {
             Some(spec) if check => {
                 let mut acc = StreamAccum::default();
                 walk_stream(state, host, task_id, stream, out, &mut acc, resolved.as_mut(), carried.as_deref());
@@ -1603,21 +1549,13 @@ fn execute_submission_g<M: HostMemory + HostOps>(
             },
         };
         acc.memo.flush();
-        let merge_next = acc.last_render_continues_into_next
-            && render_encoder_merge_on()
-            && streams.get(si + 1).is_some_and(|next| stream_is_render_continuation_only(next));
-        if acc.last_render_continues_into_next && !merge_next {
+        if acc.last_render_continues_into_next {
             hold_pass_for_continuation(&mut acc);
             carry = acc.pass_record.clone();
         }
         let walk_ns = walk_started.elapsed().as_nanos() as u64;
         *measured_ns += walk_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
-        if merge_next {
-            crate::runtime::drain::note_store_route("render_encoder_merged");
-            merging = Some(acc);
-            continue;
-        }
         let finish_started = crate::lab_clock::LabInstant::now();
         let lab_before = (out.metal_draws_ok, out.metal_draws_fail, out.clears_applied);
         finish_stream_g(
