@@ -1540,8 +1540,16 @@ impl WindowPresenter {
                 // TEMP (lab, PRESENT_DLSS_SR): without PRESENT_FG the same flow, run on every new guest frame, gives
                 // DLSS its motion vectors (no midpoint, no FG request). Not beside DLSS-G: the GPU has one
                 // optical-flow queue and DLSS-G's own flow holds it - the upscale then gets zero vectors.
+                // Only where DLSS evaluates a moving frame: under PRESENT_VSR_SETTLE without a motion instance it runs
+                // on settled presents alone, history reset, where the vectors are zero anyway - and the flow is not
+                // free (chain946: with it canvas 50.9 fps at drain duty 0.79, without it 60.7 at 0.40, 21g).
                 let fg_on = super::present_fg::on();
-                let dlss_flow = !fg_on && super::present_dlssg::dlss_sr_active() && !super::present_dlssg::active();
+                let dlss_moving_frames = crate::host_window::present::lab_present_settle().is_none()
+                    || (super::present_dlssg::dlss_motion_active() && super::present_dlssg::dlss_motion_vectors());
+                let dlss_flow = !fg_on
+                    && super::present_dlssg::dlss_sr_active()
+                    && !super::present_dlssg::active()
+                    && dlss_moving_frames;
                 let fg_input = match (&blit, sharp_view.is_some() && (fg_on || dlss_flow)) {
                     (BlitSource::Resident { image, access, .. }, true) => Some((*image, *access)),
                     _ => None,

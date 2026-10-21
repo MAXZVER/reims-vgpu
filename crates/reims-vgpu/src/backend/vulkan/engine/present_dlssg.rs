@@ -55,6 +55,13 @@ pub(crate) fn dlss_sr() -> Option<(i32, i32)> {
     })
 }
 
+/// TEMP (lab, 10-21): `REIMS_VGPU_LAB_PRESENT_DLSS_MVEC=off` - the motion instance runs on zero vectors instead of the
+/// optical flow's (the flow cost ~20 % of canvas fps in chain946; this is its A/B for the picture in motion).
+pub(crate) fn dlss_motion_vectors() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_PRESENT_DLSS_MVEC").map_or(true, |v| v != "off"))
+}
+
 /// TEMP (lab, 10-21): `REIMS_VGPU_LAB_PRESENT_DLSS_PRESET_MOTION=K|L|M` - with PRESENT_VSR_SETTLE the moving frames
 /// take DLSS with this preset (its own instance, viewport 2) instead of EASU, and the settled present keeps the main
 /// preset (viewport 1): Mish's "K in motion, M on still". `sl::DLSSPreset`.
