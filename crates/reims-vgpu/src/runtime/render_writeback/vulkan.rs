@@ -1592,6 +1592,26 @@ pub(crate) fn lazy_pending(mapping_id: u32) -> bool {
         && LAZY.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|l| l.mapping_id == mapping_id)
 }
 
+/// Block until every landing copy in flight - PAY_DEFER's and the lazy ones - is in (`flush_retired_views`).
+pub(crate) fn wait_landing_copies() {
+    let deferred = LANDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(_, done)| std::sync::Arc::clone(done));
+    if let Some(done) = deferred {
+        let mut g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !done.flag.load(std::sync::atomic::Ordering::Acquire) {
+            g = done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    if LAZY_N.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        for l in LAZY.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            l.job.wait();
+        }
+    }
+}
+
 /// Block until a lazy copy into `mapping_id`'s pages is in (an invalidation of its page list; the bookkeeping waits
 /// for the next [`lazy_land`]).
 pub(crate) fn wait_lazy_copy_for(mapping_id: u32) {

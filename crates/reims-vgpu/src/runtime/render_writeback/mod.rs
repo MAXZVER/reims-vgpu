@@ -575,6 +575,12 @@ pub fn lazy_land<M: crate::runtime::host::HostMemory + crate::runtime::host::Hos
     let _ = (state, host, only, block);
 }
 
+/// TEMP (lab PAY_DEFER / LAZY_SYNC): block until every landing copy in flight is in - before views are unmapped.
+pub fn wait_landing_copies() {
+    #[cfg(feature = "backend-vulkan")]
+    vulkan::wait_landing_copies();
+}
+
 /// TEMP (lab, LAZY_SYNC): whether any lazily landing frame is in flight (one atomic load).
 pub fn vulkan_lazy_any() -> bool {
     #[cfg(feature = "backend-vulkan")]

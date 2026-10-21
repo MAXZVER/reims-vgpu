@@ -1537,6 +1537,13 @@ fn lab_resolve_fingerprint(m: &crate::model::MappingEntry) -> u64 {
 /// admitted to a backend import, so its only users are CPU copies that finish
 /// inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
+    // TEMP (lab PAY_DEFER / LAZY_SYNC, Opus 10-21 review): a landing copy writes through a mapping's packed view
+    // on the landing thread. Views are retired from several places (map_surface, unmap_surface, condemn, backing
+    // re-resolution, attach - not only invalidate_mapping_pages, which already waits for its mapping's copy), and
+    // this is where every one of them is unmapped: not while a copy may still write through it.
+    if !state.retired_views.is_empty() {
+        crate::runtime::render_writeback::wait_landing_copies();
+    }
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
     // fence-safe retirement; only then is the matching host view unmapped.
