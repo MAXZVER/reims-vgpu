@@ -1511,23 +1511,51 @@ impl LandJob {
 }
 
 /// The landing copy, in chunks so a cancel (TEMP lab LAZY_SYNC) stops it within one.
+///
+/// TEMP (lab LAZY_SYNC, Opus 10-21 b961a): the guest's WebGL frame waits for a synchronize's stamp, which waits for
+/// this copy (~2.4 ms for 42 MB on one thread) - the chunks are shared out over `REIMS_VGPU_LAB_LAND_THREADS` threads
+/// (default 4, 1 = the landing thread alone) once a copy is past 4 MB.
 fn land_copy(spans: &LandSpans, cancel: &std::sync::atomic::AtomicBool) {
     const CHUNK: usize = 1 << 20;
-    for &(dst, src, n) in spans {
-        let mut off = 0;
-        while off < n {
+    let chunks: Vec<(usize, usize, usize)> = spans
+        .iter()
+        .flat_map(|&(dst, src, n)| {
+            (0..n.div_ceil(CHUNK)).map(move |i| (dst + i * CHUNK, src + i * CHUNK, CHUNK.min(n - i * CHUNK)))
+        })
+        .collect();
+    let copy = |part: &[(usize, usize, usize)]| {
+        for &(dst, src, len) in part {
             if cancel.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
-            let len = CHUNK.min(n - off);
             // SAFETY: see `LandSpans`; the ranges were bounds-checked against the view and the answer buffer by the
-            // drain, and the chunk lies inside its span.
-            unsafe {
-                crate::runtime::mapper::write_guest_bytes_raw((src + off) as *const u8, (dst + off) as *mut u8, len)
-            };
-            off += len;
+            // drain, and the chunk lies inside its span. Chunks are disjoint, so the threads never share a byte.
+            unsafe { crate::runtime::mapper::write_guest_bytes_raw(src as *const u8, dst as *mut u8, len) };
         }
+    };
+    let threads = land_threads().min(chunks.len().div_ceil(4)).max(1);
+    if threads == 1 {
+        copy(&chunks);
+        return;
     }
+    let per = chunks.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut parts = chunks.chunks(per);
+        let mine = parts.next().unwrap_or(&[]);
+        for part in parts {
+            scope.spawn(move || copy(part));
+        }
+        copy(mine);
+    });
+}
+
+fn land_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("REIMS_VGPU_LAB_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4);
+        crate::observe::off(format!("lab_land_threads n={n}"));
+        n.clamp(1, 16)
+    })
 }
 
 /// The landing copy in flight, if any: its mapping and its done latch.
