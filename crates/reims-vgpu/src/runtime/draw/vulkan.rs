@@ -13120,7 +13120,8 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         }
         // TEMP (lab, MERGE_DRAWS): stage-in buffers a sub-draw reads instead of the record's - its own bytes, read with
         // the record's bounds, for every location the buffer feeds.
-        let mut lab_sub_vstage: Vec<Vec<(std::sync::Arc<[u32]>, std::sync::Arc<Vec<u8>>)>> = Vec::new();
+        let mut lab_sub_vstage: Vec<Vec<(std::sync::Arc<[u32]>, crate::backend::vulkan::engine::BufferContent)>> =
+            Vec::new();
         if let Some(m) = req.merged.as_deref().filter(|m| m.overrides.iter().any(|o| !o.vstage.is_empty()) && !lab_merge_deltas.is_empty()) {
             lab_sub_vstage = vec![Vec::new(); m.subs.len()];
             for o in &m.overrides {
@@ -13165,12 +13166,8 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         }));
                     };
                     note_inflight_buffer_read(req.task_id, b.buffer_ref, &content);
-                    let bytes = match content {
-                        crate::backend::vulkan::engine::BufferContent::Bytes(b) => b,
-                        other => std::sync::Arc::new(other.cpu_bytes().into_owned()),
-                    };
                     if let Some(slot) = lab_sub_vstage.get_mut(o.sub as usize) {
-                        slot.push((locations.into(), bytes));
+                        slot.push((locations.into(), content));
                     }
                 }
             }

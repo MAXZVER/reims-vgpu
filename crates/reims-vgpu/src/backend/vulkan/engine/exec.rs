@@ -7618,15 +7618,33 @@ fn lab_sub_vstage(
     let Some(list) = own else {
         return Ok(());
     };
-    for (bindings, bytes) in list {
-        if bytes.is_empty() {
+    for (bindings, content) in list {
+        if content.len() == 0 {
             continue;
         }
-        let slot = unsafe { pools.acquire_staging(ctx, bytes.len() as u64, counters)? };
-        unsafe { pools.write_staging(ctx, &slot, bytes)? };
+        let at = match content {
+            // A window the prepare worker staged into its arena (PASS_STAGE): bound where it is, as
+            // `stage_buffer_content` binds one - the copy this recorder used to make is the one the worker made.
+            BufferContent::Staged(slice) => {
+                if !pools.note_staged_read(std::sync::Arc::clone(&slice.ring), slice.window) {
+                    return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedDraw));
+                }
+                crate::runtime::drain::note_store_route("merge_sub_vstage_staged");
+                BoundBuffer {
+                    buffer: slice.buffer,
+                    offset: slice.window.offset,
+                }
+            }
+            other => {
+                let bytes = other.cpu_bytes();
+                let slot = unsafe { pools.acquire_staging(ctx, bytes.len() as u64, counters)? };
+                unsafe { pools.write_staging(ctx, &slot, &bytes)? };
+                BoundBuffer::from(slot)
+            }
+        };
         for b in bindings.iter() {
             unsafe {
-                crate::backend::vulkan::engine::cmd_sink::bind_vertex_buffers(&ctx.device, cb, *b, &[slot.buffer], &[0]);
+                crate::backend::vulkan::engine::cmd_sink::bind_vertex_buffers(&ctx.device, cb, *b, &[at.buffer], &[at.offset]);
             }
             bound.push(*b);
         }

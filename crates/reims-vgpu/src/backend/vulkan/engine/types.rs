@@ -541,8 +541,9 @@ pub struct DrawRequest {
     /// TEMP (lab, MERGE_DRAWS): per sub-draw (by position), its own index bytes.
     pub sub_index: Vec<Option<std::sync::Arc<Vec<u8>>>>,
     /// TEMP (lab, MERGE_DRAWS): per sub-draw (by position), stage-in bytes it binds instead of the record's, each with
-    /// the vertex input bindings (one per location) that read them.
-    pub sub_vstage: Vec<Vec<(std::sync::Arc<[u32]>, std::sync::Arc<Vec<u8>>)>>,
+    /// the vertex input bindings (one per location) that read them. The content as the prepare worker read it: a
+    /// window it already staged into its arena (PASS_STAGE) is bound where it is, not copied out and in again.
+    pub sub_vstage: Vec<Vec<(std::sync::Arc<[u32]>, BufferContent)>>,
     pub vertex_attributes: Vec<VertexAttributeResource>,
     pub storage_buffers: Vec<StorageBufferResource>,
     pub sampled_images: Vec<SampledImageResource>,
