@@ -1201,7 +1201,11 @@ impl PresentSharp {
             return -102;
         };
         let range = super::color_subresource_range();
-        let reset = !self.dlss_cleared;
+        // TEMP (lab, PRESENT_VSR_SETTLE with DLSS): with a settle time DLSS runs only on the present that refines a
+        // frame that stood still (the moving frames take EASU, ~1 ms of GPU against preset M's ~11 ms at 5K out -
+        // b942a canvas 45 fps; Mish: 60 real frames for DLSS-G to make 120). The frames between two such presents
+        // never reached DLSS, so its history is another picture: every settled evaluate starts it afresh.
+        let reset = !self.dlss_cleared || crate::host_window::present::lab_present_settle().is_some();
         if !self.dlss_cleared {
             let to_dst = [depth.image, mvec.image].map(|image| {
                 vk::ImageMemoryBarrier::default()

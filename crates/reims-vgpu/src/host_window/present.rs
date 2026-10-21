@@ -459,8 +459,9 @@ fn needs_present(presented: Option<u64>, redraw_required: bool, incoming: Option
 /// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_VSR_SETTLE_MS=N`): the scaled present runs
 /// its cheap filter while guest frames keep arriving, and once the shown frame
 /// has stood still for N ms the window presents it once more through the
-/// expensive upscaler (RTX VSR) - motion at full rate, still content at full
-/// quality. `None` when unset: the upscaler, if on, runs on every frame.
+/// expensive upscaler (RTX VSR, or DLSS SR in its place) - motion at full rate,
+/// still content at full quality. `None` when unset: the upscaler, if on, runs
+/// on every frame.
 pub(crate) fn lab_present_settle() -> Option<std::time::Duration> {
     static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     MS.get_or_init(|| {
