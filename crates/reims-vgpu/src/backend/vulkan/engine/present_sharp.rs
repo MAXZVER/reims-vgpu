@@ -74,10 +74,12 @@ pub(crate) fn ss_factor() -> Option<f32> {
 }
 
 /// PRESENT_SS: the size the upscaler writes for a `src` frame shown in a `vis` visible part, when supersampled.
+/// At most 2.5x the visible part: `present_down.frag`'s 10 taps an axis cover the kernel up to that scale.
 fn ss_size(k: f32, src: (u32, u32), vis: (u32, u32)) -> Option<(u32, u32)> {
     let w = (src.0 as f32 * k).round() as u32;
     let h = (src.1 as f32 * k).round() as u32;
-    (w > vis.0 && h > vis.1).then_some((w, h))
+    let fits = u64::from(w) * 2 <= u64::from(vis.0) * 5 && u64::from(h) * 2 <= u64::from(vis.1) * 5;
+    (w > vis.0 && h > vis.1 && fits).then_some((w, h))
 }
 
 /// `REIMS_VGPU_LAB_PRESENT_NIS`: NVIDIA Image Scaling (NVScaler) instead of

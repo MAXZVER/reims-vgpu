@@ -1437,6 +1437,11 @@ type LandSpans = Vec<(usize, usize, usize)>;
 /// What the landing thread does once a job's copy is in (see [`LandJob::spawn`]).
 type LandThen = Box<dyn FnOnce() + Send>;
 
+/// TEMP (lab LAZY_SYNC async read): what the landing thread does before the copy - wait for the readback the
+/// spans read and hold its frame through the copy. `None`: there is no frame (the device went away); the copy is
+/// cancelled.
+type LandBefore = Box<dyn FnOnce() -> Option<Box<dyn Send>> + Send>;
+
 impl LandJob {
     fn done(&self) -> bool {
         self.done.flag.load(std::sync::atomic::Ordering::Acquire)
@@ -1454,8 +1459,8 @@ impl LandJob {
     }
 
     /// Hand `spans` to the landing thread (started on first use).
-    /// `then` runs on the landing thread once the copy is in, before the job reads
-    /// done (TEMP lab LAZY_SYNC: the readback lease returned, the guest fence opened).
+    /// `before` runs there first (TEMP lab LAZY_SYNC async read: waits for the readback the spans read), `then`
+    /// once the copy is in, before the job reads done (TEMP lab LAZY_SYNC: the readback lease returned).
     #[allow(clippy::too_many_arguments)]
     fn spawn(
         spans: LandSpans,
@@ -1464,15 +1469,28 @@ impl LandJob {
         frame_len: usize,
         pages: usize,
         full: bool,
+        before: Option<LandBefore>,
         then: Option<LandThen>,
     ) -> Self {
         use std::sync::{mpsc, Mutex, OnceLock};
         type Job = (
             LandSpans,
             std::sync::Arc<LandDone>,
+            Option<LandBefore>,
             Option<LandThen>,
             std::sync::Arc<std::sync::atomic::AtomicBool>,
         );
+        fn run(spans: &LandSpans, before: Option<LandBefore>, then: Option<LandThen>, cancel: &std::sync::atomic::AtomicBool) {
+            let hold = before.map(|b| b());
+            if matches!(hold, Some(None)) {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            land_copy(spans, cancel);
+            drop(hold);
+            if let Some(then) = then {
+                then();
+            }
+        }
         static TX: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
         let done = std::sync::Arc::new(LandDone::default());
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1481,11 +1499,8 @@ impl LandJob {
             std::thread::Builder::new()
                 .name("reims-land".into())
                 .spawn(move || {
-                    while let Ok((spans, done, then, cancel)) = rx.recv() {
-                        land_copy(&spans, &cancel);
-                        if let Some(then) = then {
-                            then();
-                        }
+                    while let Ok((spans, done, before, then, cancel)) = rx.recv() {
+                        run(&spans, before, then, &cancel);
                         let _g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
                         done.flag.store(true, std::sync::atomic::Ordering::Release);
                         done.cv.notify_all();
@@ -1497,13 +1512,10 @@ impl LandJob {
         let sent = tx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .send((spans, done.clone(), then, cancel.clone()));
-        if let Err(mpsc::SendError((spans, _, then, cancel))) = sent {
+            .send((spans, done.clone(), before, then, cancel.clone()));
+        if let Err(mpsc::SendError((spans, _, before, then, cancel))) = sent {
             // No landing thread: copy here, so the job is as done as it would be.
-            land_copy(&spans, &cancel);
-            if let Some(then) = then {
-                then();
-            }
+            run(&spans, before, then, &cancel);
             done.flag.store(true, std::sync::atomic::Ordering::Release);
         }
         Self { done, cancel, runs, mapped, frame_len, pages, full }
@@ -1543,10 +1555,24 @@ fn land_copy(spans: &LandSpans, cancel: &std::sync::atomic::AtomicBool) {
         let mut parts = chunks.chunks(per);
         let mine = parts.next().unwrap_or(&[]);
         for part in parts {
-            scope.spawn(move || copy(part));
+            // A thread the OS refuses must not panic the landing thread (its job would never read done, and every
+            // stamp after the synchronize would wait for it): that part is copied here instead.
+            if std::thread::Builder::new().spawn_scoped(scope, move || copy(part)).is_err() {
+                copy(part);
+            }
         }
         copy(mine);
     });
+}
+
+/// TEMP (lab LAZY_SYNC): `REIMS_VGPU_LAB_LAZY_ASYNC_READ` - on unless `off`. Latched.
+fn lazy_async_read() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = !matches!(std::env::var("REIMS_VGPU_LAB_LAZY_ASYNC_READ").as_deref(), Ok("off" | "0"));
+        crate::observe::off(format!("lab_lazy_async_read on={}", u8::from(on)));
+        on
+    })
 }
 
 fn land_threads() -> usize {
@@ -1593,7 +1619,8 @@ pub(crate) fn wait_landing_copy_for(mapping_id: u32) {
     }
 }
 
-/// TEMP (lab, Opus 10-21, `REIMS_VGPU_LAB_LAZY_SYNC_PX=<pixels>`, off unless set): a synchronize (0x35) of a
+/// TEMP (lab, Opus 10-21, `REIMS_VGPU_LAB_LAZY_SYNC_PX=<pixels>`; on by default at 4 000 000 since 10-22 - chain961
+/// ABA: canvas 61 -> 71 fps, Maps 30 -> 40-45, webgl duty 0.69 -> 0.64, ART 0 - and `off` for the A/B): a synchronize (0x35) of a
 /// never-presented surface of at least that many pixels leaves the drain before its frame has landed. The drain
 /// reads the frame back (leased) and hands the copy into the guest's pages to the landing thread; every completion
 /// stamp queued after the synchronize waits for the copy (`write_baseline::resolve_after` - the guest reads a
@@ -1604,7 +1631,7 @@ pub(crate) fn wait_landing_copy_for(mapping_id: u32) {
 pub fn lazy_sync_px() -> Option<u64> {
     static PX: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *PX.get_or_init(|| {
-        let px = std::env::var("REIMS_VGPU_LAB_LAZY_SYNC_PX").ok().and_then(|v| v.trim().parse().ok());
+        let px = crate::runtime::write_baseline::lazy_sync_px_setting();
         crate::observe::off(format!("lab_lazy_sync px={px:?}"));
         px
     })
@@ -1817,16 +1844,49 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
     // synchronize - its own and any FIFO's later ones - waits for the copy (`write_baseline::resolve_after`), and
     // every device reader of these pages lands it first (`lazy_land`).
     let pages = need_end.div_ceil(state.page_size()) as usize - (base_off / state.page_size()) as usize;
-    let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
-        Ok(Some(l)) if l.bgra && l.bytes().len() as u64 >= frame_bytes => l,
-        _ => {
-            note_store_route("lab_lazy_sync_no_lease");
-            lazy_why("no_lease", 0);
-            return false;
-        }
+    // TEMP (lab LAZY_SYNC async read, Opus 10-22, `REIMS_VGPU_LAB_LAZY_ASYNC_READ=off` for the A/B): the readback
+    // is submitted, not waited - the landing thread waits for it before the copy (b961a: the drain's fence wait was
+    // 166 ms/s of the WebGL scene, ~3.7 ms a frame on the drain the next packets queued behind).
+    let (src_base, before, then): (usize, Option<LandBefore>, Option<LandThen>) = if lazy_async_read() {
+        let ticket = match crate::backend::vulkan::engine::submit_target_read_leased(identity) {
+            Ok(Some(t)) if t.bgra() && t.lease_span().1 as u64 >= frame_bytes => t,
+            _ => {
+                note_store_route("lab_lazy_sync_no_lease");
+                lazy_why("no_lease", 0);
+                return false;
+            }
+        };
+        let src_base = ticket.lease_span().0;
+        let before: LandBefore = Box::new(move || {
+            // The engine lock is taken briefly per look, never held across the GPU's work.
+            let t0 = std::time::Instant::now();
+            while !crate::backend::vulkan::engine::target_read_done(&ticket) {
+                if t0.elapsed() < std::time::Duration::from_micros(300) {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            }
+            match crate::backend::vulkan::engine::finish_target_read_leased(ticket) {
+                Ok(Some(frame)) => Some(Box::new(frame) as Box<dyn Send>),
+                _ => None,
+            }
+        });
+        (src_base, Some(before), None)
+    } else {
+        let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
+            Ok(Some(l)) if l.bgra && l.bytes().len() as u64 >= frame_bytes => l,
+            _ => {
+                note_store_route("lab_lazy_sync_no_lease");
+                lazy_why("no_lease", 0);
+                return false;
+            }
+        };
+        let src_base = leased.bytes().as_ptr() as usize;
+        // The lease returns once the copy has read it.
+        (src_base, None, Some(Box::new(move || drop(leased)) as LandThen))
     };
     let runs = vec![(base_off, need_end)];
-    let src_base = leased.bytes().as_ptr() as usize;
     let Some((spans, mapped)) = land_spans(state, host, mapping_id, &runs, base_off, need_end, src_base) else {
         note_store_route("lab_lazy_sync_no_spans");
         lazy_why("no_spans", 0);
@@ -1849,16 +1909,7 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
         .iter()
         .fold((usize::MAX, 0usize), |(lo, hi), &(d, _, n)| (lo.min(d), hi.max(d + n)));
     let map_generation = state.mappings.get(&mapping_id).map_or(0, |m| u64::from(m.map_generation));
-    let job = LandJob::spawn(
-        spans,
-        runs,
-        mapped,
-        frame_bytes as usize,
-        pages,
-        true,
-        // The lease returns once the copy has read it.
-        Some(Box::new(move || drop(leased))),
-    );
+    let job = LandJob::spawn(spans, runs, mapped, frame_bytes as usize, pages, true, before, then);
     let done = std::sync::Arc::clone(&job.done);
     let gated = crate::runtime::write_baseline::resolve_after(Box::new(move || {
         let mut g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -2249,6 +2300,7 @@ fn start_landing_copy<M: HostMemory + HostOps>(
         changed.frame_bytes as usize,
         changed.pages.len(),
         changed.full,
+        None,
         None,
     );
     *LANDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((mapping_id, std::sync::Arc::clone(&job.done)));

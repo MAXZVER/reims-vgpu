@@ -141,7 +141,19 @@ static GATE: Mutex<()> = Mutex::new(());
 static GATE_CV: Condvar = Condvar::new();
 
 fn enabled() -> bool {
-    reads_enabled() || std::env::var_os("REIMS_VGPU_LAB_LAZY_SYNC_PX").is_some()
+    reads_enabled() || lazy_sync_px_setting().is_some()
+}
+
+/// TEMP (lab LAZY_SYNC): `REIMS_VGPU_LAB_LAZY_SYNC_PX` - unset: 4 000 000 pixels (the default since 10-22); `off`
+/// or `0`: none; a number: that threshold. The one parse both the gate thread and the drain read.
+pub(crate) fn lazy_sync_px_setting() -> Option<u64> {
+    match std::env::var("REIMS_VGPU_LAB_LAZY_SYNC_PX") {
+        Err(_) => Some(4_000_000),
+        Ok(v) => match v.trim() {
+            "off" | "0" | "" => None,
+            n => n.parse().ok(),
+        },
+    }
 }
 
 /// The deferred generation reads ([`issue`]) - this module's own switch.

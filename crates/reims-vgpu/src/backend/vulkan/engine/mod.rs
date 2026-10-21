@@ -5961,6 +5961,12 @@ impl TargetReadTicket {
         self.bgra
     }
 
+    /// TEMP (lab LAZY_SYNC async read): where the frame will be once finished, and how long it is - the host
+    /// address of the leased slot, valid while the ticket (then the frame it finishes into) holds the lease.
+    pub fn lease_span(&self) -> (usize, usize) {
+        (self.lease_ptr, self.len)
+    }
+
     /// TEMP (lab, T2T_PARK): the slot as a GPU copy source, holding the lease.
     pub(crate) fn parked(&self) -> ParkedReadback {
         ParkedReadback {
