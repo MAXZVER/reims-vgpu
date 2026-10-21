@@ -325,7 +325,17 @@ pub(crate) fn depth() -> u32 {
         // since b130: with the overlapped commit the drain fills 64 in a
         // stream and waits on it (wait_below 8.9 % of the drain) while the
         // recorder idles 55 % of the time between streams.
-        return 256;
+        // TEMP (lab, 10-21): `REIMS_VGPU_LAB_RECORDER_DEPTH` overrides it here too (up to 4096) - b941 (21c, 5K
+        // Maps, ROUTES off): the drain still waits on a full 256-job queue (wait_below 12.6 % of its samples)
+        // while the recorder idles between the bursts.
+        static PAR_DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        return *PAR_DEPTH.get_or_init(|| {
+            std::env::var("REIMS_VGPU_LAB_RECORDER_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256u32)
+                .clamp(1, 4096)
+        });
     }
     static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *DEPTH.get_or_init(|| {
