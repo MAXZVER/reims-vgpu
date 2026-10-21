@@ -829,10 +829,11 @@ fn store_render_frame_inner<M: HostMemory + HostOps>(
         static N: AtomicU32 = AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4000 {
             crate::observe::off(format!(
-                "lab_flush_trace mid={mapping_id} {width}x{height} presented={} mapgen={} since_prev_ms={}",
+                "lab_flush_trace mid={mapping_id} {width}x{height} presented={} mapgen={} since_prev_ms={} since_publish_us={}",
                 u8::from(m.scanout_presented),
                 m.map_generation,
                 if m.lab_flush_us == 0 { -1 } else { (now.saturating_sub(m.lab_flush_us) / 1000) as i64 },
+                if m.lab_published_us == 0 { -1 } else { now.saturating_sub(m.lab_published_us) as i64 },
             ));
         }
         m.lab_flush_us = now;

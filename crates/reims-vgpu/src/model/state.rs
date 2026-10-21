@@ -2121,6 +2121,10 @@ pub struct MappingEntry {
     pub lab_bump_us: u64,
     pub lab_bump_site: (&'static str, u32),
     pub lab_flush_us: u64,
+    /// TEMP (lab, 10-21): when this device last published content into the mapping (a draw's Store,
+    /// `note_surface_content_published`) - `lab_flush_trace` prints the gap to the flush, the window a speculative
+    /// readback of a per-frame synchronised surface (heavy WebGL's canvas) would have.
+    pub lab_published_us: u64,
     /// Guest page-table entries (valid bit + PFN); empty until resolved.
     pub page_entries: Vec<u32>,
     /// Page entries retired by a trailing `DeleteIOSurfaceBacking2` while the
@@ -6892,6 +6896,7 @@ impl DeviceState {
             return 0;
         };
         m.surface_content_epoch = Self::next_epoch(m.surface_content_epoch);
+        m.lab_published_us = crate::observe::elapsed_us();
         // The pixels this publishes are newer than anything the guest claimed
         // before now, which is what a deferred writeback later has to know.
         m.validity.host_published_seq = seq;
