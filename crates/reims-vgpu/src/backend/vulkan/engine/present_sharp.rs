@@ -32,7 +32,9 @@
 
 use ash::vk;
 
-use super::present_sharp_shader::{PRESENT_RCAS_FRAG_SPIRV, PRESENT_SHARP_FRAG_SPIRV, PRESENT_SHARP_VERT_SPIRV};
+use super::present_sharp_shader::{
+    PRESENT_DOWN_FRAG_SPIRV, PRESENT_RCAS_FRAG_SPIRV, PRESENT_SHARP_FRAG_SPIRV, PRESENT_SHARP_VERT_SPIRV,
+};
 
 /// `REIMS_VGPU_LAB_PRESENT_SHARP=on`. Latched.
 pub(crate) fn on() -> bool {
@@ -55,6 +57,27 @@ pub(crate) fn rcas_sharp() -> Option<f32> {
         };
         Some((-stops as f32).exp2())
     })
+}
+
+/// TEMP (lab, Mish 2026-10-22): `REIMS_VGPU_LAB_PRESENT_SS=K` - the supersampled present. The upscaler (EASU, and
+/// DLSS/VSR on the presents they take) writes K x the guest frame (2 for a 3456x1458 guest: 6912x2916, its exact
+/// double) instead of the visible part's size, and the window pass resamples that down to the visible part
+/// (`shaders/present_down.frag`, Lanczos-2 widened by the scale, anti-ringing clamp) - ~1.35x supersampling per
+/// axis on the 5120x2160 panel. Only where K x the frame is larger than the visible part on both axes; not with
+/// NIS or PRESENT_VSR_TILES. `K` in 1..=2.5. Latched.
+pub(crate) fn ss_factor() -> Option<f32> {
+    static K: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let k = std::env::var("REIMS_VGPU_LAB_PRESENT_SS").ok()?.trim().parse::<f32>().ok()?;
+        (k > 1.0 && k <= 2.5).then_some(k)
+    })
+}
+
+/// PRESENT_SS: the size the upscaler writes for a `src` frame shown in a `vis` visible part, when supersampled.
+fn ss_size(k: f32, src: (u32, u32), vis: (u32, u32)) -> Option<(u32, u32)> {
+    let w = (src.0 as f32 * k).round() as u32;
+    let h = (src.1 as f32 * k).round() as u32;
+    (w > vis.0 && h > vis.1).then_some((w, h))
 }
 
 /// `REIMS_VGPU_LAB_PRESENT_NIS`: NVIDIA Image Scaling (NVScaler) instead of
@@ -240,6 +263,12 @@ pub(crate) struct PresentSharp {
     /// RCAS: EASU into `mid` (`UNDEFINED -> SHADER_READ_ONLY_OPTIMAL`).
     mid_pass: vk::RenderPass,
     rcas_pipeline: vk::Pipeline,
+    /// TEMP (lab, PRESENT_SS): its factor, and the window pass that resamples a larger `mid` down.
+    ss: Option<f32>,
+    down_pipeline: vk::Pipeline,
+    /// TEMP (lab, PRESENT_SS with VSR/DLSS): `mid` is their rgba8 storage image, which EASU cannot render into -
+    /// the presents EASU takes render this one (the window's format, the same supersampled size).
+    ss_easu: Option<MidImage>,
     /// RCAS: one per frame entry, reading `mid`.
     rcas_sets: Vec<vk::DescriptorSet>,
     mid: Option<MidImage>,
@@ -423,7 +452,7 @@ impl PresentSharp {
             transient: vec![None; frames],
             // With NIS the window pass is RCAS too: an exact copy unless
             // REIMS_VGPU_LAB_PRESENT_RCAS also asks for its sharpening.
-            rcas: if nis_sharp().is_some() || super::present_vsr::quality().is_some() {
+            rcas: if nis_sharp().is_some() || super::present_vsr::quality().is_some() || Self::ss_wanted().is_some() {
                 Some(rcas_sharp().unwrap_or(0.0))
             } else {
                 rcas_sharp()
@@ -437,6 +466,9 @@ impl PresentSharp {
             nis_coef: None,
             mid_pass: vk::RenderPass::null(),
             rcas_pipeline: vk::Pipeline::null(),
+            ss: Self::ss_wanted(),
+            down_pipeline: vk::Pipeline::null(),
+            ss_easu: None,
             rcas_sets: Vec::new(),
             mid: None,
             retired: Vec::new(),
@@ -467,7 +499,25 @@ impl PresentSharp {
         } else if let Some(sharp) = made.rcas {
             crate::observe::off(format!("present_sharp rcas sharp={sharp:.3}"));
         }
+        if let Some(k) = made.ss {
+            crate::observe::off(format!("present_sharp ss k={k:.3}"));
+        }
         Ok(made)
+    }
+
+    /// PRESENT_SS where it applies: not with NIS (its constants are for the visible part's size) nor with the VSR
+    /// tiles (their cells are cut at it).
+    fn ss_wanted() -> Option<f32> {
+        ss_factor().filter(|_| nis_sharp().is_none() && !super::present_refine::on())
+    }
+
+    /// The window pass reading a `mid_w` x `mid_h` first-pass result: RCAS 1:1, or PRESENT_SS's resample down.
+    fn window_pipeline(&self, mid_w: u32, mid_h: u32, vp: (u32, u32, u32, u32)) -> vk::Pipeline {
+        if (mid_w, mid_h) != (vp.2, vp.3) && self.down_pipeline != vk::Pipeline::null() {
+            self.down_pipeline
+        } else {
+            self.rcas_pipeline
+        }
     }
 
     unsafe fn build(&mut self, device: &ash::Device, format: vk::Format, frames: usize) -> Result<(), vk::Result> {
@@ -565,6 +615,9 @@ impl PresentSharp {
         )?;
         if self.rcas.is_some() {
             self.rcas_pipeline = self.make_pipeline(device, &PRESENT_RCAS_FRAG_SPIRV)?;
+            if self.ss.is_some() {
+                self.down_pipeline = self.make_pipeline(device, &PRESENT_DOWN_FRAG_SPIRV)?;
+            }
             self.rcas_sets = device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(self.pool)
@@ -967,6 +1020,44 @@ impl PresentSharp {
         if let Some(old) = self.mid.take() {
             self.retired.push((old, self.records));
         }
+        // NVScaler writes `mid` as an rgba8 storage image; EASU renders it in
+        // the window's format.
+        let storage = self.nis.is_some() || self.vsr.is_some();
+        self.mid = Some(self.make_mid(device, format, width, height, storage, memory_type)?);
+        Ok(())
+    }
+
+    /// TEMP (lab, PRESENT_SS with VSR/DLSS): `ss_easu` at `width` x `height`, made (and the old one retired) on a
+    /// size change.
+    unsafe fn ensure_ss_easu(
+        &mut self,
+        device: &ash::Device,
+        format: vk::Format,
+        width: u32,
+        height: u32,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> Result<(), vk::Result> {
+        if self.ss_easu.as_ref().is_some_and(|m| (m.width, m.height) == (width, height)) {
+            return Ok(());
+        }
+        if let Some(old) = self.ss_easu.take() {
+            self.retired.push((old, self.records));
+        }
+        self.ss_easu = Some(self.make_mid(device, format, width, height, false, memory_type)?);
+        Ok(())
+    }
+
+    /// A first-pass image: an rgba8 storage image (`storage`), or a colour attachment in the window's `format`
+    /// with its `mid_pass` framebuffer.
+    unsafe fn make_mid(
+        &self,
+        device: &ash::Device,
+        format: vk::Format,
+        width: u32,
+        height: u32,
+        storage: bool,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> Result<MidImage, vk::Result> {
         let mut made = MidImage {
             image: vk::Image::null(),
             memory: vk::DeviceMemory::null(),
@@ -975,9 +1066,7 @@ impl PresentSharp {
             width,
             height,
         };
-        // NVScaler writes `mid` as an rgba8 storage image; EASU renders it in
-        // the window's format.
-        let nis = self.nis.is_some() || self.vsr.is_some();
+        let nis = storage;
         let format = if nis { vk::Format::R8G8B8A8_UNORM } else { format };
         let usage = if nis {
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC
@@ -1031,10 +1120,7 @@ impl PresentSharp {
             Ok(())
         })();
         match r {
-            Ok(()) => {
-                self.mid = Some(made);
-                Ok(())
-            }
+            Ok(()) => Ok(made),
             Err(e) => {
                 made.destroy(device);
                 Err(e)
@@ -1497,13 +1583,32 @@ impl PresentSharp {
         } else {
             self.rcas
         };
+        // TEMP (lab, PRESENT_SS): the first pass's size - supersampled, or the visible part's.
+        let ss = self.ss.and_then(|k| ss_size(k, (src.width, src.height), (vp.2, vp.3)));
+        let (mid_w, mid_h) = ss.unwrap_or((vp.2, vp.3));
+        let dlss = super::present_dlssg::dlss_sr_active();
+        let upscaler_ready = if dlss { true } else { super::present_vsr::ready() };
+        // PRESENT_SS with VSR/DLSS: the presents EASU takes render `ss_easu` (`mid` is the upscaler's storage image).
+        let ss_easu = match ss {
+            Some((w, h)) if self.vsr.is_some() => match self.ensure_ss_easu(device, format, w, h, memory_type) {
+                Ok(()) => true,
+                Err(e) => {
+                    if crate::observe::first_sight("present_ss_easu_refused", 0) {
+                        crate::observe::fail(format!("present_ss_easu_refused {w}x{h} err={e:?}"));
+                    }
+                    false
+                }
+            },
+            _ => false,
+        };
+        let easu_frame = ss_easu && !(vsr_this && !self.vsr_failed && upscaler_ready);
         let rcas = match second {
-            Some(sharp) => match self.ensure_mid(device, format, vp.2, vp.3, memory_type) {
+            Some(sharp) => match self.ensure_mid(device, format, mid_w, mid_h, memory_type) {
                 Ok(()) => Some(sharp),
                 Err(e) => {
                     // EASU alone this present; the next one tries again.
                     if crate::observe::first_sight("present_rcas_mid_refused", 0) {
-                        crate::observe::fail(format!("present_rcas_mid_refused {}x{} err={e:?}", vp.2, vp.3));
+                        crate::observe::fail(format!("present_rcas_mid_refused {mid_w}x{mid_h} err={e:?}"));
                     }
                     None
                 }
@@ -1539,14 +1644,14 @@ impl PresentSharp {
         self.write_set(device, set, src.view);
         // REIMS_VGPU_LAB_PRESENT_DUMP: the source as this present reads it.
         // With PRESENT_VSR_TILES the "out" half is the refined-cell cache.
-        let dumping = (rcas.is_some() || super::present_refine::on())
+        let dumping = (rcas.is_some() || easu_frame || super::present_refine::on())
             && self.begin_dump(
                 device,
                 ix,
                 (src.width, src.height),
-                (vp.2, vp.3),
-                // `mid` is rgba8 under NVScaler and VSR alike, and so is the cache.
-                (self.nis.is_some() && nis_cfg.is_some()) || self.vsr.is_some(),
+                (mid_w, mid_h),
+                // `mid` is rgba8 under NVScaler and VSR alike, and so is the cache; `ss_easu` is the window's.
+                ((self.nis.is_some() && nis_cfg.is_some()) || self.vsr.is_some()) && !easu_frame,
                 memory_type,
             );
         if let (true, Some(d)) = (dumping, self.dump.as_mut()) {
@@ -1572,8 +1677,6 @@ impl PresentSharp {
         let nis_cfg = if rcas.is_some() { nis_cfg } else { None };
         // VSR this present: ready, a `mid`, and its input image.
         // TEMP (lab, PRESENT_DLSS_SR): DLSS Super Resolution takes VSR's place (same input, same `mid`).
-        let dlss = super::present_dlssg::dlss_sr_active();
-        let upscaler_ready = if dlss { true } else { super::present_vsr::ready() };
         let vsr = match (self.vsr.filter(|_| vsr_this), rcas.is_some() && !self.vsr_failed && upscaler_ready) {
             (Some(q), true) => match self.ensure_vsr_in(device, src.width, src.height, memory_type) {
                 Ok(()) => Some(q),
@@ -1739,14 +1842,14 @@ impl PresentSharp {
                 }
                 push[16..].copy_from_slice(&rcas.unwrap_or(0.0).to_le_bytes());
                 self.begin_window_pass(device, cmd, fb, extent, clear);
-                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rcas_pipeline);
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.window_pipeline(mid_w, mid_h, vp));
                 Self::set_rect(device, cmd, vp.0, vp.1, vp.2, vp.3);
                 device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
                 device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
                 device.cmd_draw(cmd, 3, 1, 0, 0);
                 self.end_window_pass(device, cmd, vp);
                 if dumping {
-                    self.record_mid_dump(device, cmd, src.width, src.height);
+                    self.record_mid_dump(device, cmd, src.width, src.height, None);
                 }
                 return Ok(());
             }
@@ -1866,8 +1969,13 @@ impl PresentSharp {
             device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
             device.cmd_draw(cmd, 3, 1, 0, 0);
             self.end_window_pass(device, cmd, vp);
-        } else if let (Some(sharp), Some(mid)) = (rcas.filter(|_| self.nis.is_none()), self.mid.as_ref()) {
-            // EASU over the whole of `mid`.
+        } else if let Some(mid) = self.mid.as_ref().filter(|m| m.fb != vk::Framebuffer::null()).filter(|_| {
+            rcas.is_some() && self.nis.is_none()
+        }).or(self.ss_easu.as_ref().filter(|_| ss_easu)) {
+            // EASU over the whole of `mid` (or PRESENT_SS's `ss_easu`), then the window pass from it: RCAS, or
+            // PRESENT_SS's resample down.
+            let sharp = rcas.unwrap_or(0.0);
+            let pipeline = self.window_pipeline(mid.width, mid.height, vp);
             device.cmd_begin_render_pass(
                 cmd,
                 &vk::RenderPassBeginInfo::default()
@@ -1888,7 +1996,7 @@ impl PresentSharp {
             device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &easu_push);
             device.cmd_draw(cmd, 3, 1, 0, 0);
             device.cmd_end_render_pass(cmd);
-            // RCAS from `mid` into the visible part of the window.
+            // RCAS (or the resample down) from `mid` into the visible part of the window.
             let rcas_set = self.rcas_sets[ix];
             self.write_set(device, rcas_set, mid.view);
             let mut push = [0u8; 20];
@@ -1897,7 +2005,7 @@ impl PresentSharp {
             }
             push[16..].copy_from_slice(&sharp.to_le_bytes());
             self.begin_window_pass(device, cmd, fb, extent, clear);
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rcas_pipeline);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             Self::set_rect(device, cmd, vp.0, vp.1, vp.2, vp.3);
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
             device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
@@ -1915,7 +2023,8 @@ impl PresentSharp {
         // REIMS_VGPU_LAB_PRESENT_DUMP: the first pass's result, as the window
         // pass just read it.
         if dumping {
-            self.record_mid_dump(device, cmd, src.width, src.height);
+            let easu_image = self.ss_easu.as_ref().filter(|_| easu_frame).map(|m| (m.image, m.width, m.height));
+            self.record_mid_dump(device, cmd, src.width, src.height, easu_image);
         }
         let back = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
@@ -1940,7 +2049,14 @@ impl PresentSharp {
 
     /// REIMS_VGPU_LAB_PRESENT_DUMP: `mid` (in SHADER_READ_ONLY) after the
     /// source copy the dump already holds.
-    unsafe fn record_mid_dump(&self, device: &ash::Device, cmd: vk::CommandBuffer, src_w: u32, src_h: u32) {
+    unsafe fn record_mid_dump(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        src_w: u32,
+        src_h: u32,
+        image: Option<(vk::Image, u32, u32)>,
+    ) {
         // TEMP (lab, PRESENT_VSR_TILES): the refined cells (others undefined).
         if let (Some(d), true, Some(refine)) = (self.dump.as_ref(), self.refine_active, self.refine.as_ref()) {
             let (image, w, h) = refine.cache_image();
@@ -1970,7 +2086,11 @@ impl PresentSharp {
             );
             return;
         }
-        let (Some(d), Some(mid)) = (self.dump.as_ref(), self.mid.as_ref()) else {
+        // `image`: PRESENT_SS's `ss_easu` when EASU rendered that; else `mid`.
+        let Some(d) = self.dump.as_ref() else {
+            return;
+        };
+        let Some((mid_image, mid_w, mid_h)) = image.or(self.mid.as_ref().map(|m| (m.image, m.width, m.height))) else {
             return;
         };
             let to_src = [vk::ImageMemoryBarrier::default()
@@ -1980,7 +2100,7 @@ impl PresentSharp {
                 .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(mid.image)
+                .image(mid_image)
                 .subresource_range(super::color_subresource_range())];
             device.cmd_pipeline_barrier(
                 cmd,
@@ -1992,7 +2112,7 @@ impl PresentSharp {
                 &to_src,
             );
             let offset = src_w as u64 * src_h as u64 * 4;
-            Self::dump_copy(device, cmd, mid.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, d.buffer, offset, (mid.width, mid.height));
+            Self::dump_copy(device, cmd, mid_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, d.buffer, offset, (mid_w, mid_h));
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::TRANSFER,
@@ -2232,7 +2352,7 @@ impl PresentSharp {
         if let Some(mut refine) = self.refine.take() {
             refine.destroy(device);
         }
-        for img in [self.mid.take(), self.vsr_in.take(), self.dlss_depth.take(), self.dlss_mvec.take()]
+        for img in [self.mid.take(), self.ss_easu.take(), self.vsr_in.take(), self.dlss_depth.take(), self.dlss_mvec.take()]
             .into_iter()
             .flatten()
         {
@@ -2249,6 +2369,9 @@ impl PresentSharp {
         }
         if self.rcas_pipeline != vk::Pipeline::null() {
             device.destroy_pipeline(self.rcas_pipeline, None);
+        }
+        if self.down_pipeline != vk::Pipeline::null() {
+            device.destroy_pipeline(self.down_pipeline, None);
         }
         if self.sampler != vk::Sampler::null() {
             device.destroy_sampler(self.sampler, None);
