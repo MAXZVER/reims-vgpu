@@ -562,7 +562,9 @@ pub fn vulkan_t2t_pending() -> bool {
 }
 
 /// TEMP (lab, LAZY_SYNC): finish the lazy landings owed to `only` (all when `None`) - see
-/// `vulkan::lazy_land`. Free when none runs: one atomic load.
+/// `vulkan::lazy_land`. Free when none runs: one atomic load. A wait is booked on the caller's line
+/// (`lab_gpu_host_sites` `lazy_wait@`, microseconds).
+#[track_caller]
 pub fn lazy_land<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -570,15 +572,16 @@ pub fn lazy_land<M: crate::runtime::host::HostMemory + crate::runtime::host::Hos
     block: bool,
 ) {
     #[cfg(feature = "backend-vulkan")]
-    vulkan::lazy_land(state, host, only, block);
+    vulkan::lazy_land(state, host, only, block, std::panic::Location::caller());
     #[cfg(not(feature = "backend-vulkan"))]
     let _ = (state, host, only, block);
 }
 
 /// TEMP (lab PAY_DEFER / LAZY_SYNC): block until every landing copy in flight is in - before views are unmapped.
+#[track_caller]
 pub fn wait_landing_copies() {
     #[cfg(feature = "backend-vulkan")]
-    vulkan::wait_landing_copies();
+    vulkan::wait_landing_copies(std::panic::Location::caller());
 }
 
 /// TEMP (lab, LAZY_SYNC): whether any lazily landing frame is in flight (one atomic load).

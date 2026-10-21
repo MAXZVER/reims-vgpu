@@ -1625,7 +1625,8 @@ pub(crate) fn lazy_pending(mapping_id: u32) -> bool {
 }
 
 /// Block until every landing copy in flight - PAY_DEFER's and the lazy ones - is in (`flush_retired_views`).
-pub(crate) fn wait_landing_copies() {
+pub(crate) fn wait_landing_copies(site: &'static std::panic::Location<'static>) {
+    let t0 = std::time::Instant::now();
     let deferred = LANDING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1637,14 +1638,17 @@ pub(crate) fn wait_landing_copies() {
             g = done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
-    lazy_wait_where(|_| true);
+    if lazy_wait_where(|_| true) || t0.elapsed().as_micros() > 50 {
+        crate::backend::vulkan::engine::lab_site_note("lazy_wait", site, t0.elapsed().as_micros() as u64);
+    }
 }
 
 /// Wait for the lazy copies `pick` names, without holding [`LAZY`] across the wait (pool planners ask
 /// [`lazy_pending`] from other threads).
-fn lazy_wait_where(pick: impl Fn(&LazyStore) -> bool) {
+/// `true` when it had to wait for any.
+fn lazy_wait_where(pick: impl Fn(&LazyStore) -> bool) -> bool {
     if LAZY_N.load(std::sync::atomic::Ordering::Acquire) == 0 {
-        return;
+        return false;
     }
     let dones: Vec<std::sync::Arc<LandDone>> = LAZY
         .lock()
@@ -1653,12 +1657,15 @@ fn lazy_wait_where(pick: impl Fn(&LazyStore) -> bool) {
         .filter(|l| pick(l))
         .map(|l| std::sync::Arc::clone(&l.job.done))
         .collect();
+    let mut waited = false;
     for done in dones {
         let mut g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
         while !done.flag.load(std::sync::atomic::Ordering::Acquire) {
+            waited = true;
             g = done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
+    waited
 }
 
 /// Block until a lazy copy into `mapping_id`'s pages is in (an invalidation of its page list; the bookkeeping waits
@@ -1796,7 +1803,13 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
 
 /// Finish lazy landings on the drain: those for `only` (every one when `None`), waiting for their copies when
 /// `block`, else only those whose copy is in - the views the copy wrote through unmapped.
-pub fn lazy_land<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, only: Option<u32>, block: bool) {
+pub fn lazy_land<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    only: Option<u32>,
+    block: bool,
+    site: &'static std::panic::Location<'static>,
+) {
     if LAZY_N.load(std::sync::atomic::Ordering::Acquire) == 0 {
         return;
     }
@@ -1812,8 +1825,10 @@ pub fn lazy_land<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M,
     for mut l in taken {
         if !l.job.done() {
             crate::runtime::drain::note_store_route("lab_lazy_sync_waited");
+            let t0 = std::time::Instant::now();
+            l.job.wait();
+            crate::backend::vulkan::engine::lab_site_note("lazy_wait", site, t0.elapsed().as_micros() as u64);
         }
-        l.job.wait();
         for (p, len) in std::mem::take(&mut l.job.mapped) {
             host.unmap_pages(p, len);
         }
