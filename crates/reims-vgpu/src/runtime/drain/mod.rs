@@ -7916,16 +7916,42 @@ fn lazy_land_for_map_family<H: HostMemory + HostOps>(
             rw::lazy_land(state, host, Some(mapping_id), true);
             continue;
         }
-        let apart = released.as_ref().is_some_and(|released| {
-            state
-                .mapping_reach_pages(mapping_id)
-                .is_some_and(|owed| !owed.iter().any(|gpa| released.contains(gpa)))
-        });
-        if !apart {
-            rw::lazy_land(state, host, Some(mapping_id), true);
+        let owed = state.mapping_reach_pages(mapping_id);
+        let shared = match (&released, &owed) {
+            (Some(released), Some(owed)) => Some(owed.iter().filter(|gpa| released.contains(gpa)).count()),
+            _ => None,
+        };
+        lab_lazy_map_log(family, own, mapping_id, released.as_ref().map(|r| r.len()), owed.as_ref().map(|o| o.len()), shared);
+        // One call site per reason, so `lazy_wait@` names which one the drain waited at.
+        match (shared, family) {
+            (Some(0), _) => {}
+            (Some(_), MapFamily::UnmapMemory) => rw::lazy_land(state, host, Some(mapping_id), true),
+            (Some(_), _) => rw::lazy_land(state, host, Some(mapping_id), true),
+            (None, MapFamily::UnmapMemory) => rw::lazy_land(state, host, Some(mapping_id), true),
+            (None, _) => rw::lazy_land(state, host, Some(mapping_id), true),
         }
     }
     rw::lazy_land(state, host, None, false);
+}
+
+/// TEMP (lab LAZY_SYNC): the first 60 lazy-landing decisions of a boot, one line each - which family, whose delete,
+/// how many pages it releases and the copy owes, how many they share (None: undecided).
+fn lab_lazy_map_log(
+    family: MapFamily,
+    own: Option<u32>,
+    mapping_id: u32,
+    released: Option<usize>,
+    owed: Option<usize>,
+    shared: Option<usize>,
+) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
+        crate::observe::off(format!(
+            "lab_lazy_map family={} own={own:?} lazy_mapping={mapping_id} released={released:?} owed={owed:?} \
+             shared={shared:?}",
+            family.name()
+        ));
+    }
 }
 
 /// TEMP (lab, T2T_PARK): the deferred T2T frames a map-family command lands -
