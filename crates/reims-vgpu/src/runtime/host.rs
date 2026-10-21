@@ -478,8 +478,6 @@ impl<'a> CursorGlyphRef<'a> {
     }
 }
 
-/// Services the device cannot provide itself (time, wake, action enqueue,
-/// guest CPU / KVA access for the IOSurface mapper path).
 /// TEMP (lab, LAZY_SYNC): pages [`HostOps::guest_fence_close`] took away from
 /// the guest. Opening is the shim's thread-safe callback, so the fence is owned
 /// by whoever lands the frame - the landing thread opens it the moment the last
@@ -507,6 +505,8 @@ impl Drop for GuestFence {
     }
 }
 
+/// Services the device cannot provide itself (time, wake, action enqueue,
+/// guest CPU / KVA access for the IOSurface mapper path).
 pub trait HostOps {
     fn mono_ns(&self) -> u64;
     fn enqueue(&mut self, action: HostAction);

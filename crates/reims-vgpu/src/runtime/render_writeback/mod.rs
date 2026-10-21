@@ -561,10 +561,6 @@ pub fn vulkan_t2t_pending() -> bool {
     false
 }
 
-/// TEMP (lab T2T_DEFER): land the deferred whole-plane blit frames owed to
-/// `only` (or to every mapping). Free when none is owed: one atomic load.
-#[inline]
-#[track_caller]
 /// TEMP (lab, LAZY_SYNC): finish the lazy landings owed to `only` (all when `None`) - see
 /// `vulkan::lazy_land`. Free when none runs: one atomic load.
 pub fn lazy_land<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
@@ -598,6 +594,10 @@ pub fn lazy_pending(mapping_id: u32) -> bool {
     }
 }
 
+/// TEMP (lab T2T_DEFER): land the deferred whole-plane blit frames owed to
+/// `only` (or to every mapping). Free when none is owed: one atomic load.
+#[inline]
+#[track_caller]
 pub fn land_t2t<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(state: &mut DeviceState, host: &mut M, only: Option<u32>) {
     #[cfg(feature = "backend-vulkan")]
     if vulkan::T2T_PENDING_N.load(std::sync::atomic::Ordering::Acquire) != 0 {

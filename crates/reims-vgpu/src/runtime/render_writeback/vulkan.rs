@@ -1684,6 +1684,13 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
             host.unmap_pages(p, len);
         }
     };
+    // `land_spans` may revalidate the page list; the fence must close over the pages the copy writes, so the
+    // list the GPAs above were taken from must still be the vouched one.
+    if !vouched.covers(state, mapping_id) {
+        unmap(host, &mapped);
+        note_store_route("lab_lazy_sync_vouch_moved");
+        return false;
+    }
     // Everything that may still read guest memory runs before the fence closes: from the close to the spawn
     // nothing may, or the drain would wait on a fence whose copy is not yet started. `copy_mapping_runs`'
     // host-write note, before any byte moves; a draw the recorder still holds may read these pages.
@@ -1709,7 +1716,9 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
             crate::observe::fail(format!(
                 "render_store_lost mapping={mapping_id} {width}x{height} reason=lazy_sync_fallback_write_refused"
             ));
-            return true; // the debt is spent either way, as a refused synchronous store spends it
+            // As `pay_surface_writeback` on a refused store: the debt is spent, and the hold on the image ends.
+            crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+            return true;
         }
         finish(state, mapping_id, identity, frame_bytes as usize, started, false);
         crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
@@ -1722,9 +1731,11 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
         frame_bytes as usize,
         p1 - p0,
         true,
+        // The fence opens before the lease returns: a device teardown waits for leases, never for fences, so the
+        // shim's context must still be live when the open calls into it.
         Some(Box::new(move || {
-            drop(leased);
             fence.open();
+            drop(leased);
         })),
     );
     // The payment's bookkeeping now, not when the copy is in (`complete_landing`'s, plus the stamp `pay` commits):
