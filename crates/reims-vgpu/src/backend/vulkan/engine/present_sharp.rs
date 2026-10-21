@@ -263,6 +263,12 @@ pub(crate) struct PresentSharp {
     dlss_depth: Option<MidImage>,
     dlss_mvec: Option<MidImage>,
     dlss_cleared: bool,
+    /// TEMP (lab, PRESENT_DLSS_SR): the pass that writes `dlss_mvec` from the optical flow
+    /// (`shaders/present_dlss_mvec.comp`), made on the first present with a flow pair; whether the vectors in
+    /// `dlss_mvec` are not all zero (a present without a fresh pair clears them); a build that refused.
+    dlss_mvec_pass: Option<MvecPass>,
+    dlss_mvec_moving: bool,
+    dlss_mvec_failed: bool,
     /// TEMP (lab, PRESENT_VSR_TILES): VSR on the still cells, and whether the
     /// present being recorded draws its overlay.
     refine: Option<super::present_refine::TileRefine>,
@@ -284,6 +290,118 @@ pub(crate) struct SharpSource {
     /// TEMP (lab, PRESENT_VSR_TILES): the guest frame's sequence, when known (a
     /// present of the frame the cells were already compared against skips it).
     pub seq: Option<u64>,
+    /// TEMP (lab, PRESENT_DLSS_SR): the optical flow from the previous guest frame to this one, on the first
+    /// present of a new frame; DLSS's motion vectors are built from it (zero without it).
+    pub motion: Option<super::present_fg::FgMotion>,
+}
+
+/// TEMP (lab, PRESENT_DLSS_SR): `shaders/present_dlss_mvec.comp` - the flow's backward vectors, checked against a
+/// still match per cell, into DLSS's RG16F motion vectors. One descriptor set per presenter frame entry.
+struct MvecPass {
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    pool: vk::DescriptorPool,
+    sets: Vec<vk::DescriptorSet>,
+}
+
+impl MvecPass {
+    unsafe fn create(device: &ash::Device, frames: usize) -> Result<Self, vk::Result> {
+        let mut made = Self {
+            set_layout: vk::DescriptorSetLayout::null(),
+            layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+            pool: vk::DescriptorPool::null(),
+            sets: Vec::new(),
+        };
+        let r = (|| -> Result<(), vk::Result> {
+            let bindings: Vec<_> = (0..4u32)
+                .map(|b| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(b)
+                        .descriptor_type(if b == 3 {
+                            vk::DescriptorType::STORAGE_IMAGE
+                        } else {
+                            vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                        })
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                })
+                .collect();
+            made.set_layout = device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )?;
+            let push = [vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(12)];
+            let set_layouts = [made.set_layout];
+            made.layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&set_layouts)
+                    .push_constant_ranges(&push),
+                None,
+            )?;
+            let module = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default()
+                    .code(&super::present_sharp_shader::PRESENT_DLSS_MVEC_COMP_SPIRV),
+                None,
+            )?;
+            let info = [vk::ComputePipelineCreateInfo::default()
+                .stage(
+                    vk::PipelineShaderStageCreateInfo::default()
+                        .stage(vk::ShaderStageFlags::COMPUTE)
+                        .module(module)
+                        .name(c"main"),
+                )
+                .layout(made.layout)];
+            let pipelines = device.create_compute_pipelines(vk::PipelineCache::null(), &info, None);
+            device.destroy_shader_module(module, None);
+            made.pipeline = pipelines.map_err(|(_, e)| e)?[0];
+            let n = frames as u32;
+            let sizes = [
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(3 * n),
+                vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(n),
+            ];
+            made.pool = device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default().max_sets(n).pool_sizes(&sizes),
+                None,
+            )?;
+            let layouts = vec![made.set_layout; frames];
+            made.sets = device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(made.pool)
+                    .set_layouts(&layouts),
+            )?;
+            Ok(())
+        })();
+        match r {
+            Ok(()) => Ok(made),
+            Err(e) => {
+                made.destroy(device);
+                Err(e)
+            }
+        }
+    }
+
+    unsafe fn destroy(&mut self, device: &ash::Device) {
+        if self.pipeline != vk::Pipeline::null() {
+            device.destroy_pipeline(self.pipeline, None);
+        }
+        if self.layout != vk::PipelineLayout::null() {
+            device.destroy_pipeline_layout(self.layout, None);
+        }
+        if self.pool != vk::DescriptorPool::null() {
+            device.destroy_descriptor_pool(self.pool, None);
+        }
+        if self.set_layout != vk::DescriptorSetLayout::null() {
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+        }
+        self.sets.clear();
+    }
 }
 
 impl PresentSharp {
@@ -330,6 +448,9 @@ impl PresentSharp {
             dlss_depth: None,
             dlss_mvec: None,
             dlss_cleared: false,
+            dlss_mvec_pass: None,
+            dlss_mvec_moving: false,
+            dlss_mvec_failed: false,
             refine: None,
             refine_failed: false,
             refine_active: false,
@@ -1063,13 +1184,18 @@ impl PresentSharp {
 
     /// TEMP (lab, PRESENT_DLSS_SR): DLSS from `vin` (shader-read, rgba8) into `mid` (general, rgba8). Clears the
     /// depth and motion vectors to zero the first time (and resets the history then): a desktop's content does
-    /// not move between two presents of a still screen, which is where DLSS accumulates.
+    /// not move between two presents of a still screen, which is where DLSS accumulates. On the first present of
+    /// a new guest frame `motion` (the optical flow from the previous one, at the guest frame's size) fills the
+    /// motion vectors; any other present leaves them zero.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn dlss_evaluate(
         &mut self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
+        ix: usize,
         vin: (vk::Image, vk::ImageView, u32, u32),
         mid: (vk::Image, vk::ImageView, u32, u32),
+        motion: Option<&super::present_fg::FgMotion>,
     ) -> i32 {
         let (Some(depth), Some(mvec)) = (self.dlss_depth.as_ref(), self.dlss_mvec.as_ref()) else {
             return -102;
@@ -1105,7 +1231,12 @@ impl PresentSharp {
             });
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &to_general);
             self.dlss_cleared = true;
+            self.dlss_mvec_moving = false;
         }
+        self.record_dlss_mvec(device, cmd, ix, (vin.2, vin.3), motion);
+        let (Some(depth), Some(mvec)) = (self.dlss_depth.as_ref(), self.dlss_mvec.as_ref()) else {
+            return -102;
+        };
         let image = |(image, view, width, height): (vk::Image, vk::ImageView, u32, u32), layout, format, usage| {
             super::present_dlssg::DlssSrImage { image, view, memory: vk::DeviceMemory::null(), layout, format, width, height, usage }
         };
@@ -1121,6 +1252,132 @@ impl PresentSharp {
             &aux(mvec, DLSS_MVEC_FORMAT),
             reset,
         )
+    }
+
+    /// TEMP (lab, PRESENT_DLSS_SR): `dlss_mvec` (`GENERAL`, `width` x `height`) for this present - from the flow
+    /// pair when there is one (and the pass builds), else zero: cleared once after a present that wrote vectors.
+    unsafe fn record_dlss_mvec(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        ix: usize,
+        (width, height): (u32, u32),
+        motion: Option<&super::present_fg::FgMotion>,
+    ) {
+        let motion = motion.filter(|_| !self.dlss_mvec_failed);
+        if motion.is_some() && self.dlss_mvec_pass.is_none() {
+            match MvecPass::create(device, self.sets.len()) {
+                Ok(pass) => self.dlss_mvec_pass = Some(pass),
+                Err(e) => {
+                    self.dlss_mvec_failed = true;
+                    crate::observe::fail(format!("present_dlss_mvec_refused build={e:?}"));
+                }
+            }
+        }
+        let Some(mvec) = self.dlss_mvec.as_ref() else {
+            return;
+        };
+        let range = super::color_subresource_range();
+        let barrier = |src_a, dst_a| {
+            [vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_a)
+                .dst_access_mask(dst_a)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(mvec.image)
+                .subresource_range(range)]
+        };
+        let read = vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE;
+        match (motion, self.dlss_mvec_pass.as_ref()) {
+            (Some(m), Some(pass)) if pass.sets.len() > ix => {
+                let set = pass.sets[ix];
+                let sampled = |view| {
+                    [vk::DescriptorImageInfo::default()
+                        .sampler(self.sampler)
+                        .image_view(view)
+                        .image_layout(vk::ImageLayout::GENERAL)]
+                };
+                let (prev, cur, bwd) = (sampled(m.prev), sampled(m.cur), sampled(m.bwd));
+                let out = [vk::DescriptorImageInfo::default()
+                    .image_view(mvec.view)
+                    .image_layout(vk::ImageLayout::GENERAL)];
+                let w = |binding: u32, ty: vk::DescriptorType| {
+                    vk::WriteDescriptorSet::default().dst_set(set).dst_binding(binding).descriptor_type(ty)
+                };
+                device.update_descriptor_sets(
+                    &[
+                        w(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&prev),
+                        w(1, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&cur),
+                        w(2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&bwd),
+                        w(3, vk::DescriptorType::STORAGE_IMAGE).image_info(&out),
+                    ],
+                    &[],
+                );
+                // The flow (optical-flow queue, waited on by this submission) and the copied inputs, then the
+                // vectors DLSS read last present.
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)],
+                    &[],
+                    &barrier(read, vk::AccessFlags::SHADER_WRITE),
+                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pass.pipeline);
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pass.layout, 0, &[set], &[]);
+                let mut push = [0u8; 12];
+                push[0..4].copy_from_slice(&(width as i32).to_le_bytes());
+                push[4..8].copy_from_slice(&(height as i32).to_le_bytes());
+                push[8..12].copy_from_slice(&(m.grid as i32).to_le_bytes());
+                device.cmd_push_constants(cmd, pass.layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
+                let (cells_x, cells_y) = (width.div_ceil(m.grid), height.div_ceil(m.grid));
+                device.cmd_dispatch(cmd, cells_x.div_ceil(8), cells_y.div_ceil(8), 1);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barrier(vk::AccessFlags::SHADER_WRITE, read),
+                );
+                self.dlss_mvec_moving = true;
+            }
+            _ if self.dlss_mvec_moving => {
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barrier(read, vk::AccessFlags::TRANSFER_WRITE),
+                );
+                device.cmd_clear_color_image(
+                    cmd,
+                    mvec.image,
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearColorValue { float32: [0.0; 4] },
+                    &[range],
+                );
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barrier(vk::AccessFlags::TRANSFER_WRITE, read),
+                );
+                self.dlss_mvec_moving = false;
+            }
+            _ => {}
+        }
     }
 
     unsafe fn write_set(&self, device: &ash::Device, set: vk::DescriptorSet, view: vk::ImageView) {
@@ -1403,7 +1660,9 @@ impl PresentSharp {
                     &vin_read,
                 );
                 let r = if dlss {
-                    self.dlss_evaluate(device, cmd, (vin_image, vin_view, vin_w, vin_h), (mid_image, mid_view, mid_w, mid_h))
+                    // The flow ran at the guest frame's size; vectors only when `vin` is that size too.
+                    let motion = src.motion.as_ref().filter(|_| (vin_w, vin_h) == (src.width, src.height));
+                    self.dlss_evaluate(device, cmd, ix, (vin_image, vin_view, vin_w, vin_h), (mid_image, mid_view, mid_w, mid_h), motion)
                 } else { super::present_vsr::evaluate(
                     cmd,
                     &super::present_vsr::VsrImage {
@@ -1955,8 +2214,14 @@ impl PresentSharp {
         if let Some(mut refine) = self.refine.take() {
             refine.destroy(device);
         }
-        if let Some(mid) = self.mid.take() {
-            mid.destroy(device);
+        for img in [self.mid.take(), self.vsr_in.take(), self.dlss_depth.take(), self.dlss_mvec.take()]
+            .into_iter()
+            .flatten()
+        {
+            img.destroy(device);
+        }
+        if let Some(mut pass) = self.dlss_mvec_pass.take() {
+            pass.destroy(device);
         }
         if self.pool != vk::DescriptorPool::null() {
             device.destroy_descriptor_pool(self.pool, None);

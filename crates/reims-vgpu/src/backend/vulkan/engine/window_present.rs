@@ -1537,14 +1537,26 @@ impl WindowPresenter {
                 // TEMP (lab, PRESENT_FG): before this frame's read barrier is
                 // recorded, the guest frame is still in the layout the registry
                 // recorded - the copy into the flow inputs runs on that.
-                let fg_input = match (&blit, sharp_view.is_some() && super::present_fg::on()) {
+                // TEMP (lab, PRESENT_DLSS_SR): without PRESENT_FG the same flow, run on every new guest frame, gives
+                // DLSS its motion vectors (no midpoint, no FG request).
+                let fg_on = super::present_fg::on();
+                let dlss_flow = !fg_on && super::present_dlssg::dlss_sr_active();
+                let fg_input = match (&blit, sharp_view.is_some() && (fg_on || dlss_flow)) {
                     (BlitSource::Resident { image, access, .. }, true) => Some((*image, *access)),
                     _ => None,
                 };
                 let src_layout = blit.record_read_barrier(&ctx.device, frame_cmd);
                 let mut fg_src: Option<super::present_fg::FgSource> = None;
+                let mut motion: Option<super::present_fg::FgMotion> = None;
+                let fg_request = || {
+                    if dlss_flow {
+                        frame_seq.map(|seq| (seq, true, None))
+                    } else {
+                        crate::host_window::present::lab_take_fg_request()
+                    }
+                };
                 if let (Some((image, access)), Some((seq, want_flow, phase))) =
-                    (fg_input, fg_input.and_then(|_| crate::host_window::present::lab_take_fg_request()))
+                    (fg_input, fg_input.and_then(|_| fg_request()))
                 {
                     if !self.fg_failed && self.fg.as_ref().is_none_or(|fg| !fg.matches(base_width, base_height)) {
                         if let Some(mut old) = self.fg.take() {
@@ -1571,6 +1583,11 @@ impl WindowPresenter {
                             Ok(flowed) => {
                                 // The flow just submitted (a new pair) is waited on by
                                 // this present; later presents of the pair follow it.
+                                // A re-present of the same guest frame moved nothing: no
+                                // vectors (the evaluate writes zero ones).
+                                if dlss_flow && flowed.is_some() {
+                                    motion = fg.motion(seq);
+                                }
                                 fg_wait = flowed;
                                 if let Some(phase) = phase {
                                     fg_src = fg.record_warp(&ctx.device, frame_cmd, frame_ix, seq, phase);
@@ -1600,6 +1617,7 @@ impl WindowPresenter {
                                 layout: src_layout,
                             }),
                             seq: frame_seq,
+                            motion,
                         };
                         sharp
                             .record(

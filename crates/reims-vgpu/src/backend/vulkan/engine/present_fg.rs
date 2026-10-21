@@ -94,6 +94,16 @@ pub(crate) struct FgSource {
     pub layout: vk::ImageLayout,
 }
 
+/// TEMP (lab, PRESENT_DLSS_SR): what DLSS's motion vectors are built from (`shaders/present_dlss_mvec.comp`): the
+/// guest frame pair the last flow ran on and its backward flow (each pixel of `cur` back to `prev`), all in `GENERAL`.
+pub(crate) struct FgMotion {
+    pub prev: vk::ImageView,
+    pub cur: vk::ImageView,
+    /// `R16G16_SINT` view of the S10.5 vectors, one per `grid` x `grid` cell.
+    pub bwd: vk::ImageView,
+    pub grid: u32,
+}
+
 const GRID: u32 = 4;
 
 impl PresentFg {
@@ -557,6 +567,18 @@ impl PresentFg {
         self.pair = Some((prev, cur));
         self.pair_seq = seq;
         Ok(Some(self.flowed[ix]))
+    }
+
+    /// TEMP (lab, PRESENT_DLSS_SR): the pair the last flow ran on, when it is `seq`'s (`None` on a re-present, the
+    /// first frame, or after a size change). The present that reads it waits on [`Self::submit_flow`]'s semaphore.
+    pub(crate) fn motion(&self, seq: u64) -> Option<FgMotion> {
+        let (prev, cur) = self.pair.filter(|_| self.pair_seq == seq)?;
+        Some(FgMotion {
+            prev: self.inputs[prev].view,
+            cur: self.inputs[cur].view,
+            bwd: self.flow_bwd.int_view,
+            grid: GRID,
+        })
     }
 
     /// Step 3, recorded into the frame's command buffer: the frame at `phase`
