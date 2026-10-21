@@ -1565,13 +1565,10 @@ pub fn lazy_sync_px() -> Option<u64> {
     })
 }
 
-/// A synchronize's frame landing behind a guest fence (the fence and the lease ride with the copy).
+/// A synchronize's frame landing behind a guest fence (the fence and the lease ride with the copy; the payment's
+/// bookkeeping was done when it began).
 struct LazyStore {
     mapping_id: u32,
-    identity: crate::backend::vulkan::engine::TargetIdentity,
-    base_off: u64,
-    seen: crate::runtime::mapper::GuestWriteObservation,
-    started: std::time::Instant,
     job: LandJob,
 }
 
@@ -1661,41 +1658,64 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
         }
     };
     let page = state.page_size();
-    let fence = crate::runtime::mapper::mapping_page_gpas(state, host, mapping_id).and_then(|gpas| {
-        let (p0, p1) = ((base_off / page) as usize, need_end.div_ceil(page) as usize);
-        (p1 <= gpas.len()).then(|| host.guest_fence_close(&gpas[p0..p1], page as usize)).flatten()
-    });
-    let Some(fence) = fence else {
+    let Some(gpas) = crate::runtime::mapper::mapping_page_gpas(state, host, mapping_id) else {
+        unmap(host, &mapped);
+        note_store_route("lab_lazy_sync_no_gpas");
+        return false;
+    };
+    let (p0, p1) = ((base_off / page) as usize, need_end.div_ceil(page) as usize);
+    if p1 > gpas.len() {
+        unmap(host, &mapped);
+        note_store_route("lab_lazy_sync_short_gpas");
+        return false;
+    }
+    // Everything that may still read guest memory runs before the fence closes: from the close to the spawn
+    // nothing may, or the drain would wait on a fence whose copy is not yet started. `copy_mapping_runs`'
+    // host-write note, before any byte moves; a draw the recorder still holds may read these pages.
+    state.note_host_wrote_mapping_selected(mapping_id, &runs, base_off, need_end);
+    crate::backend::settle_deferred_draws_for_guest_write();
+    let Some(fence) = host.guest_fence_close(&gpas[p0..p1], page as usize) else {
         unmap(host, &mapped);
         note_store_route("lab_lazy_sync_fence_refused");
         return false;
     };
-    state.note_host_wrote_mapping_selected(mapping_id, &runs, base_off, need_end);
-    // A draw the recorder still holds may read these pages.
-    crate::backend::settle_deferred_draws_for_guest_write();
-    let pages = need_end.div_ceil(page).saturating_sub(base_off / page) as usize;
     let job = LandJob::spawn(
         spans,
         runs,
         mapped,
         frame_bytes as usize,
-        pages,
+        p1 - p0,
         true,
         Some(Box::new(move || {
             drop(leased);
             fence.open();
         })),
     );
+    // The payment's bookkeeping now, not when the copy is in (`complete_landing`'s, plus the stamp `pay` commits):
+    // the frame is already out of the resident (in the lease the copy reads), and nothing reads these pages before
+    // it lands - the guest is fenced, every device reader lands it first. Deferred, `finish` would hand back the
+    // registry state of whatever the resident holds by then - a newer frame's sole copy released to reclaim.
+    for &(lo, hi) in &job.runs {
+        crate::runtime::mapper::note_mapping_write_footprint(state, mapping_id, lo, hi - lo);
+    }
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.guest_bytes_seq = m.guest_bytes_seq.wrapping_add(1);
+    }
+    crate::backend::vulkan::engine::page_diff_forget(mapping_id);
+    state.invalidate_storage_residency_window(mapping_id, base_off, need_end);
+    let _ = state.mark_mapping_written(mapping_id);
+    finish(state, mapping_id, identity, frame_bytes as usize, started, false);
+    crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
     let mut g = LAZY.lock().unwrap_or_else(|e| e.into_inner());
-    g.push(LazyStore { mapping_id, identity: identity.clone(), base_off, seen, started, job });
+    g.push(LazyStore { mapping_id, job });
     LAZY_N.store(g.len(), std::sync::atomic::Ordering::Release);
     note_store_route("lab_lazy_sync_begun");
     true
 }
 
 /// Finish lazy landings on the drain: those for `only` (every one when `None`), waiting for their copies when
-/// `block`, else only those whose copy is in - the bookkeeping `complete_landing` does for a deferred payment.
-pub fn lazy_land<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, only: Option<u32>, block: bool) {
+/// `block`, else only those whose copy is in - the views the copy wrote through unmapped.
+pub fn lazy_land<M: HostMemory + HostOps>(_state: &mut DeviceState, host: &mut M, only: Option<u32>, block: bool) {
     if LAZY_N.load(std::sync::atomic::Ordering::Acquire) == 0 {
         return;
     }
@@ -1713,21 +1733,9 @@ pub fn lazy_land<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M,
             crate::runtime::drain::note_store_route("lab_lazy_sync_waited");
         }
         l.job.wait();
-        let mapping_id = l.mapping_id;
         for (p, len) in std::mem::take(&mut l.job.mapped) {
             host.unmap_pages(p, len);
         }
-        for &(lo, hi) in &l.job.runs {
-            crate::runtime::mapper::note_mapping_write_footprint(state, mapping_id, lo, hi - lo);
-        }
-        if let Some(m) = state.mappings.get_mut(&mapping_id) {
-            m.guest_bytes_seq = m.guest_bytes_seq.wrapping_add(1);
-        }
-        crate::backend::vulkan::engine::page_diff_forget(mapping_id);
-        state.invalidate_storage_residency_window(mapping_id, l.base_off, l.base_off + l.job.frame_len as u64);
-        let _ = state.mark_mapping_written(mapping_id);
-        finish(state, mapping_id, &l.identity, l.job.frame_len, l.started, false);
-        crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, l.seen);
         crate::runtime::drain::note_store_route("lab_lazy_sync_landed");
     }
 }
