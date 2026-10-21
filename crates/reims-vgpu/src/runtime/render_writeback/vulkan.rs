@@ -1733,7 +1733,12 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
         note_store_route("lab_lazy_sync_short_gpas"); lazy_why("short_gpas", 0);
         return false;
     }
-    let fence_runs = 1 + gpas[p0..p1].windows(2).filter(|w| w[1] != w[0] + page).count();
+    // A set of pages: the shim merges its runs over the sorted GPAs (b951a: in the guest's page order a 42 MB canvas
+    // was one run per page).
+    let mut fenced = gpas[p0..p1].to_vec();
+    fenced.sort_unstable();
+    fenced.dedup();
+    let fence_runs = 1 + fenced.windows(2).filter(|w| w[1] != w[0] + page).count();
     if fence_runs > lazy_fence_max_runs() {
         note_store_route("lab_lazy_sync_fragmented"); lazy_why("fragmented", fence_runs);
         return false;
