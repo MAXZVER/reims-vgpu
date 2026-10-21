@@ -593,6 +593,23 @@ pub fn lazy_cancel(mapping_id: u32) {
     let _ = mapping_id;
 }
 
+/// TEMP (lab LAZY_SYNC): unmap a host view, unless a lazy copy still writes through it - then the copy owns it and
+/// unmaps it once in.
+pub fn unmap_view_or_adopt<H: crate::runtime::host::HostOps>(host: &mut H, ptr: usize, len: usize) {
+    #[cfg(feature = "backend-vulkan")]
+    if vulkan::lazy_adopt_view(ptr, len) {
+        crate::runtime::drain::note_store_route("lab_lazy_sync_view_adopted");
+        return;
+    }
+    host.unmap_pages(ptr, len);
+}
+
+/// TEMP (lab PAY_DEFER): block until PAY_DEFER's landing copy is in - before views are unmapped.
+pub fn wait_deferred_landing() {
+    #[cfg(feature = "backend-vulkan")]
+    vulkan::wait_deferred_landing();
+}
+
 /// TEMP (lab PAY_DEFER / LAZY_SYNC): block until every landing copy in flight is in - before views are unmapped.
 #[track_caller]
 pub fn wait_landing_copies() {

@@ -1627,6 +1627,11 @@ pub(crate) fn lazy_why(reason: &'static str, runs: usize) {
 struct LazyStore {
     mapping_id: u32,
     base_off: u64,
+    /// The host addresses the copy writes, `[lo, hi)`: a view retired over them is the copy's to unmap.
+    dst: (usize, usize),
+    /// The mapping's generation at the start: a frame landed into pages the mapping no longer names is not
+    /// rebased onto the new ones.
+    map_generation: u64,
     job: LandJob,
 }
 
@@ -1640,6 +1645,38 @@ pub(crate) fn lazy_pending_mappings() -> Vec<u32> {
         return Vec::new();
     }
     LAZY.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|l| l.mapping_id).collect()
+}
+
+/// A host view being unmapped (`ptr`, `len`) that a lazy copy still writes through becomes that copy's: it is
+/// unmapped with the copy's own runs once the copy is in ([`lazy_land`]). `true` when adopted - the caller must
+/// not unmap it.
+pub(crate) fn lazy_adopt_view(ptr: usize, len: usize) -> bool {
+    if LAZY_N.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    let mut g = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+    match g.iter_mut().find(|l| !l.job.done() && l.dst.0 < ptr + len && ptr < l.dst.1) {
+        Some(l) => {
+            l.job.mapped.push((ptr, len));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Block until PAY_DEFER's landing copy (not the lazy ones - they adopt the views they write through) is in.
+pub(crate) fn wait_deferred_landing() {
+    let deferred = LANDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(_, done)| std::sync::Arc::clone(done));
+    if let Some(done) = deferred {
+        let mut g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !done.flag.load(std::sync::atomic::Ordering::Acquire) {
+            g = done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 /// Stop the lazy copies into `mapping_id`'s pages at their next chunk: the guest is releasing those pages.
@@ -1697,12 +1734,6 @@ fn lazy_wait_where(pick: impl Fn(&LazyStore) -> bool) -> bool {
         }
     }
     waited
-}
-
-/// Block until a lazy copy into `mapping_id`'s pages is in (an invalidation of its page list; the bookkeeping waits
-/// for the next [`lazy_land`]).
-pub(crate) fn wait_lazy_copy_for(mapping_id: u32) {
-    lazy_wait_where(|l| l.mapping_id == mapping_id);
 }
 
 /// Start the lazy landing of `mapping_id`'s owed frame (held by `identity`). `false` when this frame cannot take
@@ -1786,6 +1817,10 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
     // pages.
     state.note_host_wrote_mapping_selected(mapping_id, &runs, base_off, need_end);
     crate::backend::settle_deferred_draws_for_guest_write();
+    let dst = spans
+        .iter()
+        .fold((usize::MAX, 0usize), |(lo, hi), &(d, _, n)| (lo.min(d), hi.max(d + n)));
+    let map_generation = state.mappings.get(&mapping_id).map_or(0, |m| u64::from(m.map_generation));
     let job = LandJob::spawn(
         spans,
         runs,
@@ -1825,7 +1860,7 @@ pub fn begin_lazy_store<M: HostMemory + HostOps>(
     finish(state, mapping_id, identity, frame_bytes as usize, started, false);
     crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
     let mut g = LAZY.lock().unwrap_or_else(|e| e.into_inner());
-    g.push(LazyStore { mapping_id, base_off, job });
+    g.push(LazyStore { mapping_id, base_off, dst, map_generation, job });
     LAZY_N.store(g.len(), std::sync::atomic::Ordering::Release);
     note_store_route("lab_lazy_sync_begun");
     lazy_why("begun", 0);
@@ -1864,9 +1899,13 @@ pub fn lazy_land<M: HostMemory + HostOps>(
             host.unmap_pages(p, len);
         }
         // `write_mapping_copy_only`'s tail: a set the tracker answers for by hashing takes the landed bytes as its
-        // baseline (LAZY_SYNC_PX sizes are past DIRTY_HASH_MAX, so normally a no-op - kept for the parity).
-        let end = l.base_off + l.job.frame_len as u64;
-        crate::runtime::mapper::rebase_device_write(state, host, l.mapping_id, l.base_off, end, None);
+        // baseline (LAZY_SYNC_PX sizes are past DIRTY_HASH_MAX, so normally a no-op - kept for the parity) - only
+        // while the mapping still names the pages the copy wrote.
+        let current = state.mappings.get(&l.mapping_id).map(|m| u64::from(m.map_generation));
+        if current == Some(l.map_generation) {
+            let end = l.base_off + l.job.frame_len as u64;
+            crate::runtime::mapper::rebase_device_write(state, host, l.mapping_id, l.base_off, end, None);
+        }
         crate::runtime::drain::note_store_route("lab_lazy_sync_landed");
     }
 }

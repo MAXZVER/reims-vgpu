@@ -7870,12 +7870,12 @@ fn deferred_landing_disjoint<H: HostMemory + HostOps>(
     !released.iter().any(|gpa| owed.contains(gpa))
 }
 
-/// TEMP (lab LAZY_SYNC): what a map-family command owes the lazy landings. Only an unmap and a backing delete give
-/// pages back (PAY_DEFER's rule); the others book the copies already in without waiting (b955a: all 645 lazy copies
-/// were waited for there). An unmap waits only for copies into the pages it releases (b958a: 696 waits at UnmapMemory
-/// / DeleteIOSurfaceBacking2 - ch2 unmaps run ~2 000 a second, nearly all elsewhere); a delete of a landing mapping's
-/// own backing stops that copy at its next chunk (the guest is releasing those pages - PAY_DEFER drops its landing
-/// there too) and waits only for that. Anything that cannot be decided waits.
+/// TEMP (lab LAZY_SYNC): what a map-family command owes the lazy landings - no wait. The guest reuses pages an
+/// unmap or a backing delete releases only after that command's stamp, and every stamp queued after a lazy
+/// synchronize waits for its copy (`write_baseline::resolve_after`); a host view the copy writes through is adopted
+/// by it when retired (`unmap_view_or_adopt`). b960a: the guest unmaps the WebGL canvas (all 10 350 pages) right
+/// after synchronizing it, and that unmap waited ~2 ms for the copy 672 times in 15 s. A delete of a copy's own
+/// backing stops the copy at its next chunk (nothing will read those bytes); finished copies are booked.
 fn lazy_land_for_map_family<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -7886,72 +7886,15 @@ fn lazy_land_for_map_family<H: HostMemory + HostOps>(
     if !rw::vulkan_lazy_any() {
         return;
     }
-    if !matches!(family, MapFamily::UnmapMemory | MapFamily::DeleteIOSurfaceBacking2) {
-        rw::lazy_land(state, host, None, false);
-        return;
-    }
-    let mut own = None;
-    let released: Option<std::collections::HashSet<u64>> = match family {
-        MapFamily::UnmapMemory => crate::protocol::fifo::decode_map_memory(&packet.payload).ok().map(|cmd| {
-            crate::runtime::gva_mem::task_gva_page_gpa_set(
-                &*host,
-                &state.tasks,
-                cmd.task_id,
-                cmd.gva,
-                cmd.length,
-                state.page_shift,
-            )
-            .into_iter()
-            .collect()
-        }),
-        _ => crate::protocol::fifo::decode_delete_backing(&packet.payload).ok().and_then(|cmd| {
-            own = Some(cmd.object_id);
-            state.mapping_reach_pages(cmd.object_id).map(|pages| pages.into_iter().collect())
-        }),
-    };
-    for mapping_id in rw::lazy_pending_mappings() {
-        if own == Some(mapping_id) {
-            note_store_route("lab_lazy_sync_cancelled_on_delete");
-            rw::lazy_cancel(mapping_id);
-            rw::lazy_land(state, host, Some(mapping_id), true);
-            continue;
-        }
-        let owed = state.mapping_reach_pages(mapping_id);
-        let shared = match (&released, &owed) {
-            (Some(released), Some(owed)) => Some(owed.iter().filter(|gpa| released.contains(gpa)).count()),
-            _ => None,
-        };
-        lab_lazy_map_log(family, own, mapping_id, released.as_ref().map(|r| r.len()), owed.as_ref().map(|o| o.len()), shared);
-        // One call site per reason, so `lazy_wait@` names which one the drain waited at.
-        match (shared, family) {
-            (Some(0), _) => {}
-            (Some(_), MapFamily::UnmapMemory) => rw::lazy_land(state, host, Some(mapping_id), true),
-            (Some(_), _) => rw::lazy_land(state, host, Some(mapping_id), true),
-            (None, MapFamily::UnmapMemory) => rw::lazy_land(state, host, Some(mapping_id), true),
-            (None, _) => rw::lazy_land(state, host, Some(mapping_id), true),
+    if family == MapFamily::DeleteIOSurfaceBacking2 {
+        if let Ok(cmd) = crate::protocol::fifo::decode_delete_backing(&packet.payload) {
+            if rw::lazy_pending(cmd.object_id) {
+                note_store_route("lab_lazy_sync_cancelled_on_delete");
+                rw::lazy_cancel(cmd.object_id);
+            }
         }
     }
     rw::lazy_land(state, host, None, false);
-}
-
-/// TEMP (lab LAZY_SYNC): the first 60 lazy-landing decisions of a boot, one line each - which family, whose delete,
-/// how many pages it releases and the copy owes, how many they share (None: undecided).
-fn lab_lazy_map_log(
-    family: MapFamily,
-    own: Option<u32>,
-    mapping_id: u32,
-    released: Option<usize>,
-    owed: Option<usize>,
-    shared: Option<usize>,
-) {
-    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
-        crate::observe::off(format!(
-            "lab_lazy_map family={} own={own:?} lazy_mapping={mapping_id} released={released:?} owed={owed:?} \
-             shared={shared:?}",
-            family.name()
-        ));
-    }
 }
 
 /// TEMP (lab, T2T_PARK): the deferred T2T frames a map-family command lands -

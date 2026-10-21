@@ -1539,10 +1539,12 @@ fn lab_resolve_fingerprint(m: &crate::model::MappingEntry) -> u64 {
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     // TEMP (lab PAY_DEFER / LAZY_SYNC, Opus 10-21 review): a landing copy writes through a mapping's packed view
     // on the landing thread. Views are retired from several places (map_surface, unmap_surface, condemn, backing
-    // re-resolution, attach - not only invalidate_mapping_pages, which already waits for its mapping's copy), and
-    // this is where every one of them is unmapped: not while a copy may still write through it.
+    // re-resolution, attach, invalidate_mapping_pages), and this is where they are unmapped: not while a copy may
+    // still write through one. PAY_DEFER's copy is waited for; a lazy copy (b960a: the guest unmaps the WebGL
+    // canvas right after synchronizing it, and every unmap waited ~2 ms for the copy) adopts the view instead and
+    // unmaps it once in - the guest pages stay the guest's until the unmap's stamp, which the copy gates.
     if !state.retired_views.is_empty() {
-        crate::runtime::render_writeback::wait_landing_copies();
+        crate::runtime::render_writeback::wait_deferred_landing();
     }
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
@@ -1560,10 +1562,10 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
             continue;
         }
         released.remove(&(ptr, len));
-        host.unmap_pages(ptr, len);
+        crate::runtime::render_writeback::unmap_view_or_adopt(host, ptr, len);
     }
     for (ptr, len) in released {
-        host.unmap_pages(ptr, len);
+        crate::runtime::render_writeback::unmap_view_or_adopt(host, ptr, len);
     }
     // Same shape and the same reason: a guest-write token is host-side state
     // for a page list that no longer exists, and only the host can free it.
@@ -1582,7 +1584,7 @@ pub fn drain_deferred_unmaps<H: HostOps>(host: &mut H) -> usize {
     let released = crate::backend::selected().take_released_host_aliases();
     let count = released.len();
     for (ptr, len) in released {
-        host.unmap_pages(ptr, len);
+        crate::runtime::render_writeback::unmap_view_or_adopt(host, ptr, len);
     }
     count
 }
