@@ -36,6 +36,11 @@
 //! of any FIFO is ordered after it.
 //!
 //! One thread, jobs in issue order, so "resolved" is a single watermark.
+//!
+//! TEMP (lab LAZY_SYNC, Opus 10-21): the same gate holds the stamps after a synchronize whose frame is still being
+//! copied into the guest's pages on the landing thread ([`resolve_after`]) - the guest does not read a synchronized
+//! resource before the command's completion, so no later stamp may say "done" before the copy is in. The thread
+//! runs for that alone when `REIMS_VGPU_LAB_LAZY_SYNC_PX` is set; the deferred reads stay behind their own switch.
 
 use crate::qemu::host_ops::ReimsVgpuHostOps;
 use parking_lot::{Condvar, Mutex};
@@ -107,6 +112,12 @@ enum Job {
         slot: Arc<AtomicU64>,
         ticket: u64,
     },
+    /// TEMP (lab LAZY_SYNC): resolve `ticket` once `wait` returns (a landing copy is in).
+    Wait {
+        wait: Box<dyn FnOnce() + Send>,
+        ticket: u64,
+        queued_at: Instant,
+    },
     Publish {
         gpa: u64,
         index: u32,
@@ -130,10 +141,18 @@ static GATE: Mutex<()> = Mutex::new(());
 static GATE_CV: Condvar = Condvar::new();
 
 fn enabled() -> bool {
-    matches!(
-        std::env::var("REIMS_VGPU_LAB_ASYNC_BASELINE").as_deref(),
-        Ok("on")
-    )
+    reads_enabled() || std::env::var_os("REIMS_VGPU_LAB_LAZY_SYNC_PX").is_some()
+}
+
+/// The deferred generation reads ([`issue`]) - this module's own switch.
+fn reads_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("REIMS_VGPU_LAB_ASYNC_BASELINE").as_deref(),
+            Ok("on")
+        )
+    })
 }
 
 /// Start the baseline thread for the device whose shim table is `ops`, when
@@ -170,6 +189,15 @@ pub fn install(ops: &ReimsVgpuHostOps) {
                                 "lab_baseline_unarmed",
                             );
                         }
+                    }
+                    Job::Wait {
+                        wait,
+                        ticket,
+                        queued_at,
+                    } => {
+                        wait();
+                        resolve(ticket);
+                        note_wait("lab_baseline_land", queued_at.elapsed());
                     }
                     Job::Publish {
                         gpa,
@@ -250,9 +278,36 @@ pub fn publish_after(
     true
 }
 
+/// TEMP (lab LAZY_SYNC): gate every completion stamp queued from now on behind `wait` - run on the baseline
+/// thread in ticket order. `false` when there is no thread: the caller must wait itself before the packet's stamp.
+pub fn resolve_after(wait: Box<dyn FnOnce() + Send>) -> bool {
+    let Some(svc) = SERVICE.get() else {
+        return false;
+    };
+    // Issued before it is sent, so a stamp queued after this call is gated on it.
+    let ticket = ISSUED.load(Ordering::Acquire) + 1;
+    ISSUED.store(ticket, Ordering::Release);
+    let job = Job::Wait {
+        wait,
+        ticket,
+        queued_at: Instant::now(),
+    };
+    if let Err(mpsc::SendError(job)) = svc.tx.lock().send(job) {
+        // The thread is gone: run the wait here, then let the ticket gate nothing.
+        if let Job::Wait { wait, .. } = job {
+            wait();
+        }
+        RESOLVED.fetch_max(ticket, Ordering::AcqRel);
+    }
+    true
+}
+
 /// Start a synced generation read of `token` on the baseline thread. `None`
 /// when there is no thread or too many reads are already out — read synced.
 pub fn issue(token: u64) -> Option<PendingGen> {
+    if !reads_enabled() {
+        return None;
+    }
     let svc = SERVICE.get()?;
     let issued = ISSUED.load(Ordering::Acquire);
     if issued.saturating_sub(RESOLVED.load(Ordering::Acquire)) >= MAX_OUTSTANDING {
@@ -336,6 +391,9 @@ fn note_wait(prefix: &'static str, elapsed: Duration) {
         ("lab_baseline_publish", 100..=499) => "lab_baseline_publish_lt500us",
         ("lab_baseline_publish", 500..=1999) => "lab_baseline_publish_lt2ms",
         ("lab_baseline_publish", _) => "lab_baseline_publish_ge2ms",
+        ("lab_baseline_land", 0..=1999) => "lab_baseline_land_lt2ms",
+        ("lab_baseline_land", 2000..=7999) => "lab_baseline_land_lt8ms",
+        ("lab_baseline_land", _) => "lab_baseline_land_ge8ms",
         (_, 0..=99) => "lab_baseline_join_lt100us",
         (_, 100..=499) => "lab_baseline_join_lt500us",
         (_, 500..=1999) => "lab_baseline_join_lt2ms",
@@ -347,6 +405,7 @@ fn note_wait(prefix: &'static str, elapsed: Duration) {
             "lab_baseline_read" => "lab_baseline_read_us",
             "lab_baseline_gate" => "lab_baseline_gate_us",
             "lab_baseline_publish" => "lab_baseline_publish_us",
+            "lab_baseline_land" => "lab_baseline_land_us",
             _ => "lab_baseline_join_us",
         },
         us,
