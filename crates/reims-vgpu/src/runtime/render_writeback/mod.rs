@@ -577,6 +577,22 @@ pub fn lazy_land<M: crate::runtime::host::HostMemory + crate::runtime::host::Hos
     let _ = (state, host, only, block);
 }
 
+/// TEMP (lab, LAZY_SYNC): the mappings lazily landing frames are owed to.
+pub fn lazy_pending_mappings() -> Vec<u32> {
+    #[cfg(feature = "backend-vulkan")]
+    return vulkan::lazy_pending_mappings();
+    #[cfg(not(feature = "backend-vulkan"))]
+    Vec::new()
+}
+
+/// TEMP (lab, LAZY_SYNC): stop the lazy copies into `mapping_id`'s pages (the guest releases them).
+pub fn lazy_cancel(mapping_id: u32) {
+    #[cfg(feature = "backend-vulkan")]
+    vulkan::lazy_cancel(mapping_id);
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = mapping_id;
+}
+
 /// TEMP (lab PAY_DEFER / LAZY_SYNC): block until every landing copy in flight is in - before views are unmapped.
 #[track_caller]
 pub fn wait_landing_copies() {

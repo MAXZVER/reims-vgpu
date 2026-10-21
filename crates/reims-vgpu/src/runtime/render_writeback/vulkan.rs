@@ -1408,6 +1408,9 @@ impl DeferredStore {
 /// writing guest pages behind the drain's back.
 struct LandJob {
     done: std::sync::Arc<LandDone>,
+    /// TEMP (lab LAZY_SYNC): set when the guest releases the pages the copy writes (a delete of the mapping's
+    /// backing): the landing thread stops at the next chunk, so no byte lands in a page handed back.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Mapping-linear `[lo, hi)` runs copied, for the footprint marks.
     runs: Vec<(u64, u64)>,
     /// Page runs this landing mapped itself (`(ptr, len)`), unmapped by the drain
@@ -1464,26 +1467,22 @@ impl LandJob {
         then: Option<LandThen>,
     ) -> Self {
         use std::sync::{mpsc, Mutex, OnceLock};
-        type Job = (LandSpans, std::sync::Arc<LandDone>, Option<LandThen>);
+        type Job = (
+            LandSpans,
+            std::sync::Arc<LandDone>,
+            Option<LandThen>,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        );
         static TX: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
         let done = std::sync::Arc::new(LandDone::default());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tx = TX.get_or_init(|| {
             let (tx, rx) = mpsc::channel::<Job>();
             std::thread::Builder::new()
                 .name("reims-land".into())
                 .spawn(move || {
-                    while let Ok((spans, done, then)) = rx.recv() {
-                        for (dst, src, n) in spans {
-                            // SAFETY: see `LandSpans`; the ranges were bounds-checked
-                            // against the view and the answer buffer by the drain.
-                            unsafe {
-                                crate::runtime::mapper::write_guest_bytes_raw(
-                                    src as *const u8,
-                                    dst as *mut u8,
-                                    n,
-                                )
-                            };
-                        }
+                    while let Ok((spans, done, then, cancel)) = rx.recv() {
+                        land_copy(&spans, &cancel);
                         if let Some(then) = then {
                             then();
                         }
@@ -1498,19 +1497,36 @@ impl LandJob {
         let sent = tx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .send((spans, done.clone(), then));
-        if let Err(mpsc::SendError((spans, _, then))) = sent {
+            .send((spans, done.clone(), then, cancel.clone()));
+        if let Err(mpsc::SendError((spans, _, then, cancel))) = sent {
             // No landing thread: copy here, so the job is as done as it would be.
-            for (dst, src, n) in spans {
-                // SAFETY: as on the landing thread.
-                unsafe { crate::runtime::mapper::write_guest_bytes_raw(src as *const u8, dst as *mut u8, n) };
-            }
+            land_copy(&spans, &cancel);
             if let Some(then) = then {
                 then();
             }
             done.flag.store(true, std::sync::atomic::Ordering::Release);
         }
-        Self { done, runs, mapped, frame_len, pages, full }
+        Self { done, cancel, runs, mapped, frame_len, pages, full }
+    }
+}
+
+/// The landing copy, in chunks so a cancel (TEMP lab LAZY_SYNC) stops it within one.
+fn land_copy(spans: &LandSpans, cancel: &std::sync::atomic::AtomicBool) {
+    const CHUNK: usize = 1 << 20;
+    for &(dst, src, n) in spans {
+        let mut off = 0;
+        while off < n {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            let len = CHUNK.min(n - off);
+            // SAFETY: see `LandSpans`; the ranges were bounds-checked against the view and the answer buffer by the
+            // drain, and the chunk lies inside its span.
+            unsafe {
+                crate::runtime::mapper::write_guest_bytes_raw((src + off) as *const u8, (dst + off) as *mut u8, len)
+            };
+            off += len;
+        }
     }
 }
 
@@ -1617,6 +1633,21 @@ struct LazyStore {
 static LAZY: std::sync::Mutex<Vec<LazyStore>> = std::sync::Mutex::new(Vec::new());
 /// How many [`LAZY`] holds - the one atomic load every payment door pays when none is.
 pub(crate) static LAZY_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The mappings lazily landing frames are owed to (TEMP lab LAZY_SYNC: which an unmap or a delete must wait for).
+pub(crate) fn lazy_pending_mappings() -> Vec<u32> {
+    if LAZY_N.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    LAZY.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|l| l.mapping_id).collect()
+}
+
+/// Stop the lazy copies into `mapping_id`'s pages at their next chunk: the guest is releasing those pages.
+pub(crate) fn lazy_cancel(mapping_id: u32) {
+    for l in LAZY.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|l| l.mapping_id == mapping_id) {
+        l.job.cancel.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
 
 /// Whether a lazily landing frame is owed to `mapping_id`'s pages.
 pub(crate) fn lazy_pending(mapping_id: u32) -> bool {

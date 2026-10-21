@@ -7870,6 +7870,64 @@ fn deferred_landing_disjoint<H: HostMemory + HostOps>(
     !released.iter().any(|gpa| owed.contains(gpa))
 }
 
+/// TEMP (lab LAZY_SYNC): what a map-family command owes the lazy landings. Only an unmap and a backing delete give
+/// pages back (PAY_DEFER's rule); the others book the copies already in without waiting (b955a: all 645 lazy copies
+/// were waited for there). An unmap waits only for copies into the pages it releases (b958a: 696 waits at UnmapMemory
+/// / DeleteIOSurfaceBacking2 - ch2 unmaps run ~2 000 a second, nearly all elsewhere); a delete of a landing mapping's
+/// own backing stops that copy at its next chunk (the guest is releasing those pages - PAY_DEFER drops its landing
+/// there too) and waits only for that. Anything that cannot be decided waits.
+fn lazy_land_for_map_family<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    packet: &Packet,
+    family: MapFamily,
+) {
+    use crate::runtime::render_writeback as rw;
+    if !rw::vulkan_lazy_any() {
+        return;
+    }
+    if !matches!(family, MapFamily::UnmapMemory | MapFamily::DeleteIOSurfaceBacking2) {
+        rw::lazy_land(state, host, None, false);
+        return;
+    }
+    let mut own = None;
+    let released: Option<std::collections::HashSet<u64>> = match family {
+        MapFamily::UnmapMemory => crate::protocol::fifo::decode_map_memory(&packet.payload).ok().map(|cmd| {
+            crate::runtime::gva_mem::task_gva_page_gpa_set(
+                &*host,
+                &state.tasks,
+                cmd.task_id,
+                cmd.gva,
+                cmd.length,
+                state.page_shift,
+            )
+            .into_iter()
+            .collect()
+        }),
+        _ => crate::protocol::fifo::decode_delete_backing(&packet.payload).ok().and_then(|cmd| {
+            own = Some(cmd.object_id);
+            state.mapping_reach_pages(cmd.object_id).map(|pages| pages.into_iter().collect())
+        }),
+    };
+    for mapping_id in rw::lazy_pending_mappings() {
+        if own == Some(mapping_id) {
+            note_store_route("lab_lazy_sync_cancelled_on_delete");
+            rw::lazy_cancel(mapping_id);
+            rw::lazy_land(state, host, Some(mapping_id), true);
+            continue;
+        }
+        let apart = released.as_ref().is_some_and(|released| {
+            state
+                .mapping_reach_pages(mapping_id)
+                .is_some_and(|owed| !owed.iter().any(|gpa| released.contains(gpa)))
+        });
+        if !apart {
+            rw::lazy_land(state, host, Some(mapping_id), true);
+        }
+    }
+    rw::lazy_land(state, host, None, false);
+}
+
 /// TEMP (lab, T2T_PARK): the deferred T2T frames a map-family command lands -
 /// every unparked one, as before; a parked one only when the command deletes a
 /// backing (any: rare) or names resources (Invalidate/Synchronize: any - the
@@ -7973,15 +8031,8 @@ fn apply_map_family<H: HostMemory + HostOps>(
     // its pages (b298: landing every parked frame on every map-family command
     // landed all of them ~10 ms later, on the commands WindowServer waits for).
     lab_park_land_for_map_family(state, host, packet, family);
-    // TEMP (lab LAZY_SYNC): a lazily landing frame is in before any page moves (its copy writes them). Only an
-    // unmap and a backing delete give pages back (PAY_DEFER's rule); the others book the copies already in without
-    // waiting - b955a: every one of 645 lazy copies (~2.5 ms each on reims-land) was waited for on the drain.
-    crate::runtime::render_writeback::lazy_land(
-        state,
-        host,
-        None,
-        matches!(family, MapFamily::UnmapMemory | MapFamily::DeleteIOSurfaceBacking2),
-    );
+    // TEMP (lab LAZY_SYNC): a lazily landing frame is in before any of its pages moves (its copy writes them).
+    lazy_land_for_map_family(state, host, packet, family);
     // The delete of the payment's own backing drops it instead of landing it:
     // the guest has released those pages (see `drop_deferred_for`).
     let deleting_owed = family == MapFamily::DeleteIOSurfaceBacking2
