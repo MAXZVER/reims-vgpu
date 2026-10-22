@@ -470,6 +470,21 @@ pub(crate) fn lab_present_settle() -> Option<std::time::Duration> {
     .map(std::time::Duration::from_millis)
 }
 
+/// TEMP (lab, PRESENT_DLSSG): the steady present period while DLSS-G runs. DLSS-G paces the frames it generates
+/// from a steady stream of presents, as a game gives it; the window presents only when the guest drew - nothing on
+/// a still screen, bursts while scrolling - and Streamline lost its rhythm (Mish's work VM 10-22, 22k: 367 "Frame
+/// rate over 100ms, reseting frame timer" in 7 minutes, scrolling in visible jerks). With DLSS-G on the window
+/// re-presents the newest frame whenever none came for one period: `REIMS_VGPU_LAB_PRESENT_STEADY_HZ` (default
+/// 60, so DLSS-G makes 120 on the 120 Hz panel; 0 off). Off without DLSS-G (PRESENT_DLSSG=on, PRESENT_FG off).
+fn lab_steady_period() -> Option<std::time::Duration> {
+    static P: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        let dlssg = matches!(std::env::var("REIMS_VGPU_LAB_PRESENT_DLSSG").as_deref(), Ok("on" | "1")) && !lab_present_fg();
+        let hz = std::env::var("REIMS_VGPU_LAB_PRESENT_STEADY_HZ").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(60);
+        (dlssg && hz > 0).then(|| std::time::Duration::from_secs_f64(1.0 / f64::from(hz.min(240))))
+    })
+}
+
 /// TEMP (lab, PRESENT_VSR_SETTLE): set by the window for the one present that
 /// refines a settled frame; taken by the rail's scaled present.
 static LAB_REFINE_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1079,6 +1094,8 @@ struct App {
     lab_settle: LabSettle,
     /// TEMP (lab, PRESENT_FG).
     lab_fg: LabFg,
+    /// TEMP (lab, PRESENT_DLSSG): when the next steady re-present is due ([`lab_steady_period`]).
+    lab_steady_next: Option<std::time::Instant>,
     /// Frame seq the drawable currently holds, or `None` before the first
     /// present.
     last_presented_seq: Option<u64>,
@@ -1508,12 +1525,15 @@ impl ApplicationHandler<FramePublished> for App {
             // TEMP (lab, PRESENT_VSR_TILES): so is the next refine.
             let tiles_at = lab_tiles_due().filter(|_| !held);
             let tiles_now = tiles_at.is_some_and(|at| now >= at);
-            if redraw_due(pending || owed_due || tiles_now, now, self.next_backstop) {
+            // TEMP (lab, PRESENT_DLSSG): and the next steady re-present, once a frame was shown.
+            let steady_at = self.lab_steady_next.filter(|_| !held && lab_steady_period().is_some());
+            let steady_now = steady_at.is_some_and(|at| now >= at);
+            if redraw_due(pending || owed_due || tiles_now || steady_now, now, self.next_backstop) {
                 window.request_redraw();
                 self.loop_census.redraws_asked += 1;
                 self.next_backstop = now + WINDOW_REDRAW_BACKSTOP;
             }
-            let wake = [owed_at.filter(|_| !owed_due), tiles_at.filter(|_| !tiles_now)]
+            let wake = [owed_at.filter(|_| !owed_due), tiles_at.filter(|_| !tiles_now), steady_at.filter(|_| !steady_now)]
                 .into_iter()
                 .flatten()
                 .fold(self.next_backstop, std::cmp::Ord::min);
@@ -1647,6 +1667,7 @@ impl App {
             next_backstop: std::time::Instant::now(),
             lab_settle: LabSettle::default(),
             lab_fg: LabFg::default(),
+            lab_steady_next: None,
             last_presented_seq: None,
             last_presented_atomic: Arc::new(AtomicU64::new(0)),
             redraw_required: true,
@@ -2133,7 +2154,15 @@ impl App {
             self.loop_census.draws_stale += 1;
             return;
         }
-        if !refining && !fg_owed && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq) {
+        // TEMP (lab, PRESENT_DLSSG): no new frame for one steady period - the shown one again, for DLSS-G's pacing.
+        // Not a fresh frame: it neither restarts the settle clock nor counts as refined.
+        let steady = !refining
+            && !fg_owed
+            && incoming_seq.is_some()
+            && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq)
+            && lab_steady_period().is_some()
+            && self.lab_steady_next.is_some_and(|at| std::time::Instant::now() >= at);
+        if !refining && !fg_owed && !steady && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq) {
             self.loop_census.draws_stale += 1;
             return;
         }
@@ -2166,6 +2195,9 @@ impl App {
                 if tiles_due {
                     lab_note_tiles_due(Some(retry));
                 }
+                if self.lab_steady_next.is_some() {
+                    self.lab_steady_next = Some(retry);
+                }
             }
             Ok(WindowPresentOutcome::Presented {
                 direct,
@@ -2183,8 +2215,12 @@ impl App {
                 // after the third. See [`presenter_rebuild_budget`].
                 self.presenter_rebuilds = 0;
                 self.lab_fg.busy_streak = 0;
-                if !refining {
+                if !refining && !steady {
                     self.lab_settle.fresh_at = Some(std::time::Instant::now());
+                }
+                // TEMP (lab, PRESENT_DLSSG): every present (guest, refine or steady) restarts the steady period.
+                if let Some(period) = lab_steady_period() {
+                    self.lab_steady_next = Some(std::time::Instant::now() + period);
                 }
                 if let Some((seq, phase, _)) = fg_plan {
                     self.lab_fg_presented(seq, phase);
