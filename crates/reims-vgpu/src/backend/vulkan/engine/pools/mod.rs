@@ -226,6 +226,17 @@ pub(crate) struct ResourcePools {
     /// windows kept past their command buffer, by the buffer witness's key.
     /// See [`buf_resident`].
     buf_resident: buf_resident::BufResident,
+    /// TEMP (lab, Opus 10-23): emptied `staging_live` / `gather_live` lists
+    /// with their capacity, handed back at retire and taken at seal. Every seal
+    /// used to `mem::take` them, so each of the ~40k entries a second on 5K
+    /// Maps grew two lists from nothing and freed them at retire - b994R: half
+    /// of `acquire_staging` was that `Vec` growth, a third of it asleep on the
+    /// system heap's lock.
+    slot_vecs: Vec<Vec<BufferSlot>>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_CONTENT_RESIDENT=on`): immutable staging
+    /// copies of buffer windows kept by the digest of their bytes. See
+    /// [`content_resident`].
+    content_resident: content_resident::ContentResident,
     /// Size-bucketed free DEVICE_LOCAL buffers the draw-time guest gather
     /// assembles scattered windows into, and the in-use ones the ring returns
     /// after submit/wait.
@@ -580,6 +591,10 @@ pub(crate) struct EntryState {
     /// TEMP (lab, T2T_PARK): leases the command buffer now recording copies
     /// out of, held until the entry retires.
     keep: Vec<std::sync::Arc<crate::backend::vulkan::engine::LeaseHold>>,
+    /// TEMP (lab, Opus 10-23 LANE_BYTES): byte contents the recording lane
+    /// still copies into this entry's staging (`write_staging_bytes_lane`),
+    /// held until the entry retires.
+    keep_bytes: Vec<std::sync::Arc<Vec<u8>>>,
     gather_live: Vec<BufferSlot>,
     /// Buffer binds the command buffer now recording has already staged or
     /// gathered, keyed by the content that produced them.
@@ -1539,6 +1554,8 @@ pub(crate) struct PendingGpuCleanup {
     staged: Vec<StagedRead>,
     /// TEMP (lab, T2T_PARK): readback leases this submission copies out of.
     keep: Vec<std::sync::Arc<crate::backend::vulkan::engine::LeaseHold>>,
+    /// TEMP (lab, LANE_BYTES): see [`EntryState::keep_bytes`].
+    keep_bytes: Vec<std::sync::Arc<Vec<u8>>>,
     /// This submission's number and the recorder jobs finished at its seal,
     /// published when it retires (`crate::runtime::inflight_reads`).
     read_seal: u64,
@@ -3917,6 +3934,11 @@ impl Drop for SlowStagingWrite {
 
 pub mod buffer_gather_working_set;
 pub(crate) mod buf_resident;
+pub(crate) mod content_resident;
+
+/// TEMP (lab): how many emptied slot lists `slot_vecs` keeps (two per entry in
+/// flight is plenty).
+const SLOT_VECS_KEEP: usize = 64;
 mod images_and_registry;
 pub(crate) mod par_stage;
 /// What the resident registry says about an identity's content, readable

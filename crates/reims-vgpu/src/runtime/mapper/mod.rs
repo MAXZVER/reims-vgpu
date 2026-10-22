@@ -1611,6 +1611,28 @@ pub fn drain_deferred_unmaps<H: HostOps>(host: &mut H) -> usize {
 /// alone. Both do bump the generation exactly when the list changes, so
 /// checking it here makes a carried-over token unusable by construction instead
 /// of depending on every future writer remembering a second thing to retire.
+/// TEMP (lab, GW_TOKEN_YOUNG_MS): see [`ensure_guest_write_token`]. Below this
+/// the host hashes the set anyway (DIRTY_HASH sets), and the token is cheap.
+const YOUNG_TOKEN_MIN_PAGES: usize = 4096;
+
+/// TEMP (lab): live `GW_TOKEN_YOUNG_MS`, else `REIMS_VGPU_LAB_GW_TOKEN_YOUNG_MS`.
+fn young_token_ms() -> u64 {
+    // Unit tests build surfaces and ask for their token at once.
+    if cfg!(test) {
+        return 0;
+    }
+    if let Some(v) = crate::runtime::lab_live::value("GW_TOKEN_YOUNG_MS").and_then(|v| v.parse().ok()) {
+        return v;
+    }
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_GW_TOKEN_YOUNG_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(40)
+    })
+}
+
 pub fn ensure_guest_write_token<H: HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -1645,6 +1667,24 @@ pub fn ensure_guest_write_token<H: HostOps>(
     let m = state.mappings.get(&mapping_id)?;
     if !m.mapped || m.page_entries.is_empty() {
         return None;
+    }
+    // TEMP (lab, `REIMS_VGPU_LAB_GW_TOKEN_YOUNG_MS=<ms>`, default 40 since
+    // chain995 - webgl 48.6/47.9 -> 52.2/57.6 fps; 0 turns it off): a
+    // large incarnation younger than this gets no token yet. Heavy WebGL hands
+    // its 5K drawing surface back on fresh pages every frame (b852, b994): each
+    // incarnation built a token (sort, DIRTY_VERIFY baseline hash of all ~10k
+    // pages, its first evaluation) and died before one harvest armed it, so no
+    // observation ever read anything but "cannot tell" from it - ~19 % of the
+    // drain in b994's webgl. Without a token the answer is that same "cannot
+    // tell"; a surface that lives past the window gets its token then.
+    if m.page_entries.len() >= YOUNG_TOKEN_MIN_PAGES {
+        let young_ms = young_token_ms();
+        if young_ms > 0
+            && crate::observe::elapsed_us().saturating_sub(m.lab_bump_us) < young_ms * 1000
+        {
+            crate::runtime::drain::note_store_route("gw_token_young");
+            return None;
+        }
     }
     let gpas: Vec<u64> = m
         .page_entries

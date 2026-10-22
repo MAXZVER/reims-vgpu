@@ -823,7 +823,10 @@ pub fn task_gva_page_gpa_set<M: HostMemory>(
     span: u64,
     page_shift: u32,
 ) -> std::collections::HashSet<u64> {
-    let mut out = std::collections::HashSet::new();
+    // Sized for the walk up front: a 5K WebGL surface is ~10k pages a frame,
+    // and growing to it rehashed the set a dozen times (b994 webgl).
+    let pages = reims_vgpu_paging::span::pages_spanned(gva, span, 1u64 << page_shift) as usize;
+    let mut out = std::collections::HashSet::with_capacity(pages.min(1 << 20));
     visit_task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift, &mut |gpa| {
         out.insert(gpa);
         true

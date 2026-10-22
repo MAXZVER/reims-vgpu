@@ -270,6 +270,8 @@ impl ResourcePools {
             entry: super::EntryState::default(),
             staging_free: HashMap::new(),
             buf_resident: Default::default(),
+            slot_vecs: Vec::new(),
+            content_resident: Default::default(),
             gather_free: HashMap::new(),
             staging_hits: 0,
             staging_misses: 0,
@@ -1723,8 +1725,10 @@ impl ResourcePools {
                 lab_verify: std::mem::take(&mut self.entry.lab_verify),
                 dsets,
                 scatter_dsets: std::mem::take(&mut self.entry.scatter_dsets),
-                staging: std::mem::take(&mut self.entry.staging_live),
-                gather: std::mem::take(&mut self.entry.gather_live),
+                // TEMP (lab, Opus 10-23): the lists go with a recycled
+                // allocation in their place - see `slot_vecs`.
+                staging: std::mem::replace(&mut self.entry.staging_live, self.slot_vecs.pop().unwrap_or_default()),
+                gather: std::mem::replace(&mut self.entry.gather_live, self.slot_vecs.pop().unwrap_or_default()),
                 readback,
                 sampled,
                 attachment_snapshots: std::mem::take(&mut self.entry.attachment_snapshot_live),
@@ -1733,6 +1737,7 @@ impl ResourcePools {
                 unpin_compute_residents: std::mem::take(&mut self.entry.compute_write_pins_live),
                 staged: std::mem::take(&mut self.entry.staged_reads),
                 keep: std::mem::take(&mut self.entry.keep),
+                keep_bytes: std::mem::take(&mut self.entry.keep_bytes),
                 read_seal: 0,
                 read_jobs: 0,
             },
@@ -3406,6 +3411,16 @@ impl ResourcePools {
         }
         // TEMP (lab, T2T_PARK): the copies out of these slots have run.
         pending.keep.clear();
+        // TEMP (lab, LANE_BYTES): and the lane's copies out of these bytes.
+        pending.keep_bytes.clear();
+        // TEMP (lab, Opus 10-23): the drained lists keep their capacity for the
+        // next seal (`slot_vecs`).
+        for v in [std::mem::take(&mut pending.staging), std::mem::take(&mut pending.gather)] {
+            if v.capacity() != 0 && self.slot_vecs.len() < SLOT_VECS_KEEP {
+                debug_assert!(v.is_empty());
+                self.slot_vecs.push(v);
+            }
+        }
     }
 
     fn bucket(size: u64) -> u64 {
@@ -3695,6 +3710,42 @@ impl ResourcePools {
         Ok(())
     }
 
+    /// TEMP (lab, Opus 10-23 LANE_BYTES, `REIMS_VGPU_LAB_LANE_BYTES=off` / live
+    /// `LANE_BYTES=off` to copy here): [`Self::write_staging`] for an `Arc`'d
+    /// byte content, made by the recording lane like a guest-runs copy. b994R
+    /// (5K Maps): the merged sub-draws' stage-in bytes were copied here, on the
+    /// recorder, at 36 % of its draw time - the queue the Maps drain waits on.
+    /// The `Arc` rides with the entry to its retire, so the bytes outlive the
+    /// lane's copy whatever the request does after this returns.
+    pub(crate) unsafe fn write_staging_bytes_lane(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: &BufferSlot,
+        bytes: &std::sync::Arc<Vec<u8>>,
+    ) -> Result<(), DrawError> {
+        if bytes.is_empty()
+            || !lane_bytes_on()
+            || !crate::backend::vulkan::engine::cmd_sink::defer_host_copies()
+        {
+            return unsafe { self.write_staging(ctx, slot, bytes) };
+        }
+        let ptr = staging_write_ptr(ctx, slot, bytes.len() as u64)?;
+        self.entry.keep_bytes.push(std::sync::Arc::clone(bytes));
+        // SAFETY: the bytes are held by this entry until it retires; the slot
+        // is this command buffer's until it completes, and every reuse of it
+        // syncs with the lane first (as for `write_staging_from_runs`).
+        unsafe {
+            crate::backend::vulkan::engine::cmd_sink::host_copy(
+                crate::backend::vulkan::engine::cmd_sink::HostSeg {
+                    src: bytes.as_ptr(),
+                    dst: ptr,
+                    n: bytes.len(),
+                },
+            )
+        };
+        Ok(())
+    }
+
     /// Copy into a mapped staging slot with R and B exchanged.
     ///
     /// The exchange is an involution, so this serves both directions: a
@@ -3874,6 +3925,8 @@ impl ResourcePools {
         // TEMP (lab, REC_LANE_COPY): the lane may still owe copies into these
         // slots.
         crate::backend::vulkan::engine::cmd_sink::sync();
+        // TEMP (lab, LANE_BYTES): and out of these bytes - none after the sync.
+        self.entry.keep_bytes.clear();
         self.forget_cb_bound_buffers("bindmap_clear_recycle", "bindmap_clear_recycle_entries");
         // TEMP (lab, PASS_STAGE): a recycled entry (device loss, a draw that
         // never sealed) releases its arena windows here rather than at a
@@ -6752,6 +6805,7 @@ mod recycle_tests {
                 staging: Vec::new(),
                 staged: Vec::new(),
                 keep: Vec::new(),
+                keep_bytes: Vec::new(),
                 read_seal: 0,
                 read_jobs: 0,
                 gather: Vec::new(),
@@ -7827,3 +7881,13 @@ fn lab_sampled_storage() -> bool {
         !matches!(std::env::var("REIMS_VGPU_LAB_SAMPLED_STORAGE").as_deref(), Ok("off" | "0"))
     })
 }
+
+/// TEMP (lab, LANE_BYTES): see [`ResourcePools::write_staging_bytes_lane`].
+fn lane_bytes_on() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("LANE_BYTES") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_LANE_BYTES").as_deref() != Ok("off"))
+}
+

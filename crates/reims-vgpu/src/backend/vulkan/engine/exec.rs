@@ -700,7 +700,8 @@ unsafe fn stage_buffer_content(
                 pools.acquire_staging(ctx, b.len() as u64, counters)?
             };
             let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, b.len() as u64);
-            pools.write_staging(ctx, &slot, b)?;
+            // TEMP (lab, LANE_BYTES): the lane makes the copy.
+            pools.write_staging_bytes_lane(ctx, &slot, b)?;
             drop(_s);
             if super::pools::lab_verify_on() && slot.mapped != 0 && !b.is_empty() {
                 pools.lab_verify_note(super::pools::LabVerify::Staging {
@@ -759,6 +760,34 @@ unsafe fn stage_buffer_content(
             let snapshot_only = *SNAP.get_or_init(|| {
                 std::env::var("REIMS_VGPU_LAB_SNAPSHOT_GUEST_BUFFERS").as_deref() == Ok("1")
             });
+            // TEMP (lab, CONTENT_RESIDENT): only on the CPU-copy rail (no
+            // host-pointer import) and only for storage-free binds - a storage
+            // bind may be written by the shader, and a kept slot never is.
+            let content_key = if super::pools::content_resident::on()
+                && !ctx.caps.host_pointer.is_available()
+                && super::pools::content_resident::window_fits(src.total_len)
+            {
+                if gather_role.includes_storage() {
+                    crate::runtime::drain::note_store_route_n("crs_storage_kb", src.total_len / 1024);
+                    None
+                } else {
+                    let _d = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
+                    let started = std::time::Instant::now();
+                    let k = super::pools::content_resident::digest_runs(
+                        &src.runs,
+                        src.source_offset,
+                        src.total_len,
+                    );
+                    crate::runtime::drain::note_store_route_n(
+                        "crs_digest_ns",
+                        started.elapsed().as_nanos() as u64,
+                    );
+                    crate::runtime::drain::note_store_route_n("crs_digest_kb", src.total_len / 1024);
+                    k
+                }
+            } else {
+                None
+            };
             if let Some(bound) = if snapshot_only {
                 None
             } else {
@@ -792,6 +821,10 @@ unsafe fn stage_buffer_content(
                 // this is what says so.
                 gather_owed = true;
                 bound
+            } else if let Some(slot) = content_key.and_then(|k| pools.content_resident_hit(k)) {
+                // TEMP (lab, CONTENT_RESIDENT): a kept slot whose bytes have
+                // this window's digest - the copy, made earlier.
+                BoundBuffer::from(slot)
             } else if let Some(slot) = src
                 .resident
                 .and_then(|id| pools.buf_resident_hit(id, src.total_len))
@@ -809,13 +842,27 @@ unsafe fn stage_buffer_content(
                     pools.acquire_staging(ctx, src.total_len, counters)?
                 };
                 let _s = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
-                pools.write_staging_from_runs(
-                    ctx,
-                    &slot,
-                    &src.runs,
-                    src.source_offset,
-                    src.total_len,
-                )?;
+                if content_key.is_some_and(|k| pools.content_resident_second_sight(k)) {
+                    // TEMP (lab, CONTENT_RESIDENT): copy and digest in one pass,
+                    // and keep the slot under what was actually copied.
+                    if let Some(k) = pools.content_resident_fill(
+                        ctx,
+                        &slot,
+                        &src.runs,
+                        src.source_offset,
+                        src.total_len,
+                    )? {
+                        pools.content_resident_adopt(k, slot);
+                    }
+                } else {
+                    pools.write_staging_from_runs(
+                        ctx,
+                        &slot,
+                        &src.runs,
+                        src.source_offset,
+                        src.total_len,
+                    )?;
+                }
                 drop(_s);
                 if snapshot_volatile {
                     counters
@@ -7599,6 +7646,47 @@ fn fill_descriptor_bindings(
 ///
 /// `dst_set` is ignored by `vkCmdPushDescriptorSetKHR`, which is why the push
 /// rail passes a null handle rather than inventing one.
+/// TEMP (lab, CONTENT_RESIDENT): a vertex-only guest-runs window on the CPU-copy rail, bound from the content cache -
+/// the kept slot whose bytes have this window's digest, or a fresh slot filled and digested in one pass and kept.
+/// `None` when the cache is off or the window is outside its sizes; the caller copies as before.
+///
+/// # Safety
+///
+/// `ctx` must own the device `pools` belongs to.
+unsafe fn content_resident_bind(
+    ctx: &crate::backend::vulkan::engine::context::DeviceContext,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    src: &super::types::GuestRunSource,
+) -> Result<Option<BoundBuffer>, DrawError> {
+    use super::pools::content_resident;
+    if !content_resident::on()
+        || ctx.caps.host_pointer.is_available()
+        || !content_resident::window_fits(src.total_len)
+    {
+        return Ok(None);
+    }
+    let started = std::time::Instant::now();
+    let key = content_resident::digest_runs(&src.runs, src.source_offset, src.total_len);
+    crate::runtime::drain::note_store_route_n("crs_digest_ns", started.elapsed().as_nanos() as u64);
+    crate::runtime::drain::note_store_route_n("crs_digest_kb", src.total_len / 1024);
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    if let Some(slot) = pools.content_resident_hit(key) {
+        return Ok(Some(BoundBuffer::from(slot)));
+    }
+    if !pools.content_resident_second_sight(key) {
+        // First sight: the plain copy (the caller's), which the lane may make.
+        return Ok(None);
+    }
+    let slot = unsafe { pools.acquire_staging(ctx, src.total_len, counters)? };
+    if let Some(k) = unsafe { pools.content_resident_fill(ctx, &slot, &src.runs, src.source_offset, src.total_len)? } {
+        pools.content_resident_adopt(k, slot);
+    }
+    Ok(Some(BoundBuffer::from(slot)))
+}
+
 /// TEMP (lab, MERGE_DRAWS): before sub-draw `i` of a merged record, bind the stage-in bytes it has instead of the
 /// record's (each staged into its own slot), or the record's own again for bindings a previous sub-draw moved.
 fn lab_sub_vstage(
@@ -7646,6 +7734,8 @@ fn lab_sub_vstage(
                     pools.note_guest_read_recorded();
                     counters.note_buffer_guest_import(src.total_len, role);
                     bound
+                } else if let Some(bound) = unsafe { content_resident_bind(ctx, pools, counters, src)? } {
+                    bound
                 } else {
                     let slot = unsafe { pools.acquire_staging(ctx, src.total_len, counters)? };
                     unsafe { pools.write_staging_from_runs(ctx, &slot, &src.runs, src.source_offset, src.total_len)? };
@@ -7654,7 +7744,8 @@ fn lab_sub_vstage(
             }
             BufferContent::Bytes(bytes) => {
                 let slot = unsafe { pools.acquire_staging(ctx, bytes.len() as u64, counters)? };
-                unsafe { pools.write_staging(ctx, &slot, &bytes)? };
+                // TEMP (lab, LANE_BYTES): the lane makes the copy.
+                unsafe { pools.write_staging_bytes_lane(ctx, &slot, bytes)? };
                 BoundBuffer::from(slot)
             }
         };
@@ -7716,7 +7807,8 @@ fn lab_sub_storage_push(
                 continue;
             }
             let slot = unsafe { pools.acquire_staging(ctx, bytes.len() as u64, counters)? };
-            unsafe { pools.write_staging(ctx, &slot, bytes)? };
+            // TEMP (lab, LANE_BYTES): the lane makes the copy.
+            unsafe { pools.write_staging_bytes_lane(ctx, &slot, bytes)? };
             for e in binds.iter_mut() {
                 if let super::pools::PushDescriptorBinding::Buffer {
                     binding: ref b,

@@ -75,6 +75,9 @@ impl ResourcePools {
         for s in self.buf_resident_take_all() {
             release_buffer_slot(device, &mut self.slabs, s);
         }
+        for s in self.content_resident_take_all() {
+            release_buffer_slot(device, &mut self.slabs, s);
+        }
         for list in self.staging_free.values_mut() {
             for s in list.drain(..) {
                 release_buffer_slot(device, &mut self.slabs, s);
