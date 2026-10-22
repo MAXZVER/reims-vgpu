@@ -208,7 +208,11 @@ pub(crate) fn init(
             )
         };
         crate::observe::off(format!("present_vsr init ngx={r:#x} available={available} quality={:?}", quality()));
-        r == 0 && available == 1
+        // TEMP (lab, 10-22): with Streamline in the process NGX was initialized by it first, for its own features,
+        // and the capability set this init gets back has no VSR (b979, DLSS-G on: available=0; b922a without it: 1).
+        // The feature itself may still create: try it, and let the creation's own result decide.
+        let streamline = super::present_dlssg::active() || super::present_dlssg::dlss_sr_active();
+        r == 0 && (available == 1 || streamline)
     })
 }
 
