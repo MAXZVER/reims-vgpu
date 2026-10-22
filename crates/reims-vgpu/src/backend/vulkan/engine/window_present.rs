@@ -1476,10 +1476,11 @@ impl WindowPresenter {
                 // TEMP (lab, PRESENT_SHARP): a scaled resident frame is drawn
                 // through the Catmull-Rom pass, which clears its own slate.
                 let sharp_view = match &blit {
+                    // TEMP (lab, PRESENT_FG): at 1:1 too, so its midpoints reach the screen (an exact copy there).
                     BlitSource::Resident { view, .. }
                         if super::present_sharp::on()
                             && *view != vk::ImageView::null()
-                            && (vp.width, vp.height) != (base_width, base_height) =>
+                            && ((vp.width, vp.height) != (base_width, base_height) || super::present_fg::on()) =>
                     {
                         // TEMP (lab, PRESENT_VSR): NGX bound to this device once, before the
                         // filter that records it is built.

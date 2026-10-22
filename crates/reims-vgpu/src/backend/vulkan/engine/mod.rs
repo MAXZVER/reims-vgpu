@@ -56,6 +56,8 @@ mod present_nis_coef;
 #[cfg(feature = "host-window")]
 mod present_vsr;
 #[cfg(feature = "host-window")]
+mod present_ravu;
+#[cfg(feature = "host-window")]
 mod present_fg;
 #[cfg(feature = "host-window")]
 mod present_refine;

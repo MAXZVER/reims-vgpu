@@ -307,6 +307,13 @@ pub(crate) struct PresentSharp {
     refine: Option<super::present_refine::TileRefine>,
     refine_failed: bool,
     refine_active: bool,
+    /// TEMP (lab, PRESENT_RAVU): RAVU-Zoom-AR into `mid` in EASU's place (not with NIS or VSR, which replace
+    /// EASU themselves), its compute pass, its weight tables (both made on the first present), and a refused
+    /// load (EASU from then on).
+    ravu: bool,
+    ravu_pass: Option<super::present_ravu::RavuPass>,
+    ravu_lut: Option<super::present_ravu::RavuLut>,
+    ravu_failed: bool,
 }
 
 /// The guest frame one scaled present reads.
@@ -454,7 +461,11 @@ impl PresentSharp {
             transient: vec![None; frames],
             // With NIS the window pass is RCAS too: an exact copy unless
             // REIMS_VGPU_LAB_PRESENT_RCAS also asks for its sharpening.
-            rcas: if nis_sharp().is_some() || super::present_vsr::quality().is_some() || Self::ss_wanted().is_some() {
+            rcas: if nis_sharp().is_some()
+                || super::present_vsr::quality().is_some()
+                || Self::ss_wanted().is_some()
+                || Self::ravu_wanted()
+            {
                 Some(rcas_sharp().unwrap_or(0.0))
             } else {
                 rcas_sharp()
@@ -491,6 +502,10 @@ impl PresentSharp {
             refine: None,
             refine_failed: false,
             refine_active: false,
+            ravu: Self::ravu_wanted(),
+            ravu_pass: None,
+            ravu_lut: None,
+            ravu_failed: false,
         };
         if let Err(e) = made.build(device, format, frames) {
             made.destroy(device);
@@ -504,7 +519,26 @@ impl PresentSharp {
         if let Some(k) = made.ss {
             crate::observe::off(format!("present_sharp ss k={k:.3}"));
         }
+        if made.ravu {
+            crate::observe::off(format!("present_sharp ravu hook={:?}", super::present_ravu::hook_path()));
+        }
         Ok(made)
+    }
+
+    /// Whether the RCAS window pass (and `mid`'s pass, its sets) is built: for RCAS itself, or - TEMP (lab,
+    /// PRESENT_FG) - as the exact copy (strength 0) that shows a frame the window's size, so frame generation's
+    /// midpoints reach the screen at 1:1 too (a native 5120x2160 guest; before, only a scaled present drew them).
+    fn window_pass_built(&self) -> bool {
+        self.rcas.is_some() || super::present_fg::on()
+    }
+
+    /// PRESENT_RAVU where it applies: not with NIS or VSR (each replaces EASU itself), nor with PRESENT_SS (RAVU
+    /// writes the visible part's size).
+    fn ravu_wanted() -> bool {
+        super::present_ravu::hook_path().is_some()
+            && nis_sharp().is_none()
+            && super::present_vsr::quality().is_none()
+            && ss_factor().is_none()
     }
 
     /// PRESENT_SS where it applies: not with NIS (its constants are for the visible part's size) nor with the VSR
@@ -575,7 +609,7 @@ impl PresentSharp {
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(if self.rcas.is_some() { 20 } else { 8 })];
+            .size(if self.window_pass_built() { 20 } else { 8 })];
         let set_layouts = [self.set_layout];
         self.layout = device.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()
@@ -599,7 +633,7 @@ impl PresentSharp {
         // the same single attachment format and sample count, so it is
         // render-pass compatible with it and EASU runs in either.
         self.pipeline = self.make_pipeline(device, &PRESENT_SHARP_FRAG_SPIRV)?;
-        let per_frame = if self.rcas.is_some() { 2 } else { 1 };
+        let per_frame = if self.window_pass_built() { 2 } else { 1 };
         let sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count((frames * per_frame) as u32)];
@@ -615,7 +649,7 @@ impl PresentSharp {
                 .descriptor_pool(self.pool)
                 .set_layouts(&layouts),
         )?;
-        if self.rcas.is_some() {
+        if self.window_pass_built() {
             self.rcas_pipeline = self.make_pipeline(device, &PRESENT_RCAS_FRAG_SPIRV)?;
             if self.ss.is_some() {
                 self.down_pipeline = self.make_pipeline(device, &PRESENT_DOWN_FRAG_SPIRV)?;
@@ -664,6 +698,9 @@ impl PresentSharp {
         }
         if self.nis.is_some() {
             self.build_nis(device, frames)?;
+        }
+        if self.ravu {
+            self.ravu_pass = Some(super::present_ravu::RavuPass::create(device, frames)?);
         }
         Ok(())
     }
@@ -988,6 +1025,9 @@ impl PresentSharp {
 
     /// Free entry `ix`'s view and framebuffer. Only once its fence retired.
     pub(crate) unsafe fn release(&mut self, device: &ash::Device, ix: usize) {
+        if let Some(lut) = self.ravu_lut.as_mut() {
+            lut.confirm(ix);
+        }
         if let Some((view, fb)) = self.transient.get_mut(ix).and_then(Option::take) {
             device.destroy_framebuffer(fb, None);
             device.destroy_image_view(view, None);
@@ -997,6 +1037,10 @@ impl PresentSharp {
     /// Free every entry's view and framebuffer, and every retired EASU image —
     /// the queue is idle.
     pub(crate) unsafe fn release_all(&mut self, device: &ash::Device) {
+        // Before the entries below: an idle queue says nothing about whether the upload was ever submitted.
+        if let Some(lut) = self.ravu_lut.as_mut() {
+            lut.unconfirm();
+        }
         for ix in 0..self.transient.len() {
             self.release(device, ix);
         }
@@ -1022,9 +1066,9 @@ impl PresentSharp {
         if let Some(old) = self.mid.take() {
             self.retired.push((old, self.records));
         }
-        // NVScaler writes `mid` as an rgba8 storage image; EASU renders it in
-        // the window's format.
-        let storage = self.nis.is_some() || self.vsr.is_some();
+        // NVScaler (and VSR, RAVU) write `mid` as an rgba8 storage image; EASU
+        // renders it in the window's format.
+        let storage = self.nis.is_some() || self.vsr.is_some() || self.ravu;
         self.mid = Some(self.make_mid(device, format, width, height, storage, memory_type)?);
         Ok(())
     }
@@ -1500,6 +1544,39 @@ impl PresentSharp {
         );
     }
 
+    /// TEMP (lab, PRESENT_RAVU): whether this present can run RAVU - its tables made (once; a refusal is
+    /// reported and leaves EASU) and their upload recorded into `cmd` until one ran.
+    unsafe fn ravu_tables(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        ix: usize,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> bool {
+        if !self.ravu || self.ravu_failed || self.ravu_pass.is_none() {
+            return false;
+        }
+        if self.ravu_lut.is_none() {
+            let path = super::present_ravu::hook_path().unwrap_or_default();
+            match super::present_ravu::RavuLut::create(device, path, memory_type) {
+                Ok(lut) => {
+                    crate::observe::off("present_ravu tables loaded".to_string());
+                    self.ravu_lut = Some(lut);
+                }
+                Err(e) => {
+                    self.ravu_failed = true;
+                    crate::observe::fail(format!("present_ravu_refused tables={e}"));
+                    return false;
+                }
+            }
+        }
+        let Some(lut) = self.ravu_lut.as_mut() else {
+            return false;
+        };
+        lut.record_upload(device, cmd, ix);
+        true
+    }
+
     unsafe fn set_rect(device: &ash::Device, cmd: vk::CommandBuffer, x: u32, y: u32, w: u32, h: u32) {
         device.cmd_set_viewport(
             cmd,
@@ -1644,6 +1721,12 @@ impl PresentSharp {
         self.transient[ix] = Some((view, fb));
         let set = self.sets[ix];
         self.write_set(device, set, src.view);
+        // TEMP (lab, PRESENT_RAVU): this present's RAVU into `mid` - an upscale, its tables loaded (their upload
+        // recorded until one ran) and `mid` there; otherwise EASU as without it.
+        let ravu_this = rcas.is_some()
+            && super::present_ravu::RavuPass::takes((src.width, src.height), (mid_w, mid_h))
+            && self.mid.as_ref().is_some_and(|m| (m.width, m.height) == (mid_w, mid_h))
+            && self.ravu_tables(device, cmd, ix, memory_type);
         // REIMS_VGPU_LAB_PRESENT_DUMP: the source as this present reads it.
         // With PRESENT_VSR_TILES the "out" half is the refined-cell cache.
         let dumping = (rcas.is_some() || easu_frame || super::present_refine::on())
@@ -1653,7 +1736,7 @@ impl PresentSharp {
                 (src.width, src.height),
                 (mid_w, mid_h),
                 // `mid` is rgba8 under NVScaler and VSR alike, and so is the cache; `ss_easu` is the window's.
-                ((self.nis.is_some() && nis_cfg.is_some()) || self.vsr.is_some()) && !easu_frame,
+                ((self.nis.is_some() && nis_cfg.is_some()) || self.vsr.is_some() || ravu_this) && !easu_frame,
                 memory_type,
             );
         if let (true, Some(d)) = (dumping, self.dump.as_mut()) {
@@ -1856,7 +1939,7 @@ impl PresentSharp {
                 return Ok(());
             }
         }
-        let reader = if nis_cfg.is_some() {
+        let reader = if nis_cfg.is_some() || ravu_this {
             vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER
         } else {
             vk::PipelineStageFlags::FRAGMENT_SHADER
@@ -1874,7 +1957,93 @@ impl PresentSharp {
         let mut easu_push = [0u8; 8];
         easu_push[..4].copy_from_slice(&size[0].to_le_bytes());
         easu_push[4..].copy_from_slice(&size[1].to_le_bytes());
-        if let (Some(cfg), Some(mid)) = (nis_cfg, self.mid.as_ref()) {
+        // TEMP (lab, PRESENT_FG at 1:1): a frame the visible part's size (a generated midpoint of a native guest)
+        // through the window pass at strength 0 - an exact copy.
+        let copy_1to1 = (src.width, src.height) == (vp.2, vp.3) && self.rcas_pipeline != vk::Pipeline::null();
+        let ravu_run = match (ravu_this && !copy_1to1, self.mid.as_ref(), self.ravu_pass.as_ref(), self.ravu_lut.as_ref()) {
+            (true, Some(mid), Some(pass), Some(lut)) => Some((mid.image, mid.view, mid.width, mid.height, pass, lut.views())),
+            _ => None,
+        };
+        if copy_1to1 {
+            let rcas_set = self.rcas_sets[ix];
+            self.write_set(device, rcas_set, src.view);
+            let mut push = [0u8; 20];
+            for (i, v) in [vp.0, vp.1, vp.2, vp.3].iter().enumerate() {
+                push[i * 4..i * 4 + 4].copy_from_slice(&(*v as i32).to_le_bytes());
+            }
+            push[16..].copy_from_slice(&0.0f32.to_le_bytes());
+            self.begin_window_pass(device, cmd, fb, extent, clear);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rcas_pipeline);
+            Self::set_rect(device, cmd, vp.0, vp.1, vp.2, vp.3);
+            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
+            device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
+            device.cmd_draw(cmd, 3, 1, 0, 0);
+            self.end_window_pass(device, cmd, vp);
+        } else if let Some((mid_image, mid_view, mid_w, mid_h, pass, tables)) = ravu_run {
+            // TEMP (lab, PRESENT_RAVU): RAVU into `mid`, then the window pass (RCAS) from it. In: the previous
+            // present's window-pass read of `mid` (any earlier submission) before RAVU overwrites it.
+            let to_general = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(mid_image)
+                .subresource_range(super::color_subresource_range())];
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_general,
+            );
+            pass.record(
+                device,
+                cmd,
+                ix,
+                self.sampler,
+                src.view,
+                (src.width, src.height),
+                tables,
+                mid_view,
+                (mid_w, mid_h),
+            );
+            let mid_read = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(mid_image)
+                .subresource_range(super::color_subresource_range())];
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &mid_read,
+            );
+            let rcas_set = self.rcas_sets[ix];
+            self.write_set(device, rcas_set, mid_view);
+            let mut push = [0u8; 20];
+            for (i, v) in [vp.0, vp.1, vp.2, vp.3].iter().enumerate() {
+                push[i * 4..i * 4 + 4].copy_from_slice(&(*v as i32).to_le_bytes());
+            }
+            push[16..].copy_from_slice(&rcas.unwrap_or(0.0).to_le_bytes());
+            self.begin_window_pass(device, cmd, fb, extent, clear);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rcas_pipeline);
+            Self::set_rect(device, cmd, vp.0, vp.1, vp.2, vp.3);
+            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
+            device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
+            device.cmd_draw(cmd, 3, 1, 0, 0);
+            self.end_window_pass(device, cmd, vp);
+        } else if let (Some(cfg), Some(mid)) = (nis_cfg, self.mid.as_ref()) {
             // NVScaler into `mid`, then an exact copy into the window (the
             // RCAS pass at strength 0).
             let (mid_image, mid_view, mid_w, mid_h) = (mid.image, mid.view, mid.width, mid.height);
@@ -2371,6 +2540,12 @@ impl PresentSharp {
         }
         if self.rcas_pipeline != vk::Pipeline::null() {
             device.destroy_pipeline(self.rcas_pipeline, None);
+        }
+        if let Some(mut pass) = self.ravu_pass.take() {
+            pass.destroy(device);
+        }
+        if let Some(mut lut) = self.ravu_lut.take() {
+            lut.destroy(device);
         }
         if self.down_pipeline != vk::Pipeline::null() {
             device.destroy_pipeline(self.down_pipeline, None);
