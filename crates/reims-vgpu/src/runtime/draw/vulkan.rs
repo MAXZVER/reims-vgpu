@@ -8012,6 +8012,15 @@ fn load_buffer_content_resolved<M: HostMemory + HostOps>(
 
 // Same shape as `load_buffer_content_resolved`, which this forwards to.
 #[allow(clippy::too_many_arguments)]
+/// TEMP (lab, SUB_VMAX_SHARED): see its one use in the merged sub-draw bounds.
+fn sub_vmax_shared_on() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("SUB_VMAX_SHARED") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SUB_VMAX_SHARED").as_deref() != Ok("off"))
+}
+
 /// TEMP (lab, SUB_VSTAGE_ZC): see its one use in the merged sub-draw stage-in.
 fn sub_vstage_zc_on() -> bool {
     if let Some(on) = crate::runtime::lab_live::on("SUB_VSTAGE_ZC") {
@@ -12685,6 +12694,43 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 }
             }
         }
+        // TEMP (lab, Opus 10-23 SUB_VMAX_SHARED, `REIMS_VGPU_LAB_SUB_VMAX_SHARED=off` / live
+        // `SUB_VMAX_SHARED=off`): the vertex reach of each sub-draw of an indexed record that reads the record's
+        // index buffer - its own index range's largest index, plus the record's baseVertex and its vertex_delta (the
+        // term `merge::vertex_max` folds) - so a sub-draw's own stage-in buffers are read to its reach and not to
+        // the whole record's. b997/b998: the lane copied 5.2-5.8 GB/s on 5K Maps once these windows moved there.
+        let mut lab_sub_vmax_shared: Vec<Option<u64>> = Vec::new();
+        if let (Some(m), Some(idx), true) = (req.merged.as_deref(), req.indexed.as_ref(), sub_vmax_shared_on()) {
+            if m.overrides.iter().any(|o| !o.vstage.is_empty() || !o.vertex.is_empty()) {
+                let bytes: Option<std::borrow::Cow<'_, [u8]>> = match early_index.as_ref() {
+                    Some(Ok(crate::backend::vulkan::engine::BufferContent::Bytes(b))) => {
+                        Some(std::borrow::Cow::Borrowed(b.as_slice()))
+                    }
+                    Some(Ok(c @ crate::backend::vulkan::engine::BufferContent::GuestRuns(src)))
+                        if lab_index_runs_max() && src.total_len <= INDEX_RUNS_READ_MAX_BYTES =>
+                    {
+                        Some(c.cpu_bytes())
+                    }
+                    _ => None,
+                };
+                let isz = match u16::try_from(idx.index_type).ok().and_then(crate::protocol::render::IndexType::parse) {
+                    Some(crate::protocol::render::IndexType::Uint16) => Some(2usize),
+                    Some(crate::protocol::render::IndexType::Uint32) => Some(4usize),
+                    None => None,
+                };
+                if let (Some(bytes), Some(isz)) = (bytes, isz) {
+                    let reach = |sub: &crate::runtime::draw::merge::SubDraw| -> Option<u64> {
+                        if sub.own_index {
+                            return None;
+                        }
+                        let one = IndexedDrawInfo { index_count: sub.count, ..idx.clone() };
+                        indexed_vertex_max_fn(&one, bytes.get((sub.first as usize).checked_mul(isz)?..)?)?
+                            .checked_add_signed(i64::from(sub.vertex_delta))
+                    };
+                    lab_sub_vmax_shared = m.subs.iter().map(reach).collect();
+                }
+            }
+        }
         // TEMP (lab, MERGE_DRAWS): a merged non-indexed record fetches its sub-draws' vertices too, and as far
         // past them as its largest stage-in move.
         let (lab_first, lab_count) = match (req.merged.as_deref(), req.indexed.is_none()) {
@@ -13062,7 +13108,12 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 let Some(slot) = lab_sub_storage.get_mut(o.sub as usize) else {
                     continue;
                 };
-                let bounds = lab_sub_vmax.get(o.sub as usize).copied().flatten().map_or(render_buffer_bounds, |v| {
+                let bounds = lab_sub_vmax
+                    .get(o.sub as usize)
+                    .copied()
+                    .flatten()
+                    .or_else(|| lab_sub_vmax_shared.get(o.sub as usize).copied().flatten())
+                    .map_or(render_buffer_bounds, |v| {
                     crate::runtime::spirv_bind::RenderBufferIndexBounds::new(0, 0, req.base_instance, req.instance_count, true)
                         .with_indexed_vertex_max(Some(v))
                 });
@@ -13150,7 +13201,15 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         req.instance_count,
                         false,
                     ),
-                    _ => render_buffer_bounds,
+                    // TEMP (lab, SUB_VMAX_SHARED): a sub-draw of the record's index buffer, to its own reach.
+                    _ => match lab_sub_vmax_shared.get(o.sub as usize).copied().flatten() {
+                        Some(v) => {
+                            crate::runtime::drain::note_store_route("merge_sub_vmax_shared");
+                            crate::runtime::spirv_bind::RenderBufferIndexBounds::new(0, 0, req.base_instance, req.instance_count, true)
+                                .with_indexed_vertex_max(Some(v))
+                        }
+                        None => render_buffer_bounds,
+                    },
                 };
                 for b in &o.vstage {
                     let locations: Vec<u32> =
