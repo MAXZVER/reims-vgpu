@@ -566,6 +566,10 @@ pub(crate) fn lab_note_fg_shown() {
     LAB_FG_SHOWN.store(true, Ordering::Release);
 }
 
+/// TEMP (lab, PRESENT_FG): how long interpolation stays off after three misses in a row before one present asks
+/// again (see `LabFg::not_shown`).
+const LAB_FG_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// TEMP (lab, PRESENT_FG): the two newest guest frames as the window saw
 /// them arrive, and the presents the interpolation between them still wants.
 #[derive(Default)]
@@ -588,8 +592,13 @@ struct LabFg {
     rate_from: Option<(std::time::Instant, u64)>,
     /// Presents in a row that asked for a generated frame and got the guest
     /// frame (no scaled present, no optical flow): at 3 the window stops
-    /// interpolating, so it does not hold each new frame for a tick in vain.
+    /// interpolating, so it does not hold each new frame for a tick in vain -
+    /// for [`LAB_FG_RETRY`], then one present asks again (since the boot's own
+    /// frames, shown before the guest's scaled mode, set it off for good: Mish's
+    /// work VM ran without generated frames all of 2026-10-22, b985/b986 too).
     not_shown: u32,
+    /// When interpolation went off (at the third miss in a row).
+    off_since: Option<std::time::Instant>,
     /// Presents in a row that came back Busy (a window that cannot present,
     /// e.g. minimised): after 8 the deadlines retry every 50 ms, not every 1 ms.
     busy_streak: u32,
@@ -2048,6 +2057,11 @@ impl App {
         let Some((_, at)) = self.lab_fg.cur else {
             return (seq, LAB_FG_PHASE_REAL, false);
         };
+        if self.lab_fg.off_since.is_some_and(|at| now.duration_since(at) >= LAB_FG_RETRY) {
+            // One more try: a miss sets it off again at once, a drawn midpoint clears it.
+            self.lab_fg.off_since = None;
+            self.lab_fg.not_shown = 2;
+        }
         let Some(interval) = self.lab_fg.interval.filter(|_| self.lab_fg.not_shown < 3) else {
             return (seq, LAB_FG_PHASE_REAL, false);
         };
@@ -2068,12 +2082,22 @@ impl App {
             // nothing more to interpolate for it.
             self.lab_fg.not_shown += 1;
             if self.lab_fg.not_shown == 3 {
-                crate::observe::fail("present_fg_not_shown x3: interpolation off for this window".to_string());
+                self.lab_fg.off_since = Some(now);
+                if crate::observe::first_sight("present_fg_not_shown", 0) {
+                    crate::observe::fail(format!(
+                        "present_fg_not_shown x3: interpolation off, retried every {} ms",
+                        LAB_FG_RETRY.as_millis()
+                    ));
+                }
             }
             LAB_FG_PHASE_REAL
         } else {
             if drew {
+                if self.lab_fg.not_shown >= 2 && crate::observe::first_sight("present_fg_resumed", 0) {
+                    crate::observe::off("present_fg resumed: a generated frame drawn after the off-switch".to_string());
+                }
                 self.lab_fg.not_shown = 0;
+                self.lab_fg.off_since = None;
             }
             phase
         };
