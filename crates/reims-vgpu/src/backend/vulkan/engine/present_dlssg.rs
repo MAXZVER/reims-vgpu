@@ -238,14 +238,44 @@ pub(crate) fn loader() -> Option<std::path::PathBuf> {
         .clone()
 }
 
+/// Which device Streamline serves: none created yet, the current one, or none any more.
+const SL_DEVICE_NONE: u8 = 0;
+const SL_DEVICE_CURRENT: u8 = 1;
+const SL_DEVICE_RETIRED: u8 = 2;
+static SL_DEVICE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SL_DEVICE_NONE);
+
+/// The loader the engine's device is created through: [`loader`] for the first device, `vulkan-1` for every later
+/// one. Streamline binds its plugins to the device it saw first and cannot follow a second (10-22, Mish's work VM:
+/// after a DEVICE_LOST the recovery device came up through the interposer - SL: "plugins already initialized but
+/// could be using the wrong device" - and DLSS-G crashed in its swapchain hook on the new swapchain). So a recovered
+/// device runs without DLSS and DLSS-G, and the VM keeps running.
+pub(crate) fn device_loader() -> Option<std::path::PathBuf> {
+    use std::sync::atomic::Ordering;
+    let path = loader()?;
+    match SL_DEVICE.compare_exchange(SL_DEVICE_NONE, SL_DEVICE_CURRENT, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Some(path),
+        Err(_) => {
+            if SL_DEVICE.swap(SL_DEVICE_RETIRED, Ordering::AcqRel) != SL_DEVICE_RETIRED {
+                crate::observe::fail("present_dlssg_refused reason=second_device (Streamline stays with the first device; DLSS and DLSS-G off from here)".to_string());
+            }
+            None
+        }
+    }
+}
+
+/// Whether the current device came up through Streamline.
+fn sl_device() -> bool {
+    SL_DEVICE.load(std::sync::atomic::Ordering::Acquire) == SL_DEVICE_CURRENT
+}
+
 /// Whether the device came up through Streamline (DLSS-G active).
 pub(crate) fn active() -> bool {
-    on() && loader().is_some()
+    on() && sl_device()
 }
 
 /// Whether the DLSS upscale can run: asked for and the device came up through Streamline.
 pub(crate) fn dlss_sr_active() -> bool {
-    dlss_sr().is_some() && loader().is_some()
+    dlss_sr().is_some() && sl_device()
 }
 
 /// One image handed to the DLSS upscale (the layout it is in when the evaluate runs).
@@ -556,6 +586,25 @@ impl Dlssg {
             } else {
                 (api.marker)(token, 5); // ePresentEnd
             }
+        }
+    }
+
+    /// Before the window's swapchain is destroyed for a recreation: DLSS-G off and the whole device idle, then the
+    /// views of the old images dropped; the next [`Self::record`] turns DLSS-G on again. Streamline presents the
+    /// generated frames into the swapchain from queues of its own, and the queue idle the recreation waits for is
+    /// only ours (10-22, Mish's work VM: a same-size recreation at t=61.5 s, the GPU hung - 0.5 s tranches - and the
+    /// device was lost at 63.7 s, twice in two boots).
+    pub(crate) unsafe fn pause(&mut self, device: &ash::Device) {
+        if self.started && !self.failed {
+            if let Some(api) = api() {
+                let r = (api.dlssg)(0);
+                crate::observe::off(format!("present_dlssg pause dlssg={r} frame={}", self.frame));
+            }
+            self.started = false;
+        }
+        let _ = device.device_wait_idle();
+        for (_, view) in self.views.drain(..) {
+            device.destroy_image_view(view, None);
         }
     }
 

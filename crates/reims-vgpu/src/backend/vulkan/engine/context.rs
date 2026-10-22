@@ -1028,8 +1028,9 @@ impl DeviceContext {
     pub(crate) unsafe fn create() -> Result<Self, DrawError> {
         // TEMP (lab, PRESENT_DLSSG): through Streamline's interposer when DLSS-G
         // is on (slInit has run; its proxies set up instance, device, swapchain).
+        // Only the first device: a recovered one comes up through vulkan-1.
         #[cfg(feature = "host-window")]
-        let sl_loader = super::present_dlssg::loader();
+        let sl_loader = super::present_dlssg::device_loader();
         #[cfg(not(feature = "host-window"))]
         let sl_loader: Option<std::path::PathBuf> = None;
         let entry = match sl_loader {

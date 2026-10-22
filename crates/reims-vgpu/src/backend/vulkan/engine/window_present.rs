@@ -1104,6 +1104,12 @@ impl WindowPresenter {
         // workaround assumes. The queue idled above, so no submitted work
         // references the old swapchain.
         let from = self.extent;
+        // TEMP (lab, PRESENT_DLSSG): DLSS-G off and the whole device idle before
+        // the old swapchain goes - its generated frames are presented from
+        // Streamline's own queues, which the queue idle above does not cover.
+        if let Some(dlssg) = self.dlssg.as_mut() {
+            dlssg.pause(&ctx.device);
+        }
         // TEMP (lab, PRESENT_SHARP): views of the old images go first.
         if let Some(sharp) = self.sharp.as_mut() {
             sharp.release_all(&ctx.device);
