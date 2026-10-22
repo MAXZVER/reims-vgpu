@@ -299,12 +299,49 @@ pub(crate) fn release_device() {
     }
     match api().and_then(|a| a.shutdown) {
         Some(shutdown) => {
+            pin_sl_modules();
             unsafe { shutdown() };
             SL_DEVICE.store(SL_DEVICE_SHUT, Ordering::Release);
             crate::observe::off("present_dlssg shutdown (its device is going away)".to_string());
         }
         // An rslg.dll without the entry: the next device must not come through the interposer.
         None => SL_DEVICE.store(SL_DEVICE_RETIRED, Ordering::Release),
+    }
+}
+
+/// Keep Streamline's and NGX's modules mapped for the life of the process. `slShutdown` frees the plugins, but NGX's
+/// feature DLL (nvngx_dlssg.dll, loaded by the driver's _nvngx.dll) stays and keeps callbacks into sl.common.dll;
+/// after the next `slInit` it called one at its old, unmapped address (b976: 0xc0000005 executing 0x7fffa245e490 in
+/// the range sl.common had held, from nvngx_dlssg.dll under sl.interposer). Pinned, every module stays at its address
+/// and `slInit` reinitializes the same images.
+fn pin_sl_modules() {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
+        }
+        const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x1;
+        let mut pinned = Vec::new();
+        for name in [
+            "sl.interposer.dll",
+            "sl.common.dll",
+            "sl.dlss.dll",
+            "sl.dlss_g.dll",
+            "sl.reflex.dll",
+            "sl.pcl.dll",
+            "nvngx_dlss.dll",
+            "nvngx_dlssg.dll",
+            "_nvngx.dll",
+            "NvLowLatencyVk.dll",
+        ] {
+            let mut module = std::ptr::null_mut();
+            // Only modules already loaded: the flag pins, it never loads.
+            if unsafe { GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, wide(name).as_ptr(), &mut module) } != 0 {
+                pinned.push(name);
+            }
+        }
+        crate::observe::off(format!("present_dlssg pinned {}", pinned.join(",")));
     }
 }
 
