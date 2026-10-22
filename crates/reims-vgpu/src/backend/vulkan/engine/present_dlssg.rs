@@ -28,7 +28,7 @@ pub(crate) fn on() -> bool {
     })
 }
 
-/// TEMP (lab): `REIMS_VGPU_LAB_PRESENT_DLSS_SR=dlaa|quality|balanced|performance|ultra` - the present's upscale
+/// TEMP (lab): `REIMS_VGPU_LAB_PRESENT_DLSS_SR=dlaa|ultra|quality|balanced|performance|ultraperf` - the present's upscale
 /// (where VSR runs) by DLSS Super Resolution through Streamline instead; `REIMS_VGPU_LAB_PRESENT_DLSS_PRESET`
 /// K/L/M (the DLSS 4.5 transformer presets L and M) or unset for the mode's default. `(sl::DLSSMode, sl::DLSSPreset)`.
 pub(crate) fn dlss_sr() -> Option<(i32, i32)> {
@@ -38,7 +38,11 @@ pub(crate) fn dlss_sr() -> Option<(i32, i32)> {
             "performance" => 1,
             "balanced" => 2,
             "quality" => 3,
-            "ultra" => 4,
+            // sl::DLSSMode: eOff 0, eMaxPerformance 1, eBalanced 2, eMaxQuality 3, eUltraPerformance 4,
+            // eUltraQuality 5, eDLAA 6. "ultra" was 4 until 10-22 - Ultra Performance, which NGX refuses for a
+            // dynamic input (b978: "Dynamic scaling unsupported by PerfQuality Mode", every evaluate 0xbad00005).
+            "ultra" => 5,
+            "ultraperf" => 4,
             "dlaa" => 6,
             other => {
                 crate::observe::fail(format!("present_dlss_sr_refused reason=mode_unrecognized value={other}"));
