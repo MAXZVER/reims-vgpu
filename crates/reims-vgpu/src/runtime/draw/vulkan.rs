@@ -8012,6 +8012,15 @@ fn load_buffer_content_resolved<M: HostMemory + HostOps>(
 
 // Same shape as `load_buffer_content_resolved`, which this forwards to.
 #[allow(clippy::too_many_arguments)]
+/// TEMP (lab, SUB_VSTAGE_ZC): see its one use in the merged sub-draw stage-in.
+fn sub_vstage_zc_on() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("SUB_VSTAGE_ZC") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SUB_VSTAGE_ZC").as_deref() != Ok("off"))
+}
+
 pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -13155,8 +13164,13 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         b.index,
                         bounds,
                     );
+                    // TEMP (lab, Opus 10-23 SUB_VSTAGE_ZC, `REIMS_VGPU_LAB_SUB_VSTAGE_ZC=off` / live
+                    // `SUB_VSTAGE_ZC=off`): guest runs where the record's own stage-in may have them (not a constant
+                    // step), as the record's own binds are loaded - not a heap copy here on the drain followed by
+                    // a second copy into staging on the recorder (b994: both were on the Maps critical path).
+                    let zc = sub_vstage_zc_on() && !bind_plan.is_constant_step(b.index);
                     let loaded = match acc.exclusive() {
-                        Some(state) => load_buffer_content(state, host, req.task_id, b.buffer_ref, b.resource.as_deref(), b.offset, false, cap),
+                        Some(state) => load_buffer_content(state, host, req.task_id, b.buffer_ref, b.resource.as_deref(), b.offset, zc, cap),
                         None => match draw_par::load_buffer_content_worker(
                             acc.shared(),
                             host,
@@ -13165,7 +13179,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                             b.buffer_ref,
                             b.resource.as_ref(),
                             b.offset,
-                            false,
+                            zc,
                             cap,
                         ) {
                             Ok(content) => Some(content),
