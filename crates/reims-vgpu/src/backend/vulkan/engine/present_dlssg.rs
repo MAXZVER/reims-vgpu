@@ -246,22 +246,22 @@ fn sl_init(api: &Api) -> bool {
     r == 0
 }
 
-/// Which device Streamline serves: none created yet, the current one, none since `slShutdown` (it may start again
-/// for the next device), or none for good.
+/// Which device Streamline serves: none created yet, the current one, none since `slShutdown`, or none for good.
 const SL_DEVICE_NONE: u8 = 0;
 const SL_DEVICE_CURRENT: u8 = 1;
 const SL_DEVICE_SHUT: u8 = 2;
 const SL_DEVICE_RETIRED: u8 = 3;
 static SL_DEVICE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SL_DEVICE_NONE);
-/// Bumped on every `slInit` after the first: the DLSS options set under the old instance are gone with it.
-static SL_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// The loader the engine's device is created through. Streamline binds its plugins to one device: the first comes up
-/// through [`loader`]; a later one (device-lost recovery) only after [`release_device`] shut Streamline down for the
-/// old one - `slInit` then runs again, as the SL guide asks ("call slShutdown() before destroying ... devices").
-/// Otherwise, or if the new `slInit` fails, the device comes up through `vulkan-1` with DLSS and DLSS-G off and the
-/// VM keeps running (10-22, Mish's work VM: the recovery device came up through the still-bound interposer - SL:
-/// "plugins already initialized but could be using the wrong device" - and DLSS-G crashed in its swapchain hook).
+/// The loader the engine's device is created through: [`loader`] for the first device, `vulkan-1` for any later one
+/// (device-lost recovery), which then runs without DLSS and DLSS-G while the VM keeps running. Streamline serves one
+/// device per process:
+/// - a second device through the still-bound interposer crashed DLSS-G in its swapchain hook (10-22, Mish's work VM;
+///   SL: "plugins already initialized but could be using the wrong device"), and `slSetVulkanInfo` cannot rebind
+///   (`initializePlugins` refuses once initialized - pluginManager.cpp);
+/// - `slShutdown` + `slInit` in the same process crashed both times on the new device's `vkCreateDevice` through the
+///   interposer: b976 in nvngx_dlssg.dll calling into the unloaded sl.common.dll, b977 (modules pinned) in
+///   sl.common.dll itself during `initializePlugins` (a null pointer left by the shutdown).
 pub(crate) fn device_loader() -> Option<std::path::PathBuf> {
     use std::sync::atomic::Ordering;
     let path = loader()?;
@@ -276,22 +276,15 @@ pub(crate) fn device_loader() -> Option<std::path::PathBuf> {
             SL_DEVICE.store(SL_DEVICE_CURRENT, Ordering::Release);
             Some(path)
         }
-        SL_DEVICE_SHUT => match api() {
-            Some(api) if sl_init(api) => {
-                SL_GENERATION.fetch_add(1, Ordering::AcqRel);
-                SL_DEVICE.store(SL_DEVICE_CURRENT, Ordering::Release);
-                crate::observe::off("present_dlssg restarted for a new device".to_string());
-                Some(path)
-            }
-            _ => retire("sl_reinit"),
-        },
+        SL_DEVICE_SHUT => retire("restart_unsupported"),
         SL_DEVICE_CURRENT => retire("second_device"),
         _ => None,
     }
 }
 
-/// Before the device Streamline serves is destroyed (the window's swapchain already gone): `slShutdown`, so the
-/// next device can bring it up again. Nothing when it serves none.
+/// Before the device Streamline serves is destroyed (the window's swapchain already gone): `slShutdown`, as the SL
+/// guide asks ("call slShutdown() before destroying ... devices"), so none of its threads outlives the device.
+/// Nothing when it serves none.
 pub(crate) fn release_device() {
     use std::sync::atomic::Ordering;
     if SL_DEVICE.load(Ordering::Acquire) != SL_DEVICE_CURRENT {
@@ -310,10 +303,8 @@ pub(crate) fn release_device() {
 }
 
 /// Keep Streamline's and NGX's modules mapped for the life of the process. `slShutdown` frees the plugins, but NGX's
-/// feature DLL (nvngx_dlssg.dll, loaded by the driver's _nvngx.dll) stays and keeps callbacks into sl.common.dll;
-/// after the next `slInit` it called one at its old, unmapped address (b976: 0xc0000005 executing 0x7fffa245e490 in
-/// the range sl.common had held, from nvngx_dlssg.dll under sl.interposer). Pinned, every module stays at its address
-/// and `slInit` reinitializes the same images.
+/// feature DLL (nvngx_dlssg.dll, loaded by the driver's _nvngx.dll) stays and keeps callbacks into sl.common.dll
+/// (b976: nvngx_dlssg.dll executed 0x7fffa245e490, in the range sl.common had held, after the shutdown).
 fn pin_sl_modules() {
     #[cfg(target_os = "windows")]
     {
@@ -403,9 +394,7 @@ pub(crate) unsafe fn dlss_sr_evaluate(
     reset: bool,
     moving: bool,
 ) -> i32 {
-    // (SL generation, width, height): a restarted Streamline holds no options.
-    static SET_FOR: [std::sync::Mutex<Option<(u32, u32, u32)>>; 2] = [std::sync::Mutex::new(None), std::sync::Mutex::new(None)];
-    let generation = SL_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    static SET_FOR: [std::sync::Mutex<Option<(u32, u32)>>; 2] = [std::sync::Mutex::new(None), std::sync::Mutex::new(None)];
     let (Some(api), Some((mode, main_preset))) = (api(), dlss_sr()) else {
         return -100;
     };
@@ -423,7 +412,7 @@ pub(crate) unsafe fn dlss_sr_evaluate(
     };
     {
         let mut set = SET_FOR[slot].lock().unwrap_or_else(|e| e.into_inner());
-        if *set != Some((generation, output.width, output.height)) {
+        if *set != Some((output.width, output.height)) {
             let r = match motion {
                 Some((_, set_vp, _)) => set_vp(vp, mode, output.width, output.height, preset),
                 None => (api.dlss)(mode, output.width, output.height, preset),
@@ -435,7 +424,7 @@ pub(crate) unsafe fn dlss_sr_evaluate(
             if r != 0 {
                 return r;
             }
-            *set = Some((generation, output.width, output.height));
+            *set = Some((output.width, output.height));
         }
     }
     let token = (api.frame)(present_index());
