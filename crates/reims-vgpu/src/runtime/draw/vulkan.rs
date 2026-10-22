@@ -13118,17 +13118,31 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             }
             crate::runtime::drain::note_store_route_n("merge_sub_overrides", m.overrides.len() as u64);
         }
-        // TEMP (lab, MERGE_DRAWS): stage-in buffers a sub-draw reads instead of the record's - its own bytes, read with
-        // the record's bounds, for every location the buffer feeds.
+        // TEMP (lab, MERGE_DRAWS): stage-in buffers a sub-draw reads instead of the record's - its own bytes, for every
+        // location the buffer feeds. Read as far as the sub-draw itself fetches: an own-index sub-draw to its index
+        // reach; a sub-draw of a record that is not indexed to its own `[first, first + count)` - it is drawn as
+        // `draw(count, instances, first, base_instance)` over these binds (Opus 10-22, b965MR: these copies were 24 %
+        // of the recorder's draw time on Maps with the record's whole span plus its largest stage-in move as the
+        // bound); anything else to the record's bounds.
         let mut lab_sub_vstage: Vec<Vec<(std::sync::Arc<[u32]>, crate::backend::vulkan::engine::BufferContent)>> =
             Vec::new();
         if let Some(m) = req.merged.as_deref().filter(|m| m.overrides.iter().any(|o| !o.vstage.is_empty()) && !lab_merge_deltas.is_empty()) {
             lab_sub_vstage = vec![Vec::new(); m.subs.len()];
             for o in &m.overrides {
-                let bounds = lab_sub_vmax.get(o.sub as usize).copied().flatten().map_or(render_buffer_bounds, |v| {
-                    crate::runtime::spirv_bind::RenderBufferIndexBounds::new(0, 0, req.base_instance, req.instance_count, true)
-                        .with_indexed_vertex_max(Some(v))
-                });
+                let bounds = match (lab_sub_vmax.get(o.sub as usize).copied().flatten(), m.subs.get(o.sub as usize)) {
+                    (Some(v), _) => {
+                        crate::runtime::spirv_bind::RenderBufferIndexBounds::new(0, 0, req.base_instance, req.instance_count, true)
+                            .with_indexed_vertex_max(Some(v))
+                    }
+                    (None, Some(sub)) if req.indexed.is_none() => crate::runtime::spirv_bind::RenderBufferIndexBounds::new(
+                        sub.first,
+                        sub.count,
+                        req.base_instance,
+                        req.instance_count,
+                        false,
+                    ),
+                    _ => render_buffer_bounds,
+                };
                 for b in &o.vstage {
                     let locations: Vec<u32> =
                         pd.vertex_attributes.iter().filter(|a| a.buffer_index == b.index).map(|a| a.location).collect();
