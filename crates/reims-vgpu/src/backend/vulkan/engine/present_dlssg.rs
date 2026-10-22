@@ -116,6 +116,7 @@ type FnTag = unsafe extern "C" fn(*mut c_void, vk::CommandBuffer, *const RslgIma
 type FnConstants = unsafe extern "C" fn(*mut c_void, f32, f32, i32) -> i32;
 type FnState = unsafe extern "C" fn(*mut u32, *mut u32, *mut u64) -> i32;
 type FnDlss = unsafe extern "C" fn(i32, u32, u32, i32) -> i32;
+type FnVoid = unsafe extern "C" fn();
 type FnDlssVp = unsafe extern "C" fn(i32, i32, u32, u32, i32) -> i32;
 type FnDlssEvalVp = unsafe extern "C" fn(
     i32,
@@ -152,6 +153,8 @@ struct Api {
     /// The per-viewport pair (an older rslg.dll lacks them: no motion instance then).
     dlss_vp: Option<FnDlssVp>,
     dlss_eval_vp: Option<FnDlssEvalVp>,
+    /// `slShutdown` (before the device it serves is destroyed; `rslg_init` then runs `slInit` again).
+    shutdown: Option<FnVoid>,
 }
 
 #[cfg(target_os = "windows")]
@@ -200,6 +203,7 @@ fn api() -> Option<&'static Api> {
                     dlss_eval: std::mem::transmute::<*mut c_void, FnDlssEval>(sym(b"rslg_dlss_eval\0")?),
                     dlss_vp: sym(b"rslg_dlss_vp\0").map(|p| std::mem::transmute::<*mut c_void, FnDlssVp>(p)),
                     dlss_eval_vp: sym(b"rslg_dlss_eval_vp\0").map(|p| std::mem::transmute::<*mut c_void, FnDlssEvalVp>(p)),
+                    shutdown: sym(b"rslg_shutdown\0").map(|p| std::mem::transmute::<*mut c_void, FnVoid>(p)),
                 })
             })();
             if made.is_none() {
@@ -223,43 +227,84 @@ pub(crate) fn loader() -> Option<std::path::PathBuf> {
     LOADER
         .get_or_init(|| {
             let api = api()?;
-            let logs = std::env::temp_dir().join("reims-sl");
-            let _ = std::fs::create_dir_all(&logs);
-            let verbose = i32::from(std::env::var("REIMS_VGPU_LAB_PRESENT_DLSSG_VERBOSE").is_ok_and(|v| v == "1"));
-            let d = dir().replace('/', "\\");
-            let r = unsafe { (api.init)(wide(&d).as_ptr(), wide(&logs.to_string_lossy()).as_ptr(), verbose) };
-            crate::observe::off(format!("present_dlssg init sl={r} dir={d} logs={}", logs.display()));
-            if r != 0 {
-                crate::observe::fail(format!("present_dlssg_refused reason=sl_init sl={r}"));
-                return None;
-            }
-            Some(std::path::PathBuf::from(format!("{d}\\sl.interposer.dll")))
+            sl_init(api).then(|| std::path::PathBuf::from(format!("{}\\sl.interposer.dll", dir().replace('/', "\\"))))
         })
         .clone()
 }
 
-/// Which device Streamline serves: none created yet, the current one, or none any more.
+/// `slInit` through the shim (a no-op while Streamline is up). Whether it is up.
+fn sl_init(api: &Api) -> bool {
+    let logs = std::env::temp_dir().join("reims-sl");
+    let _ = std::fs::create_dir_all(&logs);
+    let verbose = i32::from(std::env::var("REIMS_VGPU_LAB_PRESENT_DLSSG_VERBOSE").is_ok_and(|v| v == "1"));
+    let d = dir().replace('/', "\\");
+    let r = unsafe { (api.init)(wide(&d).as_ptr(), wide(&logs.to_string_lossy()).as_ptr(), verbose) };
+    crate::observe::off(format!("present_dlssg init sl={r} dir={d} logs={}", logs.display()));
+    if r != 0 {
+        crate::observe::fail(format!("present_dlssg_refused reason=sl_init sl={r}"));
+    }
+    r == 0
+}
+
+/// Which device Streamline serves: none created yet, the current one, none since `slShutdown` (it may start again
+/// for the next device), or none for good.
 const SL_DEVICE_NONE: u8 = 0;
 const SL_DEVICE_CURRENT: u8 = 1;
-const SL_DEVICE_RETIRED: u8 = 2;
+const SL_DEVICE_SHUT: u8 = 2;
+const SL_DEVICE_RETIRED: u8 = 3;
 static SL_DEVICE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SL_DEVICE_NONE);
+/// Bumped on every `slInit` after the first: the DLSS options set under the old instance are gone with it.
+static SL_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// The loader the engine's device is created through: [`loader`] for the first device, `vulkan-1` for every later
-/// one. Streamline binds its plugins to the device it saw first and cannot follow a second (10-22, Mish's work VM:
-/// after a DEVICE_LOST the recovery device came up through the interposer - SL: "plugins already initialized but
-/// could be using the wrong device" - and DLSS-G crashed in its swapchain hook on the new swapchain). So a recovered
-/// device runs without DLSS and DLSS-G, and the VM keeps running.
+/// The loader the engine's device is created through. Streamline binds its plugins to one device: the first comes up
+/// through [`loader`]; a later one (device-lost recovery) only after [`release_device`] shut Streamline down for the
+/// old one - `slInit` then runs again, as the SL guide asks ("call slShutdown() before destroying ... devices").
+/// Otherwise, or if the new `slInit` fails, the device comes up through `vulkan-1` with DLSS and DLSS-G off and the
+/// VM keeps running (10-22, Mish's work VM: the recovery device came up through the still-bound interposer - SL:
+/// "plugins already initialized but could be using the wrong device" - and DLSS-G crashed in its swapchain hook).
 pub(crate) fn device_loader() -> Option<std::path::PathBuf> {
     use std::sync::atomic::Ordering;
     let path = loader()?;
-    match SL_DEVICE.compare_exchange(SL_DEVICE_NONE, SL_DEVICE_CURRENT, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => Some(path),
-        Err(_) => {
-            if SL_DEVICE.swap(SL_DEVICE_RETIRED, Ordering::AcqRel) != SL_DEVICE_RETIRED {
-                crate::observe::fail("present_dlssg_refused reason=second_device (Streamline stays with the first device; DLSS and DLSS-G off from here)".to_string());
-            }
-            None
+    let retire = |why: &str| {
+        if SL_DEVICE.swap(SL_DEVICE_RETIRED, Ordering::AcqRel) != SL_DEVICE_RETIRED {
+            crate::observe::fail(format!("present_dlssg_refused reason={why} (DLSS and DLSS-G off from here)"));
         }
+        None
+    };
+    match SL_DEVICE.load(Ordering::Acquire) {
+        SL_DEVICE_NONE => {
+            SL_DEVICE.store(SL_DEVICE_CURRENT, Ordering::Release);
+            Some(path)
+        }
+        SL_DEVICE_SHUT => match api() {
+            Some(api) if sl_init(api) => {
+                SL_GENERATION.fetch_add(1, Ordering::AcqRel);
+                SL_DEVICE.store(SL_DEVICE_CURRENT, Ordering::Release);
+                crate::observe::off("present_dlssg restarted for a new device".to_string());
+                Some(path)
+            }
+            _ => retire("sl_reinit"),
+        },
+        SL_DEVICE_CURRENT => retire("second_device"),
+        _ => None,
+    }
+}
+
+/// Before the device Streamline serves is destroyed (the window's swapchain already gone): `slShutdown`, so the
+/// next device can bring it up again. Nothing when it serves none.
+pub(crate) fn release_device() {
+    use std::sync::atomic::Ordering;
+    if SL_DEVICE.load(Ordering::Acquire) != SL_DEVICE_CURRENT {
+        return;
+    }
+    match api().and_then(|a| a.shutdown) {
+        Some(shutdown) => {
+            unsafe { shutdown() };
+            SL_DEVICE.store(SL_DEVICE_SHUT, Ordering::Release);
+            crate::observe::off("present_dlssg shutdown (its device is going away)".to_string());
+        }
+        // An rslg.dll without the entry: the next device must not come through the interposer.
+        None => SL_DEVICE.store(SL_DEVICE_RETIRED, Ordering::Release),
     }
 }
 
@@ -321,7 +366,9 @@ pub(crate) unsafe fn dlss_sr_evaluate(
     reset: bool,
     moving: bool,
 ) -> i32 {
-    static SET_FOR: [std::sync::Mutex<Option<(u32, u32)>>; 2] = [std::sync::Mutex::new(None), std::sync::Mutex::new(None)];
+    // (SL generation, width, height): a restarted Streamline holds no options.
+    static SET_FOR: [std::sync::Mutex<Option<(u32, u32, u32)>>; 2] = [std::sync::Mutex::new(None), std::sync::Mutex::new(None)];
+    let generation = SL_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     let (Some(api), Some((mode, main_preset))) = (api(), dlss_sr()) else {
         return -100;
     };
@@ -339,7 +386,7 @@ pub(crate) unsafe fn dlss_sr_evaluate(
     };
     {
         let mut set = SET_FOR[slot].lock().unwrap_or_else(|e| e.into_inner());
-        if *set != Some((output.width, output.height)) {
+        if *set != Some((generation, output.width, output.height)) {
             let r = match motion {
                 Some((_, set_vp, _)) => set_vp(vp, mode, output.width, output.height, preset),
                 None => (api.dlss)(mode, output.width, output.height, preset),
@@ -351,7 +398,7 @@ pub(crate) unsafe fn dlss_sr_evaluate(
             if r != 0 {
                 return r;
             }
-            *set = Some((output.width, output.height));
+            *set = Some((generation, output.width, output.height));
         }
     }
     let token = (api.frame)(present_index());

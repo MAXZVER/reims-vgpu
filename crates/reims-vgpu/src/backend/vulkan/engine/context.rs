@@ -1927,6 +1927,10 @@ impl DeviceContext {
         }
         self.device
             .destroy_pipeline_cache(self.pipeline_cache, None);
+        // TEMP (lab, PRESENT_DLSSG): Streamline shuts down before the device it
+        // serves goes, so a recovered device can bring it up again.
+        #[cfg(feature = "host-window")]
+        super::present_dlssg::release_device();
         self.device.destroy_device(None);
         self.instance.destroy_instance(None);
     }
