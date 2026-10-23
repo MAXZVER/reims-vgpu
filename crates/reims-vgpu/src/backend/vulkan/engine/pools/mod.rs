@@ -3570,6 +3570,29 @@ impl CbBind {
         }
     }
 
+    /// TEMP (lab, Opus 10-23 REC_VHEAD): whether a bind of `key` can be staged without its first `head` bytes
+    /// under an exact key of its own - the window offset below 2^40 and the head below 2^23 pack into the offset
+    /// field, and the length field carries the mark bit no real length reaches.
+    pub(crate) fn head_fits(key: (usize, u64, u64), head: u64) -> bool {
+        head != 0 && head < key.2 && key.1 < (1 << 40) && head < (1 << 23) && key.2 < (1 << 62)
+    }
+
+    /// TEMP (lab, REC_VHEAD): the memo key of `key`'s window staged without its first `head` bytes (`key`
+    /// itself for 0). Exact: two heads of one window, or a head and a full window, never share a key.
+    pub(crate) fn key_with_head(key: (usize, u64, u64), head: u64) -> (usize, u64, u64) {
+        if head == 0 {
+            key
+        } else {
+            (key.0, key.1 | (head << 40), key.2 | (1 << 63))
+        }
+    }
+
+    /// TEMP (lab, REC_VHEAD): this bind recorded under [`Self::key_with_head`].
+    pub(crate) fn with_head(mut self, head: u64) -> Self {
+        self.key = Self::key_with_head(self.key, head);
+        self
+    }
+
     /// The identity on its own, without taking a reference to what it names.
     ///
     /// [`Self::of`] exists so that no entry can be recorded in
@@ -3935,6 +3958,35 @@ impl Drop for SlowStagingWrite {
 pub mod buffer_gather_working_set;
 pub(crate) mod buf_resident;
 pub(crate) mod content_resident;
+
+#[cfg(test)]
+mod cb_bind_head_tests {
+    use super::CbBind;
+
+    #[test]
+    fn a_head_key_never_matches_the_full_window_or_another_head() {
+        let full = (0x1000usize, 4096u64, 65536u64);
+        assert_eq!(CbBind::key_with_head(full, 0), full);
+        let a = CbBind::key_with_head(full, 512);
+        let b = CbBind::key_with_head(full, 1024);
+        assert_ne!(a, full);
+        assert_ne!(a, b);
+        // Another window of the same runs whose offset equals this one's packed field stays apart too: the mark
+        // bit is in the length.
+        let other = (0x1000usize, 4096u64 | (512u64 << 40), 65536u64);
+        assert_ne!(a, other);
+        assert_eq!(a, CbBind::key_with_head(full, 512), "one head, one key");
+    }
+
+    #[test]
+    fn heads_outside_the_packing_are_refused() {
+        assert!(CbBind::head_fits((1, 0, 4096), 16));
+        assert!(!CbBind::head_fits((1, 0, 4096), 0));
+        assert!(!CbBind::head_fits((1, 0, 4096), 4096), "a head the size of the window");
+        assert!(!CbBind::head_fits((1, 1 << 40, 1 << 30), 16), "offset past 2^40");
+        assert!(!CbBind::head_fits((1, 0, 1 << 30), 1 << 23), "head past 2^23");
+    }
+}
 
 /// TEMP (lab): how many emptied slot lists `slot_vecs` keeps (two per entry in
 /// flight is plenty).

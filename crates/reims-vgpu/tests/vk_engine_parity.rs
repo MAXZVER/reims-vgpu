@@ -1795,6 +1795,7 @@ fn vertex_buffers_bind_in_one_bulk_call_without_losing_slots() {
     // moving a buffer away from its declared slot.
     for (location, binding) in [(0, 2), (1, 0), (2, 1)] {
         req.vertex_attributes.push(VertexAttributeResource {
+            head: 0,
             location,
             binding,
             format: VertexAttributeFormat::Float2,

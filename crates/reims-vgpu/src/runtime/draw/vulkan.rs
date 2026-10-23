@@ -8287,6 +8287,42 @@ fn lab_merged_vertex_max(
     })
 }
 
+/// TEMP (lab, Opus 10-23 REC_VHEAD): the smallest vertex a record fetches through its index window - its own
+/// range and every sub-draw that reads the record's index buffer (plus its vertex_delta), the low twin of
+/// [`lab_merged_vertex_max`].
+fn lab_merged_vertex_min(
+    info: &IndexedDrawInfo,
+    bytes: &[u8],
+    merged: Option<&crate::runtime::draw::merge::MergedSubs>,
+) -> Option<u64> {
+    let Some(m) = merged else {
+        return indexed_vertex_min(info, bytes);
+    };
+    use crate::protocol::render::IndexType as Contract;
+    let isz = match Contract::parse(u16::try_from(info.index_type).ok()?)? {
+        Contract::Uint16 => 2usize,
+        Contract::Uint32 => 4usize,
+    };
+    let min_of = |first: u32, count: u32| -> Option<u64> {
+        let one = IndexedDrawInfo { index_count: count, ..info.clone() };
+        indexed_vertex_min(&one, bytes.get((first as usize).checked_mul(isz)?..)?)
+    };
+    let mut best = min_of(m.head_first, m.head_count)?;
+    for s in m.subs.iter().filter(|s| !s.own_index) {
+        best = best.min(min_of(s.first, s.count)?.checked_add_signed(i64::from(s.vertex_delta))?);
+    }
+    Some(best)
+}
+
+/// TEMP (lab, REC_VHEAD): live `REC_VHEAD=off` / `REIMS_VGPU_LAB_REC_VHEAD=off` binds every record window whole.
+fn rec_vhead_on() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("REC_VHEAD") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_REC_VHEAD").as_deref() != Ok("off"))
+}
+
 /// TEMP (lab, Opus 10-23 SUB_VHEAD): the smallest vertex `info`'s indices fetch - the smallest index plus
 /// baseVertex; `None` when unknown.
 fn indexed_vertex_min(info: &IndexedDrawInfo, bytes: &[u8]) -> Option<u64> {
@@ -13037,6 +13073,54 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         let mut attrs: Vec<crate::backend::vulkan::engine::VertexAttributeResource> =
             Vec::with_capacity(pd.vertex_attributes.len());
         let mut stage_in_bufs: std::collections::BTreeSet<u32> = Default::default();
+        // TEMP (lab, Opus 10-23 REC_VHEAD): the record's stage-in windows run from each buffer's vertex 0, but its
+        // draws fetch from their smallest vertex on - an indexed draw's smallest index (over the record's range and
+        // its shared-index sub-draws) plus baseVertex, a non-indexed one's firstVertex. The head below that, for a
+        // buffer whose attributes are all per-vertex, is left unwritten in its staging slot (b1003c: 3.4 GB/s of
+        // lane copies were the records' windows on 5K Maps).
+        let mut lab_rec_vhead: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        if rec_vhead_on() {
+            let vmin = match (req.indexed.as_ref(), early_index.as_ref()) {
+                (Some(idx), Some(Ok(crate::backend::vulkan::engine::BufferContent::Bytes(bytes)))) => {
+                    lab_merged_vertex_min(idx, bytes, req.merged.as_deref())
+                }
+                (Some(idx), Some(Ok(content @ crate::backend::vulkan::engine::BufferContent::GuestRuns(src))))
+                    if lab_index_runs_max() && src.total_len <= INDEX_RUNS_READ_MAX_BYTES =>
+                {
+                    lab_merged_vertex_min(idx, &content.cpu_bytes(), req.merged.as_deref())
+                }
+                (Some(_), _) => None,
+                (None, _) => Some(u64::from(lab_first)),
+            };
+            if let Some(vmin) = vmin.filter(|&v| v > 0) {
+                for (idx, content) in &vtx_storage {
+                    let on_buf: Vec<_> = pd.vertex_attributes.iter().filter(|a| a.buffer_index == *idx).collect();
+                    if on_buf.is_empty() || !on_buf.iter().all(|a| a.step_function_ordinal(1) == 1) {
+                        continue;
+                    }
+                    if !matches!(
+                        content,
+                        crate::backend::vulkan::engine::BufferContent::GuestRuns(_)
+                            | crate::backend::vulkan::engine::BufferContent::Bytes(_)
+                    ) {
+                        continue;
+                    }
+                    let Some(stride) = on_buf
+                        .iter()
+                        .map(|a| u64::from(super::bind_attribute_stride(&req.vertex_buffers, a.buffer_index, a.stride)))
+                        .min()
+                    else {
+                        continue;
+                    };
+                    let head = vmin.saturating_mul(stride).min(content.len() as u64);
+                    if head > 0 {
+                        crate::runtime::drain::note_store_route_n("rec_vhead_kb", head / 1024);
+                        crate::runtime::drain::note_store_route_n("rec_vwin_kb", content.len() as u64 / 1024);
+                        lab_rec_vhead.insert(*idx, head);
+                    }
+                }
+            }
+        }
         let attrs_span =
             crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::Attrs);
         for a in &pd.vertex_attributes {
@@ -13081,6 +13165,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             let step = prepare_vertex_step_function(a).map_err(DrawError::DrawPreparation)?;
             let step_rate = a.step_rate();
             attrs.push(crate::backend::vulkan::engine::VertexAttributeResource {
+                head: lab_rec_vhead.get(&a.buffer_index).copied().unwrap_or(0),
                 location: a.location,
                 // One Vulkan binding per location (archive render_draw_core).
                 binding: a.location,

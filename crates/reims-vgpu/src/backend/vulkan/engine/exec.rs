@@ -650,6 +650,9 @@ fn used_binding_absent_from_layout(
 struct StageBufferUse {
     snapshot_volatile: bool,
     gather_role: BufferGatherRole,
+    /// TEMP (lab, Opus 10-23 REC_VHEAD): bytes at the window's head no fetch of this bind reads (vertex binds
+    /// only; 0 elsewhere). Honoured on the CPU-copy arms, which leave them unwritten.
+    head: u64,
 }
 
 /// TEMP (lab, DRAW_PAR v15): set once the recorder has met a guest-runs bind
@@ -672,7 +675,10 @@ unsafe fn stage_buffer_content(
     let StageBufferUse {
         snapshot_volatile,
         gather_role,
+        head,
     } = use_;
+    // A bind a shader may also read as storage reads the whole window.
+    let head = if gather_role.includes_storage() { 0 } else { head };
     // Probe on the identity alone. A Metal argument table persists across the
     // draws of one encoder, so the guest re-presents the same buffers on every
     // draw and this probe almost always hits — paying `CbBind::of`'s `Arc` clone
@@ -683,11 +689,21 @@ unsafe fn stage_buffer_content(
         counters.note_buffer_bind_reused(gather_role);
         return Ok(bound);
     }
+    // TEMP (lab, REC_VHEAD): a slot staged without its head answers only binds with that same head; a full slot
+    // (above) answers any.
+    let head = if super::pools::CbBind::head_fits(key, head) { head } else { 0 };
+    let key = super::pools::CbBind::key_with_head(key, head);
+    if head != 0 {
+        if let Some(bound) = pools.cb_bound_buffer(key) {
+            counters.note_buffer_bind_reused(gather_role);
+            return Ok(bound);
+        }
+    }
     // A miss, so this bind is about to be recorded. The identity and a reference
     // to what it names are taken together here — see [`super::pools::CbBind`].
     // The map cannot be told about a bind without being handed this, which is
     // what keeps the key's address from being recycled under a live entry.
-    let bind = super::pools::CbBind::of(content);
+    let bind = super::pools::CbBind::of(content).with_head(head);
     debug_assert_eq!(bind.key(), key, "the probe and the record name one bind");
     // Set by the one arm that returns a slot it has not filled. Read after the
     // `match` so the flag and the `note_cb_bound_buffer` below it cannot be
@@ -700,10 +716,10 @@ unsafe fn stage_buffer_content(
                 pools.acquire_staging(ctx, b.len() as u64, counters)?
             };
             let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, b.len() as u64);
-            // TEMP (lab, LANE_BYTES): the lane makes the copy.
-            pools.write_staging_bytes_lane(ctx, &slot, b)?;
+            // TEMP (lab, LANE_BYTES): the lane makes the copy (REC_VHEAD: without the unfetched head).
+            pools.write_staging_bytes_lane_at(ctx, &slot, b, head as usize)?;
             drop(_s);
-            if super::pools::lab_verify_on() && slot.mapped != 0 && !b.is_empty() {
+            if super::pools::lab_verify_on() && slot.mapped != 0 && !b.is_empty() && head == 0 {
                 pools.lab_verify_note(super::pools::LabVerify::Staging {
                     ptr: slot.mapped,
                     len: b.len(),
@@ -855,12 +871,14 @@ unsafe fn stage_buffer_content(
                         pools.content_resident_adopt(k, slot);
                     }
                 } else {
-                    pools.write_staging_from_runs(
+                    // TEMP (lab, REC_VHEAD): without the head no fetch reads.
+                    pools.write_staging_from_runs_at(
                         ctx,
                         &slot,
                         &src.runs,
                         src.source_offset,
                         src.total_len,
+                        head,
                     )?;
                 }
                 drop(_s);
@@ -4400,6 +4418,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     snapshot_volatile: batch_eligible,
                     gather_role: buffer_gather_role(req, CbBind::key_of(&resource.content))
                         .expect("every vertex buffer was classified"),
+                    head: resource.head,
                 },
                 &mut guest_gathers,
             )?
@@ -4421,6 +4440,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 snapshot_volatile: batch_eligible,
                 gather_role: buffer_gather_role(req, CbBind::key_of(&indexed.content))
                     .expect("the index buffer was classified"),
+                head: 0,
             },
             &mut guest_gathers,
         )?),
@@ -4443,6 +4463,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 snapshot_volatile: batch_eligible,
                 gather_role: buffer_gather_role(req, CbBind::key_of(&resource.content))
                     .expect("every storage buffer was classified"),
+                head: 0,
             },
             &mut guest_gathers,
         )?;
@@ -8724,6 +8745,7 @@ mod tests {
         let req = DrawRequest {
             vertex_attributes: vec![
                 VertexAttributeResource {
+                    head: 0,
                     location: 0,
                     binding: 0,
                     format: VertexAttributeFormat::Float,
@@ -8734,6 +8756,7 @@ mod tests {
                     content: vertex_only,
                 },
                 VertexAttributeResource {
+                    head: 0,
                     location: 1,
                     binding: 1,
                     format: VertexAttributeFormat::Float,
@@ -9652,6 +9675,7 @@ mod tests {
     fn two_vertex_attributes_may_not_share_a_location_or_a_binding() {
         let attribute =
             |location: u32, binding: u32| super::super::types::VertexAttributeResource {
+                head: 0,
                 location,
                 binding,
                 format: super::super::types::VertexAttributeFormat::Float,
@@ -10165,6 +10189,7 @@ mod tests {
         };
         req.vertex_attributes
             .push(super::super::types::VertexAttributeResource {
+                head: 0,
                 location: 0,
                 binding: 0,
                 format: super::super::types::VertexAttributeFormat::Float4,
@@ -10196,6 +10221,7 @@ mod tests {
         };
         req.vertex_attributes
             .push(super::super::types::VertexAttributeResource {
+                head: 0,
                 location: 0,
                 binding: 0,
                 format: super::super::types::VertexAttributeFormat::Float4,

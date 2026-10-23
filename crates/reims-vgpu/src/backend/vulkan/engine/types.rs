@@ -1093,6 +1093,8 @@ pub struct LabSubDraw {
 
 #[derive(Debug)]
 pub struct VertexAttributeResource {
+    /// TEMP (lab, Opus 10-23 REC_VHEAD): bytes at the head of `content`'s window no vertex of this draw fetches.
+    pub head: u64,
     pub location: u32,
     pub binding: u32,
     pub format: VertexAttributeFormat,
