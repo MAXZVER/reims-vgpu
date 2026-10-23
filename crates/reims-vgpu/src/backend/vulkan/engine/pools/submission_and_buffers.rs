@@ -3746,6 +3746,38 @@ impl ResourcePools {
         Ok(())
     }
 
+    /// TEMP (lab, SUB_VHEAD): [`Self::write_staging_bytes_lane`] leaving the first `head` bytes unwritten.
+    pub(crate) unsafe fn write_staging_bytes_lane_at(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: &BufferSlot,
+        bytes: &std::sync::Arc<Vec<u8>>,
+        head: usize,
+    ) -> Result<(), DrawError> {
+        if head == 0 || head >= bytes.len() {
+            return unsafe { self.write_staging_bytes_lane(ctx, slot, bytes) };
+        }
+        let ptr = staging_write_ptr(ctx, slot, bytes.len() as u64)?;
+        let n = bytes.len() - head;
+        if lane_bytes_on() && crate::backend::vulkan::engine::cmd_sink::defer_host_copies() {
+            self.entry.keep_bytes.push(std::sync::Arc::clone(bytes));
+            // SAFETY: as in `write_staging_bytes_lane`; `head < len` keeps both ends inside.
+            unsafe {
+                crate::backend::vulkan::engine::cmd_sink::host_copy(
+                    crate::backend::vulkan::engine::cmd_sink::HostSeg {
+                        src: bytes.as_ptr().add(head),
+                        dst: ptr.add(head),
+                        n,
+                    },
+                )
+            };
+        } else {
+            // SAFETY: the mapped span is `bytes.len()` long and exclusively this slot's.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(head), ptr.add(head), n) };
+        }
+        Ok(())
+    }
+
     /// Copy into a mapped staging slot with R and B exchanged.
     ///
     /// The exchange is an involution, so this serves both directions: a
@@ -3849,12 +3881,27 @@ impl ResourcePools {
         source_offset: u64,
         total_len: u64,
     ) -> Result<(), DrawError> {
+        unsafe { self.write_staging_from_runs_at(ctx, slot, runs, source_offset, total_len, 0) }
+    }
+
+    /// TEMP (lab, Opus 10-23 SUB_VHEAD): [`Self::write_staging_from_runs`] leaving the window's first `head`
+    /// bytes unwritten (nothing fetches them); every other byte lands where the full copy puts it.
+    pub(crate) unsafe fn write_staging_from_runs_at(
+        &self,
+        ctx: &DeviceContext,
+        slot: &BufferSlot,
+        runs: &[types::GuestRun],
+        source_offset: u64,
+        total_len: u64,
+        head: u64,
+    ) -> Result<(), DrawError> {
         let _slow = SlowStagingWrite::watch("guest_runs", total_len, runs.len());
         let size = total_len.max(4);
         let ptr = staging_write_ptr(ctx, slot, size)?;
         let total = total_len as usize;
-        let mut off = 0usize;
-        let mut skip = source_offset;
+        let head = head.min(total_len);
+        let mut off = head as usize;
+        let mut skip = source_offset + head;
         // TEMP (lab PAR_STAGE): a large copy is collected as segments and split
         // over helper threads (`par_stage`); the bytes and their places are the
         // serial loop's.

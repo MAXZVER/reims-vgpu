@@ -7706,10 +7706,13 @@ fn lab_sub_vstage(
     let Some(list) = own else {
         return Ok(());
     };
-    for (bindings, content) in list {
+    for (bindings, content, head) in list {
         if content.len() == 0 {
             continue;
         }
+        // TEMP (lab, SUB_VHEAD): bytes at the window's head the sub-draw never fetches - left unwritten in the
+        // slot, which keeps its full length so every fetch lands where it would.
+        let head = (*head as usize).min(content.len());
         let at = match content {
             // A window the prepare worker staged into its arena (PASS_STAGE): bound where it is, as
             // `stage_buffer_content` binds one - the copy this recorder used to make is the one the worker made.
@@ -7734,18 +7737,31 @@ fn lab_sub_vstage(
                     pools.note_guest_read_recorded();
                     counters.note_buffer_guest_import(src.total_len, role);
                     bound
-                } else if let Some(bound) = unsafe { content_resident_bind(ctx, pools, counters, src)? } {
+                } else if let Some(bound) = if head == 0 {
+                    unsafe { content_resident_bind(ctx, pools, counters, src)? }
+                } else {
+                    None
+                } {
                     bound
                 } else {
                     let slot = unsafe { pools.acquire_staging(ctx, src.total_len, counters)? };
-                    unsafe { pools.write_staging_from_runs(ctx, &slot, &src.runs, src.source_offset, src.total_len)? };
+                    unsafe {
+                        pools.write_staging_from_runs_at(
+                            ctx,
+                            &slot,
+                            &src.runs,
+                            src.source_offset,
+                            src.total_len,
+                            head as u64,
+                        )?
+                    };
                     BoundBuffer::from(slot)
                 }
             }
             BufferContent::Bytes(bytes) => {
                 let slot = unsafe { pools.acquire_staging(ctx, bytes.len() as u64, counters)? };
                 // TEMP (lab, LANE_BYTES): the lane makes the copy.
-                unsafe { pools.write_staging_bytes_lane(ctx, &slot, bytes)? };
+                unsafe { pools.write_staging_bytes_lane_at(ctx, &slot, bytes, head)? };
                 BoundBuffer::from(slot)
             }
         };
