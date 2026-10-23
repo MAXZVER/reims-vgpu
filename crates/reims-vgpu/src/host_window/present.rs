@@ -456,6 +456,162 @@ fn needs_present(presented: Option<u64>, redraw_required: bool, incoming: Option
     redraw_required || presented != incoming
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_VSR_SETTLE_MS=N`): the scaled present runs
+/// its cheap filter while guest frames keep arriving, and once the shown frame
+/// has stood still for N ms the window presents it once more through the
+/// expensive upscaler (RTX VSR, or DLSS SR in its place) - motion at full rate,
+/// still content at full quality. `None` when unset: the upscaler, if on, runs
+/// on every frame.
+pub(crate) fn lab_present_settle() -> Option<std::time::Duration> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    MS.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PRESENT_VSR_SETTLE_MS").ok()?.trim().parse().ok().filter(|ms| *ms > 0)
+    })
+    .map(std::time::Duration::from_millis)
+}
+
+/// TEMP (lab, PRESENT_DLSSG): the steady present period while DLSS-G runs. DLSS-G paces the frames it generates
+/// from a steady stream of presents, as a game gives it; the window presents only when the guest drew - nothing on
+/// a still screen, bursts while scrolling - and Streamline lost its rhythm (Mish's work VM 10-22, 22k: 367 "Frame
+/// rate over 100ms, reseting frame timer" in 7 minutes, scrolling in visible jerks). With DLSS-G on the window
+/// re-presents the newest frame whenever none came for one period: `REIMS_VGPU_LAB_PRESENT_STEADY_HZ` (default
+/// 60, so DLSS-G makes 120 on the 120 Hz panel; 0 off). Off without DLSS-G (PRESENT_DLSSG=on, PRESENT_FG off).
+fn lab_steady_period() -> Option<std::time::Duration> {
+    static P: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        let dlssg = matches!(std::env::var("REIMS_VGPU_LAB_PRESENT_DLSSG").as_deref(), Ok("on" | "1")) && !lab_present_fg();
+        let hz = std::env::var("REIMS_VGPU_LAB_PRESENT_STEADY_HZ").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(60);
+        (dlssg && hz > 0).then(|| std::time::Duration::from_secs_f64(1.0 / f64::from(hz.min(240))))
+    })
+}
+
+/// TEMP (lab, PRESENT_VSR_SETTLE): set by the window for the one present that
+/// refines a settled frame; taken by the rail's scaled present.
+static LAB_REFINE_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// TEMP (lab, PRESENT_VSR_SETTLE): whether this present is the refining one
+/// (and clears the request).
+pub(crate) fn lab_take_refine_present() -> bool {
+    LAB_REFINE_PRESENT.swap(false, Ordering::AcqRel)
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_FG=on`): frame generation - while the
+/// guest draws slower than the monitor, the window presents at the monitor's
+/// rate and each present shows the guest's motion at that moment, built by the
+/// rail between the two newest guest frames from the hardware optical flow at
+/// the matching phase. Latched.
+pub(crate) fn lab_present_fg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("REIMS_VGPU_LAB_PRESENT_FG").as_deref(), Ok("on" | "1")))
+}
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_FG_DELAY`): how far behind the newest
+/// guest frame the shown motion runs, in guest frame intervals: 1.0 (default)
+/// interpolates every present smoothly at any guest rate; 0.5 halves the delay
+/// and is exact only for a guest at half the monitor's rate. Latched.
+fn lab_fg_delay() -> f64 {
+    static D: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_PRESENT_FG_DELAY")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|d| (0.25..=1.0).contains(d))
+            .unwrap_or(1.0)
+    })
+}
+
+/// TEMP (lab, PRESENT_FG): the phase that means "the guest frame itself".
+const LAB_FG_PHASE_REAL: u16 = u16::MAX;
+
+/// TEMP (lab, PRESENT_FG): `seq << 17 | flow << 16 | phase` of the present the
+/// window is about to make, 0 when none; taken by the rail.
+static LAB_FG_REQUEST: AtomicU64 = AtomicU64::new(0);
+
+/// TEMP (lab, PRESENT_FG): the frame sequence this present shows, whether a
+/// new frame should get the flow from the one before it, and the phase between
+/// the two to show (`None`: the frame itself).
+pub(crate) fn lab_take_fg_request() -> Option<(u64, bool, Option<f32>)> {
+    let v = LAB_FG_REQUEST.swap(0, Ordering::AcqRel);
+    let q = (v & 0xFFFF) as u16;
+    (v != 0).then_some((v >> 17, v & (1 << 16) != 0, (q != LAB_FG_PHASE_REAL).then(|| f32::from(q) / 65534.0)))
+}
+
+/// TEMP (lab, PRESENT_VSR_TILES): when the rail wants another present to
+/// refine more still cells - microseconds after [`lab_epoch`] plus one, 0 for
+/// none. Set by the rail after every present that refines; taken by the window.
+static LAB_TILES_DUE_US: AtomicU64 = AtomicU64::new(0);
+
+fn lab_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// TEMP (lab, PRESENT_VSR_TILES): the rail's next refine deadline.
+pub(crate) fn lab_note_tiles_due(at: Option<std::time::Instant>) {
+    let v = at.map_or(0, |at| at.saturating_duration_since(lab_epoch()).as_micros() as u64 + 1);
+    LAB_TILES_DUE_US.store(v, Ordering::Release);
+}
+
+fn lab_tiles_due() -> Option<std::time::Instant> {
+    let v = LAB_TILES_DUE_US.load(Ordering::Acquire);
+    (v != 0).then(|| lab_epoch() + std::time::Duration::from_micros(v - 1))
+}
+
+/// TEMP (lab, PRESENT_FG): set by the rail when the present it just made
+/// showed a generated frame; otherwise the window stops interpolating that pair.
+static LAB_FG_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// TEMP (lab, PRESENT_FG): the rail drew a generated frame into this present.
+pub(crate) fn lab_note_fg_shown() {
+    LAB_FG_SHOWN.store(true, Ordering::Release);
+}
+
+/// TEMP (lab, PRESENT_FG): how long interpolation stays off after three misses in a row before one present asks
+/// again (see `LabFg::not_shown`).
+const LAB_FG_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// TEMP (lab, PRESENT_FG): the two newest guest frames as the window saw
+/// them arrive, and the presents the interpolation between them still wants.
+#[derive(Default)]
+struct LabFg {
+    /// The newest guest frame and when the window first saw it.
+    cur: Option<(u64, std::time::Instant)>,
+    /// The interval from the frame before it, when one to interpolate across
+    /// (short enough, and the guest slower than the monitor).
+    interval: Option<std::time::Duration>,
+    /// When the next interpolated present is due (`None`: none pending).
+    next_at: Option<std::time::Instant>,
+    /// The (frame, phase) last presented.
+    shown: Option<(u64, u16)>,
+    /// The window's monitor refresh period, asked once.
+    monitor_period: Option<std::time::Duration>,
+    /// The guest's own frame rate (published frames per second over ~250 ms,
+    /// from the frame sequence - not what the window picked up), and where
+    /// the current measurement started.
+    guest_hz: f64,
+    rate_from: Option<(std::time::Instant, u64)>,
+    /// Presents in a row that asked for a generated frame and got the guest
+    /// frame (no scaled present, no optical flow): at 3 the window stops
+    /// interpolating, so it does not hold each new frame for a tick in vain -
+    /// for [`LAB_FG_RETRY`], then one present asks again (since the boot's own
+    /// frames, shown before the guest's scaled mode, set it off for good: Mish's
+    /// work VM ran without generated frames all of 2026-10-22, b985/b986 too).
+    not_shown: u32,
+    /// When interpolation went off (at the third miss in a row).
+    off_since: Option<std::time::Instant>,
+    /// Presents in a row that came back Busy (a window that cannot present,
+    /// e.g. minimised): after 8 the deadlines retry every 50 ms, not every 1 ms.
+    busy_streak: u32,
+}
+
+/// TEMP (lab, PRESENT_VSR_SETTLE): when the last fresh frame reached the screen
+/// and which frame was last refined.
+#[derive(Default)]
+struct LabSettle {
+    fresh_at: Option<std::time::Instant>,
+    refined_seq: Option<u64>,
+}
+
 /// The absolute pointer event a window position becomes: `(x, y, width,
 /// height)` for [`HostAction::input_pointer_move`], whose consumer scales `x`
 /// against `width` (`min_in = 0`, `max_in = dim`).
@@ -514,15 +670,32 @@ fn guest_resize_request(
     mode == WindowMode::Sized && observed != Some(incoming) && incoming != window && !lab_fixed_window()
 }
 
-/// TEMP (lab, `REIMS_VGPU_LAB_FIXED_WINDOW=1`): the window keeps the size it
-/// opened at and the presenter scales every guest mode into it — the scaled
-/// present path (`REIMS_VGPU_LAB_PRESENT_SHARP`) without a full-screen window.
+/// TEMP (lab, `REIMS_VGPU_LAB_FIXED_WINDOW=1` or `=WxH`): the window keeps
+/// the size it opened at (with `WxH`, opens at that size) and the presenter
+/// scales every guest mode into it — the scaled present path
+/// (`REIMS_VGPU_LAB_PRESENT_SHARP`) without a full-screen window, e.g. the
+/// work VM's 5120x2160 screen for an off-screen lab window.
 fn lab_fixed_window() -> bool {
     if cfg!(test) {
         return false;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("REIMS_VGPU_LAB_FIXED_WINDOW").as_deref(), Ok("1" | "on")))
+    lab_fixed_window_value().is_some()
+}
+
+/// `Some(None)` for `1`/`on`, `Some(Some((w, h)))` for `WxH`. Latched.
+fn lab_fixed_window_value() -> Option<Option<(u32, u32)>> {
+    static V: std::sync::OnceLock<Option<Option<(u32, u32)>>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let v = std::env::var("REIMS_VGPU_LAB_FIXED_WINDOW").ok()?;
+        match v.trim() {
+            "1" | "on" => Some(None),
+            s => {
+                let (w, h) = s.split_once('x')?;
+                let (w, h): (u32, u32) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+                (w > 0 && h > 0).then_some(Some((w, h)))
+            }
+        }
+    })
 }
 
 /// How a `Resized` event answers an outstanding guest-driven request, or
@@ -729,7 +902,26 @@ pub fn spawn(
 ) -> std::thread::JoinHandle<Result<(), WindowError>> {
     std::thread::Builder::new()
         .name("reims-vgpu-window".to_string())
-        .spawn(move || run(config, on_input, frames, stop, wake, guest_cursor))
+        .spawn(move || {
+            // The VM keeps running whatever this thread does, so how the window
+            // ended is said on the failure channel the moment it ends: an early
+            // `Err` (no display, a second event loop in the process) or a panic
+            // used to surface only at `window_stop`'s join, if ever - a frozen
+            // or absent window and a clean log.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(config, on_input, frames, stop, wake, guest_cursor)
+            })) {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => {
+                    crate::observe::fail(format!("host_window_thread_failed reason={e:?}"));
+                    Err(e)
+                }
+                Err(payload) => {
+                    crate::observe::panic::report("host_window_thread", payload.as_ref());
+                    Err(WindowError::RunApp("window thread panicked".to_string()))
+                }
+            }
+        })
         .expect("spawn reims-vgpu-window thread")
 }
 
@@ -907,6 +1099,12 @@ struct App {
     /// forward by every redraw request, so a steady publish stream never lets it
     /// fire; see [`WINDOW_REDRAW_BACKSTOP`] for what it is a floor under.
     next_backstop: std::time::Instant,
+    /// TEMP (lab, PRESENT_VSR_SETTLE).
+    lab_settle: LabSettle,
+    /// TEMP (lab, PRESENT_FG).
+    lab_fg: LabFg,
+    /// TEMP (lab, PRESENT_DLSSG): when the next steady re-present is due ([`lab_steady_period`]).
+    lab_steady_next: Option<std::time::Instant>,
     /// Frame seq the drawable currently holds, or `None` before the first
     /// present.
     last_presented_seq: Option<u64>,
@@ -945,6 +1143,11 @@ struct App {
     /// guest's cursor at once; unfocused, only once the host's own mouse has
     /// been left alone (see `apply_guest_cursor`).
     focused: bool,
+    /// Mouse buttons the guest was told are down. Focus loss sends no release
+    /// for them (winit synthesises none on `WM_CAPTURECHANGED` or deactivation),
+    /// so a button held through Alt+Tab stayed down in the guest until the next
+    /// click; [`WindowEvent::Focused`] releases them the way the keyboard does.
+    held_buttons: Vec<crate::runtime::input::ReimsVgpuButton>,
     /// TEMP lab: `REIMS_VGPU_LAB_WINDOW_BACKGROUND=1` — the window is off screen
     /// and never places the host pointer.
     lab_background: bool,
@@ -1052,12 +1255,14 @@ impl ApplicationHandler<FramePublished> for App {
         // host's mouse moving over this window unfocused, its `CursorMoved`
         // is still input.
         event_loop.listen_device_events(DeviceEvents::Always);
+        // TEMP (lab): `REIMS_VGPU_LAB_FIXED_WINDOW=WxH` opens at that size.
+        let (open_w, open_h) = match lab_fixed_window_value() {
+            Some(Some(size)) if !cfg!(test) => size,
+            _ => (self.config.width, self.config.height),
+        };
         let mut attrs = Window::default_attributes()
             .with_title(self.config.title.clone())
-            .with_inner_size(winit::dpi::PhysicalSize::new(
-                self.config.width,
-                self.config.height,
-            ));
+            .with_inner_size(winit::dpi::PhysicalSize::new(open_w, open_h));
         // TEMP (lab): `REIMS_VGPU_LAB_WINDOW_BACKGROUND=1` opens the window off
         // screen, without activating it and without a taskbar button, so lab
         // runs (device-side frame dumps, census, QMP input) can go on while the
@@ -1197,6 +1402,11 @@ impl ApplicationHandler<FramePublished> for App {
                 // also where the desktop's shortcuts are taken and handed back.
                 let effect = self.keyboard.focus(focused);
                 self.apply_key_effect(effect);
+                if !focused {
+                    for btn in std::mem::take(&mut self.held_buttons) {
+                        (self.on_input)(HostAction::input_pointer_button(btn, false));
+                    }
+                }
                 self.focused = focused;
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1215,10 +1425,15 @@ impl ApplicationHandler<FramePublished> for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(btn) = input_map::mouse_button(button) {
-                    (self.on_input)(HostAction::input_pointer_button(
-                        btn,
-                        state == ElementState::Pressed,
-                    ));
+                    let down = state == ElementState::Pressed;
+                    if down {
+                        if !self.held_buttons.contains(&btn) {
+                            self.held_buttons.push(btn);
+                        }
+                    } else {
+                        self.held_buttons.retain(|&b| b != btn);
+                    }
+                    (self.on_input)(HostAction::input_pointer_button(btn, down));
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1310,14 +1525,28 @@ impl ApplicationHandler<FramePublished> for App {
             }
             let now = std::time::Instant::now();
             let pending = std::mem::take(&mut self.frame_pending);
-            if redraw_due(pending, now, self.next_backstop) {
+            // TEMP (lab, PRESENT_FG): the next interpolated present is a deadline of its own.
+            // Not while a guest resize holds every draw (they would be asked
+            // for every tick until it settles).
+            let held = self.pending_guest_resize.is_some();
+            let owed_at = self.lab_fg.next_at.filter(|_| !held);
+            let owed_due = owed_at.is_some_and(|at| now >= at);
+            // TEMP (lab, PRESENT_VSR_TILES): so is the next refine.
+            let tiles_at = lab_tiles_due().filter(|_| !held);
+            let tiles_now = tiles_at.is_some_and(|at| now >= at);
+            // TEMP (lab, PRESENT_DLSSG): and the next steady re-present, once a frame was shown.
+            let steady_at = self.lab_steady_next.filter(|_| !held && lab_steady_period().is_some());
+            let steady_now = steady_at.is_some_and(|at| now >= at);
+            if redraw_due(pending || owed_due || tiles_now || steady_now, now, self.next_backstop) {
                 window.request_redraw();
                 self.loop_census.redraws_asked += 1;
                 self.next_backstop = now + WINDOW_REDRAW_BACKSTOP;
             }
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                self.next_backstop,
-            ));
+            let wake = [owed_at.filter(|_| !owed_due), tiles_at.filter(|_| !tiles_now), steady_at.filter(|_| !steady_now)]
+                .into_iter()
+                .flatten()
+                .fold(self.next_backstop, std::cmp::Ord::min);
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(wake));
         }
     }
 
@@ -1445,6 +1674,9 @@ impl App {
             // guest frame.
             frame_pending: true,
             next_backstop: std::time::Instant::now(),
+            lab_settle: LabSettle::default(),
+            lab_fg: LabFg::default(),
+            lab_steady_next: None,
             last_presented_seq: None,
             last_presented_atomic: Arc::new(AtomicU64::new(0)),
             redraw_required: true,
@@ -1460,6 +1692,7 @@ impl App {
             host_pointer: None,
             warp: WarpGate::default(),
             focused: false,
+            held_buttons: Vec::new(),
             lab_background: false,
         }
     }
@@ -1786,6 +2019,100 @@ impl App {
     /// presenter before the loop ends, and an attach that failed never stored a
     /// window at all. Both already named themselves where they happened, so a
     /// redraw arriving after either is expected control flow and stays quiet.
+    /// TEMP (lab, PRESENT_FG): what a present now shows for guest frame `seq`:
+    /// `(seq, phase, flow)` - the phase between the frame before it and it
+    /// ([`LAB_FG_PHASE_REAL`] for the frame itself), and whether the frame,
+    /// when new to the rail, should get the flow from the one before it.
+    fn lab_fg_plan(&mut self, seq: u64) -> (u64, u16, bool) {
+        let now = std::time::Instant::now();
+        if self.lab_fg.monitor_period.is_none() {
+            self.lab_fg.monitor_period = self
+                .window
+                .as_ref()
+                .and_then(|w| w.current_monitor())
+                .and_then(|m| m.refresh_rate_millihertz())
+                .filter(|&mhz| mhz > 0)
+                .map(|mhz| std::time::Duration::from_secs_f64(1000.0 / f64::from(mhz)));
+        }
+        match self.lab_fg.rate_from {
+            Some((at, from)) if now.duration_since(at) >= std::time::Duration::from_millis(250) => {
+                self.lab_fg.guest_hz = seq.saturating_sub(from) as f64 / now.duration_since(at).as_secs_f64();
+                self.lab_fg.rate_from = Some((now, seq));
+            }
+            Some(_) => {}
+            None => self.lab_fg.rate_from = Some((now, seq)),
+        }
+        if self.lab_fg.cur.map(|(s, _)| s) != Some(seq) {
+            let before = self.lab_fg.cur.map(|(_, at)| at);
+            self.lab_fg.cur = Some((seq, now));
+            let period = self.lab_fg.monitor_period.unwrap_or(std::time::Duration::from_micros(8333));
+            // Interpolate across a gap of motion (not the first frame after a
+            // pause, which shows at once) while the guest is slower than the
+            // monitor (at its rate every present has a new frame already).
+            self.lab_fg.interval = before
+                .map(|at| now.duration_since(at))
+                .filter(|d| *d >= period && *d <= std::time::Duration::from_millis(50))
+                .filter(|_| self.lab_fg.guest_hz * period.as_secs_f64() < 0.9);
+        }
+        let Some((_, at)) = self.lab_fg.cur else {
+            return (seq, LAB_FG_PHASE_REAL, false);
+        };
+        if self.lab_fg.off_since.is_some_and(|at| now.duration_since(at) >= LAB_FG_RETRY) {
+            // One more try: a miss sets it off again at once, a drawn midpoint clears it.
+            self.lab_fg.off_since = None;
+            self.lab_fg.not_shown = 2;
+        }
+        let Some(interval) = self.lab_fg.interval.filter(|_| self.lab_fg.not_shown < 3) else {
+            return (seq, LAB_FG_PHASE_REAL, false);
+        };
+        let phase = now.duration_since(at).as_secs_f64() / interval.as_secs_f64() + (1.0 - lab_fg_delay());
+        let q = if phase >= 0.995 { LAB_FG_PHASE_REAL } else { (phase.max(0.0) * 65534.0) as u16 };
+        // No flow for a frame whose first present already shows it whole (a late
+        // tick): the present would only wait for it.
+        (seq, q, q != LAB_FG_PHASE_REAL)
+    }
+
+    /// TEMP (lab, PRESENT_FG): a present showed `(seq, phase)`; schedule the
+    /// next one while the shown motion has not reached the frame itself.
+    fn lab_fg_presented(&mut self, seq: u64, phase: u16) {
+        let now = std::time::Instant::now();
+        let drew = LAB_FG_SHOWN.swap(false, Ordering::AcqRel);
+        let phase = if phase != LAB_FG_PHASE_REAL && !drew {
+            // The rail showed the frame itself (no scaled present, no pair):
+            // nothing more to interpolate for it.
+            self.lab_fg.not_shown += 1;
+            if self.lab_fg.not_shown == 3 {
+                self.lab_fg.off_since = Some(now);
+                if crate::observe::first_sight("present_fg_not_shown", 0) {
+                    crate::observe::fail(format!(
+                        "present_fg_not_shown x3: interpolation off, retried every {} ms",
+                        LAB_FG_RETRY.as_millis()
+                    ));
+                }
+            }
+            LAB_FG_PHASE_REAL
+        } else {
+            if drew {
+                if self.lab_fg.not_shown >= 2 && crate::observe::first_sight("present_fg_resumed", 0) {
+                    crate::observe::off("present_fg resumed: a generated frame drawn after the off-switch".to_string());
+                }
+                self.lab_fg.not_shown = 0;
+                self.lab_fg.off_since = None;
+            }
+            phase
+        };
+        self.lab_fg.shown = Some((seq, phase));
+        // The next tick of the monitor's grid; the phase there may already be
+        // the frame itself.
+        self.lab_fg.next_at = match (phase != LAB_FG_PHASE_REAL, self.lab_fg.interval) {
+            (true, Some(_)) => {
+                let period = self.lab_fg.monitor_period.unwrap_or(std::time::Duration::from_micros(8333));
+                Some(now + period)
+            }
+            _ => None,
+        };
+    }
+
     fn draw(&mut self) {
         if !self.presenter_attached {
             return;
@@ -1807,9 +2134,69 @@ impl App {
         if drag_seq != 0 {
             self.last_presented_seq = Some(drag_seq);
         }
-        if !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq) {
+        // TEMP (lab, PRESENT_VSR_SETTLE): the shown frame has stood still long
+        // enough and was not refined yet - present it once more, refining.
+        let refining = !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq)
+            && incoming_seq.is_some()
+            && self.lab_settle.refined_seq != incoming_seq
+            && lab_present_settle().is_some_and(|settle| {
+                self.lab_settle.fresh_at.is_some_and(|at| at.elapsed() >= settle)
+            });
+        // TEMP (lab, PRESENT_FG): what this present would show between the two
+        // newest guest frames, and whether the interpolation wants it now.
+        let fg_plan = incoming_seq.filter(|_| lab_present_fg()).map(|seq| self.lab_fg_plan(seq));
+        let fg_owed = fg_plan.is_some_and(|(seq, phase, _)| {
+            self.lab_fg.shown != Some((seq, phase))
+                && self.lab_fg.next_at.is_some_and(|at| std::time::Instant::now() >= at)
+        });
+        // TEMP (lab, PRESENT_VSR_TILES): still cells are waiting for a present
+        // to be refined in.
+        let tiles_came_due = lab_tiles_due().is_some_and(|at| std::time::Instant::now() >= at);
+        let tiles_due = !fg_owed && incoming_seq.is_some() && tiles_came_due;
+        // With no frame there is nothing to refine: a deadline left standing
+        // would keep the loop asking for redraws every tick.
+        if tiles_due || (tiles_came_due && incoming_seq.is_none()) {
+            LAB_TILES_DUE_US.store(0, Ordering::Release);
+        }
+        // A new frame presents anyway (and keeps its midpoint); only a still
+        // one is re-presented for the refine.
+        let refining = refining
+            || (tiles_due && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq));
+        // TEMP (lab, PRESENT_FG): while interpolating, presents keep to the
+        // monitor's grid - a new frame waits for the next tick instead of
+        // presenting at once, where it would show phase 0 (the frame before it,
+        // already on screen).
+        if !refining
+            && !fg_owed
+            && fg_plan.is_some_and(|(_, _, flow)| flow)
+            && needs_present(self.last_presented_seq, self.redraw_required, incoming_seq)
+        {
+            if self.lab_fg.next_at.is_none() {
+                let period = self.lab_fg.monitor_period.unwrap_or(std::time::Duration::from_micros(8333));
+                self.lab_fg.next_at = Some(std::time::Instant::now() + period);
+            }
             self.loop_census.draws_stale += 1;
             return;
+        }
+        // TEMP (lab, PRESENT_DLSSG): no new frame for one steady period - the shown one again, for DLSS-G's pacing.
+        // Not a fresh frame: it neither restarts the settle clock nor counts as refined.
+        let steady = !refining
+            && !fg_owed
+            && incoming_seq.is_some()
+            && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq)
+            && lab_steady_period().is_some()
+            && self.lab_steady_next.is_some_and(|at| std::time::Instant::now() >= at);
+        if !refining && !fg_owed && !steady && !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq) {
+            self.loop_census.draws_stale += 1;
+            return;
+        }
+        if let Some((seq, phase, flow)) = fg_plan {
+            LAB_FG_SHOWN.store(false, Ordering::Release);
+            LAB_FG_REQUEST.store(seq << 17 | u64::from(flow) << 16 | u64::from(phase), Ordering::Release);
+        }
+        if refining {
+            LAB_REFINE_PRESENT.store(true, Ordering::Release);
+            self.lab_settle.refined_seq = incoming_seq;
         }
         self.loop_census.draws_fresh += 1;
         let lab_t0 = std::time::Instant::now(); // TEMP (lab)
@@ -1819,7 +2206,23 @@ impl App {
         );
         lab_host_present_note(lab_t0.elapsed());
         match result {
-            Ok(WindowPresentOutcome::Busy) => {}
+            Ok(WindowPresentOutcome::Busy) => {
+                // TEMP (lab, PRESENT_FG / PRESENT_VSR_TILES): a deadline that came
+                // due retries shortly instead of every loop tick (a past deadline
+                // that no present consumes keeps the loop polling).
+                self.lab_fg.busy_streak = self.lab_fg.busy_streak.saturating_add(1);
+                let backoff = if self.lab_fg.busy_streak < 8 { 1 } else { 50 };
+                let retry = std::time::Instant::now() + std::time::Duration::from_millis(backoff);
+                if self.lab_fg.next_at.is_some() {
+                    self.lab_fg.next_at = Some(retry);
+                }
+                if tiles_due {
+                    lab_note_tiles_due(Some(retry));
+                }
+                if self.lab_steady_next.is_some() {
+                    self.lab_steady_next = Some(retry);
+                }
+            }
             Ok(WindowPresentOutcome::Presented {
                 direct,
                 width,
@@ -1835,6 +2238,17 @@ impl App {
                 // lifetime cap and a rail that recovers eight times is left dark
                 // after the third. See [`presenter_rebuild_budget`].
                 self.presenter_rebuilds = 0;
+                self.lab_fg.busy_streak = 0;
+                if !refining && !steady {
+                    self.lab_settle.fresh_at = Some(std::time::Instant::now());
+                }
+                // TEMP (lab, PRESENT_DLSSG): every present (guest, refine or steady) restarts the steady period.
+                if let Some(period) = lab_steady_period() {
+                    self.lab_steady_next = Some(std::time::Instant::now() + period);
+                }
+                if let Some((seq, phase, _)) = fg_plan {
+                    self.lab_fg_presented(seq, phase);
+                }
                 self.last_presented_seq = incoming_seq;
                 if let Some(seq) = incoming_seq {
                     self.last_presented_atomic.store(seq, Ordering::Release);
@@ -2644,8 +3058,13 @@ mod win32_drag {
     }
 
     fn present_latest_frame(state: &DragHookState) {
-        if let Ok(guard) = state.frames.lock() {
-            if let Some(frame) = guard.as_ref() {
+        // The frame is cloned out and the slot's lock let go before the present,
+        // as `draw` does: held through `window_present` (its fence wait, a
+        // swapchain recreate) it stalled the drain's `window_write_frame` - with
+        // the device lock held - for every move and resize step of the window.
+        let latest = state.frames.lock().ok().and_then(|guard| guard.clone());
+        {
+            if let Some(frame) = latest.as_ref() {
                 let seq = frame.seq;
                 let prev = state.last_presented_seq.load(Ordering::Acquire);
                 if seq != prev && state.last_presented_seq.compare_exchange(prev, seq, Ordering::AcqRel, Ordering::Acquire).is_ok() {

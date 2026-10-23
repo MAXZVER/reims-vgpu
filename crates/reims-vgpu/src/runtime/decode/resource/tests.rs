@@ -311,6 +311,36 @@ fn an_attribute_count_past_the_bound_refuses_and_names_both_numbers() {
     );
 }
 
+/// A layout count past `MAX_VERTEX_LAYOUTS` refuses on the count, as the
+/// attribute count does, instead of walking a guest-sized loop of entries.
+#[test]
+fn a_layout_count_past_the_bound_refuses_on_the_count() {
+    let cap = crate::observe::FailCapture::start();
+    let mut over = vertex_block_on_buffer(&[], 0);
+    let layout_rel = u32::from_le_bytes(over[9..13].try_into().unwrap()) as usize;
+    let declared = u32::MAX;
+    st32(&mut over[layout_rel..], declared);
+    assert_eq!(
+        parse_vertex_block(&over, 0, over.len()),
+        Err(DecodeStatus::ErrUnsupported("res_vertex_layout_count_over"))
+    );
+    assert_eq!(
+        cap.one("res_vertex_block"),
+        format!(
+            "res_vertex_block reason=vertex_descriptor_truncated \
+             what=layout_count declared={declared} max={MAX_VERTEX_LAYOUTS}"
+        )
+    );
+    // At the bound the count is admitted (the missing entries are a separate,
+    // structural refusal).
+    let mut at = vertex_block_on_buffer(&[], 0);
+    st32(&mut at[layout_rel..], MAX_VERTEX_LAYOUTS as u32);
+    assert!(!matches!(
+        parse_vertex_block(&at, 0, at.len()),
+        Err(DecodeStatus::ErrUnsupported("res_vertex_layout_count_over"))
+    ));
+}
+
 /// A well-formed heap-texture record, with the bytes the serializer does
 /// not write left as the caller asks.
 fn heap_texture_record(use_offset_byte: u8, ring: u8, offset: u64) -> Vec<u8> {

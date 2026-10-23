@@ -270,6 +270,12 @@ pub fn tight_pyramid_spans(
     if levels == 0 {
         return None;
     }
+    // The count sizes the reservation below. Past 32 levels every axis of a
+    // `u32` extent has bottomed out at 1 long ago, so a larger count is no
+    // pyramid any descriptor declares, only a guest-sized allocation.
+    if levels > u32::BITS {
+        return None;
+    }
     let mut spans = alloc::vec::Vec::with_capacity(levels as usize);
     let mut offset: usize = 0;
     for level in 0..levels {

@@ -122,6 +122,24 @@ enum ComputeImageDst {
     Direct(super::GuestCopyPlan),
 }
 
+/// Put back the registry accesses a refused submission's notes had advanced.
+///
+/// `execute_compute_inner` notes each multisample barrier's landing access at
+/// the barrier itself — the right order for a command buffer that runs. An
+/// `end_command_buffer`/`submit` refusal (or a forced loss that never submits)
+/// means those barriers never execute, so the registry would name layouts the
+/// images are not in and the next barrier over them reads a false `oldLayout`:
+/// undefined behaviour, not a validation error, durable for the boot. This
+/// restores exactly the slots the notes moved.
+fn rollback_noted_access(
+    pools: &mut ResourcePools,
+    noted: &mut Vec<(super::types::TargetIdentity, super::pools::ResidentAccess)>,
+) {
+    for (identity, prev) in noted.drain(..) {
+        pools.registry_note_access(&identity, prev);
+    }
+}
+
 pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
     if req.spirv.is_empty() {
         return Err(DrawError::ComputeValidation(
@@ -351,12 +369,19 @@ fn resident_sample_exact(
 /// for anything that is not a `UniformConstant` descriptor, so a storage buffer,
 /// whose root this walk cannot resolve, is never refused on a guess.
 fn used_binding_absent_from_layout(spirv: &[u32], layout: &[BindingSig]) -> Option<u32> {
-    crate::runtime::spirv_bind::declared_binding_numbers(spirv)
-        .into_iter()
-        .find(|binding| {
-            !layout.iter().any(|b| b.binding == *binding)
-                && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding).is_violation()
-        })
+    // A frame that does not walk whole has an unknowable used-binding list;
+    // the sentinel sits in no layout, so this refuses the dispatch by name
+    // rather than letting a used binding past the backstop on a partial scan.
+    crate::runtime::spirv_bind::declared_binding_numbers(spirv).map_or_else(
+        || Some(crate::runtime::spirv_bind::BROKEN_FRAME_BINDING),
+        |declared| {
+            declared.into_iter().find(|binding| {
+                !layout.iter().any(|b| b.binding == *binding)
+                    && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding)
+                        .is_violation()
+            })
+        },
+    )
 }
 
 pub(crate) unsafe fn execute_compute_inner(
@@ -528,6 +553,57 @@ pub(crate) unsafe fn execute_compute_inner(
                     group_count: region.group_count,
                     push: Some((*push_offset, region.push_constants)),
                 });
+            }
+        }
+    }
+
+    // Device limits, before anything is recorded: a grid or a workgroup the
+    // device cannot dispatch is refused by name rather than issued.
+    {
+        let f = &ctx.features;
+        let over = |local: Option<[u32; 3]>, count: [u32; 3]| {
+            (0..3).any(|i| count[i] > f.max_compute_workgroup_count[i])
+                || local.is_some_and(|l| {
+                    (0..3).any(|i| l[i] > f.max_compute_workgroup_size[i])
+                        || u64::from(l[0]) * u64::from(l[1]) * u64::from(l[2])
+                            > u64::from(f.max_compute_workgroup_invocations)
+                })
+        };
+        let regions: Vec<(Option<[u32; 3]>, [u32; 3])> = match &req.dispatch {
+            ComputeDispatch::Workgroups(grid) => vec![(None, *grid)],
+            ComputeDispatch::Regions { regions, .. } => {
+                regions.iter().map(|r| (Some(r.local_size), r.group_count)).collect()
+            }
+        };
+        if let Some((region, (local, count))) =
+            regions.iter().enumerate().find(|(_, (l, c))| over(*l, *c))
+        {
+            return Err(DrawError::ComputeValidation(
+                ComputeValidationDecline::DispatchOverDeviceLimit {
+                    region,
+                    local_size: local.unwrap_or([0; 3]),
+                    group_count: *count,
+                    max_count: f.max_compute_workgroup_count,
+                    max_size: f.max_compute_workgroup_size,
+                },
+            ));
+        }
+        let max = f.max_image_dimension_2d;
+        let images = req
+            .sampled_images
+            .iter()
+            .map(|i| (i.binding, i.width, i.height))
+            .chain(req.storage_images.iter().map(|i| (i.binding, i.width, i.height)));
+        for (binding, width, height) in images {
+            if width > max || height > max {
+                return Err(DrawError::ComputeValidation(
+                    ComputeValidationDecline::ImageOverDeviceLimit {
+                        binding,
+                        width,
+                        height,
+                        max,
+                    },
+                ));
             }
         }
     }
@@ -1171,6 +1247,16 @@ pub(crate) unsafe fn execute_compute_inner(
     // the only transition they get, and it is owed for the same reason the
     // render rail's `PreparedSampled::Resident` arm owes one: the resident's
     // last touch was a colour write by another submission.
+    //
+    // Rollback pair: each note remembers what the slot held before it, because
+    // the note is at the barrier for a command buffer that *runs* — an
+    // end/submit refusal below leaves these barriers unexecuted forever, and a
+    // registry naming layouts the images are not in hands the next barrier a
+    // false oldLayout (undefined behaviour, not a validation error).
+    let mut noted_access: Vec<(
+        super::types::TargetIdentity,
+        super::pools::ResidentAccess,
+    )> = Vec::new();
     for prepared in &sampled_slots {
         let PreparedSampledImage::MultisampleTarget {
             identity,
@@ -1191,7 +1277,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 .new_layout(next_access.layout())
                 .image(*image)
                 .subresource_range(super::color_subresource_range())];
-            crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
+            crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device,
                 cb,
                 src_stage,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1203,6 +1289,9 @@ pub(crate) unsafe fn execute_compute_inner(
         }
         // After the barrier is recorded, so the registry never claims a layout
         // this command buffer has not been told to place the image in.
+        if let Some(prev) = pools.registry_get(identity).map(|slot| slot.access) {
+            noted_access.push((identity.clone(), prev));
+        }
         pools.registry_note_access(identity, *next_access);
     }
 
@@ -1366,9 +1455,10 @@ pub(crate) unsafe fn execute_compute_inner(
 
     unsafe { pools.gpu_span_seal_current(ctx, cb) };
     crate::backend::vulkan::engine::cmd_sink::sync();
-    ctx.device
-        .end_command_buffer(cb)
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecEndCb, e)))?;
+    ctx.device.end_command_buffer(cb).map_err(|e| {
+        rollback_noted_access(pools, &mut noted_access);
+        DrawError::VkCall(VkCall::new(VkOp::ComputeExecEndCb, e))
+    })?;
 
     if force_loss {
         if let (Some(ds), Some(pool)) = (dset, dset_pool) {
@@ -1377,6 +1467,7 @@ pub(crate) unsafe fn execute_compute_inner(
         pools.recycle_staging();
         pools.recycle_readback();
         pools.recycle_storage_images();
+        rollback_noted_access(pools, &mut noted_access);
         return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedCompute));
     }
 
@@ -1389,7 +1480,13 @@ pub(crate) unsafe fn execute_compute_inner(
                 result: e,
             }));
         }
-        Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ComputeExecSubmit, e))),
+        Err(e) => {
+            // The command buffer never runs; put the registry back with the
+            // facts. A device loss needs nothing here - recovery flushes the
+            // whole registry anyway.
+            rollback_noted_access(pools, &mut noted_access);
+            return Err(DrawError::VkCall(VkCall::new(VkOp::ComputeExecSubmit, e)));
+        }
     }
 
     // The copy into guest pages is on the queue now, so the debt is owed from
@@ -1431,6 +1528,16 @@ pub(crate) unsafe fn execute_compute_inner(
     // nothing to read back, so it belongs on the deferred side exactly as a
     // read-only SSBO does. Its ordering does not come from this wait — see
     // `ComputeImageDestination::GuestPages` for the stamp chain that carries it.
+    // The submitted command buffer leaves every resident storage image in
+    // TRANSFER_SRC with this dispatch's output, whether or not the wait below
+    // succeeds: the registry records that now, so a failed wait cannot leave
+    // it naming the layout and generation the image had before.
+    for prepared in &simg_slots {
+        if let Some(residency) = prepared.residency {
+            pools.mark_resident_storage_image(&residency.identity, residency.output_generation);
+        }
+    }
+
     let all_writeback_deferred = storage_slots.iter().all(|(_, _, _, writable)| !writable)
         && simg_slots
             .iter()
@@ -1449,12 +1556,6 @@ pub(crate) unsafe fn execute_compute_inner(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
         pools.retire_all(ctx, counters)?;
-    }
-
-    for prepared in &simg_slots {
-        if let Some(residency) = prepared.residency {
-            pools.mark_resident_storage_image(&residency.identity, residency.output_generation);
-        }
     }
 
     let mut buffers = Vec::with_capacity(

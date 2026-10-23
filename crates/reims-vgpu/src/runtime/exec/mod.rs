@@ -1069,7 +1069,12 @@ fn load_command_streams<M: HostMemory + HostOps>(
             ));
             continue;
         };
-        let mut stream = vec![0u8; stream_len];
+        let Some(mut stream) = crate::runtime::draw::guest_zeroed(stream_len) else {
+            crate::observe::fail(format!(
+                "exec_cmdbuf skip task={task_id} i={i} gva={gva:#x} len={length} (host_commit)"
+            ));
+            continue;
+        };
         // Product x86 uses page_shift=12; the unshifted helper defaults to arm14
         // and silently fails every stream load on Ventura/Tahoe x86.
         if gva_mem::read_task_gva_by_id(host, &state.tasks, task_id, gva, &mut stream, page_shift)
@@ -3395,7 +3400,7 @@ fn handle_blit_transfer_record<M: HostMemory + HostOps>(
             crate::backend::selected().wait_recorded_gpu_work();
         }
         #[cfg(feature = "backend-vulkan")]
-        crate::runtime::draw::vulkan::lab_resolve_memo_wrote(task_id, m.texture_ref);
+        crate::runtime::draw::vulkan::lab_resolve_memo_wrote(state, task_id, m.texture_ref);
         match mipmap::generate_mipmaps_linear(state, host, task_id, m.texture_ref) {
             MipmapStatus::Ok => {}
             st => {
@@ -7062,7 +7067,7 @@ fn finish_stream_g<M: HostMemory + HostOps>(
                                         resident_chain_before_this_record;
                                     resident_chain_before_this_record = resident_chain;
                                     crate::runtime::draw::vulkan::record_plane_draw(req);
-                                    crate::runtime::draw::vulkan::lab_resolve_memo_record(req);
+                                    crate::runtime::draw::vulkan::lab_resolve_memo_record(&*st, req);
                                     crate::runtime::draw::vulkan::lab_tile_draw_with(&*st, req);
                                     crate::runtime::drain::note_store_route("draw_par_committed");
                                     fin.enter(crate::runtime::drain::FinishPhase::Result);
@@ -8315,7 +8320,11 @@ fn apply_clear<M: HostMemory + HostOps>(
             (true, ClearImageEncoding::Rgba8) => {
                 let converts =
                     pixel_format::tight_row_bytes(c0.width, c0.format).is_some_and(|tight| {
-                        converted.resize(tight as usize, 0);
+                        // Guest-sized row: a refused allocation drops the clear by name.
+                        let Some(row) = draw::guest_zeroed(tight as usize) else {
+                            return false;
+                        };
+                        converted = row;
                         pixel_format::Rgba8ToRow::for_format(c0.format).is_some_and(|rail| {
                             rail.convert(clear.pixels(), c0.width, &mut converted)
                         })
@@ -8452,7 +8461,10 @@ pub(crate) fn lab_fill_gva_solid<M: HostMemory + HostOps>(
         (true, ClearImageEncoding::Native) => draw::FrameRows::Repeat(clear.pixels()),
         (true, ClearImageEncoding::Rgba8) => {
             let converts = pixel_format::tight_row_bytes(width, format).is_some_and(|tight| {
-                converted.resize(tight as usize, 0);
+                let Some(row) = draw::guest_zeroed(tight as usize) else {
+                    return false;
+                };
+                converted = row;
                 pixel_format::Rgba8ToRow::for_format(format)
                     .is_some_and(|rail| rail.convert(clear.pixels(), width, &mut converted))
             });

@@ -196,7 +196,12 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
             format!("blob_gva={:#x} blob_size={}", f.blob_gva, f.blob_size),
         );
     };
-    let mut mtlb = vec![0u8; len];
+    let Some(mut mtlb) = crate::runtime::draw::guest_zeroed(len) else {
+        return miss(
+            "host_len",
+            format!("blob_gva={:#x} blob_size={} (host_commit)", f.blob_gva, f.blob_size),
+        );
+    };
     // Device page_shift (x86=12, arm64=14); the unshifted helper defaults to
     // arm and fails every load on the other geometry.
     if gva_mem::read_task_gva_by_id(

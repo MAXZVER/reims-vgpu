@@ -173,6 +173,13 @@ pub struct ReimsVgpuHostOps {
     pub guest_write_rebase: Option<
         unsafe extern "C" fn(ctx: *mut c_void, token: u64, gpas: *const u64, count: usize),
     >,
+    /// TEMP lab LAZY_SYNC (v29): take pages away from the guest until
+    /// `guest_fence_open`; see the ABI header.
+    pub guest_fence_close: Option<
+        unsafe extern "C" fn(ctx: *mut c_void, gpas: *const u64, count: usize, page_size: usize) -> u64,
+    >,
+    /// TEMP lab LAZY_SYNC (v29): give a fence's pages back. Safe from any thread.
+    pub guest_fence_open: Option<unsafe extern "C" fn(ctx: *mut c_void, token: u64)>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -294,6 +301,8 @@ impl ReimsVgpuHostOps {
             guest_write_sync_many: None,
             guest_write_sync_ahead: None,
             guest_write_rebase: None,
+            guest_fence_close: None,
+            guest_fence_open: None,
         }
     }
 }
@@ -1145,6 +1154,16 @@ impl HostOps for QemuHost<'_> {
 
     fn guest_write_rebase(&self, token: u64, gpas: &[u64]) {
         self.ops.rebase(token, gpas);
+    }
+
+    fn guest_fence_close(&self, gpas: &[u64], page_size: usize) -> Option<crate::runtime::host::GuestFence> {
+        let (close, open) = (self.ops.guest_fence_close?, self.ops.guest_fence_open?);
+        if gpas.is_empty() {
+            return None;
+        }
+        // SAFETY: QEMU owns ctx; the slice outlives the call, which keeps no pointer into it.
+        let token = unsafe { close(self.ops.ctx, gpas.as_ptr(), gpas.len(), page_size) };
+        (token != 0).then(|| crate::runtime::host::GuestFence::new(open, self.ops.ctx as usize, token))
     }
 
     fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {

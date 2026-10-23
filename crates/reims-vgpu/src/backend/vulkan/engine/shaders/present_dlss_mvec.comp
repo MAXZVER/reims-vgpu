@@ -1,0 +1,56 @@
+#version 450
+// TEMP (lab, REIMS_VGPU_LAB_PRESENT_DLSS_SR): DLSS Super Resolution's motion vectors from the hardware optical flow
+// (VK_NV_optical_flow, one vector per 4x4 cell, S10.5 fixed point read as integers). DLSS wants, per pixel of the
+// current frame, the offset in pixels to where that pixel was in the previous frame - the flow's backward direction.
+//
+// The flow is not trusted blindly (present_fg.comp, b914a): over still content its vectors in flat areas are
+// arbitrary, and DLSS would reproject its history along them and drag text over white. Per cell, "no motion" replaces
+// the flow when the current frame matches the previous one better without motion over the 3x3 cells (12x12 pixels)
+// around it.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D prev_frame;
+layout(binding = 1) uniform sampler2D cur_frame;
+layout(binding = 2) uniform isampler2D bwd;
+layout(binding = 3, rg16f) uniform writeonly image2D mvec;
+
+layout(push_constant) uniform Push {
+    ivec2 size;  // frame size in pixels
+    int grid;    // flow grid cell size in pixels
+} pc;
+
+void main() {
+    ivec2 cells = textureSize(bwd, 0);
+    ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+    if (cell.x >= cells.x || cell.y >= cells.y) {
+        return;
+    }
+    vec2 b = vec2(texelFetch(bwd, cell, 0).xy) / 32.0;
+    ivec2 lo = max((cell - 1) * pc.grid, ivec2(0));
+    ivec2 hi = min((cell + 2) * pc.grid, pc.size);
+    ivec2 shift = ivec2(round(b));
+    float cost_flow = 0.0;
+    float cost_still = 0.0;
+    for (int y = lo.y; y < hi.y; y++) {
+        for (int x = lo.x; x < hi.x; x++) {
+            ivec2 p = ivec2(x, y);
+            vec3 c = texelFetch(cur_frame, p, 0).rgb;
+            vec3 s = texelFetch(prev_frame, p, 0).rgb;
+            vec3 f = texelFetch(prev_frame, clamp(p + shift, ivec2(0), pc.size - 1), 0).rgb;
+            vec3 df = abs(c - f);
+            vec3 ds = abs(c - s);
+            cost_flow += df.r + df.g + df.b;
+            cost_still += ds.r + ds.g + ds.b;
+        }
+    }
+    vec2 v = cost_still <= cost_flow ? vec2(0.0) : b;
+    ivec2 base = cell * pc.grid;
+    for (int y = 0; y < pc.grid; y++) {
+        for (int x = 0; x < pc.grid; x++) {
+            ivec2 p = base + ivec2(x, y);
+            if (p.x < pc.size.x && p.y < pc.size.y) {
+                imageStore(mvec, p, vec4(v, 0.0, 0.0));
+            }
+        }
+    }
+}

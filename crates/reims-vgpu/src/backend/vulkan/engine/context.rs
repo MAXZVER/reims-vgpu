@@ -772,7 +772,17 @@ fn lab_gpu_boost() -> bool {
     *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_GPU_BOOST").map_or(true, |v| v != "off"))
 }
 
+/// Source of [`DeviceContext::generation`]: one value per device this process
+/// ever builds, never reused.
+static DEVICE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) struct DeviceContext {
+    /// This device's identity for anything kept across a device recreate (the
+    /// recording lanes, page-diff state, readback and compare tickets). The raw
+    /// `VkDevice` value used before is an address the driver may hand out again
+    /// to the device built right after the old one is destroyed, and then the
+    /// dead device's handles read as the new one's.
+    pub generation: u64,
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
     pub pd: vk::PhysicalDevice,
@@ -812,6 +822,10 @@ pub(crate) struct DeviceContext {
     /// TEMP (lab, `REIMS_VGPU_LAB_GPU_BOOST`): `VK_NV_low_latency2` entry points,
     /// `Some` when the extension was enabled for the host window's swapchain.
     pub low_latency2: Option<ash::nv::low_latency2::Device>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_FG`): the optical-flow queue and entry points, `Some` when
+    /// frame generation is on and the device offers `VK_NV_optical_flow`. Only the host window's
+    /// thread submits to this queue.
+    pub optical_flow: Option<super::OpticalFlowQueue>,
     /// Queue family used for all engine submits (graphics draws + compute).
     pub gq: u32,
     /// True when `gq` supports both GRAPHICS and COMPUTE (required for engine compute).
@@ -1012,7 +1026,18 @@ impl DeviceContext {
     }
 
     pub(crate) unsafe fn create() -> Result<Self, DrawError> {
-        let entry = ash::Entry::load().map_err(|e| {
+        // TEMP (lab, PRESENT_DLSSG): through Streamline's interposer when DLSS-G
+        // is on (slInit has run; its proxies set up instance, device, swapchain).
+        // Only the first device: a recovered one comes up through vulkan-1.
+        #[cfg(feature = "host-window")]
+        let sl_loader = super::present_dlssg::device_loader();
+        #[cfg(not(feature = "host-window"))]
+        let sl_loader: Option<std::path::PathBuf> = None;
+        let entry = match sl_loader {
+            Some(path) => ash::Entry::load_from(&path),
+            None => ash::Entry::load(),
+        }
+        .map_err(|e| {
             DrawError::Init(InitDecline::LoadVulkanLoader {
                 detail: e.to_string(),
             })
@@ -1098,6 +1123,18 @@ impl DeviceContext {
                 instance_extensions.push(ash::khr::surface::NAME.as_ptr());
                 for name in available {
                     instance_extensions.push(name.as_ptr());
+                }
+            }
+        }
+        // TEMP (lab, PRESENT_VSR): the instance extensions NGX asks for, where advertised.
+        #[cfg(feature = "host-window")]
+        if super::present_vsr::quality().is_some() {
+            let advertised = entry.enumerate_instance_extension_properties(None).unwrap_or_default();
+            for name in super::present_vsr::instance_extensions() {
+                let n = CStr::from_ptr(name);
+                let offered = advertised.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
+                if offered && !instance_extensions.iter().any(|e: &*const std::ffi::c_char| CStr::from_ptr(*e) == n) {
+                    instance_extensions.push(name);
                 }
             }
         }
@@ -1193,7 +1230,20 @@ impl DeviceContext {
         let compute_capable = plan.compute();
         let transfer_qf = plan.dedicated_transfer().map(|f| f.index);
         let prio = [1.0f32];
-        let qci = [vk::DeviceQueueCreateInfo::default()
+        // TEMP (lab, PRESENT_FG): the optical-flow-only family (`VK_NV_optical_flow`), asked for only
+        // when the present's frame generation is on.
+        #[cfg(feature = "host-window")]
+        let of_family = if super::present_fg::on() {
+            qfs.iter()
+                .position(|q| q.queue_flags.contains(vk::QueueFlags::OPTICAL_FLOW_NV))
+                .map(|i| i as u32)
+                .filter(|&i| i != gq)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "host-window"))]
+        let of_family: Option<u32> = None;
+        let mut qci = vec![vk::DeviceQueueCreateInfo::default()
             .queue_family_index(gq)
             .queue_priorities(&prio)];
         let device_extensions = instance
@@ -1331,8 +1381,12 @@ impl DeviceContext {
         // wait), which reads as ~20 % utilisation, so the GPU sat at 210 MHz of
         // its 3105 (nvidia-smi, 5K light scene) and every burst ran slow.
         #[cfg(feature = "host-window")]
+        // Not under DLSS-G: Streamline's Reflex drives VK_NV_low_latency2 itself
+        // (its own low-latency-with-boost mode); two owners of the swapchain's
+        // latency state would fight.
         let low_latency2 = swapchain
             && lab_gpu_boost()
+            && !super::present_dlssg::on()
             && has_device_extension(ash::nv::low_latency2::NAME);
         #[cfg(not(feature = "host-window"))]
         let low_latency2 = false;
@@ -1343,6 +1397,33 @@ impl DeviceContext {
             }
         }
         crate::observe::off(format!("gpu_boost low_latency2={low_latency2}"));
+        // TEMP (lab, PRESENT_FG): `VK_NV_optical_flow` and its queue, where the device offers both.
+        let optical_flow = of_family.filter(|_| has_device_extension(ash::nv::optical_flow::NAME));
+        if let Some(family) = optical_flow {
+            enabled_device_extensions.push(ash::nv::optical_flow::NAME.as_ptr());
+            qci.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family)
+                    .queue_priorities(&prio),
+            );
+        }
+        let mut en_optical_flow = vk::PhysicalDeviceOpticalFlowFeaturesNV::default().optical_flow(true);
+        crate::observe::off(format!("present_fg optical_flow_family={optical_flow:?}"));
+        // TEMP (lab, PRESENT_VSR): the device extensions NGX asks for, where advertised.
+        #[cfg(feature = "host-window")]
+        if super::present_vsr::quality().is_some() {
+            let mut took = Vec::new();
+            for name in super::present_vsr::device_extensions(instance.handle(), pd) {
+                let n = CStr::from_ptr(name);
+                if has_device_extension(n)
+                    && !enabled_device_extensions.iter().any(|e: &*const std::ffi::c_char| CStr::from_ptr(*e) == n)
+                {
+                    enabled_device_extensions.push(name);
+                    took.push(n.to_string_lossy().into_owned());
+                }
+            }
+            crate::observe::off(format!("present_vsr device_extensions={took:?}"));
+        }
         let mut enabled_divisor_features =
             vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default()
                 .vertex_attribute_instance_rate_divisor(vertex_divisor.instance_rate_divisor)
@@ -1410,6 +1491,9 @@ impl DeviceContext {
         }
         if features.wants_extended_dynamic_state3() {
             dci = dci.push_next(&mut en_extended_dynamic_state3);
+        }
+        if optical_flow.is_some() {
+            dci = dci.push_next(&mut en_optical_flow);
         }
         let device = instance
             .create_device(pd, &dci, None)
@@ -1482,6 +1566,12 @@ impl DeviceContext {
             .ok()
             .flatten();
         let queue = device.get_device_queue(gq, 0);
+        let optical_flow = optical_flow.map(|family| super::OpticalFlowQueue {
+            family,
+            queue: device.get_device_queue(family, 0),
+            device: ash::nv::optical_flow::Device::new(&instance, &device),
+            instance: ash::nv::optical_flow::Instance::new(&entry, &instance),
+        });
         let queue_owner = match super::queue_owner::QueueOwner::start(&device, queue) {
             Ok(owner) => Some(owner),
             Err(error) => {
@@ -1633,6 +1723,7 @@ impl DeviceContext {
             pipeline_cache_path.display()
         ));
         Ok(Self {
+            generation: DEVICE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             _entry: entry,
             instance,
             pd,
@@ -1644,6 +1735,7 @@ impl DeviceContext {
             extended_dynamic_state,
             extended_dynamic_state3,
             low_latency2,
+            optical_flow,
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,
@@ -1835,6 +1927,10 @@ impl DeviceContext {
         }
         self.device
             .destroy_pipeline_cache(self.pipeline_cache, None);
+        // TEMP (lab, PRESENT_DLSSG): Streamline shuts down before the device it
+        // serves goes, so a recovered device can bring it up again.
+        #[cfg(feature = "host-window")]
+        super::present_dlssg::release_device();
         self.device.destroy_device(None);
         self.instance.destroy_instance(None);
     }

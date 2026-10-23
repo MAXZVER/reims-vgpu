@@ -650,6 +650,9 @@ fn used_binding_absent_from_layout(
 struct StageBufferUse {
     snapshot_volatile: bool,
     gather_role: BufferGatherRole,
+    /// TEMP (lab, Opus 10-23 REC_VHEAD): bytes at the window's head no fetch of this bind reads (vertex binds
+    /// only; 0 elsewhere). Honoured on the CPU-copy arms, which leave them unwritten.
+    head: u64,
 }
 
 /// TEMP (lab, DRAW_PAR v15): set once the recorder has met a guest-runs bind
@@ -672,7 +675,10 @@ unsafe fn stage_buffer_content(
     let StageBufferUse {
         snapshot_volatile,
         gather_role,
+        head,
     } = use_;
+    // A bind a shader may also read as storage reads the whole window.
+    let head = if gather_role.includes_storage() { 0 } else { head };
     // Probe on the identity alone. A Metal argument table persists across the
     // draws of one encoder, so the guest re-presents the same buffers on every
     // draw and this probe almost always hits — paying `CbBind::of`'s `Arc` clone
@@ -683,11 +689,21 @@ unsafe fn stage_buffer_content(
         counters.note_buffer_bind_reused(gather_role);
         return Ok(bound);
     }
+    // TEMP (lab, REC_VHEAD): a slot staged without its head answers only binds with that same head; a full slot
+    // (above) answers any.
+    let head = if super::pools::CbBind::head_fits(key, head) { head } else { 0 };
+    let key = super::pools::CbBind::key_with_head(key, head);
+    if head != 0 {
+        if let Some(bound) = pools.cb_bound_buffer(key) {
+            counters.note_buffer_bind_reused(gather_role);
+            return Ok(bound);
+        }
+    }
     // A miss, so this bind is about to be recorded. The identity and a reference
     // to what it names are taken together here — see [`super::pools::CbBind`].
     // The map cannot be told about a bind without being handed this, which is
     // what keeps the key's address from being recycled under a live entry.
-    let bind = super::pools::CbBind::of(content);
+    let bind = super::pools::CbBind::of(content).with_head(head);
     debug_assert_eq!(bind.key(), key, "the probe and the record name one bind");
     // Set by the one arm that returns a slot it has not filled. Read after the
     // `match` so the flag and the `note_cb_bound_buffer` below it cannot be
@@ -700,9 +716,10 @@ unsafe fn stage_buffer_content(
                 pools.acquire_staging(ctx, b.len() as u64, counters)?
             };
             let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, b.len() as u64);
-            pools.write_staging(ctx, &slot, b)?;
+            // TEMP (lab, LANE_BYTES): the lane makes the copy (REC_VHEAD: without the unfetched head).
+            pools.write_staging_bytes_lane_at(ctx, &slot, b, head as usize)?;
             drop(_s);
-            if super::pools::lab_verify_on() && slot.mapped != 0 && !b.is_empty() {
+            if super::pools::lab_verify_on() && slot.mapped != 0 && !b.is_empty() && head == 0 {
                 pools.lab_verify_note(super::pools::LabVerify::Staging {
                     ptr: slot.mapped,
                     len: b.len(),
@@ -759,6 +776,34 @@ unsafe fn stage_buffer_content(
             let snapshot_only = *SNAP.get_or_init(|| {
                 std::env::var("REIMS_VGPU_LAB_SNAPSHOT_GUEST_BUFFERS").as_deref() == Ok("1")
             });
+            // TEMP (lab, CONTENT_RESIDENT): only on the CPU-copy rail (no
+            // host-pointer import) and only for storage-free binds - a storage
+            // bind may be written by the shader, and a kept slot never is.
+            let content_key = if super::pools::content_resident::on()
+                && !ctx.caps.host_pointer.is_available()
+                && super::pools::content_resident::window_fits(src.total_len)
+            {
+                if gather_role.includes_storage() {
+                    crate::runtime::drain::note_store_route_n("crs_storage_kb", src.total_len / 1024);
+                    None
+                } else {
+                    let _d = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
+                    let started = std::time::Instant::now();
+                    let k = super::pools::content_resident::digest_runs(
+                        &src.runs,
+                        src.source_offset,
+                        src.total_len,
+                    );
+                    crate::runtime::drain::note_store_route_n(
+                        "crs_digest_ns",
+                        started.elapsed().as_nanos() as u64,
+                    );
+                    crate::runtime::drain::note_store_route_n("crs_digest_kb", src.total_len / 1024);
+                    k
+                }
+            } else {
+                None
+            };
             if let Some(bound) = if snapshot_only {
                 None
             } else {
@@ -792,6 +837,10 @@ unsafe fn stage_buffer_content(
                 // this is what says so.
                 gather_owed = true;
                 bound
+            } else if let Some(slot) = content_key.and_then(|k| pools.content_resident_hit(k)) {
+                // TEMP (lab, CONTENT_RESIDENT): a kept slot whose bytes have
+                // this window's digest - the copy, made earlier.
+                BoundBuffer::from(slot)
             } else if let Some(slot) = src
                 .resident
                 .and_then(|id| pools.buf_resident_hit(id, src.total_len))
@@ -809,13 +858,29 @@ unsafe fn stage_buffer_content(
                     pools.acquire_staging(ctx, src.total_len, counters)?
                 };
                 let _s = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
-                pools.write_staging_from_runs(
-                    ctx,
-                    &slot,
-                    &src.runs,
-                    src.source_offset,
-                    src.total_len,
-                )?;
+                if content_key.is_some_and(|k| pools.content_resident_second_sight(k)) {
+                    // TEMP (lab, CONTENT_RESIDENT): copy and digest in one pass,
+                    // and keep the slot under what was actually copied.
+                    if let Some(k) = pools.content_resident_fill(
+                        ctx,
+                        &slot,
+                        &src.runs,
+                        src.source_offset,
+                        src.total_len,
+                    )? {
+                        pools.content_resident_adopt(k, slot);
+                    }
+                } else {
+                    // TEMP (lab, REC_VHEAD): without the head no fetch reads.
+                    pools.write_staging_from_runs_at(
+                        ctx,
+                        &slot,
+                        &src.runs,
+                        src.source_offset,
+                        src.total_len,
+                        head,
+                    )?;
+                }
                 drop(_s);
                 if snapshot_volatile {
                     counters
@@ -1214,7 +1279,7 @@ fn t2t_park_texels(
             });
         }
     }
-    if served.readback.device != vk::Handle::as_raw(ctx.device.handle()) {
+    if served.readback.device != ctx.generation {
         crate::runtime::drain::note_store_route("t2t_park_serve_device_gone");
         return None;
     }
@@ -4323,7 +4388,15 @@ pub(crate) unsafe fn execute_draw_inner(
             })?;
             let shifted = {
                 let _s = stage_phase::Span::moving(stage_phase::Part::Shift, len as u64);
-                let mut shifted = vec![0u8; len];
+                // `prefix` is the guest's base instance times its stride; a
+                // length the host cannot commit is the same refusal as one that
+                // overflows, not a process abort.
+                let mut shifted = crate::runtime::draw::guest_zeroed(len).ok_or(
+                    DrawError::DrawExecution(DrawExecutionDecline::ConstantVertexAllocationOverflow {
+                        prefix,
+                        bytes_len: bytes.len(),
+                    }),
+                )?;
                 shifted[prefix..].copy_from_slice(bytes);
                 shifted
             };
@@ -4345,6 +4418,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     snapshot_volatile: batch_eligible,
                     gather_role: buffer_gather_role(req, CbBind::key_of(&resource.content))
                         .expect("every vertex buffer was classified"),
+                    head: resource.head,
                 },
                 &mut guest_gathers,
             )?
@@ -4366,6 +4440,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 snapshot_volatile: batch_eligible,
                 gather_role: buffer_gather_role(req, CbBind::key_of(&indexed.content))
                     .expect("the index buffer was classified"),
+                head: 0,
             },
             &mut guest_gathers,
         )?),
@@ -4388,6 +4463,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 snapshot_volatile: batch_eligible,
                 gather_role: buffer_gather_role(req, CbBind::key_of(&resource.content))
                     .expect("every storage buffer was classified"),
+                head: 0,
             },
             &mut guest_gathers,
         )?;
@@ -6163,6 +6239,82 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
+    // The sampled residents' registry notes, taken at the last barrier rather
+    // than after the submit. The render rail's notes used to sit in a batch at
+    // the end of the draw, which is the right order only for a draw that
+    // reaches the end: a joiner into an open batch records these barriers into
+    // the batch's shared command buffer and can still fail after them
+    // (`clear_values` below, a query-pool create) - the barriers execute at the
+    // batch's flush either way, and a registry still naming the layouts they
+    // moved the images out of hands the next barrier a false `oldLayout`
+    // (undefined behaviour, not a validation error). At this point every
+    // sampled/seed barrier this draw owes is recorded and no fallible step has
+    // run since; the compute rail has always noted at the barrier.
+    for image in &sampled {
+        match image {
+            PreparedSampled::Resident {
+                identity,
+                next_access,
+                ..
+            } => pools.registry_note_access(identity, *next_access),
+            PreparedSampled::Snapshot {
+                identity,
+                next_access,
+                ..
+            } if req.attachment_slot(identity).is_none() => {
+                pools.registry_note_access(identity, *next_access)
+            }
+            PreparedSampled::Pyramid { levels, .. } => {
+                for level in levels {
+                    if req.attachment_slot(&level.identity).is_none() {
+                        pools.registry_note_access(&level.identity, level.next_access);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((_, _, next_access)) = seed_from_resolved {
+        if let Some(seed_identity) = &req.seed_from_target {
+            pools.registry_note_access(seed_identity, next_access);
+        }
+    }
+    // MRT secondaries' ready-marks move with the same argument: their
+    // layout-transition barriers above (the `MrtLayout` obstacle) are recorded
+    // before the fallible steps below, so a joiner that fails after them
+    // leaves recorded transitions with no registry record. The marks describe
+    // what the flushed batch's command buffer produces, which is the order the
+    // deferred path already records in.
+    //
+    // The target's own mark stays at the submit: its transition is the render
+    // pass itself, recorded only past every production fallible step below, so
+    // an earlier move would claim a pass this draw may still refuse to open.
+    if is_mrt {
+        for (secondary_index, (identity, _image, _old)) in mrt_secondaries.iter().enumerate() {
+            let attachment_index = secondary_index + 1;
+            if pass_key.color_feedback(attachment_index) {
+                // An MRT secondary is a write this accounting does not follow:
+                // every row.
+                pools.registry_mark_ready_with_access(
+                    identity,
+                    super::pools::ResidentAccess::ColorFeedback(
+                        pass_key.color_final_layout(attachment_index),
+                    ),
+                    super::pay_band::RowBand::Full,
+                );
+            } else {
+                // The pass's own `finalLayout` for this slot, asked of the key
+                // rather than respelled. The feedback arm beside it already
+                // derives; this one carried a hand-written
+                // `COLOR_ATTACHMENT_OPTIMAL`, which is the second spelling
+                // `color0_pass_exit_layout` exists to remove — a registry record
+                // naming a layout the pass did not leave the image in is a later
+                // barrier's wrong `oldLayout`.
+                pools.registry_mark_ready_at(identity, pass_key.color_final_layout(attachment_index));
+            }
+        }
+    }
+
     let mut clear = clear_values(req)?;
     if multisample_cold_clear {
         clear.values[0] = vk::ClearValue {
@@ -6942,39 +7094,9 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     let guest_store_recorded = guest_store_footprint.is_some();
     phase.enter(super::draw_phase::Phase::PostTarget);
-    // MRT secondary attachments settle at COLOR_ATTACHMENT_OPTIMAL (the pass
-    // final layout) and become sampleable residents; the consumer's
-    // resident-sample barrier then transitions COLOR_ATTACHMENT→SHADER_READ,
-    // carrying the color-write→shader-read dependency. (The ad-hoc MRT
-    // framebuffer is disposed below, after `finish_entry_async` — see there.)
-    if is_mrt {
-        for (secondary_index, (identity, _image, _old)) in mrt_secondaries.iter().enumerate() {
-            let attachment_index = secondary_index + 1;
-            if pass_key.color_feedback(attachment_index) {
-                // An MRT secondary is a write this accounting does not follow:
-                // every row.
-                pools.registry_mark_ready_with_access(
-                    identity,
-                    super::pools::ResidentAccess::ColorFeedback(
-                        pass_key.color_final_layout(attachment_index),
-                    ),
-                    super::pay_band::RowBand::Full,
-                );
-            } else {
-                // The pass's own `finalLayout` for this slot, asked of the key
-                // rather than respelled. The feedback arm beside it already
-                // derives; this one carried a hand-written
-                // `COLOR_ATTACHMENT_OPTIMAL`, which is the second spelling
-                // `color0_pass_exit_layout` exists to remove — a registry record
-                // naming a layout the pass did not leave the image in is a later
-                // barrier's wrong `oldLayout`.
-                pools.registry_mark_ready_at(
-                    identity,
-                    pass_key.color_final_layout(attachment_index),
-                );
-            }
-        }
-    }
+    // MRT secondaries' ready-marks were taken at their barriers, above the
+    // fallible steps; the deferred-submit comment below is what makes that
+    // order safe.
     // The depth pass stores unconditionally and settles at
     // DEPTH_STENCIL_ATTACHMENT_OPTIMAL, so after this draw the resident holds
     // depth a later pass can load and sits in the layout that pass will name.
@@ -7024,35 +7146,6 @@ pub(crate) unsafe fn execute_draw_inner(
                 });
             }
             _ => {}
-        }
-    }
-    for image in &sampled {
-        match image {
-            PreparedSampled::Resident {
-                identity,
-                next_access,
-                ..
-            } => pools.registry_note_access(identity, *next_access),
-            PreparedSampled::Snapshot {
-                identity,
-                next_access,
-                ..
-            } if req.attachment_slot(identity).is_none() => {
-                pools.registry_note_access(identity, *next_access)
-            }
-            PreparedSampled::Pyramid { levels, .. } => {
-                for level in levels {
-                    if req.attachment_slot(&level.identity).is_none() {
-                        pools.registry_note_access(&level.identity, level.next_access);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if let Some((_, _, next_access)) = seed_from_resolved {
-        if let Some(seed_identity) = &req.seed_from_target {
-            pools.registry_note_access(seed_identity, next_access);
         }
     }
     // Deferred-submit draw: park the per-draw descriptor set on the open batch
@@ -7574,6 +7667,47 @@ fn fill_descriptor_bindings(
 ///
 /// `dst_set` is ignored by `vkCmdPushDescriptorSetKHR`, which is why the push
 /// rail passes a null handle rather than inventing one.
+/// TEMP (lab, CONTENT_RESIDENT): a vertex-only guest-runs window on the CPU-copy rail, bound from the content cache -
+/// the kept slot whose bytes have this window's digest, or a fresh slot filled and digested in one pass and kept.
+/// `None` when the cache is off or the window is outside its sizes; the caller copies as before.
+///
+/// # Safety
+///
+/// `ctx` must own the device `pools` belongs to.
+unsafe fn content_resident_bind(
+    ctx: &crate::backend::vulkan::engine::context::DeviceContext,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    src: &super::types::GuestRunSource,
+) -> Result<Option<BoundBuffer>, DrawError> {
+    use super::pools::content_resident;
+    if !content_resident::on()
+        || ctx.caps.host_pointer.is_available()
+        || !content_resident::window_fits(src.total_len)
+    {
+        return Ok(None);
+    }
+    let started = std::time::Instant::now();
+    let key = content_resident::digest_runs(&src.runs, src.source_offset, src.total_len);
+    crate::runtime::drain::note_store_route_n("crs_digest_ns", started.elapsed().as_nanos() as u64);
+    crate::runtime::drain::note_store_route_n("crs_digest_kb", src.total_len / 1024);
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    if let Some(slot) = pools.content_resident_hit(key) {
+        return Ok(Some(BoundBuffer::from(slot)));
+    }
+    if !pools.content_resident_second_sight(key) {
+        // First sight: the plain copy (the caller's), which the lane may make.
+        return Ok(None);
+    }
+    let slot = unsafe { pools.acquire_staging(ctx, src.total_len, counters)? };
+    if let Some(k) = unsafe { pools.content_resident_fill(ctx, &slot, &src.runs, src.source_offset, src.total_len)? } {
+        pools.content_resident_adopt(k, slot);
+    }
+    Ok(Some(BoundBuffer::from(slot)))
+}
+
 /// TEMP (lab, MERGE_DRAWS): before sub-draw `i` of a merged record, bind the stage-in bytes it has instead of the
 /// record's (each staged into its own slot), or the record's own again for bindings a previous sub-draw moved.
 fn lab_sub_vstage(
@@ -7593,15 +7727,68 @@ fn lab_sub_vstage(
     let Some(list) = own else {
         return Ok(());
     };
-    for (bindings, bytes) in list {
-        if bytes.is_empty() {
+    for (bindings, content, head) in list {
+        if content.len() == 0 {
             continue;
         }
-        let slot = unsafe { pools.acquire_staging(ctx, bytes.len() as u64, counters)? };
-        unsafe { pools.write_staging(ctx, &slot, bytes)? };
+        // TEMP (lab, SUB_VHEAD): bytes at the window's head the sub-draw never fetches - left unwritten in the
+        // slot, which keeps its full length so every fetch lands where it would.
+        let head = (*head as usize).min(content.len());
+        let at = match content {
+            // A window the prepare worker staged into its arena (PASS_STAGE): bound where it is, as
+            // `stage_buffer_content` binds one - the copy this recorder used to make is the one the worker made.
+            BufferContent::Staged(slice) => {
+                if !pools.note_staged_read(std::sync::Arc::clone(&slice.ring), slice.window) {
+                    return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedDraw));
+                }
+                crate::runtime::drain::note_store_route("merge_sub_vstage_staged");
+                BoundBuffer {
+                    buffer: slice.buffer,
+                    offset: slice.window.offset,
+                }
+            }
+            // TEMP (lab, MERGE_DRAWS, Opus 10-22): bound as the record's own guest-runs binds are - the import itself
+            // where the host has one, else the CPU gather straight into the staging slot. b944MR (Maps, scene window):
+            // `cpu_bytes()` here - a heap Vec of the runs, then a second copy into staging - was 37 % of the recorder's
+            // draw time, and the recorder's bursts are what the Maps drain waits on. No GPU gather: a sub-draw is
+            // recorded inside the render pass, where a copy cannot go.
+            BufferContent::GuestRuns(src) => {
+                let role = BufferGatherRole { vertex: true, ..BufferGatherRole::default() };
+                if let Some(bound) = unsafe { import_guest_buffer_window(ctx, pools, src, role) } {
+                    pools.note_guest_read_recorded();
+                    counters.note_buffer_guest_import(src.total_len, role);
+                    bound
+                } else if let Some(bound) = if head == 0 {
+                    unsafe { content_resident_bind(ctx, pools, counters, src)? }
+                } else {
+                    None
+                } {
+                    bound
+                } else {
+                    let slot = unsafe { pools.acquire_staging(ctx, src.total_len, counters)? };
+                    unsafe {
+                        pools.write_staging_from_runs_at(
+                            ctx,
+                            &slot,
+                            &src.runs,
+                            src.source_offset,
+                            src.total_len,
+                            head as u64,
+                        )?
+                    };
+                    BoundBuffer::from(slot)
+                }
+            }
+            BufferContent::Bytes(bytes) => {
+                let slot = unsafe { pools.acquire_staging(ctx, bytes.len() as u64, counters)? };
+                // TEMP (lab, LANE_BYTES): the lane makes the copy.
+                unsafe { pools.write_staging_bytes_lane_at(ctx, &slot, bytes, head)? };
+                BoundBuffer::from(slot)
+            }
+        };
         for b in bindings.iter() {
             unsafe {
-                crate::backend::vulkan::engine::cmd_sink::bind_vertex_buffers(&ctx.device, cb, *b, &[slot.buffer], &[0]);
+                crate::backend::vulkan::engine::cmd_sink::bind_vertex_buffers(&ctx.device, cb, *b, &[at.buffer], &[at.offset]);
             }
             bound.push(*b);
         }
@@ -7657,7 +7844,8 @@ fn lab_sub_storage_push(
                 continue;
             }
             let slot = unsafe { pools.acquire_staging(ctx, bytes.len() as u64, counters)? };
-            unsafe { pools.write_staging(ctx, &slot, bytes)? };
+            // TEMP (lab, LANE_BYTES): the lane makes the copy.
+            unsafe { pools.write_staging_bytes_lane(ctx, &slot, bytes)? };
             for e in binds.iter_mut() {
                 if let super::pools::PushDescriptorBinding::Buffer {
                     binding: ref b,
@@ -8557,6 +8745,7 @@ mod tests {
         let req = DrawRequest {
             vertex_attributes: vec![
                 VertexAttributeResource {
+                    head: 0,
                     location: 0,
                     binding: 0,
                     format: VertexAttributeFormat::Float,
@@ -8567,6 +8756,7 @@ mod tests {
                     content: vertex_only,
                 },
                 VertexAttributeResource {
+                    head: 0,
                     location: 1,
                     binding: 1,
                     format: VertexAttributeFormat::Float,
@@ -9485,6 +9675,7 @@ mod tests {
     fn two_vertex_attributes_may_not_share_a_location_or_a_binding() {
         let attribute =
             |location: u32, binding: u32| super::super::types::VertexAttributeResource {
+                head: 0,
                 location,
                 binding,
                 format: super::super::types::VertexAttributeFormat::Float,
@@ -9998,6 +10189,7 @@ mod tests {
         };
         req.vertex_attributes
             .push(super::super::types::VertexAttributeResource {
+                head: 0,
                 location: 0,
                 binding: 0,
                 format: super::super::types::VertexAttributeFormat::Float4,
@@ -10029,6 +10221,7 @@ mod tests {
         };
         req.vertex_attributes
             .push(super::super::types::VertexAttributeResource {
+                head: 0,
                 location: 0,
                 binding: 0,
                 format: super::super::types::VertexAttributeFormat::Float4,

@@ -32,7 +32,9 @@
 
 use ash::vk;
 
-use super::present_sharp_shader::{PRESENT_RCAS_FRAG_SPIRV, PRESENT_SHARP_FRAG_SPIRV, PRESENT_SHARP_VERT_SPIRV};
+use super::present_sharp_shader::{
+    PRESENT_DOWN_FRAG_SPIRV, PRESENT_RCAS_FRAG_SPIRV, PRESENT_SHARP_FRAG_SPIRV, PRESENT_SHARP_VERT_SPIRV,
+};
 
 /// `REIMS_VGPU_LAB_PRESENT_SHARP=on`. Latched.
 pub(crate) fn on() -> bool {
@@ -55,6 +57,29 @@ pub(crate) fn rcas_sharp() -> Option<f32> {
         };
         Some((-stops as f32).exp2())
     })
+}
+
+/// TEMP (lab, Mish 2026-10-22): `REIMS_VGPU_LAB_PRESENT_SS=K` - the supersampled present. The upscaler (EASU, and
+/// DLSS/VSR on the presents they take) writes K x the guest frame (2 for a 3456x1458 guest: 6912x2916, its exact
+/// double) instead of the visible part's size, and the window pass resamples that down to the visible part
+/// (`shaders/present_down.frag`, Lanczos-2 widened by the scale, anti-ringing clamp) - ~1.35x supersampling per
+/// axis on the 5120x2160 panel. Only where K x the frame is larger than the visible part on both axes; not with
+/// NIS or PRESENT_VSR_TILES. `K` in 1..=2.5. Latched.
+pub(crate) fn ss_factor() -> Option<f32> {
+    static K: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let k = std::env::var("REIMS_VGPU_LAB_PRESENT_SS").ok()?.trim().parse::<f32>().ok()?;
+        (k > 1.0 && k <= 2.5).then_some(k)
+    })
+}
+
+/// PRESENT_SS: the size the upscaler writes for a `src` frame shown in a `vis` visible part, when supersampled.
+/// At most 2.5x the visible part: `present_down.frag`'s 10 taps an axis cover the kernel up to that scale.
+fn ss_size(k: f32, src: (u32, u32), vis: (u32, u32)) -> Option<(u32, u32)> {
+    let w = (src.0 as f32 * k).round() as u32;
+    let h = (src.1 as f32 * k).round() as u32;
+    let fits = u64::from(w) * 2 <= u64::from(vis.0) * 5 && u64::from(h) * 2 <= u64::from(vis.1) * 5;
+    (w > vis.0 && h > vis.1 && fits).then_some((w, h))
 }
 
 /// `REIMS_VGPU_LAB_PRESENT_NIS`: NVIDIA Image Scaling (NVScaler) instead of
@@ -95,6 +120,8 @@ struct PresentDump {
     out: (u32, u32),
     /// Whether the result is RGBA (NVScaler's storage image) or BGRA (EASU's).
     out_rgba: bool,
+    /// The source is rgba8 too (a PRESENT_FG frame), not the BGRA guest frame.
+    src_rgba: bool,
 }
 
 /// NVScaler's constants for one present (`NVScalerUpdateConfig`, SDR), as the
@@ -206,6 +233,12 @@ impl MidImage {
     }
 }
 
+const DLSS_DEPTH_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
+const DLSS_MVEC_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
+const DLSS_AUX_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::SAMPLED.as_raw() | vk::ImageUsageFlags::STORAGE.as_raw() | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
+);
+
 pub(crate) struct PresentSharp {
     render_pass: vk::RenderPass,
     set_layout: vk::DescriptorSetLayout,
@@ -232,6 +265,12 @@ pub(crate) struct PresentSharp {
     /// RCAS: EASU into `mid` (`UNDEFINED -> SHADER_READ_ONLY_OPTIMAL`).
     mid_pass: vk::RenderPass,
     rcas_pipeline: vk::Pipeline,
+    /// TEMP (lab, PRESENT_SS): its factor, and the window pass that resamples a larger `mid` down.
+    ss: Option<f32>,
+    down_pipeline: vk::Pipeline,
+    /// TEMP (lab, PRESENT_SS with VSR/DLSS): `mid` is their rgba8 storage image, which EASU cannot render into -
+    /// the presents EASU takes render this one (the window's format, the same supersampled size).
+    ss_easu: Option<MidImage>,
     /// RCAS: one per frame entry, reading `mid`.
     rcas_sets: Vec<vk::DescriptorSet>,
     mid: Option<MidImage>,
@@ -241,6 +280,40 @@ pub(crate) struct PresentSharp {
     /// `REIMS_VGPU_LAB_PRESENT_DUMP`: the dump in flight, and how many written.
     dump: Option<PresentDump>,
     dumps: u32,
+    /// VSR (`present_vsr`): its quality, or `None`. Like NIS it writes `mid`
+    /// (rgba8 storage) and the window pass copies it out at strength 0.
+    vsr: Option<i32>,
+    /// VSR: the guest frame converted to rgba8 at its own size (NGX's input).
+    vsr_in: Option<MidImage>,
+    /// VSR: the feature was created (recorded into an earlier present).
+    vsr_created: bool,
+    /// VSR: a create or evaluate refused; the present keeps EASU from here on.
+    vsr_failed: bool,
+    /// TEMP (lab, PRESENT_DLSS_SR): DLSS Super Resolution in VSR's place - its zero depth and motion vectors at
+    /// the input size, and whether they were cleared (and the history reset) since they were made.
+    dlss_depth: Option<MidImage>,
+    dlss_mvec: Option<MidImage>,
+    dlss_cleared: bool,
+    /// TEMP (lab, PRESENT_DLSS_PRESET_MOTION): which instance ran the last evaluate (`Some(true)` = motion).
+    dlss_last_moving: Option<bool>,
+    /// TEMP (lab, PRESENT_DLSS_SR): the pass that writes `dlss_mvec` from the optical flow
+    /// (`shaders/present_dlss_mvec.comp`), made on the first present with a flow pair; whether the vectors in
+    /// `dlss_mvec` are not all zero (a present without a fresh pair clears them); a build that refused.
+    dlss_mvec_pass: Option<MvecPass>,
+    dlss_mvec_moving: bool,
+    dlss_mvec_failed: bool,
+    /// TEMP (lab, PRESENT_VSR_TILES): VSR on the still cells, and whether the
+    /// present being recorded draws its overlay.
+    refine: Option<super::present_refine::TileRefine>,
+    refine_failed: bool,
+    refine_active: bool,
+    /// TEMP (lab, PRESENT_RAVU): RAVU-Zoom-AR into `mid` in EASU's place (not with NIS or VSR, which replace
+    /// EASU themselves), its compute pass, its weight tables (both made on the first present), and a refused
+    /// load (EASU from then on).
+    ravu: bool,
+    ravu_pass: Option<super::present_ravu::RavuPass>,
+    ravu_lut: Option<super::present_ravu::RavuLut>,
+    ravu_failed: bool,
 }
 
 /// The guest frame one scaled present reads.
@@ -251,6 +324,124 @@ pub(crate) struct SharpSource {
     pub layout: vk::ImageLayout,
     pub width: u32,
     pub height: u32,
+    /// TEMP (lab, PRESENT_VSR_TILES): the guest frame behind `image` when that
+    /// is a generated midpoint (PRESENT_FG); `None` when `image` is the frame.
+    pub real: Option<super::present_refine::RefineFrame>,
+    /// TEMP (lab, PRESENT_VSR_TILES): the guest frame's sequence, when known (a
+    /// present of the frame the cells were already compared against skips it).
+    pub seq: Option<u64>,
+    /// TEMP (lab, PRESENT_DLSS_SR): the optical flow from the previous guest frame to this one, on the first
+    /// present of a new frame; DLSS's motion vectors are built from it (zero without it).
+    pub motion: Option<super::present_fg::FgMotion>,
+}
+
+/// TEMP (lab, PRESENT_DLSS_SR): `shaders/present_dlss_mvec.comp` - the flow's backward vectors, checked against a
+/// still match per cell, into DLSS's RG16F motion vectors. One descriptor set per presenter frame entry.
+struct MvecPass {
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    pool: vk::DescriptorPool,
+    sets: Vec<vk::DescriptorSet>,
+}
+
+impl MvecPass {
+    unsafe fn create(device: &ash::Device, frames: usize) -> Result<Self, vk::Result> {
+        let mut made = Self {
+            set_layout: vk::DescriptorSetLayout::null(),
+            layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+            pool: vk::DescriptorPool::null(),
+            sets: Vec::new(),
+        };
+        let r = (|| -> Result<(), vk::Result> {
+            let bindings: Vec<_> = (0..4u32)
+                .map(|b| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(b)
+                        .descriptor_type(if b == 3 {
+                            vk::DescriptorType::STORAGE_IMAGE
+                        } else {
+                            vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                        })
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                })
+                .collect();
+            made.set_layout = device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )?;
+            let push = [vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(12)];
+            let set_layouts = [made.set_layout];
+            made.layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&set_layouts)
+                    .push_constant_ranges(&push),
+                None,
+            )?;
+            let module = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default()
+                    .code(&super::present_sharp_shader::PRESENT_DLSS_MVEC_COMP_SPIRV),
+                None,
+            )?;
+            let info = [vk::ComputePipelineCreateInfo::default()
+                .stage(
+                    vk::PipelineShaderStageCreateInfo::default()
+                        .stage(vk::ShaderStageFlags::COMPUTE)
+                        .module(module)
+                        .name(c"main"),
+                )
+                .layout(made.layout)];
+            let pipelines = device.create_compute_pipelines(vk::PipelineCache::null(), &info, None);
+            device.destroy_shader_module(module, None);
+            made.pipeline = pipelines.map_err(|(_, e)| e)?[0];
+            let n = frames as u32;
+            let sizes = [
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(3 * n),
+                vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(n),
+            ];
+            made.pool = device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default().max_sets(n).pool_sizes(&sizes),
+                None,
+            )?;
+            let layouts = vec![made.set_layout; frames];
+            made.sets = device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(made.pool)
+                    .set_layouts(&layouts),
+            )?;
+            Ok(())
+        })();
+        match r {
+            Ok(()) => Ok(made),
+            Err(e) => {
+                made.destroy(device);
+                Err(e)
+            }
+        }
+    }
+
+    unsafe fn destroy(&mut self, device: &ash::Device) {
+        if self.pipeline != vk::Pipeline::null() {
+            device.destroy_pipeline(self.pipeline, None);
+        }
+        if self.layout != vk::PipelineLayout::null() {
+            device.destroy_pipeline_layout(self.layout, None);
+        }
+        if self.pool != vk::DescriptorPool::null() {
+            device.destroy_descriptor_pool(self.pool, None);
+        }
+        if self.set_layout != vk::DescriptorSetLayout::null() {
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+        }
+        self.sets.clear();
+    }
 }
 
 impl PresentSharp {
@@ -270,7 +461,15 @@ impl PresentSharp {
             transient: vec![None; frames],
             // With NIS the window pass is RCAS too: an exact copy unless
             // REIMS_VGPU_LAB_PRESENT_RCAS also asks for its sharpening.
-            rcas: if nis_sharp().is_some() { Some(rcas_sharp().unwrap_or(0.0)) } else { rcas_sharp() },
+            rcas: if nis_sharp().is_some()
+                || super::present_vsr::quality().is_some()
+                || Self::ss_wanted().is_some()
+                || Self::ravu_wanted()
+            {
+                Some(rcas_sharp().unwrap_or(0.0))
+            } else {
+                rcas_sharp()
+            },
             nis: nis_sharp(),
             nis_set_layout: vk::DescriptorSetLayout::null(),
             nis_layout: vk::PipelineLayout::null(),
@@ -280,12 +479,33 @@ impl PresentSharp {
             nis_coef: None,
             mid_pass: vk::RenderPass::null(),
             rcas_pipeline: vk::Pipeline::null(),
+            ss: Self::ss_wanted(),
+            down_pipeline: vk::Pipeline::null(),
+            ss_easu: None,
             rcas_sets: Vec::new(),
             mid: None,
             retired: Vec::new(),
             records: 0,
             dump: None,
             dumps: 0,
+            vsr: super::present_vsr::quality(),
+            vsr_in: None,
+            vsr_created: false,
+            vsr_failed: false,
+            dlss_depth: None,
+            dlss_mvec: None,
+            dlss_cleared: false,
+            dlss_last_moving: None,
+            dlss_mvec_pass: None,
+            dlss_mvec_moving: false,
+            dlss_mvec_failed: false,
+            refine: None,
+            refine_failed: false,
+            refine_active: false,
+            ravu: Self::ravu_wanted(),
+            ravu_pass: None,
+            ravu_lut: None,
+            ravu_failed: false,
         };
         if let Err(e) = made.build(device, format, frames) {
             made.destroy(device);
@@ -296,7 +516,44 @@ impl PresentSharp {
         } else if let Some(sharp) = made.rcas {
             crate::observe::off(format!("present_sharp rcas sharp={sharp:.3}"));
         }
+        if let Some(k) = made.ss {
+            crate::observe::off(format!("present_sharp ss k={k:.3}"));
+        }
+        if made.ravu {
+            crate::observe::off(format!("present_sharp ravu hook={:?}", super::present_ravu::hook_path()));
+        }
         Ok(made)
+    }
+
+    /// Whether the RCAS window pass (and `mid`'s pass, its sets) is built: for RCAS itself, or - TEMP (lab,
+    /// PRESENT_FG) - as the exact copy (strength 0) that shows a frame the window's size, so frame generation's
+    /// midpoints reach the screen at 1:1 too (a native 5120x2160 guest; before, only a scaled present drew them).
+    fn window_pass_built(&self) -> bool {
+        self.rcas.is_some() || super::present_fg::on()
+    }
+
+    /// PRESENT_RAVU where it applies: not with NIS or VSR (each replaces EASU itself), nor with PRESENT_SS (RAVU
+    /// writes the visible part's size).
+    fn ravu_wanted() -> bool {
+        super::present_ravu::hook_path().is_some()
+            && nis_sharp().is_none()
+            && super::present_vsr::quality().is_none()
+            && ss_factor().is_none()
+    }
+
+    /// PRESENT_SS where it applies: not with NIS (its constants are for the visible part's size) nor with the VSR
+    /// tiles (their cells are cut at it).
+    fn ss_wanted() -> Option<f32> {
+        ss_factor().filter(|_| nis_sharp().is_none() && !super::present_refine::on())
+    }
+
+    /// The window pass reading a `mid_w` x `mid_h` first-pass result: RCAS 1:1, or PRESENT_SS's resample down.
+    fn window_pipeline(&self, mid_w: u32, mid_h: u32, vp: (u32, u32, u32, u32)) -> vk::Pipeline {
+        if (mid_w, mid_h) != (vp.2, vp.3) && self.down_pipeline != vk::Pipeline::null() {
+            self.down_pipeline
+        } else {
+            self.rcas_pipeline
+        }
     }
 
     unsafe fn build(&mut self, device: &ash::Device, format: vk::Format, frames: usize) -> Result<(), vk::Result> {
@@ -352,7 +609,7 @@ impl PresentSharp {
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(if self.rcas.is_some() { 20 } else { 8 })];
+            .size(if self.window_pass_built() { 20 } else { 8 })];
         let set_layouts = [self.set_layout];
         self.layout = device.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()
@@ -376,7 +633,7 @@ impl PresentSharp {
         // the same single attachment format and sample count, so it is
         // render-pass compatible with it and EASU runs in either.
         self.pipeline = self.make_pipeline(device, &PRESENT_SHARP_FRAG_SPIRV)?;
-        let per_frame = if self.rcas.is_some() { 2 } else { 1 };
+        let per_frame = if self.window_pass_built() { 2 } else { 1 };
         let sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count((frames * per_frame) as u32)];
@@ -392,8 +649,11 @@ impl PresentSharp {
                 .descriptor_pool(self.pool)
                 .set_layouts(&layouts),
         )?;
-        if self.rcas.is_some() {
+        if self.window_pass_built() {
             self.rcas_pipeline = self.make_pipeline(device, &PRESENT_RCAS_FRAG_SPIRV)?;
+            if self.ss.is_some() {
+                self.down_pipeline = self.make_pipeline(device, &PRESENT_DOWN_FRAG_SPIRV)?;
+            }
             self.rcas_sets = device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(self.pool)
@@ -438,6 +698,9 @@ impl PresentSharp {
         }
         if self.nis.is_some() {
             self.build_nis(device, frames)?;
+        }
+        if self.ravu {
+            self.ravu_pass = Some(super::present_ravu::RavuPass::create(device, frames)?);
         }
         Ok(())
     }
@@ -762,6 +1025,9 @@ impl PresentSharp {
 
     /// Free entry `ix`'s view and framebuffer. Only once its fence retired.
     pub(crate) unsafe fn release(&mut self, device: &ash::Device, ix: usize) {
+        if let Some(lut) = self.ravu_lut.as_mut() {
+            lut.confirm(ix);
+        }
         if let Some((view, fb)) = self.transient.get_mut(ix).and_then(Option::take) {
             device.destroy_framebuffer(fb, None);
             device.destroy_image_view(view, None);
@@ -771,6 +1037,10 @@ impl PresentSharp {
     /// Free every entry's view and framebuffer, and every retired EASU image —
     /// the queue is idle.
     pub(crate) unsafe fn release_all(&mut self, device: &ash::Device) {
+        // Before the entries below: an idle queue says nothing about whether the upload was ever submitted.
+        if let Some(lut) = self.ravu_lut.as_mut() {
+            lut.unconfirm();
+        }
         for ix in 0..self.transient.len() {
             self.release(device, ix);
         }
@@ -796,6 +1066,44 @@ impl PresentSharp {
         if let Some(old) = self.mid.take() {
             self.retired.push((old, self.records));
         }
+        // NVScaler (and VSR, RAVU) write `mid` as an rgba8 storage image; EASU
+        // renders it in the window's format.
+        let storage = self.nis.is_some() || self.vsr.is_some() || self.ravu;
+        self.mid = Some(self.make_mid(device, format, width, height, storage, memory_type)?);
+        Ok(())
+    }
+
+    /// TEMP (lab, PRESENT_SS with VSR/DLSS): `ss_easu` at `width` x `height`, made (and the old one retired) on a
+    /// size change.
+    unsafe fn ensure_ss_easu(
+        &mut self,
+        device: &ash::Device,
+        format: vk::Format,
+        width: u32,
+        height: u32,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> Result<(), vk::Result> {
+        if self.ss_easu.as_ref().is_some_and(|m| (m.width, m.height) == (width, height)) {
+            return Ok(());
+        }
+        if let Some(old) = self.ss_easu.take() {
+            self.retired.push((old, self.records));
+        }
+        self.ss_easu = Some(self.make_mid(device, format, width, height, false, memory_type)?);
+        Ok(())
+    }
+
+    /// A first-pass image: an rgba8 storage image (`storage`), or a colour attachment in the window's `format`
+    /// with its `mid_pass` framebuffer.
+    unsafe fn make_mid(
+        &self,
+        device: &ash::Device,
+        format: vk::Format,
+        width: u32,
+        height: u32,
+        storage: bool,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> Result<MidImage, vk::Result> {
         let mut made = MidImage {
             image: vk::Image::null(),
             memory: vk::DeviceMemory::null(),
@@ -804,9 +1112,7 @@ impl PresentSharp {
             width,
             height,
         };
-        // NVScaler writes `mid` as an rgba8 storage image; EASU renders it in
-        // the window's format.
-        let nis = self.nis.is_some();
+        let nis = storage;
         let format = if nis { vk::Format::R8G8B8A8_UNORM } else { format };
         let usage = if nis {
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC
@@ -860,14 +1166,366 @@ impl PresentSharp {
             Ok(())
         })();
         match r {
+            Ok(()) => Ok(made),
+            Err(e) => {
+                made.destroy(device);
+                Err(e)
+            }
+        }
+    }
+
+    /// VSR's input: an rgba8 copy of the guest frame at its own size.
+    unsafe fn ensure_vsr_in(
+        &mut self,
+        device: &ash::Device,
+        width: u32,
+        height: u32,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> Result<(), vk::Result> {
+        if self.vsr_in.as_ref().is_some_and(|m| (m.width, m.height) == (width, height)) {
+            return Ok(());
+        }
+        if let Some(old) = self.vsr_in.take() {
+            self.retired.push((old, self.records));
+        }
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let mut made = MidImage {
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            fb: vk::Framebuffer::null(),
+            width,
+            height,
+        };
+        let r = (|| -> Result<(), vk::Result> {
+            made.image = device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format)
+                    .extent(vk::Extent3D { width, height, depth: 1 })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )?;
+            let req = device.get_image_memory_requirements(made.image);
+            let mt = memory_type(req.memory_type_bits, req.size, false).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+            made.memory = device.allocate_memory(
+                &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt),
+                None,
+            )?;
+            device.bind_image_memory(made.image, made.memory, 0)?;
+            made.view = device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(made.image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(super::color_subresource_range()),
+                None,
+            )?;
+            Ok(())
+        })();
+        match r {
             Ok(()) => {
-                self.mid = Some(made);
+                self.vsr_in = Some(made);
                 Ok(())
             }
             Err(e) => {
                 made.destroy(device);
                 Err(e)
             }
+        }
+    }
+
+    /// TEMP (lab, PRESENT_DLSS_SR): the zero depth (R32F) and motion vectors (RG16F) at the input size.
+    unsafe fn ensure_dlss_aux(
+        &mut self,
+        device: &ash::Device,
+        width: u32,
+        height: u32,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> Result<(), vk::Result> {
+        if self.dlss_depth.as_ref().is_some_and(|m| (m.width, m.height) == (width, height)) && self.dlss_mvec.is_some() {
+            return Ok(());
+        }
+        for old in [self.dlss_depth.take(), self.dlss_mvec.take()].into_iter().flatten() {
+            self.retired.push((old, self.records));
+        }
+        self.dlss_cleared = false;
+        let make = |format: vk::Format| -> Result<MidImage, vk::Result> {
+            let mut made = MidImage {
+                image: vk::Image::null(),
+                memory: vk::DeviceMemory::null(),
+                view: vk::ImageView::null(),
+                fb: vk::Framebuffer::null(),
+                width,
+                height,
+            };
+            let r = (|| -> Result<(), vk::Result> {
+                made.image = device.create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(format)
+                        .extent(vk::Extent3D { width, height, depth: 1 })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(DLSS_AUX_USAGE)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )?;
+                let req = device.get_image_memory_requirements(made.image);
+                let mt = memory_type(req.memory_type_bits, req.size, false).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+                made.memory = device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt),
+                    None,
+                )?;
+                device.bind_image_memory(made.image, made.memory, 0)?;
+                made.view = device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(made.image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(format)
+                        .subresource_range(super::color_subresource_range()),
+                    None,
+                )?;
+                Ok(())
+            })();
+            match r {
+                Ok(()) => Ok(made),
+                Err(e) => {
+                    made.destroy(device);
+                    Err(e)
+                }
+            }
+        };
+        let depth = make(DLSS_DEPTH_FORMAT)?;
+        match make(DLSS_MVEC_FORMAT) {
+            Ok(mvec) => {
+                self.dlss_depth = Some(depth);
+                self.dlss_mvec = Some(mvec);
+                Ok(())
+            }
+            Err(e) => {
+                depth.destroy(device);
+                Err(e)
+            }
+        }
+    }
+
+    /// TEMP (lab, PRESENT_DLSS_SR): DLSS from `vin` (shader-read, rgba8) into `mid` (general, rgba8). Clears the
+    /// depth and motion vectors to zero the first time (and resets the history then): a desktop's content does
+    /// not move between two presents of a still screen, which is where DLSS accumulates. On the first present of
+    /// a new guest frame `motion` (the optical flow from the previous one, at the guest frame's size) fills the
+    /// motion vectors; any other present leaves them zero.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn dlss_evaluate(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        ix: usize,
+        vin: (vk::Image, vk::ImageView, u32, u32),
+        mid: (vk::Image, vk::ImageView, u32, u32),
+        motion: Option<&super::present_fg::FgMotion>,
+        moving: bool,
+    ) -> i32 {
+        let (Some(depth), Some(mvec)) = (self.dlss_depth.as_ref(), self.dlss_mvec.as_ref()) else {
+            return -102;
+        };
+        let range = super::color_subresource_range();
+        // TEMP (lab, PRESENT_VSR_SETTLE with DLSS): with a settle time DLSS runs only on the present that refines a
+        // frame that stood still (the moving frames take EASU, ~1 ms of GPU against preset M's ~11 ms at 5K out -
+        // b942a canvas 45 fps; Mish: 60 real frames for DLSS-G to make 120). The frames between two such presents
+        // never reached DLSS, so its history is another picture: every settled evaluate starts it afresh.
+        // With a motion instance (PRESENT_DLSS_PRESET_MOTION) the moving frames run consecutively through it, so its
+        // history holds - it starts afresh only after a settled present (or a gap) came between.
+        let reset = if moving {
+            !self.dlss_cleared || self.dlss_last_moving != Some(true)
+        } else {
+            !self.dlss_cleared || crate::host_window::present::lab_present_settle().is_some()
+        };
+        if !self.dlss_cleared {
+            let to_dst = [depth.image, mvec.image].map(|image| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range)
+            });
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_dst);
+            for image in [depth.image, mvec.image] {
+                device.cmd_clear_color_image(cmd, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: [0.0; 4] }, &[range]);
+            }
+            let to_general = [depth.image, mvec.image].map(|image| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range)
+            });
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &to_general);
+            self.dlss_cleared = true;
+            self.dlss_mvec_moving = false;
+        }
+        self.record_dlss_mvec(device, cmd, ix, (vin.2, vin.3), motion);
+        let (Some(depth), Some(mvec)) = (self.dlss_depth.as_ref(), self.dlss_mvec.as_ref()) else {
+            return -102;
+        };
+        let image = |(image, view, width, height): (vk::Image, vk::ImageView, u32, u32), layout, format, usage| {
+            super::present_dlssg::DlssSrImage { image, view, memory: vk::DeviceMemory::null(), layout, format, width, height, usage }
+        };
+        let rgba = vk::Format::R8G8B8A8_UNORM;
+        let vin_usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE;
+        let mid_usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        let aux = |m: &MidImage, format| image((m.image, m.view, m.width, m.height), vk::ImageLayout::GENERAL, format, DLSS_AUX_USAGE);
+        let r = super::present_dlssg::dlss_sr_evaluate(
+            cmd,
+            &image(vin, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, rgba, vin_usage),
+            &image(mid, vk::ImageLayout::GENERAL, rgba, mid_usage),
+            &aux(depth, DLSS_DEPTH_FORMAT),
+            &aux(mvec, DLSS_MVEC_FORMAT),
+            reset,
+            moving,
+        );
+        self.dlss_last_moving = Some(moving);
+        r
+    }
+
+    /// TEMP (lab, PRESENT_DLSS_SR): `dlss_mvec` (`GENERAL`, `width` x `height`) for this present - from the flow
+    /// pair when there is one (and the pass builds), else zero: cleared once after a present that wrote vectors.
+    unsafe fn record_dlss_mvec(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        ix: usize,
+        (width, height): (u32, u32),
+        motion: Option<&super::present_fg::FgMotion>,
+    ) {
+        let motion = motion.filter(|_| !self.dlss_mvec_failed);
+        if motion.is_some() && self.dlss_mvec_pass.is_none() {
+            match MvecPass::create(device, self.sets.len()) {
+                Ok(pass) => self.dlss_mvec_pass = Some(pass),
+                Err(e) => {
+                    self.dlss_mvec_failed = true;
+                    crate::observe::fail(format!("present_dlss_mvec_refused build={e:?}"));
+                }
+            }
+        }
+        let Some(mvec) = self.dlss_mvec.as_ref() else {
+            return;
+        };
+        let range = super::color_subresource_range();
+        let barrier = |src_a, dst_a| {
+            [vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_a)
+                .dst_access_mask(dst_a)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(mvec.image)
+                .subresource_range(range)]
+        };
+        let read = vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE;
+        match (motion, self.dlss_mvec_pass.as_ref()) {
+            (Some(m), Some(pass)) if pass.sets.len() > ix => {
+                let set = pass.sets[ix];
+                let sampled = |view| {
+                    [vk::DescriptorImageInfo::default()
+                        .sampler(self.sampler)
+                        .image_view(view)
+                        .image_layout(vk::ImageLayout::GENERAL)]
+                };
+                let (prev, cur, bwd) = (sampled(m.prev), sampled(m.cur), sampled(m.bwd));
+                let out = [vk::DescriptorImageInfo::default()
+                    .image_view(mvec.view)
+                    .image_layout(vk::ImageLayout::GENERAL)];
+                let w = |binding: u32, ty: vk::DescriptorType| {
+                    vk::WriteDescriptorSet::default().dst_set(set).dst_binding(binding).descriptor_type(ty)
+                };
+                device.update_descriptor_sets(
+                    &[
+                        w(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&prev),
+                        w(1, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&cur),
+                        w(2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&bwd),
+                        w(3, vk::DescriptorType::STORAGE_IMAGE).image_info(&out),
+                    ],
+                    &[],
+                );
+                // The flow (optical-flow queue, waited on by this submission) and the copied inputs, then the
+                // vectors DLSS read last present.
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)],
+                    &[],
+                    &barrier(read, vk::AccessFlags::SHADER_WRITE),
+                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pass.pipeline);
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pass.layout, 0, &[set], &[]);
+                let mut push = [0u8; 12];
+                push[0..4].copy_from_slice(&(width as i32).to_le_bytes());
+                push[4..8].copy_from_slice(&(height as i32).to_le_bytes());
+                push[8..12].copy_from_slice(&(m.grid as i32).to_le_bytes());
+                device.cmd_push_constants(cmd, pass.layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
+                let (cells_x, cells_y) = (width.div_ceil(m.grid), height.div_ceil(m.grid));
+                device.cmd_dispatch(cmd, cells_x.div_ceil(8), cells_y.div_ceil(8), 1);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barrier(vk::AccessFlags::SHADER_WRITE, read),
+                );
+                self.dlss_mvec_moving = true;
+            }
+            _ if self.dlss_mvec_moving => {
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barrier(read, vk::AccessFlags::TRANSFER_WRITE),
+                );
+                device.cmd_clear_color_image(
+                    cmd,
+                    mvec.image,
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearColorValue { float32: [0.0; 4] },
+                    &[range],
+                );
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barrier(vk::AccessFlags::TRANSFER_WRITE, read),
+                );
+                self.dlss_mvec_moving = false;
+            }
+            _ => {}
         }
     }
 
@@ -884,6 +1542,39 @@ impl PresentSharp {
                 .image_info(&image_info)],
             &[],
         );
+    }
+
+    /// TEMP (lab, PRESENT_RAVU): whether this present can run RAVU - its tables made (once; a refusal is
+    /// reported and leaves EASU) and their upload recorded into `cmd` until one ran.
+    unsafe fn ravu_tables(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        ix: usize,
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> bool {
+        if !self.ravu || self.ravu_failed || self.ravu_pass.is_none() {
+            return false;
+        }
+        if self.ravu_lut.is_none() {
+            let path = super::present_ravu::hook_path().unwrap_or_default();
+            match super::present_ravu::RavuLut::create(device, path, memory_type) {
+                Ok(lut) => {
+                    crate::observe::off("present_ravu tables loaded".to_string());
+                    self.ravu_lut = Some(lut);
+                }
+                Err(e) => {
+                    self.ravu_failed = true;
+                    crate::observe::fail(format!("present_ravu_refused tables={e}"));
+                    return false;
+                }
+            }
+        }
+        let Some(lut) = self.ravu_lut.as_mut() else {
+            return false;
+        };
+        lut.record_upload(device, cmd, ix);
+        true
     }
 
     unsafe fn set_rect(device: &ash::Device, cmd: vk::CommandBuffer, x: u32, y: u32, w: u32, h: u32) {
@@ -959,14 +1650,44 @@ impl PresentSharp {
                 nis_cfg = None;
             }
         }
-        let second = if self.nis.is_some() && nis_cfg.is_none() { None } else { self.rcas };
+        // TEMP (lab, PRESENT_VSR_SETTLE): with a settle time VSR runs only on the
+        // present that refines a settled frame; the others take EASU alone.
+        let refine_present = crate::host_window::present::lab_present_settle().is_none()
+            || crate::host_window::present::lab_take_refine_present();
+        // TEMP (lab, PRESENT_DLSS_PRESET_MOTION): the moving frames take DLSS's motion instance instead of EASU.
+        let dlss_moving = !refine_present && super::present_dlssg::dlss_motion_active();
+        let vsr_this = self.vsr.is_some() && !super::present_refine::on() && (refine_present || dlss_moving);
+        let second = if (self.nis.is_some() && nis_cfg.is_none()) || (self.vsr.is_some() && !vsr_this) {
+            None
+        } else {
+            self.rcas
+        };
+        // TEMP (lab, PRESENT_SS): the first pass's size - supersampled, or the visible part's.
+        let ss = self.ss.and_then(|k| ss_size(k, (src.width, src.height), (vp.2, vp.3)));
+        let (mid_w, mid_h) = ss.unwrap_or((vp.2, vp.3));
+        let dlss = super::present_dlssg::dlss_sr_active();
+        let upscaler_ready = if dlss { true } else { super::present_vsr::ready() };
+        // PRESENT_SS with VSR/DLSS: the presents EASU takes render `ss_easu` (`mid` is the upscaler's storage image).
+        let ss_easu = match ss {
+            Some((w, h)) if self.vsr.is_some() => match self.ensure_ss_easu(device, format, w, h, memory_type) {
+                Ok(()) => true,
+                Err(e) => {
+                    if crate::observe::first_sight("present_ss_easu_refused", 0) {
+                        crate::observe::fail(format!("present_ss_easu_refused {w}x{h} err={e:?}"));
+                    }
+                    false
+                }
+            },
+            _ => false,
+        };
+        let easu_frame = ss_easu && !(vsr_this && !self.vsr_failed && upscaler_ready);
         let rcas = match second {
-            Some(sharp) => match self.ensure_mid(device, format, vp.2, vp.3, memory_type) {
+            Some(sharp) => match self.ensure_mid(device, format, mid_w, mid_h, memory_type) {
                 Ok(()) => Some(sharp),
                 Err(e) => {
                     // EASU alone this present; the next one tries again.
                     if crate::observe::first_sight("present_rcas_mid_refused", 0) {
-                        crate::observe::fail(format!("present_rcas_mid_refused {}x{} err={e:?}", vp.2, vp.3));
+                        crate::observe::fail(format!("present_rcas_mid_refused {mid_w}x{mid_h} err={e:?}"));
                     }
                     None
                 }
@@ -1000,18 +1721,34 @@ impl PresentSharp {
         self.transient[ix] = Some((view, fb));
         let set = self.sets[ix];
         self.write_set(device, set, src.view);
+        // TEMP (lab, PRESENT_RAVU): this present's RAVU into `mid` - an upscale, its tables loaded (their upload
+        // recorded until one ran) and `mid` there; otherwise EASU as without it.
+        let ravu_this = rcas.is_some()
+            && super::present_ravu::RavuPass::takes((src.width, src.height), (mid_w, mid_h))
+            && self.mid.as_ref().is_some_and(|m| (m.width, m.height) == (mid_w, mid_h))
+            && self.ravu_tables(device, cmd, ix, memory_type);
         // REIMS_VGPU_LAB_PRESENT_DUMP: the source as this present reads it.
-        let dumping = rcas.is_some()
+        // With PRESENT_VSR_TILES the "out" half is the refined-cell cache.
+        let dumping = (rcas.is_some() || easu_frame || super::present_refine::on())
             && self.begin_dump(
                 device,
                 ix,
                 (src.width, src.height),
-                (vp.2, vp.3),
-                self.nis.is_some() && nis_cfg.is_some(),
+                (mid_w, mid_h),
+                // `mid` is rgba8 under NVScaler and VSR alike, and so is the cache; `ss_easu` is the window's.
+                ((self.nis.is_some() && nis_cfg.is_some()) || self.vsr.is_some() || ravu_this) && !easu_frame,
                 memory_type,
             );
-        if let (true, Some(d)) = (dumping, self.dump.as_ref()) {
+        if let (true, Some(d)) = (dumping, self.dump.as_mut()) {
+            d.src_rgba = src.real.is_some();
             Self::dump_copy(device, cmd, src.image, src.layout, d.buffer, 0, (src.width, src.height));
+        }
+        // TEMP (lab, PRESENT_VSR_TILES): stamp the changed cells, refine still
+        // ones; the window pass draws the refined cells over its own result.
+        self.refine_active = false;
+        if super::present_refine::on() {
+            let due = self.record_refine(device, cmd, ix, src, vp, memory_type);
+            crate::host_window::present::lab_note_tiles_due(due);
         }
         let to_read = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
@@ -1023,7 +1760,186 @@ impl PresentSharp {
             .image(src.image)
             .subresource_range(super::color_subresource_range())];
         let nis_cfg = if rcas.is_some() { nis_cfg } else { None };
-        let reader = if nis_cfg.is_some() {
+        // VSR this present: ready, a `mid`, and its input image.
+        // TEMP (lab, PRESENT_DLSS_SR): DLSS Super Resolution takes VSR's place (same input, same `mid`).
+        let vsr = match (self.vsr.filter(|_| vsr_this), rcas.is_some() && !self.vsr_failed && upscaler_ready) {
+            (Some(q), true) => match self.ensure_vsr_in(device, src.width, src.height, memory_type) {
+                Ok(()) => Some(q),
+                Err(e) => {
+                    if crate::observe::first_sight("present_vsr_in_refused", 0) {
+                        crate::observe::fail(format!("present_vsr_in_refused err={e:?}"));
+                    }
+                    None
+                }
+            },
+            _ => None,
+        };
+        if let (Some(q), Some(vin), Some(mid)) = (vsr, self.vsr_in.as_ref(), self.mid.as_ref()) {
+            let (vin_image, vin_view, vin_w, vin_h) = (vin.image, vin.view, vin.width, vin.height);
+            let (mid_image, mid_view, mid_w, mid_h) = (mid.image, mid.view, mid.width, mid.height);
+            if dlss {
+                // Streamline creates its feature on the first evaluate; only its inputs are made here.
+                self.vsr_created = match self.ensure_dlss_aux(device, vin_w, vin_h, memory_type) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        crate::observe::fail(format!("present_dlss_sr_refused reason=aux err={e:?} {vin_w}x{vin_h}"));
+                        self.vsr_failed = true;
+                        false
+                    }
+                };
+            }
+            if !self.vsr_created && !dlss {
+                self.vsr_created = super::present_vsr::create_feature(device, cmd);
+                if !self.vsr_created {
+                    self.vsr_failed = true;
+                }
+            }
+            if self.vsr_created {
+                // The guest frame (in `src.layout`, a transfer-read layout) into
+                // the rgba8 input at its own size; then NGX from it into `mid`.
+                let barriers = [
+                    vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(vin_image)
+                        .subresource_range(super::color_subresource_range()),
+                    vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(mid_image)
+                        .subresource_range(super::color_subresource_range()),
+                ];
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barriers,
+                );
+                let whole = |w: u32, h: u32| [vk::Offset3D { x: 0, y: 0, z: 0 }, vk::Offset3D { x: w as i32, y: h as i32, z: 1 }];
+                let layers = vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                device.cmd_blit_image(
+                    cmd,
+                    src.image,
+                    src.layout,
+                    vin_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::ImageBlit {
+                        src_subresource: layers,
+                        src_offsets: whole(src.width, src.height),
+                        dst_subresource: layers,
+                        dst_offsets: whole(vin_w, vin_h),
+                    }],
+                    vk::Filter::NEAREST,
+                );
+                let vin_read = [vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(vin_image)
+                    .subresource_range(super::color_subresource_range())];
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &vin_read,
+                );
+                let r = if dlss {
+                    // The flow ran at the guest frame's size; vectors only when `vin` is that size too.
+                    let motion = src.motion.as_ref().filter(|_| (vin_w, vin_h) == (src.width, src.height));
+                    self.dlss_evaluate(device, cmd, ix, (vin_image, vin_view, vin_w, vin_h), (mid_image, mid_view, mid_w, mid_h), motion, dlss_moving)
+                } else { super::present_vsr::evaluate(
+                    cmd,
+                    &super::present_vsr::VsrImage {
+                        image: vin_image,
+                        view: vin_view,
+                        format: vk::Format::R8G8B8A8_UNORM,
+                        width: vin_w,
+                        height: vin_h,
+                    },
+                    &super::present_vsr::VsrImage {
+                        image: mid_image,
+                        view: mid_view,
+                        format: vk::Format::R8G8B8A8_UNORM,
+                        width: mid_w,
+                        height: mid_h,
+                    },
+                    q,
+                ) };
+                {
+                    // TEMP (lab): how often VSR ran (with a settle time: once per settled frame).
+                    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n <= 5 || n % 200 == 0 {
+                        crate::observe::off(format!("present_vsr evaluate #{n} {vin_w}x{vin_h}->{mid_w}x{mid_h} ngx={r:#x}"));
+                    }
+                }
+                if r != 0 {
+                    self.vsr_failed = true;
+                    crate::observe::fail(format!("present_vsr_refused reason=evaluate ngx={r:#x} {vin_w}x{vin_h}->{mid_w}x{mid_h}"));
+                }
+                // Whatever NGX did, `mid` goes to the window pass's layout
+                // (a refused evaluate shows one undefined frame, then EASU).
+                let mid_read = [vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(mid_image)
+                    .subresource_range(super::color_subresource_range())];
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &mid_read,
+                );
+                let rcas_set = self.rcas_sets[ix];
+                self.write_set(device, rcas_set, mid_view);
+                let mut push = [0u8; 20];
+                for (i, v) in [vp.0, vp.1, vp.2, vp.3].iter().enumerate() {
+                    push[i * 4..i * 4 + 4].copy_from_slice(&(*v as i32).to_le_bytes());
+                }
+                push[16..].copy_from_slice(&rcas.unwrap_or(0.0).to_le_bytes());
+                self.begin_window_pass(device, cmd, fb, extent, clear);
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.window_pipeline(mid_w, mid_h, vp));
+                Self::set_rect(device, cmd, vp.0, vp.1, vp.2, vp.3);
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
+                device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
+                device.cmd_draw(cmd, 3, 1, 0, 0);
+                self.end_window_pass(device, cmd, vp);
+                if dumping {
+                    self.record_mid_dump(device, cmd, src.width, src.height, None);
+                }
+                return Ok(());
+            }
+        }
+        let reader = if nis_cfg.is_some() || ravu_this {
             vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER
         } else {
             vk::PipelineStageFlags::FRAGMENT_SHADER
@@ -1041,7 +1957,93 @@ impl PresentSharp {
         let mut easu_push = [0u8; 8];
         easu_push[..4].copy_from_slice(&size[0].to_le_bytes());
         easu_push[4..].copy_from_slice(&size[1].to_le_bytes());
-        if let (Some(cfg), Some(mid)) = (nis_cfg, self.mid.as_ref()) {
+        // TEMP (lab, PRESENT_FG at 1:1): a frame the visible part's size (a generated midpoint of a native guest)
+        // through the window pass at strength 0 - an exact copy.
+        let copy_1to1 = (src.width, src.height) == (vp.2, vp.3) && self.rcas_pipeline != vk::Pipeline::null();
+        let ravu_run = match (ravu_this && !copy_1to1, self.mid.as_ref(), self.ravu_pass.as_ref(), self.ravu_lut.as_ref()) {
+            (true, Some(mid), Some(pass), Some(lut)) => Some((mid.image, mid.view, mid.width, mid.height, pass, lut.views())),
+            _ => None,
+        };
+        if copy_1to1 {
+            let rcas_set = self.rcas_sets[ix];
+            self.write_set(device, rcas_set, src.view);
+            let mut push = [0u8; 20];
+            for (i, v) in [vp.0, vp.1, vp.2, vp.3].iter().enumerate() {
+                push[i * 4..i * 4 + 4].copy_from_slice(&(*v as i32).to_le_bytes());
+            }
+            push[16..].copy_from_slice(&0.0f32.to_le_bytes());
+            self.begin_window_pass(device, cmd, fb, extent, clear);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rcas_pipeline);
+            Self::set_rect(device, cmd, vp.0, vp.1, vp.2, vp.3);
+            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
+            device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
+            device.cmd_draw(cmd, 3, 1, 0, 0);
+            self.end_window_pass(device, cmd, vp);
+        } else if let Some((mid_image, mid_view, mid_w, mid_h, pass, tables)) = ravu_run {
+            // TEMP (lab, PRESENT_RAVU): RAVU into `mid`, then the window pass (RCAS) from it. In: the previous
+            // present's window-pass read of `mid` (any earlier submission) before RAVU overwrites it.
+            let to_general = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(mid_image)
+                .subresource_range(super::color_subresource_range())];
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_general,
+            );
+            pass.record(
+                device,
+                cmd,
+                ix,
+                self.sampler,
+                src.view,
+                (src.width, src.height),
+                tables,
+                mid_view,
+                (mid_w, mid_h),
+            );
+            let mid_read = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(mid_image)
+                .subresource_range(super::color_subresource_range())];
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &mid_read,
+            );
+            let rcas_set = self.rcas_sets[ix];
+            self.write_set(device, rcas_set, mid_view);
+            let mut push = [0u8; 20];
+            for (i, v) in [vp.0, vp.1, vp.2, vp.3].iter().enumerate() {
+                push[i * 4..i * 4 + 4].copy_from_slice(&(*v as i32).to_le_bytes());
+            }
+            push[16..].copy_from_slice(&rcas.unwrap_or(0.0).to_le_bytes());
+            self.begin_window_pass(device, cmd, fb, extent, clear);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rcas_pipeline);
+            Self::set_rect(device, cmd, vp.0, vp.1, vp.2, vp.3);
+            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
+            device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
+            device.cmd_draw(cmd, 3, 1, 0, 0);
+            self.end_window_pass(device, cmd, vp);
+        } else if let (Some(cfg), Some(mid)) = (nis_cfg, self.mid.as_ref()) {
             // NVScaler into `mid`, then an exact copy into the window (the
             // RCAS pass at strength 0).
             let (mid_image, mid_view, mid_w, mid_h) = (mid.image, mid.view, mid.width, mid.height);
@@ -1137,9 +2139,14 @@ impl PresentSharp {
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
             device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
             device.cmd_draw(cmd, 3, 1, 0, 0);
-            device.cmd_end_render_pass(cmd);
-        } else if let (Some(sharp), Some(mid)) = (rcas.filter(|_| self.nis.is_none()), self.mid.as_ref()) {
-            // EASU over the whole of `mid`.
+            self.end_window_pass(device, cmd, vp);
+        } else if let Some(mid) = self.mid.as_ref().filter(|m| m.fb != vk::Framebuffer::null()).filter(|_| {
+            rcas.is_some() && self.nis.is_none()
+        }).or(self.ss_easu.as_ref().filter(|_| ss_easu)) {
+            // EASU over the whole of `mid` (or PRESENT_SS's `ss_easu`), then the window pass from it: RCAS, or
+            // PRESENT_SS's resample down.
+            let sharp = rcas.unwrap_or(0.0);
+            let pipeline = self.window_pipeline(mid.width, mid.height, vp);
             device.cmd_begin_render_pass(
                 cmd,
                 &vk::RenderPassBeginInfo::default()
@@ -1160,7 +2167,7 @@ impl PresentSharp {
             device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &easu_push);
             device.cmd_draw(cmd, 3, 1, 0, 0);
             device.cmd_end_render_pass(cmd);
-            // RCAS from `mid` into the visible part of the window.
+            // RCAS (or the resample down) from `mid` into the visible part of the window.
             let rcas_set = self.rcas_sets[ix];
             self.write_set(device, rcas_set, mid.view);
             let mut push = [0u8; 20];
@@ -1169,12 +2176,12 @@ impl PresentSharp {
             }
             push[16..].copy_from_slice(&sharp.to_le_bytes());
             self.begin_window_pass(device, cmd, fb, extent, clear);
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rcas_pipeline);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             Self::set_rect(device, cmd, vp.0, vp.1, vp.2, vp.3);
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[rcas_set], &[]);
             device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
             device.cmd_draw(cmd, 3, 1, 0, 0);
-            device.cmd_end_render_pass(cmd);
+            self.end_window_pass(device, cmd, vp);
         } else {
             self.begin_window_pass(device, cmd, fb, extent, clear);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
@@ -1182,42 +2189,13 @@ impl PresentSharp {
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[set], &[]);
             device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, &easu_push);
             device.cmd_draw(cmd, 3, 1, 0, 0);
-            device.cmd_end_render_pass(cmd);
+            self.end_window_pass(device, cmd, vp);
         }
         // REIMS_VGPU_LAB_PRESENT_DUMP: the first pass's result, as the window
         // pass just read it.
-        if let (true, Some(d), Some(mid)) = (dumping, self.dump.as_ref(), self.mid.as_ref()) {
-            let to_src = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(mid.image)
-                .subresource_range(super::color_subresource_range())];
-            device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &to_src,
-            );
-            let offset = src.width as u64 * src.height as u64 * 4;
-            Self::dump_copy(device, cmd, mid.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, d.buffer, offset, (mid.width, mid.height));
-            device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::HOST_READ)],
-                &[],
-                &[],
-            );
+        if dumping {
+            let easu_image = self.ss_easu.as_ref().filter(|_| easu_frame).map(|m| (m.image, m.width, m.height));
+            self.record_mid_dump(device, cmd, src.width, src.height, easu_image);
         }
         let back = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
@@ -1238,6 +2216,85 @@ impl PresentSharp {
             &back,
         );
         Ok(())
+    }
+
+    /// REIMS_VGPU_LAB_PRESENT_DUMP: `mid` (in SHADER_READ_ONLY) after the
+    /// source copy the dump already holds.
+    unsafe fn record_mid_dump(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        src_w: u32,
+        src_h: u32,
+        image: Option<(vk::Image, u32, u32)>,
+    ) {
+        // TEMP (lab, PRESENT_VSR_TILES): the refined cells (others undefined).
+        if let (Some(d), true, Some(refine)) = (self.dump.as_ref(), self.refine_active, self.refine.as_ref()) {
+            let (image, w, h) = refine.cache_image();
+            let offset = src_w as u64 * src_h as u64 * 4;
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)],
+                &[],
+                &[],
+            );
+            Self::dump_copy(device, cmd, image, vk::ImageLayout::GENERAL, d.buffer, offset, (w, h));
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                &[],
+                &[],
+            );
+            return;
+        }
+        // `image`: PRESENT_SS's `ss_easu` when EASU rendered that; else `mid`.
+        let Some(d) = self.dump.as_ref() else {
+            return;
+        };
+        let Some((mid_image, mid_w, mid_h)) = image.or(self.mid.as_ref().map(|m| (m.image, m.width, m.height))) else {
+            return;
+        };
+            let to_src = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(mid_image)
+                .subresource_range(super::color_subresource_range())];
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_src,
+            );
+            let offset = src_w as u64 * src_h as u64 * 4;
+            Self::dump_copy(device, cmd, mid_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, d.buffer, offset, (mid_w, mid_h));
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                &[],
+                &[],
+            );
     }
 
     /// The swapchain pass over the whole window, slate-cleared.
@@ -1264,6 +2321,79 @@ impl PresentSharp {
                 .clear_values(&clear_values),
             vk::SubpassContents::INLINE,
         );
+    }
+
+    /// TEMP (lab, PRESENT_VSR_TILES): steps 1 and 2 of [`super::present_refine`]
+    /// for this present; when the window should present again for more.
+    unsafe fn record_refine(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        ix: usize,
+        src: &SharpSource,
+        vp: (u32, u32, u32, u32),
+        memory_type: &dyn Fn(u32, u64, bool) -> Option<u32>,
+    ) -> Option<std::time::Instant> {
+        let q = self.vsr.filter(|_| !self.refine_failed && !self.vsr_failed && super::present_vsr::ready())?;
+        let Some(geo) = super::present_refine::Geometry::new(src.width, src.height, vp.2, vp.3) else {
+            if crate::observe::first_sight("present_refine_refused_geometry", 0) {
+                crate::observe::fail(format!(
+                    "present_refine_refused reason=geometry {}x{}->{}x{}",
+                    src.width, src.height, vp.2, vp.3
+                ));
+            }
+            return None;
+        };
+        if self.refine.as_ref().is_some_and(|r| r.geometry() != geo) {
+            // A new size: rare; the old cells go with an idle queue.
+            let _ = device.device_wait_idle();
+            if let Some(mut old) = self.refine.take() {
+                old.destroy(device);
+            }
+        }
+        if self.refine.is_none() {
+            match super::present_refine::TileRefine::create(device, geo, self.render_pass, self.transient.len(), memory_type) {
+                Ok(r) => self.refine = Some(r),
+                Err(e) => {
+                    self.refine_failed = true;
+                    crate::observe::fail(format!("present_refine_refused reason=build err={e:?}"));
+                    return None;
+                }
+            }
+        }
+        if !self.vsr_created {
+            self.vsr_created = super::present_vsr::create_feature(device, cmd);
+            if !self.vsr_created {
+                self.vsr_failed = true;
+                return None;
+            }
+        }
+        let refine = self.refine.as_mut()?;
+        let frame = match src.real.as_ref() {
+            Some(real) => super::present_refine::RefineFrame {
+                image: real.image,
+                view: real.view,
+                layout: real.layout,
+            },
+            None => super::present_refine::RefineFrame {
+                image: src.image,
+                view: src.view,
+                layout: src.layout,
+            },
+        };
+        refine.record_diff(device, cmd, ix, &frame, src.seq);
+        let due = refine.record_refine(device, cmd, q);
+        self.refine_active = true;
+        due
+    }
+
+    /// Ends a window pass, drawing the refined cells over it first
+    /// (PRESENT_VSR_TILES).
+    unsafe fn end_window_pass(&self, device: &ash::Device, cmd: vk::CommandBuffer, vp: (u32, u32, u32, u32)) {
+        if let (true, Some(refine)) = (self.refine_active, self.refine.as_ref()) {
+            refine.record_overlay(device, cmd, vp);
+        }
+        device.cmd_end_render_pass(cmd);
     }
 
     /// `REIMS_VGPU_LAB_PRESENT_DUMP`: a buffer for this present's dump when
@@ -1318,7 +2448,7 @@ impl PresentSharp {
             device.free_memory(memory, None);
             return false;
         }
-        self.dump = Some(PresentDump { buffer, memory, ix, src, out, out_rgba });
+        self.dump = Some(PresentDump { buffer, memory, ix, src, out, out_rgba, src_rgba: false });
         true
     }
 
@@ -1353,7 +2483,7 @@ impl PresentSharp {
                 }
                 let _ = std::fs::write(name, out);
             };
-            write(format!("{dir}/{n:03}-src.ppm"), d.src, &bytes[..src_len], false);
+            write(format!("{dir}/{n:03}-src.ppm"), d.src, &bytes[..src_len], d.src_rgba);
             write(format!("{dir}/{n:03}-out.ppm"), d.out, &bytes[src_len..], d.out_rgba);
             device.unmap_memory(d.memory);
             crate::observe::fail(format!(
@@ -1390,8 +2520,17 @@ impl PresentSharp {
 
     pub(crate) unsafe fn destroy(&mut self, device: &ash::Device) {
         self.release_all(device);
-        if let Some(mid) = self.mid.take() {
-            mid.destroy(device);
+        if let Some(mut refine) = self.refine.take() {
+            refine.destroy(device);
+        }
+        for img in [self.mid.take(), self.ss_easu.take(), self.vsr_in.take(), self.dlss_depth.take(), self.dlss_mvec.take()]
+            .into_iter()
+            .flatten()
+        {
+            img.destroy(device);
+        }
+        if let Some(mut pass) = self.dlss_mvec_pass.take() {
+            pass.destroy(device);
         }
         if self.pool != vk::DescriptorPool::null() {
             device.destroy_descriptor_pool(self.pool, None);
@@ -1401,6 +2540,15 @@ impl PresentSharp {
         }
         if self.rcas_pipeline != vk::Pipeline::null() {
             device.destroy_pipeline(self.rcas_pipeline, None);
+        }
+        if let Some(mut pass) = self.ravu_pass.take() {
+            pass.destroy(device);
+        }
+        if let Some(mut lut) = self.ravu_lut.take() {
+            lut.destroy(device);
+        }
+        if self.down_pipeline != vk::Pipeline::null() {
+            device.destroy_pipeline(self.down_pipeline, None);
         }
         if self.sampler != vk::Sampler::null() {
             device.destroy_sampler(self.sampler, None);

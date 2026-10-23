@@ -1181,7 +1181,12 @@ pub(crate) fn stage_buffer_with_extent<M: HostMemory + HostOps>(
             format!("base={base_gva:#x} size={size:#x}"),
         );
     };
-    let mut bytes = vec![0u8; want];
+    let Some(mut bytes) = crate::runtime::draw::guest_zeroed(want) else {
+        return miss(
+            ComputeStatus::MissingBuffer("compute_stage_buf_want_bad"),
+            format!("size={size:#x} avail={avail:#x} (host_commit)"),
+        );
+    };
     if let Err(e) = gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
@@ -1881,7 +1886,8 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             mip_levels: 1,
             width,
             height,
-            bytes: vec![0; need],
+            bytes: crate::runtime::draw::guest_zeroed(need)
+                .ok_or(ComputeStatus::MissingTexture("compute_stage_tex_heap_host_commit"))?,
             is_storage,
             writeback: TextureWriteback::None,
             rail: R::stage(
@@ -2557,7 +2563,10 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             stage_format,
         )
     });
-    let mut bytes = vec![0u8; pyramid_need];
+    // Sized by the guest texture's extent; a refused allocation is a missing
+    // texture with its line, not a process abort.
+    let mut bytes = crate::runtime::draw::guest_zeroed(pyramid_need)
+        .ok_or(ComputeStatus::MissingTexture("compute_stage_tex_host_commit"))?;
     // Resident-authoritative window (deferred linear writeback): consume the
     // rail's resident without bytes when possible; otherwise flush it into the
     // entry first — falling through to the raw guest read would silently serve

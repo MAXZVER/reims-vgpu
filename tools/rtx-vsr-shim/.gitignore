@@ -1,0 +1,17 @@
+rvsr.dll
+*.obj
+*.lib
+*.exp
+vsrbench.exe
+vulkan-1.lib
+frucbench.exe
+NvOFFRUC.dll
+cudart64_110.dll
+nvngx_vsr.dll
+ofbench.exe
+vkext.exe
+ofpair.exe
+rslg.dll
+vulkan-1.def
+dlssgcheck.exe
+dlssgwin.exe

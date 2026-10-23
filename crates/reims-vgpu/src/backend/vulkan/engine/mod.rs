@@ -53,6 +53,25 @@ mod present_sharp_shader;
 mod present_sharp;
 #[cfg(feature = "host-window")]
 mod present_nis_coef;
+#[cfg(feature = "host-window")]
+mod present_vsr;
+#[cfg(feature = "host-window")]
+mod present_ravu;
+#[cfg(feature = "host-window")]
+mod present_fg;
+#[cfg(feature = "host-window")]
+mod present_refine;
+#[cfg(feature = "host-window")]
+mod present_dlssg;
+
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_FG`): the `VK_NV_optical_flow` queue and
+/// entry points the host window's frame generation submits to.
+pub(crate) struct OpticalFlowQueue {
+    pub family: u32,
+    pub queue: ash::vk::Queue,
+    pub device: ash::nv::optical_flow::Device,
+    pub instance: ash::nv::optical_flow::Instance,
+}
 pub(crate) mod stamp_completion;
 /// The requested draw-time buffer-gather working set. Re-exported for the same
 /// reason: `pools` is private, and the number this reports is what a content
@@ -402,6 +421,12 @@ impl EngineState {
         self.counters.device_lost.fetch_add(1, Ordering::Relaxed);
         self.owner.mark_device_lost();
         self.flush_device_derived(caches);
+        // Every observer that latched a loss up to here saw the device this call
+        // is replacing - the flush's own queue barrier runs the old owner's
+        // queued submits, which fail and latch it again. Left set, the next
+        // tranche end tore the healthy new device down too: two rebuilds a loss,
+        // and a third latch before any draw exhausted the recreate cap for good.
+        let _ = device_lost::take_device_lost_seen();
         let EngineState {
             ref mut owner,
             ref counters,
@@ -1762,6 +1787,8 @@ pub fn submit_deferred_draw(
                 recorder::JobResult::Failed(Box::new(recorder::DeferredFailure { error, meta }))
             }
         };
+        // TEMP (lab, REAP): the request's buffers are freed off the recorder.
+        recorder::reap(recorder::AssertSend(req));
         result
     });
     recorder::DRAW.submit(job);
@@ -2849,6 +2876,11 @@ struct WindowSnapshotImage {
     memory: ash::vk::DeviceMemory,
     width: u32,
     height: u32,
+    /// The device the image belongs to ([`context::DeviceContext::generation`]).
+    /// Nothing tore the snapshot down on a device recreate, so the next publish
+    /// at the same extent recorded the dead device's image into the new
+    /// device's command buffer and handed it to the presenter as its source.
+    generation: u64,
 }
 
 fn window_snapshot() -> &'static std::sync::Mutex<Option<WindowSnapshotImage>> {
@@ -2889,9 +2921,9 @@ unsafe fn snapshot_window_source(
     let mut guard = window_snapshot().lock().unwrap_or_else(|e| e.into_inner());
     // Extent change: the old image is retired by leaking (a TEMP prototype;
     // counted) — no queue interaction on the change path at all.
-    let needs = guard
-        .as_ref()
-        .map_or(true, |s| s.width != resolved.width || s.height != resolved.height);
+    let needs = guard.as_ref().map_or(true, |s| {
+        s.width != resolved.width || s.height != resolved.height || s.generation != ctx.generation
+    });
     if needs {
         if guard.is_some() {
             crate::runtime::drain::note_store_route("scanout_snapshot_recreate_n");
@@ -2923,20 +2955,27 @@ unsafe fn snapshot_window_source(
         }
         .ok()?;
         let req = unsafe { ctx.device.get_image_memory_requirements(image) };
-        let mt = ctx.memory_type_for(
+        // The image is destroyed on both refusals below: they used to return
+        // with it alive, one leaked image per publish while they kept failing.
+        let Some(mt) = ctx.memory_type_for(
             req.memory_type_bits,
             req.size,
             reims_vgpu_vulkan::memory::MemoryClass::DeviceLocal,
-        )?;
-        let memory = unsafe {
+        ) else {
+            unsafe { ctx.device.destroy_image(image, None) };
+            return None;
+        };
+        let Ok(memory) = (unsafe {
             ctx.device.allocate_memory(
                 &ash::vk::MemoryAllocateInfo::default()
                     .allocation_size(req.size)
                     .memory_type_index(mt),
                 None,
             )
-        }
-        .ok()?;
+        }) else {
+            unsafe { ctx.device.destroy_image(image, None) };
+            return None;
+        };
         if unsafe { ctx.device.bind_image_memory(image, memory, 0) }.is_err() {
             unsafe {
                 ctx.device.free_memory(memory, None);
@@ -2949,6 +2988,7 @@ unsafe fn snapshot_window_source(
             memory,
             width: resolved.width,
             height: resolved.height,
+            generation: ctx.generation,
         });
     }
     let s = guard.as_ref()?;
@@ -3626,6 +3666,13 @@ pub fn surface_store_guest_backed_lock_free(
 pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
     let mut guard = lock_engine();
     guard.pools.registry_note_content_copied_out(identity)
+}
+
+/// TEMP (lab PAY_DEFER): undo [`note_resident_content_copied_out`] for a resident that holds a newer frame than
+/// the one whose landing booked it - that frame is owed, and the image is again its only copy.
+pub fn note_resident_content_sole_copy(identity: &TargetIdentity) -> bool {
+    let mut guard = lock_engine();
+    guard.pools.registry_note_content_sole_copy(identity)
 }
 
 /// Whether this backend may leave guest-visible content only in GPU-resident
@@ -4926,7 +4973,7 @@ pub fn target_compare_done(ticket: &CompareTicket) -> bool {
     let Ok(ctx) = owner.ensure(counters) else {
         return true;
     };
-    if ash::vk::Handle::as_raw(ctx.device.handle()) != ticket.device {
+    if ctx.generation != ticket.device {
         return true;
     }
     unsafe { pools.submission_done(ctx, counters, ticket.token) }.unwrap_or(true)
@@ -4944,7 +4991,7 @@ pub fn finish_target_compare(ticket: &CompareTicket) -> Result<Option<ChangedPag
         ..
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
-    if ash::vk::Handle::as_raw(ctx.device.handle()) != ticket.device {
+    if ctx.generation != ticket.device {
         return Ok(None);
     }
     let mut st_guard = page_diff::STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -4990,7 +5037,7 @@ fn read_target_changed_pages_inner(
     let padded = pages * page_diff::PAGE_BYTES;
 
     let mut st_guard = page_diff::STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let device_handle = ash::vk::Handle::as_raw(ctx.device.handle());
+    let device_handle = ctx.generation;
     if st_guard.as_ref().is_none_or(|s| s.device != device_handle) {
         // A new device: the old handles are dead. Leak them rather than destroy
         // objects of a device that no longer exists.
@@ -5916,6 +5963,12 @@ impl TargetReadTicket {
         self.bgra
     }
 
+    /// TEMP (lab LAZY_SYNC async read): where the frame will be once finished, and how long it is - the host
+    /// address of the leased slot, valid while the ticket (then the frame it finishes into) holds the lease.
+    pub fn lease_span(&self) -> (usize, usize) {
+        (self.lease_ptr, self.len)
+    }
+
     /// TEMP (lab, T2T_PARK): the slot as a GPU copy source, holding the lease.
     pub(crate) fn parked(&self) -> ParkedReadback {
         ParkedReadback {
@@ -6048,7 +6101,7 @@ pub fn submit_target_read_leased(identity: &TargetIdentity) -> Result<Option<Tar
         let lease = guard_lease.disarm().expect("fits implies a lease");
         Ok(Some(TargetReadTicket {
             token,
-            device: ash::vk::Handle::as_raw(ctx.device.handle()),
+            device: ctx.generation,
             readback,
             hold: LeaseHold::new(lease.token),
             lease_ptr: lease.ptr,
@@ -6071,7 +6124,7 @@ pub fn target_read_done(ticket: &TargetReadTicket) -> bool {
     let Ok(ctx) = owner.ensure(counters) else {
         return true;
     };
-    if ash::vk::Handle::as_raw(ctx.device.handle()) != ticket.device {
+    if ctx.generation != ticket.device {
         return true;
     }
     unsafe { pools.submission_done(ctx, counters, ticket.token) }.unwrap_or(true)
@@ -6088,7 +6141,7 @@ pub fn finish_target_read_leased(ticket: TargetReadTicket) -> Result<Option<Leas
         ..
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
-    if ash::vk::Handle::as_raw(ctx.device.handle()) != ticket.device {
+    if ctx.generation != ticket.device {
         return Ok(None);
     }
     let ops = target_readback_ops();

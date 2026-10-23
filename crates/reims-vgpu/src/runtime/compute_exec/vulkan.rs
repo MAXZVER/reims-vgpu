@@ -934,7 +934,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         if is_storage {
             // A storage image is written by this dispatch: the resolve memo's
             // sampled source for it, if any, ends here (stream order).
-            crate::runtime::draw::vulkan::lab_resolve_memo_wrote(task_id, t.texture_ref);
+            crate::runtime::draw::vulkan::lab_resolve_memo_wrote(state, task_id, t.texture_ref);
         }
         match stage_texture_raw::<VulkanStage, _>(
             state,
@@ -1382,6 +1382,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 || storage_images.iter().any(|x| x.binding == b)
         };
         let missing: Vec<u32> = crate::runtime::spirv_bind::declared_binding_numbers(words)
+            .unwrap_or_else(|| vec![crate::runtime::spirv_bind::BROKEN_FRAME_BINDING])
             .into_iter()
             .filter(|b| !supplied(*b))
             .filter(|b| crate::runtime::spirv_bind::descriptor_static_use(words, *b).is_violation())

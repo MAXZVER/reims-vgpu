@@ -154,17 +154,25 @@ pub(crate) struct Witness {
     /// The names generation when a probe found no backing for a surface
     /// (guest object lists read): it must not have moved.
     no_backing_gen: Option<u64>,
+    /// The names generation any *positive* answer was taken under. The same
+    /// guard `no_backing_gen` gives the negative half: pointer identity alone
+    /// is an ABA away from wrong under a delete+redeclare of the same
+    /// `(task, ref)`, and a backing's host-side fields cannot see a guest
+    /// rewrite of the descriptor bytes that produced them (`apply_backing`
+    /// bumps this generation on the rebuild). `None` while nothing was read.
+    names_gen: Option<u64>,
 }
 
 impl Witness {
     /// Whether every read still answers the same, against `state` as the
     /// drain's own walk would read it now.
     fn holds(&self, state: &DeviceState) -> bool {
-        self.names.iter().all(|n| {
-            let now = objects::resolve_resource_peek(state, n.task_id, n.obj_ref)
-                .map(|r| Arc::as_ptr(&r) as usize);
-            now == n.resource
-        }) && self.no_backing_gen.is_none_or(|g| state.names_gen() == g)
+        self.names_gen.is_none_or(|g| state.names_gen() == g)
+            && self.names.iter().all(|n| {
+                let now = objects::resolve_resource_peek(state, n.task_id, n.obj_ref)
+                    .map(|r| Arc::as_ptr(&r) as usize);
+                now == n.resource
+            }) && self.no_backing_gen.is_none_or(|g| state.names_gen() == g)
             && self.backings.iter().all(|b| {
             state.mappings.get(&b.surface_id).is_some_and(|m| {
                 m.owner_task_hint == b.owner_task
@@ -220,6 +228,9 @@ impl<'a> SpecWalk<'a> {
     }
 
     fn note_name(&mut self, task_id: u32, obj_ref: u32, resource: Option<&Arc<TaskResource>>) {
+        // Stamped once, at the first thing recorded: every read below shares
+        // one walk, and the guard is the walk's, not the item's.
+        self.witness.names_gen.get_or_insert(self.st.names_gen());
         self.witness.names.push(NameRead {
             task_id,
             obj_ref,
@@ -306,6 +317,10 @@ impl WalkState for SpecWalk<'_> {
         match objects::resolve_backing_peek(self.st, host, surface_id) {
             Some(true) => {
                 if let Some(m) = self.st.mappings.get(&surface_id) {
+                    // The positive half of `no_backing_gen` below: a true whose
+                    // guest-side inputs (descriptor bytes, object-list entry)
+                    // were read under this generation.
+                    self.witness.names_gen.get_or_insert(self.st.names_gen());
                     self.witness.backings.push(BackingRead {
                         surface_id,
                         owner_task: m.owner_task_hint,
@@ -527,14 +542,25 @@ pub(super) fn check_walk(state: &DeviceState, spec: SpecStream, real: &StreamAcc
         crate::runtime::drain::note_store_route("walk_ahead_check_stale");
         return;
     }
-    if format!("{:?}", spec.acc) == format!("{real:?}") {
+    // Normalize, on both sides, the two fields only the drain's own walk sets
+    // (`lab_seg_prev`/`lab_seg_next` are `walk_stream`'s segment bookkeeping;
+    // the spec walk never touches them). Compared whole, every chained segment
+    // read as a disagreement, and the constant latch key 0 kept the first
+    // false line for a real one.
+    let mut spec_acc = spec.acc.clone();
+    let mut real_acc = real.clone();
+    spec_acc.lab_seg_prev = false;
+    spec_acc.lab_seg_next = false;
+    real_acc.lab_seg_prev = false;
+    real_acc.lab_seg_next = false;
+    if format!("{spec_acc:?}") == format!("{real_acc:?}") {
         crate::runtime::drain::note_store_route("walk_ahead_check_same");
     } else {
         crate::runtime::drain::note_store_route("walk_ahead_check_diff");
         if crate::observe::first_sight("walk_ahead_check_diff", 0) {
             crate::observe::fail(format!(
-                "walk_ahead_check_diff (a helper's walk and the drain's disagree) spec={:?} real={real:?}",
-                spec.acc
+                "walk_ahead_check_diff (a helper's walk and the drain's disagree) spec={:?} real={real_acc:?}",
+                spec_acc
             ));
         }
     }

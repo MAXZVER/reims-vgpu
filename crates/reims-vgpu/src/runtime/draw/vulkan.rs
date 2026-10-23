@@ -359,7 +359,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut gva_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         record_plane_draw(req);
-        lab_resolve_memo_record(req);
+        lab_resolve_memo_record(state, req);
         lab_tile_draw_with(state, req);
         lab_draw_sig(req);
         req.chain_resident_established = false;
@@ -2977,7 +2977,7 @@ pub(super) fn lab_resolve_memo_prime<M: HostMemory + HostOps>(
     // Textures any record of these writes are not memoized in this stream: a
     // bind of one may run after that write (see `lab_resolve_memo_written`).
     for (req, _) in reqs {
-        lab_resolve_memo_written(req);
+        lab_resolve_memo_written(state, req);
     }
     for (req, _) in reqs.iter() {
         let attachments: Vec<u32> = req.colors.iter().map(|c| c.texture_ref).collect();
@@ -3063,14 +3063,41 @@ fn pass_written_refs(req: &DrawEncodeRequest) -> impl Iterator<Item = u32> + '_ 
 /// resolution outlives a pass boundary exactly when nothing has written its
 /// texture. (Clearing at every pass open instead, 6c28a911, cost Maps half its
 /// frames: 44 -> 22 fps, b614-b619.)
-pub(crate) fn lab_resolve_memo_record(req: &DrawEncodeRequest) {
-    lab_resolve_memo_written(req);
+pub(crate) fn lab_resolve_memo_record(state: &DeviceState, req: &DrawEncodeRequest) {
+    lab_resolve_memo_written(state, req);
+}
+
+/// Drop every memoized resolution of `task_id` whose texture shares a named
+/// mapping (an IOSurface) with one of `written`.
+///
+/// The memo is keyed and invalidated by texture ref, and two refs can name one
+/// storage: a second `MTLTexture` over the same IOSurface. A pass rendering into
+/// one left the other's earlier resolution in the memo for the rest of the
+/// stream, and a later bind of it sampled the bytes from before the pass.
+fn drop_storage_aliases(
+    state: &DeviceState,
+    task_id: u32,
+    written: &[u32],
+    m: &mut reims_vgpu_core::fasthash::FxHashMap<ResolveMemoKey, MemoSlot>,
+) {
+    let mut storage: Vec<u32> = Vec::new();
+    for &r in written {
+        storage.extend(state.mappings_named_by(task_id, r).iter());
+    }
+    if storage.is_empty() {
+        return;
+    }
+    m.retain(|key, _| {
+        key.0 != task_id
+            || written.contains(&key.1)
+            || !state.mappings_named_by(task_id, key.1).iter().any(|id| storage.contains(&id))
+    });
 }
 
 /// A writer other than a render pass - a blit, a mipmap chain, a compute
 /// kernel's storage image - is about to write `(task_id, reference)` in this
 /// stream: its resolution leaves the memo and is not taken again in the stream.
-pub(crate) fn lab_resolve_memo_wrote(task_id: u32, reference: u32) {
+pub(crate) fn lab_resolve_memo_wrote(state: &DeviceState, task_id: u32, reference: u32) {
     if reference == 0 || !lab_resolve_memo_on() {
         return;
     }
@@ -3078,10 +3105,11 @@ pub(crate) fn lab_resolve_memo_wrote(task_id: u32, reference: u32) {
     let mut m = RESOLVE_MEMO.write();
     if !m.is_empty() {
         m.retain(|key, _| key.0 != task_id || key.1 != reference);
+        drop_storage_aliases(state, task_id, &[reference], &mut m);
     }
 }
 
-pub(crate) fn lab_resolve_memo_written(req: &DrawEncodeRequest) {
+pub(crate) fn lab_resolve_memo_written(state: &DeviceState, req: &DrawEncodeRequest) {
     let written: Vec<u32> = pass_written_refs(req).collect();
     if written.is_empty() {
         return;
@@ -3095,6 +3123,7 @@ pub(crate) fn lab_resolve_memo_written(req: &DrawEncodeRequest) {
     let mut m = RESOLVE_MEMO.write();
     if !m.is_empty() {
         m.retain(|key, _| key.0 != req.task_id || !written.contains(&key.1));
+        drop_storage_aliases(state, req.task_id, &written, &mut m);
     }
 }
 
@@ -7983,6 +8012,33 @@ fn load_buffer_content_resolved<M: HostMemory + HostOps>(
 
 // Same shape as `load_buffer_content_resolved`, which this forwards to.
 #[allow(clippy::too_many_arguments)]
+/// TEMP (lab, SUB_VHEAD): see its one use in the merged sub-draw stage-in.
+fn sub_vhead_on() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("SUB_VHEAD") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SUB_VHEAD").as_deref() != Ok("off"))
+}
+
+/// TEMP (lab, SUB_VMAX_SHARED): see its one use in the merged sub-draw bounds.
+fn sub_vmax_shared_on() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("SUB_VMAX_SHARED") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SUB_VMAX_SHARED").as_deref() != Ok("off"))
+}
+
+/// TEMP (lab, SUB_VSTAGE_ZC): see its one use in the merged sub-draw stage-in.
+fn sub_vstage_zc_on() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("SUB_VSTAGE_ZC") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_SUB_VSTAGE_ZC").as_deref() != Ok("off"))
+}
+
 pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -8229,6 +8285,62 @@ fn lab_merged_vertex_max(
         let one = IndexedDrawInfo { index_count: count, ..info.clone() };
         indexed_vertex_max(&one, bytes.get((first as usize).checked_mul(isz)?..)?)
     })
+}
+
+/// TEMP (lab, Opus 10-23 REC_VHEAD): the smallest vertex a record fetches through its index window - its own
+/// range and every sub-draw that reads the record's index buffer (plus its vertex_delta), the low twin of
+/// [`lab_merged_vertex_max`].
+fn lab_merged_vertex_min(
+    info: &IndexedDrawInfo,
+    bytes: &[u8],
+    merged: Option<&crate::runtime::draw::merge::MergedSubs>,
+) -> Option<u64> {
+    let Some(m) = merged else {
+        return indexed_vertex_min(info, bytes);
+    };
+    use crate::protocol::render::IndexType as Contract;
+    let isz = match Contract::parse(u16::try_from(info.index_type).ok()?)? {
+        Contract::Uint16 => 2usize,
+        Contract::Uint32 => 4usize,
+    };
+    let min_of = |first: u32, count: u32| -> Option<u64> {
+        let one = IndexedDrawInfo { index_count: count, ..info.clone() };
+        indexed_vertex_min(&one, bytes.get((first as usize).checked_mul(isz)?..)?)
+    };
+    let mut best = min_of(m.head_first, m.head_count)?;
+    for s in m.subs.iter().filter(|s| !s.own_index) {
+        best = best.min(min_of(s.first, s.count)?.checked_add_signed(i64::from(s.vertex_delta))?);
+    }
+    Some(best)
+}
+
+/// TEMP (lab, REC_VHEAD): live `REC_VHEAD=off` / `REIMS_VGPU_LAB_REC_VHEAD=off` binds every record window whole.
+fn rec_vhead_on() -> bool {
+    if let Some(on) = crate::runtime::lab_live::on("REC_VHEAD") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_REC_VHEAD").as_deref() != Ok("off"))
+}
+
+/// TEMP (lab, Opus 10-23 SUB_VHEAD): the smallest vertex `info`'s indices fetch - the smallest index plus
+/// baseVertex; `None` when unknown.
+fn indexed_vertex_min(info: &IndexedDrawInfo, bytes: &[u8]) -> Option<u64> {
+    use crate::protocol::render::IndexType as Contract;
+    let count = info.index_count as usize;
+    let min = match Contract::parse(u16::try_from(info.index_type).ok()?)? {
+        Contract::Uint16 => bytes
+            .get(..count.checked_mul(2)?)?
+            .chunks_exact(2)
+            .map(|c| u64::from(u16::from_le_bytes([c[0], c[1]])))
+            .min()?,
+        Contract::Uint32 => bytes
+            .get(..count.checked_mul(4)?)?
+            .chunks_exact(4)
+            .map(|c| u64::from(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+            .min()?,
+    };
+    min.checked_add_signed(i64::from(info.base_vertex))
 }
 
 fn indexed_vertex_max(info: &IndexedDrawInfo, bytes: &[u8]) -> Option<u64> {
@@ -9986,7 +10098,7 @@ fn native_scratch_to_upload(
     {
         let row_bytes = tight as usize;
         let rows = (fmt.tight_row_count(h) as usize).checked_mul(planes as usize)?;
-        let mut out = vec![0u8; row_bytes.checked_mul(rows)?];
+        let mut out = crate::runtime::draw::guest_zeroed(row_bytes.checked_mul(rows)?)?;
         for row_index in 0..rows {
             let src = row_index.checked_mul(bpr)?;
             let dst = row_index * row_bytes;
@@ -9999,7 +10111,7 @@ fn native_scratch_to_upload(
     let rows = (h as usize).checked_mul(planes as usize)?;
     let out_len = out_row.checked_mul(rows)?;
     let trow = tight as usize;
-    let mut out = vec![0u8; out_len];
+    let mut out = crate::runtime::draw::guest_zeroed(out_len)?;
     // This rung carries nearly all of the pathway's sampled traffic, so a
     // narrowing taken here is the one most likely to be the narrowing that
     // matters — and until this line existed the rung reported none at all while
@@ -10191,6 +10303,14 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         crate::runtime::render_writeback::SettleSite::LinearMemoRead,
     );
     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
+    // `native_len` follows the guest's descriptor (up to the 64 GiB object
+    // bound), and a growth the host cannot commit aborts the process: reserved
+    // fallibly, a torn descriptor declines this rung like a failed read does.
+    if scratch.try_reserve(native_len.saturating_sub(scratch.len())).is_err() {
+        state.guest_linear_scratch = scratch;
+        crate::runtime::drain::note_store_route("linear_memo_scratch_host_commit");
+        return None;
+    }
     scratch.resize(native_len, 0);
     let read = gva_mem::read_task_gva_by_id(
         host,
@@ -11284,7 +11404,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
     if gva != 0 {
         let backing =
             crate::runtime::surface_cache::gva_backing(state, host, task_id, gva, width, height);
-        crate::runtime::surface_cache::store_gva_owned(
+        crate::runtime::surface_cache::store_gva_owned_by(
             state,
             gva,
             width,
@@ -11293,6 +11413,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
             object_type,
             backing,
             guest_holds_bytes,
+            task_id,
         );
     }
 }
@@ -12580,12 +12701,15 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         let mut lab_sub_index: Vec<Option<std::sync::Arc<Vec<u8>>>> = Vec::new();
         // Each own-index sub-draw's own vertex reach; its overridden buffers are read that far, not the record's.
         let mut lab_sub_vmax: Vec<Option<u64>> = Vec::new();
+        // TEMP (lab, SUB_VHEAD): and its smallest - the head of its stage-in windows it never fetches.
+        let mut lab_sub_vmin: Vec<Option<u64>> = Vec::new();
         let mut indexed_vertex_max = indexed_vertex_max;
         lab_early_index_census(req, early_index.as_ref(), indexed_vertex_max);
         if let (Some(m), true) = (req.merged.as_deref(), !lab_merge_deltas.is_empty()) {
             if m.overrides.iter().any(|o| o.index.is_some()) {
                 lab_sub_index = vec![None; m.subs.len()];
                 lab_sub_vmax = vec![None; m.subs.len()];
+                lab_sub_vmin = vec![None; m.subs.len()];
                 for o in &m.overrides {
                     let Some(info) = o.index.as_ref() else {
                         continue;
@@ -12604,6 +12728,9 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         other => std::sync::Arc::new(other.cpu_bytes().into_owned()),
                     };
                     let sub_vmax = indexed_vertex_max_fn(info, &bytes);
+                    if let Some(slot) = lab_sub_vmin.get_mut(o.sub as usize) {
+                        *slot = indexed_vertex_min(info, &bytes);
+                    }
                     // The record's shared per-vertex buffers serve this sub-draw too unless it brings its own for
                     // every one of them (stage-in buffers, and device buffers indexed by vertex_id).
                     let own_v: Vec<u32> = o.vstage.iter().chain(o.vertex.iter()).map(|b| b.index).collect();
@@ -12635,6 +12762,53 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                     if let Some(slot) = lab_sub_vmax.get_mut(o.sub as usize) {
                         *slot = sub_vmax;
                     }
+                }
+            }
+        }
+        // TEMP (lab, Opus 10-23 SUB_VMAX_SHARED, `REIMS_VGPU_LAB_SUB_VMAX_SHARED=off` / live
+        // `SUB_VMAX_SHARED=off`): the vertex reach of each sub-draw of an indexed record that reads the record's
+        // index buffer - its own index range's largest index, plus the record's baseVertex and its vertex_delta (the
+        // term `merge::vertex_max` folds) - so a sub-draw's own stage-in buffers are read to its reach and not to
+        // the whole record's. b997/b998: the lane copied 5.2-5.8 GB/s on 5K Maps once these windows moved there.
+        let mut lab_sub_vmax_shared: Vec<Option<u64>> = Vec::new();
+        let mut lab_sub_vmin_shared: Vec<Option<u64>> = Vec::new();
+        if let (Some(m), Some(idx), true) = (req.merged.as_deref(), req.indexed.as_ref(), sub_vmax_shared_on()) {
+            if m.overrides.iter().any(|o| !o.vstage.is_empty() || !o.vertex.is_empty()) {
+                let bytes: Option<std::borrow::Cow<'_, [u8]>> = match early_index.as_ref() {
+                    Some(Ok(crate::backend::vulkan::engine::BufferContent::Bytes(b))) => {
+                        Some(std::borrow::Cow::Borrowed(b.as_slice()))
+                    }
+                    Some(Ok(c @ crate::backend::vulkan::engine::BufferContent::GuestRuns(src)))
+                        if lab_index_runs_max() && src.total_len <= INDEX_RUNS_READ_MAX_BYTES =>
+                    {
+                        Some(c.cpu_bytes())
+                    }
+                    _ => None,
+                };
+                let isz = match u16::try_from(idx.index_type).ok().and_then(crate::protocol::render::IndexType::parse) {
+                    Some(crate::protocol::render::IndexType::Uint16) => Some(2usize),
+                    Some(crate::protocol::render::IndexType::Uint32) => Some(4usize),
+                    None => None,
+                };
+                if let (Some(bytes), Some(isz)) = (bytes, isz) {
+                    let reach = |sub: &crate::runtime::draw::merge::SubDraw| -> Option<u64> {
+                        if sub.own_index {
+                            return None;
+                        }
+                        let one = IndexedDrawInfo { index_count: sub.count, ..idx.clone() };
+                        indexed_vertex_max_fn(&one, bytes.get((sub.first as usize).checked_mul(isz)?..)?)?
+                            .checked_add_signed(i64::from(sub.vertex_delta))
+                    };
+                    lab_sub_vmax_shared = m.subs.iter().map(reach).collect();
+                    let low = |sub: &crate::runtime::draw::merge::SubDraw| -> Option<u64> {
+                        if sub.own_index {
+                            return None;
+                        }
+                        let one = IndexedDrawInfo { index_count: sub.count, ..idx.clone() };
+                        indexed_vertex_min(&one, bytes.get((sub.first as usize).checked_mul(isz)?..)?)?
+                            .checked_add_signed(i64::from(sub.vertex_delta))
+                    };
+                    lab_sub_vmin_shared = m.subs.iter().map(low).collect();
                 }
             }
         }
@@ -12899,6 +13073,54 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         let mut attrs: Vec<crate::backend::vulkan::engine::VertexAttributeResource> =
             Vec::with_capacity(pd.vertex_attributes.len());
         let mut stage_in_bufs: std::collections::BTreeSet<u32> = Default::default();
+        // TEMP (lab, Opus 10-23 REC_VHEAD): the record's stage-in windows run from each buffer's vertex 0, but its
+        // draws fetch from their smallest vertex on - an indexed draw's smallest index (over the record's range and
+        // its shared-index sub-draws) plus baseVertex, a non-indexed one's firstVertex. The head below that, for a
+        // buffer whose attributes are all per-vertex, is left unwritten in its staging slot (b1003c: 3.4 GB/s of
+        // lane copies were the records' windows on 5K Maps).
+        let mut lab_rec_vhead: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        if rec_vhead_on() {
+            let vmin = match (req.indexed.as_ref(), early_index.as_ref()) {
+                (Some(idx), Some(Ok(crate::backend::vulkan::engine::BufferContent::Bytes(bytes)))) => {
+                    lab_merged_vertex_min(idx, bytes, req.merged.as_deref())
+                }
+                (Some(idx), Some(Ok(content @ crate::backend::vulkan::engine::BufferContent::GuestRuns(src))))
+                    if lab_index_runs_max() && src.total_len <= INDEX_RUNS_READ_MAX_BYTES =>
+                {
+                    lab_merged_vertex_min(idx, &content.cpu_bytes(), req.merged.as_deref())
+                }
+                (Some(_), _) => None,
+                (None, _) => Some(u64::from(lab_first)),
+            };
+            if let Some(vmin) = vmin.filter(|&v| v > 0) {
+                for (idx, content) in &vtx_storage {
+                    let on_buf: Vec<_> = pd.vertex_attributes.iter().filter(|a| a.buffer_index == *idx).collect();
+                    if on_buf.is_empty() || !on_buf.iter().all(|a| a.step_function_ordinal(1) == 1) {
+                        continue;
+                    }
+                    if !matches!(
+                        content,
+                        crate::backend::vulkan::engine::BufferContent::GuestRuns(_)
+                            | crate::backend::vulkan::engine::BufferContent::Bytes(_)
+                    ) {
+                        continue;
+                    }
+                    let Some(stride) = on_buf
+                        .iter()
+                        .map(|a| u64::from(super::bind_attribute_stride(&req.vertex_buffers, a.buffer_index, a.stride)))
+                        .min()
+                    else {
+                        continue;
+                    };
+                    let head = vmin.saturating_mul(stride).min(content.len() as u64);
+                    if head > 0 {
+                        crate::runtime::drain::note_store_route_n("rec_vhead_kb", head / 1024);
+                        crate::runtime::drain::note_store_route_n("rec_vwin_kb", content.len() as u64 / 1024);
+                        lab_rec_vhead.insert(*idx, head);
+                    }
+                }
+            }
+        }
         let attrs_span =
             crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::Attrs);
         for a in &pd.vertex_attributes {
@@ -12943,6 +13165,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             let step = prepare_vertex_step_function(a).map_err(DrawError::DrawPreparation)?;
             let step_rate = a.step_rate();
             attrs.push(crate::backend::vulkan::engine::VertexAttributeResource {
+                head: lab_rec_vhead.get(&a.buffer_index).copied().unwrap_or(0),
                 location: a.location,
                 // One Vulkan binding per location (archive render_draw_core).
                 binding: a.location,
@@ -13015,7 +13238,12 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 let Some(slot) = lab_sub_storage.get_mut(o.sub as usize) else {
                     continue;
                 };
-                let bounds = lab_sub_vmax.get(o.sub as usize).copied().flatten().map_or(render_buffer_bounds, |v| {
+                let bounds = lab_sub_vmax
+                    .get(o.sub as usize)
+                    .copied()
+                    .flatten()
+                    .or_else(|| lab_sub_vmax_shared.get(o.sub as usize).copied().flatten())
+                    .map_or(render_buffer_bounds, |v| {
                     crate::runtime::spirv_bind::RenderBufferIndexBounds::new(0, 0, req.base_instance, req.instance_count, true)
                         .with_indexed_vertex_max(Some(v))
                 });
@@ -13080,16 +13308,47 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             }
             crate::runtime::drain::note_store_route_n("merge_sub_overrides", m.overrides.len() as u64);
         }
-        // TEMP (lab, MERGE_DRAWS): stage-in buffers a sub-draw reads instead of the record's - its own bytes, read with
-        // the record's bounds, for every location the buffer feeds.
-        let mut lab_sub_vstage: Vec<Vec<(std::sync::Arc<[u32]>, std::sync::Arc<Vec<u8>>)>> = Vec::new();
+        // TEMP (lab, MERGE_DRAWS): stage-in buffers a sub-draw reads instead of the record's - its own bytes, for every
+        // location the buffer feeds. Read as far as the sub-draw itself fetches: an own-index sub-draw to its index
+        // reach; a sub-draw of a record that is not indexed to its own `[first, first + count)` - it is drawn as
+        // `draw(count, instances, first, base_instance)` over these binds (Opus 10-22, b965MR: these copies were 24 %
+        // of the recorder's draw time on Maps with the record's whole span plus its largest stage-in move as the
+        // bound); anything else to the record's bounds.
+        let mut lab_sub_vstage: Vec<Vec<(std::sync::Arc<[u32]>, crate::backend::vulkan::engine::BufferContent, u64)>> =
+            Vec::new();
         if let Some(m) = req.merged.as_deref().filter(|m| m.overrides.iter().any(|o| !o.vstage.is_empty()) && !lab_merge_deltas.is_empty()) {
             lab_sub_vstage = vec![Vec::new(); m.subs.len()];
             for o in &m.overrides {
-                let bounds = lab_sub_vmax.get(o.sub as usize).copied().flatten().map_or(render_buffer_bounds, |v| {
-                    crate::runtime::spirv_bind::RenderBufferIndexBounds::new(0, 0, req.base_instance, req.instance_count, true)
-                        .with_indexed_vertex_max(Some(v))
-                });
+                // The bound, and (TEMP lab SUB_VHEAD) the smallest vertex the sub-draw fetches.
+                let (bounds, vmin) = match (lab_sub_vmax.get(o.sub as usize).copied().flatten(), m.subs.get(o.sub as usize)) {
+                    (Some(v), _) => (
+                        crate::runtime::spirv_bind::RenderBufferIndexBounds::new(0, 0, req.base_instance, req.instance_count, true)
+                            .with_indexed_vertex_max(Some(v)),
+                        lab_sub_vmin.get(o.sub as usize).copied().flatten(),
+                    ),
+                    (None, Some(sub)) if req.indexed.is_none() => (
+                        crate::runtime::spirv_bind::RenderBufferIndexBounds::new(
+                            sub.first,
+                            sub.count,
+                            req.base_instance,
+                            req.instance_count,
+                            false,
+                        ),
+                        Some(u64::from(sub.first)),
+                    ),
+                    // TEMP (lab, SUB_VMAX_SHARED): a sub-draw of the record's index buffer, to its own reach.
+                    _ => match lab_sub_vmax_shared.get(o.sub as usize).copied().flatten() {
+                        Some(v) => {
+                            crate::runtime::drain::note_store_route("merge_sub_vmax_shared");
+                            (
+                                crate::runtime::spirv_bind::RenderBufferIndexBounds::new(0, 0, req.base_instance, req.instance_count, true)
+                                    .with_indexed_vertex_max(Some(v)),
+                                lab_sub_vmin_shared.get(o.sub as usize).copied().flatten(),
+                            )
+                        }
+                        None => (render_buffer_bounds, None),
+                    },
+                };
                 for b in &o.vstage {
                     let locations: Vec<u32> =
                         pd.vertex_attributes.iter().filter(|a| a.buffer_index == b.index).map(|a| a.location).collect();
@@ -13102,8 +13361,13 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         b.index,
                         bounds,
                     );
+                    // TEMP (lab, Opus 10-23 SUB_VSTAGE_ZC, `REIMS_VGPU_LAB_SUB_VSTAGE_ZC=off` / live
+                    // `SUB_VSTAGE_ZC=off`): guest runs where the record's own stage-in may have them (not a constant
+                    // step), as the record's own binds are loaded - not a heap copy here on the drain followed by
+                    // a second copy into staging on the recorder (b994: both were on the Maps critical path).
+                    let zc = sub_vstage_zc_on() && !bind_plan.is_constant_step(b.index);
                     let loaded = match acc.exclusive() {
-                        Some(state) => load_buffer_content(state, host, req.task_id, b.buffer_ref, b.resource.as_deref(), b.offset, false, cap),
+                        Some(state) => load_buffer_content(state, host, req.task_id, b.buffer_ref, b.resource.as_deref(), b.offset, zc, cap),
                         None => match draw_par::load_buffer_content_worker(
                             acc.shared(),
                             host,
@@ -13112,7 +13376,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                             b.buffer_ref,
                             b.resource.as_ref(),
                             b.offset,
-                            false,
+                            zc,
                             cap,
                         ) {
                             Ok(content) => Some(content),
@@ -13127,12 +13391,26 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         }));
                     };
                     note_inflight_buffer_read(req.task_id, b.buffer_ref, &content);
-                    let bytes = match content {
-                        crate::backend::vulkan::engine::BufferContent::Bytes(b) => b,
-                        other => std::sync::Arc::new(other.cpu_bytes().into_owned()),
+                    // TEMP (lab, Opus 10-23 SUB_VHEAD, `REIMS_VGPU_LAB_SUB_VHEAD=off` / live `SUB_VHEAD=off`): the
+                    // window runs from the buffer's vertex 0, but this sub-draw fetches from `vmin` on - CA's folded
+                    // quads sit one after another in one buffer, so the k-th sub-draw's window held every quad
+                    // before it (quadratic in the merge; the lane copied 5.4-8.2 GB/s on 5K Maps). Only per-vertex
+                    // attributes on this buffer (an instance-step one fetches by instance), the same stride the
+                    // extent used.
+                    let attrs: Vec<_> = pd.vertex_attributes.iter().filter(|a| a.buffer_index == b.index).collect();
+                    let head = match (vmin, sub_vhead_on()) {
+                        (Some(v), true) if attrs.iter().all(|a| a.step_function_ordinal(1) == 1) => attrs
+                            .iter()
+                            .map(|a| u64::from(super::bind_attribute_stride(&req.vertex_buffers, a.buffer_index, a.stride)))
+                            .min()
+                            .and_then(|stride| v.checked_mul(stride))
+                            .map_or(0, |h| h.min(content.len() as u64)),
+                        _ => 0,
                     };
+                    crate::runtime::drain::note_store_route_n("merge_sub_vstage_kb", content.len() as u64 / 1024);
+                    crate::runtime::drain::note_store_route_n("merge_sub_vhead_kb", head / 1024);
                     if let Some(slot) = lab_sub_vstage.get_mut(o.sub as usize) {
-                        slot.push((locations.into(), bytes));
+                        slot.push((locations.into(), content, head));
                     }
                 }
             }
@@ -16195,8 +16473,12 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         } else {
             f_words
         };
-        let frag_declared_bindings =
-            crate::runtime::spirv_bind::declared_binding_numbers_memoized(&f_words);
+        let frag_declared_bindings = crate::runtime::spirv_bind::declared_binding_numbers_memoized(
+            &f_words,
+        )
+        // A refused frame keeps the sentinel entry: the hang trail's gap count
+        // then names it and the layout backstop refuses the draws by name.
+        .unwrap_or_else(|| std::sync::Arc::from(vec![crate::runtime::spirv_bind::BROKEN_FRAME_BINDING]));
         let frag_layout_bindings: Vec<u32> = resources
             .storage_buffers
             .iter()
@@ -17018,6 +17300,7 @@ pub(super) fn depth_chain_identity(
             0
         };
         return Some(crate::backend::vulkan::engine::TargetIdentity::Texture {
+            task: req.task_id,
             ref_: texture_ref,
             width,
             height,
@@ -17727,7 +18010,15 @@ pub(super) fn try_preserve_seed_from_guest_window<M: HostMemory + HostOps>(
         };
         let tight = c0.width.checked_mul(RGBA8_BPP)?;
         let task = state.tasks.get(task_id)?;
-        let mut raw = vec![0u8; tight as usize * c0.height as usize];
+        // Guest-sized frame buffer: a refused reservation is the door's counted
+        // fallback, not a process abort — the same rule the linear memo's
+        // scratch already pays.
+        let Some(mut raw) =
+            crate::runtime::draw::guest_zeroed(tight as usize * c0.height as usize)
+        else {
+            crate::runtime::drain::note_store_route("preserve_seed_fb_host_commit");
+            return None;
+        };
         let mut row = vec![0u8; tight as usize];
         for y in 0..c0.height {
             let gva = c0.target_gva + u64::from(y) * u64::from(c0.row_stride);
@@ -17790,7 +18081,11 @@ pub(super) fn try_preserve_seed_from_guest_window<M: HostMemory + HostOps>(
         }
     };
     let tight = c0.width.checked_mul(RGBA8_BPP)?;
-    let mut raw = vec![0u8; tight as usize * c0.height as usize];
+    let Some(mut raw) = crate::runtime::draw::guest_zeroed(tight as usize * c0.height as usize)
+    else {
+        crate::runtime::drain::note_store_route("preserve_seed_fb_host_commit");
+        return None;
+    };
     let read = crate::runtime::mapping_write::read_rect_raw_at(
         state,
         host,
@@ -17939,7 +18234,12 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
     }
     // A GPU copy into guest pages still in flight would tear the read below.
     crate::backend::vulkan::engine::quiesce_guest_writes();
-    let mut bytes = vec![0u8; staged as usize];
+    // The spans are guest-sized (bounded by the surface's extent): a refused
+    // reservation declines the adoption, not the process.
+    let Some(mut bytes) = crate::runtime::draw::guest_zeroed(staged as usize) else {
+        crate::runtime::drain::note_store_route("resident_overlay_host_commit");
+        return false;
+    };
     for span in &spans {
         let lo = span.staged_offset as usize;
         let hi = lo + (span.window_end - span.window_start) as usize;
@@ -21324,6 +21624,7 @@ mod vulkan_split_tests {
         assert_eq!(
             depth.identity,
             Some(crate::backend::vulkan::engine::TargetIdentity::Texture {
+                task: 0,
                 ref_: 11,
                 width: 8,
                 height: 8,
@@ -23131,10 +23432,20 @@ pub(crate) fn note_compositor_plane_pass(
 /// not write it, so it is zeroed here. A recycled buffer must not carry a
 /// previous surface's tail into the memo comparison, where it would manufacture a
 /// miss and cost a full conversion.
-fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
+fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) -> bool {
     let filled = filled.min(span);
+    // Guest-sized span (the surface's own extent): a refused reservation is the
+    // memo's counted miss, not a process abort — the rule the linear memo's
+    // scratch already pays. `false` leaves the scratch empty for the caller to
+    // put back.
+    let grow = span.saturating_sub(scratch.len());
+    if scratch.try_reserve(grow).is_err() {
+        crate::runtime::drain::note_store_route("t11_memo_host_commit");
+        return false;
+    }
     scratch.resize(span, 0);
     scratch[filled..].fill(0);
+    true
 }
 
 /// TEMP (lab): `REIMS_VGPU_LAB_MEMO_READ=off` reads the mapper-ref-texture memo's
@@ -23491,11 +23802,14 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
     // Taken before the read, so a write landing during it moves past the stamp.
     let stamp = lab_memo_stamp::take(state, host, mid);
     let mut scratch = std::mem::take(&mut state.mapper_ref_texture_memo_scratch);
-    prepare_memo_scratch(
+    if !prepare_memo_scratch(
         &mut scratch,
         span,
         (stride as usize).saturating_mul(h as usize),
-    );
+    ) {
+        state.mapper_ref_texture_memo_scratch = scratch;
+        return None;
+    }
     if !memo_read_bgra8(
         lab_memo_read(),
         state,
@@ -23537,12 +23851,29 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
     }
     let rgba = if bgra {
         // First sight or the native bytes changed: the bytes as read, in the
-        // order the surface holds them.
+        // order the surface holds them. Guest-sized span, so the copy is
+        // reserved fallibly — a refusal is the memo's miss, not an abort.
         crate::runtime::drain::note_store_route("t11_memo_bgra_fill");
-        scratch[..span].to_vec()
+        let mut out = match crate::runtime::draw::guest_zeroed(span) {
+            Some(out) => out,
+            None => {
+                state.mapper_ref_texture_memo_scratch = scratch;
+                crate::runtime::drain::note_store_route("t11_memo_host_commit");
+                return None;
+            }
+        };
+        out.copy_from_slice(&scratch[..span]);
+        out
     } else {
         // First sight or the native bytes changed: convert BGRA→RGBA fresh.
-        let mut rgba = vec![0u8; span];
+        let mut rgba = match crate::runtime::draw::guest_zeroed(span) {
+            Some(rgba) => rgba,
+            None => {
+                state.mapper_ref_texture_memo_scratch = scratch;
+                crate::runtime::drain::note_store_route("t11_memo_host_commit");
+                return None;
+            }
+        };
         let converted =
             pixel_format::RowToRgba8::for_format(sample_fmt).is_some_and(|row_rail| {
                 (0..h as usize).all(|y| {
@@ -23751,7 +24082,7 @@ mod memo_scratch_tests {
     fn the_rect_is_not_rezeroed_and_the_padding_is() {
         let (span, filled) = (4096, 4000);
         let mut scratch = vec![0xAAu8; span];
-        prepare_memo_scratch(&mut scratch, span, filled);
+        assert!(prepare_memo_scratch(&mut scratch, span, filled));
         assert_eq!(scratch.len(), span);
         assert!(
             scratch[..filled].iter().all(|&b| b == 0xAA),
@@ -23768,20 +24099,33 @@ mod memo_scratch_tests {
     #[test]
     fn a_recycled_buffer_resizes_either_way_with_a_clean_tail() {
         let mut scratch = vec![0xAAu8; 1024];
-        prepare_memo_scratch(&mut scratch, 8192, 8000);
+        assert!(prepare_memo_scratch(&mut scratch, 8192, 8000));
         assert_eq!(scratch.len(), 8192);
         assert!(scratch[8000..].iter().all(|&b| b == 0));
 
-        prepare_memo_scratch(&mut scratch, 512, 500);
+        assert!(prepare_memo_scratch(&mut scratch, 512, 500));
         assert_eq!(scratch.len(), 512);
         assert!(scratch[500..].iter().all(|&b| b == 0));
 
         // A rect that claims the whole span leaves no tail to zero, and a rect
         // larger than the span (impossible geometry) must not panic on the slice.
-        prepare_memo_scratch(&mut scratch, 512, 512);
+        assert!(prepare_memo_scratch(&mut scratch, 512, 512));
         assert_eq!(scratch.len(), 512);
-        prepare_memo_scratch(&mut scratch, 512, 9999);
+        assert!(prepare_memo_scratch(&mut scratch, 512, 9999));
         assert_eq!(scratch.len(), 512);
+    }
+
+    /// The span is guest-sized, so a reservation the host cannot make is a
+    /// counted miss rather than a process abort. `usize::MAX` is past every
+    /// allocator's capacity, so the reserve refuses without allocating.
+    #[test]
+    fn a_span_the_host_cannot_reserve_is_a_miss_not_an_abort() {
+        let mut scratch = vec![0xAAu8; 64];
+        assert!(
+            !prepare_memo_scratch(&mut scratch, usize::MAX, 8),
+            "the refused reservation reports the miss"
+        );
+        assert_eq!(scratch.len(), 64, "the scratch is left as it was");
     }
 
     /// The abandoned-chain recovery rail must name a lost frame.

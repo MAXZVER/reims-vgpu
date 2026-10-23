@@ -541,8 +541,10 @@ pub struct DrawRequest {
     /// TEMP (lab, MERGE_DRAWS): per sub-draw (by position), its own index bytes.
     pub sub_index: Vec<Option<std::sync::Arc<Vec<u8>>>>,
     /// TEMP (lab, MERGE_DRAWS): per sub-draw (by position), stage-in bytes it binds instead of the record's, each with
-    /// the vertex input bindings (one per location) that read them.
-    pub sub_vstage: Vec<Vec<(std::sync::Arc<[u32]>, std::sync::Arc<Vec<u8>>)>>,
+    /// the vertex input bindings (one per location) that read them. The content as the prepare worker read it: a
+    /// window it already staged into its arena (PASS_STAGE) is bound where it is, not copied out and in again.
+    /// The third term: bytes at the window's head the sub-draw never fetches (TEMP lab SUB_VHEAD).
+    pub sub_vstage: Vec<Vec<(std::sync::Arc<[u32]>, BufferContent, u64)>>,
     pub vertex_attributes: Vec<VertexAttributeResource>,
     pub storage_buffers: Vec<StorageBufferResource>,
     pub sampled_images: Vec<SampledImageResource>,
@@ -1091,6 +1093,8 @@ pub struct LabSubDraw {
 
 #[derive(Debug)]
 pub struct VertexAttributeResource {
+    /// TEMP (lab, Opus 10-23 REC_VHEAD): bytes at the head of `content`'s window no vertex of this draw fetches.
+    pub head: u64,
     pub location: u32,
     pub binding: u32,
     pub format: VertexAttributeFormat,
@@ -1964,6 +1968,12 @@ pub enum TargetIdentity {
     },
     /// normal texture ref namespace.
     Texture {
+        /// The task whose object list `ref_` indexes. Refs are per task (two
+        /// processes routinely hold the same number for unrelated textures), and
+        /// without it two tasks' depth textures of one ref and extent shared one
+        /// resident and one `content_ready`: a pass that loaded its stored depth
+        /// read whatever the other task's pass had written in between.
+        task: u32,
         ref_: u32,
         width: u32,
         height: u32,
@@ -2190,7 +2200,7 @@ impl TargetIdentity {
     pub fn namespaced_id(&self) -> (u8, u64) {
         match self {
             Self::Surface { id, .. } => (0, u64::from(*id)),
-            Self::Texture { ref_, .. } => (1, u64::from(*ref_)),
+            Self::Texture { task, ref_, .. } => (1, (u64::from(*task) << 32) | u64::from(*ref_)),
             Self::Gva { gva, .. } => (2, *gva),
             Self::Anonymous { slot } => (3, *slot),
         }
@@ -2289,7 +2299,10 @@ impl TargetIdentity {
         match (self, other) {
             (Self::Surface { id: a, .. }, Self::Surface { id: b, .. }) => a == b,
             (Self::Gva { gva: a, .. }, Self::Gva { gva: b, .. }) => a == b,
-            (Self::Texture { ref_: a, .. }, Self::Texture { ref_: b, .. }) => a == b,
+            (
+                Self::Texture { task: ta, ref_: a, .. },
+                Self::Texture { task: tb, ref_: b, .. },
+            ) => ta == tb && a == b,
             (Self::Anonymous { slot: a }, Self::Anonymous { slot: b }) => a == b,
             _ => false,
         }
@@ -2834,6 +2847,7 @@ mod tests {
                 format: translate::pixel::SCANOUT_FORMAT,
             },
             TargetIdentity::Texture {
+                task: 0,
                 ref_: 12,
                 width: 64,
                 height: 64,
@@ -2892,6 +2906,7 @@ mod tests {
         );
         assert_eq!(
             asked.diverges_from(&TargetIdentity::Texture {
+                task: 0,
                 ref_: 7,
                 width: 1920,
                 height: 1080,
@@ -2917,6 +2932,7 @@ mod tests {
         // mapping id must not be reported as a resize of it.
         assert_eq!(
             asked.diverges_from(&TargetIdentity::Texture {
+                task: 0,
                 ref_: 7,
                 width: 8,
                 height: 8,
@@ -3029,6 +3045,7 @@ mod tests {
         }
         for other in [
             TargetIdentity::Texture {
+                task: 0,
                 ref_: 2,
                 width: 8,
                 height: 8,

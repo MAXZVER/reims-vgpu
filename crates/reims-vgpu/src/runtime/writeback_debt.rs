@@ -700,11 +700,15 @@ impl PendingWritebacks {
 
     /// Cancel any pending writeback debt for `mapping_id` (e.g. when mapping is unmapped/released).
     pub fn drop_mapping(&mut self, mapping_id: u32) -> bool {
-        let dropped = self.debts.remove(&mapping_id).is_some();
-        if dropped {
+        let dropped = self.debts.remove(&mapping_id);
+        if let Some(debt) = dropped.as_ref() {
             crate::runtime::drain::note_store_route("wbdebt_cancelled_on_refresh_or_unmap");
+            // The debt kept its resident as the sole copy of these pages; with
+            // the debt gone nothing pays it, and the reclaim paths refuse a
+            // sole copy - one full-frame image held per delete until teardown.
+            crate::backend::selected().abandon_resident(&debt.target);
         }
-        dropped
+        dropped.is_some()
     }
 
     /// Every mapping owed a frame, oldest arm first.
@@ -1417,6 +1421,7 @@ pub fn lab_pay_after_stamp<M: HostMemory + HostOps>(
     if !guest_waiting {
         land_deferred_if_ready(state, host);
     }
+    crate::runtime::render_writeback::lazy_land(state, host, None, false); // TEMP (lab LAZY_SYNC)
     let mapping_id = LAB_PAY_AFTER_STAMP.swap(0, Relaxed);
     if mapping_id != 0 && lab_pay_settling() {
         // TEMP (lab PAY_SETTLE): the screen still moves; the frame stays owed.
@@ -1550,7 +1555,11 @@ pub fn fb_copy_replay_enabled() -> bool {
 /// ([`crate::runtime::draw::vulkan::sample_plan`]'s `OwedFrame` bail) and the
 /// serial rail pays on the drain thread exactly as before.
 pub fn owes_mapping(state: &DeviceState, mapping_id: u32) -> bool {
-    !state.pending_writebacks.is_empty() && state.pending_writebacks.get(mapping_id).is_some()
+    // `owes`, not `get`: a payment begun and not landed (PAY_DEFER) is still
+    // owed to these pages - its copy may be mid-flight on the landing thread -
+    // and the serial rail lands it before reading, so a pool plan must refuse.
+    (!state.pending_writebacks.is_empty() && state.pending_writebacks.owes(mapping_id))
+        || crate::runtime::render_writeback::lazy_pending(mapping_id) // TEMP (lab LAZY_SYNC)
 }
 
 /// Pay `mapping_id`'s owed frame, if it owes one.
@@ -1567,6 +1576,7 @@ pub fn pay_for_mapping<M: HostMemory + HostOps>(
     crate::runtime::render_writeback::land_t2t(state, host, Some(mapping_id)); // TEMP (lab T2T_DEFER)
     // TEMP (lab, T2T_PARK): a parked frame owed to these pages through another mapping.
     crate::runtime::render_writeback::land_t2t_over_mapping(state, host, mapping_id);
+    crate::runtime::render_writeback::lazy_land(state, host, Some(mapping_id), true); // TEMP (lab LAZY_SYNC)
     pay_for_mapping_debt(state, host, mapping_id);
 }
 
@@ -1580,6 +1590,7 @@ pub fn pay_for_mapping_gathered<M: HostMemory + HostOps>(
     mapping_id: u32,
 ) {
     crate::runtime::render_writeback::land_t2t_unparked(state, host, mapping_id);
+    crate::runtime::render_writeback::lazy_land(state, host, Some(mapping_id), true); // TEMP (lab LAZY_SYNC)
     pay_for_mapping_debt(state, host, mapping_id);
 }
 
@@ -1626,6 +1637,7 @@ fn pay_for_mapping_debt<M: HostMemory + HostOps>(state: &mut DeviceState, host: 
 /// it would be worth it; read its doc before building one.
 pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
     crate::runtime::render_writeback::land_t2t(state, host, None); // TEMP (lab T2T_DEFER)
+    crate::runtime::render_writeback::lazy_land(state, host, None, true); // TEMP (lab LAZY_SYNC)
     if state.pending_writebacks.is_empty() {
         return;
     }
@@ -1974,6 +1986,15 @@ pub fn lab_pay_after_first_arm<M: HostMemory + HostOps>(
 /// would let a worker plan a bind whose debt the drain then skips by the lab
 /// switch's own choice — the conservative side is the one that cannot diverge.
 pub fn owes_texture(state: &DeviceState, task_id: u32, texture_ref: u32) -> bool {
+    // TEMP (lab LAZY_SYNC): a lazily landing frame is owed too.
+    if crate::runtime::render_writeback::vulkan_lazy_any()
+        && state
+            .mappings_named_by(task_id, texture_ref)
+            .iter()
+            .any(crate::runtime::render_writeback::lazy_pending)
+    {
+        return true;
+    }
     if state.pending_writebacks.is_empty() {
         return false;
     }
@@ -1989,7 +2010,7 @@ pub fn owes_texture(state: &DeviceState, task_id: u32, texture_ref: u32) -> bool
     state
         .mappings_named_by(task_id, texture_ref)
         .iter()
-        .any(|mapping_id| state.pending_writebacks.get(mapping_id).is_some())
+        .any(|mapping_id| state.pending_writebacks.owes(mapping_id))
 }
 
 #[track_caller]
@@ -1999,12 +2020,33 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
 ) {
+    pay_for_texture_with(state, host, task_id, texture_ref, true);
+}
+
+/// [`pay_for_texture`]; `land_lazy` false for the synchronize that may just have started a lazy landing of this
+/// texture (TEMP lab LAZY_SYNC, b956a: lazy_wait@ submit_for_resources 682 of 685 copies, 2.4 ms each - the command
+/// waited for its own copy). Not a reader of that frame: a payment of a newer frame into the same pages still lands
+/// the older copy first (`pay_for_mapping`).
+#[track_caller]
+fn pay_for_texture_with<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    land_lazy: bool,
+) {
     // TEMP (lab T2T_DEFER): a reader of either surface spelling of this texture.
     if crate::runtime::render_writeback::vulkan_t2t_pending() {
         for mapping_id in state.mappings_named_by(task_id, texture_ref).iter() {
             crate::runtime::render_writeback::land_t2t(state, host, Some(mapping_id));
             // TEMP (lab, T2T_PARK): the same pages through another mapping.
             crate::runtime::render_writeback::land_t2t_over_mapping(state, host, mapping_id);
+        }
+    }
+    // TEMP (lab LAZY_SYNC): a lazily landing frame for either surface spelling lands before a reader looks.
+    if land_lazy && crate::runtime::render_writeback::vulkan_lazy_any() {
+        for mapping_id in state.mappings_named_by(task_id, texture_ref).iter() {
+            crate::runtime::render_writeback::lazy_land(state, host, Some(mapping_id), true);
         }
     }
     if state.pending_writebacks.is_empty() {
@@ -2831,8 +2873,10 @@ pub fn supersede_for_mapping(
     mapping_id: u32,
     site: crate::runtime::render_writeback::SettleSite,
 ) {
-    if state.pending_writebacks.take(mapping_id).is_some() {
+    if let Some(debt) = state.pending_writebacks.take(mapping_id) {
         crate::runtime::drain::note_store_route("wbdebt_superseded_by_skipping_write");
+        // Superseded, not paid: release the resident it held as the sole copy.
+        crate::backend::selected().abandon_resident(&debt.target);
     }
     crate::runtime::render_writeback::settle_guest_writes(site);
 }
@@ -2936,8 +2980,126 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
     task_id: u32,
     object_ids: &[u32],
 ) {
+    if let Some(min_px) = lab_sync_skip_px() {
+        for &object_id in object_ids {
+            lab_sync_skip(state, task_id, object_id, min_px);
+        }
+    }
+    #[cfg(feature = "backend-vulkan")]
+    if let Some(min_px) = crate::runtime::render_writeback::vulkan::lazy_sync_px() {
+        for &object_id in object_ids {
+            lab_lazy_sync(state, host, task_id, object_id, min_px);
+        }
+    }
     for &object_id in object_ids {
-        pay_for_texture(state, host, task_id, object_id);
+        pay_for_texture_with(state, host, task_id, object_id, false);
+    }
+}
+
+/// TEMP (lab, Opus 10-21, `REIMS_VGPU_LAB_SYNC_SKIP_PX=<pixels>`): a CEILING arm, not a fix. The WebGL canvas
+/// (5120x2070, 42 MB) is synchronized (0x35) every frame and the payment is ~55 % of the drain at 5K - yet ~5-20 ms
+/// later the kernel re-backs the surface on fresh zero pages (b851/chain852 census), so the bytes may never be read.
+/// With this set, a synchronize naming a never-presented surface of at least that many pixels abandons its owed frame
+/// instead of landing it: the fps it buys is the prize of a lazy (trap-on-access) landing, and a wrong picture says
+/// somebody does read those pages.
+fn lab_sync_skip_px() -> Option<u64> {
+    use std::sync::OnceLock;
+    static PX: OnceLock<Option<u64>> = OnceLock::new();
+    *PX.get_or_init(|| {
+        let px = std::env::var("REIMS_VGPU_LAB_SYNC_SKIP_PX").ok().and_then(|v| v.trim().parse().ok());
+        crate::observe::off(format!("lab_sync_skip px={px:?}"));
+        px
+    })
+}
+
+/// TEMP (lab, LAZY_SYNC): a synchronize's owed frame of a big never-presented surface lands behind a guest fence
+/// (`render_writeback::vulkan::begin_lazy_store`). Every exit `pay` would take instead of writing leaves the debt
+/// where it is, so the payment below takes it as before; so does a frame the lazy door declines.
+#[cfg(feature = "backend-vulkan")]
+fn lab_lazy_sync<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M, task_id: u32, texture_ref: u32, min_px: u64) {
+    for mapping_id in state.mappings_named_by(task_id, texture_ref).iter() {
+        let Some(debt) = state.pending_writebacks.get(mapping_id) else {
+            continue;
+        };
+        if u64::from(debt.width) * u64::from(debt.height) < min_px {
+            continue;
+        }
+        use crate::runtime::render_writeback::vulkan::lazy_why;
+        if state.pending_writebacks.deferred_mapping() == Some(mapping_id) {
+            lazy_why("deferred", 0);
+            continue;
+        }
+        let Some(entry) = state.mappings.get(&mapping_id) else {
+            lazy_why("no_entry", 0);
+            continue;
+        };
+        let why = if entry.scanout_presented {
+            "presented"
+        } else if entry.released_since_resolve {
+            "released"
+        } else if entry.map_generation != debt.map_generation {
+            "generation"
+        } else if crate::runtime::resource_validity::licence_of(entry.validity)
+            == crate::runtime::resource_validity::WritebackLicence::Superseded
+        {
+            "superseded"
+        } else {
+            ""
+        };
+        if !why.is_empty() {
+            lazy_why(why, 0);
+            continue;
+        }
+        let gpas: Vec<u64> = entry
+            .page_entries
+            .iter()
+            .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, state.page_shift))
+            .collect();
+        if state.host_writes.first_armed(&gpas).is_some() {
+            lazy_why("host_armed", 0);
+            continue;
+        }
+        let Some(identity) = debt.target.get::<crate::backend::vulkan::engine::TargetIdentity>().cloned() else {
+            lazy_why("no_identity", 0);
+            continue;
+        };
+        // An older lazy frame for these pages lands first.
+        crate::runtime::render_writeback::lazy_land(state, host, Some(mapping_id), true);
+        let Some(debt) = state.pending_writebacks.take(mapping_id) else {
+            lazy_why("gone_after_land", 0);
+            continue;
+        };
+        let seen = crate::runtime::mapper::observe_guest_write_gen(state, host, mapping_id);
+        if !crate::runtime::render_writeback::vulkan::begin_lazy_store(
+            state,
+            host,
+            mapping_id,
+            &identity,
+            debt.width,
+            debt.height,
+            seen,
+        ) {
+            state.pending_writebacks.put_back(mapping_id, debt);
+        }
+    }
+}
+
+fn lab_sync_skip(state: &mut DeviceState, task_id: u32, texture_ref: u32, min_px: u64) {
+    for mapping_id in state.mappings_named_by(task_id, texture_ref).iter() {
+        let Some(debt) = state.pending_writebacks.get(mapping_id) else {
+            continue;
+        };
+        if u64::from(debt.width) * u64::from(debt.height) < min_px
+            || state.pending_writebacks.deferred_mapping() == Some(mapping_id)
+            || state.mappings.get(&mapping_id).is_none_or(|m| m.scanout_presented)
+        {
+            continue;
+        }
+        let Some(debt) = state.pending_writebacks.take(mapping_id) else {
+            continue;
+        };
+        crate::runtime::drain::note_store_route("lab_sync_skipped");
+        crate::backend::selected().abandon_resident(&debt.target);
     }
 }
 
@@ -3120,6 +3282,43 @@ pub fn deferred_mapping(state: &DeviceState) -> Option<u32> {
         .map(|d| d.mapping_id)
 }
 
+/// TEMP (lab PAY_DEFER, Opus 10-21 review): a begun payment's landing ends in `finish`, which releases its
+/// resident's sole-copy flag - but when a newer frame was drawn into that resident meanwhile (the `newer` debt
+/// `land_deferred` holds aside), the image is that frame's only copy and the reclaim paths must not take it.
+fn lab_newer_still_sole(newer: &WritebackDebt) {
+    #[cfg(feature = "backend-vulkan")]
+    if let Some(identity) = newer.target.get::<crate::backend::vulkan::engine::TargetIdentity>() {
+        crate::backend::vulkan::engine::note_resident_content_sole_copy(identity);
+        crate::runtime::drain::note_store_route("lab_pay_defer_newer_kept_sole");
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = newer;
+}
+
+/// TEMP (lab PAY_DEFER): drop the begun payment owed to `mapping_id` without
+/// landing it, because the guest is deleting that mapping's backing.
+///
+/// The delete trails the guest's own release of the pages, which may already be
+/// recycled (the boot-16 PTE-corruption panic was a delete-time flush), so the
+/// ordinary debt is cancelled there and never paid. A begun payment was landed
+/// instead - the map-family prologue ran `land_deferred` for the delete of the
+/// payment's own mapping, writing the frame into pages the guest had given
+/// back. Now it is dropped like the debt: a copy already on the landing thread
+/// is waited for (it cannot be recalled), none is started, and the resident is
+/// released to the reclaim paths. Returns whether there was one to drop.
+pub fn drop_deferred_for(state: &mut DeviceState, mapping_id: u32) -> bool {
+    if state.pending_writebacks.deferred_mapping() != Some(mapping_id) {
+        return false;
+    }
+    let Some(d) = state.pending_writebacks.deferred.0.take() else {
+        return false;
+    };
+    crate::runtime::drain::note_store_route("lab_pay_defer_dropped_on_delete");
+    drop(d.pending);
+    crate::backend::selected().abandon_resident(&d.target);
+    true
+}
+
 pub fn land_deferred<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
     let Some(d) = state.pending_writebacks.deferred.0.take() else {
         return;
@@ -3145,6 +3344,7 @@ pub fn land_deferred<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             }
             crate::runtime::mapper::commit_guest_write_stamp(state, d.mapping_id, d.seen);
             if let Some(newer) = newer {
+                lab_newer_still_sole(&newer);
                 state.pending_writebacks.put_back(d.mapping_id, newer);
             }
         }
@@ -3193,6 +3393,9 @@ pub fn land_deferred_if_ready<M: HostMemory + HostOps>(state: &mut DeviceState, 
         rail.advance_surface_writeback(state, host, &mut d.pending)
     };
     if let Some(newer) = newer {
+        if step.is_some() {
+            lab_newer_still_sole(&newer);
+        }
         state.pending_writebacks.put_back(d.mapping_id, newer);
     }
     match step {

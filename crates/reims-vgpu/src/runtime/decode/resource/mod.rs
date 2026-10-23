@@ -2773,6 +2773,14 @@ pub fn parse_vertex_block(
         return Err(DecodeStatus::ErrShort("res_vertex_layout_count_oob"));
     }
     let layout_count = ld32(&bytes[layout_section..]) as usize;
+    if layout_count > MAX_VERTEX_LAYOUTS {
+        // The attribute count below has this bound and the layouts had none: a
+        // count past the 31-slot `MTLVertexDescriptor.layouts` is a descriptor no
+        // Apple driver writes, and the loop walked it entry by entry (a 16 MiB
+        // descriptor is ~4M entries on the drain) before failing on bytes.
+        note_vertex_truncated("layout_count", layout_count, MAX_VERTEX_LAYOUTS);
+        return Err(DecodeStatus::ErrUnsupported("res_vertex_layout_count_over"));
+    }
     for i in 0..layout_count {
         let offloc = layout_section + 4 + i * 4;
         if offloc + 4 > bytes.len() {

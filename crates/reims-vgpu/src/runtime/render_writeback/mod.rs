@@ -561,6 +561,81 @@ pub fn vulkan_t2t_pending() -> bool {
     false
 }
 
+/// TEMP (lab, LAZY_SYNC): finish the lazy landings owed to `only` (all when `None`) - see
+/// `vulkan::lazy_land`. Free when none runs: one atomic load. A wait is booked on the caller's line
+/// (`lab_gpu_host_sites` `lazy_wait@`, microseconds).
+#[track_caller]
+pub fn lazy_land<M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    only: Option<u32>,
+    block: bool,
+) {
+    #[cfg(feature = "backend-vulkan")]
+    vulkan::lazy_land(state, host, only, block, std::panic::Location::caller());
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = (state, host, only, block);
+}
+
+/// TEMP (lab, LAZY_SYNC): the mappings lazily landing frames are owed to.
+pub fn lazy_pending_mappings() -> Vec<u32> {
+    #[cfg(feature = "backend-vulkan")]
+    return vulkan::lazy_pending_mappings();
+    #[cfg(not(feature = "backend-vulkan"))]
+    Vec::new()
+}
+
+/// TEMP (lab, LAZY_SYNC): stop the lazy copies into `mapping_id`'s pages (the guest releases them).
+pub fn lazy_cancel(mapping_id: u32) {
+    #[cfg(feature = "backend-vulkan")]
+    vulkan::lazy_cancel(mapping_id);
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = mapping_id;
+}
+
+/// TEMP (lab LAZY_SYNC): unmap a host view, unless a lazy copy still writes through it - then the copy owns it and
+/// unmaps it once in.
+pub fn unmap_view_or_adopt<H: crate::runtime::host::HostOps>(host: &mut H, ptr: usize, len: usize) {
+    #[cfg(feature = "backend-vulkan")]
+    if vulkan::lazy_adopt_view(ptr, len) {
+        crate::runtime::drain::note_store_route("lab_lazy_sync_view_adopted");
+        return;
+    }
+    host.unmap_pages(ptr, len);
+}
+
+/// TEMP (lab PAY_DEFER): block until PAY_DEFER's landing copy is in - before views are unmapped.
+pub fn wait_deferred_landing() {
+    #[cfg(feature = "backend-vulkan")]
+    vulkan::wait_deferred_landing();
+}
+
+/// TEMP (lab PAY_DEFER / LAZY_SYNC): block until every landing copy in flight is in - before views are unmapped.
+#[track_caller]
+pub fn wait_landing_copies() {
+    #[cfg(feature = "backend-vulkan")]
+    vulkan::wait_landing_copies(std::panic::Location::caller());
+}
+
+/// TEMP (lab, LAZY_SYNC): whether any lazily landing frame is in flight (one atomic load).
+pub fn vulkan_lazy_any() -> bool {
+    #[cfg(feature = "backend-vulkan")]
+    return vulkan::LAZY_N.load(std::sync::atomic::Ordering::Acquire) != 0;
+    #[cfg(not(feature = "backend-vulkan"))]
+    false
+}
+
+/// TEMP (lab, LAZY_SYNC): whether a lazily landing frame is owed to `mapping_id`'s pages.
+pub fn lazy_pending(mapping_id: u32) -> bool {
+    #[cfg(feature = "backend-vulkan")]
+    return vulkan::lazy_pending(mapping_id);
+    #[cfg(not(feature = "backend-vulkan"))]
+    {
+        let _ = mapping_id;
+        false
+    }
+}
+
 /// TEMP (lab T2T_DEFER): land the deferred whole-plane blit frames owed to
 /// `only` (or to every mapping). Free when none is owed: one atomic load.
 #[inline]

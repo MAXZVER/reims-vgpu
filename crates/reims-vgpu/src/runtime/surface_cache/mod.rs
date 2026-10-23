@@ -799,7 +799,7 @@ pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
     // `false`: this runs *before* the caller's guest write, so at this instant
     // the guest's pages do not hold these bytes. The caller calls
     // [`note_gva_landed`] once its write reports `Written`.
-    store_gva_owned(state, w.gva, w.width, w.height, bgra, 0, backing, false);
+    store_gva_owned_by(state, w.gva, w.width, w.height, bgra, 0, backing, false, w.task_id);
 }
 
 /// Record that the guest's own pages now hold the bytes cached at `gva`, so the
@@ -883,6 +883,23 @@ pub fn store_gva_owned(
     backing: Option<GvaBacking>,
     guest_holds_bytes: bool,
 ) {
+    store_gva_owned_by(state, gva, width, height, bgra, object_type, backing, guest_holds_bytes, 0);
+}
+
+/// [`store_gva_owned`] naming the task whose Store produced the bytes, which
+/// the seed door checks even when the walk left no backing.
+#[allow(clippy::too_many_arguments, reason = "store_gva_owned's identity plus its producer")]
+pub fn store_gva_owned_by(
+    state: &mut DeviceState,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+    object_type: u8,
+    backing: Option<GvaBacking>,
+    guest_holds_bytes: bool,
+    producer_task: u32,
+) {
     if gva == 0 || !scanout_extent_ok(width, height) {
         return;
     }
@@ -926,6 +943,7 @@ pub fn store_gva_owned(
     // on a 300 s boot — not because the guest had rewritten every entry, which
     // is how that zero was read, but because no set this rail ever created
     // outlived its own arming window.
+    entry.producer_task = backing.as_ref().map_or(producer_task, |b| b.task_id);
     entry.backing = backing;
     // Per store, not sticky: a later flush that *does* reach guest RAM makes
     // the same address evictable again, and a `true` left over from an earlier
@@ -1496,6 +1514,10 @@ pub fn gva_seed_verdict<H: HostMemory>(
         return GvaSeedVerdict::Unrecorded;
     };
     let Some(backing) = entry.backing.as_ref() else {
+        // No backing to ask freshness of, but ownership is still known.
+        if entry.producer_task != 0 && entry.producer_task != task_id {
+            return GvaSeedVerdict::OtherTask;
+        }
         return GvaSeedVerdict::Unrecorded;
     };
     // Ownership before freshness: a walk of another task's page table answers a

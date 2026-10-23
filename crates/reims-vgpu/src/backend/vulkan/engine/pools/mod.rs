@@ -226,6 +226,17 @@ pub(crate) struct ResourcePools {
     /// windows kept past their command buffer, by the buffer witness's key.
     /// See [`buf_resident`].
     buf_resident: buf_resident::BufResident,
+    /// TEMP (lab, Opus 10-23): emptied `staging_live` / `gather_live` lists
+    /// with their capacity, handed back at retire and taken at seal. Every seal
+    /// used to `mem::take` them, so each of the ~40k entries a second on 5K
+    /// Maps grew two lists from nothing and freed them at retire - b994R: half
+    /// of `acquire_staging` was that `Vec` growth, a third of it asleep on the
+    /// system heap's lock.
+    slot_vecs: Vec<Vec<BufferSlot>>,
+    /// TEMP (lab, `REIMS_VGPU_LAB_CONTENT_RESIDENT=on`): immutable staging
+    /// copies of buffer windows kept by the digest of their bytes. See
+    /// [`content_resident`].
+    content_resident: content_resident::ContentResident,
     /// Size-bucketed free DEVICE_LOCAL buffers the draw-time guest gather
     /// assembles scattered windows into, and the in-use ones the ring returns
     /// after submit/wait.
@@ -580,6 +591,10 @@ pub(crate) struct EntryState {
     /// TEMP (lab, T2T_PARK): leases the command buffer now recording copies
     /// out of, held until the entry retires.
     keep: Vec<std::sync::Arc<crate::backend::vulkan::engine::LeaseHold>>,
+    /// TEMP (lab, Opus 10-23 LANE_BYTES): byte contents the recording lane
+    /// still copies into this entry's staging (`write_staging_bytes_lane`),
+    /// held until the entry retires.
+    keep_bytes: Vec<std::sync::Arc<Vec<u8>>>,
     gather_live: Vec<BufferSlot>,
     /// Buffer binds the command buffer now recording has already staged or
     /// gathered, keyed by the content that produced them.
@@ -1539,6 +1554,8 @@ pub(crate) struct PendingGpuCleanup {
     staged: Vec<StagedRead>,
     /// TEMP (lab, T2T_PARK): readback leases this submission copies out of.
     keep: Vec<std::sync::Arc<crate::backend::vulkan::engine::LeaseHold>>,
+    /// TEMP (lab, LANE_BYTES): see [`EntryState::keep_bytes`].
+    keep_bytes: Vec<std::sync::Arc<Vec<u8>>>,
     /// This submission's number and the recorder jobs finished at its seal,
     /// published when it retires (`crate::runtime::inflight_reads`).
     read_seal: u64,
@@ -3553,6 +3570,29 @@ impl CbBind {
         }
     }
 
+    /// TEMP (lab, Opus 10-23 REC_VHEAD): whether a bind of `key` can be staged without its first `head` bytes
+    /// under an exact key of its own - the window offset below 2^40 and the head below 2^23 pack into the offset
+    /// field, and the length field carries the mark bit no real length reaches.
+    pub(crate) fn head_fits(key: (usize, u64, u64), head: u64) -> bool {
+        head != 0 && head < key.2 && key.1 < (1 << 40) && head < (1 << 23) && key.2 < (1 << 62)
+    }
+
+    /// TEMP (lab, REC_VHEAD): the memo key of `key`'s window staged without its first `head` bytes (`key`
+    /// itself for 0). Exact: two heads of one window, or a head and a full window, never share a key.
+    pub(crate) fn key_with_head(key: (usize, u64, u64), head: u64) -> (usize, u64, u64) {
+        if head == 0 {
+            key
+        } else {
+            (key.0, key.1 | (head << 40), key.2 | (1 << 63))
+        }
+    }
+
+    /// TEMP (lab, REC_VHEAD): this bind recorded under [`Self::key_with_head`].
+    pub(crate) fn with_head(mut self, head: u64) -> Self {
+        self.key = Self::key_with_head(self.key, head);
+        self
+    }
+
     /// The identity on its own, without taking a reference to what it names.
     ///
     /// [`Self::of`] exists so that no entry can be recorded in
@@ -3917,6 +3957,40 @@ impl Drop for SlowStagingWrite {
 
 pub mod buffer_gather_working_set;
 pub(crate) mod buf_resident;
+pub(crate) mod content_resident;
+
+#[cfg(test)]
+mod cb_bind_head_tests {
+    use super::CbBind;
+
+    #[test]
+    fn a_head_key_never_matches_the_full_window_or_another_head() {
+        let full = (0x1000usize, 4096u64, 65536u64);
+        assert_eq!(CbBind::key_with_head(full, 0), full);
+        let a = CbBind::key_with_head(full, 512);
+        let b = CbBind::key_with_head(full, 1024);
+        assert_ne!(a, full);
+        assert_ne!(a, b);
+        // Another window of the same runs whose offset equals this one's packed field stays apart too: the mark
+        // bit is in the length.
+        let other = (0x1000usize, 4096u64 | (512u64 << 40), 65536u64);
+        assert_ne!(a, other);
+        assert_eq!(a, CbBind::key_with_head(full, 512), "one head, one key");
+    }
+
+    #[test]
+    fn heads_outside_the_packing_are_refused() {
+        assert!(CbBind::head_fits((1, 0, 4096), 16));
+        assert!(!CbBind::head_fits((1, 0, 4096), 0));
+        assert!(!CbBind::head_fits((1, 0, 4096), 4096), "a head the size of the window");
+        assert!(!CbBind::head_fits((1, 1 << 40, 1 << 30), 16), "offset past 2^40");
+        assert!(!CbBind::head_fits((1, 0, 1 << 30), 1 << 23), "head past 2^23");
+    }
+}
+
+/// TEMP (lab): how many emptied slot lists `slot_vecs` keeps (two per entry in
+/// flight is plenty).
+const SLOT_VECS_KEEP: usize = 64;
 mod images_and_registry;
 pub(crate) mod par_stage;
 /// What the resident registry says about an identity's content, readable

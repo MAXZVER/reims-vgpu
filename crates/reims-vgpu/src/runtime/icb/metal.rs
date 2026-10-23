@@ -460,7 +460,8 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             // Guest blob_size is authoritative — no product 1 MiB MTLB ceiling.
             let len = crate::runtime::draw::host_alloc_len(f.blob_size as u64)
                 .ok_or(IcbStatus::Args("icb_frc_function_blob_too_large"))?;
-            let mut mtlb = vec![0u8; len];
+            let mut mtlb = crate::runtime::draw::guest_zeroed(len)
+                .ok_or(IcbStatus::Args("icb_frc_function_blob_too_large"))?;
             gva_mem::read_task_gva_by_id(
                 host,
                 &state.tasks,

@@ -536,6 +536,7 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
         format: SURFACE_TEST_FORMAT,
     };
     let depth_identity = TargetIdentity::Texture {
+        task: 0,
         ref_: 990_105,
         width: W,
         height: H,
@@ -939,6 +940,7 @@ fn a_warm_repeat_draw_that_binds_descriptors_and_vertex_buffers_does_not_allocat
     // binding order, so the draw pays the normalization a guest draw pays.
     let attributes = || {
         [(0u32, 2u32), (1, 0), (2, 1)].map(|(location, binding)| VertexAttributeResource {
+            head: 0,
             location,
             binding,
             format: VertexAttributeFormat::Float2,

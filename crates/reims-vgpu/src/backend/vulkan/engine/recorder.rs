@@ -325,7 +325,17 @@ pub(crate) fn depth() -> u32 {
         // since b130: with the overlapped commit the drain fills 64 in a
         // stream and waits on it (wait_below 8.9 % of the drain) while the
         // recorder idles 55 % of the time between streams.
-        return 256;
+        // TEMP (lab, 10-21): `REIMS_VGPU_LAB_RECORDER_DEPTH` overrides it here too (up to 4096) - b941 (21c, 5K
+        // Maps, ROUTES off): the drain still waits on a full 256-job queue (wait_below 12.6 % of its samples)
+        // while the recorder idles between the bursts.
+        static PAR_DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        return *PAR_DEPTH.get_or_init(|| {
+            std::env::var("REIMS_VGPU_LAB_RECORDER_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256u32)
+                .clamp(1, 4096)
+        });
     }
     static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *DEPTH.get_or_init(|| {
@@ -894,6 +904,43 @@ fn note_last(targets: &[super::types::TargetIdentity], stamp: Option<u32>) {
 /// TEMP (lab, RETAIN_DEFER): whether a job still out writes `identity`.
 pub(crate) fn pending_writer(identity: &super::types::TargetIdentity) -> bool {
     PENDING_TARGETS.lock().iter().any(|(id, _)| id == identity)
+}
+
+/// TEMP (lab, REAP, on unless `REIMS_VGPU_LAB_REAP=off`): drop `value` on a
+/// background thread instead of the caller's. A deferred draw's request owns
+/// its stage-in bytes (`Arc<Vec<u8>>`, ~125 KB a Maps tile); freeing them at the
+/// end of the job cost the recorder 10.5 % of its samples on 5K Maps (b937,
+/// `drop_glue` -> `Arc::drop_slow` -> `RtlFreeHeap` / `ZwFreeVirtualMemory`), and
+/// the recorder is what the drain waits on. Nothing a request owns needs its
+/// drop ordered against later work: its buffers are plain memory, a lease or a
+/// staged window it holds only delays its slot's reclaim, and the targets a job
+/// holds pending are released by the job itself, not by the request.
+pub(crate) fn reap<T: Send + 'static>(value: T) {
+    use std::sync::mpsc::{channel, Sender};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static TX: parking_lot::Mutex<Option<Sender<Box<dyn Send>>>> = parking_lot::Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var("REIMS_VGPU_LAB_REAP").as_deref() != Ok("off")) {
+        return;
+    }
+    let mut tx = TX.lock();
+    if tx.is_none() {
+        let (sender, receiver) = channel::<Box<dyn Send>>();
+        let spawned = std::thread::Builder::new()
+            .name("vgpu-reaper".into())
+            .spawn(move || {
+                for garbage in receiver {
+                    drop(garbage);
+                }
+            });
+        if spawned.is_err() {
+            return;
+        }
+        *tx = Some(sender);
+    }
+    if let Some(sender) = tx.as_ref() {
+        // A send fails only once the reaper is gone; the value then drops here.
+        let _ = sender.send(Box::new(value));
+    }
 }
 
 /// TEMP (lab, RETAIN_DEFER): run `f` on the recorder after every job already

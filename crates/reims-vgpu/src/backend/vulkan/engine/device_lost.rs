@@ -101,7 +101,25 @@ pub(crate) fn note_device_lost_seen() {
 /// transaction. A loss arriving just after a `false` answer remains latched and
 /// is consumed by the next tranche.
 pub(crate) fn device_lost_seen() -> bool {
+    lab_simulated_loss();
     DEVICE_LOST_SEEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// TEMP (lab, 10-22): `REIMS_VGPU_LAB_DEVICE_LOST_AT_S=N` - once, N seconds into the run, latch a device loss as an
+/// observer that cannot recover would, so the whole recovery (presenter gone, device rebuilt, presenter reattached)
+/// runs without a GPU fault: the lab check of Streamline's shutdown and restart across a device recreation.
+fn lab_simulated_loss() {
+    static AT_US: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(at) = *AT_US.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_DEVICE_LOST_AT_S").ok()?.parse::<u64>().ok().map(|s| s * 1_000_000)
+    }) else {
+        return;
+    };
+    if crate::observe::elapsed_us() >= at && !FIRED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        crate::observe::off(format!("lab_device_lost_simulated at_s={}", at / 1_000_000));
+        note_device_lost_seen();
+    }
 }
 
 /// Take the latch if it is set. Callers must be able to run the recovery, since

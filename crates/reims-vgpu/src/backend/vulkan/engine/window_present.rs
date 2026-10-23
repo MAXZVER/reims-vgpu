@@ -457,6 +457,79 @@ impl PendingWindowPresent {
     }
 }
 
+/// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_GPU_TIME=1`). Latched.
+fn lab_present_gpu_time() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("REIMS_VGPU_LAB_PRESENT_GPU_TIME").as_deref(), Ok("1" | "on")))
+}
+
+/// TEMP (lab, PRESENT_GPU_TIME): a top and a bottom timestamp per frame entry,
+/// read when the entry's fence has signalled; reported with the cadence line.
+struct LabGpuTime {
+    pool: vk::QueryPool,
+    scale: super::context::TickScale,
+    written: Vec<bool>,
+    sum_ns: u64,
+    max_ns: u64,
+    n: u32,
+}
+
+impl LabGpuTime {
+    unsafe fn create(ctx: &DeviceContext, frames: usize) -> Option<Self> {
+        let scale = ctx.timestamps.as_ref()?.scale;
+        let pool = ctx
+            .device
+            .create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2 * frames as u32),
+                None,
+            )
+            .ok()?;
+        Some(Self { pool, scale, written: vec![false; frames], sum_ns: 0, max_ns: 0, n: 0 })
+    }
+
+    unsafe fn begin(&mut self, device: &ash::Device, cmd: vk::CommandBuffer, ix: usize) {
+        device.cmd_reset_query_pool(cmd, self.pool, 2 * ix as u32, 2);
+        device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.pool, 2 * ix as u32);
+        self.written[ix] = true;
+    }
+
+    unsafe fn end(&self, device: &ash::Device, cmd: vk::CommandBuffer, ix: usize) {
+        device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.pool, 2 * ix as u32 + 1);
+    }
+
+    unsafe fn retire(&mut self, device: &ash::Device, ix: usize) {
+        if !std::mem::take(&mut self.written[ix]) {
+            return;
+        }
+        let mut stamps = [0u64; 2];
+        if device
+            .get_query_pool_results(self.pool, 2 * ix as u32, &mut stamps, vk::QueryResultFlags::TYPE_64)
+            .is_ok()
+        {
+            let ns = self.scale.elapsed_ns(stamps[0], stamps[1]);
+            self.sum_ns += ns;
+            self.max_ns = self.max_ns.max(ns);
+            self.n += 1;
+        }
+    }
+
+    fn report(&mut self) {
+        if self.n > 0 {
+            crate::observe::off(format!(
+                "lab_present_gpu n={} avg_ms={:.2} max_ms={:.2}",
+                self.n,
+                self.sum_ns as f64 / f64::from(self.n) / 1e6,
+                self.max_ns as f64 / 1e6
+            ));
+        }
+        self.sum_ns = 0;
+        self.max_ns = 0;
+        self.n = 0;
+    }
+}
+
 pub(crate) struct WindowPresenter {
     surface_loader: ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
@@ -574,6 +647,15 @@ pub(crate) struct WindowPresenter {
     /// being retried every frame.
     sharp: Option<super::present_sharp::PresentSharp>,
     sharp_failed: bool,
+    /// TEMP (lab, PRESENT_FG): frame generation for the scaled present.
+    fg: Option<super::present_fg::PresentFg>,
+    fg_failed: bool,
+    /// TEMP (lab, PRESENT_DLSSG): DLSS Frame Generation's per-present state.
+    dlssg: Option<super::present_dlssg::Dlssg>,
+    dlssg_failed: bool,
+    /// TEMP (lab, `REIMS_VGPU_LAB_PRESENT_GPU_TIME=1`): GPU time of each
+    /// present's command buffer.
+    lab_gpu: Option<LabGpuTime>,
 }
 
 /// Everything one in-flight present owns for as long as its blit is running.
@@ -839,6 +921,11 @@ impl WindowPresenter {
             lab_restamp: None,
             sharp: None,
             sharp_failed: false,
+            fg: None,
+            dlssg: None,
+            dlssg_failed: false,
+            lab_gpu: None,
+            fg_failed: false,
         };
         // A window created while minimized has no swapchain yet, which is not a
         // failure to attach: `begin_present` retries every frame until the
@@ -882,6 +969,9 @@ impl WindowPresenter {
             }
             end_present_in_flight(&mut self.frames[ix]);
             lab_probe_retire(ctx, ix);
+            if let Some(gpu) = self.lab_gpu.as_mut() {
+                gpu.retire(&ctx.device, ix);
+            }
         }
         lab_probe_flush();
         Ok(!self.frames[self.frame_ix].submitted)
@@ -1014,6 +1104,12 @@ impl WindowPresenter {
         // workaround assumes. The queue idled above, so no submitted work
         // references the old swapchain.
         let from = self.extent;
+        // TEMP (lab, PRESENT_DLSSG): DLSS-G off and the whole device idle before
+        // the old swapchain goes - its generated frames are presented from
+        // Streamline's own queues, which the queue idle above does not cover.
+        if let Some(dlssg) = self.dlssg.as_mut() {
+            dlssg.pause(&ctx.device);
+        }
         // TEMP (lab, PRESENT_SHARP): views of the old images go first.
         if let Some(sharp) = self.sharp.as_mut() {
             sharp.release_all(&ctx.device);
@@ -1133,7 +1229,8 @@ impl WindowPresenter {
         source: Option<&WindowPresentSource>,
         cpu: Option<WindowCpuFrame<'_>>,
     ) -> Result<WindowPresentDispatch, DrawError> {
-        if let Some(seq) = cpu.map(|frame| frame.seq) {
+        let frame_seq = cpu.map(|frame| frame.seq);
+        if let Some(seq) = frame_seq {
             if self.cadence_last_offered != Some(seq) {
                 self.cadence_last_offered = Some(seq);
                 self.cadence_offered = self.cadence_offered.saturating_add(1);
@@ -1307,6 +1404,8 @@ impl WindowPresenter {
 
         // TEMP (lab): whether this present carries a `REIMS_VGPU_LAB_PROBE` copy.
         let mut probe_armed = false;
+        // TEMP (lab, PRESENT_FG): the optical-flow work this frame's submission waits on.
+        let mut fg_wait: Option<vk::Semaphore> = None;
         let submit_result = (|| {
             ctx.device
                 .reset_fences(&[frame_in_flight])
@@ -1325,6 +1424,16 @@ impl WindowPresenter {
                 .map_err(|error| {
                     DrawError::VkCall(VkCall::new(VkOp::WindowBeginCommandBuffer, error))
                 })?;
+            // TEMP (lab, PRESENT_DLSSG / PRESENT_DLSS_SR): one Streamline frame per present, shared by the
+            // filter's DLSS upscale and DLSS-G at present.
+            super::present_dlssg::begin_present();
+            // TEMP (lab, PRESENT_GPU_TIME): the top stamp of this present.
+            if lab_present_gpu_time() && self.lab_gpu.is_none() {
+                self.lab_gpu = LabGpuTime::create(ctx, self.frames.len());
+            }
+            if let Some(gpu) = self.lab_gpu.as_mut() {
+                gpu.begin(&ctx.device, frame_cmd, frame_ix);
+            }
 
             let color_range = vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1367,11 +1476,18 @@ impl WindowPresenter {
                 // TEMP (lab, PRESENT_SHARP): a scaled resident frame is drawn
                 // through the Catmull-Rom pass, which clears its own slate.
                 let sharp_view = match &blit {
+                    // TEMP (lab, PRESENT_FG): at 1:1 too, so its midpoints reach the screen (an exact copy there).
                     BlitSource::Resident { view, .. }
                         if super::present_sharp::on()
                             && *view != vk::ImageView::null()
-                            && (vp.width, vp.height) != (base_width, base_height) =>
+                            && ((vp.width, vp.height) != (base_width, base_height) || super::present_fg::on()) =>
                     {
+                        // TEMP (lab, PRESENT_VSR): NGX bound to this device once, before the
+                        // filter that records it is built.
+                        // (Not with PRESENT_DLSS_SR: DLSS takes VSR's place and NGX belongs to Streamline.)
+                        if super::present_vsr::quality().is_some() && !super::present_dlssg::dlss_sr_active() {
+                            super::present_vsr::init(&ctx._entry, &ctx.instance, ctx.pd, &ctx.device, ctx.generation);
+                        }
                         if self.sharp.is_none() && !self.sharp_failed {
                             match super::present_sharp::PresentSharp::create(
                                 &ctx.device,
@@ -1425,15 +1541,99 @@ impl WindowPresenter {
                         &[],
                     );
                 }
+                // TEMP (lab, PRESENT_FG): before this frame's read barrier is
+                // recorded, the guest frame is still in the layout the registry
+                // recorded - the copy into the flow inputs runs on that.
+                // TEMP (lab, PRESENT_DLSS_SR): without PRESENT_FG the same flow, run on every new guest frame, gives
+                // DLSS its motion vectors (no midpoint, no FG request). Not beside DLSS-G: the GPU has one
+                // optical-flow queue and DLSS-G's own flow holds it - the upscale then gets zero vectors.
+                // Only where DLSS evaluates a moving frame: under PRESENT_VSR_SETTLE without a motion instance it runs
+                // on settled presents alone, history reset, where the vectors are zero anyway - and the flow is not
+                // free (chain946: with it canvas 50.9 fps at drain duty 0.79, without it 60.7 at 0.40, 21g).
+                let fg_on = super::present_fg::on();
+                let dlss_moving_frames = crate::host_window::present::lab_present_settle().is_none()
+                    || (super::present_dlssg::dlss_motion_active() && super::present_dlssg::dlss_motion_vectors());
+                let dlss_flow = !fg_on
+                    && super::present_dlssg::dlss_sr_active()
+                    && !super::present_dlssg::active()
+                    && dlss_moving_frames;
+                let fg_input = match (&blit, sharp_view.is_some() && (fg_on || dlss_flow)) {
+                    (BlitSource::Resident { image, access, .. }, true) => Some((*image, *access)),
+                    _ => None,
+                };
                 let src_layout = blit.record_read_barrier(&ctx.device, frame_cmd);
+                let mut fg_src: Option<super::present_fg::FgSource> = None;
+                let mut motion: Option<super::present_fg::FgMotion> = None;
+                let fg_request = || {
+                    if dlss_flow {
+                        frame_seq.map(|seq| (seq, true, None))
+                    } else {
+                        crate::host_window::present::lab_take_fg_request()
+                    }
+                };
+                if let (Some((image, access)), Some((seq, want_flow, phase))) =
+                    (fg_input, fg_input.and_then(|_| fg_request()))
+                {
+                    if !self.fg_failed && self.fg.as_ref().is_none_or(|fg| !fg.matches(base_width, base_height)) {
+                        if let Some(mut old) = self.fg.take() {
+                            // The whole device: the optical-flow queue may still be
+                            // writing the old flow images (a queue idle covers only
+                            // the graphics queue).
+                            let _ = ctx.device.device_wait_idle();
+                            old.destroy(ctx);
+                        }
+                        let memory_type = |bits, bytes, _host| {
+                            ctx.memory_type_for(bits, bytes, reims_vgpu_vulkan::memory::MemoryClass::DeviceLocal)
+                        };
+                        match super::present_fg::PresentFg::create(ctx, base_width, base_height, self.frames.len(), &memory_type) {
+                            Ok(fg) => self.fg = Some(fg),
+                            Err(e) => {
+                                self.fg_failed = true;
+                                crate::observe::fail(format!("present_fg_refused build={e:?} {base_width}x{base_height}"));
+                            }
+                        }
+                    }
+                    if let Some(fg) = self.fg.as_mut() {
+                        let (stage, acc) = access.source_scope();
+                        match fg.submit_flow(ctx, frame_ix, image, access.layout(), stage, acc, seq, want_flow) {
+                            Ok(flowed) => {
+                                // The flow just submitted (a new pair) is waited on by
+                                // this present; later presents of the pair follow it.
+                                // A re-present of the same guest frame moved nothing: no
+                                // vectors (the evaluate writes zero ones).
+                                if dlss_flow && flowed.is_some() {
+                                    motion = fg.motion(seq);
+                                }
+                                fg_wait = flowed;
+                                if let Some(phase) = phase {
+                                    fg_src = fg.record_warp(&ctx.device, frame_cmd, frame_ix, seq, phase);
+                                    if fg_src.is_some() {
+                                        crate::host_window::present::lab_note_fg_shown();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.fg_failed = true;
+                                crate::observe::fail(format!("present_fg_refused submit={e:?}"));
+                            }
+                        }
+                    }
+                }
                 let drew_sharp = match (sharp_view, self.sharp.as_mut()) {
                     (Some(view), Some(sharp)) => {
                         let src = super::present_sharp::SharpSource {
-                            image: blit.image(),
-                            view,
-                            layout: src_layout,
+                            image: fg_src.as_ref().map_or(blit.image(), |s| s.image),
+                            view: fg_src.as_ref().map_or(view, |s| s.view),
+                            layout: fg_src.as_ref().map_or(src_layout, |s| s.layout),
                             width: base_width,
                             height: base_height,
+                            real: fg_src.as_ref().map(|_| super::present_refine::RefineFrame {
+                                image: blit.image(),
+                                view,
+                                layout: src_layout,
+                            }),
+                            seq: frame_seq,
+                            motion,
                         };
                         sharp
                             .record(
@@ -1576,14 +1776,55 @@ impl WindowPresenter {
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
             );
+            // TEMP (lab, PRESENT_GPU_TIME): the bottom stamp of this present.
+            if let Some(gpu) = self.lab_gpu.as_ref() {
+                gpu.end(&ctx.device, frame_cmd, frame_ix);
+            }
+            // TEMP (lab, PRESENT_DLSSG): this frame's token, tags and constants.
+            let dlssg_token = if super::present_dlssg::active() && !self.dlssg_failed {
+                let (w, h) = (self.extent.width, self.extent.height);
+                if self.dlssg.as_ref().is_none_or(|d| !d.matches(w, h)) {
+                    if let Some(mut old) = self.dlssg.take() {
+                        // Streamline works on queues of its own.
+                        let _ = ctx.device.device_wait_idle();
+                        old.destroy(&ctx.device);
+                    }
+                    let memory_type = |bits, bytes, _host| {
+                        ctx.memory_type_for(bits, bytes, reims_vgpu_vulkan::memory::MemoryClass::DeviceLocal)
+                    };
+                    match super::present_dlssg::Dlssg::create(&ctx.device, w, h, &memory_type) {
+                        Ok(d) => self.dlssg = Some(d),
+                        Err(e) => {
+                            self.dlssg_failed = true;
+                            crate::observe::fail(format!("present_dlssg_refused reason=build err={e:?} {w}x{h}"));
+                        }
+                    }
+                }
+                match self.dlssg.as_mut() {
+                    Some(d) => {
+                        d.keep_views_of(&ctx.device, &self.images);
+                        d.record(&ctx.device, ctx.pd, frame_cmd, dst, translate::pixel::SCANOUT_FORMAT)
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
             ctx.device.end_command_buffer(frame_cmd).map_err(|error| {
                 DrawError::VkCall(VkCall::new(VkOp::WindowEndCommandBuffer, error))
             })?;
-            let waits = [frame_image_available];
-            let wait_stages = [ACQUIRE_WAIT_STAGE];
+            let mut waits = vec![frame_image_available];
+            let mut wait_stages = vec![ACQUIRE_WAIT_STAGE];
+            if let Some(flowed) = fg_wait {
+                waits.push(flowed);
+                wait_stages.push(vk::PipelineStageFlags::COMPUTE_SHADER);
+            }
             let signals = [frame_render_finished];
             let commands = [frame_cmd];
-            ctx.submit_present_transaction(super::context::PresentTransaction {
+            if let Some(token) = dlssg_token {
+                super::present_dlssg::Dlssg::mark_present(token, true);
+            }
+            let presented = ctx.submit_present_transaction(super::context::PresentTransaction {
                 command_buffers: &commands,
                 wait_semaphores: &waits,
                 wait_stages: &wait_stages,
@@ -1593,8 +1834,11 @@ impl WindowPresenter {
                 present_wait: frame_render_finished,
                 swapchain: self.swapchain,
                 image_index,
-            })
-            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
+            });
+            if let Some(token) = dlssg_token {
+                super::present_dlssg::Dlssg::mark_present(token, false);
+            }
+            presented.map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
         })();
         // A plain `?` now the failure arm has nothing to undo: it used to have to
         // drop the pins this present had taken before returning.
@@ -1958,6 +2202,9 @@ impl WindowPresenter {
             self.cadence_offered,
         ));
         lab_present_gap_report();
+        if let Some(gpu) = self.lab_gpu.as_mut() {
+            gpu.report();
+        }
         self.cadence_started = Instant::now();
         self.cadence_presents = 0;
         self.cadence_direct = 0;
@@ -1992,6 +2239,20 @@ impl WindowPresenter {
         }
         if let Some(mut sharp) = self.sharp.take() {
             sharp.destroy(&ctx.device);
+        }
+        // TEMP (lab): FG's optical-flow queue and Streamline's own queues are
+        // not covered by the queue idle above.
+        if self.fg.is_some() || self.dlssg.is_some() {
+            let _ = ctx.device.device_wait_idle();
+        }
+        if let Some(mut fg) = self.fg.take() {
+            fg.destroy(ctx);
+        }
+        if let Some(mut dlssg) = self.dlssg.take() {
+            dlssg.destroy(&ctx.device);
+        }
+        if let Some(gpu) = self.lab_gpu.take() {
+            ctx.device.destroy_query_pool(gpu.pool, None);
         }
         // Drained rather than iterated, so a second `destroy` — `create` calls
         // it on a failed `recreate_swapchain`, and the caller may call it again

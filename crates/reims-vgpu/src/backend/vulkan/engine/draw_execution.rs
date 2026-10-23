@@ -357,6 +357,7 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             ("identity_format", format!("{format:?}")),
         ],
         TargetIdentity::Texture {
+            task,
             ref_,
             width,
             height,
@@ -364,6 +365,7 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             stencil,
         } => vec![
             ("identity_kind", "texture".into()),
+            ("identity_task", task.to_string()),
             ("identity_ref", ref_.to_string()),
             ("identity_width", width.to_string()),
             ("identity_height", height.to_string()),
@@ -540,6 +542,7 @@ mod tests {
             ),
             (
                 TargetIdentity::Texture {
+                    task: 0,
                     ref_: 8,
                     width: 80,
                     height: 60,

@@ -544,7 +544,7 @@ fn cpu_read_worker<M: HostMemory + HostOps>(
         .ok_or(Bail::BufferRead)?;
     let (read_gva, read_span) = (gva + offset, want as u64);
     guest_bytes_readable(state, host, task_id, buffer_ref, read_gva, read_span)?;
-    let mut buf = vec![0u8; want];
+    let mut buf = crate::runtime::draw::guest_zeroed(want).ok_or(Bail::BufferRead)?;
     if gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,

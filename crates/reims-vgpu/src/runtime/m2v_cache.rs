@@ -350,12 +350,22 @@ impl ShaderVariant {
         words: Arc<Vec<u32>>,
         samplers: Arc<[crate::runtime::spirv_bind::ReflectedSamplerDescriptor]>,
     ) -> Arc<Self> {
+        // A module whose frame does not walk whole has an unknowable
+        // used-binding list. The sentinel below sits in no layout ever built,
+        // so the `UsedBindingAbsentFromLayout` backstop refuses each draw of
+        // this shader by name — the Mesa SIGFPE class the backstop exists for,
+        // answered fail-closed rather than guessed at from a partial scan.
         let used_descriptor_bindings = crate::runtime::spirv_bind::declared_binding_numbers(&words)
-            .into_iter()
-            .filter(|binding| {
-                crate::runtime::spirv_bind::descriptor_static_use(&words, *binding).is_violation()
+            .map(|declared| {
+                declared
+                    .into_iter()
+                    .filter(|binding| {
+                        crate::runtime::spirv_bind::descriptor_static_use(&words, *binding)
+                            .is_violation()
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>()
+            .unwrap_or_else(|| vec![crate::runtime::spirv_bind::BROKEN_FRAME_BINDING])
             .into();
         Arc::new(Self {
             words,
@@ -1470,8 +1480,34 @@ fn translate_air_raw(air: &[u8], stage: Stage) -> M2vResult<disk::Raw> {
     // Reflected translate: byte-identical SPIR-V PLUS the stage-interface facade.
     // `reflection.datalayout` carries the source `target datalayout` the sanitizer
     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
-    metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
-        .map_err(|e| translate_decline(stage, e.to_string()))
+    contain_translator_panic(stage, || {
+        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
+            .map_err(|e| translate_decline(stage, e.to_string()))
+    })
+}
+
+/// Run one translator call with its panics turned into this stage's typed
+/// refusal.
+///
+/// The translator parses guest AIR, so a shader it cannot handle can make it
+/// panic. On the async worker that unwound the worker away with the shader's
+/// entry still `Loading` and `async_worker_running` still set: no worker was
+/// ever started again, every later queued shader stayed `Loading`, and the
+/// pre-scan that re-polls until its pipeline is ready held its guest packet at
+/// the channel head forever. On the drain it unwound to the FFI boundary, and
+/// every later drain retried the same packet into the same panic. A refusal
+/// instead resolves the ask (`Entry::Failed`) and costs one draw.
+fn contain_translator_panic<T>(
+    stage: Stage,
+    call: impl FnOnce() -> M2vResult<T>,
+) -> M2vResult<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(result) => result,
+        Err(payload) => Err(translate_decline(
+            stage,
+            format!("translator_panic {}", crate::observe::panic::payload_text(&*payload)),
+        )),
+    }
 }
 
 fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedShader> {
@@ -1503,14 +1539,16 @@ fn translate_kernel_air_raw(air: &[u8], local_size: [u32; 3]) -> M2vResult<disk:
         kernel_local_size: local_size,
         ..Default::default()
     };
-    metal2vulkan::translate_reflected_with_options(
-        path.to_str().unwrap_or("k.air"),
-        Stage::Kernel,
-        &tmp,
-        opts,
-    )
-    .map_err(|e| M2vCacheDecline::KernelTranslate {
-        detail: e.to_string(),
+    contain_translator_panic(Stage::Kernel, || {
+        metal2vulkan::translate_reflected_with_options(
+            path.to_str().unwrap_or("k.air"),
+            Stage::Kernel,
+            &tmp,
+            opts,
+        )
+        .map_err(|e| M2vCacheDecline::KernelTranslate {
+            detail: e.to_string(),
+        })
     })
 }
 
@@ -1711,10 +1749,25 @@ fn ensure_cached_async_keyed(
         }
     }
     if start_worker {
-        std::thread::spawn(async_worker);
+        // The translator recurses over the guest's AIR; a stack overflow is not a
+        // panic `contain_translator_panic` can catch, so give it room rather than
+        // the default 2 MiB.
+        let spawned = std::thread::Builder::new()
+            .name("reims-m2v-async".into())
+            .stack_size(TRANSLATOR_STACK_BYTES)
+            .spawn(async_worker);
+        if spawned.is_err() {
+            // No worker: the queued shaders would wait for one forever.
+            global().lock().unwrap_or_else(|e| e.into_inner()).async_worker_running = false;
+            crate::observe::fail("linux_m2v_async reason=worker_spawn_failed".to_string());
+        }
     }
     false
 }
+
+/// Stack for the async translation worker (see the spawn in
+/// [`ensure_cached_async_keyed`]).
+const TRANSLATOR_STACK_BYTES: usize = 64 << 20;
 
 fn async_worker() {
     loop {
@@ -1728,10 +1781,22 @@ fn async_worker() {
                 }
             }
         };
-        let result = match task.kernel_local_size {
-            Some(local_size) => translate_kernel_air(&task.air, local_size),
-            None => translate_air(&task.air, task.stage),
-        };
+        // The whole translation, not only the translator call: the
+        // post-processing around it (`finish_translated`, the capture) runs on
+        // guest-derived SPIR-V too, and a panic there would leave the entry
+        // `Loading` and this worker gone exactly as a translator panic did.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match task.kernel_local_size {
+                Some(local_size) => translate_kernel_air(&task.air, local_size),
+                None => translate_air(&task.air, task.stage),
+            }
+        }))
+        .unwrap_or_else(|payload| {
+            Err(translate_decline(
+                task.stage,
+                format!("translation_panic {}", crate::observe::panic::payload_text(&*payload)),
+            ))
+        });
         let (hits, misses, detail, failure) = {
             let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
             let (detail, failure) = match result {
@@ -2356,6 +2421,18 @@ mod tests {
         words.extend(decorate(7, 3));
         words.extend(decorate(8, M2V_TEXTURE_BINDING_BASE + 8));
         words.extend(decorate(9, TOP_SAMPLER));
+        // Typed, as the translator's modules are: relocation moves a binding by
+        // its variable's class and never by band guesswork. 20 = a sampled 2D
+        // image, 21 = a sampler, 22 = the buffer's (undeclared) block type;
+        // 30-32 point at them in UniformConstant; 7-9 are the variables.
+        words.extend([(9u32 << 16) | 25, 20, 1, 1, 0, 0, 0, 1, 0]);
+        words.extend([(2u32 << 16) | 26, 21]);
+        for (pointer, pointee) in [(30, 20), (31, 21), (32, 22)] {
+            words.extend([(4u32 << 16) | 32, pointer, 0, pointee]);
+        }
+        for (variable, pointer) in [(8, 30), (9, 31), (7, 32)] {
+            words.extend([(4u32 << 16) | 59, pointer, variable, 0]);
+        }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let shader = synth_shader(Stage::Fragment, bytes);
 

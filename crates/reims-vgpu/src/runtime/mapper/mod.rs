@@ -1537,6 +1537,15 @@ fn lab_resolve_fingerprint(m: &crate::model::MappingEntry) -> u64 {
 /// admitted to a backend import, so its only users are CPU copies that finish
 /// inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
+    // TEMP (lab PAY_DEFER / LAZY_SYNC, Opus 10-21 review): a landing copy writes through a mapping's packed view
+    // on the landing thread. Views are retired from several places (map_surface, unmap_surface, condemn, backing
+    // re-resolution, attach, invalidate_mapping_pages), and this is where they are unmapped: not while a copy may
+    // still write through one. PAY_DEFER's copy is waited for; a lazy copy (b960a: the guest unmaps the WebGL
+    // canvas right after synchronizing it, and every unmap waited ~2 ms for the copy) adopts the view instead and
+    // unmaps it once in - the guest pages stay the guest's until the unmap's stamp, which the copy gates.
+    if !state.retired_views.is_empty() {
+        crate::runtime::render_writeback::wait_deferred_landing();
+    }
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
     // fence-safe retirement; only then is the matching host view unmapped.
@@ -1553,10 +1562,10 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
             continue;
         }
         released.remove(&(ptr, len));
-        host.unmap_pages(ptr, len);
+        crate::runtime::render_writeback::unmap_view_or_adopt(host, ptr, len);
     }
     for (ptr, len) in released {
-        host.unmap_pages(ptr, len);
+        crate::runtime::render_writeback::unmap_view_or_adopt(host, ptr, len);
     }
     // Same shape and the same reason: a guest-write token is host-side state
     // for a page list that no longer exists, and only the host can free it.
@@ -1575,7 +1584,7 @@ pub fn drain_deferred_unmaps<H: HostOps>(host: &mut H) -> usize {
     let released = crate::backend::selected().take_released_host_aliases();
     let count = released.len();
     for (ptr, len) in released {
-        host.unmap_pages(ptr, len);
+        crate::runtime::render_writeback::unmap_view_or_adopt(host, ptr, len);
     }
     count
 }
@@ -1602,6 +1611,28 @@ pub fn drain_deferred_unmaps<H: HostOps>(host: &mut H) -> usize {
 /// alone. Both do bump the generation exactly when the list changes, so
 /// checking it here makes a carried-over token unusable by construction instead
 /// of depending on every future writer remembering a second thing to retire.
+/// TEMP (lab, GW_TOKEN_YOUNG_MS): see [`ensure_guest_write_token`]. Below this
+/// the host hashes the set anyway (DIRTY_HASH sets), and the token is cheap.
+const YOUNG_TOKEN_MIN_PAGES: usize = 4096;
+
+/// TEMP (lab): live `GW_TOKEN_YOUNG_MS`, else `REIMS_VGPU_LAB_GW_TOKEN_YOUNG_MS`.
+fn young_token_ms() -> u64 {
+    // Unit tests build surfaces and ask for their token at once.
+    if cfg!(test) {
+        return 0;
+    }
+    if let Some(v) = crate::runtime::lab_live::value("GW_TOKEN_YOUNG_MS").and_then(|v| v.parse().ok()) {
+        return v;
+    }
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAB_GW_TOKEN_YOUNG_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(40)
+    })
+}
+
 pub fn ensure_guest_write_token<H: HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -1636,6 +1667,24 @@ pub fn ensure_guest_write_token<H: HostOps>(
     let m = state.mappings.get(&mapping_id)?;
     if !m.mapped || m.page_entries.is_empty() {
         return None;
+    }
+    // TEMP (lab, `REIMS_VGPU_LAB_GW_TOKEN_YOUNG_MS=<ms>`, default 40 since
+    // chain995 - webgl 48.6/47.9 -> 52.2/57.6 fps; 0 turns it off): a
+    // large incarnation younger than this gets no token yet. Heavy WebGL hands
+    // its 5K drawing surface back on fresh pages every frame (b852, b994): each
+    // incarnation built a token (sort, DIRTY_VERIFY baseline hash of all ~10k
+    // pages, its first evaluation) and died before one harvest armed it, so no
+    // observation ever read anything but "cannot tell" from it - ~19 % of the
+    // drain in b994's webgl. Without a token the answer is that same "cannot
+    // tell"; a surface that lives past the window gets its token then.
+    if m.page_entries.len() >= YOUNG_TOKEN_MIN_PAGES {
+        let young_ms = young_token_ms();
+        if young_ms > 0
+            && crate::observe::elapsed_us().saturating_sub(m.lab_bump_us) < young_ms * 1000
+        {
+            crate::runtime::drain::note_store_route("gw_token_young");
+            return None;
+        }
     }
     let gpas: Vec<u64> = m
         .page_entries
@@ -3587,7 +3636,7 @@ fn lab_gw_rebase() -> bool {
 /// page this write touched, made since the set's last sync, is taken in with
 /// the device's: the same window in which a guest store into the written part
 /// is already lost under the device's bytes.
-fn rebase_device_write<H: HostOps>(
+pub(crate) fn rebase_device_write<H: HostOps>(
     state: &DeviceState,
     host: &H,
     mapping_id: u32,

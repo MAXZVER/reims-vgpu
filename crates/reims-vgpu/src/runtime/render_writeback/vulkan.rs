@@ -651,6 +651,8 @@ fn land_where<M: HostMemory + HostOps>(
                 } else {
                     None
                 };
+                // The pages hold exactly the frame only when nothing was skipped.
+                let landed_whole = guest_owned.is_none();
                 let ok = match guest_owned {
                     Some(skip) => crate::runtime::mapping_write::write_bgra8_skipping_uncached(
                         state,
@@ -673,8 +675,13 @@ fn land_where<M: HostMemory + HostOps>(
                     ),
                 };
                 drop(frame);
-                // TEMP (lab, T2T_ALIAS): name the landed pages and the frame in them.
-                if ok && crate::runtime::gather_witness::t2t_alias::on() {
+                // TEMP (lab, T2T_ALIAS): name the landed pages and the frame in them -
+                // only when that is what they hold. Landed around the guest's own
+                // stores, they are the frame *and* those stores, and naming them
+                // as the pure resident let the next gather of that window confirm
+                // an alias that drops the guest's writes (host-only verdict, then
+                // `note_decided`).
+                if ok && landed_whole && crate::runtime::gather_witness::t2t_alias::on() {
                     if let (Some(version), Some((gpas, span))) = (
                         p.source_version,
                         crate::runtime::mapping_write::lab_t2t_alias_window(state, p.mapping_id, p.width, p.height),
@@ -822,10 +829,11 @@ fn store_render_frame_inner<M: HostMemory + HostOps>(
         static N: AtomicU32 = AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4000 {
             crate::observe::off(format!(
-                "lab_flush_trace mid={mapping_id} {width}x{height} presented={} mapgen={} since_prev_ms={}",
+                "lab_flush_trace mid={mapping_id} {width}x{height} presented={} mapgen={} since_prev_ms={} since_publish_us={}",
                 u8::from(m.scanout_presented),
                 m.map_generation,
                 if m.lab_flush_us == 0 { -1 } else { (now.saturating_sub(m.lab_flush_us) / 1000) as i64 },
+                if m.lab_published_us == 0 { -1 } else { now.saturating_sub(m.lab_published_us) as i64 },
             ));
         }
         m.lab_flush_us = now;
@@ -1400,6 +1408,9 @@ impl DeferredStore {
 /// writing guest pages behind the drain's back.
 struct LandJob {
     done: std::sync::Arc<LandDone>,
+    /// TEMP (lab LAZY_SYNC): set when the guest releases the pages the copy writes (a delete of the mapping's
+    /// backing): the landing thread stops at the next chunk, so no byte lands in a page handed back.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Mapping-linear `[lo, hi)` runs copied, for the footprint marks.
     runs: Vec<(u64, u64)>,
     /// Page runs this landing mapped itself (`(ptr, len)`), unmapped by the drain
@@ -1423,6 +1434,14 @@ struct LandDone {
 /// reuses before the payment lands.
 type LandSpans = Vec<(usize, usize, usize)>;
 
+/// What the landing thread does once a job's copy is in (see [`LandJob::spawn`]).
+type LandThen = Box<dyn FnOnce() + Send>;
+
+/// TEMP (lab LAZY_SYNC async read): what the landing thread does before the copy - wait for the readback the
+/// spans read and hold its frame through the copy. `None`: there is no frame (the device went away); the copy is
+/// cancelled.
+type LandBefore = Box<dyn FnOnce() -> Option<Box<dyn Send>> + Send>;
+
 impl LandJob {
     fn done(&self) -> bool {
         self.done.flag.load(std::sync::atomic::Ordering::Acquire)
@@ -1440,6 +1459,9 @@ impl LandJob {
     }
 
     /// Hand `spans` to the landing thread (started on first use).
+    /// `before` runs there first (TEMP lab LAZY_SYNC async read: waits for the readback the spans read), `then`
+    /// once the copy is in, before the job reads done (TEMP lab LAZY_SYNC: the readback lease returned).
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         spans: LandSpans,
         runs: Vec<(u64, u64)>,
@@ -1447,28 +1469,38 @@ impl LandJob {
         frame_len: usize,
         pages: usize,
         full: bool,
+        before: Option<LandBefore>,
+        then: Option<LandThen>,
     ) -> Self {
         use std::sync::{mpsc, Mutex, OnceLock};
-        static TX: OnceLock<Mutex<mpsc::Sender<(LandSpans, std::sync::Arc<LandDone>)>>> =
-            OnceLock::new();
+        type Job = (
+            LandSpans,
+            std::sync::Arc<LandDone>,
+            Option<LandBefore>,
+            Option<LandThen>,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        );
+        fn run(spans: &LandSpans, before: Option<LandBefore>, then: Option<LandThen>, cancel: &std::sync::atomic::AtomicBool) {
+            let hold = before.map(|b| b());
+            if matches!(hold, Some(None)) {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            land_copy(spans, cancel);
+            drop(hold);
+            if let Some(then) = then {
+                then();
+            }
+        }
+        static TX: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
         let done = std::sync::Arc::new(LandDone::default());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tx = TX.get_or_init(|| {
-            let (tx, rx) = mpsc::channel::<(LandSpans, std::sync::Arc<LandDone>)>();
+            let (tx, rx) = mpsc::channel::<Job>();
             std::thread::Builder::new()
                 .name("reims-land".into())
                 .spawn(move || {
-                    while let Ok((spans, done)) = rx.recv() {
-                        for (dst, src, n) in spans {
-                            // SAFETY: see `LandSpans`; the ranges were bounds-checked
-                            // against the view and the answer buffer by the drain.
-                            unsafe {
-                                crate::runtime::mapper::write_guest_bytes_raw(
-                                    src as *const u8,
-                                    dst as *mut u8,
-                                    n,
-                                )
-                            };
-                        }
+                    while let Ok((spans, done, before, then, cancel)) = rx.recv() {
+                        run(&spans, before, then, &cancel);
                         let _g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
                         done.flag.store(true, std::sync::atomic::Ordering::Release);
                         done.cv.notify_all();
@@ -1480,16 +1512,480 @@ impl LandJob {
         let sent = tx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .send((spans, done.clone()));
-        if let Err(mpsc::SendError((spans, _))) = sent {
+            .send((spans, done.clone(), before, then, cancel.clone()));
+        if let Err(mpsc::SendError((spans, _, before, then, cancel))) = sent {
             // No landing thread: copy here, so the job is as done as it would be.
-            for (dst, src, n) in spans {
-                // SAFETY: as on the landing thread.
-                unsafe { crate::runtime::mapper::write_guest_bytes_raw(src as *const u8, dst as *mut u8, n) };
-            }
+            run(&spans, before, then, &cancel);
             done.flag.store(true, std::sync::atomic::Ordering::Release);
         }
-        Self { done, runs, mapped, frame_len, pages, full }
+        Self { done, cancel, runs, mapped, frame_len, pages, full }
+    }
+}
+
+/// The landing copy, in chunks so a cancel (TEMP lab LAZY_SYNC) stops it within one.
+///
+/// TEMP (lab LAZY_SYNC, Opus 10-21 b961a): the guest's WebGL frame waits for a synchronize's stamp, which waits for
+/// this copy (~2.4 ms for 42 MB on one thread) - the chunks are shared out over `REIMS_VGPU_LAB_LAND_THREADS` threads
+/// (default 4, 1 = the landing thread alone) once a copy is past 4 MB.
+fn land_copy(spans: &LandSpans, cancel: &std::sync::atomic::AtomicBool) {
+    const CHUNK: usize = 1 << 20;
+    let chunks: Vec<(usize, usize, usize)> = spans
+        .iter()
+        .flat_map(|&(dst, src, n)| {
+            (0..n.div_ceil(CHUNK)).map(move |i| (dst + i * CHUNK, src + i * CHUNK, CHUNK.min(n - i * CHUNK)))
+        })
+        .collect();
+    let copy = |part: &[(usize, usize, usize)]| {
+        for &(dst, src, len) in part {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            // SAFETY: see `LandSpans`; the ranges were bounds-checked against the view and the answer buffer by the
+            // drain, and the chunk lies inside its span. Chunks are disjoint, so the threads never share a byte.
+            unsafe { crate::runtime::mapper::write_guest_bytes_raw(src as *const u8, dst as *mut u8, len) };
+        }
+    };
+    let threads = land_threads().min(chunks.len().div_ceil(4)).max(1);
+    if threads == 1 {
+        copy(&chunks);
+        return;
+    }
+    let per = chunks.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut parts = chunks.chunks(per);
+        let mine = parts.next().unwrap_or(&[]);
+        for part in parts {
+            // A thread the OS refuses must not panic the landing thread (its job would never read done, and every
+            // stamp after the synchronize would wait for it): that part is copied here instead.
+            if std::thread::Builder::new().spawn_scoped(scope, move || copy(part)).is_err() {
+                copy(part);
+            }
+        }
+        copy(mine);
+    });
+}
+
+/// TEMP (lab LAZY_SYNC): `REIMS_VGPU_LAB_LAZY_ASYNC_READ` - on unless `off`. Latched.
+fn lazy_async_read() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = !matches!(std::env::var("REIMS_VGPU_LAB_LAZY_ASYNC_READ").as_deref(), Ok("off" | "0"));
+        crate::observe::off(format!("lab_lazy_async_read on={}", u8::from(on)));
+        on
+    })
+}
+
+fn land_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("REIMS_VGPU_LAB_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4);
+        crate::observe::off(format!("lab_land_threads n={n}"));
+        n.clamp(1, 16)
+    })
+}
+
+/// The landing copy in flight, if any: its mapping and its done latch.
+///
+/// The copy writes raw addresses of the mapping's packed view (or of runs it
+/// mapped) on the landing thread while the drain goes on. Its design assumed
+/// only a map-family command changes the pages under it, and lands the payment
+/// first there; a re-point (`CmdReplacePhysical`), a drifted backing, a page
+/// collision or a failed revalidation invalidate the page list too, and the
+/// view and its pages were handed back with the copy still running - into
+/// pages the guest was re-pointing (and on hosts with packed aliases, through
+/// an unmapped view). [`wait_landing_copy_for`] is what an invalidation waits on.
+static LANDING: std::sync::Mutex<Option<(u32, std::sync::Arc<LandDone>)>> =
+    std::sync::Mutex::new(None);
+
+/// Block until a landing copy into `mapping_id`'s pages is in, if one runs.
+/// Called before the mapping's page list is invalidated; the payment's own
+/// bookkeeping (and its generation check) still happens where it always did.
+pub(crate) fn wait_landing_copy_for(mapping_id: u32) {
+    let done = {
+        let g = LANDING.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_ref() {
+            Some((m, done)) if *m == mapping_id => std::sync::Arc::clone(done),
+            _ => return,
+        }
+    };
+    if done.flag.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let _span = crate::runtime::chain_phase::CostSpan::new("lab_pay_defer_invalidate_wait_us");
+    crate::runtime::drain::note_store_route("lab_pay_defer_invalidate_waited");
+    let mut g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+    while !done.flag.load(std::sync::atomic::Ordering::Acquire) {
+        g = done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// TEMP (lab, Opus 10-21, `REIMS_VGPU_LAB_LAZY_SYNC_PX=<pixels>`; on by default at 4 000 000 since 10-22 - chain961
+/// ABA: canvas 61 -> 71 fps, Maps 30 -> 40-45, webgl duty 0.69 -> 0.64, ART 0 - and `off` for the A/B): a synchronize (0x35) of a
+/// never-presented surface of at least that many pixels leaves the drain before its frame has landed. The drain
+/// reads the frame back (leased) and hands the copy into the guest's pages to the landing thread; every completion
+/// stamp queued after the synchronize waits for the copy (`write_baseline::resolve_after` - the guest reads a
+/// synchronized resource only after the command completes), so the drain goes on with the next packets while the
+/// 42 MB lands (b948 SYNC_SKIP ceiling: 51.8 -> 77.9 fps with the right picture). The device's own readers of the
+/// mapping land it first ([`lazy_land`] from every payment door). b950-b953 fenced the guest's pages instead
+/// (`HostOps::guest_fence_close`): ~2 000 scattered runs a surface made each close cost ~10 ms.
+pub fn lazy_sync_px() -> Option<u64> {
+    static PX: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *PX.get_or_init(|| {
+        let px = crate::runtime::write_baseline::lazy_sync_px_setting();
+        crate::observe::off(format!("lab_lazy_sync px={px:?}"));
+        px
+    })
+}
+
+/// TEMP (lab LAZY_SYNC, Opus 10-21 b950a: 2 of ~40 synchronizes a second went lazy with the route census off): why
+/// each big synchronize did or did not go lazy (and page runs, when a reason carries them), as one `lab_lazy_why` line a second
+/// whatever `REIMS_VGPU_LAB_ROUTES` says (a few dozen calls a second).
+pub(crate) fn lazy_why(reason: &'static str, runs: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static SINCE: AtomicU64 = AtomicU64::new(0);
+    static WHY: std::sync::Mutex<(Vec<(&'static str, u64)>, u64, u64, u64)> =
+        std::sync::Mutex::new((Vec::new(), 0, 0, 0));
+    let line = {
+        let mut g = WHY.lock().unwrap_or_else(|e| e.into_inner());
+        match g.0.iter_mut().find(|(r, _)| *r == reason) {
+            Some((_, n)) => *n += 1,
+            None => g.0.push((reason, 1)),
+        }
+        if runs != 0 {
+            g.1 += 1;
+            g.2 += runs as u64;
+            g.3 = g.3.max(runs as u64);
+        }
+        let now = crate::observe::elapsed_us();
+        let since = SINCE.load(Relaxed);
+        if since == 0 {
+            SINCE.store(now.max(1), Relaxed);
+        }
+        (since != 0 && now >= since + 1_000_000).then(|| {
+            SINCE.store(now, Relaxed);
+            let (why, n, sum, max) = std::mem::take(&mut *g);
+            let mut s = String::from("lab_lazy_why");
+            for (r, c) in why {
+                s.push_str(&format!(" {r}={c}"));
+            }
+            s.push_str(&format!(" runs_n={n} runs_avg={} runs_max={max}", sum / n.max(1)));
+            s
+        })
+    };
+    if let Some(line) = line {
+        crate::observe::off(line);
+    }
+}
+
+/// A synchronize's frame landing on the landing thread (the lease rides with the copy, the stamps wait for it; the
+/// payment's bookkeeping was done when it began).
+struct LazyStore {
+    mapping_id: u32,
+    base_off: u64,
+    /// The host addresses the copy writes, `[lo, hi)`: a view retired over them is the copy's to unmap.
+    dst: (usize, usize),
+    /// The mapping's generation at the start: a frame landed into pages the mapping no longer names is not
+    /// rebased onto the new ones.
+    map_generation: u64,
+    job: LandJob,
+}
+
+static LAZY: std::sync::Mutex<Vec<LazyStore>> = std::sync::Mutex::new(Vec::new());
+/// How many [`LAZY`] holds - the one atomic load every payment door pays when none is.
+pub(crate) static LAZY_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The mappings lazily landing frames are owed to (TEMP lab LAZY_SYNC: which an unmap or a delete must wait for).
+pub(crate) fn lazy_pending_mappings() -> Vec<u32> {
+    if LAZY_N.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    LAZY.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|l| l.mapping_id).collect()
+}
+
+/// A host view being unmapped (`ptr`, `len`) that a lazy copy still writes through becomes that copy's: it is
+/// unmapped with the copy's own runs once the copy is in ([`lazy_land`]). `true` when adopted - the caller must
+/// not unmap it.
+pub(crate) fn lazy_adopt_view(ptr: usize, len: usize) -> bool {
+    if LAZY_N.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    let mut g = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+    match g.iter_mut().find(|l| !l.job.done() && l.dst.0 < ptr + len && ptr < l.dst.1) {
+        Some(l) => {
+            l.job.mapped.push((ptr, len));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Block until PAY_DEFER's landing copy (not the lazy ones - they adopt the views they write through) is in.
+pub(crate) fn wait_deferred_landing() {
+    let deferred = LANDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(_, done)| std::sync::Arc::clone(done));
+    if let Some(done) = deferred {
+        let mut g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !done.flag.load(std::sync::atomic::Ordering::Acquire) {
+            g = done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Stop the lazy copies into `mapping_id`'s pages at their next chunk: the guest is releasing those pages.
+pub(crate) fn lazy_cancel(mapping_id: u32) {
+    for l in LAZY.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|l| l.mapping_id == mapping_id) {
+        l.job.cancel.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Whether a lazily landing frame is owed to `mapping_id`'s pages.
+pub(crate) fn lazy_pending(mapping_id: u32) -> bool {
+    LAZY_N.load(std::sync::atomic::Ordering::Acquire) != 0
+        && LAZY.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|l| l.mapping_id == mapping_id)
+}
+
+/// Block until every landing copy in flight - PAY_DEFER's and the lazy ones - is in (`flush_retired_views`).
+pub(crate) fn wait_landing_copies(site: &'static std::panic::Location<'static>) {
+    let t0 = std::time::Instant::now();
+    let deferred = LANDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(_, done)| std::sync::Arc::clone(done));
+    if let Some(done) = deferred {
+        let mut g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !done.flag.load(std::sync::atomic::Ordering::Acquire) {
+            g = done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    if lazy_wait_where(|_| true) || t0.elapsed().as_micros() > 50 {
+        crate::backend::vulkan::engine::lab_site_note("lazy_wait", site, t0.elapsed().as_micros() as u64);
+    }
+}
+
+/// Wait for the lazy copies `pick` names, without holding [`LAZY`] across the wait (pool planners ask
+/// [`lazy_pending`] from other threads).
+/// `true` when it had to wait for any.
+fn lazy_wait_where(pick: impl Fn(&LazyStore) -> bool) -> bool {
+    if LAZY_N.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    let dones: Vec<std::sync::Arc<LandDone>> = LAZY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|l| pick(l))
+        .map(|l| std::sync::Arc::clone(&l.job.done))
+        .collect();
+    let mut waited = false;
+    for done in dones {
+        let mut g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !done.flag.load(std::sync::atomic::Ordering::Acquire) {
+            waited = true;
+            g = done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    waited
+}
+
+/// Start the lazy landing of `mapping_id`'s owed frame (held by `identity`). `false` when this frame cannot take
+/// it - the caller pays synchronously as before (named on the route counters).
+pub fn begin_lazy_store<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+    seen: crate::runtime::mapper::GuestWriteObservation,
+) -> bool {
+    use crate::runtime::drain::note_store_route;
+    let started = std::time::Instant::now();
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        lazy_why("no_mapping", 0);
+        return false;
+    };
+    let Some((base_off, bpr, format)) = crate::runtime::mapping_write::resident_gpu_plane(m, width, height) else {
+        note_store_route("lab_lazy_sync_no_plane"); lazy_why("no_plane", 0);
+        return false;
+    };
+    if u64::from(bpr) != u64::from(width) * 4
+        || (format != crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
+            && format != crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB)
+    {
+        note_store_route("lab_lazy_sync_not_packed_bgra"); lazy_why("not_packed_bgra", 0);
+        return false;
+    }
+    let frame_bytes = u64::from(width) * u64::from(height) * 4;
+    // `write_mapping_bytes_only`'s prologue, in its order (as `start_landing_copy`).
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
+        crate::runtime::render_writeback::SettleSite::MappingBytesWrite,
+    );
+    let need_end = base_off + frame_bytes;
+    state.invalidate_storage_residency_window(mapping_id, base_off, need_end);
+    let Some(vouched) = crate::runtime::mapper::vouch_mapping_pages_verdict(state, host, mapping_id).1 else {
+        note_store_route("lab_lazy_sync_vouch_refused"); lazy_why("vouch_refused", 0);
+        return false;
+    };
+    if !vouched.covers(state, mapping_id) {
+        note_store_route("lab_lazy_sync_vouch_stale"); lazy_why("vouch_stale", 0);
+        return false;
+    }
+    // TEMP (lab LAZY_SYNC, Opus 10-21 b953a): no guest fence. The canvas's pages are ~2 000 scattered runs even
+    // sorted, one hypervisor protection change per run each way (~10 ms a close, more than the copy it hides). The
+    // guest does not read a resource it synchronized before the command completes (the contract `write_baseline`
+    // already rests on), so the copy is gated on the stamps instead: every completion stamp queued after this
+    // synchronize - its own and any FIFO's later ones - waits for the copy (`write_baseline::resolve_after`), and
+    // every device reader of these pages lands it first (`lazy_land`).
+    let pages = need_end.div_ceil(state.page_size()) as usize - (base_off / state.page_size()) as usize;
+    // TEMP (lab LAZY_SYNC async read, Opus 10-22, `REIMS_VGPU_LAB_LAZY_ASYNC_READ=off` for the A/B): the readback
+    // is submitted, not waited - the landing thread waits for it before the copy (b961a: the drain's fence wait was
+    // 166 ms/s of the WebGL scene, ~3.7 ms a frame on the drain the next packets queued behind).
+    let (src_base, before, then): (usize, Option<LandBefore>, Option<LandThen>) = if lazy_async_read() {
+        let ticket = match crate::backend::vulkan::engine::submit_target_read_leased(identity) {
+            Ok(Some(t)) if t.bgra() && t.lease_span().1 as u64 >= frame_bytes => t,
+            _ => {
+                note_store_route("lab_lazy_sync_no_lease");
+                lazy_why("no_lease", 0);
+                return false;
+            }
+        };
+        let src_base = ticket.lease_span().0;
+        let before: LandBefore = Box::new(move || {
+            // The engine lock is taken briefly per look, never held across the GPU's work.
+            let t0 = std::time::Instant::now();
+            while !crate::backend::vulkan::engine::target_read_done(&ticket) {
+                if t0.elapsed() < std::time::Duration::from_micros(300) {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            }
+            match crate::backend::vulkan::engine::finish_target_read_leased(ticket) {
+                Ok(Some(frame)) => Some(Box::new(frame) as Box<dyn Send>),
+                _ => None,
+            }
+        });
+        (src_base, Some(before), None)
+    } else {
+        let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
+            Ok(Some(l)) if l.bgra && l.bytes().len() as u64 >= frame_bytes => l,
+            _ => {
+                note_store_route("lab_lazy_sync_no_lease");
+                lazy_why("no_lease", 0);
+                return false;
+            }
+        };
+        let src_base = leased.bytes().as_ptr() as usize;
+        // The lease returns once the copy has read it.
+        (src_base, None, Some(Box::new(move || drop(leased)) as LandThen))
+    };
+    let runs = vec![(base_off, need_end)];
+    let Some((spans, mapped)) = land_spans(state, host, mapping_id, &runs, base_off, need_end, src_base) else {
+        note_store_route("lab_lazy_sync_no_spans");
+        lazy_why("no_spans", 0);
+        return false;
+    };
+    // `land_spans` may revalidate the page list; the copy must write the vouched pages.
+    if !vouched.covers(state, mapping_id) {
+        for &(p, len) in &mapped {
+            host.unmap_pages(p, len);
+        }
+        note_store_route("lab_lazy_sync_vouch_moved");
+        lazy_why("vouch_moved", 0);
+        return false;
+    }
+    // `copy_mapping_runs`' host-write note, before any byte moves; a draw the recorder still holds may read these
+    // pages.
+    state.note_host_wrote_mapping_selected(mapping_id, &runs, base_off, need_end);
+    crate::backend::settle_deferred_draws_for_guest_write();
+    let dst = spans
+        .iter()
+        .fold((usize::MAX, 0usize), |(lo, hi), &(d, _, n)| (lo.min(d), hi.max(d + n)));
+    let map_generation = state.mappings.get(&mapping_id).map_or(0, |m| u64::from(m.map_generation));
+    let job = LandJob::spawn(spans, runs, mapped, frame_bytes as usize, pages, true, before, then);
+    let done = std::sync::Arc::clone(&job.done);
+    let gated = crate::runtime::write_baseline::resolve_after(Box::new(move || {
+        let mut g = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !done.flag.load(std::sync::atomic::Ordering::Acquire) {
+            g = done.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }));
+    if !gated {
+        // No gate thread: nothing would hold the stamp, so the copy is in before this packet completes.
+        job.wait();
+        note_store_route("lab_lazy_sync_no_gate");
+        lazy_why("no_gate", 0);
+    }
+    // The payment's bookkeeping now, not when the copy is in (`complete_landing`'s, plus the stamp `pay` commits):
+    // the frame is already out of the resident (in the lease the copy reads), and nothing reads these pages before
+    // it lands - the guest waits for a stamp the copy gates, every device reader lands it first. Deferred, `finish` would hand back the
+    // registry state of whatever the resident holds by then - a newer frame's sole copy released to reclaim.
+    for &(lo, hi) in &job.runs {
+        crate::runtime::mapper::note_mapping_write_footprint(state, mapping_id, lo, hi - lo);
+    }
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.guest_bytes_seq = m.guest_bytes_seq.wrapping_add(1);
+    }
+    crate::backend::vulkan::engine::page_diff_forget(mapping_id);
+    state.invalidate_storage_residency_window(mapping_id, base_off, need_end);
+    let _ = state.mark_mapping_written(mapping_id);
+    finish(state, mapping_id, identity, frame_bytes as usize, started, false);
+    crate::runtime::mapper::commit_guest_write_stamp(state, mapping_id, seen);
+    let mut g = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+    g.push(LazyStore { mapping_id, base_off, dst, map_generation, job });
+    LAZY_N.store(g.len(), std::sync::atomic::Ordering::Release);
+    note_store_route("lab_lazy_sync_begun");
+    lazy_why("begun", 0);
+    true
+}
+
+/// Finish lazy landings on the drain: those for `only` (every one when `None`), waiting for their copies when
+/// `block`, else only those whose copy is in - the views the copy wrote through unmapped.
+pub fn lazy_land<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    only: Option<u32>,
+    block: bool,
+    site: &'static std::panic::Location<'static>,
+) {
+    if LAZY_N.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let taken: Vec<LazyStore> = {
+        let mut g = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+        let (take, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *g)
+            .into_iter()
+            .partition(|l| only.is_none_or(|m| m == l.mapping_id) && (block || l.job.done()));
+        *g = keep;
+        LAZY_N.store(g.len(), std::sync::atomic::Ordering::Release);
+        take
+    };
+    for mut l in taken {
+        if !l.job.done() {
+            crate::runtime::drain::note_store_route("lab_lazy_sync_waited");
+            let t0 = std::time::Instant::now();
+            l.job.wait();
+            crate::backend::vulkan::engine::lab_site_note("lazy_wait", site, t0.elapsed().as_micros() as u64);
+        }
+        for (p, len) in std::mem::take(&mut l.job.mapped) {
+            host.unmap_pages(p, len);
+        }
+        // `write_mapping_copy_only`'s tail: a set the tracker answers for by hashing takes the landed bytes as its
+        // baseline (LAZY_SYNC_PX sizes are past DIRTY_HASH_MAX, so normally a no-op - kept for the parity) - only
+        // while the mapping still names the pages the copy wrote.
+        let current = state.mappings.get(&l.mapping_id).map(|m| u64::from(m.map_generation));
+        if current == Some(l.map_generation) {
+            let end = l.base_off + l.job.frame_len as u64;
+            crate::runtime::mapper::rebase_device_write(state, host, l.mapping_id, l.base_off, end, None);
+        }
+        crate::runtime::drain::note_store_route("lab_lazy_sync_landed");
     }
 }
 
@@ -1791,6 +2287,40 @@ fn start_landing_copy<M: HostMemory + HostOps>(
     if !vouched.covers(state, mapping_id) {
         return None; // the synchronous landing reports it
     }
+    let (spans, mapped) = land_spans(state, host, mapping_id, &runs, base_off, need_end, src_base)?;
+    // `copy_mapping_runs`' host-write note, before any byte moves.
+    state.note_host_wrote_mapping_selected(mapping_id, &runs, base_off, need_end);
+    // A draw the recorder still holds may read these pages.
+    crate::backend::settle_deferred_draws_for_guest_write();
+    crate::runtime::drain::note_store_route("lab_pay_defer_copy_async");
+    let job = LandJob::spawn(
+        spans,
+        runs,
+        mapped,
+        changed.frame_bytes as usize,
+        changed.pages.len(),
+        changed.full,
+        None,
+        None,
+    );
+    *LANDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((mapping_id, std::sync::Arc::clone(&job.done)));
+    Some(job)
+}
+
+/// The landing copy's `(dst, src, n)` spans for mapping-linear `runs` of `mapping_id` (inside
+/// `[base_off, need_end)`), sourced from `src_base` (frame offset 0 = mapping offset `base_off`): through the
+/// mapping's packed view when one covers the frame, else through the page runs it maps itself, returned beside
+/// the spans to be unmapped once the copy is in. `None`: no way to address the pages - land synchronously.
+#[allow(clippy::too_many_arguments)]
+fn land_spans<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    runs: &[(u64, u64)],
+    base_off: u64,
+    need_end: u64,
+    src_base: usize,
+) -> Option<(LandSpans, Vec<(usize, usize)>)> {
     let mut mapped: Vec<(usize, usize)> = Vec::new();
     let view = crate::runtime::mapper::ensure_contig_view(state, host, mapping_id)
         .filter(|&(_, len)| len as u64 >= need_end);
@@ -1854,19 +2384,7 @@ fn start_landing_copy<M: HostMemory + HostOps>(
             spans
         }
     };
-    // `copy_mapping_runs`' host-write note, before any byte moves.
-    state.note_host_wrote_mapping_selected(mapping_id, &runs, base_off, need_end);
-    // A draw the recorder still holds may read these pages.
-    crate::backend::settle_deferred_draws_for_guest_write();
-    crate::runtime::drain::note_store_route("lab_pay_defer_copy_async");
-    Some(LandJob::spawn(
-        spans,
-        runs,
-        mapped,
-        changed.frame_bytes as usize,
-        changed.pages.len(),
-        changed.full,
-    ))
+    Some((spans, mapped))
 }
 
 /// The landing copy is in: [`land_changed_pages`]' bookkeeping, and the views it

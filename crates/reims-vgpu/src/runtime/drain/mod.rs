@@ -4765,7 +4765,10 @@ fn read_ring_bytes_inner<M: HostMemory>(
     absolute: u32,
     len: u32,
 ) -> Result<Vec<u8>, MemError> {
-    let mut out = vec![0u8; len as usize];
+    // `len` is a guest packet's `total_size`; the root ring's size is a guest
+    // register (up to 4 GiB). A refused allocation reads as an overflow, like a
+    // length the ring cannot hold, instead of aborting the process.
+    let mut out = crate::runtime::draw::guest_zeroed(len as usize).ok_or(MemError::Overflow)?;
     if ring_size == 0 || len == 0 {
         return Ok(out);
     }
@@ -6894,7 +6897,12 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
         );
     };
 
-    let mut src = vec![0u8; need_host];
+    let Some(mut src) = crate::runtime::draw::guest_zeroed(need_host) else {
+        return cursor_glyph_fail(
+            "cursor_glyph_alloc",
+            format!("cursor_glyph_fail reason=cursor_glyph_alloc need={need} (host_commit)"),
+        );
+    };
     if crate::runtime::gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
@@ -7862,6 +7870,33 @@ fn deferred_landing_disjoint<H: HostMemory + HostOps>(
     !released.iter().any(|gpa| owed.contains(gpa))
 }
 
+/// TEMP (lab LAZY_SYNC): what a map-family command owes the lazy landings - no wait. The guest reuses pages an
+/// unmap or a backing delete releases only after that command's stamp, and every stamp queued after a lazy
+/// synchronize waits for its copy (`write_baseline::resolve_after`); a host view the copy writes through is adopted
+/// by it when retired (`unmap_view_or_adopt`). b960a: the guest unmaps the WebGL canvas (all 10 350 pages) right
+/// after synchronizing it, and that unmap waited ~2 ms for the copy 672 times in 15 s. A delete of a copy's own
+/// backing stops the copy at its next chunk (nothing will read those bytes); finished copies are booked.
+fn lazy_land_for_map_family<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    packet: &Packet,
+    family: MapFamily,
+) {
+    use crate::runtime::render_writeback as rw;
+    if !rw::vulkan_lazy_any() {
+        return;
+    }
+    if family == MapFamily::DeleteIOSurfaceBacking2 {
+        if let Ok(cmd) = crate::protocol::fifo::decode_delete_backing(&packet.payload) {
+            if rw::lazy_pending(cmd.object_id) {
+                note_store_route("lab_lazy_sync_cancelled_on_delete");
+                rw::lazy_cancel(cmd.object_id);
+            }
+        }
+    }
+    rw::lazy_land(state, host, None, false);
+}
+
 /// TEMP (lab, T2T_PARK): the deferred T2T frames a map-family command lands -
 /// every unparked one, as before; a parked one only when the command deletes a
 /// backing (any: rare) or names resources (Invalidate/Synchronize: any - the
@@ -7965,7 +8000,16 @@ fn apply_map_family<H: HostMemory + HostOps>(
     // its pages (b298: landing every parked frame on every map-family command
     // landed all of them ~10 ms later, on the commands WindowServer waits for).
     lab_park_land_for_map_family(state, host, packet, family);
-    if family != MapFamily::MapMemory2 || crate::runtime::writeback_debt::lab_map_land_all() {
+    // TEMP (lab LAZY_SYNC): a lazily landing frame is in before any of its pages moves (its copy writes them).
+    lazy_land_for_map_family(state, host, packet, family);
+    // The delete of the payment's own backing drops it instead of landing it:
+    // the guest has released those pages (see `drop_deferred_for`).
+    let deleting_owed = family == MapFamily::DeleteIOSurfaceBacking2
+        && crate::protocol::fifo::decode_delete_backing(&packet.payload)
+            .is_ok_and(|cmd| crate::runtime::writeback_debt::drop_deferred_for(state, cmd.object_id));
+    if deleting_owed {
+        note_store_route("map_family_deferred_dropped_on_delete");
+    } else if family != MapFamily::MapMemory2 || crate::runtime::writeback_debt::lab_map_land_all() {
         if lab_land_reach() && deferred_landing_disjoint(state, &*host, packet, family) {
             note_store_route("lab_land_reach_skipped");
         } else {

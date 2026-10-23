@@ -2451,8 +2451,8 @@ impl ResourcePools {
             match k {
                 TargetIdentity::Surface { id, generation, .. } => (0, u64::from(*id), *generation),
                 TargetIdentity::Texture {
-                    ref_, generation, ..
-                } => (1, u64::from(*ref_), *generation),
+                    task, ref_, generation, ..
+                } => (1, (u64::from(*task) << 32) | u64::from(*ref_), *generation),
                 TargetIdentity::Gva {
                     gva, generation, ..
                 } => (2, *gva, *generation),
@@ -2520,8 +2520,8 @@ impl ResourcePools {
                     Some((0, u64::from(*id), *generation))
                 }
                 TargetIdentity::Texture {
-                    ref_, generation, ..
-                } => Some((1, u64::from(*ref_), *generation)),
+                    task, ref_, generation, ..
+                } => Some((1, (u64::from(*task) << 32) | u64::from(*ref_), *generation)),
                 TargetIdentity::Gva {
                     gva, generation, ..
                 } => Some((2, *gva, *generation)),
@@ -2631,6 +2631,12 @@ impl ResourcePools {
     /// it a loss.
     pub(crate) fn registry_note_content_copied_out(&mut self, identity: &TargetIdentity) -> bool {
         self.set_sole_copy(identity, false)
+    }
+
+    /// TEMP (lab PAY_DEFER): the inverse, for a resident whose pixels became the only copy again after a
+    /// copy-out of an older frame was booked against it (a newer frame drawn into it meanwhile).
+    pub(crate) fn registry_note_content_sole_copy(&mut self, identity: &TargetIdentity) -> bool {
+        self.set_sole_copy(identity, true)
     }
 
     /// Record that this resident's pixels are the mapping's content as of
