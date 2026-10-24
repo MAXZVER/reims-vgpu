@@ -2876,7 +2876,14 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // pass and not the no-op this comment used to claim. Both spellings of that
     // declaration must reach the same answer; `ResidentReadSnapshot::bgra` is
     // where they do, and where they did not.
-    let readback = crate::backend::vulkan::engine::read_target(identity)
+    let want_native_layout = crate::protocol::pixel_format::store_texel_order(c0.format)
+        .or_else(|| {
+            crate::backend::vulkan::translate::pixel::sampled_pixels(c0.format)
+                .ok()
+                .map(|(layout, _, _)| layout)
+                .filter(|layout| !layout.is_four_byte_color())
+        });
+    let readback = crate::backend::vulkan::engine::read_target_keeping(identity, want_native_layout)
         .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?;
     // Two ways to land a frame, and which one is decided by what the readback
     // actually holds rather than by what this rail wishes it held.
@@ -2887,9 +2894,9 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // the GPU-direct arm has always asked. That is what lets a destination with
     // no eight-bit form take the copying rail at all, so a host without the
     // guest-RAM import serves it instead of losing every frame of it.
-    let extent = match readback.texel.native_layout() {
-        Some(layout) => {
-            if crate::protocol::pixel_format::store_texel_order(c0.format) != Some(layout) {
+    let extent = match readback {
+        crate::backend::vulkan::engine::TargetRead::Native(pixels, layout) => {
+            if want_native_layout != Some(layout) {
                 return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
             }
             crate::runtime::drain::note_store_route("gva_flush_copied_native");
@@ -2899,25 +2906,47 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
                 task_id,
                 c0,
                 texture_ref,
-                crate::runtime::draw::FrameRows::Native(&readback.pixels),
+                crate::runtime::draw::FrameRows::Native(&pixels),
                 pages,
                 skip,
             )?
         }
-        None => {
-            let Some(rgba) = readback.into_rgba8() else {
-                return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
-            };
-            land_gva_frame_bytes(
-                state,
-                host,
-                task_id,
-                c0,
-                texture_ref,
-                crate::runtime::draw::FrameRows::Rgba8(&rgba),
-                pages,
-                skip,
-            )?
+        crate::backend::vulkan::engine::TargetRead::Narrowed(rb) => {
+            match rb.texel.native_layout() {
+                Some(layout) => {
+                    if want_native_layout != Some(layout) {
+                        return Err(GvaWritebackDecline::FormatNeedsConversion {
+                            format: c0.format,
+                        });
+                    }
+                    crate::runtime::drain::note_store_route("gva_flush_copied_native");
+                    land_gva_frame_bytes(
+                        state,
+                        host,
+                        task_id,
+                        c0,
+                        texture_ref,
+                        crate::runtime::draw::FrameRows::Native(&rb.pixels),
+                        pages,
+                        skip,
+                    )?
+                }
+                None => {
+                    let Some(rgba) = rb.into_rgba8() else {
+                        return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
+                    };
+                    land_gva_frame_bytes(
+                        state,
+                        host,
+                        task_id,
+                        c0,
+                        texture_ref,
+                        crate::runtime::draw::FrameRows::Rgba8(&rgba),
+                        pages,
+                        skip,
+                    )?
+                }
+            }
         }
     };
     crate::backend::vulkan::engine::note_resident_content_copied_out(identity);

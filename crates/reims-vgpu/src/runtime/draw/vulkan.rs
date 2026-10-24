@@ -20,7 +20,28 @@ use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 use crate::runtime::surface_currency::{surface_currency, CurrencyStandard, SurfaceCurrency};
 
+fn texture_presence_words(
+    variant: &crate::runtime::m2v_cache::ShaderVariant,
+    textures: &[TextureBind],
+    stage: &'static str,
+) -> Result<std::sync::Arc<Vec<u32>>, DrawError> {
+    variant
+        .words_with_texture_presence(|index| {
+            textures
+                .iter()
+                .any(|texture| texture.index == index && texture.texture_ref != 0)
+        })
+        .map_err(|feature| {
+            DrawError::DrawPreparation(DrawPreparationDecline::ReflectedInterfaceUnsupported {
+                stage,
+                feature,
+                count: 1,
+            })
+        })
+}
+
 mod sample_plan;
+mod secondary_store;
 #[allow(unused_imports)]
 pub(crate) use sample_plan::{plan_sampled_source, SampleBail, SampleInvalid, SamplePlan};
 mod prefetch;
@@ -1750,6 +1771,7 @@ fn lab_cover_tex(
             format!("bytes(len={})", b.len())
         }
         crate::backend::vulkan::engine::SampledSource::Target(t) => format!("target({t:?})"),
+        crate::backend::vulkan::engine::SampledSource::MipmappedBytes(levels) => format!("mip_bytes(levels={})", levels.len()),
         crate::backend::vulkan::engine::SampledSource::GuestRuns(g, vouch, _) => format!(
             "guest_runs(runs={} len={} first_ptr={:?} vouch={vouch:?})",
             g.runs.len(),
@@ -5458,6 +5480,9 @@ enum MapperRefTextureSeedRung {
 /// A mapper-ref-texture attachment's prior contents, kept in the representation of the
 /// freshest rung that supplied them.
 pub(super) enum MapperRefTextureLoadSeed {
+    /// The GPU-owned surface already contains this pass's prior contents.
+    /// This is a LOAD, never an absent seed that may become a clear.
+    Resident,
     /// Host-owned bytes from the render cache, or the universal converted
     /// fallback when the native guest-page view cannot be described.
     Host(
@@ -5984,7 +6009,8 @@ fn try_ref_texture_view_from_resident<M: HostMemory + HostOps>(
         lab_rtv_note_refusal("lab_rtv_gpu_plane", m, &view);
         return None;
     }
-    let base_copy = lab_rtv_copy_format(m.format);
+    let base_format = mapping_write::mapping_store_format(m);
+    let base_copy = lab_rtv_copy_format(base_format);
     let view_copy = lab_rtv_copy_format(view.pixel_format);
     let same_size = matches!((base_copy, view_copy), (Some((_, a, _)), Some((_, b, _))) if a == b);
     if !m.has_geom || !same_size {
@@ -6002,7 +6028,7 @@ fn try_ref_texture_view_from_resident<M: HostMemory + HostOps>(
         view.height,
         view.pixel_format,
     );
-    let base_window = mapping_write::ref_texture_sample_window(m, 0, m.width, m.height, m.format);
+    let base_window = mapping_write::ref_texture_sample_window(m, 0, m.width, m.height, base_format);
     match (view_window, base_window) {
         (Some((voff, vbpr, _)), Some((boff, bbpr, _))) if voff == boff && vbpr == bbpr => {}
         _ => {
@@ -6013,7 +6039,7 @@ fn try_ref_texture_view_from_resident<M: HostMemory + HostOps>(
     let Some((format, _, components)) = view_copy else {
         return refuse("lab_rtv_gpu_untranslated");
     };
-    let base_formats = translate::pixel::translate(m.format)
+    let base_formats = translate::pixel::translate(base_format)
         .map(|p| [p.vk, p.linear_vk])
         .ok();
     let Ok(top) = sample_plan::surface_top(state, host, mid, true, |identity| {
@@ -6045,7 +6071,26 @@ fn try_ref_texture_view_from_resident<M: HostMemory + HostOps>(
             }
             note_store_route("lab_rtv_gpu_served");
             note_store_route_n_px("lab_rtv_gpu_served_px", view.width, view.height);
-            Some(SampledSourceRequest::TargetRegion(top.resident_id, format, components))
+            let mut region_components = components;
+            let host_is_bgra = matches!(
+                held,
+                ash::vk::Format::B8G8R8A8_UNORM | ash::vk::Format::B8G8R8A8_SRGB
+            );
+            let host_is_rgba = matches!(
+                held,
+                ash::vk::Format::R8G8B8A8_UNORM | ash::vk::Format::R8G8B8A8_SRGB
+            );
+            let guest_order = pixel_format::store_texel_order(view.pixel_format);
+            if (host_is_bgra && guest_order == Some(pixel_format::TexelLayout::Rgba8))
+                || (host_is_rgba && guest_order == Some(pixel_format::TexelLayout::Bgra8))
+            {
+                region_components = pixel_format::swizzle_swap_rb().after(&region_components);
+            }
+            Some(SampledSourceRequest::TargetRegion(
+                top.resident_id,
+                format,
+                region_components,
+            ))
         }
         outcome => {
             // TEMP (lab): which of the two "not current" answers the mask gets
@@ -10195,6 +10240,7 @@ fn native_uploads_asking_host() -> NativeUploads {
         // filter by mandate. So this one is genuinely a per-host answer and the
         // conjunction above would hide it.
         float32: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba32Float),
+        unorm16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Unorm),
         ..NativeUploads::BGRA8
     }
 }
@@ -11688,14 +11734,11 @@ fn secondary_gva_identity(
         width: c.width,
         height: c.height,
         generation,
-        // The format this attachment's image is actually created with,
-        // not a re-derivation of it. `registry_ensure_attachment` takes
-        // `format` — resolved by the caller's `color_attachment` — so
-        // answering the key from anything else lets the identity claim
-        // one format while the image holds another. It did: a
-        // `R16G16_SFLOAT` secondary is admitted by `color_attachment`
-        // and got an identity saying eight-bit RGBA.
-        format,
+        // Name the stored allocation, as the primary, Store ledger and later
+        // readers do. The attachment retains its own declared view separately:
+        // SRGB and UNORM views must not mint different resource identities.
+        // Native widths and channel order still come from this attachment.
+        format: translate::pixel::ResidentFormat::of(format).allocation(),
     }
 }
 
@@ -11881,6 +11924,7 @@ pub(super) fn build_secondary_targets_worker<M: HostMemory + HostOps>(
                 .iter()
                 .find(|(slot, _)| *slot == c.slot)
                 .and_then(|(_, identity)| identity.clone())
+                .map(|identity| (identity, None))
         },
     ))
 }
@@ -11892,8 +11936,7 @@ pub(super) fn build_secondary_targets_worker<M: HostMemory + HostOps>(
 pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    task_id: u32,
-    colors: &[ColorRtRequest],
+    req: &DrawEncodeRequest,
     pipeline: &crate::runtime::decode::resource::RenderPipelineDescriptor,
     primary: &crate::backend::vulkan::engine::TargetIdentity,
     fb_w: u32,
@@ -11902,8 +11945,10 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
 > {
-    build_secondary_targets_with(colors, pipeline, primary, fb_w, fb_h, |c, format| {
-        secondary_attachment_identity(state, host, task_id, c, format)
+    build_secondary_targets_with(&req.colors, pipeline, primary, fb_w, fb_h, |c, format| {
+        let identity = secondary_attachment_identity(state, host, req.task_id, c, format)?;
+        let seed = secondary_store::load_seed(state, host, req, c, &identity, format);
+        Some((identity, seed))
     })
 }
 
@@ -11925,7 +11970,10 @@ fn build_secondary_targets_with(
     mut resolve_identity: impl FnMut(
         &ColorRtRequest,
         ash::vk::Format,
-    ) -> Option<crate::backend::vulkan::engine::TargetIdentity>,
+    ) -> Option<(
+        crate::backend::vulkan::engine::TargetIdentity,
+        Option<crate::backend::vulkan::engine::GuestTargetSeed>,
+    )>,
 ) -> Result<
     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
@@ -11988,7 +12036,7 @@ fn build_secondary_targets_with(
             }
         };
         let format = attachment.vk;
-        let Some(identity) = resolve_identity(c, format) else {
+        let Some((identity, guest_seed)) = resolve_identity(c, format) else {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::NoIdentity,
                 c.width,
@@ -12032,22 +12080,10 @@ fn build_secondary_targets_with(
         // meaning — see
         // [`reims_vgpu_protocol::pass_action::LoadAction::preserves_prior_contents`].
         //
-        // It has no seed door of its own: this key bit is the whole decision.
-        // So what stands in for "were the prior contents resolved" is the
-        // registry's own record of whether the resident holds this identity's
-        // pixels, and that record is load-bearing rather than cautious — the
-        // target pool recycles an image across surfaces and inserts the
-        // recycled slot `content_ready=false` precisely because its bytes
-        // belong to the previous tenant. A LOAD taken without it composites
-        // this pass onto another surface's picture.
-        //
-        // The two preserving actions differ only in where they land when the
-        // registry cannot answer, and they differ because the contract's
-        // strictness differs. A Load *requires* the prior contents, so it still
-        // loads and `load_seed_lost` is what names the shortfall. A DontCare
-        // merely *permits* them, so with nothing to preserve it falls back to
-        // the clear — which is legal for it, and is the arm that cannot leak a
-        // previous tenant.
+        // A strict LOAD requires either the current resident or a native
+        // guest seed. The engine refuses an unready resident when no seed
+        // exists, so a recycled image cannot supply another surface's texels.
+        // DontCare permits retaining ready content or clearing a cold image.
         let declared = reims_vgpu_protocol::pass_action::LoadAction::from_declared(c.load_action);
         let load = match declared {
             reims_vgpu_protocol::pass_action::LoadAction::Clear => false,
@@ -12104,7 +12140,14 @@ fn build_secondary_targets_with(
             width: c.width,
             height: c.height,
             attachment,
-            load,
+            contents: if load {
+                guest_seed.map_or(
+                    crate::backend::vulkan::engine::SecondaryLoad::Resident,
+                    crate::backend::vulkan::engine::SecondaryLoad::Guest,
+                )
+            } else {
+                crate::backend::vulkan::engine::SecondaryLoad::Clear
+            },
             blend,
             color_write_mask,
         });
@@ -12647,7 +12690,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
     // `m2v_cache::ShaderVariant` — so nothing here re-walks a module per draw.
     // A vertex module never relocates, so it is always the base variant.
     let v_variant = v_shader.variant(false, false);
-    let v_words = v_variant.words.clone();
+    let v_words = texture_presence_words(&v_variant, &req.vertex_textures, "vertex")?;
     #[allow(unused_mut)]
     let mut f_variant = f_shader.variant(false, false);
 
@@ -13212,7 +13255,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         if separate_sampled || buf_collide {
             f_variant = f_shader.variant(separate_sampled, buf_collide);
         }
-        let f_words = f_variant.words.clone();
+        let f_words = texture_presence_words(&f_variant, &req.fragment_textures, "fragment")?;
 
         // Non-stage-in vertex buffers + fragment buffers as storage buffers.
         //
@@ -14505,6 +14548,41 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         array_element,
                         levels,
                     });
+                } else if image_shape == reims_vgpu_core::texture_shape::TextureKind::D2
+                    && !multisampled
+                    && !crate::runtime::spirv_bind::is_storage_texture_binding(img_bind)
+                {
+                    if let Some(tex) = texture_resource.as_deref().and_then(|resource| {
+                        match resource.decoded().as_ref().ok()? {
+                            crate::runtime::decode::resource::Descriptor::Texture(tex)
+                                if tex.mipmap_level_count > 1 => Some(tex),
+                            _ => None,
+                        }
+                    }) {
+                        let Some(state) = acc.exclusive() else {
+                            if let Some(log) = prep.as_deref_mut() {
+                                log.bail = Some(Bail::MissDetail);
+                            }
+                            return Err(WORKER_ERR);
+                        };
+                        let texture_view::LoadedMipChain { levels, format } =
+                            texture_view::load_linear_mip_chain(
+                                state, host, req.task_id, texture_ref, tex,
+                                native_uploads_asking_host(),
+                            ).map_err(|reason| DrawError::DrawPreparation(
+                                DrawPreparationDecline::SampledMipChain { texture_ref, reason },
+                            ))?;
+                        let image = images.last_mut()
+                            .expect("the current sampled binding was pushed");
+                        image.source =
+                            crate::backend::vulkan::engine::SampledSource::MipmappedBytes(levels);
+                        image.format = translate::pixel::vk_sampled_bytes(format);
+                        image.swizzle = view_swizzle.unwrap_or_default()
+                            .after(&translate::pixel::bytes_channel_plan(format));
+                        image.identity = None;
+                        image.byte_origin =
+                            crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture;
+                    }
                 }
                 lab_sampled_bind(
                     req,
@@ -15303,8 +15381,20 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                                 target_format,
                             )
                         }) {
+                            Some(MapperRefTextureLoadSeed::Resident) => {
+                                chain_load_from_target = true;
+                                seed_door = "mapping_resident";
+                            }
                             Some(MapperRefTextureLoadSeed::Host(bytes, order)) => {
-                                lab_seed_trace(acc.shared(), "mapping", "host", c0.mapping_id, w, h, declared);
+                                lab_seed_trace(
+                                    acc.shared(),
+                                    "mapping",
+                                    "host",
+                                    c0.mapping_id,
+                                    w,
+                                    h,
+                                    declared,
+                                );
                                 target_rgba8 = Some(bytes);
                                 seed_order = order;
                             }
@@ -15452,6 +15542,10 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                                 preserve_format,
                             )
                         }) {
+                            Some(MapperRefTextureLoadSeed::Resident) => {
+                                chain_load_from_target = true;
+                                seed_door = "mapping_resident";
+                            }
                             Some(MapperRefTextureLoadSeed::Host(bytes, order)) => {
                                 target_rgba8 = Some(bytes);
                                 seed_order = order;
@@ -15489,7 +15583,10 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         w,
                         h,
                         req.pipeline_ref,
-                        target_rgba8.is_some() || target_guest_seed.is_some() || zero_seed_cleared,
+                        chain_load_from_target
+                            || target_rgba8.is_some()
+                            || target_guest_seed.is_some()
+                            || zero_seed_cleared,
                         seed_door,
                     );
                     if target_rgba8.is_some() || target_guest_seed.is_some() {
@@ -15505,7 +15602,8 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                         // says how often the widening pays or what it costs.
                         // `note_load_seed_outcome`'s own counters cannot serve:
                         // they are the LOAD-only signal below.
-                        let served = target_rgba8.is_some()
+                        let served = chain_load_from_target
+                            || target_rgba8.is_some()
                             || target_guest_seed.is_some()
                             || zero_seed_cleared;
                         crate::runtime::drain::note_store_route(if served {
@@ -16456,7 +16554,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
             match f_shader.variant_ms(separate_sampled, buf_collide, true) {
                 Some(variant) => {
                     f_variant = variant;
-                    f_variant.words.clone()
+                    texture_presence_words(&f_variant, &req.fragment_textures, "fragment")?
                 }
                 None => {
                     return Err(DrawError::DrawPreparation(
@@ -16513,6 +16611,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 binding: image.binding,
                 kind: match &image.source {
                     crate::backend::vulkan::engine::SampledSource::Bytes(_) => 1,
+                    crate::backend::vulkan::engine::SampledSource::MipmappedBytes(_) => 1,
                     crate::backend::vulkan::engine::SampledSource::Target(_) => 2,
                     crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => 3,
                     // TEMP (lab, PASS_STAGE): the staged rail beside the
@@ -16678,8 +16777,7 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 Some(state) => build_secondary_targets(
                     state,
                     host,
-                    req.task_id,
-                    &req.colors,
+                    req,
                     pd,
                     &primary_id,
                     w,
@@ -16759,13 +16857,21 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
         // counts this record as the failed one; and this record's preparation
         // has already run, whose effects are observations, caches and debt
         // payment, correct on their own.)
-        let recorder_on = crate::backend::vulkan::engine::deferred_draws_enabled();
+        // MRT publication consumes the successful engine result for every
+        // attachment. The current deferred job carries only color0's Store.
+        // Keep these requests on the serial transaction until that job can
+        // carry the complete output set; other draws retain the recorder path.
+        let recorder_on = resources.secondary_targets.is_empty()
+            && crate::backend::vulkan::engine::deferred_draws_enabled();
         // TEMP (lab, DRAW_PAR): a worker ends here. The request is finished;
         // what remains — the previous deferred draw's failure, the submit — is
         // the drain's, at the commit, in record order. Only the deferrable
         // chain intermediate is prepared: everything else runs synchronously
         // on the drain and reads the engine's answer.
         if acc.is_worker() {
+            if !resources.secondary_targets.is_empty() {
+                worker_bail!(Bail::MrtCold);
+            }
             // The gate alone: `deferred_draws_enabled` also asks for the
             // drain thread, and the commit that submits this record runs there.
             if !crate::backend::vulkan::engine::recorder::enabled() {
@@ -16961,7 +17067,19 @@ pub(super) fn try_metal2vulkan_draw_with<M: HostMemory + HostOps>(
                 }
             }
         }
+        let secondary_stores = secondary_store::prepare(
+            acc.shared(),
+            host,
+            &req.colors,
+            &resources.secondary_targets,
+            req.task_id,
+        );
         let out = crate::backend::vulkan::engine::execute_draw_request(acc.shared(), &resources)?;
+        if !secondary_stores.is_empty() {
+            if let Some(state) = acc.exclusive() {
+                secondary_store::publish(state, host, req.task_id, &secondary_stores)?;
+            }
+        }
         // Carried back on the request so `runtime::exec` can sum the chain's
         // draws into the guest's buffer. The engine reports per draw because a
         // Metal pass whose counter spans several draws is several Vulkan
@@ -17204,17 +17322,34 @@ fn depth_state_for(
     //
     // So a declared stencil attachment with no bound test gets a test that does
     // nothing, over an attachment that is still cleared and still stored.
-    let stencil = test.as_ref().and_then(|t| t.stencil).or_else(|| {
-        req.stencil_attach
-            .as_ref()
-            .map(|s| crate::backend::vulkan::engine::StencilState {
+    let bound_stencil = test.as_ref().and_then(|t| t.stencil);
+    let stencil = if let Some(s) = req.stencil_attach.as_ref().filter(|s| s.texture_ref != 0) {
+        Some(
+            bound_stencil.unwrap_or(crate::backend::vulkan::engine::StencilState {
                 front: STENCIL_PASS_THROUGH,
                 back: STENCIL_PASS_THROUGH,
                 reference_front: 0,
                 reference_back: 0,
                 clear_value: s.clear_stencil,
-            })
-    });
+            }),
+        )
+    } else {
+        // A bound comparison still tests Metal's implicit zero stencil when no
+        // texture is attached. Only an inert test may disappear here. Keeping
+        // an Always/Keep test would instead change a depth-only resident's
+        // aspect merely because the next draw bound a depth-stencil state,
+        // discarding the depth established by a prior clear/store.
+        bound_stencil.filter(|s| {
+            let inert = |f: crate::backend::vulkan::engine::StencilFaceOps| {
+                use crate::backend::vulkan::engine::StencilOp;
+                f.compare == SamplerCompareFunction::Always
+                    && f.fail_op == StencilOp::Keep
+                    && f.depth_fail_op == StencilOp::Keep
+                    && f.pass_op == StencilOp::Keep
+            };
+            !inert(s.front) || !inert(s.back)
+        })
+    };
     // TEMP (lab, Opus 2026-10-19, `REIMS_VGPU_LAB_STENCIL_TEST_OFF=1`): every stencil test passes (diagnostic only,
     // Chrome/Graphite path loss): a stencil-then-cover fill then paints its whole cover geometry, which says whether
     // the cover draws run and the stencil pass is what is empty.
@@ -17233,7 +17368,9 @@ fn depth_state_for(
     // TEMP (lab, `REIMS_VGPU_LAB_DEPTH_TEST_OFF=1`): no depth test, no depth
     // writes (diagnostic only: Metal ordering by depth is lost).
     static TEST_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let test = if *TEST_OFF.get_or_init(|| std::env::var("REIMS_VGPU_LAB_DEPTH_TEST_OFF").as_deref() == Ok("1")) {
+    let test = if *TEST_OFF
+        .get_or_init(|| std::env::var("REIMS_VGPU_LAB_DEPTH_TEST_OFF").as_deref() == Ok("1"))
+    {
         None
     } else {
         test
@@ -21770,6 +21907,48 @@ mod vulkan_split_tests {
         // decoder does not read; the refusal keeps that gap named.
         assert!(sampled_image_shape(SampledImageKind::CubeArray).is_none());
     }
+    #[test]
+    fn secondary_srgb_identity_names_the_same_allocation_as_its_store_and_reader() {
+        use crate::backend::vulkan::translate::pixel;
+        use crate::protocol::pixel_format as pf;
+
+        for format in [
+            pf::MTL_FORMAT_RGBA8_UNORM,
+            pf::MTL_FORMAT_RGBA8_UNORM_SRGB,
+            pf::MTL_FORMAT_BGRA8_UNORM,
+            pf::MTL_FORMAT_BGRA8_UNORM_SRGB,
+            pf::MTL_FORMAT_RG16_FLOAT,
+            pf::MTL_FORMAT_RGBA16_FLOAT,
+        ] {
+            let color = ColorRtRequest {
+                slot: 1,
+                texture_ref: 7,
+                target_gva: 0x1000,
+                row_stride: 64,
+                width: 8,
+                height: 8,
+                format,
+                ..Default::default()
+            };
+            let (attachment, _) = pixel::color_attachment(format).unwrap();
+            let secondary = secondary_gva_identity(&color, attachment.vk, 19);
+            let request = DrawEncodeRequest {
+                colors: vec![color],
+                gva_alloc_gen: 19,
+                ..Default::default()
+            };
+            assert_eq!(
+                secondary,
+                gva_chain_identity(&request).unwrap(),
+                "all producers must name the same stored allocation for format {format:#x}"
+            );
+            assert_eq!(
+                secondary.resident_format(),
+                pixel::ResidentFormat::of(attachment.vk).allocation()
+            );
+        }
+    }
+
     /// An MRT secondary attachment is named by ITS OWN guest pages.
     ///
     /// `74748d2` gave color0 a page-set generation and deliberately left the
@@ -21831,9 +22010,14 @@ mod vulkan_split_tests {
             format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
         };
 
+        let request = DrawEncodeRequest {
+            task_id: 1,
+            colors,
+            ..Default::default()
+        };
         let mut gen_of = |host: &mut FakeHost| {
             let secs = super::build_secondary_targets(
-                &mut state, host, 1, &colors, &pipeline, &primary, 8, 8,
+                &mut state, host, &request, &pipeline, &primary, 8, 8,
             )
             .expect("slot 1 is a resolvable secondary");
             assert_eq!(secs.len(), 1, "slot 1 is a resolvable secondary");

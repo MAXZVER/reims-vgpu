@@ -737,6 +737,52 @@ pub struct DrawRequest {
 }
 
 impl DrawRequest {
+    /// A self-sample of a guest-seeded secondary reads the same native source
+    /// used to initialize the attachment. Its registry image is not ready yet,
+    /// and snapshotting that image before the seed copy would read old texels.
+    pub(super) fn secondary_guest_seed_for_sample(
+        &self,
+        resource: &SampledImageResource,
+    ) -> Option<&GuestTargetSeed> {
+        if resource.multisampled
+            || resource.layers != 1
+            || resource.kind != reims_vgpu_core::texture_shape::TextureKind::D2
+        {
+            return None;
+        }
+        let SampledSource::Target(identity) = &resource.source else {
+            return None;
+        };
+        self.secondary_targets.iter().find_map(|secondary| {
+            let seed = secondary.contents.guest_seed()?;
+            (secondary.identity == *identity
+                && secondary.width == resource.width
+                && secondary.height == resource.height
+                && super::super::translate::pixel::stored_bytes_agree(seed.format, resource.format))
+            .then_some(seed)
+        })
+    }
+
+    /// The primary view's format, whether its image is persistent or pooled.
+    /// Validation and recording must ask the same question: an absent resident
+    /// identity does not turn a declared native attachment into RGBA8.
+    pub(super) fn primary_color_format(&self) -> vk::Format {
+        self.color_attachment
+            .map(|attachment| attachment.format())
+            .unwrap_or_else(|| {
+                self.target_identity
+                    .as_ref()
+                    .map(|identity| identity.resident_format())
+                    .unwrap_or_else(|| {
+                        if self.depth.is_some() && self.secondary_targets.is_empty() {
+                            vk::Format::UNDEFINED
+                        } else {
+                            crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT
+                        }
+                    })
+            })
+    }
+
     /// Whether this draw binds `identity` as one of its own attachments.
     ///
     /// Sampling an attachment the same draw renders into is an attachment
@@ -909,6 +955,27 @@ pub const COLOR_INPUT_BINDING: u32 = 192;
 /// One MRT color attachment beyond the primary (slot 0). Persisted as its own
 /// registry resident so a later draw can sample it.
 #[derive(Debug, Clone)]
+pub enum SecondaryLoad {
+    Clear,
+    Resident,
+    Guest(GuestTargetSeed),
+}
+
+impl SecondaryLoad {
+    pub fn preserves_contents(&self) -> bool {
+        !matches!(self, Self::Clear)
+    }
+
+    pub fn guest_seed(&self) -> Option<&GuestTargetSeed> {
+        match self {
+            Self::Guest(seed) => Some(seed),
+            Self::Clear | Self::Resident => None,
+        }
+    }
+}
+
+/// A secondary attachment and the source of its initial contents.
+#[derive(Debug, Clone)]
 pub struct SecondaryColorTarget {
     /// Residency identity — the key a later draw uses to bind this attachment
     /// as a sampled `SampledSource::Target`.
@@ -920,9 +987,9 @@ pub struct SecondaryColorTarget {
     /// pair opaque makes the render pass, image and Vulkan clear union member
     /// agree by construction.
     pub attachment: ColorAttachmentState,
-    /// true ⇒ LOAD the existing resident content; false ⇒ CLEAR to this
-    /// attachment's paired clear value.
-    pub load: bool,
+    /// A preserving pass either loads the resident or initializes it from
+    /// validated native guest texels before LOAD. Clear carries no seed.
+    pub contents: SecondaryLoad,
     /// This slot's own blend state, from the pipeline's per-attachment blend
     /// descriptor. `None` ⇒ the slot writes unblended.
     ///
@@ -2354,6 +2421,10 @@ pub enum SeedOrder {
 pub enum SampledSource {
     /// CPU origin (bytes re-staged each draw unless warm-path caches geometry only).
     Bytes(std::sync::Arc<Vec<u8>>),
+    /// A complete 2D mip chain, with each level's native tight texels retained
+    /// separately. Upload placement and view level count derive from this list;
+    /// a one-level byte source cannot silently stand for a whole chain.
+    MipmappedBytes(Vec<std::sync::Arc<Vec<u8>>>),
     /// Bind a prior GPU-resident target directly (no CPU round-trip).
     Target(TargetIdentity),
     /// Guest-memory origin. A resource-owned packed allocation binds as a
@@ -2549,8 +2620,8 @@ impl GuestRunSource {
 /// `source` carries both representations of the same window: bounded RAMBlock
 /// references for the native import rail and stable host aliases for its exact
 /// CPU fallback. `format` is the guest plane's physical texel layout; a raw
-/// buffer→image copy performs no conversion, so validation requires it to equal
-/// the attachment format before either representation may be used.
+/// buffer→image copy performs no conversion, so validation requires the same
+/// stored bytes as the attachment view before either representation may be used.
 #[derive(Clone, Debug)]
 pub struct GuestTargetSeed {
     pub source: GuestRunSource,
@@ -2654,7 +2725,7 @@ mod tests {
                 vk::Format::B8G8R8A8_UNORM,
                 ColorClearValue::default(),
             ),
-            load: false,
+            contents: SecondaryLoad::Clear,
             blend: None,
             color_write_mask: ColorWriteMask::default(),
         });

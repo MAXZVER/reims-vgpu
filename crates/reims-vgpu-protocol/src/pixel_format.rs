@@ -270,10 +270,7 @@ pub const fn is_block_compressed(format: u16) -> bool {
 pub const fn is_video_chroma_format(format: u16) -> bool {
     matches!(
         format,
-        MTL_FORMAT_RG8_UNORM
-            | MTL_FORMAT_RG16_UNORM
-            | MTL_FORMAT_RG8_UINT
-            | MTL_FORMAT_RG16_UINT
+        MTL_FORMAT_RG8_UNORM | MTL_FORMAT_RG16_UNORM | MTL_FORMAT_RG8_UINT | MTL_FORMAT_RG16_UINT
     )
 }
 
@@ -450,6 +447,9 @@ pub enum SampledClass {
     /// times in one boot (b486). Native on the sampled side too, like
     /// [`Self::Rg16Float`]: the eight-bit round trip would clamp signed values.
     R16Float,
+    /// Native normalized texels; declared for exact render LOAD/Store copies.
+    R16Unorm,
+    Rgba16Unorm,
 }
 
 /// The byte layout of one guest texel on the sampled rails, independent of any
@@ -843,6 +843,8 @@ impl TexelLayout {
                 | Self::Bgr10a2Unorm
                 | Self::Rg16Uint
                 | Self::Rgba32Float
+                | Self::R16Unorm
+                | Self::Rgba16Unorm
         )
     }
 
@@ -1857,6 +1859,8 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
         MTL_FORMAT_RG16_UINT => SampledClass::Rg16Uint,
         MTL_FORMAT_RGBA32_FLOAT => SampledClass::Rgba32Float,
         MTL_FORMAT_R16_FLOAT => SampledClass::R16Float,
+        MTL_FORMAT_R16_UNORM => SampledClass::R16Unorm,
+        MTL_FORMAT_RGBA16_UNORM => SampledClass::Rgba16Unorm,
         _ => return None,
     })
 }
@@ -2091,6 +2095,8 @@ pub fn render_target_numeric_type(format: u16) -> Option<ColorNumericType> {
         | MTL_FORMAT_RGBA16_FLOAT
         | MTL_FORMAT_RG16_FLOAT
         | MTL_FORMAT_R16_FLOAT
+        | MTL_FORMAT_R16_UNORM
+        | MTL_FORMAT_RGBA16_UNORM
         | MTL_FORMAT_R8_UNORM
         | MTL_FORMAT_RGB10A2_UNORM
         | MTL_FORMAT_BGR10A2_UNORM
@@ -2192,6 +2198,8 @@ pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
         // had no seed at all (`load_seed_lost fmt=0x19`). The resident is created
         // at `R16_SFLOAT`, so the copy is byte for byte.
         MTL_FORMAT_R16_FLOAT => TexelLayout::R16Float,
+        MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
+        MTL_FORMAT_RGBA16_UNORM => TexelLayout::Rgba16Unorm,
         _ => return None,
     })
 }
@@ -2225,6 +2233,17 @@ pub fn swizzle_identity() -> SwizzlePlan {
             SwizzleSource::R,
             SwizzleSource::G,
             SwizzleSource::B,
+            SwizzleSource::A,
+        ],
+    }
+}
+
+pub fn swizzle_swap_rb() -> SwizzlePlan {
+    SwizzlePlan {
+        source: [
+            SwizzleSource::B,
+            SwizzleSource::G,
+            SwizzleSource::R,
             SwizzleSource::A,
         ],
     }
@@ -2320,10 +2339,10 @@ pub fn solid_rgba8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
 
 /// How a CPU-published clear image carries its pixels.
 ///
-/// Continuous-colour attachments keep the existing semantic RGBA8 carrier and
-/// are converted by the destination writer. Integer attachments have no such
-/// carrier: their component values are counts rather than fractions, so their
-/// image is already encoded as the destination's native texels.
+/// Floating-point and integer attachments carry native texels. RGBA8 cannot
+/// represent signed or HDR floats, nor integer component counts. Normalized
+/// colour retains the semantic RGBA8 carrier consumed by its destination writer,
+/// except sRGB clears, which carry native, already encoded RGB bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClearImageEncoding {
     Rgba8,
@@ -2371,32 +2390,58 @@ pub fn solid_clear_image(
 ) -> Option<ClearImage> {
     let numeric = render_target_numeric_type(format)?;
     match numeric.clear_components(*clear) {
-        ClearComponents::Float(components) => match format {
-            // A float target whose texel is four f32 words cannot carry the
-            // clear through the eight-bit carrier at all: every handoff to
-            // `Rgba8ToRow` refused (`for_format` has no arm), so a clear-only
-            // pass on the Chromium HDR intermediate 0x7d lost its whole result
-            // behind a generic writer refusal. The clear's own texel is exact
-            // and the native writers already publish it (the rail `RG16_UINT`
-            // built).
-            MTL_FORMAT_RGBA32_FLOAT => {
-                let mut texel = [0u8; RGBA32F_BPP as usize];
-                for (dst, &value) in texel.chunks_exact_mut(4).zip(components.iter()) {
-                    dst.copy_from_slice(&value.to_ne_bytes());
+        ClearComponents::Float(components) => {
+            // Render-produced normalized16 contents must never pass through
+            // an RGBA8 clear: that would quantize them before the first draw.
+            let normalized_lanes = match store_texel_order(format) {
+                Some(TexelLayout::R16Unorm) => 1,
+                Some(TexelLayout::Rgba16Unorm) => 4,
+                _ => 0,
+            };
+            if normalized_lanes != 0 {
+                let mut texel = [0; 8];
+                for (lane, value) in clear.iter().take(normalized_lanes).enumerate() {
+                    let value = (value.clamp(0.0, 1.0) * f64::from(u16::MAX)).round() as u16;
+                    texel[lane * 2..(lane + 1) * 2].copy_from_slice(&value.to_le_bytes());
                 }
-                solid_native_clear_image(format, width, height, &texel)
+                return solid_native_clear_image(
+                    format,
+                    width,
+                    height,
+                    &texel[..normalized_lanes * 2],
+                );
             }
-            _ => {
-                let row_bytes = width.checked_mul(RGBA8_BPP)?;
-                let pixels = solid_rgba8(width, height, clear);
-                let need = (row_bytes as usize).checked_mul(height as usize)?;
-                (pixels.len() == need).then_some(ClearImage {
-                    encoding: ClearImageEncoding::Rgba8,
-                    pixels,
-                    row_bytes,
-                })
+            let half_lanes = match store_texel_order(format) {
+                Some(TexelLayout::R16Float) => 1,
+                Some(TexelLayout::Rg16Float) => 2,
+                Some(TexelLayout::Rgba16Float) => 4,
+                Some(TexelLayout::Rgba32Float) => {
+                    let mut texel = [0; RGBA32_BPP as usize];
+                    for (lane, value) in components.iter().enumerate() {
+                        texel[lane * 4..(lane + 1) * 4].copy_from_slice(&value.to_le_bytes());
+                    }
+                    return solid_native_clear_image(format, width, height, &texel);
+                }
+                _ => 0,
+            };
+            if half_lanes != 0 {
+                let mut texel = [0; RGBA16F_BPP as usize];
+                let bytes = &mut texel[..half_lanes * 2];
+                for (lane, value) in components.iter().take(half_lanes).enumerate() {
+                    bytes[lane * 2..(lane + 1) * 2]
+                        .copy_from_slice(&f32_to_f16(*value).to_le_bytes());
+                }
+                return solid_native_clear_image(format, width, height, bytes);
             }
-        },
+            let row_bytes = width.checked_mul(RGBA8_BPP)?;
+            let pixels = solid_rgba8(width, height, clear);
+            let need = (row_bytes as usize).checked_mul(height as usize)?;
+            (pixels.len() == need).then_some(ClearImage {
+                encoding: ClearImageEncoding::Rgba8,
+                pixels,
+                row_bytes,
+            })
+        }
         ClearComponents::Uint(components) => match format {
             MTL_FORMAT_RG16_UINT => {
                 let mut bytes = [0u8; RG16_BPP as usize];
@@ -2521,6 +2566,45 @@ pub const fn f16_to_f32(half_bits: u16) -> f32 {
         sign | (f32_exp << F32_EXP_SHIFT) | (mant << F16_F32_MANT_SHIFT)
     };
     f32::from_bits(bits)
+}
+
+/// Encode binary16, rounding to nearest with ties to even. Preserve signed zero,
+/// infinities, and the high NaN payload bits; a narrowed NaN must remain a NaN.
+pub const fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let fraction = bits & 0x7f_ffff;
+    if exponent == 255 {
+        if fraction == 0 {
+            return sign | 0x7c00;
+        }
+        let payload = (fraction >> 13) as u16;
+        return sign | 0x7c00 | payload | (payload == 0) as u16;
+    }
+    let half_exponent = exponent - 127 + 15;
+    if half_exponent >= 31 {
+        return sign | 0x7c00;
+    }
+    if half_exponent <= 0 {
+        if half_exponent < -10 {
+            return sign;
+        }
+        return sign | half_round_shift(fraction | 0x80_0000, (14 - half_exponent) as u32) as u16;
+    }
+    let encoded = ((half_exponent as u32) << 10) + half_round_shift(fraction, 13);
+    sign | if encoded > 0x7c00 {
+        0x7c00
+    } else {
+        encoded as u16
+    }
+}
+
+const fn half_round_shift(value: u32, shift: u32) -> u32 {
+    let truncated = value >> shift;
+    let remainder = value & ((1 << shift) - 1);
+    let halfway = 1 << (shift - 1);
+    truncated + (remainder > halfway || (remainder == halfway && truncated & 1 != 0)) as u32
 }
 
 /// Every half-float's unorm8, built once by the compiler.
@@ -3988,7 +4072,7 @@ mod tests {
         }
         // A guard on the walk itself: an admission set that silently emptied
         // would satisfy every assertion above.
-        assert_eq!(admitted, 12, "the admitted colour render target formats");
+        assert_eq!(admitted, 14, "the admitted colour render target formats");
     }
 
     /// An integer texel has no semantic eight-bit solid colour.
@@ -4038,7 +4122,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("render target {format:#x} cannot publish its clear"));
             assert_eq!(image.pixels().len(), image.row_bytes() as usize * 2);
         }
-        assert_eq!(admitted, 12, "the admitted colour render target formats");
+        assert_eq!(admitted, 14, "the admitted colour render target formats");
 
         let integer = solid_clear_image(MTL_FORMAT_RG16_UINT, 2, 2, &clear)
             .expect("RG16Uint is an admitted render target");
@@ -4060,6 +4144,77 @@ mod tests {
             [0u16.to_le_bytes(), 1u16.to_le_bytes()].concat(),
             "the CPU rail must narrow the same uint32 carrier as the GPU clear"
         );
+    }
+
+    #[test]
+    fn floating_clear_images_preserve_signed_and_non_unorm_values() {
+        let clear = [-0.5, 0.5, 1.0009765625, -0.0];
+        let halves = [0xb800u16, 0x3800, 0x3c01, 0x8000];
+        for (format, lanes) in [
+            (MTL_FORMAT_R16_FLOAT, 1),
+            (MTL_FORMAT_RG16_FLOAT, 2),
+            (MTL_FORMAT_RGBA16_FLOAT, 4),
+        ] {
+            let image = solid_clear_image(format, 3, 2, &clear).expect("float clear");
+            assert_eq!(image.encoding(), ClearImageEncoding::Native);
+            let texel: Vec<_> = halves[..lanes]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            assert_eq!(image.pixels(), texel.repeat(6));
+            assert_eq!(image.row_bytes() as usize, texel.len() * 3);
+        }
+        let image =
+            solid_clear_image(MTL_FORMAT_RGBA32_FLOAT, 3, 2, &clear).expect("float32 clear");
+        let texel: Vec<_> = clear
+            .iter()
+            .flat_map(|&v| (v as f32).to_le_bytes())
+            .collect();
+        assert_eq!(image.encoding(), ClearImageEncoding::Native);
+        assert_eq!(image.pixels(), texel.repeat(6));
+    }
+
+    #[test]
+    fn normalized16_render_clear_preserves_native_precision_and_channel_count() {
+        let clear = [1.0 / 65535.0, 32769.0 / 65535.0, 0.75, 1.0];
+        let expected = [1_u16, 32769, 49151, 65535];
+        for (format, layout, lanes) in [
+            (MTL_FORMAT_R16_UNORM, TexelLayout::R16Unorm, 1),
+            (MTL_FORMAT_RGBA16_UNORM, TexelLayout::Rgba16Unorm, 4),
+        ] {
+            assert_eq!(
+                render_target_numeric_type(format),
+                Some(ColorNumericType::Float)
+            );
+            assert!(layout.is_render_target_layout());
+            assert_eq!(store_texel_order(format), Some(layout));
+            let image = solid_clear_image(format, 3, 2, &clear).expect("native normalized clear");
+            assert_eq!(image.encoding, ClearImageEncoding::Native);
+            assert_eq!(image.row_bytes, 3 * lanes * 2);
+            let texel: Vec<u8> = expected[..lanes as usize]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            assert_eq!(image.pixels, texel.repeat(6));
+            let clamped = solid_clear_image(format, 1, 1, &[-0.5, 2.0, f64::NAN, 1.0]).unwrap();
+            let clamped_texel: Vec<u8> = [0_u16, 65535, 0, 65535][..lanes as usize]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            assert_eq!(clamped.pixels, clamped_texel);
+        }
+    }
+
+    #[test]
+    fn half_encoding_preserves_representable_values_and_rounds_ties_even() {
+        for bits in 0..=u16::MAX {
+            assert_eq!(f32_to_f16(f16_to_f32(bits)), bits, "half {bits:#06x}");
+        }
+        assert_eq!(f32_to_f16(f32::from_bits(0x3f80_1000)), 0x3c00);
+        assert_eq!(f32_to_f16(f32::from_bits(0x3f80_1001)), 0x3c01);
+        assert_eq!(f32_to_f16(f32::from_bits(0x3f80_3000)), 0x3c02);
+        assert_eq!(f32_to_f16(f32::from_bits(0x7f80_0001)), 0x7c01);
+        assert_eq!(f32_to_f16(f32::from_bits(0xff80_0001)), 0xfc01);
     }
 
     /// The byte copy must carry the integer target, because nothing else can.
@@ -4174,6 +4329,8 @@ mod tests {
                 SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
                 SampledClass::Rgba32Float => TexelLayout::Rgba32Float,
                 SampledClass::R16Float => TexelLayout::R16Float,
+                SampledClass::R16Unorm => TexelLayout::R16Unorm,
+                SampledClass::Rgba16Unorm => TexelLayout::Rgba16Unorm,
             });
             let layout = store_texel_order(format)
                 .or(from_class)
@@ -5023,6 +5180,9 @@ mod tests {
                     TexelLayout::Rg16Uint => SampledClass::Rg16Uint,
                     TexelLayout::Rgba32Float => SampledClass::Rgba32Float,
                     TexelLayout::R16Float => SampledClass::R16Float,
+                    TexelLayout::R16Unorm => SampledClass::R16Unorm,
+                    TexelLayout::Rgba16Unorm => SampledClass::Rgba16Unorm,
+                    TexelLayout::R8 => SampledClass::R8Unorm,
                     // Named rather than defaulted. This arm used to be
                     // `_ => SampledClass::Bgra8Unorm`, which was true only while
                     // the admitted set was {Rgba8, Bgra8, Rgba16Float}: the next

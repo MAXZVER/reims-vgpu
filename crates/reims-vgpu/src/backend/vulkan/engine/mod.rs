@@ -47,6 +47,7 @@ pub(crate) mod recorder;
 /// leases the guest's own delete releases.
 pub mod resource_lease;
 mod scatter_shader;
+mod sampled_mips;
 #[cfg(feature = "host-window")]
 mod present_sharp_shader;
 #[cfg(feature = "host-window")]
@@ -107,6 +108,7 @@ pub(crate) use draw_preparation::DrawPreparationDecline;
 // oversight nobody looked at.
 #[cfg_attr(not(feature = "host-window"), expect(unused_imports))]
 pub(crate) use facade_decline::EngineFacadeDecline;
+pub(crate) use draw_execution::DrawExecutionDecline;
 pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
@@ -119,7 +121,7 @@ pub use types::{
     GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PipelineObjectIdentity,
     PrimitiveTopology, SampledByteOrigin, SampledContentIdentity, SampledImageResource,
     SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
-    SeedOrder, StagedSampled, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
+    SecondaryLoad, SeedOrder, StagedSampled, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
     StorageImageFormat, TargetIdentity, TargetKeyDivergence, VertexAttributeFormat,
     VertexAttributeResource, VertexStepFunction, ViewportResource, VisibilityResultMode,
     WindowPresentSource, COLOR_INPUT_BINDING,
@@ -889,6 +891,19 @@ mod device_capability_snapshot_tests {
             crate::backend::vulkan::caps::DriverQuirk::default(),
         );
         assert!(!unsupported.render_target_layout_supported(TexelLayout::Rg16Uint));
+    }
+
+    #[test]
+    fn normalized16_render_capabilities_do_not_widen_the_host_answer() {
+        for layout in [TexelLayout::R16Unorm, TexelLayout::Rgba16Unorm] {
+            let mut features =
+                crate::backend::vulkan::caps::device_features::DeviceFeatures::default();
+            let unsupported = DeviceCapabilitySnapshot::from_parts(&features, Default::default());
+            assert!(!unsupported.render_target_layout_supported(layout));
+            features.color_attachment[layout.index()] = true;
+            let supported = DeviceCapabilitySnapshot::from_parts(&features, Default::default());
+            assert!(supported.render_target_layout_supported(layout));
+        }
     }
 }
 
@@ -2883,6 +2898,12 @@ struct WindowSnapshotImage {
     generation: u64,
 }
 
+impl WindowSnapshotImage {
+    fn belongs_to(&self, width: u32, height: u32, generation: u64) -> bool {
+        self.width == width && self.height == height && self.generation == generation
+    }
+}
+
 fn window_snapshot() -> &'static std::sync::Mutex<Option<WindowSnapshotImage>> {
     static SNAPSHOT: std::sync::Mutex<Option<WindowSnapshotImage>> = std::sync::Mutex::new(None);
     &SNAPSHOT
@@ -3161,6 +3182,20 @@ unsafe fn snapshot_window_source(
 
 #[cfg(all(test, feature = "host-window"))]
 mod scanout_snapshot_tests {
+    #[test]
+    fn same_extent_snapshot_from_a_retired_device_is_not_reused() {
+        let snapshot = super::WindowSnapshotImage {
+            image: ash::vk::Image::null(),
+            memory: ash::vk::DeviceMemory::null(),
+            width: 1920,
+            height: 1080,
+            generation: 7,
+        };
+        assert!(snapshot.belongs_to(1920, 1080, 7));
+        assert!(!snapshot.belongs_to(1920, 1080, 8));
+        assert!(!snapshot.belongs_to(1280, 720, 7));
+    }
+
     /// The invariant the GPU copy buys, in the only form a unit test can hold:
     /// what the presenter reads is the last publish-committed content, never
     /// the live source's current state. The GPU path itself is queue-ordered

@@ -1207,6 +1207,8 @@ pub fn sampled_image(mtl: u16) -> Result<StorageImageFormat, Refusal> {
         pf::MTL_FORMAT_RGB10A2_UNORM => StorageImageFormat::Rgb10a2Unorm,
         pf::MTL_FORMAT_BGR10A2_UNORM => StorageImageFormat::Bgr10a2Unorm,
         pf::MTL_FORMAT_RG11B10_FLOAT => StorageImageFormat::Rg11b10Float,
+        pf::MTL_FORMAT_BGRA8_UNORM_SRGB => StorageImageFormat::Bgra8Unorm,
+        pf::MTL_FORMAT_RGBA8_UNORM_SRGB => StorageImageFormat::Rgba8Unorm,
         _ => return storage_image(mtl),
     };
     translate(mtl)?;
@@ -2198,6 +2200,24 @@ mod tests {
                 word,
                 "{mtl:#x} compute sampled image"
             );
+        }
+    }
+
+    #[test]
+    fn normalized16_render_and_transfer_keep_the_sampled_native_word() {
+        for (mtl, word, bytes) in [
+            (p::MTL_FORMAT_R16_UNORM, vk::Format::R16_UNORM, 2),
+            (
+                p::MTL_FORMAT_RGBA16_UNORM,
+                vk::Format::R16G16B16A16_UNORM,
+                8,
+            ),
+        ] {
+            assert_eq!(color_attachment(mtl), Ok((word, ColorNumericType::Float)));
+            assert_eq!(verbatim_texel(mtl), Some((word, bytes)));
+            let sampled = sampled_pixels(mtl).expect("native normalized sample");
+            assert_eq!(vk_texel_layout(sampled.layout), word);
+            assert!(sampled.layout.render_target_index().is_some());
         }
     }
 

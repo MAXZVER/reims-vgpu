@@ -3917,7 +3917,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
             reims_vgpu::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM,
             [0.0, 0.0, 1.0, 1.0],
         ),
-        load: false,
+        contents: engine::SecondaryLoad::Clear,
         // Unblended: this parity case checks the attachment is written at
         // all, not how it composites.
         blend: None,
@@ -4008,7 +4008,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
             reims_vgpu::protocol::pixel_format::MTL_FORMAT_RG16_FLOAT,
             [1.0, 0.5, 0.0, 0.0],
         ),
-        load: false,
+        contents: engine::SecondaryLoad::Clear,
         // Unblended: this is the vibrancy coverage-mask shape, and a mask is a
         // raw store. Which is exactly why every secondary used to be forced
         // unblended — one real case generalized into a rule for all of them.
@@ -4077,7 +4077,7 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
                 reims_vgpu::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM,
                 [0.0, 0.0, 1.0, 1.0],
             ),
-            load: false,
+            contents: engine::SecondaryLoad::Clear,
             blend: None,
             color_write_mask: Default::default(),
         });

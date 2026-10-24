@@ -15,6 +15,10 @@ use crate::runtime::mtlb::MtlbDecline;
 /// A specific pipeline/stage preparation failure before engine request validation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DrawPreparationDecline {
+    SampledMipChain {
+        texture_ref: u32,
+        reason: crate::runtime::draw::LinearLoadRefusal,
+    },
     /// A translator-owned sampled image cannot be provisioned from its
     /// reflected contract. No guest argument index can supply this resource.
     SynthesizedSampled {
@@ -303,6 +307,7 @@ impl Decline for DrawPreparationDecline {
                 "draw_prepare_attachment_alias_identity_missing"
             }
             Self::TextureResolveMissing { .. } => "draw_prepare_texture_resolve_missing",
+            Self::SampledMipChain { .. } => "draw_prepare_sampled_mip_chain",
             Self::TextureDimensionUnsupported { .. } => {
                 "draw_prepare_texture_dimension_unsupported"
             }
@@ -507,6 +512,11 @@ impl Decline for DrawPreparationDecline {
                 ("index", index.to_string()),
                 ("texture_ref", texture_ref.to_string()),
             ],
+            Self::SampledMipChain { texture_ref, reason } => {
+                let mut fields = vec![("texture_ref", texture_ref.to_string()), ("reason", reason.slug().to_string())];
+                fields.extend(reason.fields());
+                fields
+            }
             Self::TextureResolveMissing {
                 stage,
                 index,

@@ -168,6 +168,10 @@ pub enum DrawValidationDecline {
         actual: usize,
         expected: usize,
     },
+    SampledMipChain {
+        binding: u32,
+        reason: super::sampled_mips::MipUploadDecline,
+    },
     /// The tightly-packed length this geometry implies does not fit a `usize`,
     /// so no buffer can be that long and no comparison against one would mean
     /// anything.
@@ -280,6 +284,7 @@ impl Decline for DrawValidationDecline {
                 "vk_draw_validate_sampled_no_linear_texel_footprint"
             }
             Self::SampledBytesLength { .. } => "vk_draw_validate_sampled_bytes_length",
+            Self::SampledMipChain { .. } => "vk_draw_validate_sampled_mip_chain",
             Self::UnrepresentableImageBytes { .. } => {
                 "vk_draw_validate_unrepresentable_image_bytes"
             }
@@ -448,6 +453,10 @@ impl Decline for DrawValidationDecline {
                 ("binding", binding.to_string()),
                 ("actual", actual.to_string()),
                 ("expected", expected.to_string()),
+            ],
+            Self::SampledMipChain { binding, reason } => vec![
+                ("binding", binding.to_string()),
+                ("reason", format!("{reason:?}")),
             ],
             Self::UnrepresentableImageBytes {
                 width,

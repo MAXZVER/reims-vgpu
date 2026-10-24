@@ -25,6 +25,8 @@ use super::types::{
 };
 use super::vk_call::{VkCall, VkOp};
 
+mod secondary_seed;
+
 /// A buffer a draw binds, and where in it the bytes start.
 ///
 /// Two origins, and the offset is what distinguishes them. A pooled staging slot
@@ -1504,6 +1506,9 @@ enum PreparedSampled {
         staging: BufferSlot,
         volume: bool,
         layers: u32,
+        mip_copies: Option<Vec<vk::BufferImageCopy>>,
+        bytes: std::sync::Arc<Vec<u8>>,
+        identity: Option<super::types::SampledContentIdentity>,
     },
     /// Guest source: one buffer→image copy fills the sampled image out of the
     /// guest's own texel bytes. [`GuestTexels`] says how far those bytes had to
@@ -1900,6 +1905,89 @@ fn validate_buffer_content(
     Ok(())
 }
 
+fn validate_color_guest_seed(
+    seed: &super::types::GuestTargetSeed,
+    width: u32,
+    height: u32,
+    target_format: vk::Format,
+) -> Result<(), DrawError> {
+    if !super::super::translate::pixel::stored_bytes_agree(seed.format, target_format) {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::TargetGuestSeedFormat {
+                source: seed.format,
+                target: target_format,
+            },
+        ));
+    }
+    let Some(texel) = super::super::translate::pixel::bytes_per_texel(seed.format) else {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::TargetGuestSeedFormat {
+                source: seed.format,
+                target: target_format,
+            },
+        ));
+    };
+    let tight_row =
+        (width as usize)
+            .checked_mul(texel as usize)
+            .ok_or(DrawError::DrawValidation(
+                DrawValidationDecline::UnrepresentableImageBytes {
+                    width,
+                    height,
+                    layers: 1,
+                    bytes_per_texel: texel,
+                },
+            ))?;
+    let stride = if seed.source.row_length_texels == 0 {
+        tight_row
+    } else {
+        (seed.source.row_length_texels as usize)
+            .checked_mul(texel as usize)
+            .ok_or(DrawError::DrawValidation(
+                DrawValidationDecline::UnrepresentableImageBytes {
+                    width,
+                    height,
+                    layers: 1,
+                    bytes_per_texel: texel,
+                },
+            ))?
+    };
+    if stride < tight_row {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::TargetGuestSeedRowStride { stride, tight_row },
+        ));
+    }
+    let expected = (height.saturating_sub(1) as usize)
+        .checked_mul(stride)
+        .and_then(|prefix| prefix.checked_add(tight_row))
+        .ok_or(DrawError::DrawValidation(
+            DrawValidationDecline::UnrepresentableImageBytes {
+                width,
+                height,
+                layers: 1,
+                bytes_per_texel: texel,
+            },
+        ))?;
+    if seed.source.total_len != expected as u64 {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::TargetGuestSeedLength {
+                actual: seed.source.total_len,
+                expected,
+            },
+        ));
+    }
+    let covered = seed.source.runs.iter().map(|run| run.len()).sum();
+    if covered != seed.source.total_len {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::TargetGuestSeedCoverage {
+                covered,
+                declared: seed.source.total_len,
+            },
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
     if req.width == 0 || req.height == 0 {
         return Err(DrawError::DrawValidation(
@@ -1970,7 +2058,14 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         };
-        if target.len() != expected {
+        let native_bpp = super::super::translate::pixel::bytes_per_texel(req.primary_color_format())
+            .unwrap_or(crate::protocol::pixel_format::RGBA8_BPP);
+        let expected_native = reims_vgpu_protocol::extent::tight_image_bytes(
+            req.width,
+            req.height,
+            native_bpp as usize,
+        );
+        if target.len() != expected && Some(target.len()) != expected_native {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::TargetSeedLength {
                     actual: target.len(),
@@ -1980,89 +2075,16 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         }
     }
     if let Some(seed) = &req.target_guest_seed {
-        let target_format = req
-            .target_identity
-            .as_ref()
-            .map(|identity| identity.resident_format())
-            .unwrap_or(super::super::translate::pixel::RESIDENT_RGBA_FORMAT);
-        if seed.format != target_format {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::TargetGuestSeedFormat {
-                    source: seed.format,
-                    target: target_format,
-                },
-            ));
-        }
-        let Some(texel) = super::super::translate::pixel::bytes_per_texel(seed.format) else {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::TargetGuestSeedFormat {
-                    source: seed.format,
-                    target: target_format,
-                },
-            ));
-        };
-        let tight_row =
-            (req.width as usize)
-                .checked_mul(texel as usize)
-                .ok_or(DrawError::DrawValidation(
-                    DrawValidationDecline::UnrepresentableImageBytes {
-                        width: req.width,
-                        height: req.height,
-                        layers: 1,
-                        bytes_per_texel: texel,
-                    },
-                ))?;
-        let stride = if seed.source.row_length_texels == 0 {
-            tight_row
-        } else {
-            (seed.source.row_length_texels as usize)
-                .checked_mul(texel as usize)
-                .ok_or(DrawError::DrawValidation(
-                    DrawValidationDecline::UnrepresentableImageBytes {
-                        width: req.width,
-                        height: req.height,
-                        layers: 1,
-                        bytes_per_texel: texel,
-                    },
-                ))?
-        };
-        if stride < tight_row {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::TargetGuestSeedRowStride { stride, tight_row },
-            ));
-        }
-        let expected = (req.height.saturating_sub(1) as usize)
-            .checked_mul(stride)
-            .and_then(|prefix| prefix.checked_add(tight_row))
-            .ok_or(DrawError::DrawValidation(
-                DrawValidationDecline::UnrepresentableImageBytes {
-                    width: req.width,
-                    height: req.height,
-                    layers: 1,
-                    bytes_per_texel: texel,
-                },
-            ))?;
-        if seed.source.total_len != expected as u64 {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::TargetGuestSeedLength {
-                    actual: seed.source.total_len,
-                    expected,
-                },
-            ));
-        }
-        let covered = seed.source.runs.iter().map(|run| run.len()).sum();
-        if covered != seed.source.total_len {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::TargetGuestSeedCoverage {
-                    covered,
-                    declared: seed.source.total_len,
-                },
-            ));
-        }
+        validate_color_guest_seed(seed, req.width, req.height, req.primary_color_format())?;
         if req.target_rgba8.is_some() || req.load_from_target || req.seed_from_target.is_some() {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SeedConflictsGuestSeed,
             ));
+        }
+    }
+    for secondary in &req.secondary_targets {
+        if let Some(seed) = secondary.contents.guest_seed() {
+            validate_color_guest_seed(seed, secondary.width, secondary.height, secondary.attachment.format())?;
         }
     }
     if let Some(seed_identity) = &req.seed_from_target {
@@ -2090,7 +2112,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             SampledSource::Target(identity) => identity == seed_identity,
             // A staged bind stands for a guest-runs source: no target, no
             // alias of the seed.
-            SampledSource::Bytes(_) | SampledSource::GuestRuns(..) | SampledSource::Staged(_) => {
+            SampledSource::Bytes(_) | SampledSource::MipmappedBytes(_) | SampledSource::GuestRuns(..) | SampledSource::Staged(_) => {
                 false
             }
         }) {
@@ -2398,6 +2420,13 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 }
             }
             SampledSource::Bytes(_) => {}
+            SampledSource::MipmappedBytes(levels) => {
+                super::sampled_mips::copies(image, levels).map_err(|reason| {
+                    DrawError::DrawValidation(DrawValidationDecline::SampledMipChain {
+                        binding: image.binding, reason,
+                    })
+                })?;
+            }
             SampledSource::GuestRuns(src, ..) => {
                 validate_guest_runs_shape(image, src, block, expected)?;
             }
@@ -2530,11 +2559,12 @@ unsafe fn upload_buffer_to_sampled_image(
     extent_depth: u32,
     row_length_texels: u32,
     target_layout: vk::ImageLayout,
+    mip_copies: Option<&[vk::BufferImageCopy]>,
 ) {
     let range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
-        level_count: 1,
+        level_count: mip_copies.map_or(1, |copies| copies.len() as u32),
         base_array_layer: 0,
         layer_count: array_layers,
     };
@@ -2545,7 +2575,8 @@ unsafe fn upload_buffer_to_sampled_image(
         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
         .image(image)
         .subresource_range(range)];
-    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
+    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(
+        &ctx.device,
         cb,
         vk::PipelineStageFlags::TOP_OF_PIPE,
         vk::PipelineStageFlags::TRANSFER,
@@ -2568,12 +2599,13 @@ unsafe fn upload_buffer_to_sampled_image(
             height,
             depth: extent_depth,
         })];
-    crate::backend::vulkan::engine::cmd_sink::copy_buffer_to_image(&ctx.device, 
+    crate::backend::vulkan::engine::cmd_sink::copy_buffer_to_image(
+        &ctx.device,
         cb,
         src,
         image,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        &copy,
+        mip_copies.unwrap_or(&copy),
     );
     let dst_access = if target_layout == vk::ImageLayout::GENERAL {
         vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE
@@ -2587,7 +2619,8 @@ unsafe fn upload_buffer_to_sampled_image(
         .new_layout(target_layout)
         .image(image)
         .subresource_range(range)];
-    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(&ctx.device, 
+    crate::backend::vulkan::engine::cmd_sink::pipeline_barrier(
+        &ctx.device,
         cb,
         vk::PipelineStageFlags::TRANSFER,
         vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
@@ -3523,12 +3556,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Slot 0's view supplies the attachment format. The identity names the
     // allocation behind it; treating those as the same question loses Metal's
     // compatible-format texture views (most visibly UNORM versus sRGB).
-    let color0_format = req.color_attachment.map(|a| a.format()).unwrap_or_else(|| {
-        req.target_identity
-            .as_ref()
-            .map(|id| id.resident_format())
-            .unwrap_or(crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT)
-    });
+    let color0_format = req.primary_color_format();
     // A guest-sourced sampled bind used to force the immediate-submit path.
     // Its read of guest RAM happens when the CB *executes*, and this device
     // acked the packet as soon as it was consumed, so deferred submit stretched
@@ -3910,7 +3938,11 @@ pub(crate) unsafe fn execute_draw_inner(
         .color0_declared
         .is_some_and(|declared| declared.preserves_prior_contents())
     {
-        Color0Load::Undefined
+        if resident_ready {
+            Color0Load::Preserve
+        } else {
+            Color0Load::Clear
+        }
     } else {
         Color0Load::Clear
     };
@@ -3957,7 +3989,7 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         pass_key.secondary[i] = SecondaryAttachKey {
             format: sec.attachment.format(),
-            load: sec.load,
+            load: sec.contents.preserves_contents(),
         };
     }
     pass_key.secondary_count = req.secondary_targets.len() as u8;
@@ -4857,6 +4889,9 @@ pub(crate) unsafe fn execute_draw_inner(
             },
             GuestTargetLoad::None => None,
         };
+    let secondary_guest_texels = unsafe {
+        secondary_seed::prepare(ctx, pools, counters, req, &mut guest_gathers)?
+    };
     // GPU seed source: resolved after registry_ensure (which protects it from
     // the capacity sweep) so the handle cannot be destroyed under this draw.
     // Every rejection is a distinct named error — the runtime pre-checks
@@ -4942,13 +4977,62 @@ pub(crate) unsafe fn execute_draw_inner(
                     staging: st,
                     volume: resource.kind.is_volume(),
                     layers: resource.layers,
+                    mip_copies: None,
+                    bytes: bytes.clone(),
+                    identity: resource.identity,
+                });
+            }
+            SampledSource::MipmappedBytes(levels) => {
+                let copies = super::sampled_mips::copies(resource, levels).map_err(|reason| {
+                    DrawError::DrawValidation(DrawValidationDecline::SampledMipChain {
+                        binding: resource.binding, reason,
+                    })
+                })?;
+                let mut packed = Vec::new();
+                for (copy, bytes) in copies.iter().zip(levels) {
+                    packed.resize(copy.buffer_offset as usize, 0);
+                    packed.extend_from_slice(bytes);
+                }
+                let bytes = std::sync::Arc::new(packed);
+                let key = SampledKey::of(resource);
+                if let Some(image) = pools.find_cached_sampled(key, &bytes, None, counters) {
+                    sampled.push(PreparedSampled::Cached {
+                        binding: resource.binding, array_element: resource.array_element, image,
+                    });
+                    continue;
+                }
+                let image = pools.acquire_sampled(ctx, key, counters)?;
+                let staging = pools.acquire_staging(ctx, bytes.len() as u64, counters)?;
+                pools.write_staging(ctx, &staging, &bytes)?;
+                counters.note_sampled_reupload(bytes.len() as u64, resource.byte_origin);
+                sampled.push(PreparedSampled::Upload {
+                    binding: resource.binding, array_element: resource.array_element,
+                    image, staging, volume: false, layers: 1,
+                    mip_copies: Some(copies), bytes, identity: None,
                 });
             }
             SampledSource::Target(identity) => {
                 // TEMP (lab, RTV_GPU): a serialized view over this resident's
                 // surface — its bind extent is the resident's top-left, read
                 // through the bind's format, and it always takes a snapshot.
-                let region = resource.byte_origin == super::SampledByteOrigin::SerializedSurfaceView;
+                if let Some(seed) = req.secondary_guest_seed_for_sample(resource) {
+                    sample_guest_runs(
+                        ctx,
+                        pools,
+                        counters,
+                        &mut phase,
+                        resource,
+                        &seed.source,
+                        crate::runtime::gather_witness::GatherVouch::Fresh,
+                        None,
+                        None,
+                        &mut sampled,
+                        &mut guest_gathers,
+                    )?;
+                    continue;
+                }
+                let region =
+                    resource.byte_origin == super::SampledByteOrigin::SerializedSurfaceView;
                 // Reading a resident is using it. Marked before the lookup so
                 // the refusal paths below cannot skip it: a resident whose
                 // content is not ready yet, or whose geometry disagrees with
@@ -5047,7 +5131,11 @@ pub(crate) unsafe fn execute_draw_inner(
                 // A whole guest mip chain when the runtime named one and every
                 // level is a ready resident of its own extent; otherwise level 0
                 // alone, as before, counted.
-                if self_slot.is_none() && !swizzled && !region {
+                if pyramid_source_covers_view(
+                    self_slot.is_some(),
+                    (resource.width, resource.height),
+                    (_resident_width, _resident_height),
+                ) {
                     if let Some(pyramid) = req.sampled_pyramids.iter().find(|p| {
                         p.binding == resource.binding
                             && p.array_element == resource.array_element
@@ -5898,6 +5986,7 @@ pub(crate) unsafe fn execute_draw_inner(
             staging: st,
             volume,
             layers,
+            mip_copies,
             ..
         } = image
         else {
@@ -5916,6 +6005,7 @@ pub(crate) unsafe fn execute_draw_inner(
             if *volume { *layers } else { 1 },
             0,
             image.descriptor_layout(),
+            mip_copies.as_deref(),
         );
     }
 
@@ -6186,6 +6276,7 @@ pub(crate) unsafe fn execute_draw_inner(
             if *volume { *layers } else { 1 },
             *row_length_texels,
             image.descriptor_layout(),
+            None,
         );
     }
 
@@ -6194,6 +6285,19 @@ pub(crate) unsafe fn execute_draw_inner(
     // must wait for that prior read (WAR). A freshly-created secondary tracks
     // UNDEFINED and needs no barrier — the render pass discards on CLEAR.
     for (secondary_index, (_id, image, access)) in mrt_secondaries.iter().enumerate() {
+        if let Some(source) = &secondary_guest_texels[secondary_index] {
+            unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
+            unsafe {
+                secondary_seed::record(ctx, cb, secondary_seed::Destination {
+                    attachment: &req.secondary_targets[secondary_index],
+                    image: *image,
+                    access: *access,
+                    layout: pass_key.color_layout(secondary_index + 1),
+                    feedback: pass_key.color_feedback(secondary_index + 1),
+                }, source);
+            }
+            continue;
+        }
         if *access == super::pools::ResidentAccess::Untouched {
             continue;
         }
@@ -7111,19 +7215,12 @@ pub(crate) unsafe fn execute_draw_inner(
     let mut sampled_retains: Vec<super::pools::SampledRetain> = Vec::new();
     for prepared in &sampled {
         match prepared {
-            PreparedSampled::Upload { binding, image, .. } => {
-                if let Some((SampledSource::Bytes(bytes), identity)) = req
-                    .sampled_images
-                    .iter()
-                    .find(|resource| resource.binding == *binding)
-                    .map(|resource| (&resource.source, resource.identity))
-                {
-                    sampled_retains.push(super::pools::SampledRetain {
-                        image: image.image,
-                        content: super::pools::SampledRetainContent::Bytes(bytes.clone()),
-                        identity,
-                    });
-                }
+            PreparedSampled::Upload { image, bytes, identity, .. } => {
+                sampled_retains.push(super::pools::SampledRetain {
+                    image: image.image,
+                    content: super::pools::SampledRetainContent::Bytes(bytes.clone()),
+                    identity: *identity,
+                });
             }
             // A gather with no vouched identity is dropped by the admit, which
             // is where that decision belongs: an entry nothing can name is
@@ -7422,7 +7519,9 @@ unsafe fn ad_hoc_attachment_views(
         // Read before `registry_ensure_attachment` rather than after, because
         // ensuring is what creates the resident: asking afterwards cannot tell a
         // slot born in this call from one the guest has been rendering into.
-        if sec.load && !prior.is_some_and(|s| s.content_ready) {
+        if matches!(sec.contents, super::types::SecondaryLoad::Resident)
+            && !prior.is_some_and(|s| s.content_ready)
+        {
             return Err(DrawError::DrawExecution(
                 DrawExecutionDecline::LoadSecondaryContentNotReady {
                     identity: sec.identity.clone(),
@@ -8201,6 +8300,18 @@ fn pyramid_level_admissible(
         && samples <= 1
         && slot_width == width.checked_shr(shift).unwrap_or(0).max(1)
         && slot_height == height.checked_shr(shift).unwrap_or(0).max(1)
+}
+
+// A serialized view may cover the entire resident. Its provenance does not
+// turn a whole mip chain into a cropped image. Component swizzles are carried
+// by the snapshot's SampledKey/image view, so they also preserve every level.
+// A real crop or feedback source still requires the existing snapshot route.
+fn pyramid_source_covers_view(
+    feedback: bool,
+    view_extent: (u32, u32),
+    resident_extent: (u32, u32),
+) -> bool {
+    !feedback && view_extent == resident_extent
 }
 
 /// Every level of `pyramid` as a ready, single-sample resident of exactly its
@@ -9077,6 +9188,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn byte_mip_validation_checks_each_level_instead_of_only_the_base() {
+        let mut req = guest_run_req(5, 3, 60, 0);
+        let image = &mut req.sampled_images[0];
+        image.format = vk::Format::R8_UNORM;
+        image.source = SampledSource::MipmappedBytes(vec![
+            std::sync::Arc::new(vec![1; 15]),
+            std::sync::Arc::new(vec![2; 2]),
+            std::sync::Arc::new(vec![3; 1]),
+        ]);
+        assert!(validate_v1(&req).is_ok());
+        let SampledSource::MipmappedBytes(levels) = &mut req.sampled_images[0].source else {
+            unreachable!()
+        };
+        levels[2] = std::sync::Arc::new(vec![3; 2]);
+        assert_eq!(validation_slug(&req), "vk_draw_validate_sampled_mip_chain");
+    }
+
     fn guest_target_seed_req(
         w: u32,
         h: u32,
@@ -9168,6 +9297,20 @@ mod tests {
         assert!(!pyramid_level_admissible(1, 320, 320, (160, 160, false, 1)));
         assert!(!pyramid_level_admissible(1, 320, 320, (160, 160, true, 4)));
         assert!(!pyramid_level_admissible(40, 320, 320, (0, 0, true, 1)));
+    }
+
+    #[test]
+    fn a_whole_serialized_view_keeps_the_chain_and_its_component_mapping() {
+        let mut resource = target_sample(sampled_identity());
+        resource.byte_origin = super::super::types::SampledByteOrigin::SerializedSurfaceView;
+        resource.swizzle = crate::protocol::pixel_format::swizzle_swap_rb();
+        assert!(pyramid_source_covers_view(false, (16, 16), (16, 16)));
+        let key = SampledKey { levels: 4, ..SampledKey::of(&resource) };
+        assert_eq!(key.levels, 4);
+        assert_eq!(key.swizzle, resource.swizzle);
+        assert!(!pyramid_source_covers_view(false, (8, 16), (16, 16)));
+        assert!(!pyramid_source_covers_view(false, (16, 8), (16, 16)));
+        assert!(!pyramid_source_covers_view(true, (16, 16), (16, 16)));
     }
 
     /// Capability and view shape jointly select the native feedback contract.
@@ -9476,7 +9619,7 @@ mod tests {
             width: 16,
             height: 16,
             attachment,
-            load: false,
+            contents: super::super::types::SecondaryLoad::Clear,
             blend: None,
             color_write_mask: Default::default(),
         }
@@ -9972,6 +10115,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_secondary_self_sample_uses_only_its_exact_native_seed() {
+        let mut req = guest_target_seed_req(16, 16, 1024, 1024, 16);
+        let seed = req.target_guest_seed.take().unwrap();
+        let format = seed.format;
+        let mut secondary =
+            secondary_with_attachment(super::super::types::ColorAttachmentState::new(
+                format,
+                super::super::types::ColorClearValue::default(),
+            ));
+        let identity = secondary.identity.clone();
+        secondary.contents = super::super::types::SecondaryLoad::Guest(seed);
+        req.secondary_targets.push(secondary);
+        let mut sample = target_sample(identity);
+        sample.format = format;
+        assert!(req.secondary_guest_seed_for_sample(&sample).is_some());
+        sample.width = 8;
+        assert!(req.secondary_guest_seed_for_sample(&sample).is_none());
+        sample.width = 16;
+        sample.layers = 2;
+        assert!(req.secondary_guest_seed_for_sample(&sample).is_none());
+        sample.layers = 1;
+        sample.multisampled = true;
+        assert!(req.secondary_guest_seed_for_sample(&sample).is_none());
+        sample.multisampled = false;
+        sample.format = vk::Format::R16_SFLOAT;
+        assert!(req.secondary_guest_seed_for_sample(&sample).is_none());
+        sample.format = format;
+        req.secondary_targets[0].contents = super::super::types::SecondaryLoad::Resident;
+        assert!(req.secondary_guest_seed_for_sample(&sample).is_none());
+    }
+
+    #[test]
+    fn a_secondary_guest_seed_validates_its_own_native_format_and_coverage() {
+        let mut req = guest_target_seed_req(4, 2, 20, 20, 6);
+        let mut seed = req.target_guest_seed.take().unwrap();
+        seed.format = vk::Format::R16_SFLOAT;
+        let mut secondary =
+            secondary_with_attachment(super::super::types::ColorAttachmentState::new(
+                vk::Format::R16_SFLOAT,
+                super::super::types::ColorClearValue::default(),
+            ));
+        secondary.width = 4;
+        secondary.height = 2;
+        secondary.contents = super::super::types::SecondaryLoad::Guest(seed);
+        req.secondary_targets.push(secondary);
+        assert!(validate_v1(&req).is_ok());
+        if let super::super::types::SecondaryLoad::Guest(seed) =
+            &mut req.secondary_targets[0].contents
+        {
+            seed.source.total_len -= 1;
+        }
+        assert_eq!(
+            validation_slug(&req),
+            "vk_draw_validate_target_guest_seed_length"
+        );
+    }
+
+    #[test]
+    fn a_native_seed_uses_the_declared_attachment_without_a_resident_identity() {
+        use super::super::types::{ColorAttachmentState, ColorClearValue};
+        let mut req = guest_target_seed_req(4, 2, 20, 20, 6);
+        req.color_attachment = Some(ColorAttachmentState::new(
+            vk::Format::R16_SFLOAT,
+            ColorClearValue::Float([0.0; 4]),
+        ));
+        req.target_guest_seed.as_mut().unwrap().format = vk::Format::R16_SFLOAT;
+        assert!(req.target_identity.is_none());
+        assert!(validate_v1(&req).is_ok());
+        req.color_attachment = Some(ColorAttachmentState::new(
+            vk::Format::R8G8B8A8_UNORM,
+            ColorClearValue::Float([0.0; 4]),
+        ));
+        assert_eq!(
+            validation_slug(&req),
+            "vk_draw_validate_target_guest_seed_format"
+        );
+    }
+
+    #[test]
+    fn a_native_seed_can_initialize_a_same_byte_srgb_view_but_not_swapped_channels() {
+        use super::super::types::{ColorAttachmentState, ColorClearValue};
+        let mut req = guest_target_seed_req(4, 2, 40, 40, 6);
+        req.color_attachment = Some(ColorAttachmentState::new(
+            vk::Format::R8G8B8A8_SRGB,
+            ColorClearValue::Float([0.0; 4]),
+        ));
+        assert!(validate_v1(&req).is_ok());
+        req.target_guest_seed.as_mut().unwrap().format = vk::Format::B8G8R8A8_UNORM;
+        assert_eq!(
+            validation_slug(&req),
+            "vk_draw_validate_target_guest_seed_format"
+        );
+    }
+
     /// A geometry whose byte length has no `usize` is refused, not multiplied.
     ///
     /// Both sites took the product straight, and both had enough factors to
@@ -10366,6 +10604,22 @@ mod depth_load_tests {
             content_ready: false,
         };
         assert!(!transient.honours_load(true));
+    }
+
+    #[test]
+    fn a_named_depth_resident_still_needs_initialized_contents() {
+        let mut depth = acquired(false);
+        depth.identity = Some(TargetIdentity::Surface {
+            id: 7,
+            width: 64,
+            height: 32,
+            generation: 3,
+            format: vk::Format::D32_SFLOAT_S8_UINT,
+        });
+        assert!(!depth.honours_load(true));
+        depth.content_ready = true;
+        assert!(depth.honours_load(true));
+        assert!(!depth.honours_load(false));
     }
 
     /// Every state a draw request can hold is one the owning layer admits.
