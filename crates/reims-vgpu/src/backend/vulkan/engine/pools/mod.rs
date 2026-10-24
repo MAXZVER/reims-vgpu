@@ -1681,7 +1681,7 @@ impl SampledKey {
             kind: r.kind,
             format: r.format,
             swizzle: r.swizzle,
-            levels: 1,
+            levels: super::sampled_mips::level_count(&r.source),
         }
     }
 
@@ -4062,6 +4062,17 @@ mod sampled_key_tests {
         assert_eq!((k.width, k.height, k.layers), (7, 5, 3));
         assert_eq!(k.format, ash::vk::Format::R8G8B8A8_UNORM);
         assert_eq!(k.swizzle, SwizzlePlan::default());
+    }
+
+    #[test]
+    fn byte_mip_chains_cannot_reuse_a_single_level_image_or_view() {
+        let mut r = resource(TextureKind::D2);
+        let single = SampledKey::of(&r);
+        r.source = SampledSource::MipmappedBytes(vec![std::sync::Arc::new(Vec::new()); 3]);
+        let chain = SampledKey::of(&r);
+        assert_eq!(chain.levels, 3);
+        assert_ne!(chain, single);
+        assert!(!chain.is_plain_2d_identity_view());
     }
 
     /// Only one key can describe the plain view of one attachment. Every other

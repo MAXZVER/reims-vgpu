@@ -6041,7 +6041,17 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
 
     let mut host = crate::runtime::host::FakeHost::new();
     let secs = build_secondary_targets(
-        &mut state, &mut host, 1, &colors, &pipeline, &primary, 64, 64,
+        &mut state,
+        &mut host,
+        &DrawEncodeRequest {
+            task_id: 1,
+            colors: colors.clone(),
+            ..Default::default()
+        },
+        &pipeline,
+        &primary,
+        64,
+        64,
     )
     .expect("a contiguous, geometry-matching, resolvable secondary builds");
     assert_eq!(secs.len(), 1, "one secondary attachment expected");
@@ -6079,7 +6089,17 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
     };
     let mut host = crate::runtime::host::FakeHost::new();
     let secs = build_secondary_targets(
-        &mut state, &mut host, 1, &colors, &unblended, &primary, 64, 64,
+        &mut state,
+        &mut host,
+        &DrawEncodeRequest {
+            task_id: 1,
+            colors: colors.clone(),
+            ..Default::default()
+        },
+        &unblended,
+        &primary,
+        64,
+        64,
     )
     .expect("the same secondary builds whether or not its slot blends");
     assert_eq!(secs.len(), 1);
@@ -6174,7 +6194,17 @@ fn a_warm_ledger_peek_equals_the_serial_secondary_identity() {
     .expect("a warm ledger does not bail")
     .expect("the secondary builds");
     let drain = build_secondary_targets(
-        &mut state, &mut host, 1, &colors, &pipeline, &primary, 64, 64,
+        &mut state,
+        &mut host,
+        &DrawEncodeRequest {
+            task_id: 1,
+            colors: colors.clone(),
+            ..Default::default()
+        },
+        &pipeline,
+        &primary,
+        64,
+        64,
     )
     .expect("the secondary builds");
     assert_eq!(worker.len(), 1);
@@ -6317,8 +6347,11 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         build_secondary_targets(
             &mut state,
             &mut host,
-            1,
-            &[slot0.clone(), slot1.clone()],
+            &DrawEncodeRequest {
+                task_id: 1,
+                colors: vec![slot0.clone(), slot1.clone()],
+                ..Default::default()
+            },
             &pipeline,
             &primary,
             64,
@@ -6396,8 +6429,11 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
     let single = build_secondary_targets(
         &mut state,
         &mut host,
-        1,
-        std::slice::from_ref(&slot0),
+        &DrawEncodeRequest {
+            task_id: 1,
+            colors: vec![slot0.clone()],
+            ..Default::default()
+        },
         &pipeline,
         &primary,
         64,
@@ -6453,7 +6489,17 @@ fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
     let mut build = |colors: &[ColorRtRequest]| {
         let mut host = crate::runtime::host::FakeHost::new();
         build_secondary_targets(
-            &mut state, &mut host, 1, colors, &pipeline, &primary, 64, 64,
+            &mut state,
+            &mut host,
+            &DrawEncodeRequest {
+                task_id: 1,
+                colors: colors.to_vec(),
+                ..Default::default()
+            },
+            &pipeline,
+            &primary,
+            64,
+            64,
         )
     };
 

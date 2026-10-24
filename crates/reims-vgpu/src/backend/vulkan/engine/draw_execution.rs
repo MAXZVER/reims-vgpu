@@ -50,6 +50,10 @@ pub enum DrawExecutionDecline {
     LoadSecondaryContentNotReady {
         identity: TargetIdentity,
     },
+    /// A rendered MRT attachment could not publish its guest-visible Store.
+    SecondaryStoreNotPublished {
+        identity: TargetIdentity,
+    },
     SeedResidentMissing {
         identity: TargetIdentity,
     },
@@ -185,6 +189,7 @@ impl Decline for DrawExecutionDecline {
             Self::LoadSecondaryContentNotReady { .. } => {
                 "vk_draw_exec_load_secondary_content_not_ready"
             }
+            Self::SecondaryStoreNotPublished { .. } => "vk_draw_exec_secondary_store_not_published",
             Self::SeedResidentMissing { .. } => "vk_draw_exec_seed_resident_missing",
             Self::SeedResidentNotReady { .. } => "vk_draw_exec_seed_resident_not_ready",
             Self::SeedGeometryMismatch { .. } => "vk_draw_exec_seed_geometry_mismatch",
@@ -225,6 +230,7 @@ impl Decline for DrawExecutionDecline {
             ],
             Self::LoadTargetContentNotReady { identity }
             | Self::LoadSecondaryContentNotReady { identity }
+            | Self::SecondaryStoreNotPublished { identity }
             | Self::SeedResidentMissing { identity }
             | Self::SeedResidentNotReady { identity } => identity_fields(identity),
             Self::SeedGeometryMismatch {
@@ -431,6 +437,9 @@ mod tests {
             DrawExecutionDecline::LoadSecondaryContentNotReady {
                 identity: identity(),
             },
+            DrawExecutionDecline::SecondaryStoreNotPublished {
+                identity: identity(),
+            },
             DrawExecutionDecline::SeedResidentMissing {
                 identity: identity(),
             },
@@ -507,7 +516,8 @@ mod tests {
         // Up to 13: `*_resident_view_format_incompatible` refuses a view of a
         // resident in a format of another texel size (p055 validation: a
         // B8G8R8A8 view over an R8 resident), which reads past the image.
-        assert_eq!(before, 13, "the draw executor's reason census moved");
+        // 14 adds a failed secondary Store publication after a successful draw.
+        assert_eq!(before, 14, "the draw executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-execution slug");
     }
 
